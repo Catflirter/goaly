@@ -52,7 +52,7 @@ We hand over the frozen harness. The organizers evaluate it on a hidden held-out
 | Benchmark score: starting and final scores, with improvement on every benchmark | Baseline v0 (§5.4) and final are compared on the same held-out set | T12, T17 and T23 reports |
 | Robustness: run the same test at least 3 times and report the variation; survive tool errors, timeouts and bad model output | Three held-out runs; fault tolerance in core (§5.1); per-task exception isolation (§6.1); concurrency budgets and adaptive backoff (§6.2) | T23 report; T04 and T05 tests |
 | Generalization: held-out tasks stay out of development; gains on more than one benchmark; no hard-coded answers | Three-way split (§7) and a hard-coding scan (§8.5). Each benchmark gets its own lane, and both lanes run the same RSI machinery with no benchmark-specific code, so a gain on two very different tasks shows that the method generalizes | Committed split ID lists; scan logs; per-benchmark gains in the T23 report |
-| Lessons learned: what was tried, what worked, what failed and why, backed by experiments | Experiment ledger and lessons (§8.6) | `experiments.jsonl`, `lessons.md` |
+| Lessons learned: what was tried, what worked, what failed and why, backed by experiments | Experiment ledger and lessons (§8.6) | `experiments.jsonl`, `lessons.jsonl`, and the generated `lessons.md` |
 | Efficiency: time, tokens, compute and cost reported alongside the score | Cost and tokens are recorded for every call (§9). Two limits in the decision rules (§8.3): a cost guardrail, and a hard cap that keeps the final harness at or below 3× v0's mean cost and wall time per task | Report tables, including the final harness's cost and time relative to v0 |
 | Reproducibility: code, configs, prompts, tool versions and a single command | uv lockfile, run manifests, `make final` (§10) | T23, T24 |
 | Automation: several improvement rounds with little human help | `goaly rsi run` (§8) | Ledger entries across rounds |
@@ -357,6 +357,11 @@ The first option costs more tokens, although the gateway's prefix cache absorbs 
 - Both use the same settings:
   - Thinking is on. Sampling is T=0.6, top_p=0.95, top_k=20, with max_tokens 16K per call.
   - Solving budgets are 30 steps or 10 minutes for BIRD, and 60 steps or 45 minutes for SWE.
+- Fallback when a budget runs out before `submit`: v0 still submits something rather than nothing.
+  - BIRD submits the last SQL that executed successfully. If none did, it submits the original issue_sql.
+  - SWE submits the container's final git diff, as OpenHands and other common agents do.
+
+  Neither fallback checks whether the result is any good. Smarter policies, such as never submitting an unverified patch, are left for RSI to discover.
 - v0 is frozen and tagged `baseline-v0`. Every comparison is made against it.
 
 ## 6. Evaluation framework (goaly.bench)
@@ -464,7 +469,7 @@ SWE solving and SWE evaluation never run at the same time. Solving agents run te
 
 - Each per-run JSONL file (results, trajectories, call logs) has a single writer task that reads from an asyncio queue. Lines are flushed as they are written, so a crash loses at most the line being written.
 - Cache entries are written to a temporary file and then renamed into place, so readers never see a partial entry.
-- Both lanes write `experiments.jsonl` and `lessons.md`, and the lanes run as separate processes. Every write takes an exclusive `fcntl` lock.
+- Both lanes write `experiments.jsonl` and `lessons.jsonl`, and the lanes run as separate processes. Every write takes an exclusive `fcntl` lock.
 - A repository-level file lock serializes git operations on the main repository, such as adding or removing worktrees and moving tags. Each candidate edits only its own worktree.
 
 **Tests**
@@ -582,7 +587,7 @@ A lane stops after 4 rounds in a row with no accepted change, or when its time b
 
 | Risk | Defense |
 |---|---|
-| Editing the grader or core | The implementer can write only to its lane's directories. The `bench/` and `core/` checksums are verified before every evaluation |
+| Editing the grader, core or contracts | The implementer can write only to its lane's directories, and a candidate whose diff touches any other path is rejected. The `bench/`, `harness/core/` and `contracts/` checksums are verified before every evaluation |
 | Hard-coded answers | A scan of the diff rejects it if it contains any of: an instance_id from any split; part of any split's gold SQL or gold patch (≥ 40 characters after normalization); a db_id written as a full identifier. A db_id that is also an ordinary English word only raises a warning |
 | Relying on the improvement model | The model allowlist lives in core, which RSI cannot edit |
 | Special-casing the workload or caching between timing runs | The official grader times each repetition in a fresh process and checks for stack inspection; the prompt and skills forbid both; held-out results expose this kind of overfitting |
@@ -592,7 +597,18 @@ A lane stops after 4 rounds in a row with no accepted change, or when its time b
 ### 8.6 Ledger and lessons
 
 - `experiments.jsonl` (`ExperimentRecord` contract): each record holds the experiment ID, lane, parent version, hypothesis and where it came from (idea bank or GLM's own analysis), kind of change, diff stats, screening and validation metrics, decision and reasoning, and cost. The report states how many accepted changes came from each source.
-- `lessons.md`: entries are added one at a time (as in ACE), and each counts how often it helped or hurt. GLM maintains the file and can delete entries. It is never rewritten in one go, so nothing is lost by accident.
+- `lessons.jsonl` (`Lesson` contract) is the source of truth for lessons. Entries are added one at a time, as in ACE, and each entry counts how often it helped or hurt. GLM maintains the file and can delete entries, but never rewrites it in one go, so nothing is lost by accident.
+- `lessons.md` is generated from `lessons.jsonl` for human readers. Counters embedded in hand-edited markdown could not be updated reliably.
+
+### 8.7 Operations
+
+- **Processes.** Each lane runs as its own background process. Every step is recorded in the ledger, so a lane that crashes restarts from the ledger and picks up where it stopped.
+- **Results PRs.** A lane opens an "RSI results" PR when it has 3 accepted changes since its last PR, or when 3 hours have passed since then, whichever happens first. A final results PR is opened before the freeze. Each PR contains the accepted pack changes, the ledger entries and the lessons. PRs opened overnight wait for the project lead's review.
+- **Notifications.** The project lead receives a push notification when:
+  - a lane crashes and automatic recovery fails;
+  - the gateway circuit breaker trips repeatedly;
+  - a results PR is opened;
+  - a lane stops because 4 rounds in a row accepted nothing.
 
 ## 9. Cost and efficiency accounting
 
@@ -644,7 +660,8 @@ A lane stops after 4 rounds in a row with no accepted change, or when its time b
 
 **Collaboration**
 
-- One Linear ticket maps to one branch and one small PR, with roughly 400 lines or less of non-test code. Generated code, such as the protobuf output, does not count toward that limit.
+- Every PR stays small: roughly 400 lines or less of non-test code. Generated code, such as the protobuf output, does not count toward that limit.
+- A ticket usually maps to one PR. A larger ticket is split into a short series of stacked PRs, and each PR in the series references the ticket. Tickets themselves are not split.
 - PRs that depend on each other are stacked.
 - The project lead reviews and merges every PR. Review feedback is fixed in new commits, never by force-pushing.
 - Changes that RSI makes on its own go only to `rsi/*` branches. They are bundled into "RSI results" PRs from time to time.
