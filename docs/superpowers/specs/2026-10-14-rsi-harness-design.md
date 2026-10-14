@@ -50,7 +50,7 @@ We hand over the frozen harness. The organizers evaluate it on a hidden held-out
 | PDF criterion | How the design meets it | Evidence |
 |---|---|---|
 | Benchmark score: starting and final scores, with improvement on every benchmark | Baseline v0 (§5.4) and final are compared on the same held-out set | T12, T17 and T23 reports |
-| Robustness: run the same test at least 3 times and report the variation; survive tool errors, timeouts and bad model output | Three held-out runs; fault tolerance in core (§5.1); per-task exception isolation (§6) | T23 report; T04 and T05 tests |
+| Robustness: run the same test at least 3 times and report the variation; survive tool errors, timeouts and bad model output | Three held-out runs; fault tolerance in core (§5.1); per-task exception isolation (§6.1); concurrency budgets and adaptive backoff (§6.2) | T23 report; T04 and T05 tests |
 | Generalization: held-out tasks stay out of development; gains on more than one benchmark; no hard-coded answers | Three-way split (§7); one lane per benchmark; hard-coding scan (§8.5) | Committed split ID lists; scan logs |
 | Lessons learned: what was tried, what worked, what failed and why, backed by experiments | Experiment ledger and lessons (§8.6) | `experiments.jsonl`, `lessons.md` |
 | Efficiency: time, tokens, compute and cost reported alongside the score | Cost and tokens recorded for every call (§9); cost guardrail (§8.3) | Report tables |
@@ -229,7 +229,7 @@ A task counts as solved when the prediction runs with no error or timeout and pa
 **LLM client**
 
 - Async, httpx-based, OpenAI-compatible.
-- Each call times out after 300 s. 429s, 5xx errors, timeouts and connection errors get up to 5 retries with exponential backoff.
+- Each call times out after 300 s. 429s, 5xx errors, timeouts and connection errors get up to 5 retries with exponential backoff. Concurrency limits and adaptive backoff follow §6.2.
 - Reads usage, including reasoning tokens, and the `x-litellm-response-cost` response header.
 - Writes one JSONL record per call, labeled with the purpose of the call.
 - Turns context overflow and similar failures into specific exception types.
@@ -299,6 +299,8 @@ A task counts as solved when the prediction runs with no error or timeout and pa
 
 ## 6. Evaluation framework (goaly.bench)
 
+### 6.1 Runner and records
+
 **Runner**
 
 - Built on asyncio, with separate resource pools for: LLM concurrency, database slots, SWE solving CPU slots and SWE evaluation workers (at most 4).
@@ -309,7 +311,86 @@ A task counts as solved when the prediction runs with no error or timeout and pa
 
 **Per-task records:** score, correctness, wall time, tokens (input, output and reasoning, counted separately), cost, steps and error type.
 
-**Metrics**
+### 6.2 Concurrency and rate limiting
+
+**Gateway capacity (measured 2026-10-14).** We stepped load up gradually, sending 2c requests at each concurrency level c. Every prompt began with a random string so the server's prefix cache could not shortcut it. Qwen requests used about 3.8K input tokens and 1,024 output tokens with thinking on. GLM requests used about 2.5K input tokens and about 1K output tokens.
+
+| Model | Concurrency | Errors | Latency p50 / p95 | Output tokens/s (all requests combined) |
+|---|---|---|---|---|
+| qwen3.6-35b-a3b | 1 | 0 | 2.3 s / 2.6 s | 444 |
+| | 16 | 0 | 3.1 s / 3.2 s | 5,198 |
+| | 32 | 0 | 3.9 s / 4.5 s | 7,022 |
+| | 64 | 0 | 6.9 s / 8.2 s | 8,599 |
+| | 128 | 1 × 502 | 13.8 s / 16.2 s | 8,555 |
+| glm-5.3 | 1 | 0 | 3.8 s / 4.4 s | 261 |
+| | 16 | 0 | 12.0 s / 15.7 s | 1,135 |
+| | 32 | 0 | 19.8 s / 26.9 s | 1,455 |
+
+What the numbers show:
+
+- We saw no 429s and no rate-limit headers, so the key has no request or token rate limit within the range we tested.
+- The real ceiling is backend capacity:
+  - Qwen output throughput levels off at about 8.5K tokens/s from concurrency 64. Above that, extra requests just wait in a queue and latency grows linearly. The first 5xx showed up at 128.
+  - GLM's total throughput is roughly one sixth of Qwen's.
+- Other teams probably share this gateway, so available capacity can drop at any moment. The limits below therefore adapt instead of assuming these numbers hold.
+
+**Concurrency budgets.** A model's budget is the total number of requests in flight across all of our processes:
+
+- Qwen: 48. That is about 75% of the point where throughput stops growing, and keeps p50 latency near 5 s.
+- GLM: 16.
+
+Config splits each budget among the processes that run at the same time. Each process enforces its share with one asyncio semaphore per model. The default split while RSI runs:
+
+| Process | Qwen | GLM |
+|---|---|---|
+| BIRD lane | 28 | 8 |
+| SWE lane | 12 | 8 |
+| Background runs (baseline held-out, confirmation reruns) | 8 | 0 |
+
+**Adaptive limiting** (in the LLM client, T03)
+
+- On a 429 or 503, wait for `Retry-After` if the response has one. Otherwise back off exponentially with full jitter: 1 s base, 60 s cap.
+- AIMD:
+  - after a burst of 429s, 503s or timeouts, the process halves its concurrency for that model;
+  - after every 20 consecutive successes, it adds 1 back;
+  - concurrency never exceeds the process's configured share.
+- Circuit breaker: if more than half of a model's calls fail within 2 minutes, the process stops starting new tasks for 60 s and logs a warning. Calls already in flight finish or time out as usual.
+- Every throttling event is logged with the call's purpose, so the report can show how much time the gateway cost us.
+
+**Throughput planning.** Qwen output tokens are the scarce resource.
+
+- A BIRD val pass is 100 tasks × 2 seeds, with about 15 calls per task and about 1.5K output tokens per call. That comes to about 4.5M output tokens, or roughly 12–16 minutes depending on what else is running.
+- Most of those tokens are spent on thinking. A policy that uses fewer tokens therefore also speeds up RSI iterations.
+- The SWE lane is limited by CPU and evaluation, not by the gateway.
+
+**Inside a process**
+
+- Each process runs one asyncio event loop.
+- Blocking work (Docker SDK calls, subprocesses, file I/O, git) goes through async APIs or `asyncio.to_thread`. Threads never share mutable state.
+- The HTTP client keeps one connection pool per model, sized to the process's share.
+
+**Other shared resources**
+
+| Resource | Limit | How it is enforced |
+|---|---|---|
+| PostgreSQL | One connection pool per process | psycopg async pool; each task gets its own sandbox database |
+| SWE solving | CPU slots | The slot scheduler (T14) pins each container to its cores with cpuset |
+| SWE evaluation | At most 4 workers | Official harness workers, each on its own cores |
+| Disk | Image budget | Images are pruned in batches (T13) |
+
+**Concurrent writes**
+
+- Each per-run JSONL file (results, trajectories, call logs) has a single writer task that reads from an asyncio queue. Lines are flushed as they are written, so a crash loses at most the line being written.
+- Cache entries are written to a temporary file and then renamed into place, so readers never see a partial entry.
+- Both lanes write `experiments.jsonl` and `lessons.md`, and the lanes run as separate processes. Every write takes an exclusive `fcntl` lock.
+- A repository-level file lock serializes git operations on the main repository, such as adding or removing worktrees and moving tags. Each candidate edits only its own worktree.
+
+**Tests**
+
+- A FakeLLM that injects 429s, latency and timeouts drives 500 simulated tasks. The tests check that no process exceeds its share, that limits back off and recover, that nothing deadlocks, and that every result is recorded exactly once.
+- Concurrency tests cover the JSONL writer, the cache and the ledger lock.
+
+### 6.3 Metrics
 
 - Main metrics: BIRD success rate and SWE harmonic-mean SR.
 - With several seeds, we report mean ± standard deviation and bootstrap 95% confidence intervals.
@@ -317,7 +398,7 @@ A task counts as solved when the prediction runs with no error or timeout and pa
 - The stably solved set is the tasks solved in every seed.
 - Results are broken down by category and by repository.
 
-**CLI**
+### 6.4 CLI
 
 - `goaly run --bench {birdcritic,swefficiency} --split {train,val,heldout} --harness <path|tag> --seeds N --out runs/<id>`
 - `--instances <official-format jsonl>` runs any task file. The organizers use this for their held-out set. It needs only the executor API and the matching environment: a database for BIRD, Docker for SWE.
@@ -475,6 +556,7 @@ A lane stops after 4 rounds in a row with no accepted change, or when its time b
 | Tight schedule (critical path ≈ 20 h) | BIRD and SWE tracks run in parallel. Stacked PRs keep review from blocking work. RSI runs overnight |
 | Upstream interfaces change during review | Settle the interfaces first, in T05 and T06. Downstream PRs rebase |
 | Malformed Qwen tool calls | Fallback parsing and fault tolerance in core (T04) |
+| The gateway gets overloaded, possibly because other teams share it | Concurrency budgets at about 75% of measured capacity; adaptive limiting and a circuit breaker (§6.2) |
 | Noisy evaluations | Paired comparisons, multiple seeds and confirmation reruns |
 | SWE images use too much disk | Pull only the images the subsets need, and prune in batches |
 
