@@ -1,0 +1,35 @@
+# Developer and CI entry points. Requires GNU make and uv.
+# Every tool runs through `uv run --locked`, so a stale uv.lock fails instead of being rewritten.
+
+UV_RUN := uv run --locked
+
+.DEFAULT_GOAL := help
+.PHONY: help setup lint format typecheck imports test test-integration check
+
+help: ## List the targets
+	@awk 'BEGIN {FS = ":.*## "} /^[a-z][a-z-]*:.*## / {printf "  %-18s %s\n", $$1, $$2}' $(MAKEFILE_LIST)
+
+setup: ## Create .venv from uv.lock
+	uv sync --locked
+
+lint: ## Check linting and formatting
+	$(UV_RUN) ruff check
+	$(UV_RUN) ruff format --check
+
+format: ## Format, then apply lint fixes
+	$(UV_RUN) ruff format
+	$(UV_RUN) ruff check --fix
+
+typecheck: ## Type-check src and tests (mypy --strict)
+	$(UV_RUN) mypy
+
+imports: ## Check the import-layer contracts
+	$(UV_RUN) lint-imports
+
+test: ## Run the unit tests
+	$(UV_RUN) pytest
+
+test-integration: ## Run only the integration tests (Docker, databases, the real model API)
+	$(UV_RUN) pytest --integration -m integration
+
+check: lint typecheck imports test ## Run everything CI runs
