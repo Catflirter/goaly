@@ -1,12 +1,20 @@
 """Tests for goaly.harness.core.settings."""
 
+import os
 import traceback
 from pathlib import Path
 
 import pytest
 from pydantic import SecretStr, ValidationError
+from pydantic_core import ErrorDetails
 
-from goaly.harness.core.settings import Settings, SettingsError, default_env_file, load_settings
+from goaly.harness.core.settings import (
+    Settings,
+    SettingsError,
+    _describe,
+    default_env_file,
+    load_settings,
+)
 
 DEFAULT_BASE_URL = "https://api.goaly.ai/inference/v1"
 
@@ -131,6 +139,41 @@ def test_a_missing_key_names_an_explicit_env_file(tmp_path: Path) -> None:
         load_settings(env_file)
 
     assert str(raised.value).endswith(f"to {env_file}.")
+
+
+def test_an_env_file_that_is_not_utf8_names_the_file_and_leaks_nothing(tmp_path: Path) -> None:
+    env_file = tmp_path / "latin1.env"
+    env_file.write_bytes(b"GOALY_API_KEY=canary-secret-XYZ\n# cl\xe9 API\n")
+
+    with pytest.raises(SettingsError) as raised:
+        load_settings(env_file)
+
+    error = raised.value
+    assert str(error) == f"Cannot read {env_file}: not valid UTF-8 at byte 36."
+    # The decoding error holds the undecoded bytes, key included, so it must not travel along.
+    assert error.__cause__ is None
+    assert error.__context__ is None
+    rendered = "".join(traceback.format_exception(error))
+    for text in (str(error), repr(error), repr(error.args), rendered):
+        assert "canary" not in text
+
+
+@pytest.mark.skipif(os.geteuid() == 0, reason="root can read a file whatever its mode")
+def test_an_unreadable_env_file_names_the_file(tmp_path: Path) -> None:
+    env_file = write_env_file(tmp_path / "locked.env", "GOALY_API_KEY=file-key")
+    env_file.chmod(0)
+
+    with pytest.raises(SettingsError) as raised:
+        load_settings(env_file)
+
+    assert str(raised.value) == f"Cannot read {env_file}: Permission denied."
+    assert raised.value.__context__ is None
+
+
+def test_describes_a_model_level_error_without_a_value(tmp_path: Path) -> None:
+    detail: ErrorDetails = {"type": "value_error", "loc": (), "msg": "keys disagree", "input": "x"}
+
+    assert _describe(detail, tmp_path / ".env") == "The settings are invalid: keys disagree."
 
 
 # Validation.
