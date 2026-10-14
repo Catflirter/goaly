@@ -30,7 +30,8 @@ imports: ## Check the import-layer contracts
 test: ## Run the unit tests with branch coverage
 	$(UV_RUN) pytest --cov
 
+# pytest exits with 5 when no test is selected: not a failure while no integration test exists.
 test-integration: ## Run only the integration tests (Docker, databases, the real model API)
-	$(UV_RUN) pytest --integration -m integration
+	$(UV_RUN) pytest --integration -m integration || test $$? -eq 5
 
 check: lint typecheck imports test ## Run everything CI runs
