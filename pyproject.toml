@@ -14,7 +14,7 @@ dependencies = [
 
 [dependency-groups]
 dev = [
-    "import-linter>=2",
+    "import-linter>=2.14", # 2.14 added --no-logo
     "mypy>=2",
     "pre-commit>=4",
     "pytest>=9",

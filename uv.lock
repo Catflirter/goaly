@@ -154,7 +154,7 @@ requires-dist = [
 
 [package.metadata.requires-dev]
 dev = [
-    { name = "import-linter", specifier = ">=2" },
+    { name = "import-linter", specifier = ">=2.14" },
     { name = "mypy", specifier = ">=2" },
     { name = "pre-commit", specifier = ">=4" },
     { name = "pytest", specifier = ">=9" },

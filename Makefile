@@ -25,7 +25,7 @@ typecheck: ## Type-check src and tests (mypy --strict)
 	$(UV_RUN) mypy
 
 imports: ## Check the import-layer contracts
-	$(UV_RUN) lint-imports
+	$(UV_RUN) lint-imports --no-logo
 
 test: ## Run the unit tests with branch coverage
 	$(UV_RUN) pytest --cov

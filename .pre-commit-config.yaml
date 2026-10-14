@@ -42,7 +42,7 @@ repos:
         always_run: true
       - id: lint-imports
         name: lint-imports
-        entry: uv run --locked lint-imports
+        entry: uv run --locked lint-imports --no-logo
         language: system
         pass_filenames: false
         always_run: true
