@@ -27,8 +27,8 @@ typecheck: ## Type-check src and tests (mypy --strict)
 imports: ## Check the import-layer contracts
 	$(UV_RUN) lint-imports
 
-test: ## Run the unit tests
-	$(UV_RUN) pytest
+test: ## Run the unit tests with branch coverage
+	$(UV_RUN) pytest --cov
 
 test-integration: ## Run only the integration tests (Docker, databases, the real model API)
 	$(UV_RUN) pytest --integration -m integration

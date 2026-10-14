@@ -151,6 +151,13 @@ def test_a_blank_key_argument_counts_as_missing() -> None:
     assert [error["type"] for error in raised.value.errors()] == ["missing"]
 
 
+def test_a_key_that_is_not_a_string_is_rejected() -> None:
+    with pytest.raises(ValidationError) as raised:
+        Settings(api_key=12345)  # type: ignore[arg-type]  # The wrong type is the point.
+
+    assert [error["type"] for error in raised.value.errors()] == ["string_type"]
+
+
 def test_a_blank_key_in_the_env_file_counts_as_missing() -> None:
     write_env_file(default_env_file(), 'GOALY_API_KEY="   "')
 
