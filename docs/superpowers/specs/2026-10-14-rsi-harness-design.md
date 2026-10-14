@@ -339,13 +339,15 @@ What the numbers show:
 - Qwen: 48. That is about 75% of the point where throughput stops growing, and keeps p50 latency near 5 s.
 - GLM: 16.
 
-Config splits each budget among the processes that run at the same time. Each process enforces its share with one asyncio semaphore per model. The default split while RSI runs:
+Config divides each budget among the processes that run at the same time, and the division changes by phase. Each process enforces its share with one asyncio semaphore per model.
 
-| Process | Qwen | GLM |
-|---|---|---|
-| BIRD lane | 28 | 8 |
-| SWE lane | 12 | 8 |
-| Background runs (baseline held-out, confirmation reruns) | 8 | 0 |
+| Phase | Qwen (48 total) | GLM (16 total) | Notes |
+|---|---|---|---|
+| Baseline (T12, T17) | BIRD 36, SWE 12 | unused | Run train and val first, then v0's three held-out runs |
+| RSI (T22) | BIRD lane 28, SWE lane 12, background 8 | BIRD lane 8, SWE lane 8 | Background covers confirmation reruns and any v0 held-out runs still pending |
+| Final evaluation (T23) | BIRD 40, SWE 8 | unused | GLM is no longer available |
+
+An agent never has more than one LLM request in flight, so a process runs about as many tasks at once as its Qwen share. Each share is an upper limit: adaptive limiting (below) lowers it when the gateway is busy. Shares are config values, so changing them does not require a code change.
 
 **Adaptive limiting** (in the LLM client, T03)
 
@@ -361,7 +363,9 @@ Config splits each budget among the processes that run at the same time. Each pr
 
 - A BIRD val pass is 100 tasks × 2 seeds, with about 15 calls per task and about 1.5K output tokens per call. That comes to about 4.5M output tokens, or roughly 12–16 minutes depending on what else is running.
 - Most of those tokens are spent on thinking. A policy that uses fewer tokens therefore also speeds up RSI iterations.
-- The SWE lane is limited by CPU and evaluation, not by the gateway.
+- A BIRD RSI round takes about 45–60 minutes: 3 candidates, screening, validation and one confirmation rerun. That gives the BIRD lane about 8–10 rounds overnight.
+- The SWE lane is limited by CPU and evaluation, not by the gateway. An SWE round takes about 2.5 hours. Solving runs on 8 slots and is capped at 45 minutes per task; evaluation runs on 4 workers. That allows 3–4 rounds overnight. Config can fit in more rounds by using one candidate per round or by capping solving at 30 minutes.
+- The SWE figures are estimates. T14 and T15 measure actual solving and evaluation times, and these numbers will be updated from those measurements.
 
 **Inside a process**
 
@@ -369,13 +373,23 @@ Config splits each budget among the processes that run at the same time. Each pr
 - Blocking work (Docker SDK calls, subprocesses, file I/O, git) goes through async APIs or `asyncio.to_thread`. Threads never share mutable state.
 - The HTTP client keeps one connection pool per model, sized to the process's share.
 
+**CPU partition.** The machine has 12 physical cores (24 hardware threads).
+
+| Physical cores | Used for |
+|---|---|
+| 0–1 | OS, dockerd and our Python processes |
+| 2–3 | PostgreSQL for BIRD |
+| 4–11 (8 cores) | SWE only. Each wave uses one of two modes: solving (8 slots, 1 core each) or official evaluation (4 workers, 2 cores each) |
+
+SWE solving and SWE evaluation never run at the same time. Solving agents run tests and workloads that keep their cores fully busy. If official timing ran next to them, the measured speedups would be distorted, and so would every accept/reject decision based on them. The SWE lane therefore works in waves: it solves a batch, then evaluates that batch. BIRD is not affected: its database has its own cores, and its bottleneck is LLM throughput.
+
 **Other shared resources**
 
 | Resource | Limit | How it is enforced |
 |---|---|---|
-| PostgreSQL | One connection pool per process | psycopg async pool; each task gets its own sandbox database |
-| SWE solving | CPU slots | The slot scheduler (T14) pins each container to its cores with cpuset |
-| SWE evaluation | At most 4 workers | Official harness workers, each on its own cores |
+| PostgreSQL connections | `max_connections` 200. Pools: 32 for the BIRD lane, 12 for background runs, 12 for the grader | psycopg async pools; each task gets its own sandbox database |
+| Template clones | One clone at a time per template database | PostgreSQL refuses to clone a template while it has other connections. The databases are small, so serializing clones costs little |
+| SWE solving and evaluation | 8 solving slots or 4 evaluation workers, never both at once | The slot scheduler (T14) pins containers with cpuset and switches mode between waves |
 | Disk | Image budget | Images are pruned in batches (T13) |
 
 **Concurrent writes**
