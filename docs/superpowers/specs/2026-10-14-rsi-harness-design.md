@@ -18,7 +18,7 @@ We hand over the frozen harness. The organizers evaluate it on a hidden held-out
 
 ### 1.2 Deliverables
 
-1. **The frozen harness**: code, configs, prompts, skills and pinned dependencies. A single command runs it on tasks in the official formats.
+1. **The frozen harness**: code, configs, prompts, skills and pinned dependencies. The organizers run it with the `goaly run` CLI. They pass in a task file in the benchmark's official format and get predictions back in the official format (§6.4).
 2. **The RSI system**: code, an experiment ledger and lessons. It runs several improvement rounds on its own.
 3. **A report** that covers:
    - baseline and final scores;
@@ -51,9 +51,9 @@ We hand over the frozen harness. The organizers evaluate it on a hidden held-out
 |---|---|---|
 | Benchmark score: starting and final scores, with improvement on every benchmark | Baseline v0 (§5.4) and final are compared on the same held-out set | T12, T17 and T23 reports |
 | Robustness: run the same test at least 3 times and report the variation; survive tool errors, timeouts and bad model output | Three held-out runs; fault tolerance in core (§5.1); per-task exception isolation (§6.1); concurrency budgets and adaptive backoff (§6.2) | T23 report; T04 and T05 tests |
-| Generalization: held-out tasks stay out of development; gains on more than one benchmark; no hard-coded answers | Three-way split (§7); one lane per benchmark; hard-coding scan (§8.5) | Committed split ID lists; scan logs |
+| Generalization: held-out tasks stay out of development; gains on more than one benchmark; no hard-coded answers | Three-way split (§7) and a hard-coding scan (§8.5). Each benchmark gets its own lane, and both lanes run the same RSI machinery with no benchmark-specific code, so a gain on two very different tasks shows that the method generalizes | Committed split ID lists; scan logs; per-benchmark gains in the T23 report |
 | Lessons learned: what was tried, what worked, what failed and why, backed by experiments | Experiment ledger and lessons (§8.6) | `experiments.jsonl`, `lessons.md` |
-| Efficiency: time, tokens, compute and cost reported alongside the score | Cost and tokens recorded for every call (§9); cost guardrail (§8.3) | Report tables |
+| Efficiency: time, tokens, compute and cost reported alongside the score | Cost and tokens are recorded for every call (§9). Two limits in the decision rules (§8.3): a cost guardrail, and a hard cap that keeps the final harness at or below 3× v0's mean cost and wall time per task | Report tables, including the final harness's cost and time relative to v0 |
 | Reproducibility: code, configs, prompts, tool versions and a single command | uv lockfile, run manifests, `make final` (§10) | T23, T24 |
 | Automation: several improvement rounds with little human help | `goaly rsi run` (§8) | Ledger entries across rounds |
 | Regression check: keep the best harness; new changes must not break tasks that already pass | Best-version tags and a regression rule (§8.3) | Decision log |
@@ -63,60 +63,97 @@ We hand over the frozen harness. The organizers evaluate it on a hidden held-out
 ### 3.1 Layers
 
 ```
-goaly.rsi       development only; uses GLM-5.3
+goaly.cli         composition root; the only module allowed to import every layer
+   │
+goaly.rsi         development only; uses GLM-5.3
    │ depends on
-goaly.bench     data, environments, grading, runner, metrics
+goaly.bench       data, environment implementations, grading, runner, metrics
    │ depends on
-goaly.harness   the deliverable; uses only Qwen at runtime
-   ├─ core/     infrastructure (RSI cannot edit it)
-   └─ packs/    one capability pack per benchmark (the only part RSI can edit)
+goaly.harness     uses only Qwen at runtime
+   ├─ core/       infrastructure (RSI cannot edit it)
+   └─ packs/      one capability pack per benchmark (the only part RSI can edit)
+   │ depends on
+goaly.contracts   shared data contracts (protobuf) and interfaces (Python Protocols); imports nothing else from goaly
 ```
 
-import-linter enforces these dependencies in CI. `harness` must not import `bench` or `rsi`. `bench` must not import `rsi`.
+import-linter checks these rules in CI:
+
+- `contracts` imports nothing else from `goaly`.
+- `harness` may import only `contracts`.
+- `bench` may import `contracts` and `harness`.
+- `rsi` may import `contracts`, `harness` and `bench`.
+- `goaly.cli` may import every layer. Its `goaly rsi …` subcommands import `rsi` lazily, so `goaly run` never loads it.
+
+**What ships.** The organizers receive `contracts`, `harness`, `bench` and the CLI. `rsi` is only for development, and nothing on the evaluation path imports it.
 
 ### 3.2 Repository layout
 
 ```
+proto/goaly/v1/      shared data contracts: task.proto, trajectory.proto, result.proto,
+                     manifest.proto, llm_call.proto, experiment.proto
 src/goaly/
+  contracts/
+    gen/             Python code generated from proto/ (committed; CI checks it is up to date)
+    interfaces.py    Environment, SqlEnvironment, ShellEnvironment, Policy, Tool, Benchmark
   harness/
     core/            llm.py, tools.py, agent.py, policy.py, context.py, trajectory.py, config.py
     packs/
       birdcritic/    prompt.md, skills/, tools.py, policy.py, config.yaml
       swefficiency/  (same files)
-    cli.py
   bench/
-    base.py          Benchmark / Environment protocols
     birdcritic/      data.py, env.py, grader.py, adapter.py
     swefficiency/    data.py, env.py, grader.py, adapter.py
     runner.py, metrics.py, manifest.py
     splits/          split ID lists
   rsi/
-    ledger.py, workspace.py, guards.py, analyst.py, implementer.py, decide.py, lane.py, cli.py
+    ledger.py, workspace.py, guards.py, analyst.py, implementer.py, decide.py, lane.py
+  cli.py             `goaly run …` and `goaly rsi …`
 tests/               mirrors src/; tests that need Docker, a database or the real API are marked `integration`
-docs/superpowers/{specs,plans}/   design and implementation plans
+docs/superpowers/specs/           design docs (the Linear tickets serve as the implementation plan)
 docs/results/                     experiment results
 runs/                             run artifacts (not committed)
 ```
 
-### 3.3 Key interfaces
+### 3.3 Shared contracts
 
-This is a draft. The implementation PRs define the final signatures.
+Every shared type lives in `goaly.contracts`. These types come in two kinds, and each kind uses a different technology.
+
+**Data contracts (protobuf).** Data that is written to disk, read by another process, or has to stay readable across schema versions is defined once, in `proto/goaly/v1/`:
+
+| Message | Purpose |
+|---|---|
+| `TaskInput`, `Prediction`, `Grade` | What a policy receives, what it returns, and how the result was graded. Each has one variant per benchmark |
+| `Trajectory`, `Step` | Every step of a run: messages, tool calls, results, usage and timing |
+| `TaskResult` | Per-task record: score, correctness, time, tokens, cost, steps and error type |
+| `RunManifest` | Commit, content and config hashes, dataset revision, model settings, timestamps and machine |
+| `LlmCallRecord` | One LLM call: purpose, model, tokens, cost, latency and status |
+| `ExperimentRecord`, `Hypothesis`, `Lesson` | The RSI ledger |
+
+- Field numbers are never reused, and removed fields are marked `reserved`, so files written today stay readable after the schema changes.
+- On disk, messages are stored as JSONL using protobuf's standard JSON mapping, keeping the original field names. People and the GLM analyst read trajectories directly, so a readable text format matters more than a compact binary one.
+- The official submission formats (BIRD `pred_sqls`, SWE predictions) are not our contracts. Each adapter converts to them and keeps the official field names exactly.
+- Toolchain:
+  - `grpcio-tools` bundles protoc, so no system package is needed.
+  - `mypy-protobuf` generates type stubs, so the generated code passes `mypy --strict`.
+  - `make proto` regenerates the code, and CI fails if the committed code is out of date.
+
+**Behavioral interfaces (Python Protocols).** These are async method contracts for calls within a process. The signatures below are a draft; the contracts PR (T02a) fixes the final ones.
 
 ```python
 class Environment(Protocol):
-    """Runtime environment for one task, such as a database sandbox or a container."""
+    """The runtime environment for one task."""
     async def close(self) -> None: ...
 
-class Benchmark(Protocol):
-    name: str
-    def load_instances(self, split: Split) -> Sequence[Instance]: ...
-    def provision(self, inst: Instance) -> AbstractAsyncContextManager[Environment]: ...
-    def agent_input(self, inst: Instance) -> TaskInput: ...
-    async def grade(self, inst: Instance, prediction: Prediction) -> Grade: ...
-    def to_official(self, inst: Instance, prediction: Prediction) -> dict[str, Any]: ...
+class SqlEnvironment(Environment, Protocol):
+    async def execute(self, sql: str, *, timeout_s: float) -> SqlResult: ...
+
+class ShellEnvironment(Environment, Protocol):
+    async def exec(self, command: str, *, timeout_s: float) -> ShellResult: ...
+    async def read_file(self, path: str) -> str: ...
+    async def write_file(self, path: str, content: str) -> None: ...
 
 class Policy(Protocol):
-    """Implemented by a capability pack; drives the solution of one task."""
+    """Implemented by a capability pack; solves one task."""
     async def solve(self, task: TaskInput, env: Environment, ctx: AgentContext) -> Prediction: ...
 
 class Tool(Protocol):
@@ -124,7 +161,20 @@ class Tool(Protocol):
     description: str
     args_model: type[BaseModel]
     async def run(self, args: BaseModel, env: Environment) -> ToolResult: ...
+
+class Benchmark(Protocol[InstanceT]):
+    name: str
+    def load_instances(self, split: Split) -> Sequence[InstanceT]: ...
+    def provision(self, inst: InstanceT) -> AbstractAsyncContextManager[Environment]: ...
+    def agent_input(self, inst: InstanceT) -> TaskInput: ...  # only what the agent may see
+    async def grade(self, inst: InstanceT, prediction: Prediction) -> Grade: ...
+    def to_official(self, inst: InstanceT, prediction: Prediction) -> dict[str, Any]: ...
 ```
+
+- **Instances versus agent input.** `InstanceT` is the benchmark's own record and may hold gold answers. `agent_input` copies out only the fields the agent is allowed to see, so the type system itself keeps gold answers away from the agent.
+- **harness never cares where an environment comes from.** bench provides the implementations: `SqlEnvironment` as a PostgreSQL sandbox, `ShellEnvironment` as a Docker container. harness unit tests use fake environments and need neither a database nor a container.
+- **Tool arguments stay as pydantic models.** The OpenAI tools API takes JSON Schema, which pydantic generates directly. GLM also edits tools during RSI, and with protobuf every edit would mean changing a `.proto` file and rerunning code generation.
+- **gRPC-ready, but no gRPC yet.** Interface methods take and return only contract types (protobuf messages or plain values), never framework objects. That way a gRPC-backed implementation can later replace an in-process one without changing any caller. One example is running SWE evaluation workers on other machines, which would lift the CPU ceiling described in §6.2. We are not building gRPC now.
 
 Adding a benchmark takes a `Benchmark` adapter and a capability pack. core does not change.
 
@@ -171,6 +221,7 @@ A task counts as solved when the prediction runs with no error or timeout and pa
 - Two checks show that we match the official harness:
   - In gold mode, the gold answers should pass every task. Tasks with known-bad official answers are listed separately.
   - On a sample of tasks, results are compared one by one against the official harness.
+- **Excluded tasks.** A task whose gold answer fails in gold mode is removed from our splits, and the list of removed tasks is committed along with the reason for each. Such a task cannot be scored, so keeping it would only add noise to development and to accept/reject decisions. This applies only to our development sets: the harness still handles any such task that appears in the organizers' held-out set.
 
 **Reference scores (PG-530):** ~30B open models 28–32%; Claude Opus 4.6 43.4%; leaderboard best 56.8%; humans 78.9%.
 
@@ -178,7 +229,9 @@ A task counts as solved when the prediction runs with no error or timeout and pa
 
 **Data**
 
-- We use `swefficiency/swefficiency`: 498 tasks from 9 repositories, pinned to one HF revision (the dataset was revised on 2026-03-30).
+- The main dataset is `swefficiency/swefficiency`: 498 tasks from 9 repositories. It was revised on 2026-03-30, and we pin that revision by commit hash.
+- The Lite set (`swefficiency/swefficiency_lite`, 100 tasks) was last updated on 2025-11-21, before that revision. We use it only to pick task IDs. Every task's data (workload, tests, `test_cmd`, `rebuild_cmd`, image name) comes from the revised main dataset, which the organizers most likely use as well.
+- Lite's image names point to `ghcr.io/swefficiency-anon/…`, which now refuses access. The images are available under the same tags at `ghcr.io/swefficiency/swefficiency-images`. T13 checks whether the revised main dataset already uses the new location; if it doesn't, the loader rewrites the registry prefix and records the rewrite in the run manifest.
 - The agent never sees `patch`, `problem_statement` or `hints_text`.
 
 **Task**
@@ -213,6 +266,8 @@ A task counts as solved when the prediction runs with no error or timeout and pa
 - Gold is rerun on this machine to get T_post_gold for our hardware.
 - Empty patches are scored without running an evaluation.
 - Results are cached by (patch hash, task). T_pre and gold timings are cached too.
+- **Excluded tasks.** A task is removed and replaced with another task from the same repository if, on this machine, its gold patch fails its tests or speeds the workload up by less than 1.5×. Expert speedups depend on hardware, and on such tasks no change can show a reliable gain. The removed tasks and the reason for each are committed. As with BIRD, this affects only our development sets.
+- **Open question: what the official evaluation runs.** Some tasks list a huge number of PASS_TO_PASS tests: one Lite pandas task has about 211K, alongside about 900 `covering_tests`. Whether evaluation runs every PASS_TO_PASS test or only `covering_tests` decides whether one task takes minutes or hours. T15 measures this first. Tasks that take more than 25 minutes to evaluate are swapped out (§7).
 
 **Resource constraint:** evaluation is the project's biggest bottleneck. Solving and evaluation run on separate CPU slots so one does not distort the other's timings.
 
@@ -262,7 +317,7 @@ A task counts as solved when the prediction runs with no error or timeout and pa
 - When a budget runs out, the policy's fallback submits a result.
 - No exception can take down a batch.
 
-**Trajectories** are versioned JSONL (`schema_version`). Each step records messages, tool calls and their results, token usage and latency. The trajectory ends with the final prediction and its grade.
+**Trajectories** use the `Trajectory` and `Step` contracts (§3.3) and are written as JSONL. Each step records messages, tool calls and their results, token usage and latency. The trajectory ends with the final prediction and its grade.
 
 ### 5.2 Capability packs (the only part RSI can edit)
 
@@ -273,6 +328,13 @@ A task counts as solved when the prediction runs with no error or timeout and pa
 | `tools.py` | Tools for this benchmark, built on core's Tool protocol |
 | `policy.py` | How a task is solved: phases, self-checks, when to add guidance, best-of-n, fallback submission |
 | `config.yaml` | Sampling parameters, thinking on/off, budgets, context thresholds |
+
+**How skills reach the model** is up to the pack's policy, and core supports two options:
+
+- put the skills straight into the system prompt;
+- list them in an index that the model reads on demand through a `read_skill` tool.
+
+The first option costs more tokens, although the gateway's prefix cache absorbs much of that. The second relies on the model remembering to read. Which works better is something RSI can test. v0 ships no skills.
 
 ### 5.3 Principles from prior work
 
@@ -307,9 +369,15 @@ A task counts as solved when the prediction runs with no error or timeout and pa
 - An exception in one task never affects the others. Each task's result is written to disk as soon as it's done, so an interrupted run can resume.
 - Evaluations are cached by (harness content hash, task, seed).
 
-**Run manifest:** git commit, harness content hash, config hash, dataset revision, model names and sampling parameters, start and end times, machine info.
+**Seeds and reproducibility.** In this document a *seed* means one independent replicate run, not a sampler seed.
 
-**Per-task records:** score, correctness, wall time, tokens (input, output and reasoning, counted separately), cost, steps and error type.
+- The gateway accepts a `seed` parameter but ignores it. A test on 2026-10-14 sent the same seed three times at T=0.6 and got three different outputs. Runs with T>0 therefore cannot be reproduced token for token.
+- Greedy decoding (T=0) is deterministic on this gateway. However, Qwen's model card advises against greedy decoding in thinking mode because it causes repetition, so we keep sampling at T=0.6. T is a config value that RSI may tune.
+- Reproducible here means statistically reproducible: the same code, config and data give consistent scores. Every reported score is the mean ± standard deviation over at least 3 replicates.
+
+**Run manifest** (`RunManifest` contract): git commit, harness content hash, config hash, dataset revision, model names and sampling parameters, start and end times, machine info.
+
+**Per-task records** (`TaskResult` contract): score, correctness, wall time, tokens (input, output and reasoning, counted separately), cost, steps and error type.
 
 ### 6.2 Concurrency and rate limiting
 
@@ -415,14 +483,20 @@ SWE solving and SWE evaluation never run at the same time. Solving agents run te
 ### 6.4 CLI
 
 - `goaly run --bench {birdcritic,swefficiency} --split {train,val,heldout} --harness <path|tag> --seeds N --out runs/<id>`
-- `--instances <official-format jsonl>` runs any task file. The organizers use this for their held-out set. It needs only the executor API and the matching environment: a database for BIRD, Docker for SWE.
+- `--instances <official-format jsonl>` runs any task file. The organizers use this for their held-out set, and the README documents it as the official entry point:
+
+  ```
+  goaly run --bench birdcritic --instances heldout.jsonl --harness final --out predictions.jsonl
+  ```
+
+  This needs only the executor API and the matching environment: a database for BIRD, Docker for SWE.
 
 ## 7. Data splits
 
 | | train | val | held-out |
 |---|---|---|---|
 | BIRD (PG-530, stratified by category) | 150 | 100 | 280 |
-| SWE (drawn from the 100-task Lite set, stratified by repository) | 12 | 12 | 12 |
+| SWE (IDs from the 100-task Lite set, stratified by repository; task data from the revised main dataset) | 12 | 12 | 12 |
 
 - The random seed is fixed at `20261014`. The split ID lists are committed to `src/goaly/bench/splits/`.
 - Each split has one job:
@@ -430,6 +504,7 @@ SWE solving and SWE evaluation never run at the same time. Solving agents run te
   - **val:** results go only to the decision step; the analyst never sees them.
   - **held-out:** no modified version runs on it during development. The one exception is v0, whose held-out results are the baseline for the final comparison.
 - If an SWE task takes more than 25 minutes to evaluate, it is swapped for another task from the same repository, and the swap is recorded.
+- Exclusions (§4.1, §4.2) are applied after splitting, which keeps the split itself reproducible. An excluded BIRD task is simply dropped from its split, so that split ends up slightly smaller. An excluded SWE task is replaced with another task from the same repository, so every SWE split keeps 12 tasks.
 
 ## 8. RSI system (goaly.rsi)
 
@@ -446,12 +521,14 @@ SWE solving and SWE evaluation never run at the same time. Solving agents run te
      - a summary of the ledger, rejected attempts included;
      - the current best's per-task results on train;
      - summaries of failed trajectories, with grader feedback and gold answers;
-     - an explanation of the benchmark's scoring rules.
+     - an explanation of the benchmark's scoring rules;
+     - an idea bank of techniques that prior work found effective, for reference. Examples: profiling before optimizing, keeping the fastest verified patch, execution-based self-consistency for SQL, inspecting the schema first. GLM decides whether and how to use any of them.
    - Output: structured JSON that groups failures by pattern and proposes 3 hypotheses. Each hypothesis states:
      - which failure pattern it targets;
      - the kind of change: prompt, skill, tool, policy, config or removal;
      - exactly what to change;
-     - the expected effect and the risk.
+     - the expected effect and the risk;
+     - where the idea came from: the idea bank, or GLM's own analysis.
 2. **Implement** (GLM coding agent, purpose `rsi-impl`)
    - The top k hypotheses (k=3 for BIRD, k=2 for SWE) are built in parallel, each in its own git worktree.
    - The agent may:
@@ -488,6 +565,13 @@ SWE solving and SWE evaluation never run at the same time. Solving agents run te
 - Regression: at most 1 task that has a real speedup under the best (SR > 1/gold) and drops to SR ≤ 1/gold under the candidate.
 - Cost guardrail: same as BIRD.
 
+**Both lanes: efficiency cap.** A candidate is rejected outright, whatever its gain, if on the same split its mean cost or mean wall time per task is more than 3× that of baseline v0. Without this cap, many small accepted changes could add up to a large cost increase; the cap keeps gains from depending on unlimited extra compute. The report states the cap and where the final harness stands against it.
+
+**Why these thresholds.** A higher bar accepts fewer changes, but the ones it accepts are more trustworthy. A lower bar accepts more changes, but more of them are noise mistaken for gains.
+
+- BIRD: with 100 val tasks and 2 seeds, 3pp is roughly the smallest gain that clears noise.
+- SWE: with only 12 tasks the noise is larger, so SWE requires a larger relative gain.
+
 All thresholds are set in config, and every decision records the thresholds it used.
 
 ### 8.4 Stopping
@@ -507,7 +591,7 @@ A lane stops after 4 rounds in a row with no accepted change, or when its time b
 
 ### 8.6 Ledger and lessons
 
-- `experiments.jsonl`: each record holds the experiment ID, lane, parent version, hypothesis, kind of change, diff stats, screening and validation metrics, decision and reasoning, and cost.
+- `experiments.jsonl` (`ExperimentRecord` contract): each record holds the experiment ID, lane, parent version, hypothesis and where it came from (idea bank or GLM's own analysis), kind of change, diff stats, screening and validation metrics, decision and reasoning, and cost. The report states how many accepted changes came from each source.
 - `lessons.md`: entries are added one at a time (as in ACE), and each counts how often it helped or hurt. GLM maintains the file and can delete entries. It is never rewritten in one go, so nothing is lost by accident.
 
 ## 9. Cost and efficiency accounting
@@ -517,6 +601,7 @@ A lane stops after 4 rounds in a row with no accepted change, or when its time b
   - what the final harness costs, in money and time, to run on the held-out set;
   - what the RSI experiments cost in total, by lane and by purpose.
 - On the machine side, we record wall time per task and the CPU time used by SWE evaluation.
+- The report compares the final harness's mean cost and wall time per task with v0's, against the 3× efficiency cap (§8.3).
 
 ## 10. Final evaluation and reproducibility
 
@@ -537,6 +622,8 @@ A lane stops after 4 rounds in a row with no accepted change, or when its time b
   3. grades the results;
   4. generates the report.
 
+  The report reads v0's held-out results from the runs archived during the baseline phase. A separate `make baseline` reruns v0 for anyone who wants to reproduce it too. We keep the two commands apart because rerunning v0 as part of `make final` would double the time; SWE evaluation alone would add several hours.
+
   Dependencies are pinned in `uv.lock`, and the manifests record every version.
 
 ## 11. Engineering standards and workflow
@@ -544,6 +631,7 @@ A lane stops after 4 rounds in a row with no accepted change, or when its time b
 **Stack and tests**
 
 - Python 3.12 + uv, ruff, mypy --strict, import-linter, pre-commit and GitHub Actions.
+- Protobuf for the shared data contracts (§3.3): `grpcio-tools` and `mypy-protobuf`, regenerated with `make proto`. CI fails if the generated code is out of date.
 - pytest, written test-first. Unit tests never touch the network. Tests that need Docker, a database or the real API are marked `integration` and are skipped in CI.
 
 **Config and logging**
@@ -552,11 +640,11 @@ A lane stops after 4 rounds in a row with no accepted change, or when its time b
 - Secrets are read only from environment variables or `~/.config/goaly/.env`.
 - Logs are structured JSON.
 
-**Language:** everything in the repository is written in English, including code, comments, design docs, plans, the README and reports.
+**Language:** everything in the repository is written in English, including code, comments, design docs, the README and reports.
 
 **Collaboration**
 
-- One Linear ticket maps to one branch and one small PR, with roughly 400 lines or less of non-test code.
+- One Linear ticket maps to one branch and one small PR, with roughly 400 lines or less of non-test code. Generated code, such as the protobuf output, does not count toward that limit.
 - PRs that depend on each other are stacked.
 - The project lead reviews and merges every PR. Review feedback is fixed in new commits, never by force-pushing.
 - Changes that RSI makes on its own go only to `rsi/*` branches. They are bundled into "RSI results" PRs from time to time.
@@ -579,7 +667,8 @@ A lane stops after 4 rounds in a row with no accepted change, or when its time b
 | Hours from start | Work |
 |---|---|
 | 0–1 | T01, T02 |
-| 1–3 | T03, T04, T08, T09, T13 and T14 in parallel; images and database dumps download in the background |
+| 1–1.5 | T02a (shared contracts) |
+| 1.5–3 | T03, T04, T08, T09, T13 and T14 in parallel; images and database dumps download in the background |
 | 3–5 | T05, T06, T10, T15 |
 | 5–7 | T07, T11, T16, T18; baseline experiments start (T12, T17) |
 | 7–9 | T19, T20, T21 |
@@ -588,4 +677,4 @@ A lane stops after 4 rounds in a row with no accepted change, or when its time b
 
 ## Appendix A: Ticket mapping
 
-T01–T24 correspond, in order, to CIR-1633 through CIR-1656, so T_n = CIR-(1632+n). The dependencies here match the blocked-by relations in Linear.
+T01–T24 correspond, in order, to CIR-1633 through CIR-1656, so T_n = CIR-(1632+n). T02a (shared contracts) was added during spec review and is tracked separately in Linear. The dependencies here match the blocked-by relations in Linear.
