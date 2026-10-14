@@ -1,5 +1,5 @@
 [build-system]
-requires = ["hatchling>=1"]
+requires = ["hatchling==1.32.4"] # Exact: uv.lock does not cover the build backend.
 build-backend = "hatchling.build"
 
 [project]
@@ -21,6 +21,10 @@ dev = [
     "pytest-cov>=7",
     "ruff>=0.17", # ruff is pre-1.0: its minor releases are its breaking releases
 ]
+
+[tool.uv]
+# Cooldown: lock nothing released in the 3 days before locking; move the date deliberately.
+exclude-newer = "2026-10-11T00:00:00Z"
 
 [tool.hatch.build.targets.wheel]
 packages = ["src/goaly"]
