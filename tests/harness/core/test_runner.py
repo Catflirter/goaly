@@ -58,6 +58,7 @@ from goaly.harness.core.runner import (
     TaskContext,
     classify_error,
     error_classifier,
+    lock_run_dir,
 )
 from tests.fakes import FakeSqlEnvironment, ToyInstance
 from tests.harness.core.runner_doubles import (
@@ -1135,6 +1136,30 @@ async def test_a_run_directory_in_use_is_refused(tmp_path: Path) -> None:
             await run(make_runner(ScriptedBenchmark(toy_instances(1))), tmp_path)
 
     assert not files.manifest.exists()
+
+
+async def test_a_run_can_hold_the_lock_its_caller_took(tmp_path: Path) -> None:
+    with lock_run_dir(RunFiles(tmp_path)) as lock:
+        async with asyncio.timeout(GUARD_S):
+            summary = await make_runner(ScriptedBenchmark(toy_instances(2))).run(
+                tmp_path, template(), split=SPLIT_TRAIN, seeds=[0], lock=lock
+            )
+        # The caller's lock is the caller's to release: the run left it held.
+        with pytest.raises(RunDirectoryError, match="another process"):
+            lock_run_dir(RunFiles(tmp_path))
+
+    assert summary.ran == 2
+    lock_run_dir(RunFiles(tmp_path)).release()  # Released with the caller's block.
+
+
+async def test_a_lock_on_another_directory_is_refused(tmp_path: Path) -> None:
+    with (
+        lock_run_dir(RunFiles(tmp_path / "other")) as lock,
+        pytest.raises(ValueError, match="lock"),
+    ):
+        await make_runner(ScriptedBenchmark(toy_instances(1))).run(
+            tmp_path / "run", template(), split=SPLIT_TRAIN, seeds=[0], lock=lock
+        )
 
 
 # Arguments the runner refuses.

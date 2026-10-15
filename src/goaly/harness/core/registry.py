@@ -25,6 +25,7 @@ from goaly.harness.core.runner import (
     ContextFactory,
     ErrorClassifier,
     RunFiles,
+    RunLock,
     Runner,
     RunSummary,
     TaskContext,
@@ -84,6 +85,7 @@ class RunsTasks(Protocol):
         seeds: Sequence[int],
         instance_ids: Collection[str] | None = None,
         resume: bool = False,
+        lock: RunLock | None = None,
     ) -> RunSummary:
         """Run the tasks and record them, as Runner.run does."""
 
@@ -107,6 +109,10 @@ class RunnableHarness(Protocol):
     def dataset(self) -> Dataset:
         """Where the benchmark's tasks came from."""
 
+    @property
+    def cache_namespace(self) -> str:
+        """The grading identity its runs' evaluation cache is kept under; empty for none."""
+
     def runner(
         self, *, cache: EvalCache | None, max_tasks: int, task_timeout_s: float | None
     ) -> RunsTasks:
@@ -126,6 +132,9 @@ class Harness[InstanceT: Instance, EnvT: Environment, CtxT: TaskContext]:
     # The settings of every model the pack calls, for the manifest.
     models: tuple[ModelSettings, ...] = ()
     dataset: Dataset = Dataset()
+    # The grading identity of its runs, which keys its evaluation cache (EvalCache's namespace),
+    # such as f"{mode}-{bench_fingerprint}"; empty if it cannot use a cache.
+    cache_namespace: str = ""
 
     @property
     def benchmark_name(self) -> str:

@@ -18,7 +18,7 @@ from goaly.contracts.jsonl import read_jsonl
 from goaly.harness.core import cli
 from goaly.harness.core.manifest import CORE_DIR, git_state, harness_hash, read_manifest
 from goaly.harness.core.registry import Dataset, Harness, HarnessOptions, Registry
-from goaly.harness.core.runner import RunFiles
+from goaly.harness.core.runner import RunFiles, lock_run_dir
 from tests.fakes import FakeSqlEnvironment, ToyInstance
 from tests.harness.core.runner_doubles import (
     ScriptedBenchmark,
@@ -53,6 +53,7 @@ class ToyFactory:
     policy: ScriptedPolicy = field(default_factory=ScriptedPolicy)
     pack_dir: Path | None = None
     name: str = "toy"
+    cache_namespace: str = "toy-dev"
     options: list[HarnessOptions] = field(default_factory=list)
     benchmarks: list[ScriptedBenchmark] = field(default_factory=list)
     closed: bool = False
@@ -79,6 +80,7 @@ class ToyFactory:
                 pack_dir=self.pack_dir,
                 models=(ModelSettings(model="qwen3.6-35b-a3b", temperature=0.6, thinking=True),),
                 dataset=Dataset(revision="rev-1", notes=("toy data",), gold_sha256="g" * 64),
+                cache_namespace=self.cache_namespace,
             )
         finally:
             self.closed = True
@@ -403,6 +405,60 @@ def test_the_cache_makes_a_second_run_free(
     assert (second.summary["cached"], second.summary["ran"]) == (3, 0)
     hashes = {read_manifest(RunFiles(tmp_path / name).manifest).config_hash for name in ("a", "b")}
     assert len(hashes) == 1  # The output and cache directories are not settings of the run.
+
+
+def test_a_harness_without_a_grading_namespace_cannot_use_the_cache(
+    capsys: pytest.CaptureFixture[str], budgets: Path, tmp_path: Path
+) -> None:
+    registry = Registry()
+    registry.add("toy", "v0", ToyFactory(cache_namespace=""))
+
+    outcome = goaly(
+        capsys,
+        registry,
+        budgets,
+        "--bench",
+        "toy",
+        "--split",
+        "train",
+        "--phase",
+        "test",
+        "--out",
+        str(tmp_path / "r"),
+        "--cache",
+        str(tmp_path / "cache"),
+    )
+
+    assert outcome.status == cli.USAGE
+    assert "names no grading namespace" in outcome.stderr
+
+
+def test_a_run_directory_another_process_uses_is_refused_before_the_harness_opens(
+    capsys: pytest.CaptureFixture[str],
+    registry: Registry,
+    budgets: Path,
+    factory: ToyFactory,
+    tmp_path: Path,
+) -> None:
+    out = tmp_path / "run"
+    with lock_run_dir(RunFiles(out)):  # Another process's run, as far as the lock goes.
+        outcome = goaly(
+            capsys,
+            registry,
+            budgets,
+            "--bench",
+            "toy",
+            "--split",
+            "train",
+            "--phase",
+            "test",
+            "--out",
+            str(out),
+        )
+
+    assert outcome.status == cli.USAGE
+    assert "another process is running in" in outcome.stderr
+    assert factory.options == []  # Nothing of the harness touched the directory.
 
 
 # The concurrency share.

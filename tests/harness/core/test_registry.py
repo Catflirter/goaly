@@ -127,7 +127,7 @@ def test_a_name_is_registered_once() -> None:
 async def test_a_harness_builds_its_runner(tmp_path: Path) -> None:
     policy = ScriptedPolicy({"t1": raising(GatewayDownError("502 after 5 retries"))})
     harness = toy_harness(policy)
-    cache = EvalCache(tmp_path / "cache")
+    cache = EvalCache(tmp_path / "cache", "toy-dev")
 
     runner = harness.runner(cache=cache, max_tasks=1, task_timeout_s=30.0)
     summary = await runner.run(

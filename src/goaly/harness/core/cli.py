@@ -21,7 +21,7 @@ import json
 import logging
 import math
 import sys
-from collections.abc import Mapping, Sequence
+from collections.abc import Sequence
 from pathlib import Path
 
 from goaly.contracts.gen.manifest_pb2 import RunManifest
@@ -33,13 +33,21 @@ from goaly.harness.core.logs import configure_logging
 from goaly.harness.core.manifest import (
     CORE_DIR,
     config_hash,
+    core_hash,
     harness_hash,
     new_run_id,
     provenance,
     sha256_file,
 )
 from goaly.harness.core.registry import HarnessOptions, Registry, RegistryError, RunnableHarness
-from goaly.harness.core.runner import DEFAULT_MAX_TASKS, RunDirectoryError, RunFiles, RunSummary
+from goaly.harness.core.runner import (
+    DEFAULT_MAX_TASKS,
+    RunDirectoryError,
+    RunFiles,
+    RunLock,
+    RunSummary,
+    lock_run_dir,
+)
 
 __all__ = ["FAILED", "INTERRUPTED", "USAGE", "build_parser", "main"]
 
@@ -169,55 +177,71 @@ async def _run(args: argparse.Namespace, command_line: list[str], registry: Regi
     share = args.share or args.bench
     llm_shares = (await asyncio.to_thread(load_budgets, args.budgets)).share(args.phase, share)
     files = RunFiles(args.out)
-    # The run's directory exists when the harness opens; the runner locks it when the run starts.
-    await asyncio.to_thread(files.root.mkdir, parents=True, exist_ok=True)
-    options = HarnessOptions(files=files, instances_file=args.instances, llm_shares=llm_shares)
-    async with factory(options) as harness:
-        if harness.benchmark_name != args.bench:
-            raise RuntimeError(
-                f"the harness registered for {args.bench!r} runs the benchmark"
-                f" {harness.benchmark_name!r}"
-            )
-        seeds = list(range(args.first_seed, args.first_seed + args.seeds))
-        # Every option that shapes the run: not where it is written, cached or logged.
-        settings: dict[str, JsonValue] = {
-            "benchmark": args.bench,
-            "harness": harness_name,
-            "split": args.split,
-            "instances_sha256": None if args.instances is None else sha256_file(args.instances),
-            "only": None if args.only is None else sorted(args.only),
-            "seeds": [*seeds],
-            "max_tasks": args.max_tasks,
-            "task_timeout_s": args.task_timeout,
-            "phase": args.phase,
-            "share": share,
-            "llm_shares": dict(llm_shares),
-        }
-        manifest = await asyncio.to_thread(_manifest, args, command_line, harness, settings)
-        cache = None if args.cache is None else EvalCache(args.cache)
-        runner = harness.runner(
-            cache=cache, max_tasks=args.max_tasks, task_timeout_s=args.task_timeout
+    # Locked before the harness opens, so that nothing it writes there, such as the LLM call log,
+    # can meet another process's run.
+    with await asyncio.to_thread(lock_run_dir, files) as lock:
+        options = HarnessOptions(files=files, instances_file=args.instances, llm_shares=llm_shares)
+        async with factory(options) as harness:
+            return await _run_harness(args, command_line, harness, harness_name, llm_shares, lock)
+
+
+async def _run_harness(
+    args: argparse.Namespace,
+    command_line: list[str],
+    harness: RunnableHarness,
+    harness_name: str,
+    llm_shares: dict[str, int],
+    lock: RunLock,
+) -> RunSummary:
+    if harness.benchmark_name != args.bench:
+        raise RuntimeError(
+            f"the harness registered for {args.bench!r} runs the benchmark"
+            f" {harness.benchmark_name!r}"
         )
-        return await runner.run(
-            files.root,
-            manifest,
-            split=SPLIT_EXTERNAL if args.instances is not None else _SPLITS[args.split],
-            seeds=seeds,
-            instance_ids=args.only,
-            resume=args.resume,
-        )
+    cache = None
+    if args.cache is not None:
+        if not harness.cache_namespace:
+            raise ValueError(f"the harness {harness_name!r} names no grading namespace for --cache")
+        cache = EvalCache(args.cache, harness.cache_namespace)
+    seeds = list(range(args.first_seed, args.first_seed + args.seeds))
+    # Every option that shapes the run: not where it is written, cached or logged.
+    settings: dict[str, JsonValue] = {
+        "benchmark": args.bench,
+        "harness": harness_name,
+        "split": args.split,
+        "instances_sha256": None if args.instances is None else sha256_file(args.instances),
+        "only": None if args.only is None else sorted(args.only),
+        "seeds": [*seeds],
+        "max_tasks": args.max_tasks,
+        "task_timeout_s": args.task_timeout,
+        "phase": args.phase,
+        "share": args.share or args.bench,
+        "llm_shares": dict(llm_shares),
+    }
+    manifest = await asyncio.to_thread(_manifest, args, command_line, harness, settings)
+    runner = harness.runner(cache=cache, max_tasks=args.max_tasks, task_timeout_s=args.task_timeout)
+    return await runner.run(
+        lock.files.root,
+        manifest,
+        split=SPLIT_EXTERNAL if args.instances is not None else _SPLITS[args.split],
+        seeds=seeds,
+        instance_ids=args.only,
+        resume=args.resume,
+        lock=lock,
+    )
 
 
 def _manifest(
     args: argparse.Namespace,
     command_line: list[str],
     harness: RunnableHarness,
-    settings: Mapping[str, JsonValue],
+    settings: dict[str, JsonValue],
 ) -> RunManifest:
     """The caller's part of the run's manifest; the runner adds the rest."""
     manifest = provenance(CORE_DIR)
     manifest.run_id = args.run_id or new_run_id()
-    manifest.harness_hash = harness_hash(harness.pack_dir)
+    pack = harness.pack_dir
+    manifest.harness_hash = core_hash() if pack is None else harness_hash(pack)
     manifest.config_hash = config_hash(settings)
     manifest.dataset_revision = harness.dataset.revision
     manifest.dataset_notes[:] = harness.dataset.notes
