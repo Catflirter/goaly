@@ -19,6 +19,7 @@ are T21's own classes, which it passes in.
 """
 
 import asyncio
+import json
 import logging
 import os
 import shutil
@@ -26,23 +27,38 @@ import sys
 import tarfile
 import tempfile
 from collections.abc import Callable, Sequence
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, Protocol
 
 from google.protobuf import json_format
 
 from goaly.bench.effisql.benchmark import BENCHMARK_NAME
-from goaly.bench.effisql.grading_pool import Priority
+from goaly.bench.effisql.data import EffiSqlInstance
+from goaly.bench.effisql.grading import BaseCache, Mode
+from goaly.bench.effisql.grading_pool import GradingInstance, Priority
+from goaly.bench.effisql.grading_service import EffiSqlGrader
+from goaly.bench.effisql.pg_settings import PgEnvConfig
 from goaly.contracts.gen.llm_call_pb2 import LlmCallRecord
 from goaly.contracts.gen.manifest_pb2 import RunManifest
-from goaly.contracts.gen.result_pb2 import TaskResult
-from goaly.contracts.gen.task_pb2 import SPLIT_TRAIN, Split
+from goaly.contracts.gen.result_pb2 import (
+    TASK_ERROR_TYPE_ENVIRONMENT,
+    TASK_ERROR_TYPE_LLM,
+    TaskResult,
+)
+from goaly.contracts.gen.task_pb2 import GRADE_STATUS_GRADER_ERROR, SPLIT_TRAIN, Split
 from goaly.contracts.gen.trajectory_pb2 import Trajectory
 from goaly.contracts.jsonl import from_json_line
 from goaly.harness.core.manifest import checkout_harness_hash, read_manifest
 
-__all__ = ["EffiSqlEvaluator", "TaskBudget", "make_evaluator"]
+__all__ = [
+    "EffiSqlEvaluator",
+    "ProbeGrader",
+    "ProxyTotals",
+    "TaskBudget",
+    "infra_failed",
+    "make_evaluator",
+]
 
 _logger = logging.getLogger(__name__)
 
@@ -131,6 +147,70 @@ async def _run_command(argv: Sequence[str], cwd: Path) -> tuple[int, str]:
     return process.returncode or 0, output.decode("utf-8", "replace")[-20_000:]
 
 
+@dataclass(frozen=True)
+class ProxyTotals:
+    """The proxy's own totals for a run: input plus output tokens, and the cost."""
+
+    tokens: int
+    cost_usd: float
+
+
+def _proxy_totals(usage_file: Path, calls: Sequence[LlmCallRecord]) -> ProxyTotals:
+    """The run's proxy totals from the host's usage.json, or from its call records without it."""
+    try:
+        total = json.loads(usage_file.read_text(encoding="utf-8"))["proxy_total"]
+        return ProxyTotals(
+            int(total["input_tokens"]) + int(total["output_tokens"]), float(total["cost_usd"])
+        )
+    except (OSError, ValueError, KeyError, TypeError):
+        tokens = sum(c.usage.input_tokens + c.usage.output_tokens for c in calls)
+        return ProxyTotals(tokens, sum(c.usage.cost_usd for c in calls))
+
+
+# The host's error types that are the infrastructure's, not the candidate's (T21's ruling).
+_INFRA_ERRORS = frozenset({TASK_ERROR_TYPE_LLM, TASK_ERROR_TYPE_ENVIRONMENT})
+
+
+def infra_failed(results: Sequence[TaskResult]) -> frozenset[tuple[str, int]]:
+    """The (task, seed) pairs the infrastructure failed, by the host's graded results: an LLM
+    gateway outage after the retries, an environment failure, or a grader error."""
+    return frozenset(
+        (r.instance_id, r.seed)
+        for r in results
+        if r.error_type in _INFRA_ERRORS or r.grade.status == GRADE_STATUS_GRADER_ERROR
+    )
+
+
+class ProbeGrader:
+    """T21's identity probes (§6.2): a grader made for each probe and closed right after.
+
+    T10 allows one grader per instance at a time, and the host run each evaluation starts makes
+    its own, so the evaluator holds none: a probe waits for its instance's lock as any grading
+    does, and T21 runs them once a round.
+    """
+
+    def __init__(self, cache_root: Path) -> None:
+        self._cache_root = cache_root
+        self._lock = asyncio.Lock()
+
+    async def identity_probe(
+        self, inst: EffiSqlInstance, *, instance: GradingInstance, priority: Priority = Priority.RSI
+    ) -> float:
+        async with self._lock:
+            grader = await asyncio.to_thread(
+                EffiSqlGrader.on_instances, (instance,), cache_root=self._cache_root
+            )
+            try:
+                return await grader.identity_probe(inst, instance=instance, priority=priority)
+            finally:
+                await asyncio.to_thread(grader.close)
+
+    def identity_reference(self, inst: EffiSqlInstance) -> float | None:
+        """The identity τ the setup measured for ``inst``, from the base cache; no grader."""
+        entry = BaseCache(self._cache_root / Mode.DEV.value).get(inst)
+        return None if entry is None else entry.identity_speedup
+
+
 @dataclass
 class EffiSqlEvaluator:
     """T21's Evaluator for the Effi-SQL lane; see the module docstring."""
@@ -142,6 +222,10 @@ class EffiSqlEvaluator:
     cost_stats_type: Callable[..., Any]
     run_command: RunCommand = _run_command
     python: str = sys.executable
+    grading_cache_root: Path = field(default_factory=lambda: PgEnvConfig().data_root / "grader")
+
+    def __post_init__(self) -> None:
+        self._probes = ProbeGrader(self.grading_cache_root)
 
     async def evaluate(self, request: EvaluationRequestLike) -> Any:
         """Evaluate ``request``'s commit on its tasks and seeds; raise on an infrastructure
@@ -161,10 +245,10 @@ class EffiSqlEvaluator:
         wanted = {(i, s) for i in request.instance_ids for s in request.seeds}
         chosen = [results[key] for key in sorted(wanted) if key in results]
         calls = await asyncio.to_thread(_records, run_dir / "llm_calls.jsonl", LlmCallRecord)
-        stats = self.cost_stats(chosen, [c for c in calls if c.run_id == request.run_id])
-        # TODO(T06): the host's own set of tasks the infrastructure failed, once the host run
-        # reports it; None makes T21 fall back to the results' error types.
-        return self.evaluation_type(results=chosen, stats=stats, infra_failed=None)
+        mine = [c for c in calls if c.run_id == request.run_id]
+        totals = await asyncio.to_thread(_proxy_totals, run_dir / "usage.json", mine)
+        stats = self.cost_stats(chosen, mine, totals)
+        return self.evaluation_type(results=chosen, stats=stats, infra_failed=infra_failed(chosen))
 
     def command(
         self, request: EvaluationRequestLike, snapshot: Path, run_dir: Path, max_tasks: int
@@ -184,12 +268,17 @@ class EffiSqlEvaluator:
             "--max-tasks", str(max_tasks), "--out", str(run_dir),
         ]  # fmt: skip
 
-    def cost_stats(self, results: Sequence[TaskResult], calls: Sequence[LlmCallRecord]) -> Any:
-        """The means per (task, seed), host-verified (T21's ruling).
+    def cost_stats(
+        self,
+        results: Sequence[TaskResult],
+        calls: Sequence[LlmCallRecord],
+        totals: ProxyTotals,
+    ) -> Any:
+        """The means per (task, seed), host-verified (the controller's ruling for T21).
 
-        Tokens and cost are the proxy's own records of the run, which cover every task solved
-        now; a task the cache answered brings the host numbers stored with it, as no call was
-        made for it. Wall time is the host's, per task. The container's own counts are never
+        Tokens and cost are the proxy's own totals for the run (usage.json), which cover every
+        task solved now; a task the cache answered, which made no call, brings the host numbers
+        stored with it. Wall time is the host's, per task. The container's own counts are never
         used. A per-task sum that differs from the proxy's total by more than 1% is a WARNING.
         """
         count = len(results)
@@ -200,23 +289,26 @@ class EffiSqlEvaluator:
         solved = {(c.instance_id, c.seed) for c in calls}
         cached = [r for r in results if (r.instance_id, r.seed) not in solved]
         fresh = [r for r in results if (r.instance_id, r.seed) in solved]
-        proxy_tokens = sum(c.usage.input_tokens + c.usage.output_tokens for c in calls)
-        proxy_cost = sum(c.usage.cost_usd for c in calls)
-        tokens = proxy_tokens + sum(r.usage.input_tokens + r.usage.output_tokens for r in cached)
-        cost = proxy_cost + sum(r.usage.cost_usd for r in cached)
+        tokens = totals.tokens + sum(r.usage.input_tokens + r.usage.output_tokens for r in cached)
+        cost = totals.cost_usd + sum(r.usage.cost_usd for r in cached)
         attributed = sum(r.usage.input_tokens + r.usage.output_tokens for r in fresh)
-        if calls and abs(attributed - proxy_tokens) > _DRIFT * max(proxy_tokens, 1):
+        if totals.tokens and abs(attributed - totals.tokens) > _DRIFT * totals.tokens:
             _logger.warning(
                 "the tasks' tokens differ from the proxy's total by more than 1%%",
-                extra={"tasks": attributed, "proxy": proxy_tokens},
+                extra={"tasks": attributed, "proxy": totals.tokens},
             )
-        priced = any(c.usage.cost_usd for c in calls) or any(r.usage.cost_usd for r in cached)
+        priced = totals.cost_usd > 0 or any(r.usage.cost_usd for r in cached)
         return self.cost_stats_type(
             mean_tokens=tokens / count,
             mean_cost_usd=cost / count if priced else None,
             mean_wall_time_s=sum(r.wall_time_s for r in results) / count,
             count=count,
         )
+
+    @property
+    def grader(self) -> ProbeGrader:
+        """T21's identity probes, on a grader that exists only while one runs (the ruling)."""
+        return self._probes
 
     async def aclose(self) -> None:
         """Release what the evaluator holds; it starts no pool of its own yet."""
