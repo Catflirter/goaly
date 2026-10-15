@@ -3,6 +3,8 @@
 import asyncio
 import json
 import logging
+import os
+import shutil
 from collections.abc import Callable, Sequence
 from dataclasses import dataclass, field
 from datetime import UTC, datetime, timedelta
@@ -686,3 +688,125 @@ async def test_an_organizers_run_keeps_no_grade_the_container_claims(tmp_path: P
 
     assert not results(run_dir)[("t0", 0)].HasField("grade")
     assert not trajectories(run_dir)[("t0", 0)].HasField("grade")
+
+
+# Links and other files the container may plant in its solve directory (final review N1).
+
+
+async def test_a_linked_predictions_directory_is_no_record(
+    tmp_path: Path, caplog: pytest.LogCaptureFixture
+) -> None:
+    # Run A's strong answers, which run B's container points its predictions at.
+    await solve_and_grade(
+        host(Container(ScriptedPolicy({"t1": answering("SELECT 1")}))), tmp_path / "a"
+    )
+    theirs = RunFiles(tmp_path / "a").solve.root / "predictions"
+
+    def steal(request: SolveRequest) -> None:
+        ours = RunFiles(request.solve_dir).root / "predictions"
+        shutil.rmtree(ours)
+        ours.symlink_to(theirs, target_is_directory=True)
+
+    with caplog.at_level(logging.WARNING, logger="goaly.harness.core.isolation"):
+        await solve_and_grade(host(Container(after=steal)), tmp_path / "b")
+
+    found = results(tmp_path / "b")
+    assert {result.grade.score for result in found.values()} == {0.0}
+    assert {result.error_type for result in found.values()} == {TASK_ERROR_TYPE_POLICY_CRASH}
+    assert "predictions is not a directory the host reads" in caplog.text
+    assert official(tmp_path / "b")[1] == {"instance_id": "t1", "sql": base_sql(1)}  # Not A's.
+
+
+async def test_a_linked_predictions_file_is_no_record(tmp_path: Path) -> None:
+    host_only = tmp_path / "host-only.jsonl"
+    winning = Prediction(instance_id="t1", effisql=EffiSqlPrediction(sql="SELECT 1"))
+    host_only.write_text(to_json_line(winning) + "\n", encoding="utf-8")
+
+    def link(request: SolveRequest) -> None:
+        path = predictions_file(request)
+        path.unlink()
+        path.symlink_to(host_only)
+
+    run_dir = tmp_path / "run"
+    await solve_and_grade(host(Container(after=link)), run_dir)
+
+    assert results(run_dir)[("t1", 0)].grade.score == 0.0
+    assert results(run_dir)[("t1", 0)].error_message == (
+        "the solve phase left no prediction for this task"
+    )
+
+
+async def test_linked_results_and_trajectories_are_not_read(tmp_path: Path) -> None:
+    secret = tmp_path / "host-only.jsonl"
+    leak = Trajectory(run_id="run-1", instance_id="t0", seed=0, error_message="a host secret")
+    secret.write_text(to_json_line(leak) + "\n", encoding="utf-8")
+
+    def link(request: SolveRequest) -> None:
+        for path in (RunFiles(request.solve_dir).trajectories, RunFiles(request.solve_dir).results):
+            path.unlink()
+            path.symlink_to(secret)
+
+    run_dir = tmp_path / "run"
+    await solve_and_grade(host(Container(after=link)), run_dir)
+
+    assert "a host secret" not in RunFiles(run_dir).trajectories.read_text()
+    assert results(run_dir)[("t0", 0)].grade.score == 0.5  # Graded from its prediction, as ever.
+
+
+async def test_a_fifo_in_place_of_a_file_is_refused_without_waiting(tmp_path: Path) -> None:
+    def fifo(request: SolveRequest) -> None:
+        path = predictions_file(request)
+        path.unlink()
+        os.mkfifo(path)  # An open for reading would wait for a writer forever.
+
+    run_dir = tmp_path / "run"
+    await solve_and_grade(host(Container(after=fifo)), run_dir)
+
+    assert {result.grade.score for result in results(run_dir).values()} == {0.0}
+
+
+# What the host caches, and the task it records (final review m2, m3).
+
+
+async def test_the_host_caches_only_final_outcomes(tmp_path: Path) -> None:
+    def drop_t1(request: SolveRequest) -> None:
+        path = predictions_file(request)
+        kept = [line for line in path.read_text().splitlines() if '"t1"' not in line]
+        path.write_text("".join(f"{line}\n" for line in kept), encoding="utf-8")
+
+    cache = EvalCache(tmp_path / "cache", "toy-dev")
+    broken = ScriptedBenchmark(toy_instances(3), grade_errors={"t2": ConnectionError("db")})
+    await solve_and_grade(
+        host(Container(after=drop_t1), cache=cache, benchmark=broken), tmp_path / "run"
+    )
+
+    cached = [path.read_text() for path in (tmp_path / "cache").rglob("*.json")]
+    assert len(cached) == 1  # Not t1, which had no record, nor t2, whose grader failed.
+    assert '"instance_id":"t0"' in cached[0]
+
+
+async def test_the_host_records_its_own_task_whatever_the_container_claims(
+    tmp_path: Path,
+) -> None:
+    def claim(request: SolveRequest) -> None:
+        solve = RunFiles(request.solve_dir)
+        for trajectory in list(read_jsonl(solve.trajectories, Trajectory)):
+            trajectory.task.effisql.base_sql = "SELECT 'forged'"
+            append_jsonl(solve.trajectories, trajectory)
+
+    run_dir = tmp_path / "run"
+    await solve_and_grade(host(Container(after=claim)), run_dir)
+
+    assert trajectories(run_dir)[("t0", 0)].task.effisql.base_sql == base_sql(0)
+
+
+async def test_a_solve_directory_that_is_a_link_is_no_record(tmp_path: Path) -> None:
+    def swap(request: SolveRequest) -> None:  # As only the host could; the container cannot.
+        elsewhere = tmp_path / "elsewhere"
+        request.solve_dir.rename(elsewhere)
+        request.solve_dir.symlink_to(elsewhere, target_is_directory=True)
+
+    run_dir = tmp_path / "run"
+    await solve_and_grade(host(Container(after=swap)), run_dir)
+
+    assert {result.grade.score for result in results(run_dir).values()} == {0.0}
