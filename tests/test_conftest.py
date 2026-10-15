@@ -1,4 +1,5 @@
-"""Tests for the shared test configuration: the integration opt-in and the secret isolation."""
+"""Tests for the shared test configuration: the integration opt-in, the secret isolation and the
+async test backend."""
 
 from pathlib import Path
 
@@ -31,6 +32,19 @@ def test_integration(tmp_path):
     assert goaly_variables() == ["GOALY_API_KEY", "goaly_api_key"]
 """
 
+ASYNC_PROBE_TESTS = """
+import asyncio
+
+import pytest
+
+pytestmark = pytest.mark.anyio
+
+
+async def test_async(anyio_backend):
+    assert anyio_backend == "asyncio"
+    asyncio.get_running_loop()
+"""
+
 
 @pytest.fixture
 def project(pytester: pytest.Pytester, monkeypatch: pytest.MonkeyPatch) -> pytest.Pytester:
@@ -58,3 +72,11 @@ def test_integration_flag_runs_integration_tests(project: pytest.Pytester) -> No
     result = project.runpytest("--integration", "test_probe.py")
 
     result.assert_outcomes(passed=2)
+
+
+def test_async_tests_run_once_on_asyncio(project: pytest.Pytester) -> None:
+    project.makepyfile(test_async_probe=ASYNC_PROBE_TESTS)
+
+    result = project.runpytest("test_async_probe.py")
+
+    result.assert_outcomes(passed=1)

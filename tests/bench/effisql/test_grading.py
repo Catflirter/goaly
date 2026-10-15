@@ -14,6 +14,7 @@ from goaly.bench.effisql.grading import (
     measure_base,
     normalize_sql,
     prediction_sql,
+    quick_grade,
 )
 from goaly.contracts.gen.task_pb2 import (
     GRADE_STATUS_GRADED,
@@ -366,16 +367,18 @@ class TestOutcomes:
             (QueryError("out of memory"), GRADE_STATUS_PREDICTION_FAILED),
         ],
     )
-    def test_a_failed_timing_stays_matched_with_no_speedup(
+    def test_a_failed_timing_stays_matched_with_tau_zero(
         self, grade: Any, error: Exception, status: int
     ) -> None:
         result = grade(main_session(pred_times=[250.0, error]))
         details = result.effisql
         assert result.status == status
         assert details.matched
-        assert not details.HasField("speedup")
+        assert details.HasField("speedup")
+        assert details.speedup == 0.0
         assert details.credit == 0
         assert not result.correct
+        assert "τ = 0" in result.feedback
 
     @pytest.mark.parametrize(
         ("pred_ms", "credit"),
@@ -449,3 +452,68 @@ class TestMeasureBase:
         main = main_session(base_times=[error])
         with pytest.raises(type(error)):
             measure_base(sessions(main, alt_session()), INST)
+
+
+class TestReviewFixes:
+    def test_a_data_change_is_refused_before_a_cache_miss_is_measured(self, tmp_path: Path) -> None:
+        modifying = {"Plan": {"Node Type": "ModifyTable", "Relation Name": "lineitem"}}
+        main = main_session(pred_plan=modifying)
+        grade = grade_dev(main, alt_session(), BaseCache(tmp_path))
+        assert grade.status == GRADE_STATUS_PREDICTION_FAILED
+        assert main.kinds(BASE_SQL) == [], "nothing was measured"
+
+    def test_a_quick_grade_is_not_measured(self, cache: BaseCache) -> None:
+        main = main_session()
+        grade = grade_dev(main, alt_session(), cache, sql="")
+        assert not grade.effisql.HasField("eval_wall_s")
+        assert quick_grade(INST, BASE_SQL, Mode.DEV, cache) is not None
+        assert quick_grade(INST, BASE_SQL, Mode.OFFICIAL, cache) is None
+        assert quick_grade(INST, PRED, Mode.DEV, cache) is None
+        assert quick_grade(INST, None, Mode.OFFICIAL, None) is not None
+
+    def test_the_robustness_reason_reaches_the_feedback(self, cache: BaseCache) -> None:
+        alt = alt_session(pred_rows=QueryError("division by zero"))
+        grade = grade_dev(main_session(), alt, cache)
+        assert "hard_coded: the prediction failed on the alternate database" in grade.feedback
+        assert not grade.correct
+
+    def test_the_plan_checks_reasons_reach_the_feedback(self, cache: BaseCache) -> None:
+        grade = grade_dev(main_session(pred_plan=plan()), alt_session(), cache)
+        assert "literal_result: the plan scans none of the base query's tables" in grade.feedback
+
+    def test_an_environment_probe_is_flagged(self, cache: BaseCache) -> None:
+        probe = (
+            "SELECT l_returnflag, count(*) FROM lineitem "
+            "WHERE current_database() = 'tpch' GROUP BY 1"
+        )
+        main = main_session()
+        main.plans[probe] = plan("lineitem")
+        main.results[probe] = BASE_ROWS
+        main.times[probe] = [250.0] * 3
+        alt = alt_session()
+        alt.results[probe] = ALT_ROWS
+        grade = grade_dev(main, alt, cache, sql=probe)
+        assert grade.effisql.literal_result
+        assert "probes the environment: current_database" in grade.feedback
+
+    def test_a_truncated_base_count_says_more_than(self) -> None:
+        main = main_session(pred_rows=[("A", 10)], base_rows=BASE_ROWS)
+        grade = grade_official(main, alt_session())
+        assert "returned 1 rows, the base more than 2 rows" in grade.feedback
+
+    def test_an_on_the_fly_measurement_keeps_the_setups_identity_tau(self, tmp_path: Path) -> None:
+        cache = BaseCache(tmp_path)
+        cache.put_measured(INST, entry(identity_speedup=None))
+        assert cache.get(INST) == entry(identity_speedup=None)
+        cache.put(entry())
+        cache.put_measured(INST, entry(identity_speedup=None, base_ms=5.0))
+        kept = cache.get(INST)
+        assert kept is not None
+        assert kept.identity_speedup == 1.02
+
+    def test_a_base_without_tables_is_a_grader_error(self) -> None:
+        main = main_session()
+        main.plans[BASE_SQL] = plan()
+        grade = grade_official(main, alt_session())
+        assert grade.status == GRADE_STATUS_GRADER_ERROR
+        assert "scans no table" in grade.feedback

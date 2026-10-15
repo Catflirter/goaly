@@ -70,6 +70,21 @@ def test_a_checksum_mismatch_fails_and_writes_nothing(
     assert list(cache.iterdir()) == []
 
 
+def test_a_file_system_error_fails_cleanly(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    cache = tmp_path / "cache"
+    cache.write_text("a file where the cache directory should be\n", encoding="utf-8")
+
+    status = prepare_data.main(["--cache-dir", str(cache), "--url", "file:///copy.jsonl"])
+
+    assert status == 1
+    err = capsys.readouterr().err
+    assert err.startswith("prepare_data: [Errno ")
+    assert str(cache) in err
+    assert "Traceback" not in err
+
+
 @pytest.mark.integration
 def test_prepares_the_real_dataset(tmp_path: Path) -> None:
     local_copy = os.environ.get("GOALY_EFFISQL_DATA")

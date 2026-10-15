@@ -1,8 +1,8 @@
 """Effi-SQL's task data (spec §4.1, §8.5): the pinned dataset, its tasks and their gold-free copy.
 
 - fetch_dataset downloads the pinned dataset into a local cache, which is never committed, and
-  checks its sha256 before anything reads it. The run manifest records DATASET_REVISION and
-  DATASET_SHA256.
+  checks its sha256 before anything reads it. The module exposes DATASET_REVISION and
+  DATASET_SHA256 for the run manifest.
 - EffiSqlInstance is one task, validated from a line of a task file. A task file is the dataset,
   its gold-free runtime copy, or an organizers' ``--instances`` file, all in the dataset's format.
 - load_instances reads a task file.
@@ -168,13 +168,18 @@ def _not_blank(value: str) -> str:
     return value
 
 
+def _blank_is_none(value: object) -> object:
+    """Read a blank string, which an organizers' file may hold for a missing value, as None."""
+    if isinstance(value, str) and not value.strip():
+        return None
+    return value
+
+
 def _no_empty_plan(value: object) -> object:
     """Read an empty plan, ``{}``, ``[]`` or a blank string, as no plan: None."""
     if isinstance(value, dict | list) and not value:
         return None
-    if isinstance(value, str) and not value.strip():
-        return None
-    return value
+    return _blank_is_none(value)
 
 
 _TaskId = Annotated[str, BeforeValidator(_task_id)]
@@ -183,9 +188,13 @@ NonBlankStr = Annotated[str, AfterValidator(_not_blank)]
 _Millis = Annotated[float, Field(ge=0, allow_inf_nan=False)]  # A time in milliseconds.
 # A query plan's root node, as a JSON object (spec §4.1), or None for no plan.
 _Plan = Annotated[dict[str, JsonValue] | None, BeforeValidator(_no_empty_plan)]
+_MaybeMillis = Annotated[_Millis | None, BeforeValidator(_blank_is_none)]
+_MaybeDifficulty = Annotated[Difficulty | None, BeforeValidator(_blank_is_none)]
 
 # Checks that each field of a record is JSON; pydantic's own JsonValue reports one error per field.
-_RECORD: TypeAdapter[dict[str, JsonValue]] = TypeAdapter(dict[str, PydanticJsonValue])
+_RECORD: TypeAdapter[dict[str, JsonValue]] = TypeAdapter(
+    dict[str, PydanticJsonValue], config=ConfigDict(hide_input_in_errors=True)
+)
 
 
 class EffiSqlInstance(BaseModel):
@@ -197,25 +206,28 @@ class EffiSqlInstance(BaseModel):
       ``id`` is kept as it is; a bool is rejected.
     - A field the model does not know is ignored, as an organizers' file may carry more.
     - Every field an organizers' file may lack is optional, and missing or null gives None: the
-      gold answer, ``difficulty``, ``base_time``, and the plan ``base_explain_analyze``. The
-      gold answer is never checked beyond its type.
-    - An empty plan, ``{}``, ``[]`` or a blank string, counts as no plan and gives None too, so
-      agent_input falls back to the plan cache. ``record`` keeps the value as loaded.
+      gold answer, ``difficulty``, ``base_time``, and the plan ``base_explain_analyze``. A
+      blank ``difficulty``, ``base_time`` or ``fast_time`` gives None too. The gold answer is
+      never checked beyond its type.
+    - An empty plan, ``{}``, ``[]`` or a blank string, counts as no plan and gives None.
+      agent_input takes a task's plan from plans.json first, and from this field only when
+      plans.json has none. ``record`` keeps every value as loaded.
 
-    The repr leaves out the gold answer and the plans. Times are in milliseconds, as measured on
-    the dataset authors' hardware.
+    Validation errors never show the input, which may be a gold answer, and the repr leaves out
+    the gold answer and the plans. Instances hash by ``instance_id``. Times are in milliseconds,
+    as measured on the dataset authors' hardware.
     """
 
-    model_config = ConfigDict(frozen=True, extra="ignore", strict=True)
+    model_config = ConfigDict(frozen=True, extra="ignore", strict=True, hide_input_in_errors=True)
 
     instance_id: _TaskId = Field(validation_alias="id")
     db: NonBlankStr
     base_sql: NonBlankStr
-    base_time: _Millis | None = None
+    base_time: _MaybeMillis = None
     base_explain_analyze: _Plan = Field(default=None, repr=False)
-    difficulty: Difficulty | None = None
+    difficulty: _MaybeDifficulty = None
     optimized_sql: str | None = Field(default=None, repr=False)
-    fast_time: _Millis | None = Field(default=None, repr=False)
+    fast_time: _MaybeMillis = Field(default=None, repr=False)
     optimized_explain_analyze: _Plan = Field(default=None, repr=False)
 
     _record: dict[str, JsonValue] = PrivateAttr()
@@ -238,6 +250,10 @@ class EffiSqlInstance(BaseModel):
         read-only; its values belong to the instance, so never change them.
         """
         return MappingProxyType(self._record)
+
+    def __hash__(self) -> int:
+        # By ID, which equal instances share: pydantic's frozen hash fails on the plans' dicts.
+        return hash(self.instance_id)
 
 
 def load_instances(path: Path) -> tuple[EffiSqlInstance, ...]:
@@ -280,7 +296,9 @@ def _parse_task(raw: bytes) -> EffiSqlInstance | str:
     exceptions: their text and inputs quote the line.
     """
     try:
-        record = json.loads(raw, parse_constant=_reject_constant)  # Bytes: a BOM is skipped.
+        # Without its line ending, so that an error's column is in the line's own text. As bytes,
+        # json skips a BOM.
+        record = json.loads(raw.rstrip(b"\r\n"), parse_constant=_reject_constant)
     except UnicodeDecodeError as error:
         return f"not valid UTF-8 at byte {error.start}"
     except json.JSONDecodeError as error:

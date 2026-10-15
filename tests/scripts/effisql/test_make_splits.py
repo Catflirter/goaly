@@ -57,6 +57,25 @@ def test_writes_the_committed_file_by_default(monkeypatch: pytest.MonkeyPatch) -
     assert written == [SPLITS_PATH]
 
 
+def test_a_file_system_error_fails_cleanly(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    out = tmp_path / "missing" / "effisql.json"
+
+    def fetch(cache_dir: Path, *, url: str) -> Path:
+        cache_dir.mkdir()
+        return synthetic_dataset(cache_dir / DATASET_FILE)
+
+    monkeypatch.setattr(make_splits, "fetch_dataset", fetch)
+
+    status = make_splits.main(["--cache-dir", str(tmp_path / "cache"), "--out", str(out)])
+
+    assert status == 1
+    err = capsys.readouterr().err
+    assert err.startswith("make_splits: [Errno ")
+    assert str(out) in err
+
+
 def test_a_dataset_error_fails_and_writes_nothing(
     tmp_path: Path, capsys: pytest.CaptureFixture[str]
 ) -> None:

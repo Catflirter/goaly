@@ -53,7 +53,7 @@ def test_grading_in_both_modes(effisql: EffiSqlGrader) -> None:
 
     async def scenario() -> dict[str, Grade]:
         first = await grade(BASE, Mode.DEV)  # Measures the base and caches it.
-        cache = effisql.cache(Mode.DEV)
+        cache = effisql.dev_cache
         stored = cache.get(INST)
         assert stored is not None
         cache.put(stored.model_copy(update={"identity_speedup": 1.0}))
@@ -123,7 +123,9 @@ def test_hard_coded_answers_get_no_credit(effisql: EffiSqlGrader) -> None:
 
 
 def test_a_cancelled_grading_stops_its_statement(effisql: EffiSqlGrader) -> None:
-    async def scenario() -> float:
+    """The cancel waits for the worker, so a quick return means pg_sleep(60) was stopped."""
+
+    async def scenario() -> tuple[float, Grade]:
         await effisql.grade(INST, answer(BASE), Mode.DEV)  # Measures and caches the base.
         task = asyncio.create_task(effisql.grade(INST, answer("SELECT pg_sleep(60)"), Mode.DEV))
         await asyncio.sleep(2)
@@ -131,15 +133,10 @@ def test_a_cancelled_grading_stops_its_statement(effisql: EffiSqlGrader) -> None
         task.cancel()
         with pytest.raises(asyncio.CancelledError):
             await task
-        return time.monotonic() - started
+        stopped = time.monotonic() - started
+        return stopped, await effisql.grade(INST, answer(BASE), Mode.DEV)
 
-    assert asyncio.run(scenario()) < 15
-    password = load_credentials().grader_password
-    with connector("127.0.0.1", GRADING_INSTANCES[0].port, password, user=GRADER_ROLE)(
-        "tpch"
-    ) as conn:
-        row = conn.execute(
-            "SELECT count(*) FROM pg_stat_activity WHERE usename = current_user"
-            " AND state = 'active' AND pid <> pg_backend_pid()"
-        ).fetchone()
-    assert row == (0,)
+    stopped, after = asyncio.run(scenario())
+    assert stopped < 15
+    assert after.status == GRADE_STATUS_GRADED  # The instance grades again at once.
+    assert after.effisql.matched

@@ -8,6 +8,7 @@ version = "0.1.0"
 description = "Self-evolving harness: GLM-5.3 improves the agent harness Qwen uses on Effi-SQL and SWE-fficiency."
 requires-python = ">=3.12,<3.13"
 dependencies = [
+    "httpx>=0.28", # Pre-1.0, so a minor release may break: 0.28 is the one the client is tested on
     "protobuf>=7.35.1", # The generated code rejects a runtime older than its gencode, 7.35.1
     "psycopg[binary]>=3.2", # 3.2 added cancel_safe() and chunked-rows streaming
     "pydantic>=2.4", # 2.4 added ValidationError.errors(include_input=...)
@@ -16,6 +17,7 @@ dependencies = [
 
 [dependency-groups]
 dev = [
+    "anyio>=4", # Its pytest plugin runs the async tests (tests/conftest.py)
     "grpcio-tools>=1.84", # Bundles protoc 35.1; after changing its version, run `make proto`
     "import-linter>=2.14", # 2.14 added --no-logo
     "mypy>=2",
@@ -51,6 +53,8 @@ select = [
 
 [tool.ruff.lint.per-file-ignores]
 "tests/**" = ["S101"]
+# The LLM errors are named for the failure, as the spec names them: ContextOverflow, RateLimited...
+"src/goaly/harness/core/llm_errors.py" = ["N818"]
 
 [tool.mypy]
 strict = true

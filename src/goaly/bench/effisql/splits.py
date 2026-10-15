@@ -58,8 +58,7 @@ class Exclusion(BaseModel):
 
 
 def _each_task_once(exclusions: tuple[Exclusion, ...]) -> tuple[Exclusion, ...]:
-    listed = Counter(exclusion.instance_id for exclusion in exclusions)
-    repeated = sorted((name for name, count in listed.items() if count > 1), key=_id_order)
+    repeated = _repeated(exclusion.instance_id for exclusion in exclusions)
     if repeated:
         raise ValueError(f"excluded more than once: {', '.join(repeated)}")
     return exclusions
@@ -85,8 +84,7 @@ class EffiSqlSplits(BaseModel):
 
     @model_validator(mode="after")
     def _check_each_id_is_listed_once(self) -> Self:
-        listed = Counter([*self.train, *self.val, *self.heldout])
-        repeated = sorted((name for name, count in listed.items() if count > 1), key=_id_order)
+        repeated = _repeated([*self.train, *self.val, *self.heldout])
         if repeated:
             raise ValueError(f"listed more than once: {', '.join(repeated)}")
         return self
@@ -122,7 +120,9 @@ class EffiSqlSplits(BaseModel):
 def load_splits(path: Path = SPLITS_PATH) -> EffiSqlSplits:
     """Read the split in the file at ``path``, by default the committed one.
 
-    Raises pydantic's ValidationError, a ValueError, if the file does not hold a valid split.
+    The committed ID lists still hold the excluded tasks, which keeps the split reproducible
+    (spec §7). The tasks to run are ``load_splits().without(load_exclusions())``. Raises
+    pydantic's ValidationError, a ValueError, if the file does not hold a valid split.
     """
     return EffiSqlSplits.model_validate_json(path.read_bytes())
 
@@ -226,6 +226,12 @@ def _apportion(strata: Sequence[int], sizes: Sequence[int]) -> list[tuple[int, .
         tuple(low + (k in up) for k, low in enumerate(row))
         for row, up in zip(floors, best, strict=True)
     ]
+
+
+def _repeated(ids: Iterable[str]) -> list[str]:
+    """Return the IDs that ``ids`` lists more than once, in ID order."""
+    counts = Counter(ids)
+    return sorted((name for name, count in counts.items() if count > 1), key=_id_order)
 
 
 def _id_order(instance_id: str) -> tuple[int, str]:
