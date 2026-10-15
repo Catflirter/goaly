@@ -432,19 +432,24 @@ def test_an_xml_call_with_unclosed_parameters_splits_them_at_the_next_tag() -> N
     assert arguments(call) == {"sql": "SELECT 1", "limit": 5}
 
 
-def test_a_function_block_without_a_tool_call_tag_is_still_a_call() -> None:
-    message = assistant(
-        reasoning="I'll run it:\n"
-        "<function=execute_sql>\n<parameter=sql>\nSELECT 1\n</parameter>\n</function>"
-    )
+BARE_CALL = (
+    "I'll run it:\n<function=execute_sql>\n<parameter=sql>\nSELECT 1\n</parameter>\n</function>"
+)
 
-    [call] = parse_tool_calls(message, OFFERED)
+
+def test_a_function_block_in_the_content_without_a_tool_call_tag_is_still_a_call() -> None:
+    [call] = parse_tool_calls(assistant(content=BARE_CALL), OFFERED)
 
     assert (call.name, arguments(call), call.source) == (
         "execute_sql",
         {"sql": "SELECT 1"},
-        TOOL_CALL_SOURCE_REASONING_XML,
+        TOOL_CALL_SOURCE_CONTENT_XML,
     )
+
+
+def test_a_function_block_in_the_reasoning_without_a_tool_call_tag_is_no_call() -> None:
+    # Thinking can mention a call in prose; only a <tool_call> block there is a call.
+    assert parse_tool_calls(assistant(reasoning=BARE_CALL), OFFERED) == []
 
 
 def test_names_in_the_xml_are_read_without_surrounding_spaces() -> None:
@@ -697,7 +702,7 @@ def test_strip_removes_each_of_two_call_blocks() -> None:
 def test_strip_removes_a_call_written_into_the_reasoning() -> None:
     reasoning = QWEN_REPLIES["replies"]["call_in_reasoning"]["reasoning_content"]
 
-    stripped = strip_tool_call_markup(reasoning)
+    stripped = strip_tool_call_markup(reasoning, reasoning=True)
 
     assert stripped == reasoning[: reasoning.index("<tool_call>")]
     assert stripped.endswith("Let's do that.\n")
@@ -733,8 +738,24 @@ def test_strip_removes_bare_function_blocks_only_where_the_parser_reads_them() -
     # block outside them is not a call, and stays.
     outside = "\n<function=execute_sql>\n</function>"
 
+    mixed = xml_call("submit", sql="SELECT 1") + outside
+
     assert strip_tool_call_markup(bare + "\nThen check.") == "I'll run it:\n\nThen check."
-    assert strip_tool_call_markup(xml_call("submit", sql="SELECT 1") + outside) == outside
+    assert strip_tool_call_markup(mixed) == outside
+    [call] = parse_tool_calls(assistant(content=mixed), OFFERED)
+    assert (call.name, arguments(call)) == ("submit", {"sql": "SELECT 1"})
+
+
+def test_strip_keeps_a_bare_function_block_in_the_reasoning_which_is_no_call() -> None:
+    text = BARE_CALL + "\nThen check."
+
+    assert strip_tool_call_markup(text, reasoning=True) == text
+    assert (
+        strip_tool_call_markup(
+            "Plan.\n" + xml_call("submit", sql="SELECT 1") + "\n" + text, reasoning=True
+        )
+        == "Plan.\n\n" + text
+    )
 
 
 @pytest.mark.parametrize(
@@ -744,7 +765,7 @@ def test_strip_removes_bare_function_blocks_only_where_the_parser_reads_them() -
 def test_after_strip_no_call_is_left_in_a_qwen_reply(name: str) -> None:
     reply = QWEN_REPLIES["replies"][name]
     content = strip_tool_call_markup(reply["content"])
-    reasoning = strip_tool_call_markup(reply["reasoning_content"])
+    reasoning = strip_tool_call_markup(reply["reasoning_content"], reasoning=True)
 
     assert parse_tool_calls(assistant(content=content, reasoning=reasoning), OFFERED) == []
 

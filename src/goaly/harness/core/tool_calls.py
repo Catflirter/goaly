@@ -5,8 +5,9 @@ A call can be in three places. :func:`parse_tool_calls` takes the first that has
 1. the reply's standard ``tool_calls``, which the gateway parses out of Qwen's output;
 2. Qwen3-Coder XML in the content, which the gateway leaves there when it does not parse it, as
    when the request offered no tools;
-3. Qwen3-Coder XML in the reasoning_content: Qwen sometimes writes a call before it ends its
-   thinking, where the gateway does not look for calls.
+3. Qwen3-Coder XML in the reasoning_content, in ``<tool_call>`` blocks only: Qwen sometimes
+   writes a call before it ends its thinking, where the gateway does not look for calls, but
+   thinking can also mention a call in prose, which must never run.
 
 :func:`strip_tool_call_markup` removes the XML markup from a text, so that a reply whose calls
 were parsed from it can be replayed with them as structured calls only.
@@ -81,18 +82,22 @@ def parse_tool_calls(
     return calls
 
 
-def strip_tool_call_markup(text: str) -> str:
+def strip_tool_call_markup(text: str, *, reasoning: bool = False) -> str:
     """Return ``text`` without the Qwen3-Coder XML call markup that :func:`parse_tool_calls` reads.
 
     The markup is each ``<tool_call>`` block, to its closing tag, or to the end of the text when
-    it was cut off, whether or not the block holds a call. In a text with no ``<tool_call>``
-    tag, it is each bare ``<function=...>`` block, as the parser reads those then. Everything
-    else stays as it was, whitespace included.
+    it was cut off, whether or not the block holds a call. In a content (``reasoning`` false)
+    with no ``<tool_call>`` tag, it is each bare ``<function=...>`` block, as the parser reads
+    those there. A bare block is kept otherwise: outside ``<tool_call>`` blocks, and anywhere in
+    a reasoning (``reasoning`` true), the parser never reads one as a call. Everything else
+    stays as it was, whitespace included.
 
-    A reply whose calls came from its content or its reasoning is replayed without them, as the
-    structured calls they were parsed into; otherwise the model sees each call twice.
+    When a reply's calls came from XML, its replay strips both its content and its reasoning,
+    ``strip_tool_call_markup(content)`` and ``strip_tool_call_markup(reasoning_content,
+    reasoning=True)``, and carries the calls as structured calls only. Otherwise the model sees
+    each call twice.
     """
-    markup = _TOOL_CALL if _TOOL_CALL.search(text) else _FUNCTION
+    markup = _TOOL_CALL if reasoning or _TOOL_CALL.search(text) else _FUNCTION
     return markup.sub("", text)
 
 
@@ -132,8 +137,10 @@ def _xml_calls(
     schemas: Mapping[str, Mapping[str, JsonValue]],
 ) -> list[ToolCall]:
     calls = []
-    # A function block outside any <tool_call> tag is still a call.
-    for block in _TOOL_CALL.findall(text) or [text]:
+    blocks = _TOOL_CALL.findall(text)
+    if not blocks and source == TOOL_CALL_SOURCE_CONTENT_XML:
+        blocks = [text]  # In the content, a function block outside any <tool_call> tag is a call.
+    for block in blocks:
         for written_name, body in _FUNCTION.findall(block):
             name = written_name.strip()
             parameters = schemas.get(name, {})
