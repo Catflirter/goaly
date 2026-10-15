@@ -1,6 +1,7 @@
 """Tests for goaly.harness.core.llm: the client, against the scripted gateway of llm_fakes."""
 
 import asyncio
+import inspect
 import logging
 import math
 import random
@@ -18,7 +19,14 @@ from pydantic import ValidationError
 from goaly.contracts.gen.llm_call_pb2 import CallPurpose, LlmCallRecord, LlmCallStatus, Usage
 from goaly.contracts.gen.trajectory_pb2 import ChatMessage, ChatRole, ToolCall, ToolCallSource
 from goaly.contracts.jsonl import read_jsonl, to_json_line
-from goaly.harness.core.llm import CallTags, JsonlCallRecorder, LlmClient, RetryPolicy
+from goaly.harness.core.llm import (
+    BoundLlm,
+    BoundLlmClient,
+    CallTags,
+    JsonlCallRecorder,
+    LlmClient,
+    RetryPolicy,
+)
 from goaly.harness.core.llm_errors import (
     ClientError,
     ConnectionFailed,
@@ -115,7 +123,9 @@ async def test_sends_qwen_its_thinking_switch_and_recommended_sampling() -> None
 
 async def test_a_call_overrides_the_profile_field_by_field() -> None:
     gateway = Gateway(completion(), completion())
-    params = ModelParams(temperature=0.0, max_tokens=512, enable_thinking=False)
+    params = ModelParams(
+        temperature=0.0, max_tokens=512, presence_penalty=1.5, enable_thinking=False
+    )
     async with connect(gateway) as llm:
         await llm.complete([user("hi")], model=QWEN, tags=EXEC, params=params)
         await llm.complete(
@@ -130,17 +140,28 @@ async def test_a_call_overrides_the_profile_field_by_field() -> None:
         "top_p": 0.95,
         "top_k": 20,
         "max_tokens": 512,
+        "presence_penalty": 1.5,
         "chat_template_kwargs": {"enable_thinking": False},
     }
     assert second["chat_template_kwargs"] == {"enable_thinking": True, "preserve_thinking": True}
+    assert "presence_penalty" not in second  # Not sent unless set.
 
 
 async def test_sends_glm_no_thinking_parameter_and_no_sampling_defaults() -> None:
-    gateway = Gateway(completion())
+    gateway = Gateway(completion(), completion())
     async with connect(gateway) as llm:
         await llm.complete([user("hi")], model=GLM, tags=ANALYST)
+        await llm.complete(
+            [user("hi")], model=GLM, tags=ANALYST, params=ModelParams(max_tokens=30000)
+        )
 
-    assert gateway.bodies == [{"model": "glm-5.3", "messages": [{"role": "user", "content": "hi"}]}]
+    first, second = gateway.bodies
+    assert first == {
+        "model": "glm-5.3",
+        "messages": [{"role": "user", "content": "hi"}],
+        "max_tokens": 12000,
+    }
+    assert second["max_tokens"] == 30000  # A caller may ask for more.
 
 
 async def test_refuses_to_switch_glm_thinking_before_any_io() -> None:
@@ -187,9 +208,10 @@ async def test_sends_the_tools_as_given() -> None:
 @pytest.mark.parametrize("value", [object(), math.nan], ids=["not-json", "nan"])
 async def test_refuses_tools_that_are_not_json_before_any_io(value: object) -> None:
     gateway = Gateway()
+    not_json: Any = {"x": value}  # The wrong type is the point.
     async with connect(gateway) as llm:
         with pytest.raises(ValueError, match="JSON"):
-            await llm.complete([user("hi")], model=QWEN, tags=EXEC, tools=[{"x": value}])
+            await llm.complete([user("hi")], model=QWEN, tags=EXEC, tools=[not_json])
 
     assert gateway.requests == []
 
@@ -245,10 +267,14 @@ async def test_converts_each_kind_of_message() -> None:
         ),
         pytest.param('{"sql": "SELECT', "", "{}", id="unrepaired"),
         pytest.param("[1, 2]", "", "{}", id="not-an-object"),
+        pytest.param("", "", "{}", id="empty"),
+        # A repair stands in for a malformed original, so the original never goes back.
+        pytest.param('{"sql": "SELECT', '{"sql": "SELECT', "{}", id="repair-unparsable"),
+        pytest.param('{"sql": "SELECT', "[1]", "{}", id="repair-not-an-object"),
     ],
 )
 async def test_sends_back_tool_arguments_the_gateway_accepts(
-    written: str, repaired: str, sent: str
+    written: str, repaired: str, sent: str, caplog: pytest.LogCaptureFixture
 ) -> None:
     # The gateway answers 400 to a history holding arguments that are not JSON (2026-10-15).
     call = ToolCall(
@@ -260,6 +286,13 @@ async def test_sends_back_tool_arguments_the_gateway_accepts(
         await llm.complete(history, model=QWEN, tags=EXEC)
 
     assert gateway.bodies[0]["messages"][1]["tool_calls"][0]["function"]["arguments"] == sent
+    warnings = [
+        {key: getattr(entry, key) for key in ("event", "tool_call_id", "tool")}
+        for entry in caplog.records
+        if entry.levelno == logging.WARNING
+    ]
+    replaced = {"event": "llm_arguments_replaced", "tool_call_id": "c1", "tool": "execute_sql"}
+    assert warnings == ([replaced] if sent == "{}" else [])
 
 
 async def test_refuses_a_message_without_a_role_before_any_io() -> None:
@@ -267,6 +300,27 @@ async def test_refuses_a_message_without_a_role_before_any_io() -> None:
     async with connect(gateway) as llm:
         with pytest.raises(ValueError, match="role"):
             await llm.complete([ChatMessage(content="hi")], model=QWEN, tags=EXEC)
+
+    assert gateway.requests == []
+
+
+@pytest.mark.parametrize(
+    "message",
+    [
+        pytest.param(ChatMessage(role=TOOL, content="42"), id="tool-message-without-id"),
+        pytest.param(
+            ChatMessage(role=ASSISTANT, tool_calls=[ToolCall(name="execute_sql")]),
+            id="tool-call-without-id",
+        ),
+    ],
+)
+async def test_refuses_a_message_without_an_id_it_needs_before_any_io(
+    message: ChatMessage,
+) -> None:
+    gateway = Gateway()
+    async with connect(gateway) as llm:
+        with pytest.raises(ValueError, match="id"):
+            await llm.complete([user("hi"), message], model=QWEN, tags=EXEC)
 
     assert gateway.requests == []
 
@@ -389,9 +443,18 @@ async def test_reads_a_cost_in_exponent_notation() -> None:
     assert reply.usage.cost_usd == 4.7e-06
 
 
-@pytest.mark.parametrize("value", ["free", "-0.01", "nan", "inf"])
+@pytest.mark.parametrize(
+    ("value", "logged"),
+    [
+        ("free", "free"),
+        ("-0.01", "-0.01"),
+        ("nan", "nan"),
+        ("inf", "inf"),
+        pytest.param(f"key {KEY}", "key [redacted]", id="holds-the-key"),
+    ],
+)
 async def test_ignores_a_malformed_cost_with_a_warning(
-    value: str, caplog: pytest.LogCaptureFixture
+    value: str, logged: str, caplog: pytest.LogCaptureFixture
 ) -> None:
     gateway = Gateway(completion(cost=value))
     async with connect(gateway) as llm:
@@ -399,7 +462,12 @@ async def test_ignores_a_malformed_cost_with_a_warning(
 
     assert not reply.usage.HasField("cost_usd")
     (warning,) = [entry for entry in caplog.records if entry.levelno == logging.WARNING]
-    assert getattr(warning, "event", None) == "llm_bad_cost"
+    assert {key: getattr(warning, key) for key in ("event", "call_id", "model", "value")} == {
+        "event": "llm_bad_cost",
+        "call_id": reply.record.call_id,
+        "model": QWEN,
+        "value": logged,
+    }
 
 
 async def test_sums_the_cost_of_every_attempt() -> None:
@@ -439,6 +507,8 @@ async def test_counts_no_tokens_and_warns_when_no_usage_is_reported(
 
 TRANSIENT = [
     pytest.param(lambda: failure(429), RATE_LIMITED, 429, id="429"),
+    # LiteLLM answers 408 when its own upstream request timed out.
+    pytest.param(lambda: failure(408, "Request Timeout"), TIMEOUT, 408, id="408"),
     pytest.param(lambda: failure(500), SERVER_ERROR, 500, id="500"),
     pytest.param(lambda: failure(502), SERVER_ERROR, 502, id="502"),
     pytest.param(lambda: failure(503), SERVER_ERROR, 503, id="503"),
@@ -471,6 +541,7 @@ async def test_retries_a_transient_failure(
 
 GIVE_UP = [
     pytest.param(lambda: failure(429), RateLimited, RATE_LIMITED, 429, id="429"),
+    pytest.param(lambda: failure(408), TimedOut, TIMEOUT, 408, id="408"),
     pytest.param(lambda: failure(502), ServerError, SERVER_ERROR, 502, id="502"),
     pytest.param(lambda: httpx.ReadTimeout("timed out"), TimedOut, TIMEOUT, 0, id="timeout"),
     pytest.param(
@@ -509,17 +580,36 @@ async def test_retries_as_often_as_the_policy_says() -> None:
     assert len(gateway.requests) == 2
 
 
-async def test_backs_off_exponentially_up_to_the_cap() -> None:
-    clock = FakeClock()
+def test_the_retry_policy_defaults_are_the_specs() -> None:
+    policy = RetryPolicy()
+
+    assert (policy.timeout_s, policy.max_retries) == (300.0, 5)
+    assert (policy.backoff_base_s, policy.backoff_cap_s) == (1.0, 60.0)
+
+
+class RecordingJitter(random.Random):
+    """Jitter that notes each range it is asked to pick from, and picks its middle."""
+
+    def __init__(self) -> None:
+        super().__init__()
+        self.ranges: list[tuple[float, float]] = []
+
+    def uniform(self, a: float, b: float) -> float:
+        self.ranges.append((a, b))
+        return (a + b) / 2
+
+
+async def test_backs_off_with_full_jitter_below_a_doubling_ceiling() -> None:
+    clock, jitter = FakeClock(), RecordingJitter()
     gateway = Gateway(*(failure(503) for _ in range(9)))
-    async with connect(
-        gateway, clock=clock, retry=RetryPolicy(max_retries=8), rng=TopOfRange()
-    ) as llm:
+    async with connect(gateway, clock=clock, retry=RetryPolicy(max_retries=8), rng=jitter) as llm:
         with pytest.raises(ServerError):
             await llm.complete([user("hi")], model=QWEN, tags=EXEC)
 
-    # Base 1 s, doubling, capped at 60 s.
-    assert clock.sleeps == [1, 2, 4, 8, 16, 32, 60, 60]
+    # Anywhere from 0 to a ceiling that starts at 1 s, doubles, and stops at 60 s.
+    ceilings = [1.0, 2.0, 4.0, 8.0, 16.0, 32.0, 60.0, 60.0]
+    assert jitter.ranges == [(0.0, ceiling) for ceiling in ceilings]
+    assert clock.sleeps == [ceiling / 2 for ceiling in ceilings]
 
 
 async def test_backoff_jitter_is_full() -> None:
@@ -577,14 +667,25 @@ async def test_reads_retry_after_as_an_http_date(zone: str) -> None:
     assert reply.record.attempts[0].retry_after_s == slept
 
 
-async def test_a_retry_after_in_the_past_means_retry_at_once() -> None:
+@pytest.mark.parametrize(
+    "retry_after",
+    [
+        pytest.param("0", id="zero"),
+        pytest.param(
+            format_datetime(datetime.now(UTC) - timedelta(minutes=5), usegmt=True), id="past"
+        ),
+    ],
+)
+async def test_a_retry_after_shorter_than_the_backoff_still_waits_the_backoff(
+    retry_after: str,
+) -> None:
     clock = FakeClock()
-    moment = datetime.now(UTC) - timedelta(minutes=5)
-    gateway = Gateway(failure(429, retry_after=format_datetime(moment, usegmt=True)), completion())
-    async with connect(gateway, clock=clock) as llm:
-        await llm.complete([user("hi")], model=QWEN, tags=EXEC)
+    gateway = Gateway(failure(429, retry_after=retry_after), completion())
+    async with connect(gateway, clock=clock, rng=TopOfRange()) as llm:
+        reply = await llm.complete([user("hi")], model=QWEN, tags=EXEC)
 
-    assert clock.sleeps == []
+    assert clock.sleeps == [1.0]  # The first retry's jitter, at the top of its range.
+    assert reply.record.attempts[0].retry_after_s == 0.0
 
 
 async def test_waits_no_longer_than_the_cap_whatever_retry_after_says() -> None:
@@ -610,8 +711,9 @@ async def test_backs_off_with_jitter_when_retry_after_is_malformed(value: str) -
 
 async def test_the_system_clock_really_waits() -> None:
     gateway = Gateway(failure(429, retry_after="0.05"), completion())
+    retry = RetryPolicy(backoff_base_s=0.01)  # So the 0.05 s of Retry-After is the longer wait.
     async with LlmClient(
-        settings(), Recorder(), transport=httpx.MockTransport(gateway.handle)
+        settings(), Recorder(), retry=retry, transport=httpx.MockTransport(gateway.handle)
     ) as llm:
         reply = await llm.complete([user("hi")], model=QWEN, tags=EXEC)
 
@@ -688,7 +790,6 @@ async def test_raises_context_overflow_without_retrying(message: str) -> None:
         (400, "Assistant tool call function.arguments must be valid JSON."),
         (401, "Authentication Error"),
         (404, "Not Found"),
-        (408, "Request Timeout"),
         (422, "Unprocessable Entity"),
     ],
 )
@@ -701,6 +802,23 @@ async def test_raises_client_error_without_retrying(status: int, message: str) -
     assert len(gateway.requests) == 1
     assert raised.value.record is not None
     assert attempts(raised.value.record) == [(CLIENT_ERROR, status)]
+
+
+async def test_a_request_httpx_refuses_to_send_is_not_retried_or_quoted(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    # h11's error for an illegal header quotes the header, which holds the key.
+    refused = httpx.LocalProtocolError(f"Illegal header value b'Bearer {KEY}\\n'")
+    gateway = Gateway(refused, completion())
+    async with connect(gateway) as llm:
+        with pytest.raises(ClientError, match="refused to send the request") as raised:
+            await llm.complete([user("hi")], model=QWEN, tags=EXEC)
+
+    assert len(gateway.requests) == 1
+    assert raised.value.record is not None
+    assert attempts(raised.value.record) == [(CLIENT_ERROR, 0)]
+    assert KEY not in str(raised.value)
+    assert all(KEY not in JsonFormatter().format(entry) for entry in caplog.records)
 
 
 INVALID = [
@@ -804,6 +922,23 @@ async def test_cancellation_propagates_at_once_and_is_recorded() -> None:
     assert len(gateway.requests) == 1
 
 
+async def test_a_callers_deadline_cancels_the_call_and_leaves_one_record() -> None:
+    recorder = Recorder()
+    gateway = Gateway(hang)
+    async with connect(gateway, recorder=recorder) as llm:
+
+        async def within_budget() -> None:  # As T05's agent loop enforces its time budget.
+            async with asyncio.timeout(0.05):
+                await llm.complete([user("hi")], model=QWEN, tags=EXEC)
+
+        with pytest.raises(TimeoutError):
+            await within_budget()
+
+    (record,) = recorder.records
+    assert attempts(record) == [(CANCELLED, 0)]
+    assert record.status == CANCELLED
+
+
 async def test_a_call_cancelled_during_its_backoff_is_not_retried() -> None:
     recorder, backing_off = Recorder(), asyncio.Event()
 
@@ -826,6 +961,65 @@ async def test_a_call_cancelled_during_its_backoff_is_not_retried() -> None:
     assert len(gateway.requests) == 1
 
 
+# Binding a model and tags (spec ruling V3): what a task's agent loop gets.
+
+
+async def test_a_bound_client_calls_its_model_with_its_tags() -> None:
+    recorder = Recorder()
+    gateway = Gateway(completion())
+    async with connect(gateway, recorder=recorder) as llm:
+        bound: BoundLlm = llm.bind(model=QWEN, tags=EXEC)
+        reply = await bound.complete(
+            [user("hi")], tools=[SQL_TOOL], params=ModelParams(max_tokens=512)
+        )
+
+    record = reply.record
+    assert (record.model, record.purpose) == (QWEN, CallPurpose.CALL_PURPOSE_EXEC)
+    assert (record.run_id, record.instance_id, record.seed) == ("run-1", "task-7", 2)
+    assert recorder.records == [record]
+    (body,) = gateway.bodies
+    assert (body["model"], body["max_tokens"], body["tools"]) == (QWEN, 512, [SQL_TOOL])
+
+
+def test_a_bound_client_offers_no_way_to_choose_its_purpose_or_model() -> None:
+    public = [name for name in dir(BoundLlmClient) if not name.startswith("_")]
+    parameters = list(inspect.signature(BoundLlmClient.complete).parameters)
+
+    assert public == ["complete"]
+    assert parameters == ["self", "messages", "tools", "params"]
+
+
+@pytest.mark.parametrize(
+    ("model", "tags"),
+    [pytest.param(GLM, EXEC, id="exec-glm"), pytest.param(QWEN, ANALYST, id="analyst-qwen")],
+)
+async def test_binding_a_pair_the_allowlist_refuses_raises_before_any_io(
+    model: str, tags: CallTags
+) -> None:
+    gateway, recorder = Gateway(), Recorder()
+    async with connect(gateway, recorder=recorder) as llm:
+        with pytest.raises(ModelNotAllowed, match=f"may not call {model}"):
+            llm.bind(model=model, tags=tags)
+
+    assert (gateway.requests, recorder.records) == ([], [])
+
+
+async def test_bound_clients_call_through_the_one_client_that_bound_them() -> None:
+    recorder = Recorder()
+    gateway = Gateway(completion(), completion())
+    llm = connect(gateway, recorder=recorder)
+    first = llm.bind(model=QWEN, tags=EXEC)
+    second = llm.bind(model=QWEN, tags=CallTags(CallPurpose.CALL_PURPOSE_EXEC, instance_id="x"))
+    await first.complete([user("hi")])
+    await second.complete([user("hi")])
+
+    await llm.aclose()  # Its connections are theirs too: neither has any of its own.
+    with pytest.raises(RuntimeError, match="closed"):
+        await first.complete([user("hi")])
+
+    assert [record.instance_id for record in recorder.records] == ["task-7", "x", "task-7"]
+
+
 # The model allowlist.
 
 
@@ -837,6 +1031,8 @@ async def test_a_call_cancelled_during_its_backoff_is_not_retried() -> None:
         pytest.param(QWEN, CallTags(CallPurpose.CALL_PURPOSE_RSI_IMPL), id="impl-qwen"),
         pytest.param("gpt-4o", EXEC, id="exec-other"),
         pytest.param(QWEN, CallTags(CallPurpose.CALL_PURPOSE_UNSPECIFIED), id="no-purpose"),
+        # A value no CallPurpose has, as only a cast can make one.
+        pytest.param(QWEN, CallTags(CallPurpose.ValueType(99), seed=1), id="unknown-purpose"),
     ],
 )
 async def test_refuses_a_model_the_purpose_may_not_use_before_any_io(
@@ -851,11 +1047,17 @@ async def test_refuses_a_model_the_purpose_may_not_use_before_any_io(
     assert recorder.records == []
     assert raised.value.record is None
     (warning,) = [entry for entry in caplog.records if entry.levelno == logging.WARNING]
-    assert getattr(warning, "event", None) == "llm_model_not_allowed"
-    assert (getattr(warning, "model", None), getattr(warning, "purpose", None)) == (
-        model,
-        CallPurpose.Name(tags.purpose),
-    )
+    fields = ["event", "model", "purpose", "run_id", "instance_id", "seed"]
+    purpose = "99" if tags.purpose == 99 else CallPurpose.Name(tags.purpose)
+    assert {key: getattr(warning, key) for key in fields} == {
+        "event": "llm_model_not_allowed",
+        "model": model,
+        "purpose": purpose,
+        "run_id": tags.run_id,
+        "instance_id": tags.instance_id,
+        "seed": tags.seed,
+    }
+    assert str(raised.value).startswith(f"{purpose} may not call {model}")
 
 
 # Records.
@@ -927,6 +1129,63 @@ async def test_a_bug_still_leaves_exactly_one_record() -> None:
     assert len(record.attempts) == 1
 
 
+class BrokenRecorder:
+    """A CallRecorder that breaks the rule that it must not raise."""
+
+    def record(self, record: LlmCallRecord) -> None:
+        raise OSError("disk full")
+
+
+def broken_recorder_client(gateway: Gateway) -> LlmClient:
+    return LlmClient(
+        settings(),
+        BrokenRecorder(),
+        transport=httpx.MockTransport(gateway.handle),
+        clock=FakeClock(),
+    )
+
+
+async def test_a_failing_recorder_loses_the_record_but_not_the_reply(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    gateway = Gateway(completion())
+    async with broken_recorder_client(gateway) as llm:
+        reply = await llm.complete([user("hi")], model=QWEN, tags=EXEC)
+
+    assert reply.message.content == "391"
+    (lost,) = [
+        entry for entry in caplog.records if getattr(entry, "event", None) == "llm_record_lost"
+    ]
+    assert lost.levelno == logging.ERROR
+    assert {key: getattr(lost, key) for key in ("model", "call_id")} == {
+        "model": QWEN,
+        "call_id": reply.record.call_id,
+    }
+
+
+async def test_a_failing_recorder_hides_no_error_of_the_call() -> None:
+    gateway = Gateway(failure(400, "bad request"))
+    async with broken_recorder_client(gateway) as llm:
+        with pytest.raises(ClientError, match="bad request"):
+            await llm.complete([user("hi")], model=QWEN, tags=EXEC)
+
+
+async def test_a_failing_recorder_hides_no_cancellation() -> None:
+    arrived = asyncio.Event()
+
+    async def hold(request: httpx.Request) -> httpx.Response:
+        arrived.set()
+        return await hang(request)
+
+    gateway = Gateway(hold)
+    async with broken_recorder_client(gateway) as llm:
+        task = asyncio.create_task(llm.complete([user("hi")], model=QWEN, tags=EXEC))
+        await arrived.wait()
+        task.cancel()
+        with pytest.raises(asyncio.CancelledError):
+            await task
+
+
 async def test_jsonl_recorder_appends_one_line_per_call(tmp_path: Path) -> None:
     path = tmp_path / "calls.jsonl"
     gateway = Gateway(completion(), failure(400, "bad request"))
@@ -963,6 +1222,8 @@ async def test_the_key_is_in_no_error_log_line_repr_or_record(
             *(to_json_line(record) for record in recorder.records),
         ]
 
-    assert len(caplog.records) >= 2  # Both backoffs were logged, with what the gateway said.
+    # Both backoffs were logged, with what the gateway said; httpx logs its own lines too.
+    backoffs = [entry for entry in caplog.records if getattr(entry, "event", None) == "llm_backoff"]
+    assert len(backoffs) == 2
     assert all(KEY not in text for text in texts)
     assert "Received API Key = [redacted]" in str(raised.value)

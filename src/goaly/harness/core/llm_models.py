@@ -62,6 +62,8 @@ class ModelParams(BaseModel):
     top_p: float | None = Field(default=None, gt=0, le=1)
     top_k: int | None = Field(default=None, ge=1)
     max_tokens: int | None = Field(default=None, ge=1)
+    # Discourages repeating what is already in the text; a pack may tune it, as core sets none.
+    presence_penalty: float | None = Field(default=None, ge=-2, le=2)
     # Qwen only: whether the model thinks before it answers.
     enable_thinking: bool | None = None
     # Qwen only: whether the chat template keeps the reasoning of earlier turns in the prompt.
@@ -103,5 +105,7 @@ QWEN_PROFILE: Final = ModelProfile(
         temperature=0.6, top_p=0.95, top_k=20, max_tokens=16384, enable_thinking=True
     ),
 )
-GLM_PROFILE: Final = ModelProfile(model=IMPROVEMENT_MODEL)
+# For GLM, just a max_tokens: 12K tokens take about 270 s at 45 tokens/s, its speed per call under
+# load (spec §6.2), so a reply fits in one 300 s attempt. A call may ask for more.
+GLM_PROFILE: Final = ModelProfile(model=IMPROVEMENT_MODEL, params=ModelParams(max_tokens=12000))
 DEFAULT_PROFILES: Final = (QWEN_PROFILE, GLM_PROFILE)
