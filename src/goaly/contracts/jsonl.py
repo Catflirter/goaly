@@ -86,8 +86,8 @@ def from_json_line[M: Message](line: str, message_type: type[M]) -> M:
 
     Raises ``json_format.ParseError`` if the line is not a JSON object for ``message_type``.
     """
-    # protobuf alone reads a JSON string or a list of strings as unknown field names, and
-    # returns an empty message.
+    # protobuf alone treats the items of a JSON string or list as an object's keys and ignores
+    # those that are not field names, so "x" or ["db_id"] comes back as an empty message.
     if not line.lstrip(_JSON_WHITESPACE).startswith("{"):
         raise json_format.ParseError("expected a JSON object")
     return json_format.Parse(line, message_type(), ignore_unknown_fields=True)

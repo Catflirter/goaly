@@ -274,9 +274,9 @@ def test_ignores_unknown_fields_at_any_depth() -> None:
 @pytest.mark.parametrize(
     "line",
     [
-        # protobuf alone would read these two as an empty message.
+        # protobuf alone reads these three as an empty message: no item is a field name.
         '"instance_id"',
-        '["instance_id"]',
+        '["db_id"]',
         "[]",
         "7",
         "null",
