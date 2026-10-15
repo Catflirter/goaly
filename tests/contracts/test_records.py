@@ -485,18 +485,23 @@ def test_lane_events_are_appended_to_lane_events_jsonl_and_read_back(tmp_path: P
     lane, kind = Lane.LANE_EFFISQL, LaneEventKind
     pr_opened = "effisql: results PR #12 is open"
     events = [
-        LaneEvent(lane=lane, occurred_at=at(16, 0), kind=kind.LANE_EVENT_KIND_STARTED),
+        LaneEvent(
+            lane=lane,
+            occurred_at=at(16, 0),
+            kind=kind.LANE_EVENT_KIND_STARTED,
+            deadline_at=at(23, 59),  # Absolute, from config: a restart never moves it.
+        ),
         LaneEvent(
             lane=lane,
             occurred_at=at(17, 31),
-            kind=kind.LANE_EVENT_KIND_CRASHED,
-            detail="RuntimeError: the ledger's last line does not parse",
+            kind=kind.LANE_EVENT_KIND_CRASHED,  # The supervisor writes the cause here.
+            detail="killed after 10 minutes without a heartbeat",
         ),
         LaneEvent(
             lane=lane,
             occurred_at=at(17, 32),
-            kind=kind.LANE_EVENT_KIND_RESTARTED,
-            detail="killed after 10 minutes without a heartbeat; restarted after 30 s",
+            kind=kind.LANE_EVENT_KIND_RESTARTED,  # Only the backoff: the cause is the crash's.
+            detail="restarted after a 30 s backoff",
         ),
         LaneEvent(
             lane=lane,

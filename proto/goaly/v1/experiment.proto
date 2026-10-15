@@ -475,6 +475,9 @@ message LaneEvent {
   // For LANE_EVENT_KIND_NOTIFIED and LANE_EVENT_KIND_NOTIFY_FAILED: the notification's ID, which
   // ties a NOTIFY_FAILED to the NOTIFIED of its later delivery; empty for other kinds.
   string notification_id = 10;
+  // For LANE_EVENT_KIND_STARTED: the lane's deadline, an absolute time from config that a restart
+  // never moves (spec §8.4); absent for other kinds.
+  google.protobuf.Timestamp deadline_at = 11;
 }
 
 // What happened to a lane (spec §8.4, §8.7).
@@ -482,12 +485,13 @@ enum LaneEventKind {
   // Not set.
   LANE_EVENT_KIND_UNSPECIFIED = 0;
   // The lane started: the first time, or when a new goaly rsi run resumed it from the ledger,
-  // as after the workspace stopped. The lane's time budget counts from its first start.
+  // as after the workspace stopped. deadline_at records the lane's deadline.
   LANE_EVENT_KIND_STARTED = 1;
-  // The supervisor restarted the lane after it crashed; detail says how it crashed.
+  // The supervisor restarted the lane after a LANE_EVENT_KIND_CRASHED; detail gives only the
+  // backoff it waited, since the crash event holds the cause.
   LANE_EVENT_KIND_RESTARTED = 2;
-  // The lane crashed too often for automatic recovery, so the supervisor stopped it and notified
-  // the project lead.
+  // Automatic recovery failed, at 5 LANE_EVENT_KIND_CRASHED events within an hour (spec §8.7), so
+  // the supervisor stopped the lane and notified the project lead.
   LANE_EVENT_KIND_RECOVERY_FAILED = 3;
   // The lane stopped by a stopping rule (spec §8.4); detail names the rule.
   LANE_EVENT_KIND_STOPPED = 4;
@@ -497,7 +501,8 @@ enum LaneEventKind {
   LANE_EVENT_KIND_NOTIFIED = 6;
   // A notification could not be delivered; it is retried.
   LANE_EVENT_KIND_NOTIFY_FAILED = 7;
-  // The lane crashed, or a start failed the supervisor's preflight checks, which counts as a crash
-  // (spec §8.7); detail says how.
+  // The supervisor counted the lane as crashed (spec §8.7): its process died, its heartbeat was 10
+  // minutes old so it was killed, or a start failed the preflight checks. The supervisor writes
+  // it, since a killed lane cannot, and detail gives the cause. Recovery counts these events.
   LANE_EVENT_KIND_CRASHED = 8;
 }

@@ -390,13 +390,15 @@ class _LaneEventKindEnumTypeWrapper(_enum_type_wrapper._EnumTypeWrapper[_LaneEve
     """Not set."""
     LANE_EVENT_KIND_STARTED: _LaneEventKind.ValueType  # 1
     """The lane started: the first time, or when a new goaly rsi run resumed it from the ledger,
-    as after the workspace stopped. The lane's time budget counts from its first start.
+    as after the workspace stopped. deadline_at records the lane's deadline.
     """
     LANE_EVENT_KIND_RESTARTED: _LaneEventKind.ValueType  # 2
-    """The supervisor restarted the lane after it crashed; detail says how it crashed."""
+    """The supervisor restarted the lane after a LANE_EVENT_KIND_CRASHED; detail gives only the
+    backoff it waited, since the crash event holds the cause.
+    """
     LANE_EVENT_KIND_RECOVERY_FAILED: _LaneEventKind.ValueType  # 3
-    """The lane crashed too often for automatic recovery, so the supervisor stopped it and notified
-    the project lead.
+    """Automatic recovery failed, at 5 LANE_EVENT_KIND_CRASHED events within an hour (spec §8.7), so
+    the supervisor stopped the lane and notified the project lead.
     """
     LANE_EVENT_KIND_STOPPED: _LaneEventKind.ValueType  # 4
     """The lane stopped by a stopping rule (spec §8.4); detail names the rule."""
@@ -407,8 +409,9 @@ class _LaneEventKindEnumTypeWrapper(_enum_type_wrapper._EnumTypeWrapper[_LaneEve
     LANE_EVENT_KIND_NOTIFY_FAILED: _LaneEventKind.ValueType  # 7
     """A notification could not be delivered; it is retried."""
     LANE_EVENT_KIND_CRASHED: _LaneEventKind.ValueType  # 8
-    """The lane crashed, or a start failed the supervisor's preflight checks, which counts as a crash
-    (spec §8.7); detail says how.
+    """The supervisor counted the lane as crashed (spec §8.7): its process died, its heartbeat was 10
+    minutes old so it was killed, or a start failed the preflight checks. The supervisor writes
+    it, since a killed lane cannot, and detail gives the cause. Recovery counts these events.
     """
 
 class LaneEventKind(_LaneEventKind, metaclass=_LaneEventKindEnumTypeWrapper):
@@ -418,13 +421,15 @@ LANE_EVENT_KIND_UNSPECIFIED: LaneEventKind.ValueType  # 0
 """Not set."""
 LANE_EVENT_KIND_STARTED: LaneEventKind.ValueType  # 1
 """The lane started: the first time, or when a new goaly rsi run resumed it from the ledger,
-as after the workspace stopped. The lane's time budget counts from its first start.
+as after the workspace stopped. deadline_at records the lane's deadline.
 """
 LANE_EVENT_KIND_RESTARTED: LaneEventKind.ValueType  # 2
-"""The supervisor restarted the lane after it crashed; detail says how it crashed."""
+"""The supervisor restarted the lane after a LANE_EVENT_KIND_CRASHED; detail gives only the
+backoff it waited, since the crash event holds the cause.
+"""
 LANE_EVENT_KIND_RECOVERY_FAILED: LaneEventKind.ValueType  # 3
-"""The lane crashed too often for automatic recovery, so the supervisor stopped it and notified
-the project lead.
+"""Automatic recovery failed, at 5 LANE_EVENT_KIND_CRASHED events within an hour (spec §8.7), so
+the supervisor stopped the lane and notified the project lead.
 """
 LANE_EVENT_KIND_STOPPED: LaneEventKind.ValueType  # 4
 """The lane stopped by a stopping rule (spec §8.4); detail names the rule."""
@@ -435,8 +440,9 @@ LANE_EVENT_KIND_NOTIFIED: LaneEventKind.ValueType  # 6
 LANE_EVENT_KIND_NOTIFY_FAILED: LaneEventKind.ValueType  # 7
 """A notification could not be delivered; it is retried."""
 LANE_EVENT_KIND_CRASHED: LaneEventKind.ValueType  # 8
-"""The lane crashed, or a start failed the supervisor's preflight checks, which counts as a crash
-(spec §8.7); detail says how.
+"""The supervisor counted the lane as crashed (spec §8.7): its process died, its heartbeat was 10
+minutes old so it was killed, or a start failed the preflight checks. The supervisor writes
+it, since a killed lane cannot, and detail gives the cause. Recovery counts these events.
 """
 Global___LaneEventKind: _TypeAlias = LaneEventKind  # noqa: Y015
 
@@ -1195,6 +1201,7 @@ class LaneEvent(_message.Message):
     EXPERIMENT_IDS_FIELD_NUMBER: _builtins.int
     NOTIFICATION_FIELD_NUMBER: _builtins.int
     NOTIFICATION_ID_FIELD_NUMBER: _builtins.int
+    DEADLINE_AT_FIELD_NUMBER: _builtins.int
     lane: Global___Lane.ValueType
     """The lane."""
     kind: Global___LaneEventKind.ValueType
@@ -1233,6 +1240,12 @@ class LaneEvent(_message.Message):
         empty for other kinds.
         """
 
+    @_builtins.property
+    def deadline_at(self) -> _timestamp_pb2.Timestamp:
+        """For LANE_EVENT_KIND_STARTED: the lane's deadline, an absolute time from config that a restart
+        never moves (spec §8.4); absent for other kinds.
+        """
+
     def __init__(
         self,
         *,
@@ -1246,10 +1259,11 @@ class LaneEvent(_message.Message):
         experiment_ids: _abc.Iterable[_builtins.str] | None = ...,
         notification: _builtins.str = ...,
         notification_id: _builtins.str = ...,
+        deadline_at: _timestamp_pb2.Timestamp | None = ...,
     ) -> None: ...
-    _HasFieldArgType: _TypeAlias = _typing.Literal["occurred_at", b"occurred_at"]  # noqa: Y015
+    _HasFieldArgType: _TypeAlias = _typing.Literal["deadline_at", b"deadline_at", "occurred_at", b"occurred_at"]  # noqa: Y015
     def HasField(self, field_name: _HasFieldArgType) -> _builtins.bool: ...
-    _ClearFieldArgType: _TypeAlias = _typing.Literal["detail", b"detail", "experiment_ids", b"experiment_ids", "head_commit", b"head_commit", "kind", b"kind", "lane", b"lane", "notification", b"notification", "notification_id", b"notification_id", "occurred_at", b"occurred_at", "pr_number", b"pr_number", "pr_url", b"pr_url"]  # noqa: Y015
+    _ClearFieldArgType: _TypeAlias = _typing.Literal["deadline_at", b"deadline_at", "detail", b"detail", "experiment_ids", b"experiment_ids", "head_commit", b"head_commit", "kind", b"kind", "lane", b"lane", "notification", b"notification", "notification_id", b"notification_id", "occurred_at", b"occurred_at", "pr_number", b"pr_number", "pr_url", b"pr_url"]  # noqa: Y015
     def ClearField(self, field_name: _ClearFieldArgType) -> None: ...
     def WhichOneof(self, oneof_group: _Never) -> None: ...
 
