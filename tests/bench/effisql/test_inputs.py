@@ -213,6 +213,49 @@ def test_the_schema_text_does_not_depend_on_the_snapshot_order() -> None:
         )
 
 
+LINEITEM_INDEX = "CREATE INDEX lineitem_l_orderkey_idx ON public.lineitem USING btree (l_orderkey)"
+LINEITEM_PKEY = (
+    "CREATE UNIQUE INDEX lineitem_pkey ON public.lineitem USING btree (l_orderkey, l_linenumber)"
+)
+ORDERS_PKEY = "CREATE UNIQUE INDEX orders_pkey ON public.orders USING btree (o_orderkey)"
+
+
+def test_an_index_the_ddl_creates_is_listed_once() -> None:
+    text = render_schema(snapshot(ddl=f"{ORDERS_DDL}\n\n{LINEITEM_DDL}\n\n{LINEITEM_INDEX};\n"))
+
+    assert text.count("lineitem_l_orderkey_idx") == 1
+    assert text.endswith(f"-- Indexes:\n{LINEITEM_PKEY};\n{ORDERS_PKEY};\n")
+
+
+def test_an_index_in_the_ddl_is_found_whatever_its_spacing_or_case() -> None:
+    spaced = (
+        "create index lineitem_l_orderkey_idx\n  on public.lineitem\n  using btree (l_orderkey) ;"
+    )
+    ddl = f"{ORDERS_DDL}\n\n{spaced}\n"
+
+    text = render_schema(snapshot(ddl=ddl))
+
+    assert text.count("lineitem_l_orderkey_idx") == 1
+    assert text.endswith(f"-- Indexes:\n{LINEITEM_PKEY};\n{ORDERS_PKEY};\n")
+
+
+def test_an_index_whose_name_starts_another_in_the_ddl_is_still_listed() -> None:
+    ddl = f"{ORDERS_DDL}\n\n{ORDERS_PKEY.replace('orders_pkey', 'orders_pkey_old')};\n"
+
+    text = render_schema(snapshot(ddl=ddl))
+
+    assert text.endswith(f"-- Indexes:\n{LINEITEM_INDEX};\n{LINEITEM_PKEY};\n{ORDERS_PKEY};\n")
+
+
+def test_when_the_ddl_creates_every_index_the_list_says_so() -> None:
+    ddl = f"{ORDERS_DDL}\n\n{ORDERS_PKEY};\n{LINEITEM_PKEY};\n{LINEITEM_INDEX};\n"
+
+    text = render_schema(snapshot(ddl=ddl))
+
+    assert text.endswith("--   orders: 4,500,000\n\n-- Indexes: all in the DDL above\n")
+    assert text.count("CREATE") == 4
+
+
 def test_a_schema_without_indexes_says_so() -> None:
     text = render_schema(snapshot(tables=[table(indexes=[])]))
 

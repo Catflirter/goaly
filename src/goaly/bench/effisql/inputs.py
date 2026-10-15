@@ -148,14 +148,21 @@ def render_schema(snapshot: SchemaSnapshot) -> str:
     """Return the schema text the agent reads (spec §4.1): the DDL, the row counts and indexes.
 
     Tables and each table's indexes are listed by name, so the text depends only on what the
-    snapshot holds, not on the order the setup wrote it in.
+    snapshot holds, not on the order the setup wrote it in. An index whose statement the DDL
+    already holds, whatever its spacing or case, is not listed again.
     """
     tables = sorted(snapshot.tables, key=lambda table: table.name)
-    indexes = [
-        f"{index.definition.strip().removesuffix(';')};"
+    definitions = [
+        index.definition.strip().removesuffix(";").rstrip()
         for table in tables
         for index in sorted(table.indexes, key=lambda index: index.name)
     ]
+    ddl = _normalized(snapshot.ddl)
+    statements = [f"{sql};" for sql in definitions if _normalized(sql) not in ddl]
+    if statements:
+        indexes = ["-- Indexes:", *statements]
+    else:
+        indexes = ["-- Indexes: all in the DDL above" if definitions else "-- Indexes: none"]
     lines = [
         f"-- Database {snapshot.db} on PostgreSQL {snapshot.server_version}.",
         "",
@@ -164,9 +171,14 @@ def render_schema(snapshot: SchemaSnapshot) -> str:
         "-- Rows per table:",
         *(f"--   {table.name}: {table.row_count:,}" for table in tables),
         "",
-        *(["-- Indexes:", *indexes] if indexes else ["-- Indexes: none"]),
+        *indexes,
     ]
     return "\n".join(lines) + "\n"
+
+
+def _normalized(sql: str) -> str:
+    """Return ``sql`` with its whitespace collapsed and in lower case, to compare statements."""
+    return " ".join(sql.split()).lower()
 
 
 def agent_input(
