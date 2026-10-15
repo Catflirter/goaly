@@ -57,13 +57,14 @@ message SweTaskInput {
   string repo = 1;
   // The commit that /testbed is checked out at.
   string base_commit = 2;
-  // The Python script whose run time is measured.
+  // The source text of the workload script, whose run time is measured.
   string workload = 3;
   // The command that runs the repository's tests.
   string test_cmd = 4;
   // The command that rebuilds the package after the code changes, e.g. to compile extensions.
   string rebuild_cmd = 5;
-  // The test files the dataset lists as covering the task, as paths inside the container.
+  // The test files that cover the task, as the dataset lists them: paths under /testbed for
+  // some tasks, paths relative to the repository for others. T13 normalizes them.
   repeated string covering_tests = 6;
 }
 

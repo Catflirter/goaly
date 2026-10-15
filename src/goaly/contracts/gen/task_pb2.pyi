@@ -192,14 +192,16 @@ class SweTaskInput(_message.Message):
     base_commit: _builtins.str
     """The commit that /testbed is checked out at."""
     workload: _builtins.str
-    """The Python script whose run time is measured."""
+    """The source text of the workload script, whose run time is measured."""
     test_cmd: _builtins.str
     """The command that runs the repository's tests."""
     rebuild_cmd: _builtins.str
     """The command that rebuilds the package after the code changes, e.g. to compile extensions."""
     @_builtins.property
     def covering_tests(self) -> _containers.RepeatedScalarFieldContainer[_builtins.str]:
-        """The test files the dataset lists as covering the task, as paths inside the container."""
+        """The test files that cover the task, as the dataset lists them: paths under /testbed for
+        some tasks, paths relative to the repository for others. T13 normalizes them.
+        """
 
     def __init__(
         self,
