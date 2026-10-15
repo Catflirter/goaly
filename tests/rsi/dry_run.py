@@ -17,6 +17,7 @@ accepts once and then stops after 4 rounds without an accepted change.
 
 import asyncio
 import concurrent.futures
+import functools
 import json
 import threading
 import time
@@ -30,6 +31,8 @@ from typing import Any
 import httpx
 from pydantic import SecretStr
 
+from goaly.bench.effisql.data import EffiSqlInstance
+from goaly.bench.effisql.grading_pool import GRADING_INSTANCES, GradingInstance, Priority
 from goaly.contracts.gen.experiment_pb2 import LANE_EFFISQL, GuardResult, LaneEventKind
 from goaly.harness.core.llm import LlmClient
 from goaly.harness.core.settings import Settings
@@ -42,6 +45,7 @@ from goaly.rsi.implementer.smoke import mentions_smoke
 from goaly.rsi.lane import LaneHooks, StopInfo
 from goaly.rsi.ledger import Ledger
 from goaly.rsi.lessons import LessonStore
+from goaly.rsi.probe import probe
 from goaly.rsi.round import RoundDeps
 from goaly.rsi.smoke import EvaluatorSmokeRunner
 from goaly.rsi.usage import CallTally
@@ -177,9 +181,30 @@ async def dry_run(settings: Any) -> AsyncIterator[DryRun]:
                 usage=tally.usage,
             )
             hooks = LaneHooks(
-                results_pr=_hook(repo, "results_pr", ledger), notify=_hook(repo, "notify", ledger)
+                results_pr=_hook(repo, "results_pr", ledger),
+                notify=_hook(repo, "notify", ledger),
+                identity_probe=functools.partial(
+                    probe, FakeGrader(), PROBE_TASK, GRADING_INSTANCES
+                ),
             )
             yield DryRun(deps, hooks, evaluator, glm, agents)
+
+
+PROBE_TASK = EffiSqlInstance.model_validate(
+    {"id": TRAIN[5], "db": "tpch", "base_sql": "SELECT 1", "base_time": 10_000}
+)
+
+
+class FakeGrader:
+    """T10's identity probe, on instances that time as at setup, except grade-3, 20% off."""
+
+    async def identity_probe(
+        self, inst: EffiSqlInstance, *, instance: GradingInstance, priority: Priority = Priority.RSI
+    ) -> float:
+        return 1.2 if instance.name == "grade-3" else 1.0
+
+    def identity_reference(self, inst: EffiSqlInstance) -> float | None:
+        return 1.0
 
 
 def write_config(tmp_path: Path, deadline: datetime) -> tuple[Path, Path]:

@@ -43,6 +43,7 @@ from goaly.contracts.gen.experiment_pb2 import (
 )
 from goaly.rsi.lanes import lane_info
 from goaly.rsi.locks import file_lock
+from goaly.rsi.probe import ProbeReading
 from goaly.rsi.resume import abort_experiments, reconcile_best, remove_worktrees
 from goaly.rsi.round import RoundConfig, RoundDeps, RoundOutcome, RoundRunner
 
@@ -100,6 +101,10 @@ async def _after_nothing(_: RoundOutcome) -> None:
     return None
 
 
+async def _no_probe() -> list[ProbeReading]:
+    return []
+
+
 @dataclass(frozen=True)
 class LaneHooks:
     """What the lane calls besides its rounds (T22). A stopping lane calls the final results PR,
@@ -110,6 +115,8 @@ class LaneHooks:
 
     results_pr: Hook = _nothing
     notify: Hook = _nothing
+    # The identity probes of the grading instances, once per round before its validations.
+    identity_probe: Callable[[], Awaitable[Sequence[ProbeReading]]] = _no_probe
     after_round: Callable[[RoundOutcome], Awaitable[None]] = _after_nothing
     running: Callable[[], AbstractAsyncContextManager[None]] = contextlib.nullcontext
     remove_containers: Callable[[], object] = lambda: 0  # Leftover sandboxes, at a start.
@@ -127,6 +134,7 @@ class RoundEntry(BaseModel):
     aborted: int = 0
     skipped: str = ""
     infrastructure: bool = False
+    probes: tuple[ProbeReading, ...] = ()  # A started round's identity probes (spec §6.2).
     at: AwareDatetime
 
 
@@ -237,7 +245,8 @@ class LaneRunner:
             if state.without_accept >= limit:
                 detail = f"{state.without_accept} rounds in a row accepted no change"
                 return await self._stop(NO_ACCEPTED_CHANGE, detail)
-            round_no, resume = await asyncio.to_thread(self._next_round, state)
+            probes = await self._probe() if state.unfinished is None else []
+            round_no, resume = await asyncio.to_thread(self._next_round, state, probes)
             outcome = await self._until_deadline(self._rounds.run(round_no, resume=resume))
             if outcome is None:
                 return await self._stop(DEADLINE, f"the deadline came during round {round_no}")
@@ -290,7 +299,9 @@ class LaneRunner:
         rounds = [r.round for r in self._deps.ledger.latest_experiments(self._deps.lane).values()]
         return self._log.state(rounds)
 
-    def _next_round(self, state: LaneState) -> tuple[int, list[ExperimentRecord]]:
+    def _next_round(
+        self, state: LaneState, probes: Sequence[ProbeReading]
+    ) -> tuple[int, list[ExperimentRecord]]:
         if state.unfinished is not None:
             records = [
                 record
@@ -300,7 +311,12 @@ class LaneRunner:
             _logger.warning("resuming round %d with %d experiments", state.unfinished, len(records))
             return state.unfinished, records
         self._log.append(
-            RoundEntry(round=state.next_round, status="started", at=self._deps.clock())
+            RoundEntry(
+                round=state.next_round,
+                status="started",
+                probes=tuple(probes),
+                at=self._deps.clock(),
+            )
         )
         return state.next_round, []
 
@@ -315,6 +331,14 @@ class LaneRunner:
             infrastructure=outcome.infrastructure,
             at=self._deps.clock(),
         )
+
+    async def _probe(self) -> list[ProbeReading]:
+        """The round's identity probes (goaly.rsi.probe); a failing hook gives none."""
+        try:
+            return list(await self._until_deadline(self._hooks.identity_probe()) or [])
+        except Exception:
+            _logger.exception("the identity probes failed")
+            return []
 
     # The deadline.
 

@@ -15,6 +15,7 @@ from goaly.contracts.gen.experiment_pb2 import (
     LANE_EVENT_KIND_STARTED,
     LANE_EVENT_KIND_STOPPED,
 )
+from goaly.rsi.lane import RoundLog
 from goaly.rsi.ledger import Ledger
 from tests.rsi.dry_run import write_config
 from tests.rsi.gitrepo import git
@@ -64,6 +65,14 @@ def test_the_dry_run_runs_unattended_until_its_stopping_rule(tmp_path: Path) -> 
     assert (
         repo / "runs/rsi/effisql" / accepted[0].experiment_id / "implementer.traj.json"
     ).exists()
+    # Each round probed the three grading instances first; grade-3's drift is recorded.
+    started = [
+        e for e in RoundLog(tmp_path / "ledger", LANE_EFFISQL).entries() if e.status == "started"
+    ]
+    assert len(started) == 5
+    for entry in started:
+        assert [p.instance for p in entry.probes] == ["grade-1", "grade-2", "grade-3"]
+        assert entry.probes[2].drift == pytest.approx(0.2)
     # Status reads the same state, changing nothing.
     status = run_cli(config, "status", "--lane", "effisql")
     assert status.returncode == 0, status.stderr

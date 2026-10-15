@@ -16,6 +16,8 @@
   T11's two-phase pipeline provides it, driving a host run of ``goaly run --phase all`` for
   the tasks, seeds and split each request names (V27), with at most ``task_concurrency``
   tasks at once (spec §6.2);
+- the identity probes (spec §6.2), on the grading instances through the evaluator's own
+  grader, its ``grader`` attribute, with the train task whose base takes about 10 s;
 - the stop hooks, from config's ``hooks``: ``module:function``, called with the settings and
   returning LaneHooks. T22 provides them; without them the lane stops with no results PR and
   no notification, which is logged.
@@ -31,6 +33,7 @@ from dataclasses import replace
 from typing import cast
 
 from goaly.bench.effisql.data import default_cache_dir, fetch_dataset, load_instances
+from goaly.bench.effisql.grading_pool import GRADING_INSTANCES
 from goaly.bench.effisql.splits import load_exclusions, load_splits
 from goaly.contracts.gen.experiment_pb2 import LANE_EFFISQL, GuardResult, Hypothesis
 from goaly.contracts.gen.result_pb2 import TaskResult
@@ -51,6 +54,7 @@ from goaly.rsi.implementer.run import Implementer
 from goaly.rsi.lane import LaneHooks
 from goaly.rsi.ledger import Ledger
 from goaly.rsi.lessons import LessonStore
+from goaly.rsi.probe import pick_task, probe
 from goaly.rsi.round import Evaluation, Evaluator, RoundDeps
 from goaly.rsi.sandbox import ensure_image, remove_containers
 from goaly.rsi.smoke import EvaluatorSmokeRunner
@@ -163,4 +167,13 @@ async def build(settings: LaneSettings) -> AsyncIterator[tuple[RoundDeps, LaneHo
                 usage=tally.usage,
             )
             cleanup = functools.partial(remove_containers, lane=lane, config=guard_config.sandbox)
-            yield deps, replace(hooks, remove_containers=cleanup)
+            hooks = replace(hooks, remove_containers=cleanup)
+            grader = getattr(evaluator, "grader", None)  # The evaluator's own, shared (T10).
+            if grader is None:
+                _logger.warning("no identity probes: the evaluator exposes no grader")
+            else:
+                train = set(train_ids)
+                task = pick_task([inst for inst in instances if inst.instance_id in train])
+                identity = functools.partial(probe, grader, task, GRADING_INSTANCES)
+                hooks = replace(hooks, identity_probe=identity)
+            yield deps, hooks
