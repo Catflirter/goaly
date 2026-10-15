@@ -43,6 +43,7 @@ from goaly.bench.effisql.grading import (
 from goaly.bench.effisql.grading_pool import GradingPool, Priority
 from goaly.bench.effisql.grading_service import SlotRunner
 from goaly.bench.effisql.metrics import tier_credit
+from goaly.bench.effisql.pg_build import TPCH, TPCH_ALT
 from goaly.bench.effisql.pg_snapshot import foreign_scale_plan, write_json
 from goaly.bench.effisql.splits import SPLIT_SEED, Exclusion
 from goaly.contracts.gen.task_pb2 import GRADE_STATUS_GRADED, Grade, GradeStatus
@@ -153,14 +154,47 @@ def data_check(inst: EffiSqlInstance, row_count: int) -> DataCheck:
     without actual rows has nothing to compare.
     """
     plan = inst.base_explain_analyze
-    root = plan.get("Plan", plan) if plan is not None else None
-    actual = root.get("Actual Rows") if isinstance(root, dict) else None
+    found = plan.get("Plan", plan) if plan is not None else None
+    root: Mapping[str, Any] = found if isinstance(found, dict) else {}
+    actual = root.get("Actual Rows")
     if not isinstance(actual, int | float):
         return DataCheck(outcome="no actual rows")
-    if foreign_scale_plan(plan):
+    if foreign_scale_plan(plan) or _filtered_beyond_sf3(root):
         return DataCheck(outcome="foreign scale", plan_rows=int(actual))
     outcome: Literal["pass", "fail"] = "pass" if int(actual) == row_count else "fail"
     return DataCheck(outcome=outcome, plan_rows=int(actual))
+
+
+# A scan that read more rows than its table holds at SF3, by this margin, ran on another scale.
+_SCALE_MARGIN = 1.1
+# region and nation are the same at every scale, so they cannot reveal one.
+_SF3_ROWS = {name: f.rows for name, f in TPCH.files.items() if f != TPCH_ALT.files[name]}
+_SCANS = frozenset({"Seq Scan", "Index Scan", "Index Only Scan", "Bitmap Heap Scan"})
+
+
+def _filtered_beyond_sf3(node: Mapping[str, Any]) -> bool:
+    """Say whether a scan read, per loop, more rows than its table holds at SF3.
+
+    A scan reads its Actual Rows plus its Rows Removed by Filter. foreign_scale_plan reads only
+    the rows a scan returns, so it misses a plan whose filter drops most of an SF10 table, as
+    task 40's does (the controller's ruling).
+    """
+    rows = _SF3_ROWS.get(str(node.get("Relation Name")))
+    if rows is not None and node.get("Node Type") in _SCANS:
+        read = sum(
+            value
+            for value in (node.get("Actual Rows"), node.get("Rows Removed by Filter"))
+            if isinstance(value, int | float)
+        )
+        if node.get("Parallel Aware") is True:  # Rows per process; one pass in all.
+            loops = node.get("Actual Loops")
+            read *= loops if isinstance(loops, int | float) and loops > 0 else 1
+        if read > rows * _SCALE_MARGIN:
+            return True
+    children = node.get("Plans")
+    return isinstance(children, list) and any(
+        _filtered_beyond_sf3(child) for child in children if isinstance(child, Mapping)
+    )
 
 
 def exclusion_reason(record: SetupRecord) -> str | None:
@@ -497,10 +531,23 @@ class SetupSummary(_Model):
 
 
 def summarize(
-    task_ids: Sequence[str], records: Mapping[str, SetupRecord], *, val: Iterable[str]
+    task_ids: Sequence[str],
+    records: Mapping[str, SetupRecord],
+    *,
+    val: Iterable[str],
+    tasks: Mapping[str, EffiSqlInstance] | None = None,
 ) -> SetupSummary:
-    """Decide the exclusions and check the setup's results (spec §4.1)."""
+    """Decide the exclusions and check the setup's results (spec §4.1).
+
+    With ``tasks``, the data check is decided again from each task's plan and measured row
+    count, so a record keeps up with the current rule.
+    """
     ordered = sorted(task_ids, key=_numeric)
+    if tasks is not None:
+        records = {
+            task: _with_data_check(record, tasks[task]) if task in tasks else record
+            for task, record in records.items()
+        }
     present = [task for task in ordered if task in records]
     reasons = {task: exclusion_reason(records[task]) for task in present}
     exclusions = [
@@ -581,6 +628,12 @@ def summarize(
             ),
         },
     )
+
+
+def _with_data_check(record: SetupRecord, inst: EffiSqlInstance) -> SetupRecord:
+    if record.base is None:
+        return record
+    return record.model_copy(update={"data": data_check(inst, record.base.row_count)})
 
 
 def _tier(grade: GradeSummary | None) -> float:

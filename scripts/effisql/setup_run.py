@@ -96,7 +96,10 @@ def main(argv: Sequence[str] | None = None) -> int:
         _log.info("phase %s done: %d tasks", phase, ran)
 
     summary = summarize(
-        [t.instance_id for t in tasks], RecordStore(args.records).load(), val=load_splits().val
+        [t.instance_id for t in tasks],
+        RecordStore(args.records).load(),
+        val=load_splits().val,
+        tasks={t.instance_id: t for t in tasks},
     )
     out = args.records.parent
     write_private(out / "summary.json", summary.model_dump_json(indent=2) + "\n")

@@ -100,6 +100,47 @@ class TestDataCheck:
         check = data_check(task(sf10), 17_996_609)
         assert check == DataCheck(outcome="foreign scale", plan_rows=59_986_052)
 
+    def test_a_filter_that_drops_most_of_an_sf10_table_is_an_anomaly(self) -> None:
+        """Task 40's plan: a lineitem scan returning 15.2M of SF10's 60M rows."""
+        task_40 = {
+            "Node Type": "Seq Scan",
+            "Relation Name": "lineitem",
+            "Actual Rows": 15_240_492,
+            "Rows Removed by Filter": 44_745_560,
+            "Actual Loops": 1,
+            "Plan Rows": 299_959,
+        }
+        check = data_check(task(task_40), 4_572_053)
+        assert check == DataCheck(outcome="foreign scale", plan_rows=15_240_492)
+
+    def test_a_filtered_sf3_scan_still_counts(self) -> None:
+        sf3 = {
+            "Node Type": "Seq Scan",
+            "Relation Name": "lineitem",
+            "Actual Rows": 4_572_053,
+            "Rows Removed by Filter": 13_424_556,
+        }
+        assert data_check(task(sf3), 4_572_053).outcome == "pass"
+        nested = {"Node Type": "Gather", "Actual Rows": 3, "Plans": [{**sf3, "Actual Rows": 3}]}
+        assert data_check(task(nested), 3).outcome == "pass"
+
+    def test_a_parallel_scan_counts_every_process(self) -> None:
+        parallel = {
+            "Node Type": "Gather",
+            "Actual Rows": 10,
+            "Plans": [
+                {
+                    "Node Type": "Seq Scan",
+                    "Relation Name": "orders",
+                    "Parallel Aware": True,
+                    "Actual Loops": 3,
+                    "Actual Rows": 3,
+                    "Rows Removed by Filter": 5_000_000,
+                }
+            ],
+        }
+        assert data_check(task(parallel), 10).outcome == "foreign scale"
+
 
 class TestExclusionReason:
     def test_a_good_task_is_kept(self) -> None:
@@ -413,3 +454,16 @@ def test_a_failing_task_is_logged_and_left_for_a_rerun(
     assert asyncio.run(run_phase("measure", pool, tasks, store, BaseCache(tmp_path / "c"))) == 0
     assert store.load() == {}
     assert "setup task failed" in caplog.text
+
+
+def test_summarize_decides_the_data_check_again_from_the_tasks() -> None:
+    stale = record("7", data=DataCheck(outcome="fail", plan_rows=15_240_492))
+    plan = {
+        "Node Type": "Seq Scan",
+        "Relation Name": "lineitem",
+        "Actual Rows": 15_240_492,
+        "Rows Removed by Filter": 44_745_560,
+    }
+    summary = summarize(["7"], {"7": stale}, val=[], tasks={"7": task(plan)})
+    assert summary.data["fail"] == []
+    assert summary.data["foreign scale"] == ["7"]
