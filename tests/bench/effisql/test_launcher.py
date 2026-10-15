@@ -5,6 +5,7 @@ reaches the gateway.
 """
 
 import asyncio
+import fcntl
 import json
 import subprocess
 from collections.abc import AsyncIterator
@@ -22,6 +23,7 @@ from goaly.bench.effisql.launcher import (
     SolveContainerError,
     SolveRequestLike,
     checkout_of,
+    hold_solving_instances,
     snapshot_checkout,
     stage_inputs,
 )
@@ -154,6 +156,7 @@ def setup(
         proxy=open_proxy,
         credentials=credentials,
         socket_dirs=lambda: (Path("/sock/solve-1"), Path("/sock/solve-2")),
+        lock_dir=lambda: tmp_path / "locks",
     )
     run = tmp_path / "run"
     request = Request(
@@ -270,6 +273,33 @@ def test_a_git_checkout_is_snapshotted_without_git_with_its_changes(tmp_path: Pa
     assert not (snapshot / ".git").exists()
     assert not (snapshot / "untracked.txt").exists()
     assert snapshot_checkout(snapshot, tmp_path / "unused") == snapshot
+
+
+async def test_a_solve_waits_for_no_all_instances_grading(tmp_path: Path) -> None:
+    sandbox = FakeSandbox()
+    launcher, proxy, request, _ = setup(tmp_path, sandbox)
+    locks = tmp_path / "locks"
+    locks.mkdir()
+    with (locks / "solve-2.lock").open("w") as grading:
+        fcntl.flock(grading, fcntl.LOCK_EX | fcntl.LOCK_NB)  # As T10's all-instances grader.
+
+        with pytest.raises(SolveContainerError, match="solve-2 is grading"):
+            await launcher(request)
+
+    assert sandbox.runs == []
+    assert proxy.stopped
+
+
+def test_solve_phases_share_the_locks_and_keep_graders_out(tmp_path: Path) -> None:
+    with (
+        hold_solving_instances(tmp_path, ["solve-1", "solve-2"]),
+        hold_solving_instances(tmp_path, ["solve-1", "solve-2"]),
+        (tmp_path / "solve-1.lock").open("w") as grader,
+        pytest.raises(BlockingIOError),
+    ):
+        fcntl.flock(grader, fcntl.LOCK_EX | fcntl.LOCK_NB)
+    with (tmp_path / "solve-1.lock").open("w") as grader:
+        fcntl.flock(grader, fcntl.LOCK_EX | fcntl.LOCK_NB)  # Free once the solves end.
 
 
 def test_staging_twice_replaces_the_inputs(tmp_path: Path) -> None:

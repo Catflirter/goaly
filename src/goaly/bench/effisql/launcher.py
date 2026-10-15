@@ -16,13 +16,14 @@ Cancelled, it removes the container before the proxy stops and the cancellation 
 """
 
 import asyncio
+import fcntl
 import logging
 import math
 import shutil
 import subprocess
 import tarfile
-from collections.abc import AsyncIterator, Callable
-from contextlib import AbstractAsyncContextManager, asynccontextmanager
+from collections.abc import AsyncIterator, Callable, Iterator, Sequence
+from contextlib import AbstractAsyncContextManager, asynccontextmanager, contextmanager
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Protocol
@@ -55,6 +56,7 @@ __all__ = [
     "SolveRequestLike",
     "checkout_of",
     "container_argv",
+    "hold_solving_instances",
     "snapshot_checkout",
     "stage_inputs",
 ]
@@ -194,6 +196,40 @@ def _solving_socket_dirs() -> tuple[Path, ...]:
     return tuple(root / instance.name for instance in SOLVING)
 
 
+def _grading_lock_dir() -> Path:
+    """Where grader processes lock each instance they grade on (T10): ``~/.cache/goaly/grading``.
+
+    TODO(T10 #36): grading_service.default_lock_dir(), once the stack has it.
+    """
+    return Path.home() / ".cache" / "goaly" / "grading"
+
+
+@contextmanager
+def hold_solving_instances(lock_dir: Path, names: Sequence[str]) -> Iterator[None]:
+    """Share the solving instances' grading locks while a solve phase uses them.
+
+    A grader that grades on every instance (`goaly run --grading-instances all`, for T23's final
+    runs) locks each one exclusively, so it cannot start while any solve phase holds these, and a
+    solve phase cannot start while it grades. Solve phases share the locks with each other.
+    """
+    lock_dir.mkdir(parents=True, exist_ok=True)
+    handles = []
+    try:
+        for name in names:
+            handle = (lock_dir / f"{name}.lock").open("a", encoding="utf-8")
+            handles.append(handle)
+            try:
+                fcntl.flock(handle, fcntl.LOCK_SH | fcntl.LOCK_NB)
+            except BlockingIOError:
+                raise SolveContainerError(
+                    f"{name} is grading (goaly run --grading-instances all): solve once it is done"
+                ) from None
+        yield
+    finally:
+        for handle in handles:
+            handle.close()
+
+
 @dataclass(frozen=True)
 class EffiSqlLauncher:
     """Effi-SQL's SolveLauncher; see the module docstring. Tests replace its parts."""
@@ -204,6 +240,8 @@ class EffiSqlLauncher:
     credentials: Callable[[], PgCredentials] = load_credentials
     # The solving instances' Unix-socket directories, which the container mounts (V28).
     socket_dirs: Callable[[], tuple[Path, ...]] = _solving_socket_dirs
+    # Where T10's graders lock the instances they grade on.
+    lock_dir: Callable[[], Path] = _grading_lock_dir
 
     async def __call__(self, request: SolveRequestLike) -> None:
         if not request.tasks:
@@ -232,11 +270,14 @@ class EffiSqlLauncher:
                 pg_agent_password=credentials.agent_password,
                 run_id=request.run_id,
             )
-            try:
-                result = await sandbox.run(checkout, request, argv, staged, environment, timeout_s)
-            except asyncio.CancelledError:
-                await asyncio.shield(sandbox.stop(request.run_id))
-                raise
+            with hold_solving_instances(self.lock_dir(), [i.name for i in SOLVING]):
+                try:
+                    result = await sandbox.run(
+                        checkout, request, argv, staged, environment, timeout_s
+                    )
+                except asyncio.CancelledError:
+                    await asyncio.shield(sandbox.stop(request.run_id))
+                    raise
         await asyncio.to_thread(_write_log, log, result)
         _logger.info(
             "the solve container exited",

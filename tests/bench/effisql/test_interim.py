@@ -102,7 +102,7 @@ async def fake_proxy(recorder: CallRecorder, run_id: str) -> AsyncIterator[FakeP
     yield FakeProxy()
 
 
-def launcher(fakes: FakeWiring, container: FakeContainer) -> EffiSqlLauncher:
+def launcher(fakes: FakeWiring, container: FakeContainer, locks: Path) -> EffiSqlLauncher:
     secret = SecretStr("agent")
     return EffiSqlLauncher(
         paths=fakes.wiring.paths,
@@ -112,6 +112,7 @@ def launcher(fakes: FakeWiring, container: FakeContainer) -> EffiSqlLauncher:
             admin_password=secret, agent_password=secret, grader_password=secret
         ),
         socket_dirs=lambda: (Path("/sock/solve-1"), Path("/sock/solve-2")),
+        lock_dir=lambda: locks,
     )
 
 
@@ -128,7 +129,9 @@ async def test_the_whole_run_solves_in_the_container_and_grades_on_the_host(
     fakes = fake_wiring(tmp_path)
     container = FakeContainer(fakes)
 
-    summary = await run_interim(request(tmp_path, (0, 1)), fakes.wiring, launcher(fakes, container))
+    summary = await run_interim(
+        request(tmp_path, (0, 1)), fakes.wiring, launcher(fakes, container, tmp_path / "locks")
+    )
 
     (argv,) = container.commands
     assert argv[argv.index("--out") + 1] == str(tmp_path / "run" / "solve")
@@ -164,7 +167,9 @@ async def test_a_task_the_container_left_no_record_for_fails_with_credit_zero(
     fakes = fake_wiring(tmp_path)
 
     summary = await run_interim(
-        request(tmp_path), fakes.wiring, launcher(fakes, FakeContainer(fakes, solve=False))
+        request(tmp_path),
+        fakes.wiring,
+        launcher(fakes, FakeContainer(fakes, solve=False), tmp_path / "locks"),
     )
 
     tasks = summary["tasks"]
