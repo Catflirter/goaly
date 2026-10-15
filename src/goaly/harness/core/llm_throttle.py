@@ -15,8 +15,10 @@ so its capacity can drop at any moment, and each model's limit adapts below the 
   afresh, on attempts sent after it opened only. A retry is a new attempt, so it waits too,
   while requests already sent run on.
 
-Each change of a limit, and each opening and closing of a breaker, is logged with the model and
-the purpose of the call that caused it.
+Calls wait for a slot in the order they came, across a pause of the breaker too. Each change of
+a limit, and each opening and closing of a breaker, is logged with the model and the purpose of
+the call that caused it. A breaker's closing is logged lazily, by the first call to go through
+after it, or the first outcome judged after it.
 """
 
 import asyncio
@@ -115,7 +117,8 @@ class ModelThrottle:
         self._clock = clock
         self._limit = share
         self._in_flight = 0
-        self._waiters: deque[asyncio.Future[None]] = deque()
+        self._waiters: deque[tuple[asyncio.Future[None], LlmCallRecord]] = deque()
+        self._closer: asyncio.Task[None] | None = None  # Wakes the queue when the pause ends.
         self._successes = 0  # In a row.
         self._halved_at = -math.inf
         self._window: deque[tuple[float, bool]] = deque()  # When recent attempts ended; failed?
@@ -138,8 +141,8 @@ class ModelThrottle:
     async def slot(self, record: LlmCallRecord) -> AsyncIterator[None]:
         """Hold a slot for one attempt, waiting while the breaker is open or no slot is free.
 
-        Slots go to waiting calls in the order they came. However the attempt ends,
-        cancellation included, its slot is given back.
+        Slots go to waiting calls in the order they came, and no slot goes out while the
+        breaker is open. However the attempt ends, cancellation included, its slot is given back.
         """
         await self._acquire(record)
         try:
@@ -174,39 +177,56 @@ class ModelThrottle:
                     self._grow(record)
 
     async def _acquire(self, record: LlmCallRecord) -> None:
+        first_in_line = False
         while True:
-            wait = self._open_until - self._clock.monotonic()
-            if wait > 0:
-                await self._clock.sleep(wait)
-                continue
-            self._close_if_due(self._clock.monotonic(), record)
-            await self._take_slot()
-            if self._open_until <= self._clock.monotonic():
+            waiter = asyncio.get_running_loop().create_future()
+            if first_in_line:
+                self._waiters.appendleft((waiter, record))
+            else:
+                self._waiters.append((waiter, record))
+            self._wake()
+            try:
+                await waiter
+            except asyncio.CancelledError:
+                if not waiter.cancelled():  # The slot came just before the cancellation did.
+                    self._release()
+                raise
+            # The slot came, but the limit may have halved, or the breaker opened, since.
+            if self._in_flight <= self._limit and not self._is_open(self._clock.monotonic()):
                 return
-            self._release()  # The breaker opened while the call waited for its slot.
-
-    async def _take_slot(self) -> None:
-        waiter = asyncio.get_running_loop().create_future()
-        self._waiters.append(waiter)
-        self._wake()
-        try:
-            await waiter
-        except asyncio.CancelledError:
-            if not waiter.cancelled():  # The slot came just before the cancellation did.
-                self._release()
-            raise
+            self._in_flight -= 1  # Give it back, and wait again, keeping this call's turn.
+            first_in_line = True
 
     def _release(self) -> None:
         self._in_flight -= 1
         self._wake()
 
     def _wake(self) -> None:
-        """Hand the free slots to the calls waiting longest; skip any cancelled meanwhile."""
+        """Hand the free slots to the calls waiting longest; skip any cancelled meanwhile.
+
+        While the breaker is open no slot goes out: one task wakes the queue when it closes.
+        """
+        now = self._clock.monotonic()
+        if self._is_open(now):
+            if self._waiters and self._closer is None:
+                self._closer = asyncio.get_running_loop().create_task(self._wake_when_closed())
+            return
         while self._waiters and self._in_flight < self._limit:
-            waiter = self._waiters.popleft()
+            waiter, record = self._waiters.popleft()
             if not waiter.done():
+                self._close_if_due(now, record)
                 self._in_flight += 1
                 waiter.set_result(None)
+
+    async def _wake_when_closed(self) -> None:
+        try:
+            await self._clock.sleep(self._open_until - self._clock.monotonic())
+        finally:
+            self._closer = None
+        self._wake()
+
+    def _is_open(self, now: float) -> bool:
+        return now < self._open_until
 
     def _halve(
         self, status: LlmCallStatus.ValueType, http_status: int, record: LlmCallRecord
@@ -253,7 +273,7 @@ class ModelThrottle:
             self._failures -= old
         attempts = len(self._window)
         if (
-            now < self._open_until
+            self._is_open(now)
             or attempts < self._policy.breaker_min_attempts
             or self._failures / attempts <= self._policy.breaker_failure_ratio
         ):
@@ -275,11 +295,16 @@ class ModelThrottle:
         self._failures = 0
 
     def _close_if_due(self, now: float, record: LlmCallRecord) -> None:
-        if self._opened and now >= self._open_until:
+        """Log the breaker's closing, if it is past its open period and not logged yet."""
+        if self._opened and not self._is_open(now):
             self._opened = False
             _logger.info(
                 "closed the LLM circuit breaker",
-                extra={**self._context(record), "event": "llm_breaker_closed"},
+                extra={
+                    **self._context(record),
+                    "event": "llm_breaker_closed",
+                    "open_s": self._open_until - self._opened_at,
+                },
             )
 
     def _context(self, record: LlmCallRecord) -> dict[str, object]:

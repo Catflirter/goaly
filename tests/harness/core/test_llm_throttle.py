@@ -625,7 +625,92 @@ async def test_logs_opening_and_closing_with_the_purpose_and_model(
         "attempts": 10,
         "open_s": 60.0,
     }
-    assert {key: getattr(closed, key) for key in base} == base
+    assert {key: getattr(closed, key) for key in [*base, "open_s"]} == {**base, "open_s": 60.0}
+
+
+class PausingClock(FakeClock):
+    """A FakeClock whose sleeps hold until ``resume`` is set, so a test sees the pause."""
+
+    def __init__(self) -> None:
+        super().__init__()
+        self.resume = asyncio.Event()
+
+    async def sleep(self, seconds: float) -> None:
+        self.sleeps.append(seconds)
+        await self.resume.wait()
+        self.now += seconds
+
+
+async def test_calls_keep_their_order_across_a_pause_and_wake_once_it_ends() -> None:
+    clock = PausingClock()
+    limiter = new_throttle(share=2, clock=clock)
+    dones = {name: asyncio.Event() for name in "ABCDE"}
+    entered: list[int] = []
+    tasks = [
+        asyncio.create_task(hold(limiter, dones[name], entered, n))
+        for n, name in enumerate("ABCDE")
+    ]
+    await settle()
+    assert entered == [0, 1]  # C, D and E wait, in that order.
+
+    fail(limiter, clock, 10)  # The breaker opens.
+    dones["A"].set()
+    dones["B"].set()
+    await settle()
+    assert (entered, limiter.in_flight) == ([0, 1], 0)  # No slot goes out while it is open.
+    assert clock.sleeps == [60.0]  # One wait for the whole queue.
+
+    clock.resume.set()
+    await settle()
+    assert entered == [0, 1, 2, 3]  # The queue wakes once, in order.
+    dones["C"].set()
+    await settle()
+    assert entered == [0, 1, 2, 3, 4]
+    for done in dones.values():
+        done.set()
+    await asyncio.gather(*tasks)
+    assert clock.sleeps == [60.0]
+
+
+async def test_a_call_whose_slot_came_just_before_a_halving_waits_again_first_in_line() -> None:
+    clock = FakeClock()
+    limiter = new_throttle(share=2, clock=clock)
+    first = AsyncExitStack()
+    await first.enter_async_context(limiter.slot(RECORD))
+    dones = [asyncio.Event() for _ in range(3)]
+    entered: list[int] = []
+    tasks = [asyncio.create_task(hold(limiter, dones[n], entered, n)) for n in range(3)]
+    await settle()
+    assert entered == [0]  # 1 and 2 wait, in that order.
+
+    await first.aclose()  # Its slot goes to 1, which has not resumed yet...
+    observe(limiter, RATE_LIMITED, 429, clock.now)  # ...when the limit halves to 1.
+    await settle()
+    assert (entered, limiter.in_flight, limiter.limit) == ([0], 1, 1)  # 1 gave the slot back.
+
+    dones[0].set()
+    await settle()
+    assert entered == [0, 1]  # 1 kept its turn, ahead of 2.
+    for done in dones:
+        done.set()
+    await asyncio.gather(*tasks)
+
+
+async def test_a_call_whose_slot_came_just_before_the_breaker_opened_waits_it_out() -> None:
+    clock = FakeClock()
+    limiter = new_throttle(share=1, clock=clock)
+    first = AsyncExitStack()
+    await first.enter_async_context(limiter.slot(RECORD))
+    done, entered = asyncio.Event(), list[int]()
+    task = asyncio.create_task(hold(limiter, done, entered, 1))
+    await settle()
+
+    await first.aclose()  # Its slot goes to 1, which has not resumed yet...
+    fail(limiter, clock, 10)  # ...when the breaker opens.
+    await settle()
+    assert (entered, clock.sleeps) == ([1], [60.0])  # 1 started only after the pause.
+    done.set()
+    await task
 
 
 # Through the client.
