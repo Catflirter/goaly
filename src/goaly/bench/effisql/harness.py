@@ -18,6 +18,7 @@ import asyncio
 import dataclasses
 import json
 import logging
+import os
 import threading
 from collections.abc import AsyncIterator, Awaitable, Callable, Mapping
 from contextlib import AbstractAsyncContextManager, AsyncExitStack, asynccontextmanager
@@ -25,8 +26,9 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Protocol, Self
 
+import httpx
 import yaml
-from pydantic import BaseModel, ConfigDict
+from pydantic import BaseModel, ConfigDict, SecretStr
 
 import goaly.bench.effisql
 import goaly.harness
@@ -55,6 +57,8 @@ from goaly.bench.effisql.grading_pool import (
 )
 from goaly.bench.effisql.grading_service import EffiSqlGrader
 from goaly.bench.effisql.inputs import load_plans, load_schema_snapshot
+from goaly.bench.effisql.layout import SolveInputs
+from goaly.bench.effisql.pg_instances import SOLVING
 from goaly.bench.effisql.pg_settings import (
     MAIN_DB,
     AgentCredentials,
@@ -63,6 +67,7 @@ from goaly.bench.effisql.pg_settings import (
 )
 from goaly.bench.effisql.splits import load_exclusions, load_splits
 from goaly.bench.effisql.sql_env import SolvingPool, SqlEnvOptions
+from goaly.contracts.errors import EnvironmentFailure
 from goaly.contracts.gen.llm_call_pb2 import CALL_PURPOSE_EXEC, LlmCallRecord
 from goaly.contracts.gen.manifest_pb2 import ModelSettings, RunManifest
 from goaly.contracts.gen.result_pb2 import TASK_ERROR_TYPE_LLM
@@ -72,6 +77,7 @@ from goaly.harness.core.agent import AgentContext
 from goaly.harness.core.budgets import Budgets
 from goaly.harness.core.context_window import ContextWindow
 from goaly.harness.core.grading import GRADING_TASK
+from goaly.harness.core.isolation import SolveLauncher
 from goaly.harness.core.jsonl_writer import JsonlWriter
 from goaly.harness.core.llm import BoundLlm, CallRecorder, CallTags, LlmClient
 from goaly.harness.core.llm_errors import ConnectionFailed, RateLimited, ServerError, TimedOut
@@ -253,7 +259,12 @@ class PlanLog:
 async def _real_llm(recorder: CallRecorder, shares: Mapping[str, int]) -> LlmClient:
     settings = await asyncio.to_thread(load_settings)
     profile = QWEN_PROFILE.model_copy()  # The pack's model params override it per call.
-    return LlmClient(settings, recorder, profiles=[profile], shares=_full_shares(shares))
+    # In the solve container no IP socket opens (V28): the proxy is on a Unix socket.
+    uds = os.environ.get("GOALY_LLM_UDS")
+    transport = None if not uds else httpx.AsyncHTTPTransport(uds=uds)
+    return LlmClient(
+        settings, recorder, profiles=[profile], shares=_full_shares(shares), transport=transport
+    )
 
 
 def _full_shares(shares: Mapping[str, int]) -> dict[str, int]:
@@ -281,6 +292,24 @@ async def _real_solving() -> SolvingPool:
     return SolvingPool(
         PgEnvConfig(), credentials, SqlEnvOptions(timeout_s=SOLVING_STATEMENT_TIMEOUT_S)
     )
+
+
+async def _container_solving() -> SolvingPool:
+    """The solving instances as the container's environment names them (V28): their Unix-socket
+    directories, since the container opens no IP socket, and the agent role's password alone."""
+    try:
+        dirs = [Path(entry) for entry in os.environ["GOALY_PG_SOCKET_DIRS"].split(",")]
+        password = os.environ["GOALY_PG_AGENT_PASSWORD"]
+    except KeyError as error:
+        raise EnvironmentFailure(f"the solve container lacks {error.args[0]}") from None
+    if len(dirs) != len(SOLVING) or not all(path.is_absolute() for path in dirs):
+        raise EnvironmentFailure(
+            f"GOALY_PG_SOCKET_DIRS must name {len(SOLVING)} absolute directories, in SOLVING order"
+        )
+    credentials = AgentCredentials(agent_password=SecretStr(password))
+    options = SqlEnvOptions(timeout_s=SOLVING_STATEMENT_TIMEOUT_S)
+    sockets = {instance.name: path for instance, path in zip(SOLVING, dirs, strict=True)}
+    return SolvingPool(PgEnvConfig(), credentials, options, socket_dirs=sockets)
 
 
 # Which instances a run grades on (--grading-instances): the 3 grading instances, or all 5 for
@@ -317,6 +346,28 @@ class EffiSqlWiring:
     # §8.5), once it is an InstanceCheck; until then None, and no instance is checked.
     instance_check: InstanceCheck | None = None
     pack_dir: Path = PACK_DIR
+
+    @classmethod
+    def in_container(cls, inputs_dir: Path) -> Self:
+        """The solve container's wiring: its inputs, and its LLM and database environment.
+
+        The LLM client's settings come from the environment, the proxy's URL and the run's
+        token, and the database's from GOALY_PG_*, for the agent role only (spec §6.1).
+        """
+        inputs = SolveInputs(inputs_dir)
+        paths = EffiSqlPaths(
+            tasks_file=inputs.tasks,
+            snapshot=inputs.snapshot,
+            plans=inputs.plans,
+            grading_cache_root=inputs.root / "no-grading",
+        )
+        return cls(paths=lambda: paths, solving=_container_solving, grader=_no_grader)
+
+
+def _no_grader(
+    cache_root: Path, check: InstanceCheck | None, instances: str = "grading"
+) -> GradesPredictions:
+    raise RuntimeError("the solve container grades nothing")
 
 
 class RunCallLog:
@@ -470,14 +521,23 @@ class LazyGrader:
             await asyncio.to_thread(self._grader.close)
 
 
+def _inputs_dir(options: HarnessOptions) -> Path:
+    if options.inputs_dir is None:
+        raise ValueError("the solve container needs its inputs directory (--inputs)")
+    return options.inputs_dir
+
+
 @asynccontextmanager
 async def open_harness(
     options: HarnessOptions, wiring: EffiSqlWiring | None = None
 ) -> AsyncIterator[RunnableHarness]:
     """The v0 pack's harness for one run; the factory registered as effisql's "v0"."""
-    if options.in_container:  # Part (d) adds the solve container's wiring.
-        raise ValueError("the Effi-SQL solve container's wiring is not in this version yet")
-    wiring = EffiSqlWiring() if wiring is None else wiring
+    if wiring is None:
+        wiring = (
+            EffiSqlWiring.in_container(_inputs_dir(options))
+            if options.in_container
+            else EffiSqlWiring()
+        )
     # The pack's code, imported here only, so that a grade phase never loads it (spec V24).
     from goaly.harness.packs.effisql.policy import build_policy
 
@@ -522,7 +582,9 @@ async def open_harness(
 
 @asynccontextmanager
 async def open_host(
-    options: HostOptions, wiring: EffiSqlWiring | None = None
+    options: HostOptions,
+    wiring: EffiSqlWiring | None = None,
+    launcher: SolveLauncher | None = None,
 ) -> AsyncIterator[RunnableHost]:
     """Effi-SQL's trusted host side for one run: its benchmark, which grades on the host and
     imports no pack code (spec V24, V27).
@@ -530,7 +592,10 @@ async def open_host(
     The mode follows the split core gives: held-out official, train and val dev. The grading
     instances' priority follows the budget phase or, for a grade phase without one, what the
     run's host-written manifest recorded; a manifest that names another mode is refused.
+    ``launcher`` solves the run's tasks in the solve container: EffiSqlLauncher by default.
     """
+    from goaly.bench.effisql.launcher import EffiSqlLauncher
+
     wiring = EffiSqlWiring() if wiring is None else wiring
     mode = grading_mode(options.split)
     manifest = (
@@ -564,7 +629,9 @@ async def open_host(
         )
     try:
         yield HostBenchmark(
-            with_parts(loaded.benchmark, None, grader), cache_namespace=loaded.namespace
+            with_parts(loaded.benchmark, None, grader),
+            cache_namespace=loaded.namespace,
+            launcher=EffiSqlLauncher(paths=wiring.paths) if launcher is None else launcher,
         )
     finally:
         if grader is not None:

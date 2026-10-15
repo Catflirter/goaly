@@ -482,20 +482,6 @@ class TestReviewFixes:
         assert official.startswith("official-")
         assert official.count("-") == 1
 
-    async def test_the_container_wiring_is_not_in_this_version(self, tmp_path: Path) -> None:
-        options = HarnessOptions(
-            files=RunFiles(tmp_path),
-            instances_file=None,
-            llm_shares={},
-            split=SPLIT_TRAIN,
-            budget_phase="rsi",
-            in_container=True,
-        )
-
-        with pytest.raises(ValueError, match="solve container"):
-            async with open_harness(options, fake_wiring(tmp_path).wiring):
-                pass
-
     def test_a_broken_pack_config_gives_no_models(self, tmp_path: Path) -> None:
         (tmp_path / "config.yaml").write_text("model: [unclosed\n")
 
@@ -630,3 +616,66 @@ class TestGradingOptions:
 def _chosen(chosen: list[str], instances: str, grader: FakeGrader) -> FakeGrader:
     chosen.append(instances)
     return grader
+
+
+class TestInContainer:
+    def test_the_container_reads_its_inputs_directory(self, tmp_path: Path) -> None:
+        paths = EffiSqlWiring.in_container(tmp_path / "inputs").paths()
+
+        assert paths.tasks_file == tmp_path / "inputs" / "tasks.jsonl"
+        assert paths.snapshot == tmp_path / "inputs" / "schema_snapshot.json"
+        assert paths.plans == tmp_path / "inputs" / "plans.json"
+        assert paths.tasks_sha256 is None  # An organizers' staged file has its own sha.
+
+    async def test_the_container_reaches_the_solving_sockets_as_the_agent_alone(
+        self, monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+    ) -> None:
+        dirs = [tmp_path / instance.name for instance in SOLVING]
+        monkeypatch.setenv("GOALY_PG_SOCKET_DIRS", ",".join(map(str, dirs)))
+        monkeypatch.setenv("GOALY_PG_AGENT_PASSWORD", "agent-secret")
+
+        def refuse(*_: object) -> None:
+            raise AssertionError("the container never reads a credentials file")
+
+        monkeypatch.setattr("goaly.bench.effisql.pg_settings.load_credentials", refuse)
+        monkeypatch.setattr("goaly.bench.effisql.harness.load_credentials", refuse)
+
+        pool = await EffiSqlWiring.in_container(tmp_path).solving()
+
+        assert isinstance(pool, SolvingPool)
+        assert sorted(pool.load()) == sorted(i.name for i in SOLVING)
+        assert pool.options.timeout_s == SOLVING_STATEMENT_TIMEOUT_S
+
+    @pytest.mark.parametrize(
+        ("dirs", "message"),
+        [(None, "GOALY_PG_SOCKET_DIRS"), ("/a", "2 absolute"), ("a,b", "2 absolute")],
+    )
+    async def test_missing_or_wrong_settings_fail_the_environment(
+        self, monkeypatch: pytest.MonkeyPatch, tmp_path: Path, dirs: str | None, message: str
+    ) -> None:
+        monkeypatch.setenv("GOALY_PG_AGENT_PASSWORD", "agent-secret")
+        if dirs is None:
+            monkeypatch.delenv("GOALY_PG_SOCKET_DIRS", raising=False)
+        else:
+            monkeypatch.setenv("GOALY_PG_SOCKET_DIRS", dirs)
+
+        with pytest.raises(EnvironmentFailure, match=message):
+            await EffiSqlWiring.in_container(tmp_path).solving()
+
+    def test_the_container_grades_nothing(self, tmp_path: Path) -> None:
+        with pytest.raises(RuntimeError, match="grades nothing"):
+            EffiSqlWiring.in_container(tmp_path).grader(tmp_path, None, "grading")
+
+    async def test_the_container_needs_its_inputs(self, tmp_path: Path) -> None:
+        options = HarnessOptions(
+            files=RunFiles(tmp_path),
+            instances_file=None,
+            llm_shares={},
+            split=SPLIT_TRAIN,
+            budget_phase="rsi",
+            in_container=True,
+        )
+
+        with pytest.raises(ValueError, match="--inputs"):
+            async with open_harness(options):
+                pass
