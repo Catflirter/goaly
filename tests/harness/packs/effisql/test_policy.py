@@ -18,6 +18,7 @@ from goaly.harness.core.context_window import ContextWindow
 from goaly.harness.core.llm_models import ModelParams
 from goaly.harness.packs import effisql
 from goaly.harness.packs.effisql.policy import (
+    TIME_GATE,
     EffiSqlPolicy,
     PackConfig,
     build_policy,
@@ -163,6 +164,29 @@ class TestPrompt:
         task = EffiSqlTaskInput(db="tpch", base_sql=BASE_SQL)
 
         assert "rated unknown" in task_prompt(task, PackConfig(), Budgets(steps=1, wall_clock_s=1))
+
+    def test_the_task_prompt_carries_the_time_gate(self) -> None:
+        text = task_prompt(TASK.effisql, PackConfig(), Budgets(steps=30, wall_clock_s=600))
+
+        assert TIME_GATE in text
+        # The gate is its own paragraph, the last one the model reads before it starts work.
+        assert text.endswith(TIME_GATE)
+        for phrase in (
+            "run EXPLAIN ANALYZE on it exactly once",
+            "base_time / candidate_time >= 1.2",
+            "otherwise submit the base query unchanged",
+            "cannot afford that one EXPLAIN ANALYZE",
+            "Never submit a rewrite you have not timed",
+        ):
+            assert phrase in TIME_GATE
+
+    async def test_the_model_is_shown_the_time_gate(self) -> None:
+        llm = FakeLLM([reply(tool_call("submit", {"sql": FASTER}))])
+
+        await policy().solve(TASK, FakeSqlEnvironment(), context(llm))
+
+        _, user = llm.requests[0].messages
+        assert TIME_GATE in user.content
 
 
 class TestConfig:
