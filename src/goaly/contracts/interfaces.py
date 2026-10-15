@@ -58,35 +58,50 @@ class Environment(Protocol):
 
 
 class SqlEnvironment(Environment, Protocol):
-    """A task's sandbox database, which BIRD-CRITIC's tools query: bench's PostgreSQL sandbox."""
+    """A task's sandbox database, which Effi-SQL's tools query: bench's PostgreSQL sandbox.
+
+    ``provision`` has already run any setup SQL, and each statement's effects persist for the
+    environment's lifetime. A read-only environment, such as Effi-SQL's solving sandbox,
+    reports an attempt to write as an SQL error result.
+    """
 
     async def execute(self, sql: str, *, timeout_s: float) -> SqlResult:
         """Run ``sql``, stopping it after ``timeout_s`` seconds, and return its result.
 
-        A statement that fails or times out gives a result with ``error`` set, not an exception.
-        Only a failure of the environment itself raises EnvironmentFailure.
+        ``sql`` holds one statement or more; the result is the last statement's. A statement
+        that fails or times out gives a result with ``error`` set, not an exception. Only a
+        failure of the environment itself raises EnvironmentFailure.
         """
 
 
 class ShellEnvironment(Environment, Protocol):
     """A task's container, which SWE-fficiency's tools work in: bench's Docker environment.
 
-    Paths are inside the container, where the repository is at /testbed.
+    Paths are inside the container. Each ``exec`` runs in a fresh ``bash -c`` whose working
+    directory is the task's root, /testbed for SWE-fficiency, and nothing persists between
+    calls: no ``cd`` and no exported variable. A relative path resolves against the root.
     """
 
     async def exec(self, command: str, *, timeout_s: float) -> ShellResult:
-        """Run ``command`` in a shell, stopping it after ``timeout_s`` seconds.
+        """Run ``command`` with ``bash -c``, stopping it after ``timeout_s`` seconds.
 
-        A command that fails or times out gives a result, with ``exit_code`` or ``timed_out``
-        saying so, not an exception. Only a failure of the environment itself raises
-        EnvironmentFailure.
+        The environment may cap the output, and then sets ``truncated``. A command that fails or
+        times out gives a result, with ``exit_code`` or ``timed_out`` saying so, not an
+        exception. Only a failure of the environment itself raises EnvironmentFailure.
         """
 
     async def read_file(self, path: str) -> str:
-        """Return the text of the file at ``path``. Raise FileNotFoundError if there is none."""
+        """Return the whole text of the file at ``path``, never truncated.
+
+        The file is decoded as UTF-8, with replacement characters for invalid bytes. Raise
+        FileNotFoundError if there is no such file.
+        """
 
     async def write_file(self, path: str, content: str) -> None:
-        """Write ``content`` to the file at ``path``, replacing the file if it exists."""
+        """Write ``content`` to the file at ``path`` as UTF-8, replacing the file if it exists.
+
+        Missing parent directories are created.
+        """
 
 
 class Tool[ArgsT: BaseModel, EnvT: Environment](Protocol):
@@ -165,6 +180,10 @@ class Benchmark[InstanceT: Instance, EnvT: Environment](Protocol):
     ``InstanceT`` is the benchmark's own record of a task and may hold gold answers. Only the
     copy that :meth:`agent_input` makes reaches the agent, so the types keep gold answers away
     from it. The runner identifies each instance by its ``instance_id``.
+
+    ``provision`` and ``grade`` may wait for the resources they need, such as database
+    connections, CPU slots or grading instances. The adapter owns those pools; the runner only
+    bounds how many tasks run at once (spec §6.2).
 
     The organizers' task file (``goaly run --instances``) reaches an adapter when it is
     constructed, and SPLIT_EXTERNAL then selects its tasks. Those tasks have no gold answers, so

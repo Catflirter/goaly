@@ -10,6 +10,7 @@ pytest imports tests/ as a namespace package, so any test can import them, e.g.
 """
 
 import asyncio
+import posixpath
 from collections.abc import AsyncIterator, Mapping, Sequence
 from contextlib import asynccontextmanager
 from dataclasses import dataclass
@@ -99,19 +100,26 @@ class FakeShellEnvironment(FakeEnvironment):
     """A ShellEnvironment with canned command results and files kept in memory.
 
     A command missing from the table exits with status 127, as an unknown command does, and a
-    canned EnvironmentFailure is raised instead, as when the container dies. ``commands``
-    records each command with its timeout, and ``files`` maps paths to contents.
+    canned EnvironmentFailure is raised instead, as when the container dies. Relative paths
+    resolve against ``root``. ``commands`` records each command with its timeout, and
+    ``files`` maps absolute paths to contents.
     """
 
     def __init__(
         self,
         results: Mapping[str, ShellResult | EnvironmentFailure] | None = None,
         files: Mapping[str, str] | None = None,
+        *,
+        root: str = "/testbed",
     ) -> None:
         super().__init__()
+        self.root = root
         self.results = dict(results or {})
-        self.files = dict(files or {})
+        self.files = {self._resolve(path): content for path, content in (files or {}).items()}
         self.commands: list[tuple[str, float]] = []
+
+    def _resolve(self, path: str) -> str:
+        return posixpath.normpath(posixpath.join(self.root, path))
 
     async def exec(self, command: str, *, timeout_s: float) -> ShellResult:
         self._ensure_open()
@@ -128,13 +136,13 @@ class FakeShellEnvironment(FakeEnvironment):
 
     async def read_file(self, path: str) -> str:
         self._ensure_open()
-        if path not in self.files:
+        if self._resolve(path) not in self.files:
             raise FileNotFoundError(path)
-        return self.files[path]
+        return self.files[self._resolve(path)]
 
     async def write_file(self, path: str, content: str) -> None:
         self._ensure_open()
-        self.files[path] = content
+        self.files[self._resolve(path)] = content
 
 
 class EchoArgs(BaseModel):

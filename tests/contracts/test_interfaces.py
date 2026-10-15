@@ -255,6 +255,18 @@ def test_fake_shell_environment_keeps_files_in_memory() -> None:
     assert fake.files == {"/testbed/a.py": "a = 3\n", "/testbed/b.py": "b = 2\n"}
 
 
+def test_fake_shell_environment_resolves_relative_paths_against_its_root() -> None:
+    fake = FakeShellEnvironment(files={"src/a.py": "a = 1\n"})
+    env: ShellEnvironment = fake
+
+    async def scenario() -> tuple[str, str]:
+        await env.write_file("/testbed/src/b.py", "b = 2\n")
+        return await env.read_file("/testbed/src/a.py"), await env.read_file("src/../src/b.py")
+
+    assert asyncio.run(scenario()) == ("a = 1\n", "b = 2\n")
+    assert fake.files == {"/testbed/src/a.py": "a = 1\n", "/testbed/src/b.py": "b = 2\n"}
+
+
 def test_fake_shell_environment_has_no_file_it_was_not_given() -> None:
     env: ShellEnvironment = FakeShellEnvironment()
 
@@ -283,7 +295,7 @@ def test_a_closed_fake_shell_environment_refuses_every_call(
 
     with pytest.raises(RuntimeError, match="the environment is closed"):
         asyncio.run(scenario())
-    assert (fake.commands, fake.files) == ([], {"notes.txt": "old"})
+    assert (fake.commands, fake.files) == ([], {"/testbed/notes.txt": "old"})
 
 
 def test_fake_environments_raise_a_canned_environment_failure() -> None:
