@@ -13,12 +13,15 @@ nothing is read from the home directory.
 
 The run directory, --out, holds the manifest, the results, the trajectories and, once every task
 is recorded, official/seed-<k>.jsonl: each replicate's predictions in the official format. On
-stdout the run's summary is one line of JSON; the logs go to stderr as JSON lines.
+stdout the run's summary is one line of JSON. The logs go to stderr as JSON lines, each line of
+a task's work with its run_id, instance_id and seed; a line that starts with "goaly run:",
+which is not JSON, says why the command stopped, for a person to read.
 
 The exit status is 0 once the run is done, whatever errors its tasks met, as those are in its
 records; 1 if the run failed; 2 for a usage error, such as an unknown benchmark or a run
-directory that holds another run; and 130 if it was interrupted, after which --resume
-continues it.
+directory that holds another run; 130 if it was interrupted (SIGINT) and 143 if it was
+terminated (SIGTERM). After either, --resume continues it, and --retry-errors with it also runs
+again the tasks that ended with an error, such as an LLM outage.
 """
 
 import argparse
@@ -26,8 +29,10 @@ import asyncio
 import json
 import logging
 import math
+import re
+import signal
 import sys
-from collections.abc import Sequence
+from collections.abc import Callable, Sequence
 from pathlib import Path
 
 from goaly.contracts.gen.manifest_pb2 import RunManifest
@@ -66,10 +71,11 @@ from goaly.harness.core.runner import (
     RunFiles,
     RunLock,
     RunSummary,
+    UsageError,
     lock_run_dir,
 )
 
-__all__ = ["FAILED", "INTERRUPTED", "USAGE", "build_parser", "main"]
+__all__ = ["FAILED", "INTERRUPTED", "TERMINATED", "USAGE", "build_parser", "main"]
 
 _logger = logging.getLogger(__name__)
 
@@ -77,10 +83,14 @@ _logger = logging.getLogger(__name__)
 FAILED = 1
 USAGE = 2  # As argparse exits.
 INTERRUPTED = 130  # As a shell reports a process that SIGINT ended.
+TERMINATED = 143  # As a shell reports a process that SIGTERM ended.
 
 _SPLITS = {"train": SPLIT_TRAIN, "val": SPLIT_VAL, "heldout": SPLIT_HELDOUT}
-# Errors that mean the command cannot run as asked; the message says what to change.
-_USAGE_ERRORS = (BudgetsError, RegistryError, RunDirectoryError, ValueError)
+# Errors that mean the command cannot run as asked; the message says what to change. Any other
+# error, a ValueError included, fails the run, with its traceback logged.
+_USAGE_ERRORS = (BudgetsError, RegistryError, RunDirectoryError, UsageError)
+# A run ID names the run's records and files, so it is a plain name.
+_RUN_ID = re.compile(r"[0-9A-Za-z_-]+")
 
 
 def build_parser(budgets_file: Path) -> argparse.ArgumentParser:
@@ -121,6 +131,11 @@ def build_parser(budgets_file: Path) -> argparse.ArgumentParser:
         "--resume", action="store_true", help="continue the run in --out, if there is one"
     )
     run.add_argument(
+        "--retry-errors",
+        action="store_true",
+        help="with --resume, run again the tasks whose last result is an error",
+    )
+    run.add_argument(
         "--budget-phase",
         metavar="NAME",
         help="the schedule's phase whose LLM concurrency shares apply: baseline, rsi or final",
@@ -149,17 +164,30 @@ def build_parser(budgets_file: Path) -> argparse.ArgumentParser:
         "--cache",
         type=Path,
         metavar="DIR",
-        help="the evaluation cache; runs that grade differently use different ones",
+        help=(
+            "the evaluation cache, kept by the harness's grading namespace; a task's evaluation"
+            " is reused whatever its --task-timeout was"
+        ),
     )
-    run.add_argument("--run-id", metavar="ID", help="the run's ID (default: a new one)")
+    run.add_argument(
+        "--run-id", type=_run_id, metavar="ID", help="the run's ID (default: a new one)"
+    )
     run.add_argument("--log-level", default="INFO", choices=["DEBUG", "INFO", "WARNING", "ERROR"])
     return parser
 
 
-def main(argv: Sequence[str], registry: Registry, *, budgets_file: Path) -> int:
+def main(
+    argv: Sequence[str],
+    registry: Registry,
+    *,
+    budgets_file: Path,
+    confine: Callable[[], None] = lambda: None,
+) -> int:
     """Run the `goaly` command with ``argv``, its arguments, and return the exit status.
 
-    ``registry`` holds the harnesses it can run. argparse exits with status 2 by itself for
+    ``registry`` holds the harnesses it can run. ``confine`` keeps the process to its CPUs,
+    away from the database instances', before the harness opens; the composition root passes
+    the benchmark's, and the default does nothing. argparse exits with status 2 by itself for
     arguments it refuses, and with 0 for --help.
     """
     args = build_parser(budgets_file).parse_args(argv)
@@ -168,11 +196,16 @@ def main(argv: Sequence[str], registry: Registry, *, budgets_file: Path) -> int:
     # at DEBUG, so its logger never logs below WARNING.
     logging.getLogger("pydantic_settings").setLevel(logging.WARNING)
     try:
-        summary = asyncio.run(_run(args, ["goaly", *argv], registry))
+        confine()
+        summary = asyncio.run(_main(args, ["goaly", *argv], registry))
     except KeyboardInterrupt:
         again = "again" if args.phase == "grade" else "with --resume"
         _say(f"interrupted; to continue the run, run the same command {again}")
         return INTERRUPTED
+    except _TerminatedError:
+        again = "again" if args.phase == "grade" else "with --resume"
+        _say(f"terminated; to continue the run, run the same command {again}")
+        return TERMINATED
     except _USAGE_ERRORS as error:
         _say(f"error: {error}")
         return USAGE
@@ -194,23 +227,63 @@ def main(argv: Sequence[str], registry: Registry, *, budgets_file: Path) -> int:
     return 0
 
 
+class _TerminatedError(Exception):
+    """SIGTERM stopped the run, which cleaned up as for an interrupt."""
+
+
+async def _main(
+    args: argparse.Namespace, command_line: list[str], registry: Registry
+) -> RunSummary:
+    """Run the command, which SIGTERM cancels: its harness and its lock are then released as for
+    Ctrl-C, and _TerminatedError is raised once it has stopped."""
+    task = asyncio.current_task()
+    if task is None:  # pragma: no cover - asyncio.run runs it in a task.
+        raise RuntimeError("goaly run must run in an asyncio task")
+    loop = asyncio.get_running_loop()
+    terminated = False
+
+    def terminate() -> None:
+        nonlocal terminated
+        if not terminated:  # A second SIGTERM must not cut the cleanup short.
+            terminated = True
+            task.cancel()
+
+    loop.add_signal_handler(signal.SIGTERM, terminate)
+    try:
+        return await _run(args, command_line, registry)
+    except asyncio.CancelledError:
+        if terminated:
+            raise _TerminatedError from None
+        raise
+    finally:
+        loop.remove_signal_handler(signal.SIGTERM)
+
+
 async def _run(args: argparse.Namespace, command_line: list[str], registry: Registry) -> RunSummary:
     if args.phase == "grade":
         return await _grade(args, registry)
+    if args.retry_errors and not args.resume:
+        raise UsageError("--retry-errors needs --resume: a new run has no errors to retry")
     if args.split is None and args.instances is None:
-        raise ValueError(f"--phase {args.phase} needs --split or --instances")
-    if args.instances is not None and not args.instances.is_file():
-        raise ValueError(f"no such task file: {args.instances}")
+        raise UsageError(f"--phase {args.phase} needs --split or --instances")
+    instances_sha256 = None
+    if args.instances is not None:
+        if not await asyncio.to_thread(args.instances.is_file):
+            raise UsageError(f"no such task file: {args.instances}")
+        # Hashed once, before the harness reads it.
+        instances_sha256 = await asyncio.to_thread(sha256_file, args.instances)
     registered = registry.harness(args.bench, args.harness)  # First: the share names the bench.
     if args.budget_phase is None:
-        raise ValueError(f"--phase {args.phase} needs --budget-phase, as it calls the LLM")
+        raise UsageError(f"--phase {args.phase} needs --budget-phase, as it calls the LLM")
     share = args.budget_share or args.bench
     budgets = await asyncio.to_thread(load_budgets, args.budgets)
     llm_shares = budgets.share(args.budget_phase, share)
+    _logger.info("LLM shares of %s in the phase %s: %s", share, args.budget_phase, llm_shares)
     files = RunFiles(args.out)
     # Locked before the harness opens, so that nothing it writes there, such as the LLM call log,
     # can meet another process's run.
     with await asyncio.to_thread(lock_run_dir, files) as lock:
+        await asyncio.to_thread(_preflight, args, files)
         options = HarnessOptions(
             files=files,
             instances_file=args.instances,
@@ -219,10 +292,14 @@ async def _run(args: argparse.Namespace, command_line: list[str], registry: Regi
             budget_phase=args.budget_phase,
         )
         async with registered.factory(options) as harness:
-            return await _run_harness(args, command_line, registered, harness, llm_shares, lock)
+            return await _run_harness(
+                args, command_line, registered, harness, instances_sha256, lock
+            )
 
 
-# The options a grade phase takes from the run's manifest instead.
+# The options a grade phase takes from the run's manifest instead: flags, and options with a
+# value, which may be 0.
+_SOLVING_FLAGS = ("resume", "retry_errors")
 _SOLVING_OPTIONS = (
     "harness",
     "split",
@@ -230,7 +307,6 @@ _SOLVING_OPTIONS = (
     "only",
     "seeds",
     "first_seed",
-    "resume",
     "budget_share",
     "max_tasks",
     "task_timeout",
@@ -239,10 +315,11 @@ _SOLVING_OPTIONS = (
 
 
 async def _grade(args: argparse.Namespace, registry: Registry) -> RunSummary:
-    given = [name for name in _SOLVING_OPTIONS if getattr(args, name) not in (None, False)]
+    given = [name for name in _SOLVING_OPTIONS if getattr(args, name) is not None]
+    given += [name for name in _SOLVING_FLAGS if getattr(args, name)]
     if given:
         options = ", ".join("--" + name.replace("_", "-") for name in given)
-        raise ValueError(f"--phase grade takes these from the run it grades: {options}")
+        raise UsageError(f"--phase grade takes these from the run it grades: {options}")
     factory = registry.host(args.bench)
     files = RunFiles(args.out)
     if not await asyncio.to_thread(files.manifest.exists):  # Before the lock creates --out.
@@ -265,7 +342,7 @@ def _cache(args: argparse.Namespace, namespace: str, owner: str) -> EvalCache | 
     if args.cache is None:
         return None
     if not namespace:
-        raise ValueError(f"{owner} names no grading namespace for --cache")
+        raise UsageError(f"{owner} names no grading namespace for --cache")
     return EvalCache(args.cache, namespace)
 
 
@@ -274,7 +351,7 @@ async def _run_harness(
     command_line: list[str],
     registered: RegisteredHarness,
     harness: RunnableHarness,
-    llm_shares: dict[str, int],
+    instances_sha256: str | None,
     lock: RunLock,
 ) -> RunSummary:
     if harness.benchmark_name != args.bench:
@@ -286,19 +363,18 @@ async def _run_harness(
     first_seed = args.first_seed or 0
     seeds = list(range(first_seed, first_seed + (args.seeds or 1)))
     max_tasks = args.max_tasks or DEFAULT_MAX_TASKS
-    # Every option that shapes the run: not where it is written, cached or logged.
+    # Every option that shapes the run's results: the config hash, which a resume must match.
+    # Not where it is written, cached or logged, nor how much of the gateway it may use at once,
+    # such as --max-tasks and the LLM shares: a run may resume under other limits.
     settings: dict[str, JsonValue] = {
         "benchmark": args.bench,
         "harness": registered.name,
         "split": args.split,
-        "instances_sha256": None if args.instances is None else sha256_file(args.instances),
-        "only": None if args.only is None else sorted(args.only),
+        "instances_sha256": instances_sha256,
+        "only": None if args.only is None else sorted(set(args.only)),
         "seeds": [*seeds],
-        "max_tasks": max_tasks,
         "task_timeout_s": args.task_timeout,
-        "budget_phase": args.budget_phase,
-        "budget_share": args.budget_share or args.bench,
-        "llm_shares": dict(llm_shares),
+        "grading": harness.cache_namespace,  # A run never mixes two grading identities.
     }
     manifest = await asyncio.to_thread(_manifest, args, command_line, registered, harness, settings)
     runner = harness.runner(cache=cache, max_tasks=max_tasks, task_timeout_s=args.task_timeout)
@@ -309,6 +385,7 @@ async def _run_harness(
         seeds=seeds,
         instance_ids=args.only,
         resume=args.resume,
+        retry_errors=args.retry_errors,
         lock=lock,
         grading=args.phase == "all",
     )
@@ -336,6 +413,33 @@ def _manifest(
 def _split(args: argparse.Namespace) -> Split.ValueType:
     """The split of the run's tasks: SPLIT_EXTERNAL for --instances."""
     return SPLIT_EXTERNAL if args.instances is not None else _SPLITS[args.split]
+
+
+def _preflight(args: argparse.Namespace, files: RunFiles) -> None:
+    """Refuse, before the harness opens, a run directory the runner would refuse.
+
+    The runner checks the rest, once the harness can tell it what the run is.
+    """
+    if not files.manifest.exists():
+        return
+    if not args.resume:
+        stored = read_manifest(files.manifest)
+        raise RunDirectoryError(
+            f"{files.root} already holds the run {stored.run_id}: resume it with --resume,"
+            " or choose another directory"
+        )
+    if args.run_id is not None and (stored := read_manifest(files.manifest)).run_id != args.run_id:
+        raise UsageError(
+            f"{files.root} holds the run {stored.run_id}, not {args.run_id}: a resumed run"
+            " keeps its run ID"
+        )
+
+
+def _run_id(text: str) -> str:
+    """An argument that is a plain name: letters, digits, '-' and '_'."""
+    if not _RUN_ID.fullmatch(text):
+        raise argparse.ArgumentTypeError(f"must be letters, digits, '-' and '_' only: {text!r}")
+    return text
 
 
 def _say(message: str) -> None:

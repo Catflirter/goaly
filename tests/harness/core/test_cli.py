@@ -3,6 +3,8 @@
 import asyncio
 import json
 import logging
+import os
+import signal
 from collections.abc import AsyncIterator, Coroutine, Iterator
 from contextlib import AbstractAsyncContextManager, asynccontextmanager
 from dataclasses import dataclass, field
@@ -12,11 +14,30 @@ from typing import Any
 import pytest
 
 from goaly.contracts.gen.manifest_pb2 import ModelSettings
-from goaly.contracts.gen.result_pb2 import TASK_ERROR_TYPE_TIMEOUT, TaskResult
-from goaly.contracts.gen.task_pb2 import SPLIT_EXTERNAL, SPLIT_TRAIN, SPLIT_VAL
+from goaly.contracts.gen.result_pb2 import (
+    TASK_ERROR_TYPE_NONE,
+    TASK_ERROR_TYPE_TIMEOUT,
+    TaskResult,
+)
+from goaly.contracts.gen.task_pb2 import (
+    SPLIT_EXTERNAL,
+    SPLIT_TRAIN,
+    SPLIT_VAL,
+    Prediction,
+    Split,
+    TaskInput,
+)
+from goaly.contracts.interfaces import Environment
 from goaly.contracts.jsonl import read_jsonl
 from goaly.harness.core import cli
-from goaly.harness.core.manifest import CORE_DIR, git_state, harness_hash, read_manifest
+from goaly.harness.core.manifest import (
+    CORE_DIR,
+    config_hash,
+    core_hash,
+    git_state,
+    harness_hash,
+    read_manifest,
+)
 from goaly.harness.core.registry import (
     Harness,
     HarnessOptions,
@@ -27,11 +48,13 @@ from goaly.harness.core.registry import (
 from goaly.harness.core.runner import RunFiles, lock_run_dir
 from tests.fakes import TOY_DATASET_SHA256, FakeSqlEnvironment, ToyInstance
 from tests.harness.core.runner_doubles import (
+    Action,
     ScriptedBenchmark,
     ScriptedPolicy,
     StubContext,
     StubContexts,
     base_sql,
+    raising,
     sleeping,
     toy_instances,
 )
@@ -43,6 +66,10 @@ BUDGETS = """
 [phases.test]
 toy = { "qwen3.6-35b-a3b" = 4 }
 quiet = {}
+
+[phases.later]
+toy = { "qwen3.6-35b-a3b" = 2 }
+other = { "qwen3.6-35b-a3b" = 3 }
 """
 
 type ToyHarness = Harness[ToyInstance, FakeSqlEnvironment, StubContext]
@@ -63,6 +90,7 @@ class ToyFactory:
     pack_dir: Path | None = None
     name: str = "toy"
     cache_namespace: str = "toy-dev"
+    benchmark_type: type[ScriptedBenchmark] = ScriptedBenchmark
     options: list[HarnessOptions] = field(default_factory=list)
     benchmarks: list[ScriptedBenchmark] = field(default_factory=list)
     closed: bool = False
@@ -78,7 +106,7 @@ class ToyFactory:
                 for record in map(json.loads, lines)
             ]
         instances = [*toy_instances(3), ToyInstance("v0", SPLIT_VAL, base_sql(9), "SELECT 9")]
-        benchmark = ScriptedBenchmark(instances, external=external)
+        benchmark = self.benchmark_type(instances, external=external)
         benchmark.name = self.name
         self.benchmarks.append(benchmark)
         try:
@@ -250,6 +278,20 @@ def test_runs_the_toy_benchmark_end_to_end(
     assert manifest.harness_hash == harness_hash(pack)
     assert len(manifest.config_hash) == 64
     assert list(manifest.command_line) == ["goaly", "run", *argv]
+    # What makes the run's results, and so its resume identity, and nothing else: not where it
+    # is written, cached or logged, nor how much of the gateway it may use at once.
+    assert manifest.config_hash == config_hash(
+        {
+            "benchmark": "toy",
+            "harness": "v0",
+            "split": "train",
+            "instances_sha256": None,
+            "only": None,
+            "seeds": [0, 1],
+            "task_timeout_s": None,
+            "grading": "toy-dev",
+        }
+    )
     # The benchmark's manifest_fields() alone gives the dataset's and the environment's fields.
     assert manifest.dataset_revision == "toy-revision-1"
     assert list(manifest.dataset_notes) == ["the toy tasks are held in memory"]
@@ -434,6 +476,89 @@ def test_resume_continues_the_run_and_a_new_run_refuses_its_directory(
     assert len(results(out)) == 3
 
 
+def test_a_run_resumes_under_other_concurrency_settings(
+    capsys: pytest.CaptureFixture[str], registry: Registry, budgets: Path, tmp_path: Path
+) -> None:
+    out = tmp_path / "run"
+    common = ["--bench", "toy", "--split", "train", "--out", str(out)]
+    first = goaly(
+        capsys, registry, budgets, *common, "--budget-phase", "test", "--only", "t0", "t1"
+    )
+    files = RunFiles(out)
+    lines = files.results.read_text(encoding="utf-8").splitlines(keepends=True)
+    files.results.write_text("".join(lines[:-1]), encoding="utf-8")  # Interrupted.
+
+    resumed = goaly(
+        capsys,
+        registry,
+        budgets,
+        *common,
+        "--budget-phase",
+        "later",
+        "--budget-share",
+        "other",
+        "--max-tasks",
+        "1",
+        "--only",
+        "t1",
+        "t0",
+        "t1",  # The same instances, in another order and once more.
+        "--resume",
+    )
+
+    assert resumed.status == 0, resumed.stderr
+    assert resumed.summary["run_id"] == first.summary["run_id"]
+    assert (resumed.summary["resumed"], resumed.summary["ran"]) == (1, 1)
+
+
+def test_a_resume_under_another_grading_namespace_is_refused(
+    capsys: pytest.CaptureFixture[str], budgets: Path, tmp_path: Path
+) -> None:
+    argv = [
+        "--bench",
+        "toy",
+        "--split",
+        "train",
+        "--budget-phase",
+        "test",
+        "--out",
+        str(tmp_path / "r"),
+    ]
+    dev, official = Registry(), Registry()
+    dev.add("toy", "v0", ToyFactory())
+    official.add("toy", "v0", ToyFactory(cache_namespace="toy-official"))
+    goaly(capsys, dev, budgets, *argv)
+
+    resumed = goaly(capsys, official, budgets, *argv, "--resume")
+
+    assert resumed.status == cli.USAGE
+    assert "config_hash" in resumed.stderr
+
+
+def test_a_run_without_a_pack_has_cores_hash(
+    capsys: pytest.CaptureFixture[str], budgets: Path, tmp_path: Path
+) -> None:
+    registry = Registry()
+    registry.add("toy", "v0", ToyFactory(pack_dir=None))
+    out = tmp_path / "r"
+
+    goaly(
+        capsys,
+        registry,
+        budgets,
+        "--bench",
+        "toy",
+        "--split",
+        "train",
+        "--budget-phase",
+        "test",
+        "--out",
+        str(out),
+    )
+
+    assert read_manifest(RunFiles(out).manifest).harness_hash == core_hash()
+
+
 def test_a_resumed_run_must_use_the_same_options(
     capsys: pytest.CaptureFixture[str], registry: Registry, budgets: Path, tmp_path: Path
 ) -> None:
@@ -460,6 +585,26 @@ def test_the_cache_makes_a_second_run_free(
     assert (second.summary["cached"], second.summary["ran"]) == (3, 0)
     hashes = {read_manifest(RunFiles(tmp_path / name).manifest).config_hash for name in ("a", "b")}
     assert len(hashes) == 1  # The output and cache directories are not settings of the run.
+
+
+def test_runs_that_grade_differently_never_share_a_cache_entry(
+    capsys: pytest.CaptureFixture[str], budgets: Path, tmp_path: Path
+) -> None:
+    common = ["--bench", "toy", "--split", "train", "--budget-phase", "test"]
+    cache = tmp_path / "cache"
+    dev, official = Registry(), Registry()
+    dev.add("toy", "v0", ToyFactory())
+    official.add("toy", "v0", ToyFactory(cache_namespace="toy-official"))
+    goaly(capsys, dev, budgets, *common, "--cache", str(cache), "--out", str(tmp_path / "a"))
+
+    other = goaly(
+        capsys, official, budgets, *common, "--cache", str(cache), "--out", str(tmp_path / "b")
+    )
+
+    assert other.status == 0, other.stderr
+    assert (other.summary["cached"], other.summary["ran"]) == (0, 3)
+    assert sorted(path.name for path in cache.iterdir()) == ["toy-dev", "toy-official"]
+    assert all(list((cache / name).rglob("*.json")) for name in ("toy-dev", "toy-official"))
 
 
 def test_a_harness_without_a_grading_namespace_cannot_use_the_cache(
@@ -590,8 +735,9 @@ def test_the_grade_phase_fills_the_cache_for_the_next_solve_phase(
         (["--split", "train"], "--split"),
         (
             ["--seeds", "2", "--resume", "--budget-share", "toy"],
-            "--seeds, --resume, --budget-share",
+            "--seeds, --budget-share, --resume",
         ),
+        (["--first-seed", "0", "--retry-errors"], "--first-seed, --retry-errors"),  # 0 is given.
         (["--harness", "v0", "--max-tasks", "2"], "--harness, --max-tasks"),
     ],
 )
@@ -729,7 +875,7 @@ def test_the_share_is_the_one_the_phase_gives_the_process(
 @pytest.mark.parametrize(
     ("argv", "message"),
     [
-        (["--budget-phase", "rsi"], "no phase 'rsi'; the phases are: test"),
+        (["--budget-phase", "rsi"], "no phase 'rsi'; the phases are: later, test"),
         (
             ["--budget-phase", "test", "--budget-share", "background"],
             "gives no share to 'background'",
@@ -976,6 +1122,258 @@ def test_a_run_that_fails_exits_1_and_logs_why(
     assert any("Traceback" in entry.get("exception", "") for entry in logged)
 
 
+class UnreadableData(ScriptedBenchmark):
+    """An adapter that cannot read its data: a bug to debug, not a mistake in the command."""
+
+    def load_instances(self, split: Split.ValueType) -> list[ToyInstance]:
+        raise ValueError("row 7 of the dataset has no base_sql")
+
+
+def test_any_other_value_error_fails_the_run_with_its_traceback(
+    capsys: pytest.CaptureFixture[str], budgets: Path, tmp_path: Path
+) -> None:
+    registry = Registry()
+    registry.add("toy", "v0", ToyFactory(benchmark_type=UnreadableData))
+
+    outcome = goaly(
+        capsys,
+        registry,
+        budgets,
+        "--bench",
+        "toy",
+        "--split",
+        "train",
+        "--budget-phase",
+        "test",
+        "--out",
+        str(tmp_path / "r"),
+    )
+
+    assert outcome.status == cli.FAILED
+    assert "the run failed: ValueError: row 7 of the dataset has no base_sql" in outcome.stderr
+    logged = [json.loads(line) for line in outcome.stderr.splitlines() if line.startswith("{")]
+    assert any("Traceback" in entry.get("exception", "") for entry in logged)
+
+
+def test_an_out_that_is_a_file_is_a_usage_error(
+    capsys: pytest.CaptureFixture[str], registry: Registry, budgets: Path, tmp_path: Path
+) -> None:
+    out = tmp_path / "run"
+    out.write_text("not a directory\n", encoding="utf-8")
+
+    outcome = goaly(
+        capsys,
+        registry,
+        budgets,
+        "--bench",
+        "toy",
+        "--split",
+        "train",
+        "--budget-phase",
+        "test",
+        "--out",
+        str(out),
+    )
+
+    assert outcome.status == cli.USAGE
+    assert "cannot be a run directory" in outcome.stderr
+
+
+@pytest.mark.parametrize("run_id", ["../up", "a b", "", "run/1", "r\u00e9"])
+def test_a_run_id_is_a_plain_name(
+    capsys: pytest.CaptureFixture[str],
+    registry: Registry,
+    budgets: Path,
+    tmp_path: Path,
+    run_id: str,
+) -> None:
+    with pytest.raises(SystemExit) as refused:
+        goaly(
+            capsys,
+            registry,
+            budgets,
+            "--bench",
+            "toy",
+            "--split",
+            "train",
+            "--budget-phase",
+            "test",
+            "--out",
+            str(tmp_path / "r"),
+            "--run-id",
+            run_id,
+        )
+
+    assert refused.value.code == cli.USAGE
+    assert "letters, digits, '-' and '_'" in capsys.readouterr().err
+
+
+def test_a_used_directory_is_refused_before_the_harness_opens(
+    capsys: pytest.CaptureFixture[str],
+    registry: Registry,
+    budgets: Path,
+    factory: ToyFactory,
+    tmp_path: Path,
+) -> None:
+    argv = [
+        "--bench",
+        "toy",
+        "--split",
+        "train",
+        "--budget-phase",
+        "test",
+        "--out",
+        str(tmp_path / "r"),
+    ]
+    goaly(capsys, registry, budgets, *argv, "--run-id", "first")
+    factory.options.clear()
+
+    again = goaly(capsys, registry, budgets, *argv)
+    other = goaly(capsys, registry, budgets, *argv, "--resume", "--run-id", "second")
+    same = goaly(capsys, registry, budgets, *argv, "--resume", "--run-id", "first")
+
+    assert again.status == cli.USAGE
+    assert "already holds the run first" in again.stderr
+    assert other.status == cli.USAGE
+    assert "holds the run first, not second" in other.stderr
+    assert len(factory.options) == 1  # Only the resume that can go on opened the harness.
+    assert same.status == 0, same.stderr
+
+
+def test_retry_errors_runs_the_failed_tasks_again_on_resume(
+    capsys: pytest.CaptureFixture[str],
+    registry: Registry,
+    budgets: Path,
+    factory: ToyFactory,
+    tmp_path: Path,
+) -> None:
+    argv = [
+        "--bench",
+        "toy",
+        "--split",
+        "train",
+        "--budget-phase",
+        "test",
+        "--out",
+        str(tmp_path / "r"),
+    ]
+    factory.policy = ScriptedPolicy({"t1": raising(RuntimeError("502 after 5 retries"))})
+    first = goaly(capsys, registry, budgets, *argv)
+    factory.policy = ScriptedPolicy()  # The gateway is back.
+
+    kept = goaly(capsys, registry, budgets, *argv, "--resume")
+    retried = goaly(capsys, registry, budgets, *argv, "--resume", "--retry-errors")
+
+    assert first.summary["errors"] == {"TASK_ERROR_TYPE_POLICY_CRASH": 1}
+    assert (kept.summary["resumed"], kept.summary["ran"]) == (3, 0)
+    assert (retried.summary["resumed"], retried.summary["ran"]) == (2, 1)
+    last = {result.instance_id: result for result in results(tmp_path / "r")}
+    assert last["t1"].error_type == TASK_ERROR_TYPE_NONE  # The new line supersedes the error.
+
+
+def test_retry_errors_needs_resume(
+    capsys: pytest.CaptureFixture[str], registry: Registry, budgets: Path, tmp_path: Path
+) -> None:
+    outcome = goaly(
+        capsys,
+        registry,
+        budgets,
+        "--bench",
+        "toy",
+        "--split",
+        "train",
+        "--budget-phase",
+        "test",
+        "--out",
+        str(tmp_path / "r"),
+        "--retry-errors",
+    )
+
+    assert outcome.status == cli.USAGE
+    assert "--retry-errors needs --resume" in outcome.stderr
+
+
+def test_the_process_is_confined_before_the_harness_opens(
+    capsys: pytest.CaptureFixture[str],
+    registry: Registry,
+    budgets: Path,
+    factory: ToyFactory,
+    tmp_path: Path,
+) -> None:
+    calls: list[int] = []
+    argv = [
+        "--bench",
+        "toy",
+        "--split",
+        "train",
+        "--budget-phase",
+        "test",
+        "--out",
+        str(tmp_path / "r"),
+    ]
+
+    status = cli.main(
+        ["run", *argv],
+        registry,
+        budgets_file=budgets,
+        confine=lambda: calls.append(len(factory.options)),
+    )
+
+    assert status == 0
+    assert calls == [0]  # Once, and before the harness opened.
+
+
+def signalling(*signals: signal.Signals) -> Action:
+    """An action that sends ``signals`` to its own process, as Ctrl-C or a container's stop
+    does, then works on until it is cancelled."""
+
+    async def act(task: TaskInput, env: Environment, ctx: StubContext) -> Prediction | None:
+        for number in signals:
+            os.kill(os.getpid(), number)
+        await asyncio.sleep(30)
+        return None
+
+    return act
+
+
+@pytest.mark.parametrize(
+    ("signals", "status", "said"),
+    [
+        ((signal.SIGTERM, signal.SIGTERM), cli.TERMINATED, "terminated"),
+        ((signal.SIGINT,), cli.INTERRUPTED, "interrupted"),
+    ],
+    ids=["SIGTERM, twice", "SIGINT"],
+)
+def test_a_stopped_run_closes_everything_and_resumes(
+    capsys: pytest.CaptureFixture[str],
+    registry: Registry,
+    budgets: Path,
+    factory: ToyFactory,
+    tmp_path: Path,
+    signals: tuple[signal.Signals, ...],
+    status: int,
+    said: str,
+) -> None:
+    out = tmp_path / "r"
+    argv = ["--bench", "toy", "--split", "train", "--budget-phase", "test", "--out", str(out)]
+    factory.policy = ScriptedPolicy({"t2": signalling(*signals)})
+
+    stopped = goaly(capsys, registry, budgets, *argv, "--max-tasks", "1")
+    factory.policy = ScriptedPolicy()
+    resumed = goaly(capsys, registry, budgets, *argv, "--resume")
+
+    assert stopped.status == status
+    assert f"{said}; to continue the run, run the same command with --resume" in stopped.stderr
+    assert factory.closed
+    lock_run_dir(RunFiles(out)).release()  # The stopped run released its lock.
+    assert resumed.status == 0, resumed.stderr
+    # Each task recorded before the signal is resumed; one cancelled while it wrote its records
+    # runs again, as after a crash. t2 was solving.
+    assert resumed.summary["resumed"] + resumed.summary["ran"] == 3
+    assert ("t2", 0) in factory.policy.solved  # The resumed run's policy.
+    assert {result.instance_id for result in results(out)} == {"t0", "t1", "t2"}
+
+
 def test_an_interrupted_run_says_how_to_continue(
     capsys: pytest.CaptureFixture[str],
     registry: Registry,
@@ -1008,6 +1406,40 @@ def test_an_interrupted_run_says_how_to_continue(
 
 
 # Logging.
+
+
+def test_every_log_line_of_a_task_names_its_run_and_task(
+    capsys: pytest.CaptureFixture[str],
+    registry: Registry,
+    budgets: Path,
+    factory: ToyFactory,
+    tmp_path: Path,
+) -> None:
+    factory.policy = ScriptedPolicy({"t1": raising(RuntimeError("the policy broke"))})
+
+    outcome = goaly(
+        capsys,
+        registry,
+        budgets,
+        "--bench",
+        "toy",
+        "--split",
+        "train",
+        "--budget-phase",
+        "test",
+        "--out",
+        str(tmp_path / "r"),
+    )
+
+    logged = [json.loads(line) for line in outcome.stderr.splitlines() if line.startswith("{")]
+    (failed,) = [entry for entry in logged if entry["level"] == "WARNING"]
+    assert (failed["run_id"], failed["instance_id"], failed["seed"]) == (
+        outcome.summary["run_id"],
+        "t1",
+        0,
+    )
+    (finished,) = [entry for entry in logged if entry["message"].startswith("finished run")]
+    assert "instance_id" not in finished  # Outside every task.
 
 
 def test_logs_are_json_lines_on_stderr_at_the_level_asked(

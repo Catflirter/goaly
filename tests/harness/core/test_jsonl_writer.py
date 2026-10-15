@@ -299,6 +299,67 @@ async def test_a_writer_that_stops_early_logs_how_many_lines_it_dropped(
     blocking_append.release.set()
 
 
+async def test_a_writer_stopped_while_idle_drops_no_line(
+    path: Path, caplog: pytest.LogCaptureFixture
+) -> None:
+    writer = JsonlWriter[TaskResult](path)
+    await writer.__aenter__()
+    await writer.write(result(1))  # Written and settled: the writer task now waits for more.
+    task = writer._task  # As the event loop cancels it at shutdown, if the writer is left open.
+    assert task is not None
+
+    with caplog.at_level(logging.WARNING, logger="goaly.harness.core.jsonl_writer"):
+        task.cancel()
+        with pytest.raises(asyncio.CancelledError):
+            await task
+
+    assert "unwritten" not in caplog.text
+    assert instance_ids(path) == ["task-1"]
+
+
+async def test_a_second_close_at_the_same_time_waits_for_the_queued_lines(
+    path: Path, blocking_append: BlockingAppend
+) -> None:
+    writer = JsonlWriter[TaskResult](path)
+    await writer.__aenter__()
+    for n in range(5):
+        writer.put(result(n))
+    await wait_for(blocking_append.started)
+    first = asyncio.create_task(writer.aclose())
+    await asyncio.sleep(0)
+    second = asyncio.create_task(writer.aclose())
+    await asyncio.sleep(0)
+    assert not second.done()  # Lines are still queued behind the slow one.
+
+    blocking_append.release.set()
+    await asyncio.wait_for(second, GUARD_S)
+
+    assert instance_ids(path) == [f"task-{n}" for n in range(5)]
+    await first
+
+
+async def test_a_second_close_cancelled_leaves_the_first_one_writing(
+    path: Path, blocking_append: BlockingAppend
+) -> None:
+    writer = JsonlWriter[TaskResult](path)
+    await writer.__aenter__()
+    for n in range(3):
+        writer.put(result(n))
+    await wait_for(blocking_append.started)
+    first = asyncio.create_task(writer.aclose())
+    await asyncio.sleep(0)
+    second = asyncio.create_task(writer.aclose())
+    await asyncio.sleep(0)
+
+    second.cancel()
+    with pytest.raises(asyncio.CancelledError):
+        await second
+    blocking_append.release.set()
+    await asyncio.wait_for(first, GUARD_S)
+
+    assert instance_ids(path) == [f"task-{n}" for n in range(3)]
+
+
 # Failures.
 
 
@@ -371,9 +432,11 @@ async def test_closing_after_an_error_in_the_body_keeps_that_error(path: Path) -
 async def test_refuses_messages_before_it_is_entered(path: Path) -> None:
     writer = JsonlWriter[TaskResult](path)
 
-    with pytest.raises(RuntimeError, match="has not been entered"):
+    # One error type for every line it cannot record, so a recorder that must not raise
+    # catches just that one.
+    with pytest.raises(JsonlWriterError, match="has not been entered"):
         writer.put(result(1))
-    with pytest.raises(RuntimeError, match="has not been entered"):
+    with pytest.raises(JsonlWriterError, match="has not been entered"):
         await writer.write(result(1))
 
 
@@ -382,9 +445,9 @@ async def test_refuses_messages_once_closed_and_closing_again_does_nothing(path:
         writer.put(result(1))
     await writer.aclose()
 
-    with pytest.raises(RuntimeError, match="is closed"):
+    with pytest.raises(JsonlWriterError, match="is closed"):
         writer.put(result(2))
-    with pytest.raises(RuntimeError, match="is closed"):
+    with pytest.raises(JsonlWriterError, match="is closed"):
         await writer.write(result(2))
     assert instance_ids(path) == ["task-1"]
 
@@ -394,7 +457,7 @@ async def test_closing_a_writer_never_entered_closes_it_for_good(path: Path) -> 
 
     await writer.aclose()
 
-    with pytest.raises(RuntimeError, match="already"):
+    with pytest.raises(JsonlWriterError, match="is closed"):  # Not "already entered".
         await writer.__aenter__()
     assert not path.exists()
 
@@ -402,9 +465,9 @@ async def test_closing_a_writer_never_entered_closes_it_for_good(path: Path) -> 
 async def test_cannot_be_entered_twice(path: Path) -> None:
     writer = JsonlWriter[TaskResult](path)
     async with writer:
-        with pytest.raises(RuntimeError, match="already"):
+        with pytest.raises(JsonlWriterError, match="was already entered"):
             await writer.__aenter__()
-    with pytest.raises(RuntimeError, match="already"):
+    with pytest.raises(JsonlWriterError, match="was already entered"):
         await writer.__aenter__()
 
 
@@ -413,7 +476,7 @@ async def test_cannot_be_entered_twice_at_once(path: Path) -> None:
     first = asyncio.create_task(writer.__aenter__())
     await asyncio.sleep(0)  # The first entry is now creating the file.
 
-    with pytest.raises(RuntimeError, match="already"):
+    with pytest.raises(JsonlWriterError, match="was already entered"):
         await writer.__aenter__()  # While the first entry is still creating the file.
 
     await first
