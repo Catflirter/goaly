@@ -7,6 +7,8 @@ against a FakeLLM that injects 429s, latency and timeouts.
 
 import asyncio
 import logging
+import random
+from collections import Counter
 from collections.abc import Callable, Coroutine
 from contextlib import AsyncExitStack
 from typing import Any
@@ -27,6 +29,7 @@ from tests.harness.core.llm_fakes import (
     FakeClock,
     FakeLLM,
     Gateway,
+    Phase,
     Recorder,
     TopOfRange,
     completion,
@@ -903,28 +906,26 @@ async def test_logs_the_shares_it_runs_with(
     assert getattr(entry, "shares", None) == logged
 
 
-# The stress test (spec §6.2): faults, latency and timeouts, 500 calls at once.
+# The stress test (spec §6.2): faults, latency, timeouts and cancellations, 500 calls at once.
 
 STRESS_SHARES = {QWEN: 8, GLM: 3}
+STRESS_PHASES = [
+    # A storm of 429s and timeouts, which drives both limits down to 1.
+    Phase(until=100, rate_limited=0.25, timeouts=0.05),
+    # Then nearly every request fails with a 500, which opens the breaker under load.
+    Phase(until=200, server_errors=0.9),
+]  # The calm after that is long enough for both limits to grow back to the share.
 
 
-async def test_500_faulty_calls_stay_within_the_share_and_are_each_recorded_once(
+async def test_500_faulty_calls_hold_every_limit_and_are_each_recorded_once(
     caplog: pytest.LogCaptureFixture,
 ) -> None:
     caplog.set_level(logging.INFO, logger="goaly.harness.core.llm_throttle")
-    # A storm of 429s and timeouts over the first 100 requests drives both limits down to 1;
-    # the calm after it is long enough for them to grow back, with room to spare.
-    gateway = FakeLLM(
-        seed=20261015,
-        latency_s=0.005,
-        hang_s=1.0,
-        rate_limited=0.25,
-        timeouts=0.05,
-        storm_requests=100,
-    )
+    gateway = FakeLLM(seed=20261015, latency_s=0.005, hang_s=1.0, phases=STRESS_PHASES)
     recorder = Recorder()
     retry = RetryPolicy(timeout_s=0.2, backoff_base_s=0.001, backoff_cap_s=0.01)
     policy = ThrottlePolicy(breaker_window_s=1.0, breaker_open_s=0.05)
+    cancelling = random.Random(7)  # noqa: S311 - which calls to cancel, and when.
     async with LlmClient(
         settings(),
         recorder,
@@ -933,31 +934,57 @@ async def test_500_faulty_calls_stay_within_the_share_and_are_each_recorded_once
         throttle=policy,
         transport=httpx.MockTransport(gateway.handle),
     ) as llm:
+        throttles = llm._throttles  # The test reads the throttles' own counters.
+        gateway.probe = lambda model: (throttles[model].in_flight, throttles[model].limit)
 
         async def one(n: int) -> LlmReply | LlmError:
             model, tags = (GLM, ANALYST) if n % 4 == 0 else (QWEN, EXEC)
             try:
                 return await llm.complete([user(f"task {n}")], model=model, tags=tags)
-            except LlmError as error:  # Retries can run out during the storm.
+            except LlmError as error:  # Retries can run out in the storm.
                 return error
 
+        tasks = [asyncio.create_task(one(n)) for n in range(500)]
+        loop = asyncio.get_running_loop()
+        for task in tasks:  # One call in ten is cancelled midway, as a task budget would.
+            if cancelling.random() < 0.1:
+                loop.call_later(cancelling.uniform(0.001, 0.5), task.cancel)
         async with asyncio.timeout(60):  # Nothing deadlocks.
-            results = await asyncio.gather(*(one(n) for n in range(500)))
+            results = await asyncio.gather(*tasks, return_exceptions=True)
+        held = {model: throttle.in_flight for model, throttle in throttles.items()}
 
+    # No model went over its share, no request started above its model's limit, and every slot
+    # came back, cancelled calls' too.
     assert gateway.max_in_flight == STRESS_SHARES
-    records = [result.record for result in results]
-    assert all(record is not None for record in records)
-    call_ids = [record.call_id for record in records if record is not None]
-    assert len(set(call_ids)) == 500
-    assert sorted(record.call_id for record in recorder.records) == sorted(call_ids)
-    assert sum(len(record.attempts) for record in recorder.records) == gateway.requests
-    # The limits backed off in the storm and grew back to the share in the calm.
+    assert gateway.over_limit == []
+    assert held == {QWEN: 0, GLM: 0}
+    # Every call, cancelled ones too, was recorded exactly once.
+    cancelled = [result for result in results if isinstance(result, asyncio.CancelledError)]
+    finished = [result for result in results if isinstance(result, LlmReply | LlmError)]
+    assert cancelled
+    assert len(cancelled) + len(finished) == 500
+    assert len({record.call_id for record in recorder.records}) == len(recorder.records) == 500
+    statuses = Counter(record.status for record in recorder.records)
+    assert statuses[S.LLM_CALL_STATUS_CANCELLED] == len(cancelled)
+    finished_ids = {result.record.call_id for result in finished if result.record is not None}
+    assert len(finished_ids) == len(finished)
+    assert finished_ids <= {record.call_id for record in recorder.records}
+    # Every attempt reached the gateway, but for some of the cancelled ones.
+    attempts = [attempt for record in recorder.records for attempt in record.attempts]
+    sent = sum(1 for attempt in attempts if attempt.status != S.LLM_CALL_STATUS_CANCELLED)
+    assert sent <= gateway.requests <= len(attempts)
+    # The storm took both limits down to 1, and the calm grew them back to the share.
     for model, share in STRESS_SHARES.items():
-        downs = [entry for entry in events(caplog, "llm_limit_down") if fields(entry)[0] == model]
-        changes = [
+        limits = [
             fields(entry)[1]
             for entry in caplog.records
             if getattr(entry, "event", "").startswith("llm_limit") and fields(entry)[0] == model
         ]
-        assert downs, model
-        assert changes[-1] == share, model
+        downs = [fields(entry)[1] for entry in events(caplog, "llm_limit_down")]
+        assert min(downs) == 1, model
+        assert limits[-1] == share, model
+    # The 500s opened each model's breaker under load, and each closed again.
+    for model in STRESS_SHARES:
+        assert [entry for entry in events(caplog, "llm_breaker_open") if fields(entry)[0] == model]
+        closed = events(caplog, "llm_breaker_closed")
+        assert [entry for entry in closed if fields(entry)[0] == model], model

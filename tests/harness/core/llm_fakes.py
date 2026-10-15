@@ -3,7 +3,7 @@
 ``Gateway`` answers each request with the next of its scripted replies, shaped as the real
 gateway (LiteLLM 1.92 on SGLang) sent them on 2026-10-15. It runs behind httpx.MockTransport, so
 no test reaches the network. ``FakeClock`` makes every wait take no time, and ``FakeLLM``
-injects faults at random, for the stress test.
+injects faults at random, in phases, for the stress test.
 
 pytest puts the repository root on sys.path, so tests import these as
 ``tests.harness.core.llm_fakes``.
@@ -14,6 +14,7 @@ import json
 import random
 from collections import Counter
 from collections.abc import Awaitable, Callable, Mapping, Sequence
+from dataclasses import dataclass
 from typing import Any
 
 import httpx
@@ -185,48 +186,65 @@ def attempts(record: LlmCallRecord) -> list[tuple[int, int]]:
     return [(attempt.status, attempt.http_status) for attempt in record.attempts]
 
 
-class FakeLLM:
-    """A gateway that answers after a random latency and injects faults: 429s and timeouts.
+@dataclass(frozen=True)
+class Phase:
+    """A stretch of FakeLLM's requests, up to and including number ``until``, and its faults.
 
-    Over its first ``storm_requests`` requests, a request gets a 429 with probability
-    ``rate_limited``, or else, with probability ``timeouts``, hangs for ``hang_s``: longer than
-    the client's timeout. After the storm it only answers, still after a random latency. It counts
-    each model's requests in flight, so a test can check the client never went over its share.
+    Each fault has a probability. A 429 is congestion, and a 500 is a failure that is not. A
+    timeout hangs for longer than the client waits.
+    """
+
+    until: int
+    rate_limited: float = 0.0
+    server_errors: float = 0.0
+    timeouts: float = 0.0
+
+
+class FakeLLM:
+    """A gateway that answers after a random latency and injects faults: 429s, 500s and timeouts.
+
+    A request gets the faults of the first of ``phases`` it falls in, and none after the last.
+    It counts each model's requests in flight, so a test can check the client never went over
+    its share. If a test sets ``probe``, which reads the client's slots held and limit for a
+    model, each request that starts with more slots held than the limit is noted in
+    ``over_limit``.
     """
 
     def __init__(
-        self,
-        *,
-        seed: int,
-        latency_s: float,
-        hang_s: float,
-        rate_limited: float,
-        timeouts: float,
-        storm_requests: int,
+        self, *, seed: int, latency_s: float, hang_s: float, phases: Sequence[Phase]
     ) -> None:
         self._rng = random.Random(seed)  # noqa: S311 - simulated faults, not security.
         self._latency_s = latency_s
         self._hang_s = hang_s
-        self._rate_limited = rate_limited
-        self._timeouts = timeouts
-        self._storm_requests = storm_requests
+        self._phases = tuple(phases)
         self.requests = 0
         self.in_flight: Counter[str] = Counter()
         self.max_in_flight: dict[str, int] = {}
+        self.probe: Callable[[str], tuple[int, int]] | None = None
+        self.over_limit: list[tuple[str, int, int]] = []
 
     async def handle(self, request: httpx.Request) -> httpx.Response:
         model = json.loads(request.content)["model"]
         self.requests += 1
-        roll = self._rng.random() if self.requests <= self._storm_requests else 1.0
+        if self.probe is not None:
+            held, limit = self.probe(model)
+            if held > limit:
+                self.over_limit.append((model, held, limit))
+        phase = next((phase for phase in self._phases if self.requests <= phase.until), None)
+        roll = self._rng.random()
         latency = self._rng.uniform(0.0, self._latency_s)
         self.in_flight[model] += 1
         self.max_in_flight[model] = max(self.max_in_flight.get(model, 0), self.in_flight[model])
         try:
-            if roll < self._rate_limited:
-                await asyncio.sleep(latency)
-                return failure(429)
-            if roll < self._rate_limited + self._timeouts:
-                await asyncio.sleep(self._hang_s)
+            if phase is not None:
+                if roll < phase.rate_limited:
+                    await asyncio.sleep(latency)
+                    return failure(429)
+                if roll < phase.rate_limited + phase.server_errors:
+                    await asyncio.sleep(latency)
+                    return failure(500)
+                if roll < phase.rate_limited + phase.server_errors + phase.timeouts:
+                    await asyncio.sleep(self._hang_s)
             await asyncio.sleep(latency)
             return completion()
         finally:
