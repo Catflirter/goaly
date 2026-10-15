@@ -20,6 +20,7 @@ from google.protobuf.timestamp_pb2 import Timestamp
 from goaly.contracts.gen.environment_pb2 import ShellResult, SqlResult
 from goaly.contracts.gen.llm_call_pb2 import LlmCallAttempt, LlmCallRecord, LlmCallStatus, Usage
 from goaly.contracts.gen.task_pb2 import (
+    EffiSqlGrade,
     EffiSqlPrediction,
     EffiSqlTaskInput,
     Grade,
@@ -205,6 +206,15 @@ def test_leaves_out_usage_the_gateway_did_not_report() -> None:
     assert "reasoning_tokens" not in unreported
     assert "cost_usd" not in unreported
     assert (reported["reasoning_tokens"], reported["cost_usd"]) == ("0", 0.0)
+
+
+def test_tells_a_robustness_check_that_did_not_run_from_one_that_failed() -> None:
+    # Unset: no check ran, as for the official-protocol numbers. False: hard-coded results.
+    unchecked = parse(to_json_line(EffiSqlGrade(matched=True)))
+    hard_coded = parse(to_json_line(EffiSqlGrade(matched=True, alt_matched=False)))
+
+    assert "alt_matched" not in unchecked
+    assert hard_coded["alt_matched"] is False
 
 
 def test_writes_timestamps_in_rfc_3339() -> None:
