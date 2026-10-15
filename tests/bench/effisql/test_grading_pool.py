@@ -435,9 +435,19 @@ class TestProcessRunner:
         assert holder == f"{os.getpid()}\n"
         with pytest.raises(GraderError, match="another grader process is grading on fake-1"):
             grading_service.ProcessRunner(
-                WorkerSpec(GradingInstance("fake-1", 1)), lock_dir=tmp_path
+                WorkerSpec(GradingInstance("fake-1", 1)), lock_dir=tmp_path, lock_wait_s=0.2
             )
         assert (tmp_path / "fake-1.lock").read_text(encoding="utf-8") == holder, "PID kept"
+
+    def test_a_second_grader_waits_for_the_holder_to_close(self, tmp_path: Path) -> None:
+        spec = WorkerSpec(GradingInstance("fake-3", 1))
+        holder = grading_service.ProcessRunner(spec, lock_dir=tmp_path)
+        timer = threading.Timer(0.5, holder.close)
+        timer.start()
+        second = grading_service.ProcessRunner(spec, lock_dir=tmp_path, lock_wait_s=30)
+        timer.join()
+        assert (tmp_path / "fake-3.lock").read_text(encoding="utf-8") == f"{os.getpid()}\n"
+        second.close()
 
     def test_the_lock_is_released_on_close(self, tmp_path: Path) -> None:
         spec = WorkerSpec(GradingInstance("fake-2", 1))

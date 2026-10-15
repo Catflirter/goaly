@@ -28,6 +28,7 @@ import multiprocessing
 import multiprocessing.synchronize
 import os
 import threading
+import time
 from collections.abc import Awaitable, Callable, Sequence
 from concurrent.futures import ProcessPoolExecutor, ThreadPoolExecutor
 from concurrent.futures.process import BrokenProcessPool
@@ -177,16 +178,28 @@ def _run_in_worker[T](token: int, work: Callable[..., T], args: tuple[Any, ...])
     return _worker_slot.run(token, lambda slot: work(slot, *args))
 
 
+# How long a grader waits for an instance another grader process holds, e.g. when the RSI lane
+# evaluates candidates concurrently: their grade phases take turns on the instances.
+LOCK_WAIT_S = 4 * 3600.0
+_LOCK_POLL_S = 5.0
+
+
 class ProcessRunner:
     """Runs a slot's work in a worker process of its own, started with spawn.
 
     It takes the instance's lock under ``lock_dir`` for its lifetime, so no other grader process
-    can grade on the same instance, and raises GraderError if another holds it.
+    can grade on the same instance. While another holds it, it waits up to ``lock_wait_s``, then
+    raises GraderError. Every grader takes its instances' locks in the same order, so concurrent
+    graders queue and never deadlock.
     """
 
-    def __init__(self, spec: WorkerSpec, *, lock_dir: Path | None = None) -> None:
+    def __init__(
+        self, spec: WorkerSpec, *, lock_dir: Path | None = None, lock_wait_s: float = LOCK_WAIT_S
+    ) -> None:
         self.spec = spec
-        self._lock_file = _lock_instance(lock_dir or default_lock_dir(), spec.instance)
+        self._lock_file = _lock_instance(
+            lock_dir or default_lock_dir(), spec.instance, wait_s=lock_wait_s
+        )
         self._context = multiprocessing.get_context("spawn")  # Never fork with threads around.
         self._tokens = itertools.count()
         self._deaths = 0
@@ -254,15 +267,21 @@ class ProcessRunner:
         self._lock_file.close()
 
 
-def _lock_instance(lock_dir: Path, instance: GradingInstance) -> IO[str]:
+def _lock_instance(lock_dir: Path, instance: GradingInstance, *, wait_s: float) -> IO[str]:
     lock_dir.mkdir(parents=True, exist_ok=True)
     # Append mode, so a refused second grader never truncates the holder's PID.
     handle = (lock_dir / f"{instance.name}.lock").open("a", encoding="utf-8")
-    try:
-        fcntl.flock(handle, fcntl.LOCK_EX | fcntl.LOCK_NB)
-    except BlockingIOError:
-        handle.close()
-        raise GraderError(f"another grader process is grading on {instance.name}") from None
+    deadline = time.monotonic() + wait_s
+    while True:
+        try:
+            fcntl.flock(handle, fcntl.LOCK_EX | fcntl.LOCK_NB)
+            break
+        except BlockingIOError:
+            if time.monotonic() >= deadline:
+                handle.close()
+                raise GraderError(f"another grader process is grading on {instance.name}") from None
+            _log.info("waiting for another grader's instance", extra={"instance": instance.name})
+            time.sleep(min(_LOCK_POLL_S, max(deadline - time.monotonic(), 0.0)))
     handle.truncate(0)
     handle.write(f"{os.getpid()}\n")
     handle.flush()
