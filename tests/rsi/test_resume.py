@@ -8,7 +8,9 @@ from goaly.contracts.gen.experiment_pb2 import (
     DECISION_ABORTED,
     DECISION_ACCEPTED,
     DECISION_PENDING,
+    DECISION_REJECTED,
     LANE_EFFISQL,
+    REJECTION_REASON_OUTRANKED,
     ExperimentRecord,
     PhaseResult,
 )
@@ -19,6 +21,7 @@ from goaly.rsi.resume import (
     merge_usage,
     reconcile_best,
     remove_worktrees,
+    requeue,
 )
 from tests.rsi.gitrepo import git
 from tests.rsi.round_world import World, hypothesis, make_world
@@ -136,3 +139,34 @@ def test_remove_worktrees_clears_the_lanes_leftovers(world: World) -> None:
     assert remove_worktrees(world.workspace, LANE_EFFISQL) == 2
     assert world.workspace.worktrees(LANE_EFFISQL) == []
     assert "rsi/effisql/e1" in git(world.repo, "branch", "--list", "rsi/*")
+
+
+def test_an_aborted_record_under_the_tag_is_repaired(world: World) -> None:
+    # A failed acceptance write once let the round abort the best; the tag is the truth.
+    candidate = commit(world, "candidate")
+    entry = record(world, "e1", candidate_commit=candidate, confirmation=PhaseResult(delta=0.1))
+    entry.decision = DECISION_ABORTED
+    world.ledger.record_experiment(entry)
+    world.workspace.set_best(LANE_EFFISQL, candidate, expected=world.v0)
+    assert reconcile(world) == candidate
+    assert world.ledger.latest_experiments(LANE_EFFISQL)["e1"].decision == DECISION_ACCEPTED
+
+
+def test_outranks_do_not_count_toward_the_requeue_cap(world: World) -> None:
+    for name in ("e1", "e2", "e3"):
+        entry = record(world, name)
+        entry.hypothesis.hypothesis_id = "h-o"
+        entry.decision = DECISION_REJECTED
+        entry.rejection_reasons.append(REJECTION_REASON_OUTRANKED)
+        world.ledger.record_experiment(entry)
+    fresh = record(world, "e4")
+    fresh.hypothesis.hypothesis_id = "h-o"
+    assert requeue(world.ledger, world.queue, fresh, max_requeues=2)
+    for name in ("e5", "e6"):
+        entry = record(world, name)
+        entry.hypothesis.hypothesis_id = "h-x"
+        entry.decision = DECISION_ABORTED
+        world.ledger.record_experiment(entry)
+    last = record(world, "e7")
+    last.hypothesis.hypothesis_id = "h-x"
+    assert not requeue(world.ledger, world.queue, last, max_requeues=2)
