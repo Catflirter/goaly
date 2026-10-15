@@ -26,7 +26,7 @@ The best (v0) fails train tasks 1 to 5, solves 6 to 10, and scores 0.5 on every 
 
 import asyncio
 import json
-from collections.abc import Sequence
+from collections.abc import Callable, Sequence
 from dataclasses import dataclass, field
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
@@ -147,6 +147,9 @@ class ToyEvaluator:
     most_in_flight: int = 0
     gate: asyncio.Event | None = None  # When set, validations wait for it.
     train_known: bool = True  # Whether v0's train results exist.
+    kind_of: Callable[[str], str] | None = None  # The behavior of a commit not in ``kinds``.
+    smoke_gate: asyncio.Event | None = None  # When set, goaly-smoke's evaluations wait for it.
+    smoke_error: bool = False  # Whether goaly-smoke's evaluations fail, as a dead container.
     reference_infra: int = 0  # How many val tasks the infrastructure fails in references.
 
     def __post_init__(self) -> None:
@@ -154,22 +157,27 @@ class ToyEvaluator:
 
     async def evaluate(self, request: EvaluationRequest) -> Evaluation:
         self.requests.append(request)
-        kind = self.kinds.get(request.commit, "base")
+        kind = self._kind(request.commit)
         if kind == "broken" or (kind == "late" and request.phase == "confirmation"):
             raise RuntimeError("the solve container exited with 137")
         if self.gate is not None and request.phase == "validation":
             await self.gate.wait()
-        results = []
-        for task in request.instance_ids:
-            for seed in request.seeds:
-                async with self._limit:
-                    self.in_flight += 1
-                    self.most_in_flight = max(self.most_in_flight, self.in_flight)
-                    await asyncio.sleep(0)
-                    self.in_flight -= 1
-                flagged = kind == "flag" and task == VAL[0]
-                value = credit(kind, task, seed)
-                results.append(task_result(request.run_id, task, seed, value, flagged=flagged))
+        if request.phase == "smoke" and self.smoke_error:
+            raise RuntimeError("the smoke run's solve container exited with 137")
+        if request.phase == "smoke" and self.smoke_gate is not None:
+            await self.smoke_gate.wait()
+        pairs = [(task, seed) for task in request.instance_ids for seed in request.seeds]
+        await asyncio.gather(*(self._solve() for _ in pairs))  # The tasks run concurrently.
+        results = [
+            task_result(
+                request.run_id,
+                task,
+                seed,
+                credit(kind, task, seed),
+                flagged=kind == "flag" and task == VAL[0],
+            )
+            for task, seed in pairs
+        ]
         if request.phase == "validation" and kind == "short":
             results.pop()
         if request.phase == "validation" and kind == "graderr":
@@ -191,8 +199,20 @@ class ToyEvaluator:
         stats = CostStats(1000.0, 0.01, 10.0, count=count)
         return Evaluation(results, stats, infra_failed=infra)
 
+    async def _solve(self) -> None:
+        async with self._limit:
+            self.in_flight += 1
+            self.most_in_flight = max(self.most_in_flight, self.in_flight)
+            await asyncio.sleep(0.001)
+            self.in_flight -= 1
+
+    def _kind(self, commit: str) -> str:
+        if commit in self.kinds:
+            return self.kinds[commit]
+        return "base" if self.kind_of is None else self.kind_of(commit)
+
     def known_train(self, commit: str) -> tuple[Sequence[TaskResult], Sequence[Trajectory]]:
-        kind = self.kinds.get(commit, "base")
+        kind = self._kind(commit)
         if kind != "base" or not self.train_known:
             return [], []
         results = [
@@ -270,6 +290,7 @@ class ScriptedGlm:
     analyst_ids: list[list[str]] = field(default_factory=list)
     invalid: bool = False
     fail: bool = False
+    hang_tools: bool = False  # Whether an implementer's call (one with tools) never returns.
     bodies: list[dict[str, Any]] = field(default_factory=list)
     records: list[LlmCallRecord] = field(default_factory=list)
 
@@ -279,6 +300,8 @@ class ScriptedGlm:
     async def handle(self, request: httpx.Request) -> httpx.Response:
         body = json.loads(request.content)
         self.bodies.append(body)
+        if self.hang_tools and body.get("tools"):
+            await asyncio.sleep(3600)
         if self.fail:
             return httpx.Response(400, json={"error": {"message": "refused"}})
         prompt = body["messages"][-1]["content"]
