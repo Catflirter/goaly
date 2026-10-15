@@ -401,7 +401,7 @@ def test_manual_exclusions_load_from_their_file(tmp_path: Path) -> None:
 
 
 def test_the_committed_manual_exclusions_file_is_valid() -> None:
-    assert load_manual_exclusions() == ()
+    assert [e.instance_id for e in load_manual_exclusions()] == ["93"]
 
 
 def test_grade_summary_of_a_grade() -> None:
