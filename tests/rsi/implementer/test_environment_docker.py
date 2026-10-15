@@ -83,6 +83,37 @@ def test_a_write_outside_the_pack_fails_and_no_key_is_inside(
     assert containers_of(worktree) == []
 
 
+IP_PROBE = """\
+import errno, socket
+for family in (socket.AF_INET, socket.AF_INET6):
+    try:
+        socket.socket(family, socket.SOCK_STREAM)
+    except OSError as error:
+        print(family.name, errno.errorcode[error.errno])
+    else:
+        print(family.name, "opened")
+socket.socket(socket.AF_UNIX).close()
+print("AF_UNIX opened")
+"""
+
+
+def test_the_sandbox_can_open_no_ip_socket(image: str, worktree: Worktree) -> None:
+    with SandboxEnvironment(
+        image=image, worktree=worktree, command_timeout_s=30, lifetime_s=600
+    ) as sandbox:
+        sockets = sandbox.execute({"command": f"python - <<'EOF'\n{IP_PROBE}EOF"})
+        loopback = sandbox.execute(
+            {"command": "exec 3<>/dev/tcp/127.0.0.1/13337 && echo connected || echo refused"}
+        )
+
+    assert sockets["output"].split("\n")[:3] == [
+        "AF_INET EPERM",
+        "AF_INET6 EPERM",
+        "AF_UNIX opened",
+    ]
+    assert "connected" not in loopback["output"]  # Not even code-server on localhost.
+
+
 def test_a_command_is_stopped_inside_the_container_at_its_timeout(
     image: str, worktree: Worktree
 ) -> None:

@@ -170,7 +170,7 @@ def test_the_prompt_gives_the_hypothesis_paths_rules_and_limits(lane: Lane) -> N
     assert "json, math, re" in task  # The allowlist's stdlib modules, in plain words.
     assert "`goaly.harness.core.tools`" in task
     assert "Literal" in task
-    assert "do not use the network" in system
+    assert "the sandbox can open no IP socket" in system
     assert "precomputed or constant results" in task
     assert "CASE WHEN (SELECT count(*) ...) > N THEN <constant>" in task
     assert "git does not work in the sandbox" in task
