@@ -384,17 +384,17 @@ class EffiSqlGrade(_message.Message):
     """
     alt_matched: _builtins.bool
     """The robustness check against hard-coded results: whether the prediction also returns the
-    base query's result on an alternate TPC-H database with different data. Set when the check
-    ran (dev mode, RSI and the checked numbers); unset when it did not, as for the
-    official-protocol numbers. False is the hard_coded flag: credit is then 0 and the grade's
-    correct is false. The final report gives both the official and the checked numbers.
+    base query's result on an alternate TPC-H database with different data. Set whenever the
+    check ran: in dev mode, in RSI, and in the final official runs, which feed the checked
+    numbers. False is the hard_coded flag: credit is then 0 and the grade's correct is false. The
+    final report gives both the official and the checked numbers.
     """
     literal_result: _builtins.bool
     """The plan check against hard-coded results, run on the prediction's EXPLAIN (FORMAT JSON)
-    plan. Set when the check ran (dev mode, RSI and the checked numbers); unset when it did not,
-    as for the official-protocol numbers. True is the literal_result flag: the plan scans none of
-    the base query's relations, or its output comes from a Values Scan or Result subtree with no
-    relation scan beneath it. Credit is then 0 and the grade's correct is false.
+    plan. Set whenever the check ran: in dev mode, in RSI, and in the final official runs, which
+    feed the checked numbers. True is the literal_result flag: the plan scans none of the base
+    query's relations, or its output comes from a Values Scan or Result subtree with no relation
+    scan beneath it. Credit is then 0 and the grade's correct is false.
     """
     base_time_s: _builtins.float
     """The base query's median EXPLAIN ANALYZE execution time, in seconds; unset if not measured."""
@@ -405,9 +405,10 @@ class EffiSqlGrade(_message.Message):
     timed, or when identity_cached is true: it is then the identity τ measured during setup.
     """
     credit: _builtins.float
-    """The R-VES tier credit g(τ): 1 for τ ≥ 2, 0.75 for τ ≥ 1.2, 0.5 for τ ≥ 1, 0.25 for τ ≥ 0.5,
-    and 0 otherwise. 0 when not matched, when alt_matched is false, or when literal_result is
-    true.
+    """The checked credit: the R-VES tier credit g(speedup), where g(τ) is 1 for τ ≥ 2, 0.75 for
+    τ ≥ 1.2, 0.5 for τ ≥ 1, 0.25 for τ ≥ 0.5 and 0 otherwise; but 0 when not matched, when
+    alt_matched is false, or when literal_result is true. The official credit ignores both
+    flags: it is g(speedup) when matched, an unset speedup counting as 0, and 0 otherwise.
     """
     timing_runs: _builtins.int
     """How many timed runs the times come from."""

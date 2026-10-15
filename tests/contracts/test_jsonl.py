@@ -209,7 +209,7 @@ def test_leaves_out_usage_the_gateway_did_not_report() -> None:
 
 
 def test_tells_a_robustness_check_that_did_not_run_from_one_that_failed() -> None:
-    # Unset: no check ran, as for the official-protocol numbers. False: hard-coded results.
+    # Unset: the check did not run. False: hard-coded results.
     unchecked = parse(to_json_line(EffiSqlGrade(matched=True)))
     hard_coded = parse(to_json_line(EffiSqlGrade(matched=True, alt_matched=False)))
 
@@ -218,7 +218,7 @@ def test_tells_a_robustness_check_that_did_not_run_from_one_that_failed() -> Non
 
 
 def test_tells_a_plan_check_that_did_not_run_from_one_that_passed() -> None:
-    # Unset: no check ran, as for the official-protocol numbers. True: a literal result.
+    # Unset: the check did not run. True: a literal result.
     unchecked = parse(to_json_line(EffiSqlGrade(matched=True)))
     passed = parse(to_json_line(EffiSqlGrade(matched=True, literal_result=False)))
     literal = parse(to_json_line(EffiSqlGrade(matched=True, literal_result=True)))
