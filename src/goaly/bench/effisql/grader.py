@@ -65,6 +65,7 @@ __all__ = [
     "Psycopg2Timestamptz",
     "QueryError",
     "QueryTimeoutError",
+    "ResourceError",
     "ResultDigest",
     "Timing",
     "TimingError",
@@ -72,6 +73,7 @@ __all__ = [
     "row_hash",
     "speedup",
     "statement_body",
+    "time_base",
     "time_interleaved",
     "time_prediction",
     "use_psycopg2_types",
@@ -225,6 +227,13 @@ class GraderError(GradingFailure):
     """The grader's own infrastructure failed, such as a lost connection: nothing was measured."""
 
 
+class ResourceError(GraderError):
+    """The server ran out of a resource (SQLSTATE class 53), such as shared memory or disk.
+
+    It says nothing about the query, so it is the grader's failure, retried once.
+    """
+
+
 @dataclass(frozen=True, slots=True)
 class Timing:
     """Both sides' median execution times, in ms, and how many timed runs they come from."""
@@ -300,6 +309,20 @@ def time_prediction(time_pred: Timer, *, base_ms: float, runs: int = TIMING_RUNS
         if _long_second_run(run, runs, pred_ms[-1], base_ms):
             break
     return Timing(base_ms, statistics.median(pred_ms), len(pred_ms))
+
+
+def time_base(time_base: Timer, *, runs: int = TIMING_RUNS) -> tuple[float, int]:
+    """Time only the base query (the setup's base cache); return its median ms and run count.
+
+    The stop rule reads the base's own runs. Raise :class:`TimingError` if a run fails.
+    """
+    _check_runs(runs)
+    base_ms: list[float] = []
+    for run in range(runs):
+        base_ms.append(_timed("base", time_base))
+        if _long_second_run(run, runs, 0.0, base_ms[-1]):
+            break
+    return statistics.median(base_ms), len(base_ms)
 
 
 def _long_second_run(run: int, runs: int, pred_ms: float, base_ms: float) -> bool:
@@ -535,6 +558,8 @@ class PgSession:
             return QueryTimeoutError(f"stopped by the {self._hard_cap_s:g} s hard cap")
         if isinstance(error, psycopg.errors.QueryCanceled):
             return QueryTimeoutError(f"{_message(error)} ({self._timeout_s:g} s)")
+        if (error.sqlstate or "").startswith("53"):
+            return ResourceError(f"the server ran out of resources: {_message(error)}")
         return QueryError(_message(error))
 
 

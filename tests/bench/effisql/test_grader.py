@@ -26,12 +26,14 @@ from goaly.bench.effisql.grader import (
     Psycopg2Timestamptz,
     QueryError,
     QueryTimeoutError,
+    ResourceError,
     ResultDigest,
     TimingError,
     Watchdog,
     row_hash,
     speedup,
     statement_body,
+    time_base,
     time_interleaved,
     time_prediction,
 )
@@ -533,6 +535,16 @@ class TestPgSession:
             assert conn.statements[-2:] == RESET
             assert isinstance(expected("x"), GradingFailure)
 
+    def test_running_out_of_resources_is_the_graders(self) -> None:
+        error = psycopg.errors.OutOfMemory("could not resize shared memory segment")
+        conn = FakeConn(rows=raising(error))
+        with (
+            session_on(conn) as session,
+            pytest.raises(ResourceError, match="ran out of resources"),
+        ):
+            session.digest("SELECT 1")
+        assert issubclass(ResourceError, GraderError)
+
     def test_a_dead_connection_is_a_grader_error_every_time(self) -> None:
         conn = FakeConn()
 
@@ -638,6 +650,25 @@ class TestPgSession:
         session.close()
 
 
+class TestTimeBase:
+    def test_the_median_of_three_base_runs(self) -> None:
+        log: list[str] = []
+        assert time_base(RecordingTimer("base", log, [9.0, 7.0, 8.0])) == (8.0, 3)
+
+    def test_a_long_second_run_stops_after_two(self) -> None:
+        log: list[str] = []
+        assert time_base(RecordingTimer("base", log, [1.0, LONG_RUN_MS, 1.0])) == (
+            (1.0 + LONG_RUN_MS) / 2,
+            2,
+        )
+
+    def test_a_failed_run_is_the_bases(self) -> None:
+        log: list[str] = []
+        with pytest.raises(TimingError) as caught:
+            time_base(RecordingTimer("base", log, [QueryError("boom")]))
+        assert caught.value.side == "base"
+
+
 class TestPsycopg2Timestamptz:
     """The loader on its own, without a server: the session's time zone is UTC then."""
 
@@ -675,3 +706,5 @@ def test_timing_needs_a_run(runs: int) -> None:
         time_interleaved(lambda: 1.0, lambda: 1.0, rng=rng, runs=runs)
     with pytest.raises(ValueError, match="at least 1 run"):
         time_prediction(lambda: 1.0, base_ms=1.0, runs=runs)
+    with pytest.raises(ValueError, match="at least 1 run"):
+        time_base(lambda: 1.0, runs=runs)
