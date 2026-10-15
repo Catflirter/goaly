@@ -46,7 +46,7 @@ SF001 = Dataset(
     },
 )
 CONTAINER = "goaly-effisql-itest-build"
-PORT = 55449
+PORT = 25449  # Below the ephemeral range, as in conftest.py.
 
 
 def test_the_golden_build_loads_verifies_and_describes_the_database(tmp_path: Path) -> None:

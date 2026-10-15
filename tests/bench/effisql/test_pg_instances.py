@@ -131,10 +131,18 @@ def test_each_database_grants_select_and_nothing_that_writes(db: str, readers: s
         f'GRANT USAGE ON SCHEMA "public" TO {readers}',
         f'GRANT SELECT ON ALL TABLES IN SCHEMA "public" TO {readers}',
     ]
-    revoked = " ".join(texts[3:])
-    for function in ("pg_cancel_backend", "pg_terminate_backend", "lo_create", "lo_from_bytea"):
-        assert function in revoked  # One session may not stop another or write large objects.
-    assert all(text.startswith("REVOKE EXECUTE") for text in texts[3:])
+    revoked = texts[3]
+    assert revoked.startswith("REVOKE EXECUTE ON FUNCTION")
+    for function in (
+        "pg_cancel_backend",  # One session may not stop another,
+        "pg_terminate_backend",
+        "pg_stat_get_activity",  # read the text of another's query,
+        "pg_stat_get_backend_activity",
+        "lo_create",  # or write large objects.
+        "lo_from_bytea",
+    ):
+        assert function in revoked
+    assert texts[4:] == ['REVOKE SELECT ON "pg_catalog"."pg_stat_activity" FROM PUBLIC']
 
 
 CREDENTIALS = PgCredentials(

@@ -20,7 +20,8 @@ role defaults only add defense in depth:
 - the grader role connects to both databases, with SELECT on their tables;
 - both default to read-only transactions;
 - PUBLIC loses CONNECT and TEMPORARY on every database and CREATE on the public schema. It
-  also loses the functions that let one session stop another or write large objects.
+  also loses pg_stat_activity, and the functions that let one session stop another, read
+  another's query text or write large objects.
 """
 
 import json
@@ -142,10 +143,13 @@ def instance_spec(config: PgEnvConfig, instance: Instance) -> ContainerSpec:
 
 
 _READERS = {MAIN_DB: (AGENT_ROLE, GRADER_ROLE), ALT_DB: (GRADER_ROLE,)}
-# Functions PUBLIC may call by default that let a session stop another one or write data.
+# Functions PUBLIC may call by default that let a session stop another one, read the text of
+# another session's query, or write data.
 _REVOKED_FUNCTIONS = (
     "pg_catalog.pg_cancel_backend(integer)",
     "pg_catalog.pg_terminate_backend(integer, bigint)",
+    "pg_catalog.pg_stat_get_activity(integer)",
+    "pg_catalog.pg_stat_get_backend_activity(integer)",
     "pg_catalog.lo_creat(integer)",
     "pg_catalog.lo_create(oid)",
     "pg_catalog.lo_from_bytea(oid, bytea)",
@@ -201,6 +205,10 @@ def database_statements(db: str) -> list[sql.Composed]:
             public, _names(_READERS[db])
         ),
         sql.SQL("REVOKE EXECUTE ON FUNCTION {} FROM PUBLIC").format(functions),
+        # Every task shares the agent role, which sees its own sessions' query text here.
+        sql.SQL("REVOKE SELECT ON {} FROM PUBLIC").format(
+            sql.Identifier("pg_catalog", "pg_stat_activity")
+        ),
     ]
 
 
