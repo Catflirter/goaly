@@ -256,11 +256,13 @@ class Usage(_message.Message):
     """Completion tokens, reasoning tokens included."""
     reasoning_tokens: _builtins.int
     """How many of output_tokens the model spent reasoning; unset if the gateway reported no
-    reasoning breakdown.
+    reasoning breakdown. In a sum, the field is set if any summed call reported it, and holds the
+    total of the reported values.
     """
     cost_usd: _builtins.float
     """The cost in US dollars, as the gateway reports it in the x-litellm-response-cost header;
-    unset if it reported none, as for a failed or cancelled call without the header.
+    unset if it reported none, as for a failed or cancelled call without the header. In a sum, the
+    field is set if any summed call reported it, and holds the total of the reported values.
     """
     def __init__(
         self,
