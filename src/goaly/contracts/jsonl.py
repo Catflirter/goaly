@@ -19,9 +19,10 @@ import os
 import secrets
 from collections.abc import Iterable, Iterator
 from pathlib import Path
-from typing import BinaryIO
+from typing import Any, BinaryIO, cast
 
 from google.protobuf import json_format
+from google.protobuf.descriptor import Descriptor, FieldDescriptor
 from google.protobuf.message import Message
 
 __all__ = [
@@ -34,6 +35,7 @@ __all__ = [
 ]
 
 _JSON_WHITESPACE = " \t\n\r"
+_WELL_KNOWN_TYPES = "google.protobuf"  # Their JSON form is special: a string, a list or any JSON.
 _READ_SIZE = 64 * 1024  # How far append_jsonl reads back at a time, looking for a line feed.
 
 _logger = logging.getLogger(__name__)
@@ -51,12 +53,16 @@ class JsonlError(ValueError):
 def to_json_line(message: Message) -> str:
     """Write ``message`` as one line of compact JSON, with no line break at the end.
 
-    Raises ``json_format.SerializeToJsonError`` for a value JSON cannot hold, such as a NaN in a
-    ``google.protobuf.Value``.
+    Keys follow the order the .proto declares the fields in, at every level, so the lines of a
+    file line up whichever fields are set. Raises ``json_format.SerializeToJsonError`` for a value
+    JSON cannot hold, such as a NaN in a ``google.protobuf.Value``.
     """
     fields = json_format.MessageToDict(
         message, always_print_fields_with_no_presence=True, preserving_proto_field_name=True
     )
+    descriptor = cast(Descriptor, message.DESCRIPTOR)  # The stubs also allow upb's own class.
+    if descriptor.file.package != _WELL_KNOWN_TYPES:
+        fields = _in_field_order(descriptor, fields)
     # json escapes every control character, so the line holds no "\n". Other text stays as it
     # is, U+2028 and U+2029 included, so readers must split lines at "\n" alone.
     return json.dumps(fields, ensure_ascii=False, separators=(",", ":"))
@@ -132,6 +138,31 @@ def append_jsonl(path: Path, message: Message) -> None:
             else:
                 file.truncate(start)
         file.write(line)
+
+
+def _in_field_order(descriptor: Descriptor, fields: dict[str, Any]) -> dict[str, Any]:
+    """Return ``fields``, a message's JSON object, with its keys in declaration order.
+
+    protobuf writes the fields that are set first, ordered by number, and then the rest.
+    """
+    return {
+        field.name: _value_in_field_order(field, fields[field.name])
+        for field in descriptor.fields
+        if field.name in fields
+    }
+
+
+def _value_in_field_order(field: FieldDescriptor, value: Any) -> Any:
+    """Order the keys inside a field's JSON value; a well-known type's value stays as it is."""
+    message = field.message_type
+    if message is None or message.file.package == _WELL_KNOWN_TYPES:
+        return value
+    if message.GetOptions().map_entry:  # A map: its keys stay as they are, its values are ordered.
+        entry_value = message.fields_by_name["value"]
+        return {key: _value_in_field_order(entry_value, item) for key, item in value.items()}
+    if field.is_repeated:
+        return [_in_field_order(message, item) for item in value]
+    return _in_field_order(message, value)
 
 
 def _parse_line[M: Message](raw: bytes, message_type: type[M]) -> M | None:

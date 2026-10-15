@@ -10,13 +10,23 @@ from pathlib import Path
 from typing import Any, assert_type
 
 import pytest
+from google.protobuf import descriptor_pb2, descriptor_pool, message_factory
 from google.protobuf.json_format import ParseError, SerializeToJsonError
+from google.protobuf.message import Message
 from google.protobuf.struct_pb2 import ListValue
 from google.protobuf.timestamp_pb2 import Timestamp
 
 from goaly.contracts.gen.environment_pb2 import ShellResult, SqlResult
-from goaly.contracts.gen.llm_call_pb2 import LlmCallRecord, Usage
-from goaly.contracts.gen.task_pb2 import BirdTaskInput, Grade, GradeStatus, TaskInput
+from goaly.contracts.gen.llm_call_pb2 import LlmCallRecord, LlmCallStatus, Usage
+from goaly.contracts.gen.task_pb2 import (
+    BirdGrade,
+    BirdTaskInput,
+    BirdTestCaseResult,
+    Grade,
+    GradeStatus,
+    SweGrade,
+    TaskInput,
+)
 from goaly.contracts.jsonl import (
     JsonlError,
     append_jsonl,
@@ -68,6 +78,96 @@ def test_writes_default_values_but_not_unset_messages() -> None:
         "status": "GRADE_STATUS_GRADED",
         "feedback": "",
     }
+
+
+def test_writes_keys_in_the_order_the_proto_declares_them_whatever_is_set() -> None:
+    sparse = Grade(status=GradeStatus.GRADE_STATUS_GRADED, swe=SweGrade(cached=True))
+    full = Grade(
+        instance_id="t1",
+        score=0.5,
+        correct=True,
+        status=GradeStatus.GRADE_STATUS_GRADED,
+        feedback="ok",
+        swe=SweGrade(
+            patch_applied=True,
+            tests_passed=True,
+            speedup=2.0,
+            gold_speedup=4.0,
+            sr=0.5,
+            t_pre_s=4.0,
+            t_post_s=2.0,
+            eval_wall_s=60.0,
+            eval_cpu_s=120.0,
+            cached=True,
+        ),
+    )
+    swe_keys = [
+        *("patch_applied", "tests_passed", "empty_patch", "speedup", "gold_speedup", "sr"),
+        *("t_pre_s", "t_post_s", "eval_wall_s", "eval_cpu_s", "cached"),
+    ]
+
+    lines = [parse(to_json_line(message)) for message in (sparse, full)]
+
+    for fields in lines:
+        assert list(fields) == ["instance_id", "score", "correct", "status", "feedback", "swe"]
+        assert list(fields["swe"]) == swe_keys
+
+
+def test_writes_keys_in_declaration_order_in_lists_too_not_in_number_order() -> None:
+    record = LlmCallRecord(status=LlmCallStatus.LLM_CALL_STATUS_OK, seed=2, call_id="c")
+    grade = Grade(bird=BirdGrade(test_cases=[BirdTestCaseResult(passed=True, message="m")]))
+
+    # seed is field 13, declared after instance_id.
+    assert list(parse(to_json_line(record)))[:5] == [
+        *("call_id", "run_id", "instance_id", "seed", "purpose")
+    ]
+    assert list(parse(to_json_line(grade))["bird"]["test_cases"][0]) == [
+        "index",
+        "passed",
+        "message",
+    ]
+
+
+def message_with_a_map() -> type[Message]:
+    """Outer, with a map of Inner, which declares field 2 before field 1. No contract has a map."""
+    file = descriptor_pb2.FileDescriptorProto(
+        name="goaly_tests/ordering.proto", package="goaly_tests", syntax="proto3"
+    )
+    optional, repeated = (
+        descriptor_pb2.FieldDescriptorProto.LABEL_OPTIONAL,
+        descriptor_pb2.FieldDescriptorProto.LABEL_REPEATED,
+    )
+    string, message = (
+        descriptor_pb2.FieldDescriptorProto.TYPE_STRING,
+        descriptor_pb2.FieldDescriptorProto.TYPE_MESSAGE,
+    )
+    inner = file.message_type.add(name="Inner")
+    inner.field.add(name="late", number=2, type=string, label=optional)
+    inner.field.add(name="early", number=1, type=string, label=optional)
+    outer = file.message_type.add(name="Outer")
+    entry = outer.nested_type.add(name="ByKeyEntry")
+    entry.options.map_entry = True
+    entry.field.add(name="key", number=1, type=string, label=optional)
+    entry.field.add(
+        name="value", number=2, type=message, type_name=".goaly_tests.Inner", label=optional
+    )
+    outer.field.add(
+        name="by_key",
+        number=1,
+        type=message,
+        type_name=".goaly_tests.Outer.ByKeyEntry",
+        label=repeated,
+    )
+    pool = descriptor_pool.DescriptorPool()
+    pool.Add(file)
+    return message_factory.GetMessageClass(pool.FindMessageTypeByName("goaly_tests.Outer"))
+
+
+def test_writes_the_values_of_a_map_in_declaration_order() -> None:
+    outer = message_with_a_map()()
+    getattr(outer, "by_key")["k"].early = "e"  # noqa: B009  # The type is built at run time.
+
+    assert list(parse(to_json_line(outer))["by_key"]["k"]) == ["late", "early"]
 
 
 def test_writes_timestamps_in_rfc_3339() -> None:
