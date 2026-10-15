@@ -514,10 +514,10 @@ In the RSI phase a lane's GLM share covers its analyst, its implementers and its
 - On a 429 or 503, wait for `Retry-After` if the response has one, up to the 60 s backoff cap; every attempt still records the server's own value. Otherwise back off exponentially with full jitter: 1 s base, 60 s cap.
 - A gateway 408, which LiteLLM returns when its upstream times out, counts as a timeout and is retried.
 - AIMD:
-  - on a 429, 502, 503, 504 or timeout, the process halves its concurrency for that model. 500s and connection errors do not lower it; they count only toward the circuit breaker;
+  - the process halves its concurrency for that model once per burst of 429s, 502s, 503s, 504s or timeouts. Signals from requests sent before the last halving count toward that same halving, so one batch of failures halves the limit only once. 500s and connection errors do not lower it; they count only toward the circuit breaker;
   - after every 20 consecutive successes, it adds 1 back. Any failure resets the run of successes;
   - concurrency never exceeds the process's configured share.
-- Circuit breaker: if more than half of a model's calls fail within 2 minutes, the process stops starting new tasks for 60 s and logs a warning. Calls already in flight finish or time out as usual.
+- Circuit breaker: if more than half of a model's calls fail within 2 minutes, the process stops starting new tasks for 60 s and logs a warning. Calls already in flight finish or time out as usual. Attempts sent before the breaker opened do not count toward its next judgement.
 - Every throttling event is logged with the call's purpose, so the report can show how much time the gateway cost us.
 
 **Throughput planning.** With one active lane, the scarce resources are the solving instances, which bound how many tasks can run at once, and time on the grading instances. Qwen output tokens do not bind.
