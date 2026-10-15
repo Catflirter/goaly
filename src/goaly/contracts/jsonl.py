@@ -60,12 +60,19 @@ def to_json_line(message: Message) -> str:
 
     Keys follow the order the .proto declares the fields in, at every level, so the lines of a
     file line up whichever fields are set. Raises ``json_format.SerializeToJsonError`` for a value
-    JSON cannot hold, such as a NaN in a ``google.protobuf.Value``.
+    JSON cannot hold, such as a NaN in a ``google.protobuf.Value``, and for a message that is not
+    written as a JSON object, such as a ``Timestamp``.
     """
-    fields = json_format.MessageToDict(
+    # The stubs say dict, but a well-known type such as Timestamp, Value or ListValue gives a
+    # string, a list or any JSON value instead, and from_json_line reads only objects.
+    fields: object = json_format.MessageToDict(
         message, always_print_fields_with_no_presence=True, preserving_proto_field_name=True
     )
     descriptor = cast(Descriptor, message.DESCRIPTOR)  # The stubs also allow upb's own class.
+    if not isinstance(fields, dict):
+        raise json_format.SerializeToJsonError(
+            f"{descriptor.full_name} is not written as a JSON object, so it cannot be a JSONL line"
+        )
     if descriptor.file.package != _WELL_KNOWN_TYPES:
         fields = _in_field_order(descriptor, fields)
     # json escapes every control character, so the line holds no "\n". Other text stays as it

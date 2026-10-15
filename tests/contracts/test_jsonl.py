@@ -14,7 +14,7 @@ import pytest
 from google.protobuf import descriptor_pb2, descriptor_pool, message_factory
 from google.protobuf.json_format import ParseError, SerializeToJsonError
 from google.protobuf.message import Message
-from google.protobuf.struct_pb2 import ListValue
+from google.protobuf.struct_pb2 import ListValue, Struct, Value
 from google.protobuf.timestamp_pb2 import Timestamp
 
 from goaly.contracts.gen.environment_pb2 import ShellResult, SqlResult
@@ -214,6 +214,25 @@ def test_writes_non_finite_doubles_as_strings(value: float, written: str) -> Non
     assert parse(line)["score"] == written
     read = from_json_line(line, Grade).score
     assert math.isnan(read) if math.isnan(value) else read == value
+
+
+@pytest.mark.parametrize(
+    "message",
+    [Timestamp(seconds=1), Value(string_value="x"), ListValue()],
+    ids=["Timestamp", "Value", "ListValue"],
+)
+def test_refuses_a_message_whose_json_is_not_an_object(message: Message) -> None:
+    # Their JSON is a string, any value and an array; from_json_line reads only objects.
+    with pytest.raises(SerializeToJsonError, match="is not written as a JSON object"):
+        to_json_line(message)
+
+
+def test_writes_a_struct_as_protobuf_does() -> None:
+    # A Struct's keys are its data, not fields: ordering them by its descriptor would drop them.
+    struct = Struct()
+    struct.update({"zeta": 1.0, "alpha": "a"})
+
+    assert parse(to_json_line(struct)) == {"zeta": 1.0, "alpha": "a"}
 
 
 # from_json_line.
