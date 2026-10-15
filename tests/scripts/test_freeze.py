@@ -9,6 +9,14 @@ from scripts.freeze import FreezeError, freeze_plan
 from tests.scripts.gitrepo import commit_pack, git, repo_with_origin
 
 
+@pytest.fixture(autouse=True)
+def _git_identity(monkeypatch: pytest.MonkeyPatch) -> None:
+    """The annotated tag needs a committer, which CI's git has no config for."""
+    for role in ("AUTHOR", "COMMITTER"):
+        monkeypatch.setenv(f"GIT_{role}_NAME", "Freeze Test")
+        monkeypatch.setenv(f"GIT_{role}_EMAIL", "freeze@example.com")
+
+
 def remote_tags(origin: Path) -> str:
     return git(origin, "tag", "--list")
 
