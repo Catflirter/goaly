@@ -72,6 +72,7 @@ class RunsTasks(Protocol):
         seeds: Sequence[int],
         instance_ids: Collection[str] | None = None,
         resume: bool = False,
+        retry_errors: bool = False,
         lock: RunLock | None = None,
     ) -> RunSummary:
         """Run the tasks and record them, as Runner.run does."""

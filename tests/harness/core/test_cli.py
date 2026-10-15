@@ -3,6 +3,8 @@
 import asyncio
 import json
 import logging
+import os
+import signal
 from collections.abc import AsyncIterator, Coroutine, Iterator
 from contextlib import AbstractAsyncContextManager, asynccontextmanager
 from dataclasses import dataclass, field
@@ -12,8 +14,20 @@ from typing import Any
 import pytest
 
 from goaly.contracts.gen.manifest_pb2 import ModelSettings
-from goaly.contracts.gen.result_pb2 import TASK_ERROR_TYPE_TIMEOUT, TaskResult
-from goaly.contracts.gen.task_pb2 import SPLIT_EXTERNAL, SPLIT_TRAIN, SPLIT_VAL, Split
+from goaly.contracts.gen.result_pb2 import (
+    TASK_ERROR_TYPE_NONE,
+    TASK_ERROR_TYPE_TIMEOUT,
+    TaskResult,
+)
+from goaly.contracts.gen.task_pb2 import (
+    SPLIT_EXTERNAL,
+    SPLIT_TRAIN,
+    SPLIT_VAL,
+    Prediction,
+    Split,
+    TaskInput,
+)
+from goaly.contracts.interfaces import Environment
 from goaly.contracts.jsonl import read_jsonl
 from goaly.harness.core import cli
 from goaly.harness.core.manifest import (
@@ -28,11 +42,13 @@ from goaly.harness.core.registry import Harness, HarnessOptions, Registry
 from goaly.harness.core.runner import RunFiles, lock_run_dir
 from tests.fakes import TOY_DATASET_SHA256, FakeSqlEnvironment, ToyInstance
 from tests.harness.core.runner_doubles import (
+    Action,
     ScriptedBenchmark,
     ScriptedPolicy,
     StubContext,
     StubContexts,
     base_sql,
+    raising,
     sleeping,
     toy_instances,
 )
@@ -955,6 +971,122 @@ def test_a_used_directory_is_refused_before_the_harness_opens(
     assert same.status == 0, same.stderr
 
 
+def test_retry_errors_runs_the_failed_tasks_again_on_resume(
+    capsys: pytest.CaptureFixture[str],
+    registry: Registry,
+    budgets: Path,
+    factory: ToyFactory,
+    tmp_path: Path,
+) -> None:
+    argv = ["--bench", "toy", "--split", "train", "--phase", "test", "--out", str(tmp_path / "r")]
+    factory.policy = ScriptedPolicy({"t1": raising(RuntimeError("502 after 5 retries"))})
+    first = goaly(capsys, registry, budgets, *argv)
+    factory.policy = ScriptedPolicy()  # The gateway is back.
+
+    kept = goaly(capsys, registry, budgets, *argv, "--resume")
+    retried = goaly(capsys, registry, budgets, *argv, "--resume", "--retry-errors")
+
+    assert first.summary["errors"] == {"TASK_ERROR_TYPE_POLICY_CRASH": 1}
+    assert (kept.summary["resumed"], kept.summary["ran"]) == (3, 0)
+    assert (retried.summary["resumed"], retried.summary["ran"]) == (2, 1)
+    last = {result.instance_id: result for result in results(tmp_path / "r")}
+    assert last["t1"].error_type == TASK_ERROR_TYPE_NONE  # The new line supersedes the error.
+
+
+def test_retry_errors_needs_resume(
+    capsys: pytest.CaptureFixture[str], registry: Registry, budgets: Path, tmp_path: Path
+) -> None:
+    outcome = goaly(
+        capsys,
+        registry,
+        budgets,
+        "--bench",
+        "toy",
+        "--split",
+        "train",
+        "--phase",
+        "test",
+        "--out",
+        str(tmp_path / "r"),
+        "--retry-errors",
+    )
+
+    assert outcome.status == cli.USAGE
+    assert "--retry-errors needs --resume" in outcome.stderr
+
+
+def test_the_process_is_confined_before_the_harness_opens(
+    capsys: pytest.CaptureFixture[str],
+    registry: Registry,
+    budgets: Path,
+    factory: ToyFactory,
+    tmp_path: Path,
+) -> None:
+    calls: list[int] = []
+    argv = ["--bench", "toy", "--split", "train", "--phase", "test", "--out", str(tmp_path / "r")]
+
+    status = cli.main(
+        ["run", *argv],
+        registry,
+        budgets_file=budgets,
+        confine=lambda: calls.append(len(factory.options)),
+    )
+
+    assert status == 0
+    assert calls == [0]  # Once, and before the harness opened.
+
+
+def signalling(*signals: signal.Signals) -> Action:
+    """An action that sends ``signals`` to its own process, as Ctrl-C or a container's stop
+    does, then works on until it is cancelled."""
+
+    async def act(task: TaskInput, env: Environment, ctx: StubContext) -> Prediction | None:
+        for number in signals:
+            os.kill(os.getpid(), number)
+        await asyncio.sleep(30)
+        return None
+
+    return act
+
+
+@pytest.mark.parametrize(
+    ("signals", "status", "said"),
+    [
+        ((signal.SIGTERM, signal.SIGTERM), cli.TERMINATED, "terminated"),
+        ((signal.SIGINT,), cli.INTERRUPTED, "interrupted"),
+    ],
+    ids=["SIGTERM, twice", "SIGINT"],
+)
+def test_a_stopped_run_closes_everything_and_resumes(
+    capsys: pytest.CaptureFixture[str],
+    registry: Registry,
+    budgets: Path,
+    factory: ToyFactory,
+    tmp_path: Path,
+    signals: tuple[signal.Signals, ...],
+    status: int,
+    said: str,
+) -> None:
+    out = tmp_path / "r"
+    argv = ["--bench", "toy", "--split", "train", "--phase", "test", "--out", str(out)]
+    factory.policy = ScriptedPolicy({"t2": signalling(*signals)})
+
+    stopped = goaly(capsys, registry, budgets, *argv, "--max-tasks", "1")
+    factory.policy = ScriptedPolicy()
+    resumed = goaly(capsys, registry, budgets, *argv, "--resume")
+
+    assert stopped.status == status
+    assert f"{said}; to continue the run, run the same command with --resume" in stopped.stderr
+    assert factory.closed
+    lock_run_dir(RunFiles(out)).release()  # The stopped run released its lock.
+    assert resumed.status == 0, resumed.stderr
+    # Each task recorded before the signal is resumed; one cancelled while it wrote its records
+    # runs again, as after a crash. t2 was solving.
+    assert resumed.summary["resumed"] + resumed.summary["ran"] == 3
+    assert ("t2", 0) in factory.policy.solved  # The resumed run's policy.
+    assert {result.instance_id for result in results(out)} == {"t0", "t1", "t2"}
+
+
 def test_an_interrupted_run_says_how_to_continue(
     capsys: pytest.CaptureFixture[str],
     registry: Registry,
@@ -987,6 +1119,40 @@ def test_an_interrupted_run_says_how_to_continue(
 
 
 # Logging.
+
+
+def test_every_log_line_of_a_task_names_its_run_and_task(
+    capsys: pytest.CaptureFixture[str],
+    registry: Registry,
+    budgets: Path,
+    factory: ToyFactory,
+    tmp_path: Path,
+) -> None:
+    factory.policy = ScriptedPolicy({"t1": raising(RuntimeError("the policy broke"))})
+
+    outcome = goaly(
+        capsys,
+        registry,
+        budgets,
+        "--bench",
+        "toy",
+        "--split",
+        "train",
+        "--phase",
+        "test",
+        "--out",
+        str(tmp_path / "r"),
+    )
+
+    logged = [json.loads(line) for line in outcome.stderr.splitlines() if line.startswith("{")]
+    (failed,) = [entry for entry in logged if entry["level"] == "WARNING"]
+    assert (failed["run_id"], failed["instance_id"], failed["seed"]) == (
+        outcome.summary["run_id"],
+        "t1",
+        0,
+    )
+    (finished,) = [entry for entry in logged if entry["message"].startswith("finished run")]
+    assert "instance_id" not in finished  # Outside every task.
 
 
 def test_logs_are_json_lines_on_stderr_at_the_level_asked(

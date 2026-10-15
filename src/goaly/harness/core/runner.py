@@ -67,6 +67,7 @@ from goaly.contracts.jsonl import read_jsonl, to_json_line
 from goaly.harness.core.atomic import write_text_atomically
 from goaly.harness.core.eval_cache import CachedEvaluation, CacheKey, EvalCache, task_digest
 from goaly.harness.core.jsonl_writer import JsonlWriter
+from goaly.harness.core.logs import log_context
 from goaly.harness.core.manifest import read_manifest, write_manifest
 
 __all__ = [
@@ -514,6 +515,11 @@ class Runner[InstanceT: Instance, EnvT: Environment, CtxT: TaskContext]:
         return run
 
     async def _task(self, run: "_Run", inst: InstanceT, seed: int) -> None:
+        # Every line the task's code logs names the task, the pack's and the adapter's too.
+        with log_context(run_id=run.identity.run_id, instance_id=inst.instance_id, seed=seed):
+            await self._task_records(run, inst, seed)
+
+    async def _task_records(self, run: "_Run", inst: InstanceT, seed: int) -> None:
         key = None
         task: TaskInput | None = None
         try:

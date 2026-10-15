@@ -7,12 +7,15 @@ For example, a validation run during RSI, and a run on the organizers' own task 
 
 The run directory, --out, holds the manifest, the results, the trajectories and, once every task
 is recorded, official/seed-<k>.jsonl: each replicate's predictions in the official format. On
-stdout the run's summary is one line of JSON; the logs go to stderr as JSON lines.
+stdout the run's summary is one line of JSON. The logs go to stderr as JSON lines, each line of
+a task's work with its run_id, instance_id and seed; a line that starts with "goaly run:",
+which is not JSON, says why the command stopped, for a person to read.
 
 The exit status is 0 once the run is done, whatever errors its tasks met, as those are in its
 records; 1 if the run failed; 2 for a usage error, such as an unknown benchmark or a run
-directory that holds another run; and 130 if it was interrupted, after which --resume
-continues it.
+directory that holds another run; 130 if it was interrupted (SIGINT) and 143 if it was
+terminated (SIGTERM). After either, --resume continues it, and --retry-errors with it also runs
+again the tasks that ended with an error, such as an LLM outage.
 """
 
 import argparse
@@ -21,8 +24,9 @@ import json
 import logging
 import math
 import re
+import signal
 import sys
-from collections.abc import Sequence
+from collections.abc import Callable, Sequence
 from pathlib import Path
 
 from goaly.contracts.gen.manifest_pb2 import RunManifest
@@ -52,7 +56,7 @@ from goaly.harness.core.runner import (
     lock_run_dir,
 )
 
-__all__ = ["FAILED", "INTERRUPTED", "USAGE", "build_parser", "main"]
+__all__ = ["FAILED", "INTERRUPTED", "TERMINATED", "USAGE", "build_parser", "main"]
 
 _logger = logging.getLogger(__name__)
 
@@ -60,6 +64,7 @@ _logger = logging.getLogger(__name__)
 FAILED = 1
 USAGE = 2  # As argparse exits.
 INTERRUPTED = 130  # As a shell reports a process that SIGINT ended.
+TERMINATED = 143  # As a shell reports a process that SIGTERM ended.
 
 _SPLITS = {"train": SPLIT_TRAIN, "val": SPLIT_VAL, "heldout": SPLIT_HELDOUT}
 # Errors that mean the command cannot run as asked; the message says what to change. Any other
@@ -104,6 +109,11 @@ def build_parser(budgets_file: Path) -> argparse.ArgumentParser:
         "--resume", action="store_true", help="continue the run in --out, if there is one"
     )
     run.add_argument(
+        "--retry-errors",
+        action="store_true",
+        help="with --resume, run again the tasks whose last result is an error",
+    )
+    run.add_argument(
         "--phase",
         required=True,
         metavar="NAME",
@@ -132,7 +142,10 @@ def build_parser(budgets_file: Path) -> argparse.ArgumentParser:
         "--cache",
         type=Path,
         metavar="DIR",
-        help="the evaluation cache; runs that grade differently use different ones",
+        help=(
+            "the evaluation cache, kept by the harness's grading namespace; a task's evaluation"
+            " is reused whatever its --task-timeout was"
+        ),
     )
     run.add_argument(
         "--run-id", type=_run_id, metavar="ID", help="the run's ID (default: a new one)"
@@ -141,10 +154,18 @@ def build_parser(budgets_file: Path) -> argparse.ArgumentParser:
     return parser
 
 
-def main(argv: Sequence[str], registry: Registry, *, budgets_file: Path) -> int:
+def main(
+    argv: Sequence[str],
+    registry: Registry,
+    *,
+    budgets_file: Path,
+    confine: Callable[[], None] = lambda: None,
+) -> int:
     """Run the `goaly` command with ``argv``, its arguments, and return the exit status.
 
-    ``registry`` holds the harnesses it can run. argparse exits with status 2 by itself for
+    ``registry`` holds the harnesses it can run. ``confine`` keeps the process to its CPUs,
+    away from the database instances', before the harness opens; the composition root passes
+    the benchmark's, and the default does nothing. argparse exits with status 2 by itself for
     arguments it refuses, and with 0 for --help.
     """
     args = build_parser(budgets_file).parse_args(argv)
@@ -153,10 +174,14 @@ def main(argv: Sequence[str], registry: Registry, *, budgets_file: Path) -> int:
     # at DEBUG, so its logger never logs below WARNING.
     logging.getLogger("pydantic_settings").setLevel(logging.WARNING)
     try:
-        summary = asyncio.run(_run(args, ["goaly", *argv], registry))
+        confine()
+        summary = asyncio.run(_main(args, ["goaly", *argv], registry))
     except KeyboardInterrupt:
         _say("interrupted; to continue the run, run the same command with --resume")
         return INTERRUPTED
+    except _TerminatedError:
+        _say("terminated; to continue the run, run the same command with --resume")
+        return TERMINATED
     except _USAGE_ERRORS as error:
         _say(f"error: {error}")
         return USAGE
@@ -177,7 +202,41 @@ def main(argv: Sequence[str], registry: Registry, *, budgets_file: Path) -> int:
     return 0
 
 
+class _TerminatedError(Exception):
+    """SIGTERM stopped the run, which cleaned up as for an interrupt."""
+
+
+async def _main(
+    args: argparse.Namespace, command_line: list[str], registry: Registry
+) -> RunSummary:
+    """Run the command, which SIGTERM cancels: its harness and its lock are then released as for
+    Ctrl-C, and _TerminatedError is raised once it has stopped."""
+    task = asyncio.current_task()
+    if task is None:  # pragma: no cover - asyncio.run runs it in a task.
+        raise RuntimeError("goaly run must run in an asyncio task")
+    loop = asyncio.get_running_loop()
+    terminated = False
+
+    def terminate() -> None:
+        nonlocal terminated
+        if not terminated:  # A second SIGTERM must not cut the cleanup short.
+            terminated = True
+            task.cancel()
+
+    loop.add_signal_handler(signal.SIGTERM, terminate)
+    try:
+        return await _run(args, command_line, registry)
+    except asyncio.CancelledError:
+        if terminated:
+            raise _TerminatedError from None
+        raise
+    finally:
+        loop.remove_signal_handler(signal.SIGTERM)
+
+
 async def _run(args: argparse.Namespace, command_line: list[str], registry: Registry) -> RunSummary:
+    if args.retry_errors and not args.resume:
+        raise UsageError("--retry-errors needs --resume: a new run has no errors to retry")
     instances_sha256 = None
     if args.instances is not None:
         if not await asyncio.to_thread(args.instances.is_file):
@@ -242,6 +301,7 @@ async def _run_harness(
         seeds=seeds,
         instance_ids=args.only,
         resume=args.resume,
+        retry_errors=args.retry_errors,
         lock=lock,
     )
 
