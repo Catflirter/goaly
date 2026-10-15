@@ -11,7 +11,7 @@ from pathlib import Path
 from typing import Any, assert_type
 
 import pytest
-from google.protobuf import descriptor_pb2, descriptor_pool, message_factory
+from google.protobuf import descriptor_pb2, descriptor_pool, json_format, message_factory
 from google.protobuf.json_format import ParseError, SerializeToJsonError
 from google.protobuf.message import Message
 from google.protobuf.struct_pb2 import ListValue, Struct, Value
@@ -214,6 +214,24 @@ def test_writes_non_finite_doubles_as_strings(value: float, written: str) -> Non
     assert parse(line)["score"] == written
     read = from_json_line(line, Grade).score
     assert math.isnan(read) if math.isnan(value) else read == value
+
+
+@pytest.mark.parametrize("value", [math.nan, math.inf, -math.inf], ids=["nan", "inf", "-inf"])
+def test_refuses_a_non_finite_number_inside_a_value(value: float) -> None:
+    # Written as the string "NaN", it would read back as a string, so protobuf refuses it.
+    row = ListValue()
+    row.append(value)
+
+    with pytest.raises(SerializeToJsonError, match="Fail to serialize"):
+        to_json_line(SqlResult(rows=[row]))
+
+
+def test_never_writes_a_nan_token_which_is_not_json(monkeypatch: pytest.MonkeyPatch) -> None:
+    # protobuf writes a non-finite double as a string; the line must not depend on that alone.
+    monkeypatch.setattr(json_format, "MessageToDict", lambda *_, **__: {"score": math.nan})
+
+    with pytest.raises(ValueError, match="not JSON compliant"):
+        to_json_line(Grade())
 
 
 @pytest.mark.parametrize(

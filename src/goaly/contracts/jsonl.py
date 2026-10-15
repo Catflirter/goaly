@@ -76,8 +76,9 @@ def to_json_line(message: Message) -> str:
     if descriptor.file.package != _WELL_KNOWN_TYPES:
         fields = _in_field_order(descriptor, fields)
     # json escapes every control character, so the line holds no "\n". Other text stays as it
-    # is, U+2028 and U+2029 included, so readers must split lines at "\n" alone.
-    return json.dumps(fields, ensure_ascii=False, separators=(",", ":"))
+    # is, U+2028 and U+2029 included, so readers must split lines at "\n" alone. allow_nan=False
+    # makes a NaN or infinite float an error, never a NaN token, which is not JSON.
+    return json.dumps(fields, ensure_ascii=False, separators=(",", ":"), allow_nan=False)
 
 
 def from_json_line[M: Message](line: str, message_type: type[M]) -> M:
