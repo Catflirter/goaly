@@ -71,11 +71,9 @@ def timed(speedup: float, *, alt_matched: bool | None = None) -> EffiSqlGrade:
 
 
 def hard_coded() -> EffiSqlGrade:
-    """A constant answer, matched at the speedup cap and flagged by the robustness check.
-
-    Its credit is the official evaluator's, which ignores the flag.
-    """
-    return timed(SPEEDUP_CAP, alt_matched=False)
+    """A constant answer: matched at the speedup cap, flagged by the robustness check, so the
+    grader's credit is 0. The official evaluator would give it g(1000) = 1."""
+    return grade(0.0, speedup=SPEEDUP_CAP, alt_matched=False)
 
 
 def unmatched() -> EffiSqlGrade:
@@ -276,19 +274,36 @@ def test_a_table_rejects_credit_for_an_unmatched_task() -> None:
         GradeTable({"a": {0: grade(0.5, matched=False)}})
 
 
+@pytest.mark.parametrize("speedup", [-1.0, math.nan])
+def test_a_table_rejects_a_match_with_a_speedup_that_cannot_be(speedup: float) -> None:
+    with pytest.raises(ValueError, match="task 'a', seed 0, has speedup"):
+        GradeTable({"a": {0: grade(1.0, speedup=speedup)}})
+
+
 # The metrics of one seed (spec §4.1).
 
 
-def test_rves_is_100_times_the_mean_credit_over_every_task() -> None:
+@pytest.mark.parametrize("scoring", [OFFICIAL, CHECKED])
+def test_rves_is_100_times_the_mean_credit_over_every_task(scoring: Scoring) -> None:
     table = one_seed(timed(2.0), timed(1.2), timed(1.0), timed(0.5), timed(0.1), unmatched())
 
-    assert only_seed(table, scoring=OFFICIAL).rves == 100 * 2.5 / 6
+    assert only_seed(table, scoring=scoring).rves == 100 * 2.5 / 6
 
 
-def test_rves_takes_the_graders_credit_as_given() -> None:
-    graded = grade(0.5, speedup=3.0)  # g(3.0) would be 1: the credit is never recomputed.
+def test_checked_credit_is_the_graders_and_official_credit_g_of_the_speedup() -> None:
+    # The two disagree here only to show which number each scoring reads.
+    table = one_seed(grade(0.5, speedup=3.0))
 
-    assert only_seed(one_seed(graded), scoring=OFFICIAL).rves == 50.0
+    assert only_seed(table, scoring=CHECKED).rves == 50.0
+    assert only_seed(table, scoring=OFFICIAL).rves == 100.0
+
+
+def test_official_credit_is_g_of_the_capped_speedup_of_a_match_and_0_otherwise() -> None:
+    # g(1000) for the first; no speedup for a match whose timing failed; no match for the rest.
+    unmatched_but_timed = grade(0.0, speedup=1.5, matched=False)
+    table = one_seed(hard_coded(), timing_failed(), unmatched(), unmatched_but_timed)
+
+    assert only_seed(table, scoring=OFFICIAL).rves == 25.0
 
 
 def test_coverage_counts_matched_tasks_with_a_speedup_of_2_over_every_task() -> None:
@@ -326,6 +341,7 @@ def test_gms_is_none_without_a_matched_task_with_a_speedup() -> None:
 
 
 def test_checked_numbers_count_a_flagged_task_as_unmatched() -> None:
+    # Officially the constant answer is a match at τ = 1000; checked, it is no match at all.
     table = one_seed(hard_coded(), timed(4.0))
 
     official = only_seed(table, scoring=OFFICIAL)
@@ -341,17 +357,6 @@ def test_checked_numbers_keep_a_task_that_passed_the_check() -> None:
     table = one_seed(timed(4.0, alt_matched=True), timed(1.0))
 
     assert only_seed(table, scoring=CHECKED) == only_seed(table, scoring=OFFICIAL)
-
-
-def test_checked_numbers_of_a_flagged_task_the_grader_zeroed() -> None:
-    # As dev mode grades a constant answer: credit 0 already, but still matched at the cap.
-    zeroed = grade(0.0, speedup=SPEEDUP_CAP, alt_matched=False)
-    table = one_seed(zeroed, unmatched())
-
-    official = only_seed(table, scoring=OFFICIAL)
-    assert (official.rves, official.coverage_2x) == (0.0, 50.0)
-    assert official.gms == pytest.approx(SPEEDUP_CAP)
-    assert only_seed(table, scoring=CHECKED) == Metrics(rves=0.0, coverage_2x=0.0, gms=None)
 
 
 def test_flagged_tasks_are_those_flagged_in_any_seed() -> None:

@@ -3,12 +3,13 @@
 A version's results form a :class:`GradeTable`: each task's grade in each of the same seeds.
 Every metric comes in two scorings (:class:`Scoring`):
 
-- official, as the official evaluator computes it: the hard-coding flags are ignored;
-- checked, which RSI decides on: a flagged task counts as unmatched, so it gets credit 0, is
-  not covered and is left out of GMS.
+- official, as the official evaluator computes it, ignoring the hard-coding flags: a matched
+  task's credit is g(τ) of its capped speedup, and any other task's is 0;
+- checked, which RSI decides on: the grader's credit, as given, and a flagged task counts as
+  unmatched, so it gets credit 0, is not covered and is left out of GMS.
 
-R-VES and Coverage@2x always divide by every task. The credit is the grader's, read as given and
-never recomputed from τ: :func:`tier_credit` is g(τ), for the grader and for tests.
+R-VES and Coverage@2x always divide by every task. :func:`tier_credit` is g(τ), the one function
+the grader and the official numbers share.
 """
 
 import enum
@@ -79,8 +80,8 @@ _DIFFICULTY_ORDER = {"easy": 0, "medium": 1, "hard": 2}
 class Scoring(enum.StrEnum):
     """Whether the metrics apply the hard-coding flags (spec §4.1)."""
 
-    OFFICIAL = "official"  # As the official evaluator computes them: the flags are ignored.
-    CHECKED = "checked"  # A flagged task counts as unmatched. RSI decides on these.
+    OFFICIAL = "official"  # As the official evaluator computes them: g(τ), flags ignored.
+    CHECKED = "checked"  # The grader's credit; a flagged task is unmatched. RSI decides on these.
 
 
 @dataclass(frozen=True, slots=True)
@@ -148,6 +149,8 @@ class GradeTable:
                     raise ValueError(
                         f"task {task!r}, seed {seed}, is not matched but has credit {grade.credit}"
                     )
+                if grade.matched and not grade.speedup >= 0:
+                    raise ValueError(f"task {task!r}, seed {seed}, has speedup {grade.speedup}")
 
     @classmethod
     def from_results(cls, results: Iterable[TaskResult]) -> Self:
@@ -345,11 +348,13 @@ def _effisql_grade(result: TaskResult) -> EffiSqlGrade:
 
 
 def _score(grade: EffiSqlGrade, scoring: Scoring) -> tuple[float, float]:
-    """Return the grade's credit, and its capped τ if it counts as matched, otherwise 0."""
+    """Return the task's credit, and its capped τ if it counts as matched, otherwise 0."""
     if scoring is Scoring.CHECKED and is_flagged(grade):
         return 0.0, 0.0
     # An unset speedup reads as 0: a match whose timing failed.
-    return grade.credit, min(grade.speedup, SPEEDUP_CAP) if grade.matched else 0.0
+    speedup = min(grade.speedup, SPEEDUP_CAP) if grade.matched else 0.0
+    credit = tier_credit(speedup) if scoring is Scoring.OFFICIAL else grade.credit
+    return credit, speedup
 
 
 def _metrics(grades: Sequence[EffiSqlGrade], scoring: Scoring) -> Metrics:
