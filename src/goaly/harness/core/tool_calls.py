@@ -9,8 +9,10 @@ A call can be in three places. :func:`parse_tool_calls` takes the first that has
    writes a call before it ends its thinking, where the gateway does not look for calls, but
    thinking can also mention a call in prose, which must never run.
 
-:func:`strip_tool_call_markup` removes the XML markup from a text, so that a reply whose calls
-were parsed from it can be replayed with them as structured calls only.
+Only a terminated XML call counts: markup cut off before its closing tag is never a call, so a
+draft at the end of a reply cannot become its answer. :func:`strip_tool_call_markup` removes the
+XML markup from a text, unterminated markup included, so that a reply whose calls were parsed
+from it can be replayed with them as structured calls only.
 """
 
 import hashlib
@@ -32,14 +34,13 @@ from goaly.contracts.interfaces import JsonValue
 
 __all__ = ["parse_tool_calls", "repair_arguments", "strip_tool_call_markup"]
 
-# Qwen3-Coder's XML form of a call, in which any closing tag may be missing, as in a reply that
-# was cut off: <tool_call><function=NAME><parameter=KEY>VALUE</parameter>...</function></tool_call>
-# A name is at most 256 characters, so that even a reply full of unclosed tags is read in linear
-# time: the regex engine is the event loop's, and a quadratic scan would stall every task.
-_TOOL_CALL = re.compile(r"<tool_call>(.*?)(?:</tool_call>|\Z)", re.DOTALL)
-_FUNCTION = re.compile(
-    r"<function=([^>\n]{0,256})>(.*?)(?:</function>|(?=<function=)|\Z)", re.DOTALL
-)
+# Qwen3-Coder's XML form of a call: <tool_call><function=NAME><parameter=KEY>VALUE</parameter>
+# ...</function></tool_call>. A block ends at its closing tag, at the next block, or at the end
+# of the text; the last group is the closing tag, and empty when the block has none. A name is at
+# most 256 characters, so that even a reply full of unclosed tags is read in linear time: the
+# regex engine is the event loop's, and a quadratic scan would stall every task.
+_TOOL_CALL = re.compile(r"<tool_call>(.*?)(</tool_call>|(?=<tool_call>)|\Z)", re.DOTALL)
+_FUNCTION = re.compile(r"<function=([^>\n]{0,256})>(.*?)(</function>|(?=<function=)|\Z)", re.DOTALL)
 _PARAMETER = re.compile(
     r"<parameter=([^>\n]{0,256})>(.*?)(?:</parameter>|(?=<parameter=)|\Z)", re.DOTALL
 )
@@ -52,6 +53,10 @@ def parse_tool_calls(
     message: ChatMessage, tools: Iterable[Mapping[str, JsonValue]]
 ) -> list[ToolCall]:
     """Return the calls in the assistant ``message``, in order, ready for ToolRegistry.execute.
+
+    An XML call counts only when it is terminated: a ``<tool_call>`` block with its
+    ``</tool_call>``, or, in a content with no ``<tool_call>`` tag, a bare function block with
+    its ``</function>``. Inside a terminated block, a parameter or function tag may go unclosed.
 
     ``tools`` is the ``tools`` list the model was offered, as ToolRegistry.json_schemas()
     gives it: a parameter written in XML takes the type its tool's JSON Schema gives it (a
@@ -90,8 +95,9 @@ def strip_tool_call_markup(text: str, *, reasoning: bool = False) -> str:
     it was cut off, whether or not the block holds a call. In a content (``reasoning`` false)
     with no ``<tool_call>`` tag, it is each bare ``<function=...>`` block, as the parser reads
     those there. A bare block is kept otherwise: outside ``<tool_call>`` blocks, and anywhere in
-    a reasoning (``reasoning`` true), the parser never reads one as a call. Everything else
-    stays as it was, whitespace included.
+    a reasoning (``reasoning`` true), the parser never reads one as a call. Unterminated markup,
+    which the parser never takes as a call, is removed all the same, so that none reaches the
+    model. Everything else stays as it was, whitespace included.
 
     When a reply's calls came from XML, its replay strips both its content and its reasoning,
     ``strip_tool_call_markup(content)`` and ``strip_tool_call_markup(reasoning_content,
@@ -139,20 +145,31 @@ def _xml_calls(
     schemas: Mapping[str, Mapping[str, JsonValue]],
 ) -> list[ToolCall]:
     calls = []
-    blocks = _TOOL_CALL.findall(text)
-    if not blocks and source == TOOL_CALL_SOURCE_CONTENT_XML:
-        blocks = [text]  # In the content, a function block outside any <tool_call> tag is a call.
-    for block in blocks:
-        for written_name, body in _FUNCTION.findall(block):
-            name = written_name.strip()
-            parameters = schemas.get(name, {})
-            values: dict[str, JsonValue] = {}
-            for written_key, value in _PARAMETER.findall(body):
-                key = written_key.strip()
-                values[key] = _coerce(_trim(value), _types(parameters, key))
-            arguments_json = _to_json(values)  # Each value was checked as it was coerced.
-            calls.append(ToolCall(name=name, arguments_json=arguments_json, source=source))
+    for written_name, body in _function_blocks(text, source):
+        name = written_name.strip()
+        parameters = schemas.get(name, {})
+        values: dict[str, JsonValue] = {}
+        for written_key, value in _PARAMETER.findall(body):
+            key = written_key.strip()
+            values[key] = _coerce(_trim(value), _types(parameters, key))
+        arguments_json = _to_json(values)  # Each value was checked as it was coerced.
+        calls.append(ToolCall(name=name, arguments_json=arguments_json, source=source))
     return calls
+
+
+def _function_blocks(text: str, source: ToolCallSource.ValueType) -> list[tuple[str, str]]:
+    """The name and the body of each function block in ``text`` that is a call.
+
+    Only a terminated block is a call: a ``<tool_call>`` block with its ``</tool_call>``, and in
+    the content of a text with no ``<tool_call>`` tag, a bare function block with its
+    ``</function>``. A draft cut off before its closing tag is never a call.
+    """
+    if _TOOL_CALL.search(text):
+        blocks = [match[1] for match in _TOOL_CALL.finditer(text) if match[2]]
+        return [(name, body) for block in blocks for name, body, _ in _FUNCTION.findall(block)]
+    if source == TOOL_CALL_SOURCE_CONTENT_XML:
+        return [(match[1], match[2]) for match in _FUNCTION.finditer(text) if match[3]]
+    return []
 
 
 def _parameter_schemas(

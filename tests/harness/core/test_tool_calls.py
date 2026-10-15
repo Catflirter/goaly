@@ -426,18 +426,38 @@ def test_the_parameters_of_an_unknown_tool_stay_strings() -> None:
     assert (call.name, arguments(call)) == ("explain_query", {"sql": "SELECT 1", "analyze": "true"})
 
 
-def test_an_xml_call_cut_off_inside_a_value_keeps_what_was_written() -> None:
-    message = assistant(
-        content="<tool_call>\n<function=execute_sql>\n<parameter=limit>\n5\n</parameter>\n"
-        "<parameter=sql>\nSELECT a FROM t WHERE"
-    )
+# A draft cut off before its closing tag, at the end of the text.
+UNTERMINATED_BLOCK = "<tool_call>\n<function=submit>\n<parameter=sql>\nSELECT 1 WHERE"
+UNTERMINATED_BARE = "<function=submit>\n<parameter=sql>\nSELECT 1\n</parameter>\n"
+
+
+@pytest.mark.parametrize(
+    "content",
+    [
+        "Let me submit.\n" + UNTERMINATED_BLOCK,
+        "Let me submit.\n" + UNTERMINATED_BARE,
+        # Its function block is closed, but the <tool_call> block is not.
+        "<tool_call>\n<function=submit>\n<parameter=sql>\nSELECT 1\n</parameter>\n</function>\n",
+    ],
+    ids=["tool_call block", "bare function block", "closed function, open tool_call"],
+)
+def test_unterminated_xml_in_the_content_is_no_call(content: str) -> None:
+    # Whatever the finish reason: a draft cut off at the end must never become the answer.
+    assert parse_tool_calls(assistant(content=content), OFFERED) == []
+
+
+def test_unterminated_xml_in_the_reasoning_is_no_call() -> None:
+    message = assistant(reasoning="I could submit now:\n" + UNTERMINATED_BLOCK)
+
+    assert parse_tool_calls(message, OFFERED) == []
+
+
+def test_a_terminated_block_after_an_unterminated_draft_is_the_only_call() -> None:
+    message = assistant(content=UNTERMINATED_BLOCK + "\n" + xml_call("execute_sql", sql="SELECT 1"))
 
     [call] = parse_tool_calls(message, OFFERED)
 
-    assert (call.name, arguments(call)) == (
-        "execute_sql",
-        {"limit": 5, "sql": "SELECT a FROM t WHERE"},
-    )
+    assert (call.name, arguments(call)) == ("execute_sql", {"sql": "SELECT 1"})
 
 
 def test_an_xml_call_with_unclosed_parameters_splits_them_at_the_next_tag() -> None:
@@ -531,17 +551,8 @@ def test_a_qwen_xml_call_in_the_content_is_read_with_typed_parameters() -> None:
     assert CALL_ID.fullmatch(call.id)
 
 
-def test_a_qwen_xml_call_cut_off_in_the_content_keeps_what_was_written() -> None:
-    [call] = parse_tool_calls(qwen_reply("truncated_xml_in_content"), OFFERED)
-
-    assert (call.name, arguments(call), call.source) == (
-        "execute_sql",
-        {
-            "sql": "EXPLAIN SELECT count(*) FROM orders WHERE o_custkey IN "
-            "(SELECT c_custkey FROM customer WHERE c_nationkey"
-        },
-        TOOL_CALL_SOURCE_CONTENT_XML,
-    )
+def test_a_qwen_xml_call_cut_off_in_the_content_is_no_call() -> None:
+    assert parse_tool_calls(qwen_reply("truncated_xml_in_content"), OFFERED) == []
 
 
 async def test_a_qwen_call_to_an_unknown_tool_gets_an_error_that_lists_the_tools() -> None:
@@ -733,13 +744,30 @@ def test_strip_leaves_text_with_no_call_as_it_was() -> None:
     assert strip_tool_call_markup(text) == text
 
 
-def test_strip_removes_an_unclosed_block_to_the_end_as_the_parser_reads_it() -> None:
+def test_strip_removes_an_unterminated_block_to_the_end_though_it_is_no_call() -> None:
     content = QWEN_REPLIES["replies"]["truncated_xml_in_content"]["content"]
 
     assert strip_tool_call_markup(content) == (
         "Let me first look at the query plan for the original query to understand how it's "
         "being executed.\n\n"
     )
+
+
+@pytest.mark.parametrize(
+    ("text", "reasoning"),
+    [
+        ("Let me submit.\n" + UNTERMINATED_BLOCK, False),
+        ("Let me submit.\n" + UNTERMINATED_BARE, False),
+        ("Let me submit.\n" + UNTERMINATED_BLOCK, True),
+    ],
+    ids=[
+        "tool_call block in the content",
+        "bare block in the content",
+        "tool_call block in the reasoning",
+    ],
+)
+def test_strip_removes_unterminated_markup_too(text: str, reasoning: bool) -> None:
+    assert strip_tool_call_markup(text, reasoning=reasoning) == "Let me submit.\n"
 
 
 def test_strip_removes_a_block_that_holds_no_call_as_the_parser_skips_it() -> None:
