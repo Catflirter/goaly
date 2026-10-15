@@ -5,6 +5,9 @@ JsonlWriter. Any task on the event loop hands it messages, and the writer's one 
 to the file in order, through goaly.contracts.jsonl.append_jsonl in a worker thread. So each line
 is flushed as it is written, a crash loses at most the line being written, and the next write
 cuts off the torn tail that such a crash leaves.
+
+A message that cannot be a JSON line fails its own caller, at once; it never reaches the shared
+writer, whose other callers carry on.
 """
 
 import asyncio
@@ -16,7 +19,7 @@ from typing import Self
 
 from google.protobuf.message import Message
 
-from goaly.contracts.jsonl import append_jsonl
+from goaly.contracts.jsonl import append_jsonl, to_json_line
 
 __all__ = ["JsonlWriter", "JsonlWriterError"]
 
@@ -40,24 +43,30 @@ class JsonlWriter[M: Message]:
     Use it as an async context manager, on one event loop. Entering creates the file if it does
     not exist, and starts the writer task. :meth:`put` and :meth:`write` queue a copy of a
     message, so the caller may change the message afterwards, and lines are written in the order
-    they were queued. Leaving writes every line still queued, then stops the task.
+    they were queued. The queue is unbounded: put() never waits. Leaving the context writes every
+    line still queued, even when the body was cancelled, then stops the task.
 
-    The first line that cannot be written, say because the disk is full, fails the writer. It
-    writes nothing more: the lines queued behind it are dropped, and from then on put(), write()
-    and leaving the context raise JsonlWriterError. Leaving does not raise it over an exception
-    that is already propagating, which it would hide.
+    A message that cannot be a JSON line, such as one with an invalid Timestamp, makes put() or
+    write() raise what to_json_line raises, for that caller only. A line the file system cannot
+    take (an OSError, say because the disk is full) fails the writer instead. It writes nothing
+    more: the lines queued behind it are dropped, and from then on put(), write() and leaving the
+    context raise JsonlWriterError. Leaving does not raise it over an exception that is already
+    propagating, which it would hide.
     """
 
     def __init__(self, path: Path) -> None:
         self.path = path
         self._queue: asyncio.Queue[_Line | None] = asyncio.Queue()  # None stops the writer task.
         self._task: asyncio.Task[None] | None = None
+        self._entered = False
         self._closed = False
+        self._joined = False  # Whether aclose() has awaited the writer task.
         self._failure: BaseException | None = None  # Why a line could not be written.
 
     async def __aenter__(self) -> Self:
-        if self._task is not None or self._closed:
+        if self._entered or self._closed:
             raise RuntimeError(f"the writer of {self.path} was already entered")
+        self._entered = True  # Before the await: a second, concurrent entry is refused.
         # Creating the file now fails a path that cannot be written before anything is queued.
         await asyncio.to_thread(_create, self.path)
         self._task = asyncio.create_task(self._write_lines(), name=f"JsonlWriter({self.path})")
@@ -77,13 +86,17 @@ class JsonlWriter[M: Message]:
             # The body's exception goes on; the writer's failure was logged when it happened.
 
     def put(self, message: M) -> None:
-        """Queue a copy of ``message`` and return at once; the writer task writes it later."""
+        """Queue a copy of ``message`` and return at once; the writer task writes it later.
+
+        Raise what to_json_line raises if the message cannot be a JSON line.
+        """
         self._queue_line(message, None)
 
     async def write(self, message: M) -> None:
         """Queue a copy of ``message`` and wait until its line is written and flushed.
 
-        A caller cancelled while it waits does not take the line back: it is still written.
+        Raise what to_json_line raises if the message cannot be a JSON line. A caller cancelled
+        while it waits does not take the line back: it is still written.
         """
         written = asyncio.get_running_loop().create_future()
         self._queue_line(message, written)
@@ -92,13 +105,15 @@ class JsonlWriter[M: Message]:
     async def aclose(self) -> None:
         """Write every line still queued, then stop the writer task. Calling it again does nothing.
 
-        If it is cancelled, the writer stops at once and the lines still queued are not written.
+        If it is cancelled, the writer stops at once and the lines still queued are not written;
+        calling it again then does not wait for them.
         """
-        if not self._closed:
-            self._closed = True
-            if self._task is not None:
-                self._queue.put_nowait(None)
-        if self._task is not None:
+        self._closed = True
+        if self._task is None:
+            return  # Never entered.
+        if not self._joined:
+            self._joined = True
+            self._queue.put_nowait(None)
             await self._task
         if self._failure is not None:
             raise self._error()
@@ -106,10 +121,13 @@ class JsonlWriter[M: Message]:
     def _queue_line(self, message: M, written: asyncio.Future[None] | None) -> None:
         if self._failure is not None:
             raise self._error()
-        if self._task is None or self._closed:
-            raise RuntimeError(f"the writer of {self.path} is not open")
+        if self._task is None:
+            raise RuntimeError(f"the writer of {self.path} has not been entered")
+        if self._closed:
+            raise RuntimeError(f"the writer of {self.path} is closed")
         copy = type(message)()
         copy.CopyFrom(message)
+        to_json_line(copy)  # Raises here, for this caller alone, if it cannot be a JSON line.
         self._queue.put_nowait(_Line(copy, written))
 
     async def _write_lines(self) -> None:
@@ -117,21 +135,40 @@ class JsonlWriter[M: Message]:
         try:
             while (line := await self._queue.get()) is not None:
                 if self._failure is None:
-                    try:
-                        await asyncio.to_thread(append_jsonl, self.path, line.message)
-                    except Exception as error:
-                        _logger.exception("cannot write %s; it gets no more lines", self.path)
-                        self._failure = error
-                self._settle(line, None if self._failure is None else self._error())
+                    await self._write_line(line)
+                else:
+                    self._settle(line, self._error())
         finally:
             # Cancelled: whatever is left will not be written, and nobody may wait for it forever.
-            stranded: list[_Line | None] = [line]
+            in_flight, line = line, None
+            if in_flight is not None:
+                unsure = f"the writer of {self.path} stopped while it wrote this line, which"
+                self._settle(in_flight, JsonlWriterError(f"{unsure} may not have been written"))
+            dropped = 0 if in_flight is None else 1
             while not self._queue.empty():
-                stranded.append(self._queue.get_nowait())
-            for item in stranded:
-                if item is not None:
+                if (queued := self._queue.get_nowait()) is not None:
+                    dropped += 1
                     stopped = f"the writer of {self.path} stopped before it wrote this line"
-                    self._settle(item, JsonlWriterError(stopped))
+                    self._settle(queued, JsonlWriterError(stopped))
+            if dropped:
+                _logger.warning(
+                    "the writer of %s stopped with %d lines unwritten", self.path, dropped
+                )
+
+    async def _write_line(self, line: _Line) -> None:
+        try:
+            await asyncio.to_thread(append_jsonl, self.path, line.message)
+        except OSError as error:  # The file system's failure fails the writer.
+            _logger.exception("cannot write %s; it gets no more lines", self.path)
+            self._failure = error
+            self._settle(line, self._error())
+        except Exception as error:  # Anything else fails this line alone, as to_json_line would.
+            _logger.exception("cannot write a line to %s", self.path)
+            failed = JsonlWriterError(f"cannot write this line to {self.path}: {error}")
+            failed.__cause__ = error
+            self._settle(line, failed)
+        else:
+            self._settle(line, None)
 
     @staticmethod
     def _settle(line: _Line, error: JsonlWriterError | None) -> None:

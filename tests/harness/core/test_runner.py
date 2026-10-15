@@ -3,8 +3,10 @@
 import asyncio
 import fcntl
 import json
+import logging
 import math
-from collections.abc import Callable, Sequence
+from collections.abc import AsyncIterator, Callable, Sequence
+from contextlib import asynccontextmanager
 from dataclasses import replace
 from pathlib import Path
 
@@ -76,6 +78,8 @@ pytestmark = pytest.mark.anyio
 
 # Guards each wait that would hang if the runner lost a task.
 GUARD_S = 10
+# The grading identity of the toy's runs, which share the evaluation cache.
+CACHE_NAMESPACE = "toy-dev"
 
 type Key = tuple[str, int]
 type ToyRunner = Runner[ToyInstance, FakeSqlEnvironment, StubContext]
@@ -620,27 +624,145 @@ async def test_a_task_group_failing_inside_the_policy_is_a_crash_not_a_cancellat
     assert found[("t1", 0)].error_type == TASK_ERROR_TYPE_NONE
 
 
-class CancelResistingBenchmark(ScriptedBenchmark):
-    """Its grader turns a cancellation into an error of its own."""
+async def leave_a_phantom_cancel_request() -> None:
+    """Handle a TaskGroup whose child fails while the group exits: Python 3.12 then leaves a
+    cancel request on the current task, though nothing cancelled it."""
 
-    def __init__(self, instances: Sequence[ToyInstance], grading: asyncio.Event) -> None:
+    async def failing_child() -> None:
+        await asyncio.sleep(0)
+        raise ValueError("a child failed")
+
+    try:
+        async with asyncio.TaskGroup() as group:
+            group.create_task(failing_child())
+    except* ValueError:
+        pass  # Handled: the code goes on as if nothing happened.
+
+
+class PhantomBenchmark(ScriptedBenchmark):
+    """Its provisioning or its grader handles a failing TaskGroup first."""
+
+    def __init__(self, instances: Sequence[ToyInstance], *, in_provision: bool) -> None:
+        super().__init__(instances)
+        self.in_provision = in_provision
+
+    @asynccontextmanager
+    async def provision(self, inst: ToyInstance) -> AsyncIterator[FakeSqlEnvironment]:
+        if self.in_provision:
+            await leave_a_phantom_cancel_request()
+        async with super().provision(inst) as env:
+            yield env
+
+    async def grade(self, inst: ToyInstance, prediction: Prediction) -> Grade:
+        if not self.in_provision:
+            await leave_a_phantom_cancel_request()
+        return await super().grade(inst, prediction)
+
+
+@pytest.mark.parametrize("in_provision", [True, False], ids=["provision", "grade"])
+async def test_a_failing_task_group_in_the_adapter_does_not_lose_the_task(
+    tmp_path: Path, in_provision: bool
+) -> None:
+    benchmark = PhantomBenchmark(toy_instances(2), in_provision=in_provision)
+
+    summary = await run(make_runner(benchmark), tmp_path)
+
+    found = results(tmp_path)
+    assert set(found) == {("t0", 0), ("t1", 0)}
+    assert all(result.grade.status == GRADE_STATUS_GRADED for result in found.values())
+    assert summary.errors == {}
+
+
+async def test_a_failing_task_group_in_the_context_factory_does_not_lose_the_task(
+    tmp_path: Path,
+) -> None:
+    @asynccontextmanager
+    async def contexts(
+        inst: ToyInstance, seed: int, run: RunIdentity
+    ) -> AsyncIterator[StubContext]:
+        await leave_a_phantom_cancel_request()
+        yield StubContext(inst, seed, run)
+
+    runner = Runner(ScriptedBenchmark(toy_instances(2)), ScriptedPolicy(), contexts)
+
+    await run(runner, tmp_path)
+
+    assert set(results(tmp_path)) == {("t0", 0), ("t1", 0)}
+
+
+async def test_a_cancel_request_the_policy_leaves_never_reaches_the_context(
+    tmp_path: Path,
+) -> None:
+    seen: list[int] = []
+
+    @asynccontextmanager
+    async def contexts(
+        inst: ToyInstance, seed: int, run: RunIdentity
+    ) -> AsyncIterator[StubContext]:
+        yield StubContext(inst, seed, run)
+        task = asyncio.current_task()
+        assert task is not None
+        seen.append(task.cancelling())  # What the code that closes the context sees.
+
+    async def best_of_n(task: TaskInput, env: Environment, ctx: StubContext) -> Prediction | None:
+        await leave_a_phantom_cancel_request()
+        return None
+
+    runner = Runner(
+        ScriptedBenchmark(toy_instances(1)), ScriptedPolicy({"t0": best_of_n}), contexts
+    )
+
+    await run(runner, tmp_path)
+
+    assert seen == [0]
+    assert results(tmp_path)[("t0", 0)].error_type == TASK_ERROR_TYPE_NONE
+
+
+async def test_pack_code_that_converts_a_cancellation_is_logged(
+    tmp_path: Path, caplog: pytest.LogCaptureFixture
+) -> None:
+    started = asyncio.Event()
+    policy = ScriptedPolicy({"t0": in_sleep(started, cleanup_fails)})
+    running = asyncio.create_task(
+        run(make_runner(ScriptedBenchmark(toy_instances(1)), policy), tmp_path)
+    )
+    async with asyncio.timeout(GUARD_S):
+        await started.wait()
+
+    with caplog.at_level(logging.WARNING, logger="goaly.harness.core.runner"):
+        running.cancel()
+        with pytest.raises(asyncio.CancelledError):
+            await running
+
+    assert "turned a cancellation into RuntimeError: cleanup failed" in caplog.text
+
+
+class CancelResistingBenchmark(ScriptedBenchmark):
+    """Its grader turns a cancellation into an error of its own, or swallows it."""
+
+    def __init__(
+        self, instances: Sequence[ToyInstance], grading: asyncio.Event, *, swallows: bool
+    ) -> None:
         super().__init__(instances)
         self.grading = grading
+        self.swallows = swallows
 
     async def grade(self, inst: ToyInstance, prediction: Prediction) -> Grade:
         self.grading.set()
         try:
             await asyncio.sleep(GUARD_S)
         except asyncio.CancelledError:
-            raise RuntimeError("the grading instance went away") from None
+            if not self.swallows:
+                raise RuntimeError("the grading instance went away") from None
         return await super().grade(inst, prediction)
 
 
+@pytest.mark.parametrize("swallows", [False, True], ids=["converts", "swallows"])
 async def test_a_grader_cannot_turn_a_cancellation_of_the_run_into_a_grade(
-    tmp_path: Path,
+    tmp_path: Path, swallows: bool
 ) -> None:
     grading = asyncio.Event()
-    benchmark = CancelResistingBenchmark(toy_instances(1), grading)
+    benchmark = CancelResistingBenchmark(toy_instances(1), grading, swallows=swallows)
     running = asyncio.create_task(run(make_runner(benchmark), tmp_path))
     async with asyncio.timeout(GUARD_S):
         await grading.wait()
@@ -686,7 +808,7 @@ async def test_an_external_run_is_not_graded_but_every_task_gets_its_official_re
     tmp_path: Path,
 ) -> None:
     # The organizers' tasks reuse our IDs and inputs, which the cache must never mistake for ours.
-    cache = EvalCache(tmp_path / "cache")
+    cache = EvalCache(tmp_path / "cache", CACHE_NAMESPACE)
     await run(make_runner(ScriptedBenchmark(toy_instances(3)), cache=cache), tmp_path / "ours")
     organizers = [replace(inst, split=SPLIT_EXTERNAL, gold_sql=None) for inst in toy_instances(3)]
     benchmark = ScriptedBenchmark(toy_instances(3), external=organizers)
@@ -710,7 +832,7 @@ async def test_an_external_run_is_not_graded_but_every_task_gets_its_official_re
 
 
 async def test_a_cached_evaluation_is_recorded_again_without_solving(tmp_path: Path) -> None:
-    cache = EvalCache(tmp_path / "cache")
+    cache = EvalCache(tmp_path / "cache", CACHE_NAMESPACE)
     policy = ScriptedPolicy({"t1": answering("SELECT 1")})
     await run(make_runner(ScriptedBenchmark(toy_instances(3)), policy, cache=cache), tmp_path / "a")
 
@@ -738,7 +860,7 @@ async def test_a_cached_evaluation_is_recorded_again_without_solving(tmp_path: P
 
 
 async def test_only_clean_evaluations_are_cached(tmp_path: Path) -> None:
-    cache = EvalCache(tmp_path / "cache")
+    cache = EvalCache(tmp_path / "cache", CACHE_NAMESPACE)
     benchmark = ScriptedBenchmark(
         toy_instances(3), grade_errors={"t1": RuntimeError("grader down")}
     )
@@ -764,7 +886,7 @@ async def test_only_clean_evaluations_are_cached(tmp_path: Path) -> None:
 async def test_another_harness_or_seed_misses_the_cache(
     tmp_path: Path, manifest: RunManifest, seeds: Sequence[int]
 ) -> None:
-    cache = EvalCache(tmp_path / "cache")
+    cache = EvalCache(tmp_path / "cache", CACHE_NAMESPACE)
     await run(make_runner(ScriptedBenchmark(toy_instances(2)), cache=cache), tmp_path / "a")
 
     again = ScriptedPolicy()
@@ -785,7 +907,9 @@ async def test_a_cache_that_cannot_be_written_does_not_fail_the_run(
     not_a_directory.write_text("", encoding="utf-8")
 
     await run(
-        make_runner(ScriptedBenchmark(toy_instances(2)), cache=EvalCache(not_a_directory)),
+        make_runner(
+            ScriptedBenchmark(toy_instances(2)), cache=EvalCache(not_a_directory, CACHE_NAMESPACE)
+        ),
         tmp_path / "run",
     )
 
@@ -1033,7 +1157,9 @@ async def test_duplicate_instance_ids_from_the_benchmark_are_refused(tmp_path: P
 
 
 async def test_a_run_needs_its_id_and_a_cache_needs_the_harness_hash(tmp_path: Path) -> None:
-    runner = make_runner(ScriptedBenchmark(toy_instances(1)), cache=EvalCache(tmp_path / "c"))
+    runner = make_runner(
+        ScriptedBenchmark(toy_instances(1)), cache=EvalCache(tmp_path / "c", CACHE_NAMESPACE)
+    )
 
     with pytest.raises(ValueError, match="run_id"):
         await run(runner, tmp_path / "a", manifest=template(run_id=""))

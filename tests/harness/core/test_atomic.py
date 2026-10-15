@@ -1,5 +1,6 @@
 """Tests for goaly.harness.core.atomic: replacing a file atomically."""
 
+import os
 import stat
 from pathlib import Path, PurePath
 
@@ -55,6 +56,29 @@ def test_renames_a_file_from_the_same_directory(
     assert target == path
     assert source.parent == target.parent
     assert source.name.startswith(".file.json.")
+
+
+def test_syncs_the_file_before_the_rename_and_the_directory_after_it(
+    directory: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    events: list[str] = []
+    fsync, replace = os.fsync, Path.replace
+
+    def recording_fsync(descriptor: int) -> None:
+        kind = "directory" if stat.S_ISDIR(os.fstat(descriptor).st_mode) else "file"
+        events.append(f"sync {kind}")
+        fsync(descriptor)
+
+    def recording_replace(source: Path, target: str | PurePath) -> Path:
+        events.append("rename")
+        return replace(source, target)
+
+    monkeypatch.setattr(os, "fsync", recording_fsync)
+    monkeypatch.setattr(Path, "replace", recording_replace)
+
+    write_text_atomically(directory / "file.json", "text")
+
+    assert events == ["sync file", "rename", "sync directory"]
 
 
 def test_a_failed_write_leaves_the_file_as_it_was(
