@@ -6,7 +6,7 @@ tasks that hold an environment at once, which is how many tasks run at once.
 """
 
 import asyncio
-from collections.abc import AsyncIterator, Awaitable, Callable, Sequence
+from collections.abc import AsyncIterator, Awaitable, Callable, Mapping, Sequence
 from contextlib import asynccontextmanager
 from dataclasses import dataclass, field
 
@@ -54,22 +54,22 @@ class ScriptedBenchmark(ToyBenchmark):
         instances: Sequence[ToyInstance],
         *,
         external: Sequence[ToyInstance] | None = None,
-        input_errors: dict[str, Exception] | None = None,
-        provision_errors: dict[str, Exception] | None = None,
+        input_errors: Mapping[str, BaseException] | None = None,
+        provision_errors: Mapping[str, BaseException] | None = None,
         provision_delay_s: float = 0.0,
-        grade_errors: dict[str, Exception] | None = None,
+        grade_errors: Mapping[str, BaseException] | None = None,
         grade_started: dict[str, asyncio.Event] | None = None,
         grade_waits: dict[str, asyncio.Event] | None = None,
-        official_errors: dict[str, Exception] | None = None,
+        official_errors: Mapping[str, BaseException] | None = None,
     ) -> None:
         super().__init__(instances, external=external)
-        self.input_errors = input_errors or {}
-        self.provision_errors = provision_errors or {}
+        self.input_errors = dict(input_errors or {})
+        self.provision_errors = dict(provision_errors or {})
         self.provision_delay_s = provision_delay_s
-        self.grade_errors = grade_errors or {}
+        self.grade_errors = dict(grade_errors or {})
         self.grade_started = grade_started or {}
         self.grade_waits = grade_waits or {}
-        self.official_errors = official_errors or {}
+        self.official_errors = dict(official_errors or {})
         self.running = 0
         self.most_running = 0
         self.graded: list[Prediction] = []
@@ -124,7 +124,7 @@ class StubContext:
         self.run = run
         self.entered = False
         self.exited = False
-        self.trajectory_error: Exception | None = None
+        self.trajectory_error: BaseException | None = None
         self._trajectory = Trajectory(stop_reason=STOP_REASON_SUBMITTED)
 
     @property
@@ -196,7 +196,7 @@ class ScriptedPolicy:
         return prediction
 
 
-def raising(error: Exception) -> Action:
+def raising(error: BaseException) -> Action:
     """An action that raises ``error``."""
 
     async def act(task: TaskInput, env: Environment, ctx: StubContext) -> Prediction | None:
@@ -232,3 +232,12 @@ def answering(sql: str) -> Action:
         return Prediction(effisql=EffiSqlPrediction(sql=sql))
 
     return act
+
+
+async def cancels_itself(task: TaskInput, env: Environment, ctx: StubContext) -> Prediction | None:
+    """An action that cancels its own task, as pack code that cancels the wrong task would."""
+    current = asyncio.current_task()
+    assert current is not None
+    current.cancel()
+    await asyncio.sleep(0)  # The cancellation lands here.
+    return None
