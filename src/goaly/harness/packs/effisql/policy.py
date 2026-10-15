@@ -4,9 +4,14 @@ The harness factory reads prompt.md and config.yaml, gives core the sampling, th
 context window, and calls :func:`build_policy` with the config's ``pack`` section and the prompt.
 When a budget runs out before submit, the fallback submits ``base_sql`` unchanged, which the
 grader credits with its identity τ (spec §5.4).
+
+On top of prompt.md the pack holds one rule, TIME_GATE_RULE, which the task prompt carries: a
+rewrite is handed in only once one EXPLAIN ANALYZE has shown it at least 1.2x faster than the base
+plan's time, so no rewrite slower than identity is ever submitted.
 """
 
 from collections.abc import Mapping
+from typing import Final
 
 from pydantic import BaseModel, ConfigDict, Field
 
@@ -71,8 +76,25 @@ def fallback(task: EffiSqlTaskInput) -> Prediction:
     return Prediction(effisql=EffiSqlPrediction(sql=task.base_sql))
 
 
+# The one rule this pack adds on top of prompt.md: hand in a rewrite only once it has been timed.
+# Under a 1.2x speedup the credit is the base query's anyway, and a rewrite slower than the base
+# earns less than submitting the base itself, so an unmeasured rewrite is never worth submitting.
+# The rule is prose for the executor, so it reaches it through the task prompt.
+TIME_GATE_RULE: Final = (
+    "Time-gated submission: before submitting a rewrite, run EXPLAIN ANALYZE on it exactly once "
+    "and read its total execution time. Compare it with the base plan's actual execution time "
+    "given in the task. Submit the rewrite only if base_time / candidate_time >= 1.2; otherwise "
+    "submit the base query unchanged. If the remaining budget cannot afford that one EXPLAIN "
+    "ANALYZE, submit the base query unchanged. Never submit a rewrite you have not timed."
+)
+
+
 def task_prompt(task: EffiSqlTaskInput, config: PackConfig, budgets: Budgets) -> str:
-    """The first user message: the query to rewrite, its database and plan, and the limits."""
+    """The first user message: the query, its database and plan, the limits, and the rule.
+
+    The rule comes last, and the opening messages never fold, so the model still reads it at the
+    step where it submits.
+    """
     minutes = budgets.wall_clock_s / 60
     timeout = config.execute_sql.statement_timeout_s
     return "\n\n".join(
@@ -85,6 +107,7 @@ def task_prompt(task: EffiSqlTaskInput, config: PackConfig, budgets: Budgets) ->
             f"Limits: execute_sql stops a query after {timeout:g} s. You have {budgets.steps}"
             f" steps and {minutes:g} minutes; if they run out before you submit, the query above"
             " is submitted unchanged.",
+            TIME_GATE_RULE,
         ]
     )
 

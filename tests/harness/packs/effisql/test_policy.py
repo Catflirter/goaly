@@ -1,4 +1,5 @@
-"""Tests for the v0 Effi-SQL policy: the loop, the fallback, the prompt and config.yaml."""
+"""Tests for the v0 Effi-SQL policy: the loop, the fallback, the prompt, its one rule and
+config.yaml."""
 
 import json
 from pathlib import Path
@@ -18,6 +19,7 @@ from goaly.harness.core.context_window import ContextWindow
 from goaly.harness.core.llm_models import ModelParams
 from goaly.harness.packs import effisql
 from goaly.harness.packs.effisql.policy import (
+    TIME_GATE_RULE,
     EffiSqlPolicy,
     PackConfig,
     build_policy,
@@ -163,6 +165,35 @@ class TestPrompt:
         task = EffiSqlTaskInput(db="tpch", base_sql=BASE_SQL)
 
         assert "rated unknown" in task_prompt(task, PackConfig(), Budgets(steps=1, wall_clock_s=1))
+
+
+class TestTimeGateRule:
+    """The pack's one rule on top of prompt.md: no rewrite is submitted before it has been timed."""
+
+    def test_the_rule_states_the_gate(self) -> None:
+        for part in (
+            "run EXPLAIN ANALYZE on it exactly once",
+            "the base plan's actual execution time given in the task",
+            "base_time / candidate_time >= 1.2",
+            "otherwise submit the base query unchanged",
+            "cannot afford that one EXPLAIN ANALYZE, submit the base query unchanged",
+            "Never submit a rewrite you have not timed",
+        ):
+            assert part in TIME_GATE_RULE
+
+    def test_the_task_prompt_carries_the_rule(self) -> None:
+        text = task_prompt(TASK.effisql, PackConfig(), Budgets(steps=30, wall_clock_s=600))
+
+        assert TIME_GATE_RULE in text
+        assert text.endswith(TIME_GATE_RULE)  # Last, so nothing buries it.
+
+    async def test_the_model_reads_the_rule_before_it_can_submit(self) -> None:
+        llm = FakeLLM([reply(tool_call("submit", {"sql": FASTER}))])
+
+        await policy().solve(TASK, FakeSqlEnvironment(), context(llm))
+
+        _, user = llm.requests[0].messages
+        assert TIME_GATE_RULE in user.content
 
 
 class TestConfig:
