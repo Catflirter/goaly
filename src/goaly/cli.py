@@ -4,6 +4,7 @@
 It wires the layers together. It registers each benchmark with the harnesses that solve it, which
 `goaly run` can then run: Effi-SQL, with its v0 pack as the harness "v0", and its trusted host
 side. Neither imports pack code until a harness opens, so the host loads none (spec V24, V27).
+`goaly rsi ...` runs the RSI lane's command line, goaly.rsi.cli.
 """
 
 import logging
@@ -43,4 +44,8 @@ def main() -> int:
             confine_to_python_cpus()
         except OSError as error:  # A cpuset without those CPUs.
             logging.getLogger(__name__).warning("cannot confine to the Python CPUs: %s", error)
+    if argv[:1] == ["rsi"]:  # Imported here, so `goaly run` never loads goaly.rsi (spec §3.1).
+        from goaly.rsi.cli import main as rsi_main
+
+        return rsi_main(argv[1:])
     return cli.main(argv, registry(), budgets_file=BUDGETS_FILE)

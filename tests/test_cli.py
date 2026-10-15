@@ -93,3 +93,16 @@ def test_the_budgets_shipped_are_the_specs() -> None:
 def test_the_budgets_are_outside_the_harness_hash() -> None:
     # Changing a share must not change the harness hash, or the evaluation cache would miss.
     assert not cli.BUDGETS_FILE.is_relative_to(CORE_DIR)
+
+
+def test_goaly_rsi_runs_the_rsi_command_line(
+    monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    monkeypatch.setattr(sys, "argv", ["goaly", "rsi", "status", "--help"])
+    monkeypatch.setattr(cli, "confine_to_python_cpus", lambda: None)
+
+    with pytest.raises(SystemExit) as exited:
+        cli.main()
+
+    assert exited.value.code == 0
+    assert "goaly rsi status" in capsys.readouterr().out

@@ -46,3 +46,7 @@ def test_the_shipped_config_is_valid() -> None:
     assert settings.lane.deadline == datetime(2026, 10, 15, 20, 0, tzinfo=UTC)
     assert settings.lane.round.decision.min_delta == 0.05
     assert settings.lane.round.k == 3
+    # The integration names T11's evaluator, T22's hooks and T12's v0 tag.
+    assert settings.evaluator == "goaly.bench.effisql.evaluate:make_evaluator"
+    assert settings.hooks == "goaly.rsi.hooks:lane_hooks"
+    assert settings.v0 == "v0"
