@@ -43,6 +43,7 @@ from goaly.bench.effisql.pg_build import (
     Connect,
     GoldenRecord,
     connector,
+    hba_problems,
     read_golden_record,
     wait_until_ready,
 )
@@ -243,6 +244,10 @@ def start_instances(
         )
     actions: dict[str, str] = {}
     for instance in instances:
+        hba = _instance_dir(config, instance) / "pgdata" / "pg_hba.conf"
+        problems = hba_problems(hba.read_text(encoding="utf-8"))
+        if problems:  # Each server shares the host network: no rule may skip scram.
+            raise InstanceError(f"{hba} lets in without a password: {problems}")
         action = pg_containers.ensure(instance_spec(config, instance))
         actions[instance.name] = f"{action}, data copied" if copied[instance] else action
     for instance in instances:
