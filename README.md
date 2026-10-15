@@ -42,3 +42,7 @@ make proto             # regenerate src/goaly/contracts/gen/ after editing proto
 ```
 
 Run `make` to list every target.
+
+To check that the LLM client and the real gateway still agree, run
+`uv run --locked python scripts/llm_smoke.py`. It needs `GOALY_API_KEY`, makes four small calls
+to Qwen and GLM, and prints only each call's model, status, tokens and cost. CI does not run it.
