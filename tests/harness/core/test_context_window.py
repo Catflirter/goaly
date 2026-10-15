@@ -214,3 +214,42 @@ def test_a_fold_names_the_global_step_of_its_turn() -> None:
     [fold] = prompt.fold(everything_older=True)
 
     assert (fold.step, fold.tool_call_id) == (7, "c0")
+
+
+def thinking(step: int, reasoning: str) -> ChatMessage:
+    call = ToolCall(id=f"c{step}", name="execute_sql", arguments_json="{}")
+    return ChatMessage(
+        role=ASSISTANT, content="Done.", reasoning_content=reasoning, tool_calls=[call]
+    )
+
+
+def test_reasoning_goes_out_only_within_the_last_turns() -> None:
+    prompt = ChatPrompt(OPENING, TOOLS, window(keep_turns=2))
+    for step in range(4):
+        prompt.add_turn(step, thinking(step, f"thought {step}"))
+        prompt.add(tool(f"c{step}", "rows: 1"))
+
+    replies = [message for message in prompt.messages() if message.role == ASSISTANT]
+
+    assert [reply.reasoning_content for reply in replies] == ["", "", "thought 2", "thought 3"]
+    assert [reply.content for reply in replies] == ["Done."] * 4  # Only the reasoning goes.
+    assert [reply.tool_calls[0].id for reply in replies] == ["c0", "c1", "c2", "c3"]
+
+
+def test_reasoning_that_leaves_the_last_turns_comes_off_the_estimate() -> None:
+    prompt = ChatPrompt(OPENING, TOOLS, window(keep_turns=1))
+    prompt.add_turn(0, thinking(0, "r" * 400))
+    prompt.sent(1000)
+
+    prompt.add_turn(1, thinking(1, ""))
+
+    added = len("Done.") + len("execute_sql") + len("{}")
+    assert prompt.estimated_tokens == math.ceil(1000 + added / 4 - 400 / 4)
+
+
+def test_with_no_turns_to_keep_no_reasoning_goes_out() -> None:
+    prompt = ChatPrompt(OPENING, TOOLS, window(keep_turns=0))
+
+    prompt.add_turn(0, thinking(0, "r" * 400))
+
+    assert [m.reasoning_content for m in prompt.messages() if m.role == ASSISTANT] == [""]

@@ -8,6 +8,10 @@ The fold is deterministic, with no model call, and only the prompt is folded: th
 keeps every output whole and records each fold (Step.folds), so every step's prompt can still be
 rebuilt from it.
 
+Only the turns of that verbatim tail go out with their reasoning: an assistant message that
+leaves it is sent without its reasoning_content from then on, whatever the prompt's size. The
+trajectory keeps the reasoning, and the rule, which the folds do not record, rebuilds the prompt.
+
 A prompt's size is estimated as the previous call's input tokens, as the gateway counted them,
 plus a token for every 4 characters added since.
 """
@@ -76,9 +80,15 @@ class ChatPrompt:
         return [*self._opening, *(message for turn in self._turns for message in turn.messages)]
 
     def add_turn(self, step: int, assistant: ChatMessage) -> None:
-        """Start the turn of the step at ``step`` in Trajectory.steps, with its assistant reply."""
+        """Start the turn of the step at ``step`` in Trajectory.steps, with its assistant reply.
+
+        The turn this pushes out of the last ``keep_turns`` loses its reasoning.
+        """
         self._turns.append(_Turn(step, [assistant]))
         self._estimate += _chars(assistant) / _CHARS_PER_TOKEN
+        leaving = len(self._turns) - 1 - self._window.keep_turns
+        if leaving >= 0:
+            self._drop_reasoning(self._turns[leaving])
 
     def add(self, message: ChatMessage) -> None:
         """Add a tool message, or an injected one, to the last turn."""
@@ -126,6 +136,15 @@ class ChatPrompt:
                     )
                 )
         return folds
+
+    def _drop_reasoning(self, turn: _Turn) -> None:
+        reply = turn.messages[0]
+        if reply.reasoning_content:
+            plain = ChatMessage()  # A new message, as a fold makes.
+            plain.CopyFrom(reply)
+            plain.reasoning_content = ""
+            turn.messages[0] = plain
+            self._estimate -= len(reply.reasoning_content) / _CHARS_PER_TOKEN
 
     def _fits(self) -> bool:
         return self.estimated_tokens <= self._window.fold_above_tokens
