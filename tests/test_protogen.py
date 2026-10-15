@@ -245,13 +245,23 @@ def test_check_names_every_stale_file_and_changes_nothing(proto_dir: Path, stale
 @pytest.mark.parametrize(
     ("name", "content", "reason"),
     [
-        ("goaly/v1/broken.proto", 'syntax = "proto3";\npackage goaly.v1;\nmessage {', "broken"),
+        # protoc's own messages, which protogen must pass through.
+        (
+            "goaly/v1/broken.proto",
+            'syntax = "proto3";\npackage goaly.v1;\nmessage {',
+            "expected message name",
+        ),
         (
             "goaly/v1/unused.proto",
             'syntax = "proto3";\npackage goaly.v1;\nimport "goaly/v1/leaf.proto";\n',
-            "unused",
+            "is unused",
         ),
-        ("other/thing.proto", 'syntax = "proto3";\npackage other;\n', "other/thing.proto"),
+        # protogen's own check, which names the misplaced file.
+        (
+            "other/thing.proto",
+            'syntax = "proto3";\npackage other;\n',
+            "must be in goaly/v1/: other/thing.proto",
+        ),
     ],
     ids=["syntax-error", "warning", "outside-goaly-v1"],
 )
