@@ -670,17 +670,36 @@ async def test_retries_as_often_as_the_policy_says() -> None:
     assert len(gateway.requests) == 2
 
 
-async def test_backs_off_exponentially_up_to_the_cap() -> None:
-    clock = FakeClock()
+def test_the_retry_policy_defaults_are_the_specs() -> None:
+    policy = RetryPolicy()
+
+    assert (policy.timeout_s, policy.max_retries) == (300.0, 5)
+    assert (policy.backoff_base_s, policy.backoff_cap_s) == (1.0, 60.0)
+
+
+class RecordingJitter(random.Random):
+    """Jitter that notes each range it is asked to pick from, and picks its middle."""
+
+    def __init__(self) -> None:
+        super().__init__()
+        self.ranges: list[tuple[float, float]] = []
+
+    def uniform(self, a: float, b: float) -> float:
+        self.ranges.append((a, b))
+        return (a + b) / 2
+
+
+async def test_backs_off_with_full_jitter_below_a_doubling_ceiling() -> None:
+    clock, jitter = FakeClock(), RecordingJitter()
     gateway = Gateway(*(failure(503) for _ in range(9)))
-    async with connect(
-        gateway, clock=clock, retry=RetryPolicy(max_retries=8), rng=TopOfRange()
-    ) as llm:
+    async with connect(gateway, clock=clock, retry=RetryPolicy(max_retries=8), rng=jitter) as llm:
         with pytest.raises(ServerError):
             await llm.complete([user("hi")], model=QWEN, tags=EXEC)
 
-    # Base 1 s, doubling, capped at 60 s.
-    assert clock.sleeps == [1, 2, 4, 8, 16, 32, 60, 60]
+    # Anywhere from 0 to a ceiling that starts at 1 s, doubles, and stops at 60 s.
+    ceilings = [1.0, 2.0, 4.0, 8.0, 16.0, 32.0, 60.0, 60.0]
+    assert jitter.ranges == [(0.0, ceiling) for ceiling in ceilings]
+    assert clock.sleeps == [ceiling / 2 for ceiling in ceilings]
 
 
 async def test_backoff_jitter_is_full() -> None:
