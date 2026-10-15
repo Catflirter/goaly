@@ -25,6 +25,7 @@ from goaly.harness.core.manifest import (
     GitState,
     config_hash,
     content_hash,
+    core_hash,
     git_state,
     harness_hash,
     machine_info,
@@ -155,20 +156,38 @@ def test_a_content_hash_tells_trees_apart_by_label(tmp_path: Path) -> None:
     assert content_hash({"core": one}) != content_hash({"pack": one})
 
 
-def test_a_content_hash_reads_linked_files_but_does_not_follow_linked_directories(
-    tmp_path: Path,
-) -> None:
+def test_a_content_hash_counts_a_link_by_the_path_it_holds(tmp_path: Path) -> None:
+    outside = make_tree(tmp_path / "outside", {"a.txt": "a\n", "b.txt": "b\n"})
+    root = make_tree(tmp_path / "tree", {"a.py": "x = 1\n"})
+    (root / "linked.txt").symlink_to(outside / "a.txt")
+    with_link = content_hash({"tree": root})
+
+    # What the link points to is never read: the hash reads nothing outside the tree.
+    (outside / "a.txt").write_text("changed\n", encoding="utf-8")
+    assert content_hash({"tree": root}) == with_link
+    # The path it holds counts, and so does being a link rather than a file.
+    (root / "linked.txt").unlink()
+    (root / "linked.txt").symlink_to(outside / "b.txt")
+    assert content_hash({"tree": root}) != with_link
+    (root / "linked.txt").unlink()
+    (root / "linked.txt").write_text(str(outside / "a.txt"), encoding="utf-8")
+    assert content_hash({"tree": root}) != with_link
+
+
+def test_a_content_hash_refuses_a_link_to_a_directory(tmp_path: Path) -> None:
     outside = make_tree(tmp_path / "outside", {"big.txt": "data\n"})
     root = make_tree(tmp_path / "tree", {"a.py": "x = 1\n"})
-    before = content_hash({"tree": root})
-
     (root / "linked_dir").symlink_to(outside, target_is_directory=True)
-    assert content_hash({"tree": root}) == before
 
-    (root / "linked.txt").symlink_to(outside / "big.txt")
-    with_link = content_hash({"tree": root})
-    (outside / "big.txt").write_text("other\n", encoding="utf-8")
-    assert content_hash({"tree": root}) not in {before, with_link}
+    with pytest.raises(ValueError, match="links to a directory"):
+        content_hash({"tree": root})
+
+
+def test_a_dangling_link_counts_by_the_path_it_holds(tmp_path: Path) -> None:
+    root = make_tree(tmp_path / "tree", {"a.py": "x = 1\n"})
+    (root / "gone").symlink_to(tmp_path / "missing")
+
+    assert re.fullmatch(r"[0-9a-f]{64}", content_hash({"tree": root}))
 
 
 def test_a_content_hash_needs_each_directory(tmp_path: Path) -> None:
@@ -180,7 +199,7 @@ def test_the_harness_hash_covers_core_and_the_pack(pack: Path) -> None:
     assert Path(manifest.__file__).resolve().parent == CORE_DIR
     assert CORE_DIR.parts[-3:] == ("goaly", "harness", "core")
     assert harness_hash(pack) == content_hash({"core": CORE_DIR, "pack": pack})
-    assert harness_hash(None) == content_hash({"core": CORE_DIR})
+    assert core_hash() == content_hash({"core": CORE_DIR})
 
     before = harness_hash(pack)
     (pack / "skills" / "joins.md").write_text("Use a hash join.\n", encoding="utf-8")
@@ -209,9 +228,10 @@ def test_a_config_hash_changes_with_any_value(other: dict[str, JsonValue]) -> No
     assert config_hash(other) != config_hash({"seeds": [0, 1], "bench": "x"})
 
 
-def test_a_config_hash_refuses_values_json_cannot_hold() -> None:
-    with pytest.raises(ValueError, match="JSON"):
-        config_hash({"timeout_s": float("nan")})
+@pytest.mark.parametrize("value", [float("nan"), {1, 2}, Path("/x")], ids=["nan", "set", "path"])
+def test_a_config_hash_refuses_values_json_cannot_hold(value: object) -> None:
+    with pytest.raises(ValueError, match="JSON cannot hold"):
+        config_hash({"timeout_s": value})  # type: ignore[dict-item]  # Not JSON, on purpose.
 
 
 def test_sha256_file(tmp_path: Path) -> None:
@@ -300,6 +320,15 @@ def test_git_state_is_none_outside_a_repository_or_before_the_first_commit(
     assert git_state(plain) is None
 
 
+def test_git_state_is_none_when_git_hangs(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    def hung(*args: object, **kwargs: object) -> subprocess.CompletedProcess[str]:
+        raise subprocess.TimeoutExpired(cmd="git", timeout=60)
+
+    monkeypatch.setattr(subprocess, "run", hung)
+
+    assert git_state(tmp_path) is None
+
+
 def test_git_state_is_none_without_git(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
     monkeypatch.setattr(shutil, "which", lambda name: None)
 
@@ -314,10 +343,11 @@ def test_machine_info_describes_this_machine() -> None:
 
     assert info.hostname == socket.gethostname()
     assert info.os == platform.platform()
-    assert info.cpu_count == os.cpu_count()
+    assert info.cpu_count == (os.cpu_count() or 0)
     assert info.python_version == platform.python_version()
-    assert info.memory_bytes > 0
-    assert info.cpu_model
+    # What the platform reports, if anything: /proc/cpuinfo and sysconf are not everywhere.
+    assert info.cpu_model == manifest.cpu_model()
+    assert info.memory_bytes >= 0
 
 
 @pytest.mark.parametrize("sysconf", [ValueError("unknown name"), OSError("unsupported"), -1])
