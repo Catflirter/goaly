@@ -3,7 +3,13 @@
 import json
 from collections.abc import Sequence
 
-from goaly.contracts.gen.experiment_pb2 import DecisionThresholds, Lane, PhaseResult
+from goaly.contracts.gen.experiment_pb2 import (
+    DecisionThresholds,
+    Guard,
+    GuardResult,
+    Lane,
+    PhaseResult,
+)
 from goaly.contracts.gen.manifest_pb2 import RunManifest
 from goaly.contracts.gen.task_pb2 import Prediction
 from goaly.contracts.gen.trajectory_pb2 import (
@@ -217,3 +223,17 @@ def test_a_manifest_records_the_environment_settings_that_can_change_results() -
     assert json.loads(line)["environment_settings"] == settings
     assert from_json_line(line, RunManifest) == manifest
     assert json.loads(to_json_line(RunManifest()))["environment_settings"] == {}
+
+
+# The RSI ledger: experiments, lane events and lessons (spec §8.2, §8.5-§8.8).
+
+
+def test_a_guard_result_names_the_pack_code_allowlist() -> None:
+    result = GuardResult(
+        guard=Guard.GUARD_PACK_CODE_ALLOWLIST, passed=False, detail="policy.py:3: import os"
+    )
+
+    line = to_json_line(result)
+
+    assert json.loads(line)["guard"] == "GUARD_PACK_CODE_ALLOWLIST"
+    assert from_json_line(line, GuardResult) == result

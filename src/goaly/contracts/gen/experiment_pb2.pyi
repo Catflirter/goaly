@@ -129,9 +129,19 @@ class _GuardEnumTypeWrapper(_enum_type_wrapper._EnumTypeWrapper[_Guard.ValueType
     """The bench/, harness/core/ and contracts/ checksums are unchanged."""
     GUARD_HARD_CODING_SCAN: _Guard.ValueType  # 3
     """The hard-coding scan finds nothing task-specific in the diff (spec §8.5). For Effi-SQL it
-    rejects any fragment of a gold optimized_sql 40 or more characters long after
-    normalization, and pack changes that embed large literal lists. For SWE (on hold) it also
-    rejects any instance_id from any split.
+    scans only gold-only windows: windows of any split's gold optimized_sql, 40 or more
+    characters long after normalization, that occur in no base_sql and not in the schema DDL.
+    It also rejects pack changes that embed large literal lists, above a size set in config.
+    For SWE (on hold) it rejects any fragment of a gold patch 40 or more characters long after
+    normalization, and any instance_id from any split.
+    """
+    GUARD_PACK_CODE_ALLOWLIST: _Guard.ValueType  # 5
+    """The static AST allowlist passes on the candidate's pack code, which runs on the host during
+    smoke tests, screening and validation (spec §8.5). Imports may come only from
+    goaly.contracts, goaly.harness.core, pydantic and pure stdlib modules, such as json, re and
+    typing. The builtins open, eval, exec, compile and __import__ are banned; so are the modules
+    importlib, subprocess, os, sys, socket, pathlib, shutil and ctypes, and attribute access to
+    dunder internals.
     """
     GUARD_UNIT_TESTS: _Guard.ValueType  # 4
     """The pack's unit tests pass."""
@@ -147,9 +157,19 @@ GUARD_CHECKSUMS: Guard.ValueType  # 2
 """The bench/, harness/core/ and contracts/ checksums are unchanged."""
 GUARD_HARD_CODING_SCAN: Guard.ValueType  # 3
 """The hard-coding scan finds nothing task-specific in the diff (spec §8.5). For Effi-SQL it
-rejects any fragment of a gold optimized_sql 40 or more characters long after
-normalization, and pack changes that embed large literal lists. For SWE (on hold) it also
-rejects any instance_id from any split.
+scans only gold-only windows: windows of any split's gold optimized_sql, 40 or more
+characters long after normalization, that occur in no base_sql and not in the schema DDL.
+It also rejects pack changes that embed large literal lists, above a size set in config.
+For SWE (on hold) it rejects any fragment of a gold patch 40 or more characters long after
+normalization, and any instance_id from any split.
+"""
+GUARD_PACK_CODE_ALLOWLIST: Guard.ValueType  # 5
+"""The static AST allowlist passes on the candidate's pack code, which runs on the host during
+smoke tests, screening and validation (spec §8.5). Imports may come only from
+goaly.contracts, goaly.harness.core, pydantic and pure stdlib modules, such as json, re and
+typing. The builtins open, eval, exec, compile and __import__ are banned; so are the modules
+importlib, subprocess, os, sys, socket, pathlib, shutil and ctypes, and attribute access to
+dunder internals.
 """
 GUARD_UNIT_TESTS: Guard.ValueType  # 4
 """The pack's unit tests pass."""
