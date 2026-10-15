@@ -209,6 +209,12 @@ def test_an_agent_file_without_the_agent_password_is_refused(tmp_path: Path) -> 
     assert "do-not-echo" not in str(caught.value)
 
 
+def test_the_agent_file_must_be_named() -> None:
+    # No default: the host's pg.env holds every password, so the solving side names its file.
+    with pytest.raises(TypeError):
+        load_agent_credentials()  # type: ignore[call-arg]
+
+
 def test_agent_credentials_ignore_the_environment(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
