@@ -1,6 +1,7 @@
 """Tests for goaly.bench.effisql.evaluate, T21's evaluator seam, with a fake host command."""
 
 import asyncio
+import json
 import logging
 import subprocess
 import sys
@@ -10,20 +11,39 @@ from pathlib import Path
 
 import pytest
 
+from goaly.bench.effisql.data import EffiSqlInstance
 from goaly.bench.effisql.evaluate import (
     EffiSqlEvaluator,
     TaskBudget,
     _run_command,  # The child's lifetime, tested directly.
+    infra_failed,
     make_evaluator,
 )
-from goaly.bench.effisql.grading_pool import Priority
+from goaly.bench.effisql.grading_pool import GRADING_INSTANCES, Priority
+from goaly.bench.effisql.grading_service import EffiSqlGrader
 from goaly.contracts.gen.llm_call_pb2 import LlmCallRecord, Usage
 from goaly.contracts.gen.manifest_pb2 import RunManifest
-from goaly.contracts.gen.result_pb2 import TaskResult
-from goaly.contracts.gen.task_pb2 import SPLIT_TRAIN, SPLIT_VAL, Grade, Split
+from goaly.contracts.gen.result_pb2 import (
+    TASK_ERROR_TYPE_ENVIRONMENT,
+    TASK_ERROR_TYPE_LLM,
+    TASK_ERROR_TYPE_NONE,
+    TASK_ERROR_TYPE_POLICY_CRASH,
+    TaskErrorType,
+    TaskResult,
+)
+from goaly.contracts.gen.task_pb2 import (
+    GRADE_STATUS_GRADED,
+    GRADE_STATUS_GRADER_ERROR,
+    SPLIT_TRAIN,
+    SPLIT_VAL,
+    Grade,
+    GradeStatus,
+    Split,
+)
 from goaly.contracts.gen.trajectory_pb2 import Trajectory
 from goaly.contracts.jsonl import to_json_line
 from goaly.harness.core.manifest import content_hash, write_manifest
+from tests.bench.effisql.synthetic import task
 
 pytestmark = pytest.mark.anyio
 
@@ -109,8 +129,13 @@ class FakeHost:
     """The host command: it writes the run's results and the proxy's records."""
 
     def __init__(
-        self, results: Sequence[TaskResult], calls: Sequence[LlmCallRecord], status: int = 0
+        self,
+        results: Sequence[TaskResult],
+        calls: Sequence[LlmCallRecord],
+        status: int = 0,
+        usage: dict[str, float] | None = None,
     ):
+        self.usage = usage
         self.results = results
         self.calls = calls
         self.status = status
@@ -128,6 +153,8 @@ class FakeHost:
         out.mkdir(parents=True, exist_ok=True)
         (out / "results.jsonl").write_text("".join(to_json_line(r) + "\n" for r in self.results))
         (out / "llm_calls.jsonl").write_text("".join(to_json_line(c) + "\n" for c in self.calls))
+        if self.usage is not None:
+            (out / "usage.json").write_text(json.dumps({"proxy_total": self.usage}))
         return self.status, "host output"
 
 
@@ -305,7 +332,7 @@ async def test_a_cached_task_brings_its_stored_host_numbers(repo: Path, tmp_path
     stats = evaluation.stats
     assert stats.mean_tokens == 200.0  # (300 from the proxy + 100 stored) / 2
     assert stats.mean_cost_usd == pytest.approx(0.02)
-    assert evaluation.infra_failed is None
+    assert evaluation.infra_failed == frozenset()  # The host saw no infrastructure failure.
 
 
 async def test_a_cancelled_evaluation_stops_its_host_command(tmp_path: Path) -> None:
@@ -318,3 +345,77 @@ async def test_a_cancelled_evaluation_stops_its_host_command(tmp_path: Path) -> 
     running.cancel()
     with pytest.raises(asyncio.CancelledError):
         await running
+
+
+async def test_the_proxy_totals_come_from_usage_json(repo: Path, tmp_path: Path) -> None:
+    commit, tree = head(repo)
+    usage = {"input_tokens": 900, "output_tokens": 100, "reasoning_tokens": 50, "cost_usd": 0.5}
+    host = FakeHost([result("1", 0, 300, 0.03, 30)], [tagged("1", 300, 0.03)], usage=usage)
+
+    evaluation = await evaluator(repo, tmp_path, host).evaluate(
+        Request(commit, tree, SPLIT_TRAIN, ("1",), (0,), "run-1")
+    )
+
+    assert evaluation.stats.mean_tokens == 1000.0  # The proxy's total, not the call log's.
+    assert evaluation.stats.mean_cost_usd == pytest.approx(0.5)
+
+
+def test_infra_failures_are_the_hosts_infrastructure_errors() -> None:
+    def failed(
+        instance_id: str,
+        error: TaskErrorType.ValueType,
+        status: GradeStatus.ValueType = GRADE_STATUS_GRADED,
+    ) -> TaskResult:
+        return TaskResult(
+            instance_id=instance_id, seed=0, error_type=error, grade=Grade(status=status)
+        )
+
+    results = [
+        failed("1", TASK_ERROR_TYPE_LLM),
+        failed("2", TASK_ERROR_TYPE_ENVIRONMENT),
+        failed("3", TASK_ERROR_TYPE_NONE, GRADE_STATUS_GRADER_ERROR),
+        failed("4", TASK_ERROR_TYPE_POLICY_CRASH),
+        failed("5", TASK_ERROR_TYPE_NONE),
+    ]
+
+    assert infra_failed(results) == {("1", 0), ("2", 0), ("3", 0)}
+
+
+async def test_a_probe_makes_a_grader_and_closes_it(
+    repo: Path, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    made: list[FakeProbeGrader] = []
+
+    def on_instances(instances: object, *, cache_root: Path) -> FakeProbeGrader:
+        made.append(FakeProbeGrader(instances))
+        return made[-1]
+
+    monkeypatch.setattr(EffiSqlGrader, "on_instances", on_instances)
+    grader = evaluator(repo, tmp_path, FakeHost([], [])).grader
+    inst = EffiSqlInstance.model_validate(task(id=5))
+    instance = GRADING_INSTANCES[1]
+
+    tau = await grader.identity_probe(inst, instance=instance, priority=Priority.SMOKE)
+
+    assert tau == 1.01
+    assert [(g.instances, g.probed, g.closed) for g in made] == [
+        ((instance,), [("5", instance, Priority.SMOKE)], True)
+    ]
+    assert grader.identity_reference(inst) is None  # No base cache here; no grader started.
+    assert len(made) == 1
+
+
+class FakeProbeGrader:
+    def __init__(self, instances: object) -> None:
+        self.instances = instances
+        self.probed: list[tuple[str, object, object]] = []
+        self.closed = False
+
+    async def identity_probe(
+        self, inst: EffiSqlInstance, *, instance: object, priority: object
+    ) -> float:
+        self.probed.append((inst.instance_id, instance, priority))
+        return 1.01
+
+    def close(self) -> None:
+        self.closed = True
