@@ -426,7 +426,7 @@ The first option costs more tokens, although the gateway's prefix cache absorbs 
 ### 5.4 Baseline v0 (the "simple tools" setup the PDF asks for)
 
 - Effi-SQL has two tools:
-  - `execute_sql` runs a query on a solving instance, with a 120 s timeout, and returns truncated rows or the error. It reports the execution time and, separately, the time the statement waited in the instance's queue (§6.2).
+  - `execute_sql` runs a query on a solving instance, with a 120 s timeout plus an executor backstop at the task's wall budget, 600 s for v0, and returns truncated rows or the error. It reports the execution time and, separately, the time the statement waited in the instance's queue (§6.2).
   - `submit` hands in the answer.
 
   The prompt is minimal. It states that the rewritten query must compute its result from the tables and return the same result as `base_sql` on any data, so embedding result values makes it invalid (§4.1).
@@ -532,7 +532,7 @@ In the RSI phase a lane's GLM share covers its analyst, its implementers and its
 - **Grading time per candidate** (dev mode, §4.1). A prediction costs one comparison run, up to 3 timed runs and the robustness check on the alternate database. From the dataset's timings, leaving out the 5 tasks over 300 s, that is about 55 s per task at gold speed and about 110 s at τ ≈ 1; an identity submission costs nothing. On the 3 grading instances, screening a candidate (20 tasks) takes about 6–12 minutes and validating it (30 tasks) about 9–18 minutes. A round of 3 candidates spends about 40–110 minutes on grading, depending on how many reach validation.
 - **Official mode** times both sides with no cache: about 2.5–3.5 minutes per task, so a 60-task held-out run takes about 55–70 minutes on 3 instances. v0's single held-out run therefore takes about an hour of grading.
 - **One-time setup.** The base cache, the identity τ, the alternate-database signatures, the gold check and the exclusions take about 14 instance-hours: about 3 hours on all 5 instances.
-- **Rounds.** An Effi-SQL round takes about 1.5–3 hours end to end: analysis and implementation, then screening, validation and one confirmation rerun, with solving and grading overlapping. The schedule (§13) plans 1 round, with a second as upside, and gives the conditions for each.
+- **Rounds.** An Effi-SQL round takes about 85–190 minutes end to end, the fast and slow cases of §13: analysis and implementation, then screening, validation and one confirmation rerun, with solving and grading overlapping. The schedule (§13) plans 1 round, with a second as upside, and gives the conditions for each.
 - These figures are estimates from the file's timings, which come from the authors' hardware and partly from SF10 (§4.1), so they lean high. T10 and T12 measure the real times on this machine, and these numbers will be updated from those measurements.
 - **SWE (on hold, 2026-10-15).** The SWE lane is limited by CPU and evaluation, not by the gateway. An SWE round takes about 2.5 hours. Solving runs on 8 slots and is capped at 45 minutes per task; evaluation runs on 4 workers. That allows 3–4 rounds overnight. Config can fit in more rounds by using one candidate per round or by capping solving at 30 minutes. The SWE figures are estimates. T14 and T15 measure actual solving and evaluation times, and these numbers will be updated from those measurements.
 
@@ -542,7 +542,7 @@ In the RSI phase a lane's GLM share covers its analyst, its implementers and its
 |---|---|---|---|---|
 | Setup and exclusions (T10) | When T09 and T10 land | All 5: nothing solves before T12, so the solving instances grade too | First | About 14 instance-hours, about 3 h |
 | v0's dev runs: train with 1 seed, val with 2 (T12) | When T11 lands | 3 | First: RSI starts from these results | Up to about 6 instance-hours; identity submissions are free |
-| v0's official held-out run, 1 seed (T12) | As soon as v0's dev runs are done | 3 | Ahead of the lane, because the final comparison needs it | About 3–3.5 instance-hours, about 1–1.2 h |
+| v0's official held-out run, 1 seed (T12) | As soon as v0's dev runs are done | 3 | Ahead of the lane, because the final comparison needs it | About 2.5–3.5 instance-hours, about 1–1.2 h |
 | RSI rounds (T22) | 16:00 | What v0's held-out run leaves, then all 3 | After v0's held-out run | About 2–5 instance-hours per round |
 | Final: held-out 3 times in official mode, val 3 times in dev mode (T23) | At the freeze | 3 while final solving runs, then all 5 | The only phase | About 10–14 instance-hours, about 2.5–3.5 h |
 
@@ -593,7 +593,7 @@ Each PostgreSQL instance is pinned with cpuset to both SMT siblings of its physi
 ### 6.3 Metrics
 
 - Main metric: Effi-SQL R-VES. Coverage@2x and GMS are secondary (§4.1). Each is reported twice: as the official evaluator computes it, and checked, with flagged hard-coded predictions given no credit (§4.1). RSI decides on the checked numbers. SWE (on hold, 2026-10-15): harmonic-mean SR.
-- With several seeds, we report mean ± standard deviation and bootstrap 95% confidence intervals.
+- With several seeds, we report mean ± standard deviation and bootstrap 95% confidence intervals. v0's single held-out run gets a bootstrap 95% confidence interval over tasks, and the improvement from v0 to the final gets a paired bootstrap over tasks.
 - Two versions are compared task by task, on per-task credit for Effi-SQL. We count the tasks each version wins and run a one-sided sign test. SWE uses a paired bootstrap.
 - An Effi-SQL task counts as solved when its credit is at least 0.75 (matched, with τ ≥ 1.2), the bar the regression rule uses (§8.3). Any other task is a failure. The stably solved set is the tasks with credit ≥ 0.75 in every seed.
 - Results are broken down by difficulty, and for SWE by repository.
@@ -851,7 +851,7 @@ The implementer is mini-swe-agent's `DefaultAgent` (`mini-swe-agent==2.4.6`, MIT
   - once final solving finishes, the 2 solving instances are converted into grading instances, so final grading uses all 5 (§6.2);
   - v0's held-out run, 1 seed in official mode, was already done during the baseline phase. The project lead decided on 1 seed (2026-10-15) to free grading time for RSI. v0 and the final are compared in the same mode, and the final's 3 runs meet the 3-run requirement (§2).
 - **The report includes:**
-  - starting score, final score and the improvement, with confidence intervals, for both the official and the checked R-VES (§4.1). The final's score is the mean ± standard deviation of its 3 held-out runs; v0's is its single run;
+  - starting score, final score and the improvement, with confidence intervals, for both the official and the checked R-VES (§4.1). The final's score is the mean ± standard deviation of its 3 held-out runs. v0's is its single run, with a bootstrap 95% confidence interval over tasks, and the improvement's interval is a paired bootstrap over tasks;
   - how much scores vary between runs: the final's 3 held-out runs, and v0's 2 val seeds in dev mode, since v0 has only 1 held-out run;
   - results by difficulty, and by repository if SWE resumes;
   - efficiency and experiment cost;
@@ -946,7 +946,15 @@ The schedule runs from now, 2026-10-15 03:00 UTC, to the deadline, 2026-10-16 00
 | 20:00–23:30 | T23: the freeze, then final solving and grading on all 5 instances, about 2.5–3.5 h in all. A 3.5 h final leaves no time for the report afterwards, so the report is drafted while the final runs |
 | 23:30–00:00 | The final numbers go into the report; T24; buffer before the deadline |
 
-**RSI rounds.** The hours freed by v0's single held-out run support 1 round, with a second as upside, but not more. These end times assume the lane starts at 16:00 and use the estimates in §6.2. The fast case assumes 4-minute tasks, 55 s of dev grading per task, 1 candidate reaching validation and 20 minutes of analysis and implementation; the slow case 8 minutes, 107 s, 2 candidates and 40 minutes.
+**RSI rounds.** The hours freed by v0's single held-out run support 1 round, with a second as upside, but not more. **Target: T11 lands by about 13:30.**
+
+The end times below make three assumptions:
+
+- the setup has finished when T11 lands, which needs T10 by about 09:30;
+- the lane starts at 16:00;
+- the estimates in §6.2 hold.
+
+The fast case assumes 4-minute tasks, 55 s of dev grading per task, 1 candidate reaching validation, and 20 minutes of analysis and implementation. The slow case assumes 8 minutes, 107 s, 2 candidates and 40 minutes. A round then takes about 85 minutes in the fast case and about 190 in the slow case.
 
 | T11 lands | v0's held-out run ends | Round 1 ends | Round 2 ends |
 |---|---|---|---|
@@ -957,6 +965,7 @@ The schedule runs from now, 2026-10-15 03:00 UTC, to the deadline, 2026-10-16 00
 - Round 1 finishes before the 20:00 freeze if T11 lands by about 13:30. If T11 lands at 14:30 and the rounds are slow, round 1 ends just after the freeze.
 - A second round fits only when the rounds run at the fast end, whenever T11 lands. At the slow end, round 2 ends after 22:00.
 - If the lane starts after 16:00, every time shifts by the delay. No round may then finish, and the §12 risk "RSI completes no round before the freeze" applies.
+- The freeze does not wait for a round that is still running. That round is reported as incomplete, and the best stays as it was before it.
 
 The project lead's review latency is budgeted. PRs stack, so no slot waits for a review, and the 14:30–16:00 slot leaves time to review the code the lane runs on before it starts.
 
