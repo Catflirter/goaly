@@ -18,7 +18,7 @@ import sys
 from collections.abc import Sequence
 from pathlib import Path
 
-from goaly.bench.effisql.data import DATASET_FILE, default_cache_dir
+from goaly.bench.effisql.data import DATASET_FILE, DatasetError, default_cache_dir
 from goaly.bench.effisql.report import BOOTSTRAP_SEED, ROLES, ReportInputs, render
 from goaly.bench.effisql.report_inputs import (
     RunDirError,
@@ -57,7 +57,7 @@ def main(argv: Sequence[str] | None = None) -> int:
         )
         template = None if args.template is None else args.template.read_text(encoding="utf-8")
         report = render(inputs, template)
-    except (OSError, RunDirError, ValueError) as error:
+    except (DatasetError, OSError, RunDirError, ValueError) as error:
         sys.stderr.write(f"error: {error}\n")
         return 1
     if args.out is None:

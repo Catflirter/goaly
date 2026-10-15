@@ -60,3 +60,13 @@ def test_reports_a_run_still_grading_only_when_allowed(
 
     assert final_report.main([*args, "--allow-partial"]) == 0
     assert "partial: 1 not yet" in capsys.readouterr().out
+
+
+def test_says_what_is_wrong_with_a_task_file(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    bad = tmp_path / "plans.json"
+    bad.write_text('{"1": "a plan"}\n', encoding="utf-8")
+
+    assert final_report.main(["--ledger", str(tmp_path), "--tasks", str(bad)]) == 1
+    assert f"error: {bad}:1:" in capsys.readouterr().err
