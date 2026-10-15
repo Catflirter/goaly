@@ -11,7 +11,9 @@ enum Split {
   SPLIT_UNSPECIFIED = 0;
   // The analyst may see its trajectories, grader feedback and gold answers.
   SPLIT_TRAIN = 1;
-  // Its results go to the decision step and to the final report; the analyst never sees them.
+  // Its results go to the decision step and to the final report. The analyst never sees its
+  // per-task results or its trajectories, only each experiment's decision and aggregate result
+  // (spec §7).
   SPLIT_VAL = 2;
   // Used only for baseline v0's runs and for the final runs.
   SPLIT_HELDOUT = 3;

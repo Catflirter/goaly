@@ -33,7 +33,10 @@ class _SplitEnumTypeWrapper(_enum_type_wrapper._EnumTypeWrapper[_Split.ValueType
     SPLIT_TRAIN: _Split.ValueType  # 1
     """The analyst may see its trajectories, grader feedback and gold answers."""
     SPLIT_VAL: _Split.ValueType  # 2
-    """Its results go to the decision step and to the final report; the analyst never sees them."""
+    """Its results go to the decision step and to the final report. The analyst never sees its
+    per-task results or its trajectories, only each experiment's decision and aggregate result
+    (spec §7).
+    """
     SPLIT_HELDOUT: _Split.ValueType  # 3
     """Used only for baseline v0's runs and for the final runs."""
     SPLIT_EXTERNAL: _Split.ValueType  # 4
@@ -47,7 +50,10 @@ SPLIT_UNSPECIFIED: Split.ValueType  # 0
 SPLIT_TRAIN: Split.ValueType  # 1
 """The analyst may see its trajectories, grader feedback and gold answers."""
 SPLIT_VAL: Split.ValueType  # 2
-"""Its results go to the decision step and to the final report; the analyst never sees them."""
+"""Its results go to the decision step and to the final report. The analyst never sees its
+per-task results or its trajectories, only each experiment's decision and aggregate result
+(spec §7).
+"""
 SPLIT_HELDOUT: Split.ValueType  # 3
 """Used only for baseline v0's runs and for the final runs."""
 SPLIT_EXTERNAL: Split.ValueType  # 4
