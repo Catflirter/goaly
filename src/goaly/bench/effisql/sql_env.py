@@ -47,11 +47,14 @@ runs past its timeout is stopped from the client:
 2. if it still runs after a grace period, the pool ends its backend from another agent session
    (``pg_terminate_backend``, matching the backend's PID and start time), and the next
    statement opens a new session;
-3. if even that fails, the statement is abandoned: its socket is closed, and its backend may
-   run on, outside the cap, until it next writes to the socket.
+3. if even that fails, the statement is abandoned: its socket is closed. Its backend then
+   runs on outside the cap until the server notices: the agent role's sessions check their
+   client every 5 s (client_connection_check_interval) and stop any statement at 130 s
+   (statement_timeout), backstops a statement cannot lift for itself once it runs.
 
-A cancelled ``execute`` stops its statement the same way before CancelledError propagates.
-A cancel or terminate that fails is logged at WARNING with its cause, an abandon at ERROR.
+A cancelled ``execute``, and ``close()`` with a statement in flight, stop the statement the
+same way, within the grace periods, before they return or CancelledError propagates. A cancel
+or terminate that fails is logged at WARNING with its cause, an abandon at ERROR.
 
 Other sessions. Every task shares the agent role, and PostgreSQL shows a role the query text of
 its own sessions. So the instances revoke pg_stat_activity and the functions behind it from
@@ -84,7 +87,13 @@ from psycopg.sql import SQL, Identifier, Literal
 from psycopg.waiting import Wait
 from pydantic import BaseModel, ConfigDict, Field
 
-from goaly.bench.effisql.pg_instances import ROLE_DEFAULTS, SOLVING, TERMINATE_FUNCTION, Instance
+from goaly.bench.effisql.pg_instances import (
+    AGENT_STATEMENT_TIMEOUT_S,
+    ROLE_DEFAULTS,
+    SOLVING,
+    TERMINATE_FUNCTION,
+    Instance,
+)
 from goaly.bench.effisql.pg_settings import (
     AGENT_ROLE,
     MAIN_DB,
@@ -131,11 +140,12 @@ _ABANDON_WAIT_S = 15.0  # psycopg's own cleanup of a cancelled wait takes up to 
 _NO_COPY_OUT = "COPY to the client is not supported here; run a SELECT instead"
 _NO_COPY_IN = b"COPY from the client is not supported here"
 
+# Its parameters: the terminate function, then the names of the role defaults to read.
 _PREFLIGHT_SQL = (
-    "SELECT current_setting('default_transaction_read_only'), "
-    "current_setting('temp_file_limit'), "
-    "has_table_privilege('public.lineitem', 'SELECT'), "
-    f"has_function_privilege('{TERMINATE_FUNCTION}', 'EXECUTE')"
+    "SELECT has_table_privilege('public.lineitem', 'SELECT'), "
+    "has_function_privilege(%s::text, 'EXECUTE'), "
+    "ARRAY(SELECT current_setting(name) FROM unnest(%s::text[]) WITH ORDINALITY AS s(name, i) "
+    "ORDER BY i)"
 )
 _ROLE_SETTINGS_SQL = (
     "SELECT d.datname, s.setconfig FROM pg_db_role_setting s "
@@ -152,9 +162,9 @@ _TERMINATE_SQL = (
     "pg_stat_get_backend_start(id) AS started FROM pg_stat_get_backend_idset() AS id) AS b "
     "WHERE pid = %s AND started = %s"
 )
-# The role defaults the agent role may set itself. temp_file_limit is superuser-only: the
-# agent's RESET ALL leaves it, and only setup can restore it.
-_SELF_SETTABLE = frozenset({"default_transaction_read_only"})
+# The role defaults only a superuser may set: the agent's RESET ALL leaves them, and only
+# setup can restore them. The agent role restores every other one itself.
+_SUPERUSER_ONLY = frozenset({"temp_file_limit"})
 
 
 class SqlEnvOptions(BaseModel):
@@ -163,8 +173,9 @@ class SqlEnvOptions(BaseModel):
 
     model_config = ConfigDict(frozen=True, extra="forbid")
 
-    # The longest a statement may run: a call's default, and the cap on what it asks for.
-    timeout_s: float = Field(default=120.0, gt=0, allow_inf_nan=False)
+    # The longest a statement may run: a call's default, and the cap on what it asks for. It
+    # stays below the agent role's server-side statement_timeout, the backstop behind it.
+    timeout_s: float = Field(default=120.0, gt=0, lt=AGENT_STATEMENT_TIMEOUT_S, allow_inf_nan=False)
     row_limit: int = Field(default=100, ge=0)  # Rows the agent sees; row_count counts them all.
     statement_cap: int = Field(default=2, ge=1)  # Statements in flight per solving instance.
     cancel_grace_s: float = Field(default=5.0, gt=0, allow_inf_nan=False)  # Per stop step.
@@ -646,7 +657,7 @@ async def _restore_role_defaults(
                 )
         await conn.execute("ALTER ROLE CURRENT_USER RESET ALL")
         for setting, value in ROLE_DEFAULTS[AGENT_ROLE].items():
-            if setting in _SELF_SETTABLE:
+            if setting not in _SUPERUSER_ONLY:
                 await conn.execute(
                     SQL("ALTER ROLE CURRENT_USER SET {} = {}").format(
                         Identifier(setting), Literal(value)
@@ -730,11 +741,12 @@ class SolvingPool:
     async def preflight(self) -> None:
         """Check every solving instance before a run, and fail fast if one is not ready.
 
-        The agent role must log in, get read-only transactions and its temp-file cap by default,
-        read the TPC-H tables, and be able to end its own sessions, which stopping a stuck
-        statement needs. Raise EnvironmentFailure naming every problem found.
+        The agent role must log in, start with the setup's defaults (read-only transactions,
+        its temp-file cap and its timeout backstops), read the TPC-H tables, and be able to end
+        its own sessions, which stopping a stuck statement needs. Raise EnvironmentFailure
+        naming every problem found.
         """
-        temp_file_limit = ROLE_DEFAULTS[AGENT_ROLE]["temp_file_limit"]
+        defaults = ROLE_DEFAULTS[AGENT_ROLE]
         problems: list[str] = []
         for slot in self._slots:
             name = f"{slot.instance.name} (port {slot.instance.port})"
@@ -744,22 +756,18 @@ class SolvingPool:
                 problems.append(f"{name}: the agent role cannot log in: {error}")
                 continue
             try:
-                row = await (await conn.execute(_PREFLIGHT_SQL)).fetchone()
+                cursor = await conn.execute(_PREFLIGHT_SQL, [TERMINATE_FUNCTION, list(defaults)])
+                row = await cursor.fetchone()
             except psycopg.Error as error:
                 problems.append(f"{name}: the agent's session failed: {error}")
             else:
-                read_only, temp_limit, can_read, can_end = (
-                    row if row is not None else (None, None, False, False)
-                )
-                if read_only != "on":
-                    problems.append(
-                        f"{name}: the agent's transactions are not read-only by default"
-                    )
-                if temp_limit != temp_file_limit:
-                    problems.append(
-                        f"{name}: the agent's temp_file_limit is {temp_limit}, "
-                        f"not {temp_file_limit}"
-                    )
+                can_read, can_end, settings = row if row is not None else (False, False, [])
+                found = dict(zip(defaults, settings or [], strict=False))
+                problems += [
+                    f"{name}: the agent's {setting} is {found.get(setting)}, not {wanted}"
+                    for setting, wanted in defaults.items()
+                    if found.get(setting) != wanted
+                ]
                 if not can_read:
                     problems.append(f"{name}: the agent role cannot read the TPC-H tables")
                 if not can_end:

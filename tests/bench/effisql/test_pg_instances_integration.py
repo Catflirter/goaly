@@ -174,6 +174,19 @@ def test_only_the_agent_may_end_sessions_and_only_its_own_roles(pg_env: PgEnv) -
         assert grader.execute("SELECT 1").fetchone() == (1,)
 
 
+def test_agent_sessions_start_with_the_server_side_backstops(pg_env: PgEnv) -> None:
+    solving = pg_env.instance("solving")
+    with pg_env.connect(solving, AGENT_ROLE, "tpch", autocommit=True) as agent:
+        settings = agent.execute(
+            "SELECT current_setting('statement_timeout'), "
+            "current_setting('client_connection_check_interval'), "
+            "current_setting('temp_file_limit'), "
+            "current_setting('default_transaction_read_only')"
+        ).fetchone()
+
+    assert settings == ("130s", "5s", "5GB", "on")
+
+
 def test_the_grader_reads_both_databases_read_only_by_default(pg_env: PgEnv) -> None:
     grading = pg_env.instance("grading")
     for db in ("tpch", "tpch_alt"):
