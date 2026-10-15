@@ -36,7 +36,12 @@ from pathlib import Path
 from typing import IO, TYPE_CHECKING, Any, Protocol, Self
 
 from goaly.bench.effisql.data import EffiSqlInstance
-from goaly.bench.effisql.grader import GraderError, TimingError, time_interleaved
+from goaly.bench.effisql.grader import (
+    STATEMENT_TIMEOUT_S,
+    GraderError,
+    TimingError,
+    time_interleaved,
+)
 from goaly.bench.effisql.grading import (
     BaseCache,
     GradingSlot,
@@ -225,11 +230,14 @@ class ProcessRunner:
         _log.error("grading worker died", extra={"instance": self.instance.name})
         self._executor.shutdown(wait=False, cancel_futures=True)
         self._start()
-        # The dead worker's statement ends by the server's statement_timeout. Hold the instance
-        # back after repeated deaths, so this runner does not win every lease and fail it.
+        # The dead worker's statement keeps running until the server's statement_timeout ends
+        # it, and the grader's role may not cancel it: hold the instance back that long, so it
+        # never disturbs the next evaluation's timing. After repeated deaths, hold it back
+        # longer, so this runner does not win every lease and fail it.
+        pause = STATEMENT_TIMEOUT_S
         if self._deaths >= _BACKOFF_AFTER:
-            pause = min(_BACKOFF_STEP_S * (self._deaths - _BACKOFF_AFTER + 1), _BACKOFF_MAX_S)
-            await asyncio.sleep(pause)
+            pause += min(_BACKOFF_STEP_S * (self._deaths - _BACKOFF_AFTER + 1), _BACKOFF_MAX_S)
+        await asyncio.sleep(pause)
 
     def close(self) -> None:
         """Stop the worker, waiting a bounded time for it, then release the instance's lock.
@@ -306,12 +314,17 @@ def probe_identity(slot: GradingSlot, inst: EffiSqlInstance) -> float:
 
 
 def grade_on_slot(
-    slot: GradingSlot, inst: EffiSqlInstance, sql: str | None, mode: Mode, cache: BaseCache | None
+    slot: GradingSlot,
+    inst: EffiSqlInstance,
+    sql: str | None,
+    mode: Mode,
+    cache: BaseCache | None,
+    final_attempt: bool = True,
 ) -> tuple[Grade, dict[str, Any] | None]:
     """Grade on ``slot``: the work a runner runs for :meth:`EffiSqlGrader.grade`. Return the
     grade and the prediction's plan document, or None if no plan was taken."""
     plans: list[dict[str, Any]] = []
-    grade = slot.evaluate(inst, sql, mode, cache, plans)
+    grade = slot.evaluate(inst, sql, mode, cache, plans, final_attempt)
     return grade, plans[-1] if plans else None
 
 
@@ -387,9 +400,16 @@ class EffiSqlGrader:
             if quick is not None:
                 return quick
             for attempt in range(1, _GRADER_ERROR_ATTEMPTS + 1):
-                async with self._pool.lease(priority) as runner:
-                    grade, plan = await runner.call(grade_on_slot, inst, sql, mode, cache)
-                if grade.status != GRADE_STATUS_GRADER_ERROR or attempt == _GRADER_ERROR_ATTEMPTS:
+                final = attempt == _GRADER_ERROR_ATTEMPTS
+                plan = None
+                try:
+                    async with self._pool.lease(priority) as runner:
+                        grade, plan = await runner.call(
+                            grade_on_slot, inst, sql, mode, cache, final
+                        )
+                except GraderError as error:  # A worker died: retried like a returned failure.
+                    grade = grader_error(inst, f"grader: {error}")
+                if grade.status != GRADE_STATUS_GRADER_ERROR or final:
                     if on_plan is not None and plan is not None:
                         _report_plan(on_plan, inst.instance_id, plan)
                     return grade
