@@ -517,3 +517,28 @@ class TestReviewFixes:
         assert grade.status == GRADE_STATUS_GRADED
         assert grade.effisql.matched
         assert not grade.effisql.literal_result
+
+
+def test_evaluate_hands_out_the_plan_it_took(cache: BaseCache) -> None:
+    plans: list[dict[str, Any]] = []
+    evaluate(
+        sessions(main_session(), alt_session()),
+        INST,
+        PRED,
+        Mode.DEV,
+        cache=cache,
+        rng=random.Random(0),  # noqa: S311  # Reproducible order.
+        plans=plans,
+    )
+    assert plans == [plan("lineitem")]
+    nothing: list[dict[str, Any]] = []
+    evaluate(
+        sessions(main_session(), alt_session()),
+        INST,
+        "",
+        Mode.DEV,
+        cache=cache,
+        rng=random.Random(0),  # noqa: S311  # Reproducible order.
+        plans=nothing,
+    )
+    assert nothing == []
