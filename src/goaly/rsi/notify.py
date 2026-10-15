@@ -10,10 +10,13 @@ queues, and a worker thread delivers. Each attempt is written to the lane's even
 (``lane_events.jsonl``) as a LaneEvent: NOTIFIED once delivered, NOTIFY_FAILED for each failed
 attempt, both carrying the notification's ID, so a failure is tied to its later delivery. A
 failed delivery is retried after 10 s, 30 s, 1, 2 and 5 minutes, then every 10 minutes, for as
-long as the process runs; :meth:`~QueuedNotifier.close` gives each one left a last attempt.
+long as the process runs. :meth:`~QueuedNotifier.close` attempts every queued one at once, and keeps
+retrying failures after 1, 2, 4 and 8 s while its budget lasts.
 
 A notification never carries a secret or task data. Its text is built by goaly's code from
-aggregates, and any known secret in it is replaced before it is queued, logged or sent.
+aggregates, and :func:`sanitize` replaces any known secret in it and keeps only plain words,
+before it is queued, logged or sent. :meth:`~QueuedNotifier.resume` queues again what an earlier
+process recorded as not delivered.
 
 The topic goes in the JSON body of a request to the server's root, never in a URL, so neither
 httpx's request log nor an error message can show it.
@@ -23,12 +26,13 @@ import enum
 import heapq
 import itertools
 import logging
+import re
 import secrets
 import threading
 import time
-from collections.abc import Callable, Iterable, Sequence
-from dataclasses import dataclass, field
-from datetime import UTC, datetime
+from collections.abc import Callable, Collection, Iterable, Sequence
+from dataclasses import dataclass, field, replace
+from datetime import UTC, datetime, timedelta
 from typing import Protocol
 from urllib.parse import urlsplit
 
@@ -46,6 +50,7 @@ from goaly.rsi.lanes import lane_info
 from goaly.rsi.ledger import Ledger
 
 __all__ = [
+    "CLOSE_RETRY_DELAYS_S",
     "RETRY_DELAYS_S",
     "Channel",
     "DeliveryError",
@@ -57,13 +62,20 @@ __all__ = [
     "QueuedNotifier",
     "notifier_from_settings",
     "redact",
+    "sanitize",
 ]
 
 # After the k-th failed attempt, the next comes RETRY_DELAYS_S[k - 1] later; the last repeats.
 RETRY_DELAYS_S: tuple[float, ...] = (10.0, 30.0, 60.0, 120.0, 300.0, 600.0)
+# While closing, the retries come after these, as long as close()'s budget allows.
+CLOSE_RETRY_DELAYS_S: tuple[float, ...] = (1.0, 2.0, 4.0, 8.0)
 _MAX_TEXT = 1000  # Characters; ntfy.sh accepts 4096 bytes of message.
 _MAX_DETAIL = 300
 _REDACTED = "[redacted]"
+_UNSAFE = re.compile(r"[^A-Za-z0-9 .,:;!()#/_+\-=%?&@\[\]]+")
+_SPACES = re.compile(r" {2,}")
+_OFF = "GOALY_NTFY_TOPIC is not set"
+_RESUME_WINDOW = timedelta(hours=12)
 _BREAKER_QUIET_S = 1800.0  # One breaker notification per lane in 30 minutes is enough.
 
 _logger = logging.getLogger(__name__)
@@ -87,6 +99,7 @@ _TITLES = {
     NotificationKind.TEST: "test",
 }
 _URGENT = frozenset({NotificationKind.RECOVERY_FAILED, NotificationKind.BREAKER_TRIPPED})
+_NOTIFICATION_EVENTS = frozenset({LANE_EVENT_KIND_NOTIFIED, LANE_EVENT_KIND_NOTIFY_FAILED})
 
 
 @dataclass(frozen=True)
@@ -116,7 +129,12 @@ class Notifier(Protocol):
     """What a lane and the supervisor call to notify the project lead."""
 
     def notify(self, lane: Lane.ValueType, kind: NotificationKind, text: str) -> None:
-        """Queue a notification and return at once; never raises for a delivery problem."""
+        """Queue a notification and return at once; never raises for a delivery problem.
+
+        ``text`` is built by goaly's code from counts, rules, PR numbers and links. It never
+        comes from an exception, a task, a query or a model's output: it reaches the lead's
+        phone and the next results PR. The notifier also passes it through :func:`sanitize`.
+        """
         ...
 
     def close(self, timeout_s: float = 30.0) -> None:
@@ -183,6 +201,19 @@ class FakeChannel:
             self.delivered.append(notification)
 
 
+def sanitize(text: str, secret_values: Iterable[str]) -> str:
+    """Return ``text`` fit for a notification: redacted, then cut down to plain words.
+
+    Only letters, digits, spaces and ``.,:;!()#/_+-=%?&@[]`` are kept: anything else becomes a
+    space, and a run of spaces one, so quoted SQL, a query's result or a traceback cannot pass
+    through whole. Callers still build every text from code: counts, rules, PR numbers and links,
+    never from an exception, a task, a query or a model's output.
+    """
+    text = redact(text, secret_values)
+    text = _SPACES.sub(" ", _UNSAFE.sub(" ", text)).strip()
+    return text if len(text) <= _MAX_TEXT else text[: _MAX_TEXT - 1] + "…"
+
+
 def redact(text: str, secret_values: Iterable[str]) -> str:
     """Return ``text`` with every one of ``secret_values`` and every control character replaced,
     cut to the notification limit."""
@@ -204,8 +235,10 @@ class QueuedNotifier:
     """Queues notifications and delivers them on a worker thread, recording each attempt.
 
     ``channel`` None means notifications are off, as when GOALY_NTFY_TOPIC is unset: each one is
-    then recorded once as NOTIFY_FAILED, saying so, and never retried. ``secret_values`` are
-    replaced in every text; ``now`` stamps the events and ``monotonic`` times the retries.
+    then recorded once as NOTIFY_FAILED, saying so, and never retried. ``secret_values``, or the
+    values a callable returns at each notification, are replaced in every text. ``now`` stamps
+    the events and ``monotonic`` times the retries. :meth:`close` retries failures after
+    ``close_retry_delays_s`` for as long as its budget allows.
     """
 
     def __init__(
@@ -213,23 +246,27 @@ class QueuedNotifier:
         channel: Channel | None,
         ledger: Ledger,
         *,
-        secret_values: Sequence[str] = (),
+        secret_values: Sequence[str] | Callable[[], Sequence[str]] = (),
         retry_delays_s: Sequence[float] = RETRY_DELAYS_S,
+        close_retry_delays_s: Sequence[float] = CLOSE_RETRY_DELAYS_S,
         now: Callable[[], datetime] = lambda: datetime.now(UTC),
         monotonic: Callable[[], float] = time.monotonic,
     ) -> None:
-        if not retry_delays_s or any(delay < 0 for delay in retry_delays_s):
-            raise ValueError("retry_delays_s needs at least one delay, none negative")
+        for delays in (retry_delays_s, close_retry_delays_s):
+            if not delays or any(delay < 0 for delay in delays):
+                raise ValueError("retry delays need at least one delay, none negative")
         self._channel = channel
         self._ledger = ledger
-        self._secret_values = tuple(secret_values)
+        self._secret_values = secret_values
         self._delays = tuple(retry_delays_s)
+        self._close_delays = tuple(close_retry_delays_s)
         self._now = now
         self._monotonic = monotonic
         self._queue: list[_Attempt] = []
         self._sequence = itertools.count()
         self._condition = threading.Condition()
         self._closing = False
+        self._deadline = 0.0  # Once closing: when the last attempt must have started.
         self._busy = False
         self._worker: threading.Thread | None = None
         self._last_breaker: dict[Lane.ValueType, float] = {}
@@ -240,20 +277,62 @@ class QueuedNotifier:
         except Exception:  # Never let a notification stop the loop that sent it.
             _logger.exception("could not queue a notification", extra={"kind": str(kind)})
 
+    def resume(self, lane: Lane.ValueType, kinds: Collection[NotificationKind]) -> int:
+        """Queue again ``lane``'s notifications of ``kinds`` that an earlier process recorded
+        as not delivered, within the last 12 hours, keeping their IDs; return how many.
+
+        Run it once per process, for the kinds that process sends, so that no other process
+        sends the same ones again. Notifications that were off are not resent.
+        """
+        latest: dict[str, LaneEvent] = {}
+        for event in self._ledger.lane_events(lane):
+            if event.kind in _NOTIFICATION_EVENTS and event.notification_id:
+                latest[event.notification_id] = event
+        cutoff = self._now() - _RESUME_WINDOW
+        count = 0
+        for notification_id, event in latest.items():
+            kind = _kind_of(notification_id)
+            if (
+                kind is None
+                or event.kind != LANE_EVENT_KIND_NOTIFY_FAILED
+                or event.detail == _OFF
+                or kind not in kinds
+                or event.occurred_at.ToDatetime(tzinfo=UTC) < cutoff
+            ):
+                continue
+            title = _TITLES[kind]
+            text = event.notification.removeprefix(f"{title}: ")
+            self._enqueue(Notification(notification_id, lane, kind, title, text))
+            count += 1
+        return count
+
     def close(self, timeout_s: float = 30.0) -> None:
         with self._condition:
-            self._closing = True
+            if not self._closing:
+                self._closing = True
+                self._deadline = self._monotonic() + timeout_s
+                now = self._monotonic()
+                for attempt in self._queue:  # A retry waiting for later gets its chance now.
+                    attempt.due = min(attempt.due, now)
+                heapq.heapify(self._queue)
             self._condition.notify_all()
             worker = self._worker
         if worker is not None:
-            worker.join(timeout_s)
+            worker.join(timeout_s + 5.0)  # The last attempt may start just before the deadline.
             if worker.is_alive():
                 _logger.warning("notifications were still being delivered at exit")
+        closer = getattr(self._channel, "close", None)
+        if callable(closer):
+            closer()
 
     def pending(self) -> int:
         """How many notifications are queued or being delivered."""
         with self._condition:
             return len(self._queue) + int(self._busy)
+
+    def _secrets(self) -> Sequence[str]:
+        values = self._secret_values
+        return values() if callable(values) else values
 
     def _queue_notification(self, lane: Lane.ValueType, kind: NotificationKind, text: str) -> None:
         info = lane_info(lane)
@@ -267,21 +346,22 @@ class QueuedNotifier:
                     _logger.info("breaker notification skipped: one went out recently")
                     return
                 self._last_breaker[lane] = self._monotonic()
-        notification = Notification(
-            notification_id=f"{kind.value}-{secrets.token_hex(6)}",
-            lane=lane,
-            kind=kind,
-            title=_TITLES[kind],
-            text=redact(text.strip() or f"{info.title}: {_TITLES[kind]}", self._secret_values),
-        )
-        if self._channel is None:
-            self._record(notification, delivered=False, detail="GOALY_NTFY_TOPIC is not set")
-            _logger.warning("notifications are off: GOALY_NTFY_TOPIC is not set")
-            return
-        with self._condition:
-            heapq.heappush(
-                self._queue, _Attempt(self._monotonic(), next(self._sequence), notification)
+        self._enqueue(
+            Notification(
+                notification_id=f"{kind.value}-{secrets.token_hex(6)}",
+                lane=lane,
+                kind=kind,
+                title=_TITLES[kind],
+                text=text.strip() or f"{info.title}: {_TITLES[kind]}",
             )
+        )
+
+    def _enqueue(self, notification: Notification) -> None:
+        clean = replace(notification, text=sanitize(notification.text, self._secrets()))
+        with self._condition:
+            if self._closing:  # Checked again: close() may have run since the first check.
+                raise RuntimeError("the notifier is closed")
+            heapq.heappush(self._queue, _Attempt(self._monotonic(), next(self._sequence), clean))
             if self._worker is None:
                 self._worker = threading.Thread(
                     target=self._run, name="goaly-notifier", daemon=True
@@ -293,49 +373,57 @@ class QueuedNotifier:
         while True:
             with self._condition:
                 while True:
+                    now = self._monotonic()
+                    if self._closing and (not self._queue or now >= self._deadline):
+                        return  # Every attempt left was recorded as its last.
                     if not self._queue:
-                        if self._closing:
-                            return
                         self._condition.wait()
                         continue
-                    wait = self._queue[0].due - self._monotonic()
-                    if wait <= 0 or self._closing:
+                    wait = self._queue[0].due - now
+                    if wait <= 0:
                         break
+                    if self._closing:
+                        wait = min(wait, self._deadline - now)
                     self._condition.wait(wait)
                 attempt = heapq.heappop(self._queue)
                 self._busy = True
-                closing = self._closing
             try:
-                self._attempt(attempt, last=closing)
+                self._attempt(attempt)
+            except Exception:  # The worker must outlive any bug in one attempt.
+                _logger.exception("a notification attempt failed unexpectedly")
             finally:
                 with self._condition:
                     self._busy = False
 
-    def _attempt(self, attempt: _Attempt, *, last: bool) -> None:
+    def _attempt(self, attempt: _Attempt) -> None:
         notification = attempt.notification
+        if self._channel is None:
+            self._record(notification, delivered=False, detail=_OFF)
+            _logger.warning("notifications are off: GOALY_NTFY_TOPIC is not set")
+            return
         try:
-            if self._channel is None:  # Never queued then; kept for the type checker.
-                raise DeliveryError("GOALY_NTFY_TOPIC is not set")
             self._channel.send(notification)
         except Exception as error:  # noqa: BLE001  (a channel bug must not kill the worker)
             reason = str(error) if isinstance(error, DeliveryError) else type(error).__name__
-            attempt.failures += 1
-            delay = self._delays[min(attempt.failures, len(self._delays)) - 1]
-            later = "no retry: the process is exiting" if last else f"retry in {delay:g} s"
-            self._record(
-                notification,
-                delivered=False,
-                detail=f"attempt {attempt.failures}: {reason}; {later}",
-            )
-            if not last:
-                attempt.due = self._monotonic() + delay
-                with self._condition:
-                    heapq.heappush(self._queue, attempt)
+        else:
+            self._record(notification, delivered=True, detail="")
             return
-        self._record(notification, delivered=True, detail="")
+        attempt.failures += 1
+        with self._condition:  # Decide and queue at once, so close() sees the retry.
+            closing = self._closing
+            delays = self._close_delays if closing else self._delays
+            delay = delays[min(attempt.failures, len(delays)) - 1]
+            retry = not closing or self._monotonic() + delay < self._deadline
+            if retry:
+                attempt.due = self._monotonic() + delay
+                heapq.heappush(self._queue, attempt)
+                self._condition.notify_all()
+        later = f"retry in {delay:g} s" if retry else "no retry: the process is exiting"
+        detail = f"attempt {attempt.failures}: {reason}; {later}"
+        self._record(notification, delivered=False, detail=detail)
 
     def _record(self, notification: Notification, *, delivered: bool, detail: str) -> None:
-        detail = redact(detail, self._secret_values)[:_MAX_DETAIL]
+        detail = redact(detail, self._secrets())[:_MAX_DETAIL]
         event = LaneEvent(
             lane=notification.lane,
             kind=LANE_EVENT_KIND_NOTIFIED if delivered else LANE_EVENT_KIND_NOTIFY_FAILED,
@@ -355,6 +443,13 @@ class QueuedNotifier:
             self._ledger.record_lane_event(event)
         except Exception:  # The ledger's own failure is logged; the loop goes on.
             _logger.exception("could not record a notification event", extra=extra)
+
+
+def _kind_of(notification_id: str) -> NotificationKind | None:
+    try:
+        return NotificationKind(notification_id.rpartition("-")[0])
+    except ValueError:
+        return None
 
 
 def notifier_from_settings(

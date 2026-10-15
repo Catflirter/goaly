@@ -50,7 +50,8 @@ async def heartbeat(path: Path, interval_s: float = INTERVAL_S) -> AsyncIterator
     """Beat on ``path`` now and every ``interval_s`` while the block runs.
 
     A beat that fails, as on a full disk, is logged and tried again at the next interval; the
-    supervisor then sees the file go stale.
+    supervisor then sees the file go stale. The supervisor deletes the file before it starts a
+    lane, and until the first beat counts the lane's age from its start.
     """
     path.parent.mkdir(parents=True, exist_ok=True)
     beat(path)
@@ -60,7 +61,7 @@ async def heartbeat(path: Path, interval_s: float = INTERVAL_S) -> AsyncIterator
             await asyncio.sleep(interval_s)
             try:
                 beat(path)
-            except OSError:
+            except Exception:  # Any failure: log it and try at the next beat.
                 _logger.exception("could not write the heartbeat", extra={"path": str(path)})
 
     task = asyncio.create_task(keep_beating(), name="goaly-heartbeat")
@@ -68,5 +69,5 @@ async def heartbeat(path: Path, interval_s: float = INTERVAL_S) -> AsyncIterator
         yield
     finally:
         task.cancel()
-        with contextlib.suppress(asyncio.CancelledError):
-            await task
+        # wait() never raises, so a cancellation of the block's own task is not swallowed.
+        await asyncio.wait({task})

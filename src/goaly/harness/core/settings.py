@@ -79,29 +79,19 @@ class Settings(BaseSettings):
     @field_validator("ntfy_topic", mode="before")
     @classmethod
     def _check_ntfy_topic(cls, value: object) -> object:
-        if isinstance(value, SecretStr):
-            value = value.get_secret_value()
-        if isinstance(value, str):
-            value = value.strip()
-            if not value:
-                return None
-            if not _NTFY_TOPIC.fullmatch(value):
-                raise PydanticCustomError(
-                    "invalid_topic", "must be 1 to 64 letters, digits, underscores or hyphens"
-                )
+        value = _optional_secret(value)
+        if isinstance(value, str) and not _NTFY_TOPIC.fullmatch(value):
+            raise PydanticCustomError(
+                "invalid_topic", "must be 1 to 64 letters, digits, underscores or hyphens"
+            )
         return value
 
     @field_validator("github_token", mode="before")
     @classmethod
     def _check_github_token(cls, value: object) -> object:
-        if isinstance(value, SecretStr):
-            value = value.get_secret_value()
-        if isinstance(value, str):
-            value = value.strip()
-            if not value:
-                return None
-            if not all("!" <= char <= "~" for char in value):  # It goes in a header too.
-                raise PydanticCustomError("invalid_token", _NOT_A_HEADER_VALUE)
+        value = _optional_secret(value)
+        if isinstance(value, str) and not all("!" <= char <= "~" for char in value):
+            raise PydanticCustomError("invalid_token", _NOT_A_HEADER_VALUE)  # A header value.
         return value
 
     @field_validator("base_url")
@@ -112,6 +102,16 @@ class Settings(BaseSettings):
         if problem is not None:
             raise PydanticCustomError("invalid_url", problem)
         return url.rstrip("/")
+
+
+def _optional_secret(value: object) -> object:
+    """Unwrap and strip an optional secret's value; a blank one counts as unset."""
+    if isinstance(value, SecretStr):
+        value = value.get_secret_value()
+    if isinstance(value, str):
+        value = value.strip()
+        return value or None
+    return value
 
 
 def default_env_file() -> Path:
