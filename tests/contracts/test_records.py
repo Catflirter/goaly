@@ -4,6 +4,7 @@ import json
 from collections.abc import Sequence
 
 from goaly.contracts.gen.experiment_pb2 import DecisionThresholds, Lane, PhaseResult
+from goaly.contracts.gen.task_pb2 import Prediction
 from goaly.contracts.gen.trajectory_pb2 import (
     Chat,
     ChatMessage,
@@ -188,3 +189,13 @@ def test_every_lane_has_its_own_thresholds() -> None:
 
     # A lane is decided by its own variant's thresholds, so each lane needs exactly one.
     assert {field.name for field in variants} == lanes - {"unspecified"} == {"effisql", "swe"}
+
+
+def test_a_tool_result_says_whether_a_tool_submitted() -> None:
+    # An empty prediction is still a submission: for SWE, an empty patch means "no change".
+    submitted = ToolResult(tool_call_id="t1", name="submit", submission=Prediction())
+    plain = ToolResult(tool_call_id="t2", name="execute_sql", content="3 rows")
+
+    assert from_json_line(to_json_line(submitted), ToolResult).HasField("submission")
+    assert "submission" not in json.loads(to_json_line(plain))
+    assert not from_json_line(to_json_line(plain), ToolResult).HasField("submission")

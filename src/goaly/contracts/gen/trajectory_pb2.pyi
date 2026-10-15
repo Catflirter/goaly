@@ -33,7 +33,7 @@ class _StopReasonEnumTypeWrapper(_enum_type_wrapper._EnumTypeWrapper[_StopReason
     STOP_REASON_UNSPECIFIED: _StopReason.ValueType  # 0
     """Not set."""
     STOP_REASON_SUBMITTED: _StopReason.ValueType  # 1
-    """The agent submitted its answer."""
+    """A tool returned a submission (ToolResult.submission), which ended the episode."""
     STOP_REASON_STEP_BUDGET_EXHAUSTED: _StopReason.ValueType  # 2
     """The step budget ran out (spec §5.1), so the policy's fallback answered (spec §5.4)."""
     STOP_REASON_TIME_BUDGET_EXHAUSTED: _StopReason.ValueType  # 3
@@ -55,7 +55,7 @@ class StopReason(_StopReason, metaclass=_StopReasonEnumTypeWrapper):
 STOP_REASON_UNSPECIFIED: StopReason.ValueType  # 0
 """Not set."""
 STOP_REASON_SUBMITTED: StopReason.ValueType  # 1
-"""The agent submitted its answer."""
+"""A tool returned a submission (ToolResult.submission), which ended the episode."""
 STOP_REASON_STEP_BUDGET_EXHAUSTED: StopReason.ValueType  # 2
 """The step budget ran out (spec §5.1), so the policy's fallback answered (spec §5.4)."""
 STOP_REASON_TIME_BUDGET_EXHAUSTED: StopReason.ValueType  # 3
@@ -479,7 +479,8 @@ Global___ToolCall: _TypeAlias = ToolCall  # noqa: Y015
 @_typing.final
 class ToolResult(_message.Message):
     """The result of one tool call. The model sees it as a tool message: tool_call_id and content.
-    The tool fills content and is_error; core's executor fills the rest.
+    The tool fills content, is_error and submission; core's executor fills the rest, and writes
+    the error itself when the arguments are invalid, the call times out or the tool raises.
     """
 
     DESCRIPTOR: _descriptor.Descriptor
@@ -490,6 +491,7 @@ class ToolResult(_message.Message):
     IS_ERROR_FIELD_NUMBER: _builtins.int
     TRUNCATED_FIELD_NUMBER: _builtins.int
     ELAPSED_S_FIELD_NUMBER: _builtins.int
+    SUBMISSION_FIELD_NUMBER: _builtins.int
     tool_call_id: _builtins.str
     """The ID of the tool call this answers."""
     name: _builtins.str
@@ -497,11 +499,22 @@ class ToolResult(_message.Message):
     content: _builtins.str
     """The text shown to the model, after any truncation."""
     is_error: _builtins.bool
-    """True if the call failed: its arguments were invalid, it timed out, or the tool failed."""
+    """True if the call itself failed: its arguments were invalid, it timed out, or the tool
+    raised. A statement or command that ran and failed, such as SQL that raised an error or a
+    command that exited non-zero, is a normal result. So the consecutive-error rule (spec
+    §5.1) counts only calls that failed.
+    """
     truncated: _builtins.bool
     """True if the executor cut long output down to its start and end (spec §5.1)."""
     elapsed_s: _builtins.float
     """How long the tool ran, in seconds."""
+    @_builtins.property
+    def submission(self) -> _task_pb2.Prediction:
+        """What the tool submits, if it submits. A tool ends the episode by returning a result with
+        this set: the agent loop stops, and the policy decides whether to return it. So a pack
+        can submit through any tool, one that verifies before it submits included.
+        """
+
     def __init__(
         self,
         *,
@@ -511,11 +524,14 @@ class ToolResult(_message.Message):
         is_error: _builtins.bool = ...,
         truncated: _builtins.bool = ...,
         elapsed_s: _builtins.float = ...,
+        submission: _task_pb2.Prediction | None = ...,
     ) -> None: ...
-    _HasFieldArgType: _TypeAlias = _Never  # noqa: Y015
+    _HasFieldArgType: _TypeAlias = _typing.Literal["_submission", b"_submission", "submission", b"submission"]  # noqa: Y015
     def HasField(self, field_name: _HasFieldArgType) -> _builtins.bool: ...
-    _ClearFieldArgType: _TypeAlias = _typing.Literal["content", b"content", "elapsed_s", b"elapsed_s", "is_error", b"is_error", "name", b"name", "tool_call_id", b"tool_call_id", "truncated", b"truncated"]  # noqa: Y015
+    _ClearFieldArgType: _TypeAlias = _typing.Literal["_submission", b"_submission", "content", b"content", "elapsed_s", b"elapsed_s", "is_error", b"is_error", "name", b"name", "submission", b"submission", "tool_call_id", b"tool_call_id", "truncated", b"truncated"]  # noqa: Y015
     def ClearField(self, field_name: _ClearFieldArgType) -> None: ...
-    def WhichOneof(self, oneof_group: _Never) -> None: ...
+    _WhichOneofReturnType__submission: _TypeAlias = _typing.Literal["submission"]  # noqa: Y015
+    _WhichOneofArgType__submission: _TypeAlias = _typing.Literal["_submission", b"_submission"]  # noqa: Y015
+    def WhichOneof(self, oneof_group: _WhichOneofArgType__submission) -> _WhichOneofReturnType__submission | None: ...
 
 Global___ToolResult: _TypeAlias = ToolResult  # noqa: Y015

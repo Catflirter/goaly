@@ -48,7 +48,7 @@ message Trajectory {
 enum StopReason {
   // Not set.
   STOP_REASON_UNSPECIFIED = 0;
-  // The agent submitted its answer.
+  // A tool returned a submission (ToolResult.submission), which ended the episode.
   STOP_REASON_SUBMITTED = 1;
   // The step budget ran out (spec §5.1), so the policy's fallback answered (spec §5.4).
   STOP_REASON_STEP_BUDGET_EXHAUSTED = 2;
@@ -187,7 +187,8 @@ enum ToolCallSource {
 }
 
 // The result of one tool call. The model sees it as a tool message: tool_call_id and content.
-// The tool fills content and is_error; core's executor fills the rest.
+// The tool fills content, is_error and submission; core's executor fills the rest, and writes
+// the error itself when the arguments are invalid, the call times out or the tool raises.
 message ToolResult {
   // The ID of the tool call this answers.
   string tool_call_id = 1;
@@ -195,10 +196,17 @@ message ToolResult {
   string name = 2;
   // The text shown to the model, after any truncation.
   string content = 3;
-  // True if the call failed: its arguments were invalid, it timed out, or the tool failed.
+  // True if the call itself failed: its arguments were invalid, it timed out, or the tool
+  // raised. A statement or command that ran and failed, such as SQL that raised an error or a
+  // command that exited non-zero, is a normal result. So the consecutive-error rule (spec
+  // §5.1) counts only calls that failed.
   bool is_error = 4;
   // True if the executor cut long output down to its start and end (spec §5.1).
   bool truncated = 5;
   // How long the tool ran, in seconds.
   double elapsed_s = 6;
+  // What the tool submits, if it submits. A tool ends the episode by returning a result with
+  // this set: the agent loop stops, and the policy decides whether to return it. So a pack
+  // can submit through any tool, one that verifies before it submits included.
+  optional Prediction submission = 7;
 }
