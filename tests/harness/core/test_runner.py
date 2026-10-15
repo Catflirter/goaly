@@ -33,6 +33,7 @@ from goaly.contracts.gen.task_pb2 import (
     SPLIT_EXTERNAL,
     SPLIT_TRAIN,
     SPLIT_VAL,
+    EffiSqlPrediction,
     Grade,
     Prediction,
     Split,
@@ -989,16 +990,21 @@ async def test_an_external_run_is_not_graded_but_every_task_gets_its_official_re
     ]
 
 
-# The solve phase of a two-phase run.
+# The solve phase of a two-phase run, in the solve container.
 
 
-async def test_a_solve_phase_never_grades_and_leaves_the_run_unfinished(tmp_path: Path) -> None:
+def predictions(run_dir: Path, seed: int = 0) -> list[Prediction]:
+    return list(read_jsonl(RunFiles(run_dir).predictions(seed), Prediction))
+
+
+async def test_a_solve_phase_never_grades_and_leaves_the_rest_to_the_host(
+    tmp_path: Path,
+) -> None:
     benchmark = ScriptedBenchmark(toy_instances(2))
-    policy = ScriptedPolicy({"t1": raising(ValueError("boom"))})
-    cache = EvalCache(tmp_path / "cache", CACHE_NAMESPACE)
+    policy = ScriptedPolicy({"t1": raising(ValueError("boom")), "t0": answering("SELECT 0")})
 
     async with asyncio.timeout(GUARD_S):
-        summary = await make_runner(benchmark, policy, cache=cache).run(
+        summary = await make_runner(benchmark, policy).run(
             tmp_path / "run", template(), split=SPLIT_TRAIN, seeds=[0], grading=False
         )
 
@@ -1006,39 +1012,93 @@ async def test_a_solve_phase_never_grades_and_leaves_the_run_unfinished(tmp_path
     found = results(tmp_path / "run")
     assert not any(result.HasField("grade") for result in found.values())
     assert found[("t1", 0)].error_type == TASK_ERROR_TYPE_POLICY_CRASH
-    assert official(tmp_path / "run") == [base_answer(0), base_answer(1)]
-    # The grade phase finishes the run, and only it writes the cache: graded evaluations only.
+    # Each recorded task's prediction, its last, for the host to grade; the official files and
+    # finishing the run are the host's.
+    assert predictions(tmp_path / "run") == [
+        Prediction(instance_id="t0", effisql=EffiSqlPrediction(sql="SELECT 0")),
+        Prediction(instance_id="t1"),
+    ]
+    assert not RunFiles(tmp_path / "run").official(0).exists()
     assert not read_manifest(RunFiles(tmp_path / "run").manifest).HasField("finished_at")
-    assert not (tmp_path / "cache").exists()
     assert summary.ran == 2
 
 
-async def test_a_solve_phase_takes_a_graded_evaluation_from_the_cache(tmp_path: Path) -> None:
-    cache = EvalCache(tmp_path / "cache", CACHE_NAMESPACE)
-    await run(make_runner(ScriptedBenchmark(toy_instances(2)), cache=cache), tmp_path / "a")
+async def test_a_solve_phase_has_no_cache(tmp_path: Path) -> None:
+    runner = make_runner(
+        ScriptedBenchmark(toy_instances(2)), cache=EvalCache(tmp_path / "cache", CACHE_NAMESPACE)
+    )
 
+    with pytest.raises(UsageError, match="only the host reads one"):
+        await runner.run(tmp_path / "run", template(), split=SPLIT_TRAIN, seeds=[0], grading=False)
+
+    assert not (tmp_path / "run").exists()
+
+
+async def test_a_solve_phase_solves_only_the_tasks_it_is_given(tmp_path: Path) -> None:
     policy = ScriptedPolicy()
+
     async with asyncio.timeout(GUARD_S):
-        summary = await make_runner(ScriptedBenchmark(toy_instances(2)), policy, cache=cache).run(
-            tmp_path / "b", template("run-2"), split=SPLIT_TRAIN, seeds=[0], grading=False
+        summary = await make_runner(ScriptedBenchmark(toy_instances(3)), policy).run(
+            tmp_path,
+            template(),
+            split=SPLIT_TRAIN,
+            seeds=[0, 1],
+            grading=False,
+            tasks=[("t2", 1), ("t0", 0)],
         )
 
-    assert policy.solved == []
-    assert all(result.HasField("grade") for result in results(tmp_path / "b").values())
-    assert summary.cached == 2
+    assert sorted(policy.solved) == [("t0", 0), ("t2", 1)]
+    assert summary.ran == 2
+    assert [p.instance_id for p in predictions(tmp_path, 0)] == ["t0"]
+    assert [p.instance_id for p in predictions(tmp_path, 1)] == ["t2"]
+    # The manifest is the whole run's, so that the next call, with other tasks, can resume it.
+    manifest = read_manifest(RunFiles(tmp_path).manifest)
+    assert (list(manifest.instance_ids), list(manifest.seeds)) == (["t0", "t1", "t2"], [0, 1])
 
 
-async def test_a_graded_resume_refuses_a_run_its_solve_phase_left_ungraded(
+@pytest.mark.parametrize(
+    ("change", "message"),
+    [
+        ({"tasks": [("t9", 0)]}, "not all the run's"),
+        ({"tasks": [("t0", 0)], "grading": True}, "only a solve phase"),
+    ],
+    ids=["another instance", "graded"],
+)
+async def test_tasks_to_solve_are_some_of_the_runs(
+    tmp_path: Path, change: dict[str, object], message: str
+) -> None:
+    options: dict[str, object] = {"grading": False, **change}
+
+    with pytest.raises(UsageError, match=message):
+        await make_runner(ScriptedBenchmark(toy_instances(1))).run(
+            tmp_path,
+            template(),
+            split=SPLIT_TRAIN,
+            seeds=[0],
+            **options,  # type: ignore[arg-type]
+        )
+
+
+async def test_a_graded_resume_refuses_a_run_a_solve_phase_left_ungraded(
     tmp_path: Path,
 ) -> None:
-    async with asyncio.timeout(GUARD_S):
-        await make_runner(ScriptedBenchmark(toy_instances(2))).run(
-            tmp_path, template(), split=SPLIT_TRAIN, seeds=[0], grading=False
-        )
+    blocked = make_runner(
+        ScriptedBenchmark(toy_instances(3)), ScriptedPolicy({"t2": waiting(asyncio.Event())})
+    )
+    files = RunFiles(tmp_path)
+    solving = asyncio.create_task(
+        blocked.run(tmp_path, template(), split=SPLIT_TRAIN, seeds=[0], grading=False)
+    )
+    await wait_until(
+        lambda: files.results.exists() and files.results.read_bytes().count(b"\n") == 2
+    )
+    solving.cancel()
+    with pytest.raises(asyncio.CancelledError):
+        await solving
 
-    # Resuming it as a graded run would finish it with every task ungraded.
-    with pytest.raises(RunDirectoryError, match="its grade phase grades it"):
-        await run(make_runner(ScriptedBenchmark(toy_instances(2))), tmp_path, resume=True)
+    # Resuming it as a graded run would finish it with tasks never graded; one is unrecorded.
+    with pytest.raises(RunDirectoryError, match="2 tasks a solve phase left ungraded, and 1 it"):
+        await run(make_runner(ScriptedBenchmark(toy_instances(3))), tmp_path, resume=True)
 
     assert not read_manifest(RunFiles(tmp_path).manifest).HasField("finished_at")
 
@@ -1067,7 +1127,7 @@ async def test_a_solve_phase_resumes_its_own_ungraded_run(tmp_path: Path) -> Non
     assert not any(result.HasField("grade") for result in results(tmp_path).values())
 
 
-async def test_a_solve_phase_of_an_external_run_finishes_it(tmp_path: Path) -> None:
+async def test_a_solve_phase_of_an_external_run_leaves_it_to_the_host(tmp_path: Path) -> None:
     organizers = [replace(inst, split=SPLIT_EXTERNAL, gold_sql=None) for inst in toy_instances(1)]
     benchmark = ScriptedBenchmark(toy_instances(1), external=organizers)
 
@@ -1076,8 +1136,9 @@ async def test_a_solve_phase_of_an_external_run_finishes_it(tmp_path: Path) -> N
             tmp_path, template(), split=SPLIT_EXTERNAL, seeds=[0], grading=False
         )
 
-    # No gold answers: there is nothing left to grade.
-    assert read_manifest(RunFiles(tmp_path).manifest).HasField("finished_at")
+    # The host writes its official files from these, and finishes it.
+    assert [p.instance_id for p in predictions(tmp_path)] == ["t0"]
+    assert not read_manifest(RunFiles(tmp_path).manifest).HasField("finished_at")
 
 
 # The evaluation cache.

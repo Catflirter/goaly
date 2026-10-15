@@ -35,7 +35,14 @@ from goaly.contracts.gen.trajectory_pb2 import Trajectory
 from goaly.contracts.jsonl import to_json_line
 from goaly.harness.core.atomic import write_text_atomically
 
-__all__ = ["CacheKey", "CachedEvaluation", "EvalCache", "task_digest"]
+__all__ = [
+    "CacheKey",
+    "CachedEvaluation",
+    "EvalCache",
+    "evaluation_key",
+    "put_evaluation",
+    "task_digest",
+]
 
 _logger = logging.getLogger(__name__)
 
@@ -71,6 +78,29 @@ class CachedEvaluation:
 def task_digest(task: TaskInput) -> str:
     """Return the SHA-256, in hex, of ``task`` as a JSON line: it changes with anything in it."""
     return hashlib.sha256(to_json_line(task).encode("utf-8")).hexdigest()
+
+
+def evaluation_key(
+    *, harness_hash: str, benchmark: str, instance_id: str, seed: int, task: TaskInput
+) -> CacheKey:
+    """Return the key of a task's evaluation: the harness hash, the task and the seed.
+
+    ``task`` is the agent's input, which the benchmark builds from its dataset. In a two-phase
+    run the host builds it, as it computes the harness hash: no part of a key comes from the
+    solve container.
+    """
+    return CacheKey(harness_hash, benchmark, instance_id, seed, task_digest(task))
+
+
+async def put_evaluation(cache: "EvalCache", key: CacheKey, evaluation: CachedEvaluation) -> None:
+    """Put ``evaluation`` in ``cache`` under ``key``. A failure to write it is logged, never
+    raised: the cache only saves work."""
+    try:
+        await cache.put(key, evaluation)
+    except OSError as error:
+        _logger.warning(
+            "could not cache the evaluation of %s, seed %d: %s", key.instance_id, key.seed, error
+        )
 
 
 class EvalCache:

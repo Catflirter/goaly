@@ -11,6 +11,8 @@ from goaly.contracts.gen.result_pb2 import TASK_ERROR_TYPE_LLM, TaskResult
 from goaly.contracts.gen.task_pb2 import SPLIT_TRAIN
 from goaly.contracts.jsonl import read_jsonl
 from goaly.harness.core.eval_cache import EvalCache
+from goaly.harness.core.grading import SolveOptions
+from goaly.harness.core.isolation import SolveRequest
 from goaly.harness.core.registry import (
     Harness,
     HarnessOptions,
@@ -22,7 +24,7 @@ from goaly.harness.core.registry import (
     RunnableHarness,
     RunnableHost,
 )
-from goaly.harness.core.runner import RunFiles, error_classifier
+from goaly.harness.core.runner import RunFiles, UsageError, error_classifier
 from tests.fakes import FakeSqlEnvironment, ToyInstance
 from tests.harness.core.runner_doubles import (
     ScriptedBenchmark,
@@ -182,28 +184,79 @@ def test_an_unknown_host_side_lists_those_there_are() -> None:
         registry.host("toy")
 
 
-async def test_a_host_side_grades_a_solved_run(tmp_path: Path) -> None:
-    runner = toy_harness().runner(cache=None, max_tasks=2, task_timeout_s=None)
-    await runner.run(
-        tmp_path,
+def solve_options(tmp_path: Path) -> SolveOptions:
+    return SolveOptions(
+        harness="v0",
+        checkout=tmp_path,
+        pack_dir=None,
+        instances_file=None,
+        llm_shares={},
+        max_tasks=2,
+        task_timeout_s=None,
+        log_level="INFO",
+    )
+
+
+async def test_a_host_side_solves_through_its_launcher_and_grades(tmp_path: Path) -> None:
+    requests: list[SolveRequest] = []
+
+    async def launcher(request: SolveRequest) -> None:  # The solve container, as far as it goes.
+        requests.append(request)
+        runner = toy_harness().runner(cache=None, max_tasks=2, task_timeout_s=None)
+        await runner.run(
+            request.solve_dir,
+            RunManifest(run_id=request.run_id, harness_hash="h"),
+            split=request.split,
+            seeds=[0],
+            grading=False,
+            tasks=request.tasks,
+        )
+
+    host = HostBenchmark(
+        benchmark=ScriptedBenchmark(toy_instances(2)),
+        cache_namespace="toy-dev",
+        gold_sha256="g" * 64,
+        launcher=launcher,
+    )
+    runnable: RunnableHost = host
+
+    summary = await runnable.host_runner(cache=None).run(
+        tmp_path / "run",
         RunManifest(run_id="r", harness_hash="h"),
         split=SPLIT_TRAIN,
         seeds=[0],
-        grading=False,
+        instance_ids=None,
+        solve=solve_options(tmp_path),
     )
 
+    assert (runnable.benchmark_name, runnable.cache_namespace) == ("toy", "toy-dev")
+    assert runnable.gold_sha256 == "g" * 64
+    assert [request.tasks for request in requests] == [(("t0", 0), ("t1", 0))]
+    assert summary.ran == 2
+    assert all(
+        result.HasField("grade")
+        for result in read_jsonl(RunFiles(tmp_path / "run").results, TaskResult)
+    )
+
+
+async def test_a_host_side_without_a_launcher_runs_only_in_process(tmp_path: Path) -> None:
     opening = HostOptions(
         files=RunFiles(tmp_path), instances_file=None, split=SPLIT_TRAIN, budget_phase=None
     )
     async with toy_host(opening) as host:
         runnable: RunnableHost = host
-        summary = await runnable.grader(cache=None).grade(tmp_path)
+        with pytest.raises(UsageError, match="run it with --in-process"):
+            await runnable.host_runner(cache=None).run(
+                tmp_path / "run",
+                RunManifest(run_id="r", harness_hash="h"),
+                split=SPLIT_TRAIN,
+                seeds=[0],
+                instance_ids=None,
+                solve=solve_options(tmp_path),
+            )
 
-    assert runnable.benchmark_name == "toy"
-    assert runnable.cache_namespace == "toy-dev"
-    assert runnable.gold_sha256 == "g" * 64
-    assert runnable.launcher is None  # Only --in-process can run it.
-    assert summary.ran == 2
+    assert runnable.launcher is None
+    assert not (tmp_path / "run").exists()
 
 
 # Harnesses.
