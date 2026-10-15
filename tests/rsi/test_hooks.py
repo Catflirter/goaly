@@ -1,5 +1,6 @@
 """Tests for goaly.rsi.hooks: the lane's results-PR, notification and heartbeat hooks."""
 
+import logging
 from datetime import UTC, datetime
 from pathlib import Path
 
@@ -7,8 +8,8 @@ import pytest
 
 from goaly.contracts.gen.experiment_pb2 import LANE_EFFISQL, Lane
 from goaly.rsi.cli import LaneSettings
+from goaly.rsi.hooks import BreakerWatch, lane_hooks, state_dir
 from goaly.rsi.hooks import build_hooks as build
-from goaly.rsi.hooks import lane_hooks, state_dir
 from goaly.rsi.lane import StopInfo
 from goaly.rsi.ledger import Ledger
 from goaly.rsi.notify import FakeChannel, NotificationKind, QueuedNotifier
@@ -114,3 +115,35 @@ def test_the_lane_config_names_these_hooks() -> None:
     root = Path(__file__).resolve().parents[2]
     settings = load_lane_settings(root / "rsi" / "lane-effisql.toml")
     assert import_object(settings.hooks, "hooks") is lane_hooks
+
+
+def test_breaker_watch_notifies_on_the_third_opening_within_the_window(tmp_path: Path) -> None:
+    clock = [0.0]
+    channel = FakeChannel()
+    notifier = QueuedNotifier(channel, Ledger(tmp_path / "ledger"), monotonic=lambda: clock[0])
+    watch = BreakerWatch(notifier, LANE_EFFISQL, clock=lambda: clock[0])
+    throttle = logging.getLogger("goaly.harness.core.llm_throttle")
+    throttle.addHandler(watch)
+    try:
+        for minute in (0, 10, 45, 50):  # Only two within 30 minutes so far.
+            clock[0] = minute * 60.0
+            throttle.warning("opened", extra={"event": "llm_breaker_open"})
+        throttle.warning("other", extra={"event": "llm_breaker_closed"})
+        clock[0] = 55 * 60.0
+        throttle.warning("opened", extra={"event": "llm_breaker_open"})
+    finally:
+        throttle.removeHandler(watch)
+    notifier.close()
+    (sent,) = channel.delivered
+    assert sent.kind is NotificationKind.BREAKER_TRIPPED
+    assert sent.text == "Effi-SQL: the gateway circuit breaker opened 3 times within 30 minutes."
+
+
+async def test_running_removes_the_breaker_watch(tmp_path: Path) -> None:
+    notifier = QueuedNotifier(FakeChannel(), Ledger(tmp_path / "ledger"))
+    hooks = build(lane_settings(tmp_path), Publisher(False), notifier)
+    throttle = logging.getLogger("goaly.harness.core.llm_throttle")
+    async with hooks.running():
+        assert any(isinstance(h, BreakerWatch) for h in throttle.handlers)
+    assert not any(isinstance(h, BreakerWatch) for h in throttle.handlers)
+    notifier.close()
