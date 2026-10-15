@@ -10,7 +10,9 @@ rebuilt from it.
 
 Only the turns of that verbatim tail go out with their reasoning: an assistant message that
 leaves it is sent without its reasoning_content from then on, whatever the prompt's size. The
-trajectory keeps the reasoning, and the rule, which the folds do not record, rebuilds the prompt.
+trajectory keeps the reasoning, and records the window as Chat.keep_turns, so the rule rebuilds
+the prompt (Step's comment in trajectory.proto). A window of 0 replays the chat's reasoning
+unchanged, as the contract reads it.
 
 A prompt's size is estimated as the previous call's input tokens, as the gateway counted them,
 plus a token for every 4 characters added since.
@@ -38,6 +40,11 @@ class ContextWindow(BaseModel):
     Once the next call's prompt would pass ``fold_above_tokens``, older tool outputs fold to
     their first ``folded_chars`` characters, and the last ``keep_turns`` turns never fold. The
     default threshold leaves 32K of Qwen's 128K for the reply and for the estimate's error.
+
+    ``keep_turns`` is also the chat's replay window (Chat.keep_turns): only the last
+    ``keep_turns`` replies keep their reasoning, and every reply loses its call markup. With 0,
+    any tool output may fold, but the replies replay unchanged, as the contract reads a window
+    of 0: the chat is then no executor chat.
     """
 
     model_config = ConfigDict(frozen=True, extra="forbid")
@@ -82,12 +89,13 @@ class ChatPrompt:
     def add_turn(self, step: int, assistant: ChatMessage) -> None:
         """Start the turn of the step at ``step`` in Trajectory.steps, with its assistant reply.
 
-        The turn this pushes out of the last ``keep_turns`` loses its reasoning.
+        The turn this pushes out of the last ``keep_turns`` loses its reasoning, unless the
+        window is 0, which replays reasoning unchanged.
         """
         self._turns.append(_Turn(step, [assistant]))
         self._estimate += _chars(assistant) / _CHARS_PER_TOKEN
         leaving = len(self._turns) - 1 - self._window.keep_turns
-        if leaving >= 0:
+        if self._window.keep_turns > 0 and leaving >= 0:
             self._drop_reasoning(self._turns[leaving])
 
     def add(self, message: ChatMessage) -> None:

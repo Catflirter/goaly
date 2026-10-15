@@ -247,12 +247,15 @@ def test_reasoning_that_leaves_the_last_turns_comes_off_the_estimate() -> None:
     assert prompt.estimated_tokens == math.ceil(1000 + added / 4 - 400 / 4)
 
 
-def test_with_no_turns_to_keep_no_reasoning_goes_out() -> None:
+def test_a_window_of_0_replays_reasoning_unchanged() -> None:
+    # Chat.keep_turns 0 marks a chat whose replies replay unchanged (trajectory.proto).
     prompt = ChatPrompt(OPENING, TOOLS, window(keep_turns=0))
 
-    prompt.add_turn(0, thinking(0, "r" * 400))
+    for step in range(3):
+        prompt.add_turn(step, thinking(step, f"thought {step}"))
 
-    assert [m.reasoning_content for m in prompt.messages() if m.role == ASSISTANT] == [""]
+    replies = [m.reasoning_content for m in prompt.messages() if m.role == ASSISTANT]
+    assert replies == ["thought 0", "thought 1", "thought 2"]
 
 
 def test_the_reasoning_tail_is_the_chats_last_turns_before_the_next_call() -> None:

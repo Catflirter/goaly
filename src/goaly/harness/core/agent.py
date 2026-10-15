@@ -338,7 +338,9 @@ class _Chat[E: Environment]:
         step.estimated_prompt_tokens = sent.estimated_tokens
         step.folds.extend(sent.folds)
         self._last = step
-        self._prompt.add_turn(step.index, _replayed(assistant))
+        # A window of 0 marks a chat whose replies replay unchanged (Chat.keep_turns).
+        replay = _replayed(assistant) if self._ctx._window.keep_turns > 0 else assistant
+        self._prompt.add_turn(step.index, replay)
         if reply.finish_reason == _CUT_OFF:
             for call in calls:  # A cut-off call may be a wrong submit: none runs.
                 self._answer(step, _not_run(call, _CUT_OFF_CALL))
@@ -441,12 +443,12 @@ def _with_calls(message: ChatMessage, calls: Sequence[ToolCall]) -> ChatMessage:
 def _replayed(assistant: ChatMessage) -> ChatMessage:
     """``assistant`` as later prompts carry it: no call markup, its calls only as structured calls.
 
-    An executor chat replays no Qwen3-Coder XML call markup (spec §5.1, and Step's rebuild rule
-    in trajectory.proto). Its content and its reasoning both lose it, whichever field its calls
-    came from, the standard one included. A call drafted in one field and written again in the
-    other then reaches the model once; a drafted call that never ran cannot look as if it ran;
-    and markup the parser took for no call never reaches the model either. The trajectory
-    keeps every reply as it came.
+    An executor chat, one with a replay window, replays no Qwen3-Coder XML call markup (spec
+    §5.1, and Step's rebuild rule in trajectory.proto). Its content and its reasoning both lose
+    it, whichever field its calls came from, the standard one included. A call drafted in one
+    field and written again in the other then reaches the model once; a drafted call that never
+    ran cannot look as if it ran; and markup the parser took for no call never reaches the model
+    either. The trajectory keeps every reply as it came.
     """
     message = _copy(assistant)
     message.content = _without_markup(message.content)
