@@ -628,6 +628,10 @@ def _wire_message(message: ChatMessage) -> dict[str, object]:
     role = _ROLES.get(message.role)
     if role is None:
         raise ValueError(f"a message needs a role, not {ChatRole.Name(message.role)}")
+    if message.role == ChatRole.CHAT_ROLE_TOOL and not message.tool_call_id:
+        raise ValueError("a tool message needs the tool_call_id of the call it answers")
+    if any(not call.id for call in message.tool_calls):
+        raise ValueError("every tool call needs an id; the parser gives one to any call without")
     wire: dict[str, object] = {"role": role, "content": message.content}
     if message.reasoning_content:
         wire["reasoning_content"] = message.reasoning_content

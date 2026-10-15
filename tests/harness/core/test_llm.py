@@ -440,6 +440,27 @@ async def test_refuses_a_message_without_a_role_before_any_io() -> None:
     assert gateway.requests == []
 
 
+@pytest.mark.parametrize(
+    "message",
+    [
+        pytest.param(ChatMessage(role=TOOL, content="42"), id="tool-message-without-id"),
+        pytest.param(
+            ChatMessage(role=ASSISTANT, tool_calls=[ToolCall(name="execute_sql")]),
+            id="tool-call-without-id",
+        ),
+    ],
+)
+async def test_refuses_a_message_without_an_id_it_needs_before_any_io(
+    message: ChatMessage,
+) -> None:
+    gateway = Gateway()
+    async with connect(gateway) as llm:
+        with pytest.raises(ValueError, match="id"):
+            await llm.complete([user("hi"), message], model=QWEN, tags=EXEC)
+
+    assert gateway.requests == []
+
+
 # The reply.
 
 
