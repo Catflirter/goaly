@@ -29,16 +29,18 @@ from goaly.bench.effisql.harness import (  # Private helpers.
     EffiSqlWiring,
     PackRunConfig,
     RunCallLog,
-    _model_settings,
-    _recorded_priority,
     classify_error,
     context_factory,
     grading_priority,
     load_pack,
+    model_settings,
     open_grading,
     open_harness,
+    recorded_priority,
 )
+from goaly.bench.effisql.pg_instances import SOLVING
 from goaly.bench.effisql.splits import load_splits
+from goaly.bench.effisql.sql_env import SolvingPool
 from goaly.contracts.errors import EnvironmentFailure
 from goaly.contracts.gen.llm_call_pb2 import CALL_PURPOSE_EXEC, LlmCallRecord
 from goaly.contracts.gen.manifest_pb2 import RunManifest
@@ -66,7 +68,7 @@ from goaly.harness.core.llm_errors import (
 )
 from goaly.harness.core.llm_models import EXECUTOR_MODEL, ModelParams
 from goaly.harness.core.manifest import read_manifest, write_manifest
-from goaly.harness.core.registry import GradingOptions, Registry
+from goaly.harness.core.registry import GradingOptions, HarnessOptions, Registry
 from goaly.harness.core.runner import RunFiles, RunIdentity
 from tests.bench.effisql.fake_run import OFFICIAL_FORM, FakeClient, FakeWiring, fake_wiring
 from tests.bench.effisql.synthetic import task
@@ -350,8 +352,8 @@ class TestRealWiring:
         assert paths.plans.name == "plans.json"
         assert paths.grading_cache_root.name == "grader"
 
-    def test_model_settings_leave_out_what_the_profile_does_not_set(self) -> None:
-        settings = _model_settings(ModelParams(enable_thinking=False))
+    def testmodel_settings_leave_out_what_the_profile_does_not_set(self) -> None:
+        settings = model_settings(ModelParams(enable_thinking=False))
 
         assert settings.model == EXECUTOR_MODEL
         assert not settings.thinking
@@ -366,10 +368,10 @@ class TestRealWiring:
             ("", Priority.RSI),
         ],
     )
-    def test_the_recorded_priority(self, recorded: str, priority: Priority) -> None:
+    def test_therecorded_priority(self, recorded: str, priority: Priority) -> None:
         manifest = RunManifest(environment_settings={"grading_priority": recorded})
 
-        assert _recorded_priority(manifest) is priority
+        assert recorded_priority(manifest) is priority
 
     async def test_grading_refuses_an_external_run(self, tmp_path: Path) -> None:
         fakes = fake_wiring(tmp_path)
@@ -379,4 +381,55 @@ class TestRealWiring:
 
         with pytest.raises(ValueError, match="SPLIT_EXTERNAL is not graded"):
             async with open_grading(GradingOptions(files=files), fakes.wiring):
+                pass
+
+
+class TestInContainer:
+    def test_the_container_reads_its_inputs_directory(self, tmp_path: Path) -> None:
+        paths = EffiSqlWiring.in_container(tmp_path / "inputs").paths()
+
+        assert paths.tasks_file == tmp_path / "inputs" / "tasks.jsonl"
+        assert paths.snapshot == tmp_path / "inputs" / "schema_snapshot.json"
+        assert paths.plans == tmp_path / "inputs" / "plans.json"
+
+    async def test_the_container_reaches_the_solving_instances_as_the_agent(
+        self, monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+    ) -> None:
+        monkeypatch.setenv("GOALY_PG_HOST", "127.0.0.1")
+        monkeypatch.setenv("GOALY_PG_PORTS", ",".join(str(i.port) for i in SOLVING))
+        monkeypatch.setenv("GOALY_PG_AGENT_PASSWORD", "agent-secret")
+
+        pool = await EffiSqlWiring.in_container(tmp_path).solving()
+
+        assert isinstance(pool, SolvingPool)
+        assert sorted(pool.load()) == sorted(i.name for i in SOLVING)
+
+    @pytest.mark.parametrize(
+        ("ports", "message"),
+        [(None, "GOALY_PG_PORTS"), ("1,x", "invalid literal"), ("1", "unknown")],
+    )
+    async def test_missing_or_wrong_settings_fail_the_environment(
+        self, monkeypatch: pytest.MonkeyPatch, tmp_path: Path, ports: str | None, message: str
+    ) -> None:
+        monkeypatch.setenv("GOALY_PG_HOST", "127.0.0.1")
+        monkeypatch.setenv("GOALY_PG_AGENT_PASSWORD", "agent-secret")
+        if ports is None:
+            monkeypatch.delenv("GOALY_PG_PORTS", raising=False)
+        else:
+            monkeypatch.setenv("GOALY_PG_PORTS", ports)
+
+        with pytest.raises(EnvironmentFailure, match=message):
+            await EffiSqlWiring.in_container(tmp_path).solving()
+
+    def test_the_container_grades_nothing(self, tmp_path: Path) -> None:
+        with pytest.raises(RuntimeError, match="grades nothing"):
+            EffiSqlWiring.in_container(tmp_path).grader(tmp_path, None)
+
+    async def test_the_container_needs_its_inputs(self, tmp_path: Path) -> None:
+        options = HarnessOptions(
+            files=RunFiles(tmp_path), instances_file=None, llm_shares={}, in_container=True
+        )
+
+        with pytest.raises(ValueError, match="--inputs"):
+            async with open_harness(options):
                 pass

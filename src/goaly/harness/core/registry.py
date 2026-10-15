@@ -88,6 +88,10 @@ class HarnessOptions:
     # The schedule's phase whose shares apply (--budget-phase): baseline, rsi or final; None if
     # unknown. A benchmark may schedule its grading by it.
     budget_phase: str | None = None
+    # True only under --phase solve --in-container, in the solve container (T06's interface).
+    in_container: bool = False
+    # The read-only inputs directory the container's launcher staged (--inputs); None outside it.
+    inputs_dir: Path | None = None
 
 
 class RunsTasks(Protocol):
