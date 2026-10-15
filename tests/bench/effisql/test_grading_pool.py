@@ -3,6 +3,7 @@
 import asyncio
 import functools
 import multiprocessing
+import os
 import random
 import threading
 import time
@@ -121,6 +122,7 @@ class FakeSlot:
         self.calls: list[tuple[str, str | None, Mode, BaseCache | None]] = []
         self.work = work
         self.aborts: list[int] = []
+        self.finals: list[bool] = []
         self.running: int | None = None
 
     def run(self, token: int, work: Callable[["FakeSlot"], Any]) -> Any:
@@ -134,9 +136,18 @@ class FakeSlot:
         self.aborts.append(token)
 
     def evaluate(
-        self, inst: EffiSqlInstance, sql: str | None, mode: Mode, cache: BaseCache | None
+        self,
+        inst: EffiSqlInstance,
+        sql: str | None,
+        mode: Mode,
+        cache: BaseCache | None,
+        plans: list[dict[str, Any]] | None = None,
+        final_attempt: bool = True,
     ) -> Grade:
         self.calls.append((inst.instance_id, sql, mode, cache))
+        self.finals.append(final_attempt)
+        if plans is not None:
+            plans.append({"Plan": {"Node Type": "Seq Scan", "call": len(self.calls)}})
         if self.work is not None:
             return self.work()  # type: ignore[no-any-return]  # The test's own work.
         return Grade(instance_id=inst.instance_id, status=GRADE_STATUS_GRADED)
@@ -399,8 +410,9 @@ class TestWorkerPlumbing:
 
     def test_grade_on_slot_evaluates(self) -> None:
         slot = FakeSlot()
-        grade = grading_service.grade_on_slot(slot, INST, "SELECT 1", Mode.DEV, None)  # type: ignore[arg-type]  # A fake.
+        grade, plan = grading_service.grade_on_slot(slot, INST, "SELECT 1", Mode.DEV, None)  # type: ignore[arg-type]  # A fake.
         assert grade.status == GRADE_STATUS_GRADED
+        assert plan == {"Plan": {"Node Type": "Seq Scan", "call": 1}}
 
 
 class TestProcessRunner:
@@ -419,10 +431,13 @@ class TestProcessRunner:
         assert await runner.call(worker_helpers.instance_name) == "fake-1"
 
     def test_holds_the_instances_lock(self, runner: Any, tmp_path: Path) -> None:
+        holder = (tmp_path / "fake-1.lock").read_text(encoding="utf-8")
+        assert holder == f"{os.getpid()}\n"
         with pytest.raises(GraderError, match="another grader process is grading on fake-1"):
             grading_service.ProcessRunner(
                 WorkerSpec(GradingInstance("fake-1", 1)), lock_dir=tmp_path
             )
+        assert (tmp_path / "fake-1.lock").read_text(encoding="utf-8") == holder, "PID kept"
 
     def test_the_lock_is_released_on_close(self, tmp_path: Path) -> None:
         spec = WorkerSpec(GradingInstance("fake-2", 1))
@@ -430,10 +445,19 @@ class TestProcessRunner:
         grading_service.ProcessRunner(spec, lock_dir=tmp_path).close()
 
     @run_async
-    async def test_a_dead_worker_is_replaced(self, runner: Any) -> None:
+    async def test_a_dead_worker_is_replaced(
+        self, runner: Any, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        pauses: list[float] = []
+
+        async def sleep(seconds: float) -> None:
+            pauses.append(seconds)
+
+        monkeypatch.setattr(asyncio, "sleep", sleep)
         with pytest.raises(GraderError, match="died; it was replaced"):
             await runner.call(worker_helpers.die)
         assert await runner.call(worker_helpers.instance_name) == "fake-1"
+        assert pauses == [300.0], "the dead worker's statement is waited out"
 
     @run_async
     async def test_repeated_deaths_hold_the_instance_back(
@@ -448,7 +472,7 @@ class TestProcessRunner:
         for _ in range(3):
             with pytest.raises(GraderError):
                 await runner.call(worker_helpers.die)
-        assert pauses == [30.0, 60.0]
+        assert pauses == [300.0, 330.0, 360.0], "the dead worker's statement is waited out"
         assert await runner.call(worker_helpers.instance_name) == "fake-1"
         assert runner._deaths == 0
 
@@ -489,6 +513,20 @@ class TestRulingAdditions:
         grade = await grader_on(slot, tmp_path).grade(INST, answer("SELECT 1"), Mode.OFFICIAL)
         assert grade.status == GRADE_STATUS_GRADED
         assert len(slot.calls) == 2
+        assert slot.finals == [False, True], "only the retry is the final attempt"
+
+    @run_async
+    async def test_a_worker_death_is_retried_too(self, tmp_path: Path) -> None:
+        def die_once() -> Grade:
+            if len(slot.calls) == 1:
+                raise GraderError("the grading worker died; it was replaced")
+            return Grade(status=GRADE_STATUS_GRADED)
+
+        slot = FakeSlot(die_once)
+        slot.evaluate_raises = True  # type: ignore[attr-defined]  # Raised from the call.
+        grade = await grader_on(slot, tmp_path).grade(INST, answer("SELECT 1"), Mode.OFFICIAL)
+        assert grade.status == GRADE_STATUS_GRADED
+        assert len(slot.calls) == 2
 
     @run_async
     async def test_a_second_grader_failure_is_returned(self, tmp_path: Path) -> None:
@@ -521,3 +559,33 @@ class TestRulingAdditions:
         with pytest.raises(GraderError, match="identity probe failed"):
             grading_service.probe_identity(slot, INST)  # type: ignore[arg-type]  # A fake.
         assert slot.resets == 1
+
+
+class TestPlanHook:
+    @run_async
+    async def test_the_graded_attempts_plan_root_reaches_the_hook(self, tmp_path: Path) -> None:
+        outcomes = [Grade(status=GRADE_STATUS_GRADER_ERROR), Grade(status=GRADE_STATUS_GRADED)]
+        slot = FakeSlot(lambda: outcomes.pop(0))
+        seen: list[tuple[str, Any]] = []
+        grader = grader_on(slot, tmp_path)
+        await grader.grade(
+            INST, answer("SELECT 1"), Mode.OFFICIAL, on_plan=lambda i, p: seen.append((i, p))
+        )
+        assert seen == [(INST.instance_id, {"Node Type": "Seq Scan", "call": 2})]
+
+    @run_async
+    async def test_a_grade_without_a_plan_calls_no_hook(self, tmp_path: Path) -> None:
+        seen: list[Any] = []
+        grader = grader_on(FakeSlot(), tmp_path)
+        await grader.grade(INST, answer(""), Mode.DEV, on_plan=lambda i, p: seen.append(i))
+        assert seen == []
+
+    @run_async
+    async def test_a_failing_hook_never_fails_the_grade(self, tmp_path: Path) -> None:
+        def broken(_i: str, _p: Any) -> None:
+            raise OSError("disk full")
+
+        grade = await grader_on(FakeSlot(), tmp_path).grade(
+            INST, answer("SELECT 1"), Mode.OFFICIAL, on_plan=broken
+        )
+        assert grade.status == GRADE_STATUS_GRADED

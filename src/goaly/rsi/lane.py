@@ -298,7 +298,12 @@ class LaneRunner:
     def _reconcile(self) -> str:
         deps = self._deps
         return reconcile_best(
-            deps.ledger, deps.workspace, deps.lane, v0_commit=deps.v0_commit, now=deps.clock()
+            deps.ledger,
+            deps.workspace,
+            deps.lane,
+            v0_commit=deps.v0_commit,
+            now=deps.clock(),
+            usage=deps.usage,
         )
 
     def _state(self) -> LaneState:

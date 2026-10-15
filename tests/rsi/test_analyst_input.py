@@ -18,6 +18,8 @@ from goaly.bench.effisql.splits import EffiSqlSplits
 from goaly.contracts.gen.experiment_pb2 import (
     CHANGE_KIND_PROMPT,
     CHANGE_KIND_SKILL,
+    DECISION_ABORTED,
+    DECISION_PENDING,
     DECISION_REJECTED,
     GUARD_ALLOWED_PATHS,
     GUARD_UNIT_TESTS,
@@ -37,6 +39,7 @@ from goaly.contracts.gen.task_pb2 import (
     GRADE_STATUS_GRADED,
     GRADE_STATUS_GRADER_ERROR,
     GRADE_STATUS_PREDICTION_FAILED,
+    SPLIT_HELDOUT,
     SPLIT_TRAIN,
     SPLIT_VAL,
     EffiSqlGrade,
@@ -57,6 +60,7 @@ from goaly.contracts.gen.trajectory_pb2 import (
 from goaly.rsi.analyst import Analysis, AnalystAnswer, AnalystInput, analyze
 from goaly.rsi.analyst_input import CHARS_PER_TOKEN, build_analyst_input
 from goaly.rsi.ledger import Ledger
+from goaly.rsi.lessons import LessonStore
 from goaly.rsi.structured import format_instructions
 from tests.bench.effisql.synthetic import task
 from tests.rsi.fake_llm import FakeGlm
@@ -174,6 +178,7 @@ def phase(split: Any, flagged: Sequence[str]) -> PhaseResult:
         losses=2,
         sign_test_p=0.34,
         regressions=1,
+        token_ratio_vs_best=1.2,
         flagged_instance_ids=flagged,
         candidate_run_ids=["VAL-RUN-1"],
         best_run_ids=["VAL-RUN-0"],
@@ -191,6 +196,12 @@ def queued_hypothesis(hypothesis_id: str = "h-queued") -> Hypothesis:
         risk="Longer prompts.",
         source=HYPOTHESIS_SOURCE_IDEA_BANK,
     )
+
+
+def leaky_queued() -> Hypothesis:
+    leaky = queued_hypothesis("h-queued-2")
+    leaky.change = "Copy what worked on IDs 104/77701."
+    return leaky
 
 
 def ledger_with_secrets(directory: Path) -> Ledger:
@@ -213,7 +224,7 @@ def ledger_with_secrets(directory: Path) -> Ledger:
             GuardResult(guard=GUARD_ALLOWED_PATHS, passed=True),
             GuardResult(guard=GUARD_UNIT_TESTS, passed=False, detail="VAL-detail"),
         ],
-        screening=phase(SPLIT_TRAIN, ["103", "77701"]),
+        screening=phase(SPLIT_TRAIN, ["103"]),
         validation=phase(SPLIT_VAL, list(VAL)),
         confirmation=phase(SPLIT_VAL, ["77702"]),
         decision=DECISION_REJECTED,
@@ -221,6 +232,41 @@ def ledger_with_secrets(directory: Path) -> Ledger:
         decision_reason="VAL- task 77701 was hard-coded and 77702 regressed",
     )
     ledger.record_experiment(record)
+    leaky = ExperimentRecord(
+        experiment_id="exp-2",
+        lane=LANE_EFFISQL,
+        round=2,
+        hypothesis=Hypothesis(
+            hypothesis_id="h-leaky",
+            failure_pattern="tasks 101 and 88801 time out",
+            change_kind=CHANGE_KIND_PROMPT,
+            change="Rewrite the way task 77701 does.",
+            source=HYPOTHESIS_SOURCE_ANALYST,
+        ),
+        screening=phase(SPLIT_TRAIN, ["103", "77702"]),  # Mixed: counted, not named.
+        confirmation=phase(SPLIT_HELDOUT, []),  # Never a held-out phase.
+        decision=DECISION_PENDING,
+    )
+    leaky.confirmation.candidate_score = 0.61
+    ledger.record_experiment(leaky)
+    ledger.record_experiment(
+        ExperimentRecord(
+            experiment_id="exp-3",
+            lane=LANE_EFFISQL,
+            round=2,
+            hypothesis=Hypothesis(hypothesis_id="h-3", change_kind=CHANGE_KIND_SKILL),
+            implementer=ImplementerRun(
+                exit=IMPLEMENTER_EXIT_SUBMITTED, summary="See instance #88801."
+            ),
+            decision=DECISION_ABORTED,
+        )
+    )
+    lessons = LessonStore(ledger)
+    lessons.add("L-1", LANE_EFFISQL, "Verify the rows before submitting.", ["exp-1"])
+    lessons.mark_helped("L-1", "exp-1")
+    lessons.add("L-2", LANE_EFFISQL, "Task 77702 regressed when the prompt grew.", ["exp-1"])
+    lessons.add("L-3", LANE_EFFISQL, "A deleted lesson.", ["exp-1"])
+    lessons.delete("L-3")
     return ledger
 
 
@@ -233,7 +279,7 @@ def build(tmp_path: Path, **options: Any) -> AnalystInput:
         best_results=[*results, *secret_results],
         trajectories=[*trajectories, *secret_trajectories],
         instances=[*instances, *secret_instances],
-        queued=[queued_hypothesis()],
+        queued=[queued_hypothesis(), leaky_queued()],
         **options,
     )
 
@@ -283,6 +329,7 @@ def test_the_ledger_summary_keeps_aggregates_and_train_ids_only(tmp_path: Path) 
     assert "flagged tasks: 103" in text  # The screen runs on train.
     assert "Validation: 20 tasks x 1 seeds; R-VES 42.0 vs best 40.0 (delta +2.0)" in text
     assert "2 flagged tasks" in text  # Validation's flags, counted, not named.
+    assert "tokens x1.20 of best" in text
     assert "regressed" not in text  # The decision's free-text reasoning is left out.
 
 
@@ -291,7 +338,7 @@ def test_the_input_shows_the_queue_and_reserves_its_ids(tmp_path: Path) -> None:
     text = prompt(analyst_input)
     assert "hypothesis h-queued [skill, idea_bank]" in text
     assert "(train tasks 104)" in text
-    assert analyst_input.taken_ids == {"h-old", "h-queued"}
+    assert analyst_input.taken_ids == {"h-old", "h-leaky", "h-3", "h-queued", "h-queued-2"}
 
 
 def test_the_input_holds_the_rules_and_the_idea_bank(tmp_path: Path) -> None:
@@ -301,6 +348,10 @@ def test_the_input_holds_the_rules_and_the_idea_bank(tmp_path: Path) -> None:
     )
     assert "solved when its credit is at least 0.75;" in analyst_input.system
     assert "between 0.25 and 0.5" in analyst_input.system
+    assert "precomputed or constant results, even behind a check on\n  the data" in (
+        analyst_input.system
+    )
+    assert "pg_stats" in analyst_input.system  # The introspection and catalog rule.
     assert "Decorrelate subqueries" in analyst_input.user
     assert "$" not in prompt(analyst_input)  # Every placeholder was filled.
 
@@ -328,7 +379,7 @@ def test_whole_failures_are_dropped_lowest_priority_first(
     # Room for 103 and 102, and for half of 104; the budget also keeps room to name the dropped.
     room = whole + 220 - len(summary_of(full, "101")) - len(summary_of(full, "104")) // 2
     tokens = int(room / CHARS_PER_TOKEN)
-    with caplog.at_level(logging.WARNING, logger="goaly.rsi.analyst"):
+    with caplog.at_level(logging.WARNING, logger="goaly.rsi.analyst_input"):
         analyst_input = build(tmp_path / "cut", max_input_tokens=tokens)
     assert analyst_input.shown_task_ids == ("103", "102")
     assert analyst_input.dropped_task_ids == ("104", "101")
@@ -390,7 +441,9 @@ def test_a_failure_without_a_trajectory_is_still_summarized(tmp_path: Path) -> N
         splits=SPLITS,
         ledger=Ledger(tmp_path / "ledger"),
         best_results=[result("101", 0.0), result("102", 0.0)],
-        trajectories=[Trajectory(instance_id="102", error_message="the policy crashed")],
+        trajectories=[
+            Trajectory(run_id="best-run", instance_id="102", error_message="the policy crashed")
+        ],
         instances=[],
         queued=[queued_hypothesis(f"h-{n}") for n in range(25)],
     )
@@ -427,3 +480,239 @@ async def test_an_answer_to_a_built_input_becomes_hypotheses(tmp_path: Path) -> 
     sent = gateway.bodies[0]["messages"]
     assert sent[0]["content"].startswith("You are the failure analyst")
     assert "### Task 103 " in sent[1]["content"]
+
+
+# Free text, lessons and phases (review M1, M2; the lessons follow-up).
+
+
+def events(caplog: pytest.LogCaptureFixture, event: str) -> list[dict[str, Any]]:
+    return [vars(record) for record in caplog.records if vars(record).get("event") == event]
+
+
+def test_free_text_that_names_a_secret_task_is_withheld_and_logged(
+    tmp_path: Path, caplog: pytest.LogCaptureFixture
+) -> None:
+    with caplog.at_level(logging.WARNING, logger="goaly.rsi.analyst_input"):
+        text = prompt(build(tmp_path))
+    assert text.count("[withheld: it names a task outside train]") == 4
+    assert "Implementer: SUBMITTED: [withheld" in text
+    assert "hypothesis h-leaky [prompt, analyst] targeting '[withheld" in text
+    where = {entry["where"] for entry in events(caplog, "analyst_input_withheld")}
+    assert where == {
+        "exp-2: hypothesis h-leaky, failure_pattern",
+        "exp-2: hypothesis h-leaky, change",
+        "experiment exp-3: implementer summary",
+        "queued: hypothesis h-queued-2, change",
+        "lesson L-2",
+    }
+
+
+def test_numbers_that_are_not_task_references_are_kept(tmp_path: Path) -> None:
+    hypothesis = queued_hypothesis()
+    hypothesis.change = "Allow 77701 tokens, and use 88801 as the row limit; see task 104."
+    analyst_input = build_analyst_input(
+        splits=SPLITS,
+        ledger=Ledger(tmp_path / "ledger"),
+        best_results=[result("101", 0.0)],
+        trajectories=[],
+        instances=[],
+        queued=[hypothesis],
+    )
+    assert hypothesis.change in analyst_input.user
+
+
+def test_the_lanes_latest_standing_lessons_are_shown(tmp_path: Path) -> None:
+    ledger = ledger_with_secrets(tmp_path / "ledger")
+    store = LessonStore(ledger)
+    for n in range(12):
+        store.add(f"L-n{n}", LANE_EFFISQL, f"Lesson number {n}.", ["exp-1"])
+    text = build_analyst_input(
+        splits=SPLITS,
+        ledger=ledger,
+        best_results=[result("101", 0.0)],
+        trajectories=[],
+        instances=[],
+        queued=[],
+    ).user
+    shown = [f"Lesson number {n}." for n in range(12) if f"Lesson number {n}." in text]
+    assert shown == [f"Lesson number {n}." for n in range(2, 12)]  # The latest 10.
+    assert "Verify the rows" not in text  # Older than the latest 10.
+
+
+def test_a_lesson_line_shows_its_counts_and_evidence(tmp_path: Path) -> None:
+    text = build(tmp_path).user
+    assert "- L-1 (helped 1, hurt 0; evidence: exp-1): Verify the rows before submitting." in text
+    assert "A deleted lesson." not in text
+    assert "L-2" not in text
+
+
+def test_a_phase_on_the_wrong_split_is_left_out_and_logged(
+    tmp_path: Path, caplog: pytest.LogCaptureFixture
+) -> None:
+    with caplog.at_level(logging.WARNING, logger="goaly.rsi.analyst_input"):
+        text = build(tmp_path).user
+    exp_2 = text[text.index("- exp-2, round 2") : text.index("- exp-3, round 2")]
+    assert "Confirmation" not in exp_2
+    assert "R-VES 61.0" not in text
+    assert "Screening: 20 tasks x 1 seeds" in exp_2
+    assert "2 flagged tasks" in exp_2  # A val ID among them, so none is named.
+    assert "Decision: PENDING\n" in exp_2
+    [wrong] = events(caplog, "analyst_input_wrong_split")
+    assert (wrong["experiment_id"], wrong["phase"], wrong["split"]) == (
+        "exp-2",
+        "confirmation",
+        "SPLIT_HELDOUT",
+    )
+
+
+# Pairing trajectories with results (review I1).
+
+
+def test_a_trajectory_relabelled_from_another_run_is_ignored(tmp_path: Path) -> None:
+    forged = trajectory("101", "SELECT VAL-PRED-77701", errors=["ERROR: VAL- in 77701"])
+    forged.run_id = "best-val-run"
+    analyst_input = build_analyst_input(
+        splits=SPLITS,
+        ledger=Ledger(tmp_path / "ledger"),
+        best_results=[result("101", 0.5)],
+        trajectories=[forged, trajectory("101", "SELECT train_pred_101"), forged],
+        instances=[],
+        queued=[],
+    )
+    assert "SELECT train_pred_101" in analyst_input.user
+    for secret in SECRETS:
+        assert secret not in analyst_input.user
+
+
+def test_a_trajectory_listed_twice_is_left_out(
+    tmp_path: Path, caplog: pytest.LogCaptureFixture
+) -> None:
+    with caplog.at_level(logging.WARNING, logger="goaly.rsi.analyst_input"):
+        analyst_input = build_analyst_input(
+            splits=SPLITS,
+            ledger=Ledger(tmp_path / "ledger"),
+            best_results=[result("101", 0.5)],
+            trajectories=[trajectory("101", "SELECT one"), trajectory("101", "SELECT two")],
+            instances=[],
+            queued=[],
+        )
+    assert "Final SQL: (no trajectory)" in analyst_input.user
+    [duplicate] = events(caplog, "analyst_input_duplicate_trajectories")
+    assert duplicate["tasks"] == ["101 seed 0 of best-run"]
+
+
+def test_a_task_seed_graded_in_two_runs_is_left_out(
+    tmp_path: Path, caplog: pytest.LogCaptureFixture
+) -> None:
+    other = result("101", 0.0)
+    other.run_id = "best-run-2"
+    regraded = result("102", 1.0, speedup=3.0)  # The same run graded again: the last one wins.
+    with caplog.at_level(logging.WARNING, logger="goaly.rsi.analyst_input"):
+        analyst_input = build_analyst_input(
+            splits=SPLITS,
+            ledger=Ledger(tmp_path / "ledger"),
+            best_results=[result("101", 0.5), other, result("102", 0.0), regraded],
+            trajectories=[],
+            instances=[],
+            queued=[],
+        )
+    assert analyst_input.failed_task_ids == frozenset()
+    assert "101 seed" not in analyst_input.user
+    assert "102, unknown, GRADED, matched, tau=3, credit=1" in analyst_input.user
+    [ambiguous] = events(caplog, "analyst_input_ambiguous_results")
+    assert ambiguous["tasks"] == ["101 seed 0"]
+
+
+def test_each_summary_uses_its_own_runs_trajectory(tmp_path: Path) -> None:
+    first, second = result("101", 0.5), result("102", 0.0)
+    second.run_id = "best-run-2"
+    own = trajectory("102", "SELECT from_run_2")
+    own.run_id = "best-run-2"
+    analyst_input = build_analyst_input(
+        splits=SPLITS,
+        ledger=Ledger(tmp_path / "ledger"),
+        best_results=[first, second],
+        trajectories=[
+            trajectory("101", "SELECT from_run_1"),
+            trajectory("102", "SELECT wrong"),
+            own,
+        ],
+        instances=[],
+        queued=[],
+    )
+    assert "SELECT from_run_1" in summary_of(analyst_input, "101")
+    assert "SELECT from_run_2" in summary_of(analyst_input, "102")
+    assert "SELECT wrong" not in analyst_input.user
+
+
+# The budget (review M4) and the rest of the rendering (review M8).
+
+
+def many_experiments(directory: Path, count: int) -> Ledger:
+    ledger = Ledger(directory)
+    for n in range(count):
+        ledger.record_experiment(
+            ExperimentRecord(
+                experiment_id=f"exp-{n}",
+                lane=LANE_EFFISQL,
+                round=n + 1,
+                hypothesis=Hypothesis(
+                    hypothesis_id=f"h-{n}",
+                    change_kind=CHANGE_KIND_PROMPT,
+                    change=f"Change number {n}. " + "x" * 300,
+                    target_instance_ids=list(TRAIN) * 3,
+                ),
+                decision=DECISION_PENDING,
+            )
+        )
+    return ledger
+
+
+def test_the_oldest_experiments_go_when_the_ledger_is_too_long(
+    tmp_path: Path, caplog: pytest.LogCaptureFixture
+) -> None:
+    ledger = many_experiments(tmp_path / "ledger", 45)
+    options: dict[str, Any] = {
+        "splits": SPLITS,
+        "ledger": ledger,
+        "best_results": [result("101", 0.0)],
+        "trajectories": [],
+        "instances": [],
+        "queued": [],
+    }
+    full = build_analyst_input(**options, max_input_tokens=10**6)
+    whole = full.user
+    assert "(5 earlier experiments are not shown.)" in whole  # At most 40 are shown.
+    assert "(train tasks 101, 102, 103, 104, 105, 101, 102, 103, 104, 105 and 5 more)" in whole
+    size = len(prompt(full)) + len(format_instructions(AnalystAnswer))
+    tokens = int((size - 3000) / CHARS_PER_TOKEN)  # Room for several experiments fewer.
+    with caplog.at_level(logging.WARNING, logger="goaly.rsi.analyst_input"):
+        cut = build_analyst_input(**options, max_input_tokens=tokens)
+    [event] = events(caplog, "analyst_input_sections_cut")
+    hidden = 5 + event["cut"]["ledger"]
+    assert event["cut"]["ledger"] > 0
+    assert f"({hidden} earlier experiments are not shown.)" in cut.user
+    assert f"Change number {hidden - 1}." not in cut.user
+    assert f"Change number {hidden}." in cut.user
+    size = len(prompt(cut)) + len(format_instructions(AnalystAnswer))
+    assert size <= tokens * CHARS_PER_TOKEN
+    with pytest.raises(ValueError, match="before any failure"):
+        build_analyst_input(**options, max_input_tokens=500)
+
+
+def test_flags_are_named(tmp_path: Path) -> None:
+    literal = result("101", 0.0, speedup=1000.0)
+    literal.grade.effisql.literal_result = True
+    both = result("102", 0.0, speedup=1000.0, alt_matched=False)
+    both.grade.effisql.literal_result = True
+    text = build_analyst_input(
+        splits=SPLITS,
+        ledger=Ledger(tmp_path / "ledger"),
+        best_results=[literal, both, result("103", 0.0, speedup=1000.0, alt_matched=True)],
+        trajectories=[],
+        instances=[],
+        queued=[],
+    ).user
+    assert "101, unknown, GRADED, matched, tau=1e+03, credit=0, flags=literal_result" in text
+    assert "flags=hard_coded+literal_result" in text
+    assert "103, unknown, GRADED, matched, tau=1e+03, credit=0\n" in text

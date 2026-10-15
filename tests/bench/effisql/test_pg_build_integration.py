@@ -46,7 +46,7 @@ SF001 = Dataset(
     },
 )
 CONTAINER = "goaly-effisql-itest-build"
-PORT = 55449
+PORT = 25449  # Below the ephemeral range, as in conftest.py.
 
 
 def test_the_golden_build_loads_verifies_and_describes_the_database(tmp_path: Path) -> None:
@@ -64,6 +64,8 @@ def test_the_golden_build_loads_verifies_and_describes_the_database(tmp_path: Pa
 
     def after_load(connect: Connect) -> None:
         with connect("tpch") as conn:
+            # The image's postgresql.conf says '*'; the command line keeps it to loopback.
+            assert conn.execute("SHOW listen_addresses").fetchone() == ("127.0.0.1",)
             for table in TPCH_TABLES:
                 row = conn.execute(f"SELECT count(*) FROM {table}").fetchone()  # noqa: S608
                 counts[table] = row[0] if row else -1
@@ -88,6 +90,9 @@ def test_the_golden_build_loads_verifies_and_describes_the_database(tmp_path: Pa
     record = build_golden(config, password, datasets=[SF001], after_load=after_load)
 
     assert read_golden_record(config.golden_record) == record
+    assert record.server_version is not None
+    assert record.server_version.startswith("16.")
+    assert (record.encoding, record.collation) == ("UTF8", "en_US.utf8")  # The official locale.
     assert record.databases["tpch"].tables == dict(SF001.files)
     assert (config.golden_pgdata / "PG_VERSION").read_text().strip() == "16"
     assert pg_containers.state(CONTAINER) is None

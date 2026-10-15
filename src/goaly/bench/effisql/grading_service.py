@@ -36,7 +36,12 @@ from pathlib import Path
 from typing import IO, TYPE_CHECKING, Any, Protocol, Self
 
 from goaly.bench.effisql.data import EffiSqlInstance
-from goaly.bench.effisql.grader import GraderError, TimingError, time_interleaved
+from goaly.bench.effisql.grader import (
+    STATEMENT_TIMEOUT_S,
+    GraderError,
+    TimingError,
+    time_interleaved,
+)
 from goaly.bench.effisql.grading import (
     BaseCache,
     GradingSlot,
@@ -50,6 +55,7 @@ from goaly.bench.effisql.grading_pool import GradingInstance, GradingPool, Prior
 from goaly.bench.effisql.pg_build import Connect, connector
 from goaly.bench.effisql.pg_settings import GRADER_ROLE, load_credentials
 from goaly.contracts.gen.task_pb2 import GRADE_STATUS_GRADER_ERROR, Grade, Prediction
+from goaly.contracts.interfaces import JsonValue
 
 __all__ = [
     "EffiSqlGrader",
@@ -224,11 +230,14 @@ class ProcessRunner:
         _log.error("grading worker died", extra={"instance": self.instance.name})
         self._executor.shutdown(wait=False, cancel_futures=True)
         self._start()
-        # The dead worker's statement ends by the server's statement_timeout. Hold the instance
-        # back after repeated deaths, so this runner does not win every lease and fail it.
+        # The dead worker's statement keeps running until the server's statement_timeout ends
+        # it, and the grader's role may not cancel it: hold the instance back that long, so it
+        # never disturbs the next evaluation's timing. After repeated deaths, hold it back
+        # longer, so this runner does not win every lease and fail it.
+        pause = STATEMENT_TIMEOUT_S
         if self._deaths >= _BACKOFF_AFTER:
-            pause = min(_BACKOFF_STEP_S * (self._deaths - _BACKOFF_AFTER + 1), _BACKOFF_MAX_S)
-            await asyncio.sleep(pause)
+            pause += min(_BACKOFF_STEP_S * (self._deaths - _BACKOFF_AFTER + 1), _BACKOFF_MAX_S)
+        await asyncio.sleep(pause)
 
     def close(self) -> None:
         """Stop the worker, waiting a bounded time for it, then release the instance's lock.
@@ -247,12 +256,14 @@ class ProcessRunner:
 
 def _lock_instance(lock_dir: Path, instance: GradingInstance) -> IO[str]:
     lock_dir.mkdir(parents=True, exist_ok=True)
-    handle = (lock_dir / f"{instance.name}.lock").open("w", encoding="utf-8")
+    # Append mode, so a refused second grader never truncates the holder's PID.
+    handle = (lock_dir / f"{instance.name}.lock").open("a", encoding="utf-8")
     try:
         fcntl.flock(handle, fcntl.LOCK_EX | fcntl.LOCK_NB)
     except BlockingIOError:
         handle.close()
         raise GraderError(f"another grader process is grading on {instance.name}") from None
+    handle.truncate(0)
     handle.write(f"{os.getpid()}\n")
     handle.flush()
     return handle
@@ -303,10 +314,29 @@ def probe_identity(slot: GradingSlot, inst: EffiSqlInstance) -> float:
 
 
 def grade_on_slot(
-    slot: GradingSlot, inst: EffiSqlInstance, sql: str | None, mode: Mode, cache: BaseCache | None
-) -> Grade:
-    """Grade on ``slot``: the work a runner runs for :meth:`EffiSqlGrader.grade`."""
-    return slot.evaluate(inst, sql, mode, cache)
+    slot: GradingSlot,
+    inst: EffiSqlInstance,
+    sql: str | None,
+    mode: Mode,
+    cache: BaseCache | None,
+    final_attempt: bool = True,
+) -> tuple[Grade, dict[str, Any] | None]:
+    """Grade on ``slot``: the work a runner runs for :meth:`EffiSqlGrader.grade`. Return the
+    grade and the prediction's plan document, or None if no plan was taken."""
+    plans: list[dict[str, Any]] = []
+    grade = slot.evaluate(inst, sql, mode, cache, plans, final_attempt)
+    return grade, plans[-1] if plans else None
+
+
+def _report_plan(
+    on_plan: Callable[[str, JsonValue], None], instance_id: str, plan: dict[str, Any]
+) -> None:
+    """Hand the plan root to the caller's hook; a failing hook never fails the grade."""
+    root = plan.get("Plan", plan)
+    try:
+        on_plan(instance_id, root)
+    except Exception:  # noqa: BLE001  # The audit trail is the caller's; the grade stands.
+        _log.exception("the plan hook failed", extra={"instance_id": instance_id})
 
 
 class EffiSqlGrader:
@@ -355,8 +385,14 @@ class EffiSqlGrader:
         mode: Mode,
         *,
         priority: Priority = Priority.RSI,
+        on_plan: Callable[[str, JsonValue], None] | None = None,
     ) -> Grade:
-        """Grade ``prediction`` for ``inst``. Grading trouble sets the status; it never raises."""
+        """Grade ``prediction`` for ``inst``. Grading trouble sets the status; it never raises.
+
+        ``on_plan`` is called once, with the instance ID and the prediction's ``EXPLAIN (FORMAT
+        JSON)`` plan root, when the graded attempt took the plan; a prediction graded without
+        one, such as an empty answer or an identity submission in dev mode, gives none.
+        """
         sql = prediction_sql(inst, prediction)
         cache = self._dev_cache if mode is Mode.DEV else None
         try:
@@ -364,9 +400,18 @@ class EffiSqlGrader:
             if quick is not None:
                 return quick
             for attempt in range(1, _GRADER_ERROR_ATTEMPTS + 1):
-                async with self._pool.lease(priority) as runner:
-                    grade = await runner.call(grade_on_slot, inst, sql, mode, cache)
-                if grade.status != GRADE_STATUS_GRADER_ERROR or attempt == _GRADER_ERROR_ATTEMPTS:
+                final = attempt == _GRADER_ERROR_ATTEMPTS
+                plan = None
+                try:
+                    async with self._pool.lease(priority) as runner:
+                        grade, plan = await runner.call(
+                            grade_on_slot, inst, sql, mode, cache, final
+                        )
+                except GraderError as error:  # A worker died: retried like a returned failure.
+                    grade = grader_error(inst, f"grader: {error}")
+                if grade.status != GRADE_STATUS_GRADER_ERROR or final:
+                    if on_plan is not None and plan is not None:
+                        _report_plan(on_plan, inst.instance_id, plan)
                     return grade
                 _log.warning(
                     "retrying a grader failure",

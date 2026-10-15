@@ -70,8 +70,104 @@ def test_a_parallel_scan_counts_the_rows_of_all_its_processes() -> None:
             **{"Parallel Aware": True, "Actual Rows": rows_per_process, "Actual Loops": 3},
         )
 
-    assert not foreign_scale_plan(_root(parallel(1_500_000)))
-    assert foreign_scale_plan(_root(parallel(5_000_000)))
+    assert not foreign_scale_plan(_root(parallel(1_500_000)))  # 4.5M rows in all: SF3's orders.
+    # 2M per process is within SF3's 4.5M rows, but the three processes read 6M in all.
+    assert foreign_scale_plan(_root(parallel(2_000_000)))
+
+
+def test_a_scan_just_above_the_sf3_size_is_still_native() -> None:
+    estimate = int(17_996_609 * 1.05)  # Within the margin a fresh ANALYZE can overshoot by.
+
+    assert not foreign_scale_plan(_root(_scan("lineitem", estimate)))
+    assert foreign_scale_plan(_root(_scan("lineitem", int(17_996_609 * 1.15))))
+
+
+def _task_40(subplan_loops: int) -> dict[str, object]:
+    """Task 40's plan: a lineitem scan whose filter runs a subplan once per row it reads."""
+    inner = _scan(
+        "lineitem",
+        149,
+        **{"Node Type": "Index Scan", "Actual Rows": 5, "Actual Loops": subplan_loops},
+    )
+    subplan = {
+        "Node Type": "Aggregate",
+        "Parent Relationship": "SubPlan",
+        "Actual Rows": 1,
+        "Actual Loops": subplan_loops,
+        "Plan Rows": 1,
+        "Plans": [inner],
+    }
+    return _scan(
+        "lineitem", 299_959, **{"Actual Rows": 15_240_492, "Actual Loops": 1, "Plans": [subplan]}
+    )
+
+
+def test_a_filter_subplan_counts_the_rows_its_scan_read() -> None:
+    assert foreign_scale_plan(_task_40(subplan_loops=59_986_052))  # SF10's lineitem.
+    assert not foreign_scale_plan(_task_40(subplan_loops=17_996_609))  # SF3's.
+
+
+def test_rows_removed_by_the_filter_count_as_rows_read() -> None:
+    def scan(removed: int) -> dict[str, object]:
+        counts = {"Actual Rows": 1_000_000, "Actual Loops": 1, "Rows Removed by Filter": removed}
+        return _scan("lineitem", 1_000_000, **counts)
+
+    assert foreign_scale_plan(_root(scan(58_986_052)))  # 59,986,052 read: SF10.
+    assert not foreign_scale_plan(_root(scan(16_996_609)))  # 17,996,609 read: SF3.
+
+
+def test_a_parallel_scan_counts_rows_read_over_its_processes() -> None:
+    counts = {"Parallel Aware": True, "Actual Rows": 500_000, "Actual Loops": 3}
+
+    assert foreign_scale_plan(
+        _root(_scan("orders", 1, **counts, **{"Rows Removed by Filter": 4_500_000}))
+    )
+    assert not foreign_scale_plan(
+        _root(_scan("orders", 1, **counts, **{"Rows Removed by Filter": 1_000_000}))
+    )
+
+
+def _filtered(subplan_loops: int, **scan: object) -> dict[str, object]:
+    subplan = {
+        "Node Type": "Result",
+        "Parent Relationship": "SubPlan",
+        "Actual Loops": subplan_loops,
+    }
+    return _scan("orders", 1, **{**scan, "Plans": [subplan]})
+
+
+def test_a_filter_subplan_is_counted_per_pass_of_its_scan() -> None:
+    # SF3: an orders lookup for each of lineitem's rows, with a subplan in the lookup's filter.
+    inner = _filtered(
+        17_996_609, **{"Node Type": "Index Scan", "Actual Rows": 1, "Actual Loops": 17_996_609}
+    )
+
+    assert not foreign_scale_plan(_root(inner))  # One row read per pass.
+
+
+def test_a_parallel_scans_subplan_loops_are_already_summed_over_its_processes() -> None:
+    # SF3: orders' 4,500,000 rows read by 3 processes, the filter's subplan run once for each.
+    parallel = _filtered(
+        4_500_000, **{"Parallel Aware": True, "Actual Rows": 1_500_000, "Actual Loops": 3}
+    )
+
+    assert not foreign_scale_plan(_root(parallel))
+    assert foreign_scale_plan(_root(_filtered(15_000_000, **{"Parallel Aware": True})))  # SF10.
+
+
+def test_an_inner_scan_looping_once_per_outer_row_is_no_sign_of_scale() -> None:
+    # Task 148 on SF3: a supplier lookup for each of lineitem's 17,996,609 rows.
+    inner = _scan(
+        "supplier", 1, **{"Node Type": "Index Scan", "Actual Rows": 1, "Actual Loops": 17_996_609}
+    )
+
+    assert not foreign_scale_plan(_root(inner))
+
+
+def test_only_scan_nodes_count_even_if_they_name_a_relation() -> None:
+    update = {"Node Type": "ModifyTable", "Relation Name": "orders", "Plan Rows": 15_000_000}
+
+    assert not foreign_scale_plan(_root(update))
 
 
 def test_tables_outside_tpch_are_ignored() -> None:
@@ -122,6 +218,7 @@ def test_plan_requests_cover_tasks_without_a_plan_or_with_a_foreign_one(tmp_path
         _task(4, plan={}),
         _task(5, plan=foreign),
         _task(6, db="solar_panel"),
+        _task(7, plan="  \n"),
         "",
     ]
     path.write_text("\n".join(lines))
@@ -133,6 +230,7 @@ def test_plan_requests_cover_tasks_without_a_plan_or_with_a_foreign_one(tmp_path
         PlanRequest(instance_id="3", base_sql="SELECT 3", reason="no plan"),
         PlanRequest(instance_id="4", base_sql="SELECT 4", reason="no plan"),
         PlanRequest(instance_id="5", base_sql="SELECT 5", reason="foreign scale"),
+        PlanRequest(instance_id="7", base_sql="SELECT 7", reason="no plan"),
     ]
 
 

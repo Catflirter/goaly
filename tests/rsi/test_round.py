@@ -224,6 +224,12 @@ async def test_a_queue_short_of_k_still_runs_when_the_analysis_is_skipped(
     world.queue_up("bad-1")
     outcome = await world.runner(llm).run(1)
     assert outcome.decided == 1
+    # The invalid analysis's calls are charged to the round's experiment (3 calls x $0.03).
+    (record,) = latest(world).values()
+    (analyst,) = [
+        u for u in record.usage_by_purpose if u.purpose == CallPurpose.CALL_PURPOSE_RSI_ANALYST
+    ]
+    assert analyst.usage.cost_usd == pytest.approx(0.09)
 
 
 async def test_the_screen_targets_failures_then_draws_solved_tasks(

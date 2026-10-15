@@ -45,10 +45,12 @@ class FakeGlm:
     def __init__(self, *replies: GlmReply | str) -> None:
         self.replies = [GlmReply(reply) if isinstance(reply, str) else reply for reply in replies]
         self.bodies: list[dict[str, Any]] = []
+        self.read_timeouts: list[float | None] = []  # Each request's read timeout, in seconds.
         self.recorder = Recorder()
 
     async def handle(self, request: httpx.Request) -> httpx.Response:
         self.bodies.append(json.loads(request.content))
+        self.read_timeouts.append(request.extensions.get("timeout", {}).get("read"))
         reply = self.replies.pop(0)
         body = {
             "id": f"chatcmpl-{len(self.bodies)}",

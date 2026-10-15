@@ -30,10 +30,13 @@ Synchronous code in a worker thread, such as the mini-swe-agent that RSI's imple
 (T20), calls ``complete_sync``, which runs the call on the client's own loop.
 
 The API key goes in the Authorization header and nowhere else: no message, log line, repr or
-record holds it, and the client removes it from any text it quotes from the gateway.
+record holds it, and the client removes it from any text it quotes from the gateway. Each request
+also carries the call's tags in an ``X-Goaly-Call-Tags`` header, for the host's proxy, which
+records every call from the solve container (``llm_proxy``, spec §6.1).
 """
 
 import asyncio
+import concurrent.futures
 import contextlib
 import json
 import logging
@@ -80,6 +83,9 @@ from goaly.harness.core.llm_throttle import (
 from goaly.harness.core.settings import Settings
 
 __all__ = [
+    "CALL_TAGS_HEADER",
+    "REQUEST_KEYS",
+    "THINKING_SWITCHES",
     "BoundLlm",
     "BoundLlmClient",
     "CallRecorder",
@@ -88,7 +94,9 @@ __all__ = [
     "JsonlCallRecorder",
     "LlmClient",
     "LlmReply",
+    "MemoryCallRecorder",
     "RetryPolicy",
+    "judge_response",
 ]
 
 _logger = logging.getLogger(__name__)
@@ -98,7 +106,6 @@ _S = LlmCallStatus
 # LiteLLM marks a prompt too long by itself, but passes SGLang's message on as a plain
 # BadRequestError when the prompt fits and max_tokens does not.
 _CONTEXT_OVERFLOW_MARKS: Final = ("contextwindowexceedederror", "maximum context length")
-_THINKING_SWITCHES: Final = ("enable_thinking", "preserve_thinking")
 _ROLES: Final = {
     ChatRole.CHAT_ROLE_SYSTEM: "system",
     ChatRole.CHAT_ROLE_USER: "user",
@@ -112,9 +119,10 @@ _QUOTE_CHARS: Final = 500  # How much of the gateway's error text an error messa
 class RetryPolicy(BaseModel):
     """How long an attempt may take, and how the client retries a failed one (spec §5.1, §6.2).
 
-    ``timeout_s`` runs from sending an attempt's request to reading all of its response. A retry
-    waits for full jitter on an exponential backoff, or for the server's Retry-After when that is
-    longer; either way no longer than ``backoff_cap_s``.
+    ``timeout_s`` runs from sending an attempt's request to reading all of its response; a call
+    may give its attempts longer (LlmClient.complete's ``attempt_timeout_s``). A retry waits for
+    full jitter on an exponential backoff, or for the server's Retry-After when that is longer;
+    either way no longer than ``backoff_cap_s``.
     """
 
     model_config = ConfigDict(frozen=True, extra="forbid", allow_inf_nan=False)
@@ -177,6 +185,16 @@ class CallRecorder(Protocol):
         does, the client logs the lost record and goes on, so a call never loses its reply or
         its own error to its recorder.
         """
+
+
+class MemoryCallRecorder:
+    """A CallRecorder that keeps the records it gets, in order, for scripts and tests."""
+
+    def __init__(self) -> None:
+        self.records: list[LlmCallRecord] = []
+
+    def record(self, record: LlmCallRecord) -> None:
+        self.records.append(record)
 
 
 class JsonlCallRecorder:
@@ -258,6 +276,7 @@ class BoundLlm(Protocol):
         *,
         tools: Sequence[Mapping[str, JsonValue]] = (),
         params: ModelParams | None = None,
+        attempt_timeout_s: float | None = None,
     ) -> LlmReply:
         """Send ``messages`` and return the assistant's reply, as LlmClient.complete does."""
 
@@ -269,8 +288,9 @@ class LlmClient:
     ``shares`` gives every model this process's share of its budget, a positive int each (spec
     §6.2). The runner passes the shares of the phase it runs in. Without them each model gets its
     whole budget (llm_throttle.DEFAULT_SHARES), right only for a process that runs alone.
-    ``transport``, ``clock`` and ``rng`` are for tests: a mock transport, a clock that skips
-    waits, and a seeded source of jitter.
+    With ``settings.llm_uds`` set, the client connects through that Unix socket, as the solve
+    container reaches the host's proxy (spec §6.1). ``transport``, ``clock`` and ``rng`` are for
+    tests: a mock transport, a clock that skips waits, and a seeded source of jitter.
     """
 
     def __init__(
@@ -310,16 +330,11 @@ class LlmClient:
             for model, share in shares.items()
         }
         self._loop: asyncio.AbstractEventLoop | None = None  # Set by the first async use.
+        self._closed = False
         self._api_key = settings.api_key
         headers = {"Authorization": f"Bearer {settings.api_key.get_secret_value()}"}
         self._http = {  # One connection pool per model, as large as its share.
-            model: httpx.AsyncClient(
-                base_url=settings.base_url,
-                headers=headers,
-                timeout=self._retry.timeout_s,
-                limits=httpx.Limits(max_connections=share, max_keepalive_connections=share),
-                transport=transport,
-            )
+            model: _http_client(settings, share, self._retry.timeout_s, headers, transport)
             for model, share in shares.items()
         }
 
@@ -336,10 +351,12 @@ class LlmClient:
         await self.aclose()
 
     async def aclose(self) -> None:
-        """Close the client's connections; it cannot make calls after.
+        """Close the client's connections. A call made after raises RuntimeError, with no record.
 
-        Every model's pool is closed, even when closing another fails.
+        Every model's pool is closed, even when closing another fails. A call in flight ends with
+        RuntimeError too, its attempt recorded as cancelled, since this client cut it off.
         """
+        self._closed = True
         async with contextlib.AsyncExitStack() as pools:
             for http in self._http.values():
                 pools.push_async_callback(http.aclose)
@@ -352,11 +369,14 @@ class LlmClient:
         tags: CallTags,
         tools: Sequence[Mapping[str, JsonValue]] = (),
         params: ModelParams | None = None,
+        attempt_timeout_s: float | None = None,
     ) -> LlmReply:
         """Send ``messages`` to ``model`` and return the assistant's reply.
 
         ``tools`` are OpenAI tool entries, as core's tool registry makes them (T04). ``params``
-        override the fields of the model's profile that they set.
+        override the fields of the model's profile that they set. ``attempt_timeout_s`` gives
+        each of this call's attempts that long instead of RetryPolicy.timeout_s, for a reply
+        that takes longer to write: a GLM answer of 24K tokens, at about 45 tokens/s, needs 900 s.
 
         A purpose that may not use ``model`` raises ModelNotAllowed, and arguments that cannot
         be sent raise ValueError, both before any I/O and with no record. Any other call gets
@@ -364,8 +384,12 @@ class LlmClient:
         asyncio.CancelledError goes through at once, with no retry.
         """
         self._bind_loop()
+        self._check_open()
         if allowed_model(tags.purpose) != model:
             raise self._refuse(model, tags)
+        timeout_s = self._retry.timeout_s if attempt_timeout_s is None else attempt_timeout_s
+        if not (math.isfinite(timeout_s) and timeout_s > 0):
+            raise ValueError(f"attempt_timeout_s must be a positive time, not {timeout_s!r}")
         body = _request_body(self._profiles[model].with_overrides(params), messages, tools)
         record = LlmCallRecord(
             call_id=uuid.uuid4().hex,
@@ -378,8 +402,8 @@ class LlmClient:
         record.started_at.GetCurrentTime()
         start = self._clock.monotonic()
         try:
-            response = await self._send(body, record)
-            self._read_usage(response, record)
+            response = await self._send(body, record, timeout_s)
+            _read_usage(response, record)
         finally:
             self._finish(record, start)
         choice = response.choices[0]
@@ -393,6 +417,8 @@ class LlmClient:
         tags: CallTags,
         tools: Sequence[Mapping[str, JsonValue]] = (),
         params: ModelParams | None = None,
+        attempt_timeout_s: float | None = None,
+        timeout_s: float | None = None,
     ) -> LlmReply:
         """Make a call from a worker thread: run complete() on the client's loop and wait for it.
 
@@ -404,9 +430,16 @@ class LlmClient:
             async with LlmClient(settings, recorder) as llm:
                 await asyncio.to_thread(run_agent, llm)  # The agent's model calls complete_sync.
 
-        It returns or raises as complete() does. It raises RuntimeError if the client's loop is
-        not running, or if called in the loop's own thread, where waiting would deadlock. If the
-        loop cancels the call, at shutdown say, it raises concurrent.futures.CancelledError.
+        Cancelling that ``asyncio.to_thread`` does not stop the worker thread. Stop the agents and
+        join them before leaving ``async with``: a call after the client closes raises
+        RuntimeError.
+
+        It returns or raises as complete() does. It raises RuntimeError if the client is closed,
+        if its loop is not running, or if called in the loop's own thread, where waiting would
+        deadlock. If the loop cancels the call, at shutdown say, it raises
+        asyncio.CancelledError, which ``except Exception`` does not catch. If ``timeout_s`` passes
+        first, it cancels the call and raises TimeoutError; a ``timeout_s`` that is not a positive
+        time raises ValueError before the call is sent.
         """
         loop = self._loop
         if loop is None:
@@ -419,8 +452,29 @@ class LlmClient:
             running = None
         if running is loop:
             raise RuntimeError("complete_sync would block the loop it needs: await complete()")
-        call = self.complete(messages, model=model, tags=tags, tools=tools, params=params)
-        return asyncio.run_coroutine_threadsafe(call, loop).result()
+        if timeout_s is not None and not (math.isfinite(timeout_s) and timeout_s > 0):
+            raise ValueError(f"timeout_s must be a positive time, not {timeout_s!r}")
+        self._check_open()
+        call = self.complete(
+            messages,
+            model=model,
+            tags=tags,
+            tools=tools,
+            params=params,
+            attempt_timeout_s=attempt_timeout_s,
+        )
+        try:
+            future = asyncio.run_coroutine_threadsafe(call, loop)
+        except RuntimeError:  # The loop closed since the check above.
+            call.close()
+            raise
+        try:
+            return future.result(timeout_s)
+        except concurrent.futures.TimeoutError:
+            future.cancel()  # Its record says the call was cancelled.
+            raise TimeoutError(f"{model}: no reply within {timeout_s:g} s") from None
+        except concurrent.futures.CancelledError:
+            raise asyncio.CancelledError from None
 
     def bind(self, *, model: str, tags: CallTags) -> "BoundLlmClient":
         """Return a client whose calls all go to ``model``, tagged ``tags``.
@@ -432,6 +486,10 @@ class LlmClient:
         if allowed_model(tags.purpose) != model:
             raise self._refuse(model, tags)
         return BoundLlmClient(self, model, tags)
+
+    def _check_open(self) -> None:
+        if self._closed:
+            raise RuntimeError("the LlmClient is closed; it makes no more calls")
 
     def _bind_loop(self) -> None:
         """Make the running loop the client's own, the one its connections and limits live on."""
@@ -461,15 +519,20 @@ class LlmClient:
         may = f"it may call only {allowed}" if allowed else "it may call no model"
         return ModelNotAllowed(f"{purpose} may not call {model}: {may}")
 
-    async def _send(self, body: bytes, record: LlmCallRecord) -> _WireResponse:
-        """Make attempts until one succeeds, one fails for good, or the retries run out."""
+    async def _send(self, body: bytes, record: LlmCallRecord, timeout_s: float) -> _WireResponse:
+        """Make attempts until one succeeds, one fails for good, or the retries run out.
+
+        Each attempt may take ``timeout_s``.
+        """
         delay = 0.0
         while True:
-            outcome = await self._attempt(record, record.attempts.add(), body, delay)
+            outcome = await self._attempt(record, record.attempts.add(), body, delay, timeout_s)
             if outcome.cost_usd is not None:
                 record.usage.cost_usd += outcome.cost_usd  # Every attempt the gateway billed.
             if outcome.response is not None:
                 return outcome.response
+            if outcome.status == _S.LLM_CALL_STATUS_CANCELLED:
+                raise RuntimeError(f"{record.model}: the LlmClient closed during the call")
             retries = len(record.attempts) - 1
             if outcome.status not in TRANSIENT_FAILURES or retries >= self._retry.max_retries:
                 count = f"{retries + 1} attempt{'s' if retries else ''}"
@@ -479,7 +542,12 @@ class LlmClient:
             self._log_backoff(record, outcome, delay)
 
     async def _attempt(
-        self, record: LlmCallRecord, attempt: LlmCallAttempt, body: bytes, delay: float
+        self,
+        record: LlmCallRecord,
+        attempt: LlmCallAttempt,
+        body: bytes,
+        delay: float,
+        timeout_s: float,
     ) -> _Outcome:
         """Wait ``delay`` and then for a slot, send the request once, and fill in ``attempt``.
 
@@ -494,7 +562,7 @@ class LlmClient:
                 await self._clock.sleep(delay)
             async with throttle.slot(record):
                 sent = self._clock.monotonic()
-                outcome = await self._request(self._http[record.model], body, record)
+                outcome = await self._request(self._http[record.model], body, record, timeout_s)
                 throttle.observe(outcome.status, outcome.http_status, sent, record)
         except asyncio.CancelledError:
             attempt.status = _S.LLM_CALL_STATUS_CANCELLED
@@ -510,14 +578,21 @@ class LlmClient:
         return outcome
 
     async def _request(
-        self, http: httpx.AsyncClient, body: bytes, record: LlmCallRecord
+        self, http: httpx.AsyncClient, body: bytes, record: LlmCallRecord, timeout_s: float
     ) -> _Outcome:
         """Send the request and say how it went. Only cancellation and bugs raise."""
+        if self._closed:  # It closed while this attempt waited: send nothing.
+            return _Outcome(_S.LLM_CALL_STATUS_CANCELLED)
         try:
-            async with asyncio.timeout(self._retry.timeout_s):
-                response = await http.post("/chat/completions", content=body, headers=_JSON_HEADERS)
+            async with asyncio.timeout(timeout_s):
+                response = await http.post(
+                    "/chat/completions",
+                    content=body,
+                    headers=_call_headers(record),
+                    timeout=timeout_s,
+                )
         except (TimeoutError, httpx.TimeoutException):
-            detail = f"no response within {self._retry.timeout_s:g} s"
+            detail = f"no response within {timeout_s:g} s"
             return _Outcome(_S.LLM_CALL_STATUS_TIMEOUT, detail=detail)
         except httpx.LocalProtocolError as error:
             # The request itself breaks HTTP, so a retry fails the same way. The error's text
@@ -530,76 +605,7 @@ class LlmClient:
         except httpx.RequestError as error:  # For example, a body that cannot be decoded.
             detail = self._quote(f"unreadable response: {type(error).__name__}: {error}")
             return _Outcome(_S.LLM_CALL_STATUS_INVALID_RESPONSE, detail=detail)
-        return self._outcome(response, record)
-
-    def _outcome(self, response: httpx.Response, record: LlmCallRecord) -> _Outcome:
-        """Say how an attempt that got ``response`` ended (spec §5.1)."""
-        code = response.status_code
-        retry_after = _retry_after_s(response.headers)
-        cost = self._cost_usd(response.headers, record)
-        if response.is_success:
-            try:
-                parsed = _WireResponse.model_validate_json(response.content)
-            except ValidationError as error:
-                detail = f"HTTP {code}, but no chat completion: {_problems(error)}"
-                return _Outcome(
-                    _S.LLM_CALL_STATUS_INVALID_RESPONSE, code, detail, retry_after, cost
-                )
-            return _Outcome(_S.LLM_CALL_STATUS_OK, code, "", retry_after, cost, parsed)
-        said = self._redact(_error_message(response))
-        if code == httpx.codes.TOO_MANY_REQUESTS:
-            status = _S.LLM_CALL_STATUS_RATE_LIMITED
-        elif code == httpx.codes.REQUEST_TIMEOUT:  # LiteLLM's own upstream request timed out.
-            status = _S.LLM_CALL_STATUS_TIMEOUT
-        elif code >= httpx.codes.INTERNAL_SERVER_ERROR:
-            status = _S.LLM_CALL_STATUS_SERVER_ERROR
-        elif code == httpx.codes.BAD_REQUEST and any(
-            mark in said.lower() for mark in _CONTEXT_OVERFLOW_MARKS
-        ):
-            status = _S.LLM_CALL_STATUS_CONTEXT_OVERFLOW
-        elif code >= httpx.codes.BAD_REQUEST:
-            status = _S.LLM_CALL_STATUS_CLIENT_ERROR
-        else:  # 1xx or 3xx: no chat completion comes that way.
-            status = _S.LLM_CALL_STATUS_INVALID_RESPONSE
-        detail = f"HTTP {code}: {_cut(said)}" if said else f"HTTP {code}"
-        return _Outcome(status, code, detail, retry_after, cost)
-
-    def _cost_usd(self, headers: httpx.Headers, record: LlmCallRecord) -> float | None:
-        """Return the cost the gateway reported in x-litellm-response-cost, or None for none."""
-        value = headers.get("x-litellm-response-cost")
-        if value is None:
-            return None
-        try:
-            cost = float(value)
-        except ValueError:
-            cost = math.nan
-        if math.isfinite(cost) and cost >= 0:
-            return cost
-        _logger.warning(
-            "ignored a malformed cost header",
-            extra={
-                "event": "llm_bad_cost",
-                "model": record.model,
-                "call_id": record.call_id,
-                "value": self._redact(value)[:40],  # Redacted first: a cut could split the key.
-            },
-        )
-        return None
-
-    def _read_usage(self, response: _WireResponse, record: LlmCallRecord) -> None:
-        """Copy the tokens the gateway reported into ``record``, whose cost is already in."""
-        usage = response.usage
-        if usage is None:
-            _logger.warning(
-                "the gateway reported no usage, so the call counts no tokens",
-                extra={"event": "llm_no_usage", "model": record.model, "call_id": record.call_id},
-            )
-            return
-        record.usage.input_tokens = usage.prompt_tokens
-        record.usage.output_tokens = usage.completion_tokens
-        details = usage.completion_tokens_details
-        if details is not None and details.reasoning_tokens is not None:
-            record.usage.reasoning_tokens = details.reasoning_tokens
+        return _outcome(response, record, self._api_key.get_secret_value())
 
     def _finish(self, record: LlmCallRecord, start: float) -> None:
         """Complete ``record`` from its attempts, and hand the recorder a copy of its own."""
@@ -641,10 +647,30 @@ class LlmClient:
         )
 
     def _redact(self, text: str) -> str:
-        return text.replace(self._api_key.get_secret_value(), "[redacted]")
+        return _redact(text, self._api_key.get_secret_value())
 
     def _quote(self, text: str) -> str:
         return _cut(self._redact(text))
+
+
+def _http_client(
+    settings: Settings,
+    share: int,
+    timeout_s: float,
+    headers: Mapping[str, str],
+    transport: httpx.AsyncBaseTransport | None,
+) -> httpx.AsyncClient:
+    """A model's connection pool, of ``share`` connections, by TCP or by settings.llm_uds."""
+    limits = httpx.Limits(max_connections=share, max_keepalive_connections=share)
+    if transport is None and settings.llm_uds is not None:
+        transport = httpx.AsyncHTTPTransport(uds=str(settings.llm_uds), limits=limits)
+    return httpx.AsyncClient(
+        base_url=settings.base_url,
+        headers=headers,
+        timeout=timeout_s,
+        limits=limits,
+        transport=transport,
+    )
 
 
 class BoundLlmClient:
@@ -663,11 +689,39 @@ class BoundLlmClient:
         *,
         tools: Sequence[Mapping[str, JsonValue]] = (),
         params: ModelParams | None = None,
+        attempt_timeout_s: float | None = None,
     ) -> LlmReply:
         """Send ``messages`` to the bound model with the bound tags; see LlmClient.complete."""
         return await self._client.complete(
-            messages, model=self._model, tags=self._tags, tools=tools, params=params
+            messages,
+            model=self._model,
+            tags=self._tags,
+            tools=tools,
+            params=params,
+            attempt_timeout_s=attempt_timeout_s,
         )
+
+
+# The keys a request body may hold, at its top level and in chat_template_kwargs. _request_body
+# writes no others, and the proxy (llm_proxy) forwards no others (spec §6.1).
+REQUEST_KEYS: Final = frozenset(
+    {"model", "messages", "temperature", "top_p", "top_k", "max_tokens", "presence_penalty"}
+    | {"chat_template_kwargs", "tools"}
+)
+THINKING_SWITCHES: Final = ("enable_thinking", "preserve_thinking")
+# The header that tells the proxy which call a request belongs to: compact JSON of its tags.
+CALL_TAGS_HEADER: Final = "X-Goaly-Call-Tags"
+
+
+def _call_headers(record: LlmCallRecord) -> dict[str, str]:
+    """A request's own headers: its content type, and the call's tags, which the proxy records."""
+    tags = {
+        "run_id": record.run_id,
+        "instance_id": record.instance_id,
+        "seed": record.seed,
+        "purpose": CallPurpose.Name(record.purpose),
+    }
+    return {**_JSON_HEADERS, CALL_TAGS_HEADER: json.dumps(tags, separators=(",", ":"))}
 
 
 def _request_body(
@@ -681,7 +735,7 @@ def _request_body(
         "messages": [_wire_message(message) for message in messages],
     }
     params = profile.params.model_dump(exclude_none=True)
-    switches = {name: params.pop(name) for name in _THINKING_SWITCHES if name in params}
+    switches = {name: params.pop(name) for name in THINKING_SWITCHES if name in params}
     body.update(params)  # The sampling fields, named as the wire names them.
     if switches:
         body["chat_template_kwargs"] = switches
@@ -758,6 +812,97 @@ def _assistant_message(message: _WireMessage) -> ChatMessage:
             for call in message.tool_calls or ()
         ],
     )
+
+
+def judge_response(
+    response: httpx.Response, record: LlmCallRecord, *, secret: str
+) -> LlmCallStatus.ValueType:
+    """Say how an attempt that got ``response`` ended, and add the usage it reports to ``record``.
+
+    This is how the client judges each response. The proxy (llm_proxy) judges the gateway's
+    replies with it too, so that its records and the client's agree. ``secret`` is the key, which
+    no log line may quote.
+    """
+    outcome = _outcome(response, record, secret)
+    if outcome.cost_usd is not None:
+        record.usage.cost_usd += outcome.cost_usd
+    if outcome.response is not None:
+        _read_usage(outcome.response, record)
+    return outcome.status
+
+
+def _outcome(response: httpx.Response, record: LlmCallRecord, secret: str) -> _Outcome:
+    """Say how an attempt that got ``response`` ended (spec §5.1)."""
+    code = response.status_code
+    retry_after = _retry_after_s(response.headers)
+    cost = _cost_usd(response.headers, record, secret)
+    if response.is_success:
+        try:
+            parsed = _WireResponse.model_validate_json(response.content)
+        except ValidationError as error:
+            detail = f"HTTP {code}, but no chat completion: {_problems(error)}"
+            return _Outcome(_S.LLM_CALL_STATUS_INVALID_RESPONSE, code, detail, retry_after, cost)
+        return _Outcome(_S.LLM_CALL_STATUS_OK, code, "", retry_after, cost, parsed)
+    said = _redact(_error_message(response), secret)
+    if code == httpx.codes.TOO_MANY_REQUESTS:
+        status = _S.LLM_CALL_STATUS_RATE_LIMITED
+    elif code == httpx.codes.REQUEST_TIMEOUT:  # LiteLLM's own upstream request timed out.
+        status = _S.LLM_CALL_STATUS_TIMEOUT
+    elif code >= httpx.codes.INTERNAL_SERVER_ERROR:
+        status = _S.LLM_CALL_STATUS_SERVER_ERROR
+    elif code == httpx.codes.BAD_REQUEST and any(
+        mark in said.lower() for mark in _CONTEXT_OVERFLOW_MARKS
+    ):
+        status = _S.LLM_CALL_STATUS_CONTEXT_OVERFLOW
+    elif code >= httpx.codes.BAD_REQUEST:
+        status = _S.LLM_CALL_STATUS_CLIENT_ERROR
+    else:  # 1xx or 3xx: no chat completion comes that way.
+        status = _S.LLM_CALL_STATUS_INVALID_RESPONSE
+    detail = f"HTTP {code}: {_cut(said)}" if said else f"HTTP {code}"
+    return _Outcome(status, code, detail, retry_after, cost)
+
+
+def _cost_usd(headers: httpx.Headers, record: LlmCallRecord, secret: str) -> float | None:
+    """Return the cost the gateway reported in x-litellm-response-cost, or None for none."""
+    value = headers.get("x-litellm-response-cost")
+    if value is None:
+        return None
+    try:
+        cost = float(value)
+    except ValueError:
+        cost = math.nan
+    if math.isfinite(cost) and cost >= 0:
+        return cost
+    _logger.warning(
+        "ignored a malformed cost header",
+        extra={
+            "event": "llm_bad_cost",
+            "model": record.model,
+            "call_id": record.call_id,
+            "value": _redact(value, secret)[:40],  # Redacted first: a cut could split the key.
+        },
+    )
+    return None
+
+
+def _read_usage(response: _WireResponse, record: LlmCallRecord) -> None:
+    """Copy the tokens the gateway reported into ``record``, whose cost is already in."""
+    usage = response.usage
+    if usage is None:
+        _logger.warning(
+            "the gateway reported no usage, so the call counts no tokens",
+            extra={"event": "llm_no_usage", "model": record.model, "call_id": record.call_id},
+        )
+        return
+    record.usage.input_tokens = usage.prompt_tokens
+    record.usage.output_tokens = usage.completion_tokens
+    details = usage.completion_tokens_details
+    if details is not None and details.reasoning_tokens is not None:
+        record.usage.reasoning_tokens = details.reasoning_tokens
+
+
+def _redact(text: str, secret: str) -> str:
+    return text.replace(secret, "[redacted]")
 
 
 def _error_message(response: httpx.Response) -> str:

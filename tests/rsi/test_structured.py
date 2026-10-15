@@ -81,6 +81,9 @@ async def test_calls_carry_the_bound_purpose_and_run() -> None:
         f"```json\n{VALID}\n```",
         f"Here is the answer:\n```\n{VALID}\n```\nDone.",
         f"Sure. {VALID} Hope that helps.",
+        f"The rewrite:\n```sql\nSELECT 1\n```\nAnswer:\n```json\n{VALID}\n```",
+        f"```sql\nSELECT 1\n```\nThen:\n```\n{VALID}\n```",
+        f"```JSON\n{VALID}\n```",
     ],
 )
 async def test_json_is_read_from_a_fence_or_from_the_text(content: str) -> None:
@@ -159,6 +162,14 @@ async def test_a_cut_off_reply_is_retried_with_its_reasoning_replayed() -> None:
     assert "cut off at the token limit" in retry[3]["content"]
 
 
+async def test_an_invalid_reply_quotes_the_likeliest_candidates_problems() -> None:
+    content = '```sql\nSELECT 1\n```\n```json\n{"text": "x", "count": "many"}\n```'
+    gateway = FakeGlm(content, VALID)
+    await ask(gateway)
+    feedback = gateway.bodies[1]["messages"][-1]["content"]
+    assert "count: Input should be a valid integer" in feedback
+
+
 async def test_the_context_reaches_the_validators() -> None:
     gateway = FakeGlm(VALID, json.dumps({"text": "y", "count": 1}))
     reply = await ask(gateway, context={"limit": 1})
@@ -170,6 +181,15 @@ async def test_params_are_sent_with_every_attempt() -> None:
     gateway = FakeGlm("nope", VALID)
     await ask(gateway, params=ModelParams(max_tokens=777))
     assert [body["max_tokens"] for body in gateway.bodies] == [777, 777]
+
+
+async def test_the_attempt_timeout_goes_with_every_attempt() -> None:
+    gateway = FakeGlm("nope", VALID)
+    await ask(gateway, attempt_timeout_s=42.0)
+    assert gateway.read_timeouts == [42.0, 42.0]
+    default = FakeGlm(VALID)
+    await ask(default)
+    assert default.read_timeouts == [300.0]
 
 
 async def test_many_problems_are_quoted_in_part() -> None:

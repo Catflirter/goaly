@@ -62,13 +62,13 @@ SCALE_INVARIANT_TABLES = frozenset({"region", "nation"})
 ENVIRONMENT_PROBES = re.compile(
     r"\b(current_database|current_catalog|current_setting|current_user|current_role|"
     r"session_user|inet_server_addr|inet_server_port|inet_client_addr|inet_client_port|"
-    r"pg_backend_pid|version|pg_postmaster_start_time|pg_conf_load_time|pg_relation_size|"
-    r"pg_table_size|pg_indexes_size|pg_total_relation_size|pg_database_size|"
-    r"pg_tablespace_size|pg_relation_filenode|pg_relation_filepath|to_regclass|regclass|"
-    r"tableoid|pg_stat_get_live_tuples|pg_stat_get_dead_tuples|pg_stat_get_numscans|"
-    r"pg_stat_get_tuples_returned|pg_stat_get_tuples_fetched|pg_stat_get_tuples_inserted|"
-    r"pg_stat_get_tuples_updated|pg_stat_get_tuples_deleted|pg_stat_get_blocks_fetched|"
-    r"pg_stat_get_blocks_hit)\b"
+    r"version|to_regclass|regclass|tableoid|"
+    # The broad rule (rrT10 I-2): every pg_ name, function or relation; information_schema;
+    # the *_to_xml family and ts_stat, which run SQL from a string literal; and U& identifiers,
+    # whose escapes would hide a name. Of all 300 tasks' SQL, only task 47's xmlagg comes
+    # close, and it matches none of these.
+    r"pg_\w+|information_schema|\w*_to_xml\w*|ts_stat)\b"
+    r"|\bu&"
 )
 # Children that compute a value for their parent rather than feed it rows.
 _SUBPLAN_LINKS = frozenset({"InitPlan", "SubPlan"})
@@ -132,7 +132,7 @@ def scanned_relations(document: Mapping[str, Any]) -> frozenset[str]:
 def environment_probes(sql: str) -> list[str]:
     """Return the names in ``sql``'s code, outside strings and comments, that probe the
     environment (:data:`ENVIRONMENT_PROBES`), in order of appearance."""
-    return [match.group(1) for match in ENVIRONMENT_PROBES.finditer(_code(sql))]
+    return [match.group(1) or "U&" for match in ENVIRONMENT_PROBES.finditer(_code(sql))]
 
 
 def inspect_plan(

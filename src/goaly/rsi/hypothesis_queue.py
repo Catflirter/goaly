@@ -6,13 +6,11 @@ analyst sees the queue, so it does not propose the same idea again.
 
 The queue is a FIFO of Hypothesis contracts, one JSONL file per lane in the ledger's directory,
 ``hypothesis_queue-<lane>.jsonl``. Every change takes the queue's exclusive file lock and replaces
-the whole file durably: the new content goes to a temporary file that is synced, renamed over the
-old one, and the directory synced too. Readers, which take the shared lock, see the old queue or
+the whole file with the ledger's durable_replace, which also clears the temporary files a crash
+left behind. Readers, which take the shared lock, see the old queue or
 the new one, never part of one, and a crash leaves one of the two.
 """
 
-import os
-import secrets
 from collections.abc import Iterable, Iterator
 from contextlib import contextmanager
 from pathlib import Path
@@ -26,6 +24,7 @@ from goaly.contracts.gen.experiment_pb2 import (
 from goaly.contracts.jsonl import read_jsonl, to_json_line
 from goaly.rsi.ids import check_id
 from goaly.rsi.lanes import lane_info
+from goaly.rsi.ledger import durable_replace, make_directory
 from goaly.rsi.locks import file_lock
 
 __all__ = ["HypothesisQueue"]
@@ -83,7 +82,7 @@ class HypothesisQueue:
     @contextmanager
     def _writing(self) -> Iterator[list[Hypothesis]]:
         """Lock the queue and yield it as a list; the list as the block leaves it is written."""
-        _make_directory(self.directory)
+        make_directory(self.directory)
         with file_lock(self._lock, timeout_s=self._lock_timeout_s):
             queue = self._read()
             before = list(queue)
@@ -92,17 +91,7 @@ class HypothesisQueue:
                 self._write(queue)
 
     def _write(self, queue: list[Hypothesis]) -> None:
-        text = "".join(to_json_line(hypothesis) + "\n" for hypothesis in queue)
-        temporary = self.path.with_name(f".{self.path.name}.{secrets.token_hex(8)}.tmp")
-        try:
-            with temporary.open("x", encoding="utf-8") as file:
-                file.write(text)
-                file.flush()
-                os.fsync(file.fileno())
-            temporary.replace(self.path)
-            _fsync(self.directory)
-        finally:
-            temporary.unlink(missing_ok=True)  # Already gone once it has replaced the queue.
+        durable_replace(self.path, "".join(to_json_line(hypothesis) + "\n" for hypothesis in queue))
 
 
 def _check(hypothesis: Hypothesis) -> None:
@@ -111,18 +100,3 @@ def _check(hypothesis: Hypothesis) -> None:
         raise ValueError(f"hypothesis {hypothesis.hypothesis_id} has no change kind")
     if hypothesis.source == HYPOTHESIS_SOURCE_UNSPECIFIED:
         raise ValueError(f"hypothesis {hypothesis.hypothesis_id} has no source")
-
-
-def _make_directory(directory: Path) -> None:
-    if directory.exists():
-        return
-    directory.mkdir(parents=True, exist_ok=True)
-    _fsync(directory.parent)
-
-
-def _fsync(path: Path) -> None:
-    descriptor = os.open(path, os.O_RDONLY | os.O_CLOEXEC)
-    try:
-        os.fsync(descriptor)
-    finally:
-        os.close(descriptor)
