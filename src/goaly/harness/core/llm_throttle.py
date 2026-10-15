@@ -31,13 +31,22 @@ from pydantic import BaseModel, ConfigDict, Field, PositiveFloat, PositiveInt
 from goaly.contracts.gen.llm_call_pb2 import CallPurpose, LlmCallRecord, LlmCallStatus
 from goaly.harness.core.llm_models import EXECUTOR_MODEL, IMPROVEMENT_MODEL
 
-__all__ = ["DEFAULT_SHARES", "Clock", "ModelThrottle", "SystemClock", "ThrottlePolicy"]
+__all__ = [
+    "DEFAULT_SHARES",
+    "TRANSIENT_FAILURES",
+    "Clock",
+    "ModelThrottle",
+    "SystemClock",
+    "ThrottlePolicy",
+]
 
 _logger = logging.getLogger(__name__)
 
 _S = LlmCallStatus
-# What the breaker counts as the gateway failing: the outcomes the client retries.
-_FAILURES: Final = frozenset(
+# The gateway failing, or too busy, which the client retries: 429, 5xx, timeouts (a 408
+# included) and connection errors. The breaker counts them, and each ends AIMD's run of
+# successes.
+TRANSIENT_FAILURES: Final = frozenset(
     {
         _S.LLM_CALL_STATUS_RATE_LIMITED,
         _S.LLM_CALL_STATUS_SERVER_ERROR,
@@ -141,7 +150,7 @@ class ModelThrottle:
     ) -> None:
         """Take in how an attempt sent at ``sent_at`` ended: feed AIMD and the breaker."""
         now = self._clock.monotonic()
-        self._judge(status in _FAILURES, now, record)
+        self._judge(status in TRANSIENT_FAILURES, now, record)
         if status == _S.LLM_CALL_STATUS_OK:
             self._successes += 1
             if self._successes >= self._policy.successes_to_grow:

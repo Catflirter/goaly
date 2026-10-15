@@ -67,6 +67,7 @@ from goaly.harness.core.llm_models import (
 )
 from goaly.harness.core.llm_throttle import (
     DEFAULT_SHARES,
+    TRANSIENT_FAILURES,
     Clock,
     ModelThrottle,
     SystemClock,
@@ -89,14 +90,6 @@ __all__ = [
 _logger = logging.getLogger(__name__)
 
 _S = LlmCallStatus
-_RETRYABLE: Final = frozenset(
-    {
-        _S.LLM_CALL_STATUS_RATE_LIMITED,
-        _S.LLM_CALL_STATUS_SERVER_ERROR,
-        _S.LLM_CALL_STATUS_TIMEOUT,
-        _S.LLM_CALL_STATUS_CONNECTION_ERROR,
-    }
-)
 # How a 400 says the request does not fit in the context, in both forms seen on 2026-10-15:
 # LiteLLM marks a prompt too long by itself, but passes SGLang's message on as a plain
 # BadRequestError when the prompt fits and max_tokens does not.
@@ -415,7 +408,7 @@ class LlmClient:
             if outcome.response is not None:
                 return outcome.response
             retries = len(record.attempts) - 1
-            if outcome.status not in _RETRYABLE or retries >= self._retry.max_retries:
+            if outcome.status not in TRANSIENT_FAILURES or retries >= self._retry.max_retries:
                 count = f"{retries + 1} attempt{'s' if retries else ''}"
                 message = f"{record.model}: {outcome.detail} ({count})"
                 raise error_type(outcome.status)(message, record=record)
