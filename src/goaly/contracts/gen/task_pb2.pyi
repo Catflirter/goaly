@@ -33,7 +33,10 @@ class _SplitEnumTypeWrapper(_enum_type_wrapper._EnumTypeWrapper[_Split.ValueType
     SPLIT_TRAIN: _Split.ValueType  # 1
     """The analyst may see its trajectories, grader feedback and gold answers."""
     SPLIT_VAL: _Split.ValueType  # 2
-    """Its results go to the decision step and to the final report; the analyst never sees them."""
+    """Its results go to the decision step and to the final report. The analyst never sees its
+    per-task results or its trajectories, only each experiment's decision and aggregate result
+    (spec §7).
+    """
     SPLIT_HELDOUT: _Split.ValueType  # 3
     """Used only for baseline v0's runs and for the final runs."""
     SPLIT_EXTERNAL: _Split.ValueType  # 4
@@ -47,7 +50,10 @@ SPLIT_UNSPECIFIED: Split.ValueType  # 0
 SPLIT_TRAIN: Split.ValueType  # 1
 """The analyst may see its trajectories, grader feedback and gold answers."""
 SPLIT_VAL: Split.ValueType  # 2
-"""Its results go to the decision step and to the final report; the analyst never sees them."""
+"""Its results go to the decision step and to the final report. The analyst never sees its
+per-task results or its trajectories, only each experiment's decision and aggregate result
+(spec §7).
+"""
 SPLIT_HELDOUT: Split.ValueType  # 3
 """Used only for baseline v0's runs and for the final runs."""
 SPLIT_EXTERNAL: Split.ValueType  # 4
@@ -65,7 +71,9 @@ class _GradeStatusEnumTypeWrapper(_enum_type_wrapper._EnumTypeWrapper[_GradeStat
     GRADE_STATUS_GRADED: _GradeStatus.ValueType  # 1
     """The grader evaluated the prediction."""
     GRADE_STATUS_PREDICTION_FAILED: _GradeStatus.ValueType  # 2
-    """The prediction failed to run (Effi-SQL: the query raised an error) or to apply (SWE)."""
+    """The prediction failed to run (Effi-SQL: the query raised an error or was refused, e.g. a plan
+    that modifies data) or to apply (SWE).
+    """
     GRADE_STATUS_TIMEOUT: _GradeStatus.ValueType  # 3
     """The prediction ran past the grader's time limit."""
     GRADE_STATUS_GRADER_ERROR: _GradeStatus.ValueType  # 4
@@ -81,7 +89,9 @@ GRADE_STATUS_UNSPECIFIED: GradeStatus.ValueType  # 0
 GRADE_STATUS_GRADED: GradeStatus.ValueType  # 1
 """The grader evaluated the prediction."""
 GRADE_STATUS_PREDICTION_FAILED: GradeStatus.ValueType  # 2
-"""The prediction failed to run (Effi-SQL: the query raised an error) or to apply (SWE)."""
+"""The prediction failed to run (Effi-SQL: the query raised an error or was refused, e.g. a plan
+that modifies data) or to apply (SWE).
+"""
 GRADE_STATUS_TIMEOUT: GradeStatus.ValueType  # 3
 """The prediction ran past the grader's time limit."""
 GRADE_STATUS_GRADER_ERROR: GradeStatus.ValueType  # 4
@@ -144,8 +154,10 @@ class EffiSqlTaskInput(_message.Message):
     schema: _builtins.str
     """The database's DDL, row counts and indexes, as text."""
     base_plan: _builtins.str
-    """The base query's plan, as JSON text: the task file's base_explain_analyze when it has one,
-    otherwise our own EXPLAIN (FORMAT JSON).
+    """The base query's plan, as JSON text: our plans.json entry for the task when there is one,
+    otherwise the task file's base_explain_analyze. plans.json holds our own EXPLAIN (FORMAT
+    JSON) for the tasks whose file has no plan and for those whose plan was recorded at another
+    scale (spec §4.1).
     """
     difficulty: _builtins.str
     """The dataset's difficulty label: easy, medium or hard."""
@@ -314,12 +326,13 @@ class Grade(_message.Message):
     instance_id: _builtins.str
     """The task graded."""
     score: _builtins.float
-    """The score: Effi-SQL the R-VES credit (EffiSqlGrade.credit); SWE SR_i (spec §4.2), already
+    """The score: Effi-SQL the checked credit (EffiSqlGrade.credit); SWE SR_i (spec §4.2), already
     floored at 0.001.
     """
     correct: _builtins.bool
-    """Effi-SQL: EffiSqlGrade.matched AND (alt_matched unset or true). SWE: the patch applied and
-    the tests passed, never for an empty patch. Never true unless status is GRADE_STATUS_GRADED.
+    """Effi-SQL: EffiSqlGrade.matched, and no check against hard-coded results flagged the
+    prediction: alt_matched not false and literal_result not true. SWE: the patch applied and the
+    tests passed, never for an empty patch. Never true unless status is GRADE_STATUS_GRADED.
     """
     status: Global___GradeStatus.ValueType
     """How grading went."""
@@ -356,15 +369,18 @@ Global___Grade: _TypeAlias = Grade  # noqa: Y015
 
 @_typing.final
 class EffiSqlGrade(_message.Message):
-    """The Effi-SQL details of a grade, following the official evaluator's algorithm (spec §4.1). The
-    grade's score is credit. Its correct is matched AND (alt_matched unset or true), and is never
-    true unless the status is GRADE_STATUS_GRADED.
+    """The Effi-SQL details of a grade, following the official evaluator's algorithm (spec §4.1), with
+    our two checks against hard-coded results, which only a matched prediction gets: a wrong rewrite
+    also fails on the alternate database, so checking it would flag nearly every candidate. The
+    grade's score is credit. Its correct is matched, alt_matched not false and literal_result not
+    true, and is never true unless the status is GRADE_STATUS_GRADED.
     """
 
     DESCRIPTOR: _descriptor.Descriptor
 
     MATCHED_FIELD_NUMBER: _builtins.int
     ALT_MATCHED_FIELD_NUMBER: _builtins.int
+    LITERAL_RESULT_FIELD_NUMBER: _builtins.int
     BASE_TIME_S_FIELD_NUMBER: _builtins.int
     PRED_TIME_S_FIELD_NUMBER: _builtins.int
     SPEEDUP_FIELD_NUMBER: _builtins.int
@@ -374,16 +390,28 @@ class EffiSqlGrade(_message.Message):
     BASE_ROW_COUNT_FIELD_NUMBER: _builtins.int
     EVAL_WALL_S_FIELD_NUMBER: _builtins.int
     BASE_CACHED_FIELD_NUMBER: _builtins.int
+    IDENTITY_CACHED_FIELD_NUMBER: _builtins.int
     matched: _builtins.bool
     """True if the prediction ran without an error or a timeout and its result equals the base
-    query's: the same row count and the same multiset of row hashes.
+    query's: the same row count and the same multiset of row hashes. A plan that would modify
+    data, with a ModifyTable node, is refused before it runs: the grade is then not matched, and
+    its status is GRADE_STATUS_PREDICTION_FAILED.
     """
     alt_matched: _builtins.bool
-    """The robustness check against hard-coded results: whether the prediction also returns the
-    base query's result on an alternate TPC-H database with different data. Set when the check
-    ran (dev mode and RSI, and our checked R-VES); unset when it did not, as for the
-    official-protocol numbers. False flags the task as hard-coded: credit is then 0 and the
-    grade's correct is false. The final report gives both the official and the checked R-VES.
+    """The robustness check against hard-coded results: whether a matched prediction also returns
+    the base query's result on an alternate TPC-H database with different data. Set only when the
+    prediction matched, and then whenever the check ran, which §4.1 does for every matched
+    prediction in both grading modes, except an identity-cached grade; unset otherwise. False is
+    the hard_coded flag: credit is then 0 and the grade's correct is false. The final report
+    gives both the official and the checked numbers.
+    """
+    literal_result: _builtins.bool
+    """The plan check against hard-coded results, run on a matched prediction's EXPLAIN (FORMAT
+    JSON) plan. Set only when the prediction matched, and then whenever the check ran, which §4.1
+    does for every matched prediction in both grading modes, except an identity-cached grade;
+    unset otherwise. True is the literal_result flag: the plan scans none of the base query's
+    relations, or its output comes from a Values Scan or Result subtree with no relation scan
+    beneath it. Credit is then 0 and the grade's correct is false.
     """
     base_time_s: _builtins.float
     """The base query's median EXPLAIN ANALYZE execution time, in seconds; unset if not measured."""
@@ -391,14 +419,18 @@ class EffiSqlGrade(_message.Message):
     """The prediction's median EXPLAIN ANALYZE execution time, in seconds; unset if not measured."""
     speedup: _builtins.float
     """τ = base_time_s / pred_time_s, capped at 1000. Set only when matched and both sides were
-    timed.
+    timed, or when identity_cached is true: it is then the identity τ measured during setup. A
+    matched prediction is timed even when a check flagged it.
     """
     credit: _builtins.float
-    """The R-VES tier credit g(τ): 1 for τ ≥ 2, 0.75 for τ ≥ 1.2, 0.5 for τ ≥ 1, 0.25 for τ ≥ 0.5,
-    and 0 otherwise. 0 when not matched, or when alt_matched is false.
+    """The checked credit: the R-VES tier credit g(speedup), where g(τ) is 1 for τ ≥ 2, 0.75 for
+    τ ≥ 1.2, 0.5 for τ ≥ 1, 0.25 for τ ≥ 0.5 and 0 otherwise; but 0 when not matched, and 0 for
+    a matched prediction that a check flagged: alt_matched false or literal_result true. The
+    official credit ignores both flags: it is g(speedup) when matched, an unset speedup counting
+    as 0, and 0 otherwise.
     """
     timing_runs: _builtins.int
-    """How many timed runs the times come from."""
+    """How many timed runs the times come from; 0 for an identity-cached grade."""
     pred_row_count: _builtins.int
     """How many rows the prediction returned."""
     base_row_count: _builtins.int
@@ -409,11 +441,20 @@ class EffiSqlGrade(_message.Message):
     """
     base_cached: _builtins.bool
     """True if dev mode reused the base query's cached result signature and timing."""
+    identity_cached: _builtins.bool
+    """True if dev mode graded a prediction identical to base_sql after normalization with the
+    identity τ measured during setup, and that τ's credit, without timing it again (spec §4.1).
+    Such a grade has matched true, speedup the setup's identity τ, base_time_s the cached value,
+    pred_time_s unset, timing_runs 0, eval_wall_s unset, and alt_matched and literal_result
+    unset: the checks do not run on it. Official mode always times the prediction, identity
+    submissions included, so it is false there.
+    """
     def __init__(
         self,
         *,
         matched: _builtins.bool = ...,
         alt_matched: _builtins.bool | None = ...,
+        literal_result: _builtins.bool | None = ...,
         base_time_s: _builtins.float | None = ...,
         pred_time_s: _builtins.float | None = ...,
         speedup: _builtins.float | None = ...,
@@ -423,10 +464,11 @@ class EffiSqlGrade(_message.Message):
         base_row_count: _builtins.int = ...,
         eval_wall_s: _builtins.float | None = ...,
         base_cached: _builtins.bool = ...,
+        identity_cached: _builtins.bool = ...,
     ) -> None: ...
-    _HasFieldArgType: _TypeAlias = _typing.Literal["_alt_matched", b"_alt_matched", "_base_time_s", b"_base_time_s", "_eval_wall_s", b"_eval_wall_s", "_pred_time_s", b"_pred_time_s", "_speedup", b"_speedup", "alt_matched", b"alt_matched", "base_time_s", b"base_time_s", "eval_wall_s", b"eval_wall_s", "pred_time_s", b"pred_time_s", "speedup", b"speedup"]  # noqa: Y015
+    _HasFieldArgType: _TypeAlias = _typing.Literal["_alt_matched", b"_alt_matched", "_base_time_s", b"_base_time_s", "_eval_wall_s", b"_eval_wall_s", "_literal_result", b"_literal_result", "_pred_time_s", b"_pred_time_s", "_speedup", b"_speedup", "alt_matched", b"alt_matched", "base_time_s", b"base_time_s", "eval_wall_s", b"eval_wall_s", "literal_result", b"literal_result", "pred_time_s", b"pred_time_s", "speedup", b"speedup"]  # noqa: Y015
     def HasField(self, field_name: _HasFieldArgType) -> _builtins.bool: ...
-    _ClearFieldArgType: _TypeAlias = _typing.Literal["_alt_matched", b"_alt_matched", "_base_time_s", b"_base_time_s", "_eval_wall_s", b"_eval_wall_s", "_pred_time_s", b"_pred_time_s", "_speedup", b"_speedup", "alt_matched", b"alt_matched", "base_cached", b"base_cached", "base_row_count", b"base_row_count", "base_time_s", b"base_time_s", "credit", b"credit", "eval_wall_s", b"eval_wall_s", "matched", b"matched", "pred_row_count", b"pred_row_count", "pred_time_s", b"pred_time_s", "speedup", b"speedup", "timing_runs", b"timing_runs"]  # noqa: Y015
+    _ClearFieldArgType: _TypeAlias = _typing.Literal["_alt_matched", b"_alt_matched", "_base_time_s", b"_base_time_s", "_eval_wall_s", b"_eval_wall_s", "_literal_result", b"_literal_result", "_pred_time_s", b"_pred_time_s", "_speedup", b"_speedup", "alt_matched", b"alt_matched", "base_cached", b"base_cached", "base_row_count", b"base_row_count", "base_time_s", b"base_time_s", "credit", b"credit", "eval_wall_s", b"eval_wall_s", "identity_cached", b"identity_cached", "literal_result", b"literal_result", "matched", b"matched", "pred_row_count", b"pred_row_count", "pred_time_s", b"pred_time_s", "speedup", b"speedup", "timing_runs", b"timing_runs"]  # noqa: Y015
     def ClearField(self, field_name: _ClearFieldArgType) -> None: ...
     _WhichOneofReturnType__alt_matched: _TypeAlias = _typing.Literal["alt_matched"]  # noqa: Y015
     _WhichOneofArgType__alt_matched: _TypeAlias = _typing.Literal["_alt_matched", b"_alt_matched"]  # noqa: Y015
@@ -434,6 +476,8 @@ class EffiSqlGrade(_message.Message):
     _WhichOneofArgType__base_time_s: _TypeAlias = _typing.Literal["_base_time_s", b"_base_time_s"]  # noqa: Y015
     _WhichOneofReturnType__eval_wall_s: _TypeAlias = _typing.Literal["eval_wall_s"]  # noqa: Y015
     _WhichOneofArgType__eval_wall_s: _TypeAlias = _typing.Literal["_eval_wall_s", b"_eval_wall_s"]  # noqa: Y015
+    _WhichOneofReturnType__literal_result: _TypeAlias = _typing.Literal["literal_result"]  # noqa: Y015
+    _WhichOneofArgType__literal_result: _TypeAlias = _typing.Literal["_literal_result", b"_literal_result"]  # noqa: Y015
     _WhichOneofReturnType__pred_time_s: _TypeAlias = _typing.Literal["pred_time_s"]  # noqa: Y015
     _WhichOneofArgType__pred_time_s: _TypeAlias = _typing.Literal["_pred_time_s", b"_pred_time_s"]  # noqa: Y015
     _WhichOneofReturnType__speedup: _TypeAlias = _typing.Literal["speedup"]  # noqa: Y015
@@ -444,6 +488,8 @@ class EffiSqlGrade(_message.Message):
     def WhichOneof(self, oneof_group: _WhichOneofArgType__base_time_s) -> _WhichOneofReturnType__base_time_s | None: ...
     @_typing.overload
     def WhichOneof(self, oneof_group: _WhichOneofArgType__eval_wall_s) -> _WhichOneofReturnType__eval_wall_s | None: ...
+    @_typing.overload
+    def WhichOneof(self, oneof_group: _WhichOneofArgType__literal_result) -> _WhichOneofReturnType__literal_result | None: ...
     @_typing.overload
     def WhichOneof(self, oneof_group: _WhichOneofArgType__pred_time_s) -> _WhichOneofReturnType__pred_time_s | None: ...
     @_typing.overload
