@@ -216,11 +216,14 @@ def test_the_retry_schedule_follows_the_delays_and_repeats_the_last(
 def test_resume_requeues_what_an_earlier_process_failed_to_deliver(
     ledger: Ledger, notifiers: list[QueuedNotifier]
 ) -> None:
-    first = make(FakeChannel(failures=1000), ledger, notifiers)
+    # The earlier process: each notification fails once, and its retry is an hour away, so
+    # its worker records exactly 2 events and then waits, as if the process had died. (Its
+    # retries must not race the second process's delivery; the fixture closes it at the end.)
+    first = QueuedNotifier(FakeChannel(failures=2), ledger, retry_delays_s=(3600.0,))
+    notifiers.append(first)
     first.notify(LANE_EFFISQL, NotificationKind.RESULTS_PR, "Results PR #3 is open.")
     first.notify(LANE_EFFISQL, NotificationKind.RECOVERY_FAILED, "given up")
-    wait_for(lambda: len(ledger.lane_events()) >= 4)
-    first._closing = True  # The process dies: nothing more is attempted.
+    wait_for(lambda: len(ledger.lane_events()) == 2)
     channel = FakeChannel()
     second = make(channel, ledger, notifiers)
     kinds = {NotificationKind.RESULTS_PR, NotificationKind.STOPPED}
