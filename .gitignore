@@ -7,6 +7,9 @@
 # Run artifacts, at the top level only.
 /runs/
 
+# The RSI ledger the lanes write (spec §8.6); results PRs carry copies of it.
+/rsi/ledger/
+
 # Python and packaging.
 .venv/
 __pycache__/
