@@ -278,7 +278,10 @@ class Step(_message.Message):
       2. the chat's initial_messages;
       3. each earlier step of the same chat: its assistant message, its tool results as tool
          messages, and its injected messages.
-    Then every fold in effect at the step replaces the content of the tool message it names.
+    Then every fold in effect at the step replaces the content of the tool message it names. An
+    assistant message is sent with its reasoning_content only while its step is among its chat's
+    last keep_turns steps (the run's context configuration); older assistant messages are sent
+    without reasoning. The trajectory still stores every message in full.
     """
 
     DESCRIPTOR: _descriptor.Descriptor
