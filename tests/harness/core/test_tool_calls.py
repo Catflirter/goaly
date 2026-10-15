@@ -873,3 +873,48 @@ def test_a_standard_call_with_a_non_finite_number_gets_no_repaired_arguments() -
     [call] = parse_tool_calls(message, OFFERED)
 
     assert call.repaired_arguments_json == ""
+
+
+def test_a_calls_id_is_the_sha256_of_its_index_name_and_arguments() -> None:
+    message = assistant(calls=[ToolCall(name="execute_sql", arguments_json='{"sql": "SELECT 1"}')])
+
+    [call] = parse_tool_calls(message, OFFERED)
+
+    # The first 24 hex digits of sha256('0\nexecute_sql\n{"sql": "SELECT 1"}').
+    assert call.id == "call_edd3f0731f55e9d52bf87b18"
+
+
+@pytest.mark.parametrize(
+    ("name", "arguments_json"),
+    [("submit", '{"sql": "SELECT 1"}'), ("execute_sql", '{"sql": "SELECT 2"}')],
+    ids=["only the name differs", "only the arguments differ"],
+)
+def test_calls_that_differ_in_name_or_arguments_get_different_ids(
+    name: str, arguments_json: str
+) -> None:
+    first = assistant(calls=[ToolCall(name="execute_sql", arguments_json='{"sql": "SELECT 1"}')])
+    second = assistant(calls=[ToolCall(name=name, arguments_json=arguments_json)])
+
+    [one], [other] = parse_tool_calls(first, OFFERED), parse_tool_calls(second, OFFERED)
+
+    assert one.id != other.id
+
+
+async def test_a_gateway_id_repeated_in_one_reply_is_replaced_so_each_result_answers_one_call() -> (
+    None
+):
+    calls = [
+        ToolCall(id="call_0", name="execute_sql", arguments_json='{"sql": "SELECT 1"}'),
+        ToolCall(id="call_0", name="execute_sql", arguments_json='{"sql": "SELECT 1"}'),
+    ]
+    env = FakeSqlEnvironment({"SELECT 1": SqlResult(row_count=1)})
+
+    first, second = parse_tool_calls(assistant(calls=calls), OFFERED)
+    results = [await REGISTRY.execute(call, env) for call in (first, second)]
+
+    # The first keeps the gateway's id; the second gets the formula's id for index 1.
+    assert (first.id, second.id) == ("call_0", "call_7a300c3273e4108aa15a6c53")
+    assert [result.tool_call_id for result in results] == [
+        "call_0",
+        "call_7a300c3273e4108aa15a6c53",
+    ]
