@@ -281,7 +281,7 @@ def set_fields(*messages: Message) -> set[str]:
 def test_an_experiment_records_its_implementer_run_and_smoke_tests() -> None:
     run = ImplementerRun(
         exit=ImplementerExit.IMPLEMENTER_EXIT_SUBMITTED,
-        steps=23,
+        step_count=23,
         wall_time_s=812.5,
         trajectory_path="rsi/effisql/exp-3/implementer.traj.json",
         smoke_tests=[
@@ -311,6 +311,18 @@ def test_an_implementer_that_never_started_leaves_no_run() -> None:
     assert not from_json_line(line, ExperimentRecord).HasField("implementer")
 
 
+def test_an_implementer_run_that_was_never_measured_has_no_step_count_or_wall_time() -> None:
+    # An INTERRUPTED run found after a crash: its steps and time are unknown, not 0.
+    unmeasured = to_json_line(ImplementerRun(exit=ImplementerExit.IMPLEMENTER_EXIT_INTERRUPTED))
+    measured = to_json_line(ImplementerRun(step_count=0, wall_time_s=0.0))
+
+    assert {"step_count", "wall_time_s"}.isdisjoint(json.loads(unmeasured))
+    assert (json.loads(measured)["step_count"], json.loads(measured)["wall_time_s"]) == (0, 0.0)
+    read = from_json_line(unmeasured, ImplementerRun)
+    assert not read.HasField("step_count")
+    assert not read.HasField("wall_time_s")
+
+
 def test_a_smoke_test_that_never_ran_the_candidate_has_no_score() -> None:
     # The host refused the call, or a guard failed: no run, so no score. A score of 0 was earned.
     refused = to_json_line(SmokeTest(instance_id="250", detail="refused: 250 is not in train"))
@@ -337,6 +349,12 @@ def test_lane_events_are_appended_to_lane_events_jsonl_and_read_back(tmp_path: P
         LaneEvent(
             lane=lane,
             occurred_at=at(17, 31),
+            kind=kind.LANE_EVENT_KIND_CRASHED,
+            detail="RuntimeError: the ledger's last line does not parse",
+        ),
+        LaneEvent(
+            lane=lane,
+            occurred_at=at(17, 32),
             kind=kind.LANE_EVENT_KIND_RESTARTED,
             detail="killed after 10 minutes without a heartbeat; restarted after 30 s",
         ),
@@ -356,12 +374,14 @@ def test_lane_events_are_appended_to_lane_events_jsonl_and_read_back(tmp_path: P
             kind=kind.LANE_EVENT_KIND_NOTIFY_FAILED,
             detail="HTTP 502 from ntfy.sh",
             notification=pr_opened,
+            notification_id="notify-12",
         ),
         LaneEvent(
             lane=lane,
             occurred_at=at(19, 2),
             kind=kind.LANE_EVENT_KIND_NOTIFIED,
             notification=pr_opened,
+            notification_id="notify-12",  # The same notification, delivered on its retry.
         ),
         LaneEvent(
             lane=lane,

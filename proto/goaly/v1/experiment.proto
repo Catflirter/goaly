@@ -125,12 +125,16 @@ message ExperimentRecord {
 // LlmCallRecords with purpose CALL_PURPOSE_RSI_IMPL and the experiment ID as run_id, and their
 // tokens and cost are in the experiment's usage_by_purpose.
 message ImplementerRun {
+  // Renamed step_count before any ledger used it.
+  reserved "steps";
+
   // How the run ended.
   ImplementerExit exit = 1;
-  // How many steps the agent took, one model call each.
-  int32 steps = 2;
-  // From the agent's start to its end, in seconds.
-  double wall_time_s = 3;
+  // How many steps the agent took, one model call each; unset if the run was never measured, as
+  // for an IMPLEMENTER_EXIT_INTERRUPTED run that the restarted lane found after a crash.
+  optional int32 step_count = 2;
+  // From the agent's start to its end, in seconds; unset if the run was never measured.
+  optional double wall_time_s = 3;
   // Where the agent's trajectory is, relative to the runs directory:
   // rsi/<lane>/<experiment_id>/implementer.traj.json. The file stays in mini-swe-agent's own
   // format, which it names in its trajectory_format key; it is not converted to a Trajectory.
@@ -468,6 +472,9 @@ message LaneEvent {
   // apart from detail, which holds a failed delivery's error, because the next results PR lists
   // every notification, delivered or not (spec §8.7).
   string notification = 9;
+  // For LANE_EVENT_KIND_NOTIFIED and LANE_EVENT_KIND_NOTIFY_FAILED: the notification's ID, which
+  // ties a NOTIFY_FAILED to the NOTIFIED of its later delivery; empty for other kinds.
+  string notification_id = 10;
 }
 
 // What happened to a lane (spec §8.4, §8.7).
@@ -490,4 +497,7 @@ enum LaneEventKind {
   LANE_EVENT_KIND_NOTIFIED = 6;
   // A notification could not be delivered; it is retried.
   LANE_EVENT_KIND_NOTIFY_FAILED = 7;
+  // The lane crashed, or a start failed the supervisor's preflight checks, which counts as a crash
+  // (spec §8.7); detail says how.
+  LANE_EVENT_KIND_CRASHED = 8;
 }

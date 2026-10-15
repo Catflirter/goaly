@@ -406,6 +406,10 @@ class _LaneEventKindEnumTypeWrapper(_enum_type_wrapper._EnumTypeWrapper[_LaneEve
     """A notification was delivered to the ntfy topic."""
     LANE_EVENT_KIND_NOTIFY_FAILED: _LaneEventKind.ValueType  # 7
     """A notification could not be delivered; it is retried."""
+    LANE_EVENT_KIND_CRASHED: _LaneEventKind.ValueType  # 8
+    """The lane crashed, or a start failed the supervisor's preflight checks, which counts as a crash
+    (spec §8.7); detail says how.
+    """
 
 class LaneEventKind(_LaneEventKind, metaclass=_LaneEventKindEnumTypeWrapper):
     """What happened to a lane (spec §8.4, §8.7)."""
@@ -430,6 +434,10 @@ LANE_EVENT_KIND_NOTIFIED: LaneEventKind.ValueType  # 6
 """A notification was delivered to the ntfy topic."""
 LANE_EVENT_KIND_NOTIFY_FAILED: LaneEventKind.ValueType  # 7
 """A notification could not be delivered; it is retried."""
+LANE_EVENT_KIND_CRASHED: LaneEventKind.ValueType  # 8
+"""The lane crashed, or a start failed the supervisor's preflight checks, which counts as a crash
+(spec §8.7); detail says how.
+"""
 Global___LaneEventKind: _TypeAlias = LaneEventKind  # noqa: Y015
 
 @_typing.final
@@ -630,17 +638,19 @@ class ImplementerRun(_message.Message):
     DESCRIPTOR: _descriptor.Descriptor
 
     EXIT_FIELD_NUMBER: _builtins.int
-    STEPS_FIELD_NUMBER: _builtins.int
+    STEP_COUNT_FIELD_NUMBER: _builtins.int
     WALL_TIME_S_FIELD_NUMBER: _builtins.int
     TRAJECTORY_PATH_FIELD_NUMBER: _builtins.int
     SMOKE_TESTS_FIELD_NUMBER: _builtins.int
     SUMMARY_FIELD_NUMBER: _builtins.int
     exit: Global___ImplementerExit.ValueType
     """How the run ended."""
-    steps: _builtins.int
-    """How many steps the agent took, one model call each."""
+    step_count: _builtins.int
+    """How many steps the agent took, one model call each; unset if the run was never measured, as
+    for an IMPLEMENTER_EXIT_INTERRUPTED run that the restarted lane found after a crash.
+    """
     wall_time_s: _builtins.float
-    """From the agent's start to its end, in seconds."""
+    """From the agent's start to its end, in seconds; unset if the run was never measured."""
     trajectory_path: _builtins.str
     """Where the agent's trajectory is, relative to the runs directory:
     rsi/<lane>/<experiment_id>/implementer.traj.json. The file stays in mini-swe-agent's own
@@ -659,17 +669,24 @@ class ImplementerRun(_message.Message):
         self,
         *,
         exit: Global___ImplementerExit.ValueType = ...,
-        steps: _builtins.int = ...,
-        wall_time_s: _builtins.float = ...,
+        step_count: _builtins.int | None = ...,
+        wall_time_s: _builtins.float | None = ...,
         trajectory_path: _builtins.str = ...,
         smoke_tests: _abc.Iterable[Global___SmokeTest] | None = ...,
         summary: _builtins.str = ...,
     ) -> None: ...
-    _HasFieldArgType: _TypeAlias = _Never  # noqa: Y015
+    _HasFieldArgType: _TypeAlias = _typing.Literal["_step_count", b"_step_count", "_wall_time_s", b"_wall_time_s", "step_count", b"step_count", "wall_time_s", b"wall_time_s"]  # noqa: Y015
     def HasField(self, field_name: _HasFieldArgType) -> _builtins.bool: ...
-    _ClearFieldArgType: _TypeAlias = _typing.Literal["exit", b"exit", "smoke_tests", b"smoke_tests", "steps", b"steps", "summary", b"summary", "trajectory_path", b"trajectory_path", "wall_time_s", b"wall_time_s"]  # noqa: Y015
+    _ClearFieldArgType: _TypeAlias = _typing.Literal["_step_count", b"_step_count", "_wall_time_s", b"_wall_time_s", "exit", b"exit", "smoke_tests", b"smoke_tests", "step_count", b"step_count", "summary", b"summary", "trajectory_path", b"trajectory_path", "wall_time_s", b"wall_time_s"]  # noqa: Y015
     def ClearField(self, field_name: _ClearFieldArgType) -> None: ...
-    def WhichOneof(self, oneof_group: _Never) -> None: ...
+    _WhichOneofReturnType__step_count: _TypeAlias = _typing.Literal["step_count"]  # noqa: Y015
+    _WhichOneofArgType__step_count: _TypeAlias = _typing.Literal["_step_count", b"_step_count"]  # noqa: Y015
+    _WhichOneofReturnType__wall_time_s: _TypeAlias = _typing.Literal["wall_time_s"]  # noqa: Y015
+    _WhichOneofArgType__wall_time_s: _TypeAlias = _typing.Literal["_wall_time_s", b"_wall_time_s"]  # noqa: Y015
+    @_typing.overload
+    def WhichOneof(self, oneof_group: _WhichOneofArgType__step_count) -> _WhichOneofReturnType__step_count | None: ...
+    @_typing.overload
+    def WhichOneof(self, oneof_group: _WhichOneofArgType__wall_time_s) -> _WhichOneofReturnType__wall_time_s | None: ...
 
 Global___ImplementerRun: _TypeAlias = ImplementerRun  # noqa: Y015
 
@@ -1177,6 +1194,7 @@ class LaneEvent(_message.Message):
     HEAD_COMMIT_FIELD_NUMBER: _builtins.int
     EXPERIMENT_IDS_FIELD_NUMBER: _builtins.int
     NOTIFICATION_FIELD_NUMBER: _builtins.int
+    NOTIFICATION_ID_FIELD_NUMBER: _builtins.int
     lane: Global___Lane.ValueType
     """The lane."""
     kind: Global___LaneEventKind.ValueType
@@ -1201,6 +1219,10 @@ class LaneEvent(_message.Message):
     apart from detail, which holds a failed delivery's error, because the next results PR lists
     every notification, delivered or not (spec §8.7).
     """
+    notification_id: _builtins.str
+    """For LANE_EVENT_KIND_NOTIFIED and LANE_EVENT_KIND_NOTIFY_FAILED: the notification's ID, which
+    ties a NOTIFY_FAILED to the NOTIFIED of its later delivery; empty for other kinds.
+    """
     @_builtins.property
     def occurred_at(self) -> _timestamp_pb2.Timestamp:
         """When it happened."""
@@ -1223,10 +1245,11 @@ class LaneEvent(_message.Message):
         head_commit: _builtins.str = ...,
         experiment_ids: _abc.Iterable[_builtins.str] | None = ...,
         notification: _builtins.str = ...,
+        notification_id: _builtins.str = ...,
     ) -> None: ...
     _HasFieldArgType: _TypeAlias = _typing.Literal["occurred_at", b"occurred_at"]  # noqa: Y015
     def HasField(self, field_name: _HasFieldArgType) -> _builtins.bool: ...
-    _ClearFieldArgType: _TypeAlias = _typing.Literal["detail", b"detail", "experiment_ids", b"experiment_ids", "head_commit", b"head_commit", "kind", b"kind", "lane", b"lane", "notification", b"notification", "occurred_at", b"occurred_at", "pr_number", b"pr_number", "pr_url", b"pr_url"]  # noqa: Y015
+    _ClearFieldArgType: _TypeAlias = _typing.Literal["detail", b"detail", "experiment_ids", b"experiment_ids", "head_commit", b"head_commit", "kind", b"kind", "lane", b"lane", "notification", b"notification", "notification_id", b"notification_id", "occurred_at", b"occurred_at", "pr_number", b"pr_number", "pr_url", b"pr_url"]  # noqa: Y015
     def ClearField(self, field_name: _ClearFieldArgType) -> None: ...
     def WhichOneof(self, oneof_group: _Never) -> None: ...
 
