@@ -240,12 +240,18 @@ class Chat(_message.Message):
     LABEL_FIELD_NUMBER: _builtins.int
     FORKED_FROM_STEP_FIELD_NUMBER: _builtins.int
     INITIAL_MESSAGES_FIELD_NUMBER: _builtins.int
+    KEEP_TURNS_FIELD_NUMBER: _builtins.int
     label: _builtins.str
     """A name the policy gives the chat, such as "main", "sample-2" or "verify"."""
     forked_from_step: _builtins.int
     """The step whose full context the chat continues, as an index into Trajectory.steps; absent
     if the chat starts afresh. That context is the step's prompt, then its assistant message,
     tool results and injected messages, and it comes before initial_messages.
+    """
+    keep_turns: _builtins.int
+    """Set on every executor chat, from the run's context configuration: how many of the latest
+    steps in a prompt keep their assistant message's reasoning_content (the rule is in Step's
+    comment). Unset on a chat whose reasoning is replayed unchanged, as GLM's is (spec §5.1).
     """
     @_builtins.property
     def initial_messages(self) -> _containers.RepeatedCompositeFieldContainer[Global___ChatMessage]:
@@ -259,29 +265,45 @@ class Chat(_message.Message):
         label: _builtins.str = ...,
         forked_from_step: _builtins.int | None = ...,
         initial_messages: _abc.Iterable[Global___ChatMessage] | None = ...,
+        keep_turns: _builtins.int | None = ...,
     ) -> None: ...
-    _HasFieldArgType: _TypeAlias = _typing.Literal["_forked_from_step", b"_forked_from_step", "forked_from_step", b"forked_from_step"]  # noqa: Y015
+    _HasFieldArgType: _TypeAlias = _typing.Literal["_forked_from_step", b"_forked_from_step", "_keep_turns", b"_keep_turns", "forked_from_step", b"forked_from_step", "keep_turns", b"keep_turns"]  # noqa: Y015
     def HasField(self, field_name: _HasFieldArgType) -> _builtins.bool: ...
-    _ClearFieldArgType: _TypeAlias = _typing.Literal["_forked_from_step", b"_forked_from_step", "forked_from_step", b"forked_from_step", "initial_messages", b"initial_messages", "label", b"label"]  # noqa: Y015
+    _ClearFieldArgType: _TypeAlias = _typing.Literal["_forked_from_step", b"_forked_from_step", "_keep_turns", b"_keep_turns", "forked_from_step", b"forked_from_step", "initial_messages", b"initial_messages", "keep_turns", b"keep_turns", "label", b"label"]  # noqa: Y015
     def ClearField(self, field_name: _ClearFieldArgType) -> None: ...
     _WhichOneofReturnType__forked_from_step: _TypeAlias = _typing.Literal["forked_from_step"]  # noqa: Y015
     _WhichOneofArgType__forked_from_step: _TypeAlias = _typing.Literal["_forked_from_step", b"_forked_from_step"]  # noqa: Y015
+    _WhichOneofReturnType__keep_turns: _TypeAlias = _typing.Literal["keep_turns"]  # noqa: Y015
+    _WhichOneofArgType__keep_turns: _TypeAlias = _typing.Literal["_keep_turns", b"_keep_turns"]  # noqa: Y015
+    @_typing.overload
     def WhichOneof(self, oneof_group: _WhichOneofArgType__forked_from_step) -> _WhichOneofReturnType__forked_from_step | None: ...
+    @_typing.overload
+    def WhichOneof(self, oneof_group: _WhichOneofArgType__keep_turns) -> _WhichOneofReturnType__keep_turns | None: ...
 
 Global___Chat: _TypeAlias = Chat  # noqa: Y015
 
 @_typing.final
 class Step(_message.Message):
     """One model call and the tool calls it made (spec §5.1). A step holds only what it adds to its
-    chat, never the history before it. The prompt its call was sent is, in order:
+    chat, never the history before it, and the trajectory stores every message in full. The prompt
+    its call was sent is, in order:
       1. the forked context of its chat, if any;
       2. the chat's initial_messages;
       3. each earlier step of the same chat: its assistant message, its tool results as tool
          messages, and its injected messages.
-    Then every fold in effect at the step replaces the content of the tool message it names. An
-    assistant message is sent with its reasoning_content only while its step is among its chat's
-    last keep_turns steps (the run's context configuration); older assistant messages are sent
-    without reasoning. The trajectory still stores every message in full.
+    Then three rules apply to that whole prompt, forked context included:
+      - Folds: every fold in effect at the step replaces the content of the tool message it names.
+      - XML calls: an assistant message whose tool calls were parsed from Qwen3-Coder XML
+        (TOOL_CALL_SOURCE_REASONING_XML or CONTENT_XML) carries them only as tool_calls. Its
+        content loses each <tool_call> block, or, if it has none, each bare <function=...> block;
+        its reasoning_content loses each <tool_call> block. A block ends at its closing tag, at the
+        next block or at the end of the text. A message whose calls came from the standard field
+        is replayed as written.
+      - Reasoning: in a chat with keep_turns set, an executor chat, an assistant message keeps its
+        reasoning_content only while its step is among the last keep_turns steps whose assistant
+        messages the prompt holds, counted back from the newest and through the forked context.
+        Older assistant messages are sent without reasoning. A chat without keep_turns replays
+        reasoning unchanged, as GLM's is (spec §5.1).
     """
 
     DESCRIPTOR: _descriptor.Descriptor

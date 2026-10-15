@@ -1,6 +1,7 @@
 """Tests for the run and experiment records: trajectory, result, manifest and experiment."""
 
 import json
+import re
 from collections.abc import Sequence
 from datetime import UTC, datetime
 from pathlib import Path
@@ -33,6 +34,7 @@ from goaly.contracts.gen.trajectory_pb2 import (
     ContextFold,
     Step,
     ToolCall,
+    ToolCallSource,
     ToolResult,
     Trajectory,
 )
@@ -41,8 +43,18 @@ from goaly.contracts.jsonl import append_jsonl, from_json_line, read_jsonl, to_j
 # Rebuilding the prompt a step's model call was sent, by the rule in Step's comment
 # (proto/goaly/v1/trajectory.proto). These helpers are that rule's reference implementation.
 
-type Origin = tuple[int, str] | None  # For a tool message: its step's index and tool_call_id.
+# For a tool message: its step's index and tool_call_id. For an assistant message: its step's
+# index. None for any other message.
+type Origin = tuple[int, str] | int | None
 type Located = tuple[Origin, ChatMessage]
+
+XML_SOURCES = {
+    ToolCallSource.TOOL_CALL_SOURCE_REASONING_XML,
+    ToolCallSource.TOOL_CALL_SOURCE_CONTENT_XML,
+}
+# Qwen3-Coder's call markup: a block ends at its closing tag, at the next block, or at the end.
+TOOL_CALL_BLOCK = re.compile(r"<tool_call>.*?(?:</tool_call>|(?=<tool_call>)|\Z)", re.DOTALL)
+FUNCTION_BLOCK = re.compile(r"<function=[^>\n]*>.*?(?:</function>|(?=<function=)|\Z)", re.DOTALL)
 
 
 def tool_message(tool_call_id: str, content: str) -> ChatMessage:
@@ -51,7 +63,7 @@ def tool_message(tool_call_id: str, content: str) -> ChatMessage:
 
 def added_by(step: Step) -> list[Located]:
     """What ``step`` adds to its chat: its assistant message, tool messages and injected ones."""
-    added: list[Located] = [(None, step.assistant)]
+    added: list[Located] = [(step.index, step.assistant)]
     added += [
         ((step.index, result.tool_call_id), tool_message(result.tool_call_id, result.content))
         for result in step.tool_results
@@ -77,18 +89,44 @@ def unfolded(trajectory: Trajectory, step: Step) -> tuple[list[Located], list[Co
     return messages, [*folds, *step.folds]
 
 
+def without_markup(text: str, *, reasoning: bool) -> str:
+    """``text`` without its <tool_call> blocks, or, in a content with none, its <function> ones."""
+    markup = TOOL_CALL_BLOCK if reasoning or TOOL_CALL_BLOCK.search(text) else FUNCTION_BLOCK
+    return markup.sub("", text)
+
+
+def replayed(assistant: ChatMessage, *, keep_reasoning: bool) -> ChatMessage:
+    """An earlier assistant message as a later prompt carries it."""
+    message = ChatMessage()
+    message.CopyFrom(assistant)
+    if any(call.source in XML_SOURCES for call in assistant.tool_calls):
+        message.content = without_markup(message.content, reasoning=False)
+        message.reasoning_content = without_markup(message.reasoning_content, reasoning=True)
+    if not keep_reasoning:
+        message.reasoning_content = ""
+    return message
+
+
 def prompt(trajectory: Trajectory, index: int) -> list[ChatMessage]:
-    """The messages the model was sent at step ``index``, folds applied."""
-    messages, folds = unfolded(trajectory, trajectory.steps[index])
+    """The messages the model was sent at step ``index``: folds, XML and reasoning rules applied."""
+    step = trajectory.steps[index]
+    messages, folds = unfolded(trajectory, step)
     replacements: dict[Origin, str] = {
         (fold.step, fold.tool_call_id): fold.replacement for fold in folds
     }
-    return [
-        tool_message(message.tool_call_id, replacements[origin])
-        if origin in replacements
-        else message
-        for origin, message in messages
-    ]
+    chat = trajectory.chats[step.chat]
+    assistants = [origin for origin, _ in messages if isinstance(origin, int)]
+    if chat.HasField("keep_turns"):  # An executor chat: only the latest steps keep reasoning.
+        assistants = assistants[max(len(assistants) - chat.keep_turns, 0) :]
+    sent = []
+    for origin, message in messages:
+        if origin in replacements:
+            sent.append(tool_message(message.tool_call_id, replacements[origin]))
+        elif isinstance(origin, int):
+            sent.append(replayed(message, keep_reasoning=origin in assistants))
+        else:
+            sent.append(message)
+    return sent
 
 
 SYSTEM = ChatMessage(role=ChatRole.CHAT_ROLE_SYSTEM, content="You make slow queries faster.")
@@ -110,6 +148,7 @@ def make_step(
         assistant=ChatMessage(
             role=ChatRole.CHAT_ROLE_ASSISTANT,
             content=f"answer {index}",
+            reasoning_content=f"thinking {index}",
             tool_calls=[
                 ToolCall(id=call, name="execute_sql", arguments_json="{}") for call in calls
             ],
@@ -191,17 +230,118 @@ def test_chats_forked_from_a_step_continue_its_context() -> None:
     assert prompt(trajectory, 6) == at_fork  # The main chat sees none of the samples.
 
 
-def test_an_optional_statistic_keeps_its_presence_through_jsonl() -> None:
-    # A sign-test p of exactly 0 was computed; a gain probability never set was not.
-    line = to_json_line(PhaseResult(sign_test_p=0.0))
+def without_reasoning(message: ChatMessage) -> ChatMessage:
+    """``message`` as a prompt carries it once its step is out of the reasoning window."""
+    sent = ChatMessage()
+    sent.CopyFrom(message)
+    sent.reasoning_content = ""
+    return sent
 
-    fields = json.loads(line)
-    read = from_json_line(line, PhaseResult)
 
-    assert fields["sign_test_p"] == 0.0
-    assert "gain_probability" not in fields
-    assert read.HasField("sign_test_p")
-    assert not read.HasField("gain_probability")
+def test_an_executor_chat_replays_reasoning_for_its_last_keep_turns_steps_only() -> None:
+    trajectory = Trajectory(
+        chats=[Chat(label="main", initial_messages=[SYSTEM, TASK], keep_turns=2)],
+        steps=[
+            make_step(0, 0, "t0"),
+            make_step(1, 0, "t1"),
+            make_step(2, 0, "t2"),
+            make_step(3, 0),
+        ],
+    )
+    steps = trajectory.steps
+
+    assert prompt(trajectory, 2) == [
+        *(SYSTEM, TASK, steps[0].assistant, tool("t0"), steps[1].assistant, tool("t1"))
+    ]
+    assert prompt(trajectory, 3) == [
+        *(SYSTEM, TASK, without_reasoning(steps[0].assistant), tool("t0")),
+        *(steps[1].assistant, tool("t1"), steps[2].assistant, tool("t2")),
+    ]
+    # The trajectory keeps every message in full.
+    assert steps[0].assistant.reasoning_content == "thinking 0"
+
+
+def test_a_chat_without_keep_turns_replays_reasoning_unchanged() -> None:
+    # As GLM's reasoning is (spec §5.1).
+    trajectory = Trajectory(
+        chats=[Chat(label="main", initial_messages=[SYSTEM, TASK])],
+        steps=[make_step(0, 0, "t0"), make_step(1, 0, "t1"), make_step(2, 0)],
+    )
+    steps = trajectory.steps
+
+    assert prompt(trajectory, 2) == [
+        *(SYSTEM, TASK, steps[0].assistant, tool("t0"), steps[1].assistant, tool("t1"))
+    ]
+
+
+def test_a_forked_chat_counts_its_reasoning_window_through_the_forked_context() -> None:
+    trajectory = Trajectory(
+        chats=[
+            Chat(label="main", initial_messages=[SYSTEM, TASK], keep_turns=2),
+            Chat(label="sample-1", forked_from_step=1, keep_turns=2),
+        ],
+        steps=[
+            make_step(0, 0, "t0"),
+            make_step(1, 0, "t1"),
+            make_step(2, 1, "s2"),
+            make_step(3, 1),
+        ],
+    )
+    steps = trajectory.steps
+
+    # At step 2 the window holds steps 0 and 1, both from the forked context.
+    assert prompt(trajectory, 2) == [
+        *(SYSTEM, TASK, steps[0].assistant, tool("t0"), steps[1].assistant, tool("t1"))
+    ]
+    # At step 3 it holds step 1, from the forked context, and step 2, the chat's own.
+    assert prompt(trajectory, 3) == [
+        *(SYSTEM, TASK, without_reasoning(steps[0].assistant), tool("t0")),
+        *(steps[1].assistant, tool("t1"), steps[2].assistant, tool("s2")),
+    ]
+
+
+def xml_step(index: int, source: ToolCallSource.ValueType, content: str, reasoning: str) -> Step:
+    """Step ``index`` of chat 0, whose one call ``t{index}`` was parsed from XML."""
+    step = make_step(index, 0, f"t{index}")
+    step.assistant.content = content
+    step.assistant.reasoning_content = reasoning
+    step.assistant.tool_calls[0].source = source
+    return step
+
+
+def test_a_call_parsed_from_xml_is_replayed_only_as_a_structured_call() -> None:
+    call = (
+        "<tool_call><function=execute_sql><parameter=sql>SELECT 1</parameter></function>"
+        "</tool_call>"
+    )
+    bare = "<function=execute_sql><parameter=sql>SELECT 2</parameter></function>"
+    content_xml = ToolCallSource.TOOL_CALL_SOURCE_CONTENT_XML
+    reasoning_xml = ToolCallSource.TOOL_CALL_SOURCE_REASONING_XML
+    standard = make_step(3, 0, "t3")
+    standard.assistant.content = call  # Its call came from the standard field.
+    trajectory = Trajectory(
+        chats=[Chat(label="main", initial_messages=[SYSTEM, TASK], keep_turns=8)],
+        steps=[
+            xml_step(0, content_xml, f"Run it. {call}", f"Plan. {call}"),
+            xml_step(1, content_xml, f"Again. {bare}", ""),
+            # Cut off: the block runs to the end of the text. A bare block in reasoning stays.
+            xml_step(2, reasoning_xml, "", f"{bare} <tool_call>x"),
+            standard,
+            make_step(4, 0),
+        ],
+    )
+
+    sent = [
+        message for message in prompt(trajectory, 4) if message.role == ChatRole.CHAT_ROLE_ASSISTANT
+    ]
+
+    assert [(message.content, message.reasoning_content) for message in sent] == [
+        ("Run it. ", "Plan. "),
+        ("Again. ", ""),
+        ("", f"{bare} "),
+        (call, "thinking 3"),
+    ]
+    assert [len(message.tool_calls) for message in sent] == [1, 1, 1, 1]
 
 
 def test_every_lane_has_its_own_thresholds() -> None:
