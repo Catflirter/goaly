@@ -16,9 +16,12 @@ process, the LLM client, the PostgreSQL instances and the grader's workers, come
 
 import asyncio
 import dataclasses
+import json
 import logging
+import threading
 from collections.abc import AsyncIterator, Awaitable, Callable, Mapping
 from contextlib import AbstractAsyncContextManager, AsyncExitStack, asynccontextmanager
+from contextvars import ContextVar
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Protocol, Self
@@ -30,7 +33,6 @@ import goaly.bench.effisql
 import goaly.harness
 from goaly.bench.effisql.benchmark import (
     EffiSqlBenchmark,
-    GradeFunction,
     TaskSource,
     grading_mode,
 )
@@ -82,6 +84,7 @@ from goaly.harness.core.runner import ContextFactory, RunIdentity, error_classif
 from goaly.harness.core.settings import load_settings
 
 __all__ = [
+    "GRADING_TASK",
     "PACK_DIR",
     "RUNTIME_SHA256",
     "SOLVING_STATEMENT_TIMEOUT_S",
@@ -91,6 +94,7 @@ __all__ = [
     "LazyGrader",
     "LoadedTasks",
     "PackRunConfig",
+    "PlanLog",
     "RunCallLog",
     "SolvesTasks",
     "classify_error",
@@ -197,9 +201,49 @@ class SolvesTasks(Protocol):
 class GradesPredictions(Protocol):
     """The grader: EffiSqlGrader, or a test's fake."""
 
-    def benchmark_grade(self, mode: Mode, *, priority: Priority) -> GradeFunction: ...
+    async def grade(
+        self,
+        inst: EffiSqlInstance,
+        prediction: Prediction,
+        mode: Mode,
+        *,
+        priority: Priority = ...,
+        on_plan: Callable[[str, JsonValue], None] | None = ...,
+    ) -> Grade: ...
 
     def close(self) -> None: ...
+
+
+# The task a host grade is grading, (instance ID, seed), which Benchmark.grade does not get;
+# whoever grades sets it around each grading (the interim driver does).
+# TODO(T06): read core's own, once its host grade sets one.
+GRADING_TASK: ContextVar[tuple[str, int] | None] = ContextVar(
+    "goaly_effisql_grading_task", default=None
+)
+
+
+class PlanLog:
+    """The host-only audit of every graded prediction's EXPLAIN (FORMAT JSON) plan, for T23.
+
+    Each plan T10's grader took goes to ``<run>/plans/seed-<k>.jsonl`` as a line
+    ``{"instance_id": ..., "plan": ...}``. The solve container never sees the directory.
+    """
+
+    def __init__(self, run_root: Path) -> None:
+        self._dir = run_root / "plans"
+        self._lock = threading.Lock()
+
+    def record(self, instance_id: str, plan: JsonValue) -> None:
+        """Write ``plan``, under the seed GRADING_TASK names; a plan of no known task is logged."""
+        task = GRADING_TASK.get()
+        if task is None or task[0] != instance_id:
+            _logger.warning("a graded plan of no known task", extra={"instance_id": instance_id})
+            return
+        line = json.dumps({"instance_id": instance_id, "plan": plan}, ensure_ascii=False)
+        with self._lock:
+            self._dir.mkdir(parents=True, exist_ok=True)
+            with (self._dir / f"seed-{task[1]}.jsonl").open("a", encoding="utf-8") as file:
+                file.write(line + "\n")
 
 
 async def _real_llm(recorder: CallRecorder, shares: Mapping[str, int]) -> LlmClient:
@@ -370,12 +414,22 @@ def _base_cache_digest(cache_root: Path) -> str:
 
 
 class LazyGrader:
-    """Starts the grader's workers on the first grading only: a solve phase grades nothing."""
+    """Starts the grader's workers on the first grading only: a solve phase grades nothing.
 
-    def __init__(self, start: Callable[[], GradesPredictions], mode: Mode, priority: Priority):
+    With ``plans``, each plan the grader takes is written to the run's plan audit.
+    """
+
+    def __init__(
+        self,
+        start: Callable[[], GradesPredictions],
+        mode: Mode,
+        priority: Priority,
+        plans: PlanLog | None = None,
+    ):
         self._start = start
         self._mode = mode
         self._priority = priority
+        self._plans = plans
         self._grader: GradesPredictions | None = None
         self._lock = asyncio.Lock()
 
@@ -383,8 +437,9 @@ class LazyGrader:
         async with self._lock:
             if self._grader is None:
                 self._grader = await asyncio.to_thread(self._start)
-        return await self._grader.benchmark_grade(self._mode, priority=self._priority)(
-            inst, prediction
+        on_plan = None if self._plans is None else self._plans.record
+        return await self._grader.grade(
+            inst, prediction, self._mode, priority=self._priority, on_plan=on_plan
         )
 
     async def close(self) -> None:
@@ -470,7 +525,10 @@ async def open_host(
     grader = None
     if mode is not None:
         grader = LazyGrader(
-            lambda: wiring.grader(paths.grading_cache_root, wiring.instance_check), mode, priority
+            lambda: wiring.grader(paths.grading_cache_root, wiring.instance_check),
+            mode,
+            priority,
+            PlanLog(options.files.root),
         )
     try:
         yield HostBenchmark(

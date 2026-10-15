@@ -30,11 +30,14 @@ from goaly.bench.effisql.data import (
 from goaly.bench.effisql.grading import Mode
 from goaly.bench.effisql.grading_pool import Priority
 from goaly.bench.effisql.harness import (
+    GRADING_TASK,
     PACK_DIR,
     SOLVING_STATEMENT_TIMEOUT_S,
     EffiSqlPaths,
     EffiSqlWiring,
+    LazyGrader,
     PackRunConfig,
+    PlanLog,
     RunCallLog,
     _full_shares,  # The share rule, tested directly.
     classify_error,
@@ -61,7 +64,14 @@ from goaly.contracts.gen.result_pb2 import (
     TASK_ERROR_TYPE_POLICY_CRASH,
     TaskResult,
 )
-from goaly.contracts.gen.task_pb2 import SPLIT_EXTERNAL, SPLIT_HELDOUT, SPLIT_TRAIN, SPLIT_VAL
+from goaly.contracts.gen.task_pb2 import (
+    SPLIT_EXTERNAL,
+    SPLIT_HELDOUT,
+    SPLIT_TRAIN,
+    SPLIT_VAL,
+    EffiSqlPrediction,
+    Prediction,
+)
 from goaly.contracts.jsonl import read_jsonl
 from goaly.harness.core import cli
 from goaly.harness.core.budgets import Budgets
@@ -560,3 +570,24 @@ class TestSolvingTrust:
         assert result.content.startswith(f"The query failed: {STATEMENT_TIMEOUT}\n")
         assert result.elapsed_s < 1
         await env.close()
+
+
+class TestPlanAudit:
+    async def test_each_graded_plan_goes_to_its_seeds_file(self, tmp_path: Path) -> None:
+        grader = fake_wiring(tmp_path).grader
+        lazy = LazyGrader(lambda: grader, Mode.DEV, Priority.RSI, PlanLog(tmp_path / "run"))
+        inst = EffiSqlInstance.model_validate(task(id=5))
+        prediction = Prediction(instance_id="5", effisql=EffiSqlPrediction(sql="SELECT 1"))
+
+        token = GRADING_TASK.set(("5", 2))
+        try:
+            await lazy(inst, prediction)
+        finally:
+            GRADING_TASK.reset(token)
+        await lazy(inst, prediction)  # No task known: nothing is written.
+
+        lines = (tmp_path / "run" / "plans" / "seed-2.jsonl").read_text().splitlines()
+        assert [json.loads(line) for line in lines] == [
+            {"instance_id": "5", "plan": {"Node Type": "Aggregate"}}
+        ]
+        assert sorted(p.name for p in (tmp_path / "run" / "plans").iterdir()) == ["seed-2.jsonl"]
