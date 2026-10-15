@@ -26,7 +26,7 @@ from goaly.harness.core.registry import (
     Registry,
 )
 from goaly.harness.core.runner import RunFiles, lock_run_dir
-from tests.fakes import FakeSqlEnvironment, ToyInstance
+from tests.fakes import TOY_DATASET_SHA256, FakeSqlEnvironment, ToyInstance
 from tests.harness.core.runner_doubles import (
     ScriptedBenchmark,
     ScriptedPolicy,
@@ -246,8 +246,11 @@ def test_runs_the_toy_benchmark_end_to_end(
     assert manifest.harness_hash == harness_hash(pack)
     assert len(manifest.config_hash) == 64
     assert list(manifest.command_line) == ["goaly", "run", *argv]
-    assert manifest.dataset_revision == "rev-1"
-    assert list(manifest.dataset_notes) == ["toy data"]
+    # The benchmark's own fields (Benchmark.manifest_fields) win over the harness's Dataset.
+    assert manifest.dataset_revision == "toy-revision-1"
+    assert list(manifest.dataset_notes) == ["the toy tasks are held in memory"]
+    assert manifest.dataset_sha256 == TOY_DATASET_SHA256
+    assert dict(manifest.environment_settings) == {"grading_mode": "dev"}
     assert manifest.gold_sha256 == "g" * 64
     assert [model.model for model in manifest.models] == ["qwen3.6-35b-a3b"]
     assert manifest.machine.hostname
@@ -259,6 +262,8 @@ def test_runs_the_toy_benchmark_end_to_end(
     assert options.files == RunFiles(out)
     assert options.instances_file is None
     assert options.llm_shares == {"qwen3.6-35b-a3b": 4}
+    assert options.split == SPLIT_TRAIN
+    assert options.budget_phase == "test"
     assert factory.closed
 
 

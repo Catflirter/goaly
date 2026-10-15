@@ -82,6 +82,12 @@ class HarnessOptions:
     # This process's share of each model's concurrency budget (llm_budgets); a model with no
     # share must not be called. The LLM client enforces it.
     llm_shares: Mapping[str, int]
+    # The split the run takes its tasks from: SPLIT_EXTERNAL for --instances; None if unknown, as
+    # in a test. A benchmark may grade by it, e.g. Effi-SQL's held-out runs in official mode.
+    split: Split.ValueType | None = None
+    # The schedule's phase whose shares apply (--budget-phase): baseline, rsi or final; None if
+    # unknown. A benchmark may schedule its grading by it.
+    budget_phase: str | None = None
 
 
 class RunsTasks(Protocol):
@@ -125,6 +131,9 @@ class RunnableHarness(Protocol):
     def cache_namespace(self) -> str:
         """The grading identity its runs' evaluation cache is kept under; empty for none."""
 
+    def manifest_fields(self) -> RunManifest:
+        """The benchmark's part of the run's manifest (Benchmark.manifest_fields)."""
+
     def runner(
         self, *, cache: EvalCache | None, max_tasks: int, task_timeout_s: float | None
     ) -> RunsTasks:
@@ -152,6 +161,10 @@ class Harness[InstanceT: Instance, EnvT: Environment, CtxT: TaskContext]:
     def benchmark_name(self) -> str:
         """The benchmark adapter's name."""
         return self.benchmark.name
+
+    def manifest_fields(self) -> RunManifest:
+        """The benchmark's part of the run's manifest (Benchmark.manifest_fields)."""
+        return self.benchmark.manifest_fields()
 
     def runner(
         self, *, cache: EvalCache | None, max_tasks: int, task_timeout_s: float | None

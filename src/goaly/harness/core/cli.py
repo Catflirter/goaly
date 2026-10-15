@@ -31,7 +31,13 @@ from collections.abc import Sequence
 from pathlib import Path
 
 from goaly.contracts.gen.manifest_pb2 import RunManifest
-from goaly.contracts.gen.task_pb2 import SPLIT_EXTERNAL, SPLIT_HELDOUT, SPLIT_TRAIN, SPLIT_VAL
+from goaly.contracts.gen.task_pb2 import (
+    SPLIT_EXTERNAL,
+    SPLIT_HELDOUT,
+    SPLIT_TRAIN,
+    SPLIT_VAL,
+    Split,
+)
 from goaly.contracts.interfaces import JsonValue
 from goaly.harness.core.eval_cache import EvalCache
 from goaly.harness.core.llm_budgets import BudgetsError, load_budgets
@@ -204,7 +210,13 @@ async def _run(args: argparse.Namespace, command_line: list[str], registry: Regi
     # Locked before the harness opens, so that nothing it writes there, such as the LLM call log,
     # can meet another process's run.
     with await asyncio.to_thread(lock_run_dir, files) as lock:
-        options = HarnessOptions(files=files, instances_file=args.instances, llm_shares=llm_shares)
+        options = HarnessOptions(
+            files=files,
+            instances_file=args.instances,
+            llm_shares=llm_shares,
+            split=_split(args),
+            budget_phase=args.budget_phase,
+        )
         async with factory(options) as harness:
             return await _run_harness(args, command_line, harness, harness_name, llm_shares, lock)
 
@@ -289,7 +301,7 @@ async def _run_harness(
     return await runner.run(
         lock.files.root,
         manifest,
-        split=SPLIT_EXTERNAL if args.instances is not None else _SPLITS[args.split],
+        split=_split(args),
         seeds=seeds,
         instance_ids=args.only,
         resume=args.resume,
@@ -313,9 +325,22 @@ def _manifest(
     manifest.dataset_revision = harness.dataset.revision
     manifest.dataset_notes[:] = harness.dataset.notes
     manifest.gold_sha256 = harness.dataset.gold_sha256
+    # The benchmark's own fields (Benchmark.manifest_fields): it knows its task file and grader.
+    fields = harness.manifest_fields()
+    if fields.dataset_revision:
+        manifest.dataset_revision = fields.dataset_revision
+    if fields.dataset_notes:
+        manifest.dataset_notes[:] = fields.dataset_notes
+    manifest.dataset_sha256 = fields.dataset_sha256
+    manifest.environment_settings.update(fields.environment_settings)
     manifest.models.extend(harness.models)
     manifest.command_line[:] = command_line
     return manifest
+
+
+def _split(args: argparse.Namespace) -> Split.ValueType:
+    """The split the run's tasks come from: SPLIT_EXTERNAL for --instances."""
+    return SPLIT_EXTERNAL if args.instances is not None else _SPLITS[args.split]
 
 
 def _say(message: str) -> None:
