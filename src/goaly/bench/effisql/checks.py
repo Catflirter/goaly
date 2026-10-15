@@ -11,10 +11,12 @@ A prediction can return the base query's result as constants, such as ``SELECT 1
     depends on the scale, the prediction must scan one of those: region and nation hold the
     same rows at every scale, so a constant answer over them would pass the robustness check;
   - the output comes from a Values Scan, or from a Result with no table scan beneath it,
-    counting the InitPlans and CTEs that PostgreSQL attaches to the nodes above it;
-  - a scan-free branch of more than one row reaches the output through an Append (a UNION);
-  - the SQL calls a function that tells the databases apart, such as ``current_database()``:
-    a prediction could return precomputed rows on one database and compute them on the other.
+    counting the CTEs it reads and the InitPlans above it that feed its values, but not those
+    that only feed a filter, such as an EXISTS;
+  - scan-free branches yielding more than one row reach the output through an Append (a UNION);
+  - the SQL calls a function that tells the databases apart, such as ``current_database()``,
+    or the plan reads a system catalog: a prediction could return precomputed rows on one
+    database and compute them on the other. Time functions are not such probes.
 
   ``VALUES`` joined to real rows stays allowed: task 1's gold unpivots lineitem's columns with
   it. The plan check also finds ``ModifyTable`` nodes, so a data change is refused before it runs.
@@ -54,16 +56,23 @@ RELATION_SCANS = frozenset(
 )  # fmt: skip
 # TPC-H tables whose rows are the same at every scale factor.
 SCALE_INVARIANT_TABLES = frozenset({"region", "nation"})
-# Functions, views and columns that differ between the main and the alternate database, or
-# between sessions, so a query can branch on them (the controller's ruling).
+# Environment-introspection functions, and columns, that differ between the main and the
+# alternate database or between sessions, so a query can branch on them. Exact names, never
+# prefixes: time functions such as current_timestamp are not introspection (spec §4.1).
 ENVIRONMENT_PROBES = re.compile(
     r"\b(current_database|current_catalog|current_setting|current_user|current_role|"
-    r"session_user|inet_server_\w+|inet_client_\w+|pg_backend_pid|version|"
-    r"pg_postmaster_start_time|pg_conf_load_time|pg_\w+_size|pg_relation_filenode|"
-    r"pg_stat\w*|pg_class|pg_database|pg_settings|regclass|to_regclass|tableoid)\b"
+    r"session_user|inet_server_addr|inet_server_port|inet_client_addr|inet_client_port|"
+    r"pg_backend_pid|version|pg_postmaster_start_time|pg_conf_load_time|pg_relation_size|"
+    r"pg_table_size|pg_indexes_size|pg_total_relation_size|pg_database_size|"
+    r"pg_tablespace_size|pg_relation_filenode|pg_relation_filepath|to_regclass|regclass|"
+    r"tableoid|pg_stat_get_live_tuples|pg_stat_get_dead_tuples|pg_stat_get_numscans|"
+    r"pg_stat_get_tuples_returned|pg_stat_get_tuples_fetched|pg_stat_get_tuples_inserted|"
+    r"pg_stat_get_tuples_updated|pg_stat_get_tuples_deleted|pg_stat_get_blocks_fetched|"
+    r"pg_stat_get_blocks_hit)\b"
 )
 # Children that compute a value for their parent rather than feed it rows.
 _SUBPLAN_LINKS = frozenset({"InitPlan", "SubPlan"})
+_SUBPLAN_PARAM = re.compile(r"\$\d+")
 _APPENDS = frozenset({"Append", "Merge Append"})
 _DOLLAR_TAG = re.compile(r"\$(?:[A-Za-z_][A-Za-z0-9_]*)?\$")
 # Roles whose membership would let a prediction reach the server's files or other sessions.
@@ -129,11 +138,16 @@ def environment_probes(sql: str) -> list[str]:
 def inspect_plan(
     document: Mapping[str, Any], base_relations: frozenset[str], *, sql: str
 ) -> PlanVerdict:
-    """Run the plan check on a prediction's plan and SQL, given the base query's tables."""
-    if not base_relations:
-        raise ValueError("the base query's plan scans no table, so nothing can be checked")
+    """Run the plan check on a prediction's plan and SQL, given the base query's tables.
+
+    The check does not apply when the base query reads no table (spec §4.1): its answer is a
+    constant list, so a constant answer is the right one.
+    """
     root = _root(document)
     relations = scanned_relations(document)
+    modifies = any(node.get("Node Type") == "ModifyTable" for node in plan_nodes(root))
+    if not base_relations:
+        return PlanVerdict(modifies_data=modifies, literal_result=False, relations=relations)
     required = base_relations - SCALE_INVARIANT_TABLES or base_relations
     reasons = []
     if not relations & required:
@@ -144,7 +158,9 @@ def inspect_plan(
     probes = environment_probes(sql)
     if probes:
         reasons.append(f"the query probes the environment: {', '.join(sorted(set(probes)))}")
-    modifies = any(node.get("Node Type") == "ModifyTable" for node in plan_nodes(root))
+    catalogs = sorted(name for name in relations if name.startswith("pg_"))
+    if catalogs:
+        reasons.append(f"the query reads the system catalog: {', '.join(catalogs)}")
     return PlanVerdict(
         modifies_data=modifies,
         literal_result=bool(reasons),
@@ -157,32 +173,72 @@ def _literal_output(root: Mapping[str, Any]) -> str | None:
     """Say how the output comes from no table data, or return None if it does not.
 
     The output's source is followed down from the root through each node with one input of
-    rows, and through a CTE Scan into its CTE. PostgreSQL attaches a query level's InitPlans and
-    CTEs to the topmost node of that level, so a scan in any of them counts as beneath a Result
-    further down. A Values Scan on the path is always literal. An Append is literal when any of
-    its branches is a scan-free subtree of more than one row.
+    rows, and through a CTE Scan into its CTE. PostgreSQL attaches a query level's InitPlans to
+    the topmost node of that level, so an InitPlan on a node above that feeds values into the
+    output counts as beneath a Result further down; one that only feeds a filter does not. A
+    Values Scan on the path is always literal. An Append is literal when its scan-free branches,
+    together, yield more than one row.
     """
     ctes = _ctes(root)
-    above: list[Mapping[str, Any]] = []  # The subplans of the nodes on the path so far.
+    filters = _filter_text(root)
+    above: list[Mapping[str, Any]] = []  # The value-feeding subplans of the nodes on the path.
     node: Mapping[str, Any] | None = root
     while node is not None:
         kind = node.get("Node Type")
         children = [c for c in node.get("Plans") or () if isinstance(c, Mapping)]
         inputs = [c for c in children if c.get("Parent Relationship") not in _SUBPLAN_LINKS]
-        above.extend(c for c in children if c.get("Parent Relationship") in _SUBPLAN_LINKS)
+        above.extend(
+            c
+            for c in children
+            if c.get("Parent Relationship") in _SUBPLAN_LINKS
+            and not str(c.get("Subplan Name", "")).startswith("CTE ")
+            and not _feeds_only_filters(c, filters)
+        )
         if kind == "Values Scan":
             return "the output comes from a Values Scan"
-        if kind == "Result" and not any(_reads_table(n, ctes) for n in (node, *above)):
+        if kind == "Result" and not any(_reads_table(n, ctes) for n in (*inputs, *above)):
             return "the output comes from a Result with no table scan beneath it"
         if kind in _APPENDS:
-            if any(_literal_branch(branch, ctes) for branch in inputs):
-                return "a branch of constant rows reaches the output through a union"
+            constant = [branch for branch in inputs if not _reads_table(branch, ctes)]
+            if sum(_plan_rows(branch) for branch in constant) > 1:
+                return "constant rows reach the output through a union"
             return None
         if kind == "CTE Scan":
             node = ctes.get(str(node.get("CTE Name")))
             continue
         node = inputs[0] if len(inputs) == 1 else None
     return None
+
+
+def _filter_text(root: Mapping[str, Any]) -> str:
+    """Return every filter and condition in the plan, as one text."""
+    return "\n".join(
+        str(value)
+        for node in plan_nodes(root)
+        for key, value in node.items()
+        if "Filter" in key or "Cond" in key
+    )
+
+
+def _feeds_only_filters(subplan: Mapping[str, Any], filters: str) -> bool:
+    """Say whether a subplan's values are used in a filter or condition, such as EXISTS.
+
+    A plan without VERBOSE shows no output lists, so a subplan referenced in no filter feeds
+    the output. An InitPlan is referenced by its parameters ($0, PostgreSQL 16) or its name
+    (InitPlan 1, PostgreSQL 17), a SubPlan by its name.
+    """
+    name = str(subplan.get("Subplan Name", ""))
+    identifiers = [*_SUBPLAN_PARAM.findall(name), name.split(" (")[0]]
+    return any(
+        re.search(re.escape(identifier) + r"(?![0-9])", filters)
+        for identifier in identifiers
+        if identifier
+    )
+
+
+def _plan_rows(node: Mapping[str, Any]) -> float:
+    rows = node.get("Plan Rows")
+    return rows if isinstance(rows, int | float) else 0.0
 
 
 def _ctes(root: Mapping[str, Any]) -> dict[str, Mapping[str, Any]]:
@@ -195,7 +251,10 @@ def _ctes(root: Mapping[str, Any]) -> dict[str, Mapping[str, Any]]:
 
 
 def _reads_table(node: Mapping[str, Any], ctes: Mapping[str, Mapping[str, Any]]) -> bool:
-    """Say whether a table scan is beneath ``node``, following CTE Scans into their CTEs."""
+    """Say whether a table scan is beneath ``node``, following CTE Scans into their CTEs.
+
+    A CTE Scan whose CTE the plan does not name counts as a read.
+    """
     seen: set[str] = set()
     pending = [node]
     while pending:
@@ -203,17 +262,14 @@ def _reads_table(node: Mapping[str, Any], ctes: Mapping[str, Mapping[str, Any]])
             kind = current.get("Node Type")
             if kind in RELATION_SCANS:
                 return True
-            name = str(current.get("CTE Name"))
-            if kind == "CTE Scan" and name in ctes and name not in seen:
-                seen.add(name)
-                pending.append(ctes[name])
+            if kind == "CTE Scan":
+                name = str(current.get("CTE Name"))
+                if name not in ctes:
+                    return True  # A plan without CTE names, as the dataset stores: assume it reads.
+                if name not in seen:
+                    seen.add(name)
+                    pending.append(ctes[name])
     return False
-
-
-def _literal_branch(branch: Mapping[str, Any], ctes: Mapping[str, Mapping[str, Any]]) -> bool:
-    rows = branch.get("Plan Rows")
-    many = isinstance(rows, int | float) and rows > 1
-    return many and not _reads_table(branch, ctes)
 
 
 def _code(sql: str) -> str:
