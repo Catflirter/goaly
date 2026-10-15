@@ -36,7 +36,8 @@ class Budgets(BaseModel):
     start of the task's first loop. ``tokens`` and ``cost_usd`` cap the input plus output tokens
     and the reported cost of every model call of the task; None means no cap. After
     ``remind_after_errors`` errors in a row the loop reminds the model of the tool schemas, and
-    after ``stop_after_errors`` it stops.
+    after ``stop_after_errors`` it stops. A reply's tool calls past ``calls_per_reply`` do not
+    run.
     """
 
     model_config = ConfigDict(frozen=True, extra="forbid", allow_inf_nan=False)
@@ -47,6 +48,7 @@ class Budgets(BaseModel):
     cost_usd: PositiveFloat | None = None
     remind_after_errors: PositiveInt = 3
     stop_after_errors: PositiveInt = 5
+    calls_per_reply: PositiveInt = 16
 
     @model_validator(mode="after")
     def _remind_before_stopping(self) -> Self:

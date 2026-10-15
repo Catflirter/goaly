@@ -8,9 +8,10 @@ it returns. When a budget runs out first, it returns the pack's fallback, marked
 
 Bad model output never raises. These are errors, and each counts toward the error streak: a
 call to an unknown tool, or whose arguments do not parse or validate, or whose tool failed; a
-reply that calls no tool; and a reply cut off at the output limit, none of whose calls run.
-After 3 errors in a row (by default) the model is reminded of the tool schemas, and after 5
-the loop stops.
+reply that calls no tool; a reply cut off at the output limit, none of whose calls run; and a
+reply with more calls than the budgets allow, whose calls past the cap do not run. After 3
+errors in a row (by default) the model is reminded of the tool schemas, and after 5 the loop
+stops.
 
 What raises is what the Policy.solve docstring lets through: an EnvironmentFailure, an LLM
 failure that outlasted the client's retries, and cancellation; so does a bug in the pack's
@@ -69,6 +70,10 @@ _CUT_OFF_NO_CALL: Final = (
 )
 _NO_CALL: Final = (
     "Error: your reply called no tool. Each reply must call one of the tools: {tools}."
+)
+_OVER_CAP: Final = (
+    "Error: a reply may make at most {cap} tool calls, so this call was not run. "
+    "Make fewer calls in each reply."
 )
 _REMINDER: Final = (
     "You have made {errors} in a row. Call the tools exactly as these schemas define them:\n"
@@ -260,7 +265,7 @@ class _Chat[E: Environment]:
         self._prompt.append(_replayed(assistant))
         if reply.finish_reason == _CUT_OFF:
             for call in calls:  # A cut-off call may be a wrong submit: none runs.
-                self._answer(step, _cut_off(call))
+                self._answer(step, _not_run(call, _CUT_OFF_CALL))
             self._streak.add(error=True)  # One error for the reply, however many calls it had.
             if not calls:
                 self._notes.append(_CUT_OFF_NO_CALL.format(tools=self._tool_names))
@@ -269,13 +274,18 @@ class _Chat[E: Environment]:
             self._streak.add(error=True)
             self._notes.append(_NO_CALL.format(tools=self._tool_names))
             return None
-        for call in calls:
+        cap = self._ctx.budgets.calls_per_reply
+        for call in calls[:cap]:
             result = await self._hooks.tools.execute(call, self._env)
             self._streak.add(error=result.is_error)
             self._add_guidance(call, result)
             self._answer(step, result)
             if result.HasField("submission"):  # The episode ends: later calls do not run.
                 return result.submission
+        if len(calls) > cap:
+            for call in calls[cap:]:
+                self._answer(step, _not_run(call, _OVER_CAP.format(cap=cap)))
+            self._streak.add(error=True)  # One error for the reply, however far past the cap.
         return None
 
     def _add_guidance(self, call: ToolCall, result: ToolResult) -> None:
@@ -344,8 +354,9 @@ def _replayed(assistant: ChatMessage) -> ChatMessage:
     return message
 
 
-def _cut_off(call: ToolCall) -> ToolResult:
-    return ToolResult(tool_call_id=call.id, name=call.name, content=_CUT_OFF_CALL, is_error=True)
+def _not_run(call: ToolCall, content: str) -> ToolResult:
+    """The error result of a call that the loop did not run, telling the model why."""
+    return ToolResult(tool_call_id=call.id, name=call.name, content=content, is_error=True)
 
 
 def _copy[M: Message](message: M) -> M:

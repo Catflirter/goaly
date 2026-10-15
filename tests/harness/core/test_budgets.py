@@ -32,6 +32,7 @@ def test_v0_effisql_budgets_read_from_config() -> None:
     assert v0.tokens is None
     assert v0.cost_usd is None
     assert (v0.remind_after_errors, v0.stop_after_errors) == (3, 5)  # Spec §5.1.
+    assert v0.calls_per_reply == 16
 
 
 @pytest.mark.parametrize(
@@ -50,6 +51,7 @@ def test_v0_effisql_budgets_read_from_config() -> None:
         {"steps": 30, "wall_clock_s": 600, "remind_after_errors": 0},
         {"steps": 30, "wall_clock_s": 600, "remind_after_errors": 5},  # Not before the stop.
         {"steps": 30, "wall_clock_s": 600, "stop_after_errors": 3},
+        {"steps": 30, "wall_clock_s": 600, "calls_per_reply": 0},
         {"steps": 30, "wall_clock_s": 600, "max_steps": 30},  # Unknown fields are typos.
     ],
 )

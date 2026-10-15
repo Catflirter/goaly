@@ -602,6 +602,30 @@ async def test_a_reply_cut_off_at_the_output_limit_runs_none_of_its_calls() -> N
     assert first.injected[0].content.startswith("You have made 1 error in a row.")
 
 
+async def test_calls_past_the_cap_of_a_reply_are_answered_but_not_run() -> None:
+    env = environment()
+    calls = [execute_sql(FAST), execute_sql(EXPLAIN), execute_sql(SLOW), submit(QWEN_BASE_SQL)]
+    llm = FakeLLM([reply(*calls), reply(submit())])
+    ctx = context(llm, calls_per_reply=2, remind_after_errors=1, stop_after_errors=2)
+
+    prediction = await run_agent(env, ctx, hooks())
+
+    assert prediction == SUBMISSION  # The capped submit never ran.
+    assert [sql for sql, _ in env.executed] == [FAST, EXPLAIN]
+    first = ctx.trajectory().steps[0]
+    assert [result.tool_call_id for result in first.tool_results] == [call.id for call in calls]
+    assert [result.is_error for result in first.tool_results] == [False, False, True, True]
+    for result in first.tool_results[2:]:
+        assert result.content == (
+            "Error: a reply may make at most 2 tool calls, so this call was not run. "
+            "Make fewer calls in each reply."
+        )
+    # The capped calls make one error: the reminder came, after 1, and the stop, after 2, did not.
+    assert [message.content[:31] for message in first.injected] == [
+        "You have made 1 error in a row."
+    ]
+
+
 async def test_a_reply_cut_off_before_any_call_is_nudged_to_think_less() -> None:
     thinking = reply(reasoning="Let me weigh every plan...", finish_reason="length")
     llm = FakeLLM([thinking, reply(submit())])
