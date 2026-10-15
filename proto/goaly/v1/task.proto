@@ -101,7 +101,8 @@ message Grade {
   string instance_id = 1;
   // The score: BIRD 1 or 0; SWE SR_i (spec §4.2), already floored at 0.001.
   double score = 2;
-  // BIRD: the prediction passed every test case. SWE: the patch applied and the tests passed.
+  // BIRD: the prediction passed every test case. SWE: the patch applied and the tests passed;
+  // never true for an empty patch.
   bool correct = 3;
   // How grading went.
   GradeStatus status = 4;
@@ -155,7 +156,8 @@ message SweGrade {
   bool patch_applied = 1;
   // True if the tests passed with the patch applied.
   bool tests_passed = 2;
-  // True if the patch was empty, so the task was scored without an evaluation run.
+  // True if the patch was empty, so the task was scored without an evaluation run. Then
+  // patch_applied, tests_passed and the grade's correct are all false.
   bool empty_patch = 3;
   // The agent's speedup, T_pre / T_post. A patch that is empty, does not apply or fails the
   // tests counts as 1: no speedup.

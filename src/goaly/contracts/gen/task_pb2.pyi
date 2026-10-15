@@ -323,7 +323,9 @@ class Grade(_message.Message):
     score: _builtins.float
     """The score: BIRD 1 or 0; SWE SR_i (spec §4.2), already floored at 0.001."""
     correct: _builtins.bool
-    """BIRD: the prediction passed every test case. SWE: the patch applied and the tests passed."""
+    """BIRD: the prediction passed every test case. SWE: the patch applied and the tests passed;
+    never true for an empty patch.
+    """
     status: Global___GradeStatus.ValueType
     """How grading went."""
     feedback: _builtins.str
@@ -437,7 +439,9 @@ class SweGrade(_message.Message):
     tests_passed: _builtins.bool
     """True if the tests passed with the patch applied."""
     empty_patch: _builtins.bool
-    """True if the patch was empty, so the task was scored without an evaluation run."""
+    """True if the patch was empty, so the task was scored without an evaluation run. Then
+    patch_applied, tests_passed and the grade's correct are all false.
+    """
     speedup: _builtins.float
     """The agent's speedup, T_pre / T_post. A patch that is empty, does not apply or fails the
     tests counts as 1: no speedup.
