@@ -7,11 +7,14 @@ import pytest
 
 from goaly.bench.effisql.report_inputs import (
     DEFAULT_MAX_TASKS,
+    Official,
     RunDirError,
+    Verdict,
     load_difficulty,
     load_experiments,
     load_lessons,
     load_run,
+    load_verdicts,
 )
 from goaly.contracts.gen.experiment_pb2 import DECISION_PENDING, DECISION_REJECTED, Lesson
 from goaly.contracts.gen.task_pb2 import GRADE_STATUS_GRADER_ERROR
@@ -21,9 +24,11 @@ from tests.bench.effisql.rundirs import (
     experiment,
     result,
     write_ledger,
+    write_plans,
     write_run,
+    write_stages,
 )
-from tests.bench.effisql.synthetic import task, write_tasks
+from tests.bench.effisql.synthetic import BASE_SQL, task, write_tasks
 
 
 def test_reads_a_graded_run(tmp_path: Path) -> None:
@@ -39,17 +44,36 @@ def test_reads_a_graded_run(tmp_path: Path) -> None:
     assert run.run_span_s == 3600
 
 
-def test_takes_tokens_cost_and_the_solve_span_from_the_host_call_log(tmp_path: Path) -> None:
+def test_takes_tokens_and_cost_from_the_host_call_log(tmp_path: Path) -> None:
     run = load_run(write_run(tmp_path / "r", {"1": [2.0], "2": [1.0]}, calls=4, cost=0.25))
 
     assert run.usage is not None
     assert (run.usage.calls, run.usage.input_tokens, run.usage.output_tokens) == (4, 400, 40)
     assert run.usage.cost_usd == 1.0
     assert run.usage.unpriced_calls == 0
-    assert run.usage.solve_span_s == 3 * 60 + 30  # First start to last end.
     assert run.cost_per_task_usd() == 0.5
-    # 210 s over 2 tasks, at a concurrency of 2: spec §8.3.
-    assert run.wall_per_task_s() == 210
+
+
+def test_takes_wall_time_from_the_solve_segments_leaving_downtime_out(tmp_path: Path) -> None:
+    root = tmp_path / "final"
+    run_dir = write_run(root / "heldout", {"1": [2.0], "2": [1.0], "3": [1.0]})
+    write_stages(root, run_dir, 120.0, 30.0)  # Two segments: a crash and its resume.
+    write_stages(root, root / "val", 999.0)  # Another run's.
+
+    run = load_run(run_dir)
+
+    assert run.solve_wall_s == 150.0
+    assert run.wall_source == "solve phase"
+    # 150 s over 3 tasks, at a concurrency of 2: spec §8.3.
+    assert run.wall_per_task_s() == 100.0
+
+
+def test_without_solve_segments_takes_the_results_host_wall_time(tmp_path: Path) -> None:
+    run = load_run(write_run(tmp_path / "r", {"1": [2.0], "2": [1.0]}))
+
+    assert run.solve_wall_s is None
+    assert run.wall_source == "results"
+    assert run.wall_per_task_s() == 30.0  # The mean of the graded lines' wall_time_s, as T21's.
 
 
 @pytest.mark.parametrize(
@@ -76,7 +100,6 @@ def test_a_run_without_a_call_log_has_no_usage(tmp_path: Path) -> None:
 
     assert run.usage is None
     assert run.cost_per_task_usd() is None
-    assert run.wall_per_task_s() is None
 
 
 def test_refuses_a_directory_without_a_manifest(tmp_path: Path) -> None:
@@ -182,3 +205,74 @@ def test_a_run_still_solving_has_no_results_and_no_finish(tmp_path: Path) -> Non
     assert run.table is None
     assert run.missing == (("1", 0),)
     assert run.run_span_s is None
+
+
+def test_refuses_a_malformed_manifest(tmp_path: Path) -> None:
+    path = write_run(tmp_path / "r", {"1": [2.0]})
+    (path / "manifest.json").write_text('{"run_id": ', encoding="utf-8")
+
+    with pytest.raises(RunDirError, match="is not a valid manifest"):
+        load_run(path)
+
+
+def test_reads_the_official_records_and_names_the_seeds_without_one(tmp_path: Path) -> None:
+    path = write_run(tmp_path / "r", {"1": [2.0, 2.0]}, queries={("1", 1): "SELECT 2"})
+    (path / "official" / "seed-0.jsonl").unlink()
+
+    run = load_run(path)
+
+    assert run.unread_seeds == (0,)
+    assert run.queries["1", 1] == Official("SELECT 2;", BASE_SQL)
+
+
+def test_reads_the_stored_plans(tmp_path: Path) -> None:
+    path = write_run(tmp_path / "r", {"1": [2.0, 2.0]})
+    write_plans(path, {("1", 1): {"Plan": {"Node Type": "Result"}}})
+
+    assert load_run(path).plans == {("1", 1): {"Plan": {"Node Type": "Result"}}}
+
+
+def test_refuses_a_plans_file_that_is_not_json_lines(tmp_path: Path) -> None:
+    path = write_run(tmp_path / "r", {"1": [2.0]})
+    (path / "plans").mkdir()
+    (path / "plans" / "seed-0.jsonl").write_text("{oops\n", encoding="utf-8")
+
+    with pytest.raises(RunDirError, match=r"seed-0\.jsonl:1: not JSON"):
+        load_run(path)
+
+
+def test_reads_the_audit_verdicts(tmp_path: Path) -> None:
+    path = tmp_path / "verdicts.json"
+    entries = [
+        {
+            "role": "final-heldout",
+            "task": "7",
+            "seed": 0,
+            "verdict": "constant branch",
+            "note": "x",
+        },
+        {"role": "final-heldout", "task": 8, "seed": "1", "verdict": "clean"},
+    ]
+    path.write_text(json.dumps(entries), encoding="utf-8")
+
+    assert load_verdicts(path) == {
+        ("final-heldout", "7", 0): Verdict(constant_branch=True, note="x"),
+        ("final-heldout", "8", 1): Verdict(constant_branch=False),
+    }
+
+
+@pytest.mark.parametrize(
+    ("entries", "message"),
+    [
+        ([{"role": "r", "task": "1", "seed": 0, "verdict": "maybe"}], "not a list of"),
+        ([{"role": "r", "task": "1"}], "not a list of"),
+        ({"role": "r"}, "not a list of"),
+        ([{"role": "r", "task": "1", "seed": 0, "verdict": "clean"}] * 2, "two verdicts on"),
+    ],
+)
+def test_refuses_malformed_verdicts(tmp_path: Path, entries: object, message: str) -> None:
+    path = tmp_path / "verdicts.json"
+    path.write_text(json.dumps(entries), encoding="utf-8")
+
+    with pytest.raises(RunDirError, match=message):
+        load_verdicts(path)

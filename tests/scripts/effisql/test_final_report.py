@@ -1,9 +1,11 @@
 """Tests for scripts/effisql/final_report.py, on toy run directories."""
 
+import json
 from pathlib import Path
 
 import pytest
 
+from goaly.bench.effisql.report_inputs import load_verdicts
 from goaly.contracts.gen.task_pb2 import GRADE_STATUS_GRADER_ERROR
 from scripts.effisql import final_report
 from tests.bench.effisql.rundirs import effisql_grade, experiment, result, write_ledger, write_run
@@ -70,3 +72,34 @@ def test_says_what_is_wrong_with_a_task_file(
 
     assert final_report.main(["--ledger", str(tmp_path), "--tasks", str(bad)]) == 1
     assert f"error: {bad}:1:" in capsys.readouterr().err
+
+
+def test_applies_the_audit_verdicts(tmp_path: Path) -> None:
+    run = write_run(
+        tmp_path / "final", {"1": [2.0], "2": [1.0]}, queries={("1", 0): "SELECT 12345.67"}
+    )
+    verdicts = tmp_path / "verdicts.json"
+    entry = {"role": "final-heldout", "task": "1", "seed": 0, "verdict": "constant branch"}
+    verdicts.write_text(json.dumps([entry]), encoding="utf-8")
+    out = tmp_path / "report.md"
+    args = ["--final-heldout", str(run), "--ledger", str(tmp_path), "--tasks", str(tasks(tmp_path))]
+
+    assert final_report.main([*args, "--verdicts", str(verdicts), "--out", str(out)]) == 0
+    report = out.read_text(encoding="utf-8")
+    assert "| constant branch: no credit |" in report
+    assert "| final-heldout | 0 | checked | 25.0 |" in report  # Task 1's credit of 1 is gone.
+
+
+def test_refuses_a_malformed_manifest_without_a_traceback(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    run = write_run(tmp_path / "final", {"1": [2.0]})
+    (run / "manifest.json").write_text("{", encoding="utf-8")
+    args = ["--final-heldout", str(run), "--ledger", str(tmp_path), "--tasks", str(tasks(tmp_path))]
+
+    assert final_report.main(args) == 1
+    assert "is not a valid manifest" in capsys.readouterr().err
+
+
+def test_the_committed_verdicts_file_loads() -> None:
+    assert load_verdicts(TEMPLATE.with_name("audit-verdicts.json")) == {}

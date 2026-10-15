@@ -10,7 +10,9 @@ the final runs exist. --allow-partial reports a run that is still grading, from 
 in every seed, and the Runs section marks it partial. --tasks is the task file the difficulty
 labels come from, by default the cached dataset (scripts/effisql/prepare_data.py). With
 --template, the narrative template's markers are filled; without it the sections are written in
-order. The report goes to --out, or to stdout.
+order. --verdicts is the JSON list of the constant-branch audit's verdicts
+(docs/results/audit-verdicts.json): a prediction judged a constant branch gets no credit in every
+checked number. The report goes to --out, or to stdout.
 """
 
 import argparse
@@ -26,6 +28,7 @@ from goaly.bench.effisql.report_inputs import (
     load_experiments,
     load_lessons,
     load_run,
+    load_verdicts,
 )
 
 DEFAULT_LEDGER = Path("rsi/ledger")
@@ -40,6 +43,7 @@ def main(argv: Sequence[str] | None = None) -> int:
     parser.add_argument("--template", type=Path, metavar="FILE")
     parser.add_argument("--out", type=Path, metavar="FILE")
     parser.add_argument("--allow-partial", action="store_true")
+    parser.add_argument("--verdicts", type=Path, metavar="FILE", help="the audit's verdicts")
     parser.add_argument("--bootstrap-seed", type=int, default=BOOTSTRAP_SEED)
     args = parser.parse_args(argv)
     try:
@@ -54,6 +58,8 @@ def main(argv: Sequence[str] | None = None) -> int:
             experiments=load_experiments(args.ledger),
             lessons=load_lessons(args.ledger),
             bootstrap_seed=args.bootstrap_seed,
+            allow_partial=args.allow_partial,
+            verdicts={} if args.verdicts is None else load_verdicts(args.verdicts),
         )
         template = None if args.template is None else args.template.read_text(encoding="utf-8")
         report = render(inputs, template)
