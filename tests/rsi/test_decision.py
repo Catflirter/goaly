@@ -344,7 +344,7 @@ def test_cost_stats_average_per_task_and_seed() -> None:
         CostStats.from_results([])
 
 
-def test_a_ratio_without_a_basis_is_left_unset() -> None:
+def test_a_ratio_without_a_basis_is_left_unset(caplog: pytest.LogCaptureFixture) -> None:
     best = measured(val(seeds=2), seeds=[0, 1], tokens=0, wall=0.0)
     v0 = measured(val(seeds=2), seeds=[0, 1], cost=None)
     candidate = measured(val(FOUR_WINS), tokens=5000, wall=99.0, cost=1.0)
@@ -352,6 +352,8 @@ def test_a_ratio_without_a_basis_is_left_unset() -> None:
     for field in ("token_ratio_vs_best", "time_ratio_vs_best", "cost_ratio_vs_v0"):
         assert not verdict.phase.HasField(field)
     assert verdict.phase.time_ratio_vs_v0 == pytest.approx(9.9)
+    skipped = {r.getMessage().split()[0] for r in caplog.records if r.levelname == "WARNING"}
+    assert skipped == {"token_ratio_vs_best", "time_ratio_vs_best", "cost_ratio_vs_v0"}
     assert verdict.reasons == (REJECTION_REASON_EFFICIENCY_CAP,)
 
 

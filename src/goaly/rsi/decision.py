@@ -27,6 +27,7 @@ does not apply.
 decision_reason and the lessons drawn from it stay clean of per-task val data (spec §7).
 """
 
+import logging
 import math
 from collections.abc import Iterable, Mapping, Sequence
 from dataclasses import dataclass
@@ -63,6 +64,8 @@ __all__ = [
     "screen",
     "validate",
 ]
+
+_logger = logging.getLogger(__name__)
 
 _SCORING = Scoring.CHECKED  # RSI decides on the checked numbers (spec §6.3).
 _GUARDRAIL_FACTOR = 2.0  # The cost guardrail doubles both Δ thresholds (spec §8.3).
@@ -318,6 +321,11 @@ def _phase(
 def _set_ratio(phase: PhaseResult, field: _Ratio, value: float | None, basis: float | None) -> None:
     if value is not None and basis is not None and basis > 0:
         setattr(phase, field, value / basis)
+        return
+    # Until the evaluator reports host-side numbers for every task, cached ones included.
+    _logger.warning(
+        "%s is unknown, so its rule is skipped", field, extra={"value": value, "basis": basis}
+    )
 
 
 def _ratios(phase: PhaseResult, *fields: _Ratio) -> list[tuple[_Ratio, float]]:
