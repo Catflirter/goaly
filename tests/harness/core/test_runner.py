@@ -883,16 +883,20 @@ async def test_a_graded_resume_refuses_a_run_its_solve_phase_left_ungraded(
     assert not read_manifest(RunFiles(tmp_path).manifest).HasField("finished_at")
 
 
-async def test_a_solve_phase_may_resume_a_run_and_leave_it_to_the_grade_phase(
-    tmp_path: Path,
-) -> None:
-    await interrupt_after(
-        make_runner(
-            ScriptedBenchmark(toy_instances(2)), ScriptedPolicy({"t1": waiting(asyncio.Event())})
-        ),
-        tmp_path,
-        1,
+async def test_a_solve_phase_resumes_its_own_ungraded_run(tmp_path: Path) -> None:
+    files = RunFiles(tmp_path)
+    blocked = make_runner(
+        ScriptedBenchmark(toy_instances(2)), ScriptedPolicy({"t1": waiting(asyncio.Event())})
     )
+    solving = asyncio.create_task(
+        blocked.run(tmp_path, template(), split=SPLIT_TRAIN, seeds=[0], grading=False)
+    )
+    await wait_until(
+        lambda: files.results.exists() and files.results.read_bytes().count(b"\n") == 1
+    )
+    solving.cancel()
+    with pytest.raises(asyncio.CancelledError):
+        await solving
 
     async with asyncio.timeout(GUARD_S):
         summary = await make_runner(ScriptedBenchmark(toy_instances(2))).run(
@@ -900,6 +904,7 @@ async def test_a_solve_phase_may_resume_a_run_and_leave_it_to_the_grade_phase(
         )
 
     assert (summary.resumed, summary.ran) == (1, 1)
+    assert not any(result.HasField("grade") for result in results(tmp_path).values())
 
 
 async def test_a_solve_phase_of_an_external_run_finishes_it(tmp_path: Path) -> None:
