@@ -298,6 +298,7 @@ class LlmClient:
             model: ModelThrottle(model, share, policy, self._clock)
             for model, share in shares.items()
         }
+        self._loop: asyncio.AbstractEventLoop | None = None  # Set by the first async use.
         self._api_key = settings.api_key
         headers = {"Authorization": f"Bearer {settings.api_key.get_secret_value()}"}
         self._http = {  # One connection pool per model, as large as its share.
@@ -312,6 +313,7 @@ class LlmClient:
         }
 
     async def __aenter__(self) -> Self:
+        self._bind_loop()
         return self
 
     async def __aexit__(
@@ -346,6 +348,7 @@ class LlmClient:
         exactly one record, however it ends: a failure raises an LlmError, and
         asyncio.CancelledError goes through at once, with no retry.
         """
+        self._bind_loop()
         if allowed_model(tags.purpose) != model:
             raise self._refuse(model, tags)
         body = _request_body(self._profiles[model].with_overrides(params), messages, tools)
@@ -377,6 +380,14 @@ class LlmClient:
         if allowed_model(tags.purpose) != model:
             raise self._refuse(model, tags)
         return BoundLlmClient(self, model, tags)
+
+    def _bind_loop(self) -> None:
+        """Make the running loop the client's own, the one its connections and limits live on."""
+        loop = asyncio.get_running_loop()
+        if self._loop is None:
+            self._loop = loop
+        elif loop is not self._loop:
+            raise RuntimeError("an LlmClient serves one event loop: the one it was first used on")
 
     def _refuse(self, model: str, tags: CallTags) -> ModelNotAllowed:
         try:

@@ -792,6 +792,22 @@ async def test_bound_clients_share_the_limit_of_the_client_that_bound_them() -> 
     assert peak == 2  # Three tasks under one limit of 2: not 2 each.
 
 
+async def test_a_client_serves_only_the_loop_it_was_first_used_on() -> None:
+    # Its limits wait on futures of that loop: a call from another loop must not join them.
+    gateway = Gateway(completion())
+    async with LlmClient(
+        settings(), Recorder(), transport=httpx.MockTransport(gateway.handle)
+    ) as llm:
+
+        def call_on_a_second_loop() -> None:
+            asyncio.run(llm.complete([user("hi")], model=QWEN, tags=EXEC))
+
+        with pytest.raises(RuntimeError, match="one event loop"):
+            await asyncio.to_thread(call_on_a_second_loop)
+
+    assert gateway.requests == []
+
+
 async def test_each_model_has_its_own_limit(caplog: pytest.LogCaptureFixture) -> None:
     caplog.set_level(logging.INFO, logger="goaly.harness.core.llm_throttle")
     gateway = Gateway(failure(429), completion(), completion())
