@@ -6,7 +6,8 @@ When a budget runs out before submit, the fallback submits ``base_sql`` unchange
 grader credits with its identity τ (spec §5.4).
 """
 
-from collections.abc import Mapping
+import asyncio
+from collections.abc import Callable, Mapping
 
 from pydantic import BaseModel, ConfigDict, Field
 
@@ -46,24 +47,46 @@ class EffiSqlPolicy:
         if task.WhichOneof("benchmark") != "effisql":
             raise ValueError("the Effi-SQL policy solves Effi-SQL tasks only")
         sql_task = task.effisql
+        # Read before the loop starts, which is when core's own wall clock starts, so what the
+        # tool's guard is told is never more time than the task really has left.
+        started = asyncio.get_running_loop().time()
         hooks = AgentHooks(
             system_prompt=self.system_prompt,
             task_prompt=task_prompt(sql_task, self.config, ctx.budgets),
-            tools=registry(self.config, ctx.budgets),
+            tools=registry(self.config, ctx.budgets, wall_clock_remaining(ctx.budgets, started)),
             fallback=lambda: fallback(sql_task),
         )
         return await run_agent(env, ctx, hooks)
 
 
-def registry(config: PackConfig, budgets: Budgets) -> ToolRegistry[SqlEnvironment]:
-    """The tools: execute_sql with the task's wall budget as its backstop, and submit."""
-    execute_sql = ExecuteSql(config.execute_sql)
+def registry(
+    config: PackConfig,
+    budgets: Budgets,
+    remaining_s: Callable[[], float] | None = None,
+) -> ToolRegistry[SqlEnvironment]:
+    """The tools: execute_sql with the task's wall budget as its backstop, and submit.
+
+    ``remaining_s`` tells execute_sql how much of that budget the task still has, so its
+    runaway guard cancels a call that would run to the backstop; without it the tool falls
+    back to a fixed cap.
+    """
+    execute_sql = ExecuteSql(config.execute_sql, remaining_s)
     return ToolRegistry(
         [
             bind(execute_sql, timeout_s=budgets.wall_clock_s),
             bind(Submit(), timeout_s=config.submit_timeout_s),
         ]
     )
+
+
+def wall_clock_remaining(budgets: Budgets, started: float) -> Callable[[], float]:
+    """How many seconds of the task's wall budget are left, as the event loop's clock counts.
+
+    Read at ``started``, just before the loop starts core's own wall clock, so this never
+    reports more time than the task really has; execute_sql's guard cancels with that much of
+    the budget still to spend on another shape, or on submitting.
+    """
+    return lambda: budgets.wall_clock_s - (asyncio.get_running_loop().time() - started)
 
 
 def fallback(task: EffiSqlTaskInput) -> Prediction:

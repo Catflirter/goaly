@@ -26,4 +26,6 @@ pack:
     statement_timeout_s: 120 # At most 120; the environment caps it there too, by client-side cancel.
     rows_shown: 100
     value_chars: 2000 # Enough for a plan's EXPLAIN text.
+    guard_fraction: 0.5 # The runaway guard cancels a call past this share of the time left.
+    guard_min_s: 10 # ... and never sooner than this, so a late probe still gets its turn.
   submit_timeout_s: 10
