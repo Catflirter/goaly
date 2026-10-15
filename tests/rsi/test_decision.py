@@ -488,3 +488,8 @@ def test_the_screen_applies_the_cap_when_v0_is_given() -> None:
     assert capped.reasons == (REJECTION_REASON_EFFICIENCY_CAP,)
     assert capped.phase.cost_ratio_vs_v0 == pytest.approx(5.0)
     assert screen(SPLIT_TRAIN, BEST, candidate).passed
+
+
+def test_a_config_comes_back_from_its_recorded_thresholds() -> None:
+    config = DecisionConfig(min_delta=0.07, confirm_min_delta=0.02, max_regressions=2)
+    assert DecisionConfig.from_thresholds(config.thresholds()) == config

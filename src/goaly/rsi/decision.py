@@ -99,6 +99,19 @@ class DecisionConfig(BaseModel):
     cost_guardrail_ratio: float = Field(default=1.5, gt=0)
     efficiency_cap_ratio: float = Field(default=3.0, gt=0)
 
+    @classmethod
+    def from_thresholds(cls, thresholds: DecisionThresholds) -> "DecisionConfig":
+        """The config that :meth:`thresholds` recorded, as on an ExperimentRecord."""
+        effisql = thresholds.effisql
+        return cls(
+            min_delta=effisql.min_delta,
+            sign_test_max_p=effisql.sign_test_max_p,
+            max_regressions=effisql.max_regressions,
+            confirm_min_delta=effisql.confirm_min_delta,
+            cost_guardrail_ratio=thresholds.cost_guardrail_ratio,
+            efficiency_cap_ratio=thresholds.efficiency_cap_ratio,
+        )
+
     def thresholds(self) -> DecisionThresholds:
         """The thresholds as ExperimentRecord.thresholds records them."""
         return DecisionThresholds(

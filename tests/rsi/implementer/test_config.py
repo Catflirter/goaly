@@ -11,13 +11,15 @@ from goaly.rsi.implementer.config import DEFAULT_CONFIG, Limits, load_config
 def test_the_shipped_config_holds_the_spec_limits() -> None:
     config = load_config()
 
-    # Spec §8.8: 60 steps, $3 of GLM, 30 minutes, 3 format errors in a row, 120 s per command.
+    # Spec §8.8: 60 steps, $3 of GLM, 30 minutes, 3 format errors in a row, 120 s per command,
+    # and at most 2 goaly-smoke runs.
     assert config.limits == Limits(
         step_limit=60,
         cost_limit_usd=3.0,
         wall_time_limit_s=1800,
         max_consecutive_format_errors=3,
         command_timeout_s=120,
+        smoke_limit=2,
     )
     assert "output.returncode" in config.model.observation_template
     assert "finish_reason" in config.model.format_error_template
