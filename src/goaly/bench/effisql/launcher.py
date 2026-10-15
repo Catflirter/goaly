@@ -36,7 +36,7 @@ from goaly.bench.effisql.data import write_runtime_file
 from goaly.bench.effisql.harness import EffiSqlPaths, RunCallLog
 from goaly.bench.effisql.layout import SolveInputs
 from goaly.bench.effisql.pg_instances import SOLVING
-from goaly.bench.effisql.pg_settings import AgentCredentials, PgEnvConfig, load_agent_credentials
+from goaly.bench.effisql.pg_settings import AgentCredentials, PgEnvConfig, load_credentials
 from goaly.bench.sandbox import (
     SandboxResult,
     SolveEnvironment,
@@ -255,7 +255,7 @@ class EffiSqlLauncher:
     sandbox: Callable[[], Sandbox] = DockerSandbox
     proxy: Callable[[CallRecorder, str, Path], AbstractAsyncContextManager[Gateway]] = _open_proxy
     # Only the agent role's password: the container never gets the admin's or the grader's.
-    credentials: Callable[[], AgentCredentials] = load_agent_credentials
+    credentials: Callable[[], AgentCredentials] = lambda: load_credentials().agent_only()
     # The solving instances' Unix-socket directories, which the container mounts (V28).
     socket_dirs: Callable[[], tuple[Path, ...]] = _solving_socket_dirs
     # Where T10's graders lock the instances they grade on.

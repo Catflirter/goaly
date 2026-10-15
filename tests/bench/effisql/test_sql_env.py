@@ -24,6 +24,7 @@ from goaly.bench.effisql.sql_env import (
     ResultBuilder,
     SolvingPool,
     SqlEnvOptions,
+    capped_error,
     connection_lost,
     encode_value,
     refuse_copy_data,
@@ -214,6 +215,30 @@ def test_an_error_ends_the_result_with_the_servers_message() -> None:
     assert result.error == "ERROR:  division by zero"
     assert (result.row_count, len(result.rows), list(result.columns)) == (0, 0, [])
     assert builder.sqlstate == "22012"
+
+
+def test_an_error_message_is_cut_to_8_kib_with_a_note() -> None:
+    assert capped_error(b"ERROR:  short\n") == "ERROR:  short"
+    assert capped_error("x" * 8192) == "x" * 8192
+    cut = capped_error("x" * 10_000)
+    assert cut == "x" * 8169 + "[truncated 1831 bytes]"  # At most 8 KiB with its note,
+    assert len(cut) <= 8192
+    assert capped_error(cut) == cut  # and cutting it again changes nothing.
+    # A cut inside a character drops the half, never writes it out broken.
+    assert capped_error("é" * 20, max_bytes=31) == "ééééé[truncated 30 bytes]"
+
+
+def test_a_huge_server_error_reaches_the_agent_cut() -> None:
+    builder = ResultBuilder(row_limit=10)
+    quoted = b'ERROR:  invalid input syntax for type integer: "' + b"x" * 100_000 + b'"'
+    builder.add(FakeResult(ExecStatus.FATAL_ERROR, error_message=quoted, sqlstate=b"22P02"))
+
+    error = builder.result().error
+
+    assert error.startswith("ERROR:  invalid input syntax for type integer")
+    kept, note = error.rsplit("[truncated ", 1)
+    assert note == f"{len(quoted) - len(kept.encode())} bytes]"  # What was left out, exactly.
+    assert len(error.encode()) <= 8192
 
 
 def test_an_empty_query_is_an_empty_result() -> None:
@@ -684,6 +709,39 @@ async def test_a_lost_session_is_an_error_result_and_the_next_call_reopens(
     scenario.behave = "ok"
     assert (await env.execute("SELECT 1", timeout_s=5)).error == ""
     assert len(scenario.connections) == 2
+
+
+@pytest.mark.anyio
+async def test_a_lost_session_with_a_huge_reason_reports_it_cut() -> None:
+    scenario = Scenario()
+    env = _environment(scenario)
+    await env.open()
+
+    async def huge(conn: Any, sql: str, builder: ResultBuilder) -> None:
+        raise psycopg.OperationalError("the server said: " + "y" * 50_000)
+
+    env._runner = huge
+
+    result = await env.execute("SELECT 1", timeout_s=5)
+
+    assert result.error.startswith("the session ended: the server said: yyy")
+    assert "[truncated " in result.error
+    assert len(result.error.encode()) <= 8192
+
+
+@pytest.mark.anyio
+async def test_a_close_while_the_session_opens_leaves_no_session_behind() -> None:
+    scenario = Scenario()
+    scenario.connect_delay = 0.2
+    env = _environment(scenario)
+    opening = asyncio.create_task(env.open())
+    await asyncio.sleep(0.05)  # Connecting.
+
+    await env.close()
+
+    with pytest.raises(RuntimeError, match="closed while its session opened"):
+        await opening
+    assert scenario.connections[0].closed
 
 
 @pytest.mark.anyio

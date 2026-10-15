@@ -53,7 +53,7 @@ from goaly.bench.effisql.harness import (
     recorded_priority,
 )
 from goaly.bench.effisql.pg_instances import SOLVING
-from goaly.bench.effisql.pg_settings import AgentCredentials
+from goaly.bench.effisql.pg_settings import AgentCredentials, PgCredentials
 from goaly.bench.effisql.splits import load_splits
 from goaly.bench.effisql.sql_env import STATEMENT_TIMEOUT, PgSqlEnvironment, SolvingPool
 from goaly.contracts.errors import EnvironmentFailure
@@ -509,17 +509,16 @@ class TestSolvingTrust:
     async def test_the_solving_pool_holds_the_agent_password_alone(
         self, monkeypatch: pytest.MonkeyPatch
     ) -> None:
-        def refuse() -> None:
-            raise AssertionError("the solve path must never load every password")
-
-        monkeypatch.setattr("goaly.bench.effisql.pg_settings.load_credentials", refuse)
-        monkeypatch.setattr(
-            "goaly.bench.effisql.harness.load_agent_credentials",
-            lambda: AgentCredentials(agent_password=SecretStr("agent-only")),
+        every = PgCredentials(
+            admin_password=SecretStr("admin"),
+            agent_password=SecretStr("agent-only"),
+            grader_password=SecretStr("grader"),
         )
+        monkeypatch.setattr("goaly.bench.effisql.harness.load_credentials", lambda: every)
 
         pool = await EffiSqlWiring().solving()
 
+        # SolvingPool takes AgentCredentials alone (T09): the others stay on the host's file.
         assert isinstance(pool, SolvingPool)
         assert pool.options.timeout_s == SOLVING_STATEMENT_TIMEOUT_S == 120
         assert not hasattr(AgentCredentials(agent_password=SecretStr("x")), "admin_password")
@@ -529,7 +528,7 @@ class TestSolvingTrust:
     ) -> None:
         monkeypatch.setattr("goaly.bench.effisql.harness.SOLVING_STATEMENT_TIMEOUT_S", 0.2)
         monkeypatch.setattr(
-            "goaly.bench.effisql.harness.load_agent_credentials",
+            "goaly.bench.effisql.harness._agent_credentials",
             lambda: AgentCredentials(agent_password=SecretStr("agent-only")),
         )
         pool = await EffiSqlWiring().solving()
@@ -639,7 +638,7 @@ class TestInContainer:
             raise AssertionError("the container never reads a credentials file")
 
         monkeypatch.setattr("goaly.bench.effisql.pg_settings.load_credentials", refuse)
-        monkeypatch.setattr("goaly.bench.effisql.harness.load_agent_credentials", refuse)
+        monkeypatch.setattr("goaly.bench.effisql.harness.load_credentials", refuse)
 
         pool = await EffiSqlWiring.in_container(tmp_path).solving()
 

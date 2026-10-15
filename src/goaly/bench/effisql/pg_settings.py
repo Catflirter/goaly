@@ -7,8 +7,9 @@ creates that file with random passwords, and :func:`load_credentials` reads it. 
 prints a password, and no error message quotes one.
 
 The solving side holds the agent role's password and nothing else (spec §6.1, §8.5):
-:class:`AgentCredentials`, read by :func:`load_agent_credentials`, which never loads another
-password. :func:`write_agent_credentials` writes the agent-only file a solve container mounts.
+:class:`AgentCredentials`, read by :func:`load_agent_credentials` from a file it must be given,
+normally the agent-only file :func:`write_agent_credentials` writes for a solve container to
+mount; it keeps the agent's password and no other.
 """
 
 import os
@@ -265,11 +266,13 @@ def load_credentials(path: Path | None = None) -> PgCredentials:
     return _load(PgCredentials, path)
 
 
-def load_agent_credentials(path: Path | None = None) -> AgentCredentials:
-    """Read only the agent role's password from ``path`` (default: the pg.env file).
+def load_agent_credentials(path: Path) -> AgentCredentials:
+    """Read the agent role's password from ``path``, the agent-only file a solve container
+    mounts (see :func:`write_agent_credentials`).
 
-    The file may also hold the other passwords, as the host's does; they are never loaded. It
-    fails as :func:`load_credentials` does.
+    There is no default: the host's pg.env holds every password, so the solving side must name
+    the file it reads. Any other password in the file is ignored. It fails as
+    :func:`load_credentials` does. Host code takes ``load_credentials().agent_only()``.
     """
     return _load(AgentCredentials, path)
 

@@ -29,7 +29,7 @@ from goaly.bench.effisql.launcher import (
     stage_inputs,
 )
 from goaly.bench.effisql.layout import SolveInputs
-from goaly.bench.effisql.pg_settings import AgentCredentials, load_agent_credentials
+from goaly.bench.effisql.pg_settings import AgentCredentials, PgCredentials
 from goaly.bench.sandbox import SandboxResult, SolveEnvironment
 from goaly.contracts.gen.llm_call_pb2 import LlmCallRecord
 from goaly.contracts.gen.task_pb2 import SPLIT_EXTERNAL, SPLIT_HELDOUT, SPLIT_VAL
@@ -328,7 +328,15 @@ async def test_the_container_gets_the_agent_password_alone(
         "GOALY_PG_AGENT_PASSWORD",
     ]
     assert not any("pg.env" in value for value in variables.values())
-    assert EffiSqlLauncher().credentials is load_agent_credentials
+    every = PgCredentials(
+        admin_password=SecretStr("admin"),
+        agent_password=SecretStr("agent"),
+        grader_password=SecretStr("grader"),
+    )
+    monkeypatch.setattr("goaly.bench.effisql.launcher.load_credentials", lambda: every)
+    default = EffiSqlLauncher().credentials()
+    assert isinstance(default, AgentCredentials)  # The host's file, the agent's password alone.
+    assert default.agent_password.get_secret_value() == "agent"
 
 
 def test_the_proxy_socket_is_beside_solve_unless_too_long(tmp_path: Path) -> None:
