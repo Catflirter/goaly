@@ -42,6 +42,9 @@ DEFAULT_MAX_ATTEMPTS: Final = 3
 _FENCE = re.compile(r"```(?:json)?[ \t]*\n(.*?)\n?```", re.DOTALL)
 _ERRORS_SHOWN: Final = 20  # How many validation errors a retry quotes.
 _INPUT_QUOTED: Final = 200  # How much of an invalid value an error quotes.
+_CUT_OFF: Final = (
+    "The answer was cut off at the token limit. Think more briefly, and write a shorter answer."
+)
 
 _logger = logging.getLogger(__name__)
 
@@ -150,7 +153,7 @@ def _validate[M: BaseModel](
 ) -> tuple[M | None, str]:
     """Return the reply's value, or None and what is wrong with it, in words."""
     if reply.finish_reason == "length":
-        return None, "The answer was cut off at the token limit. Write a shorter answer."
+        return None, _CUT_OFF
     text = _json_text(reply.message.content)
     if not text:
         return None, "The answer held no JSON object: the content was empty."

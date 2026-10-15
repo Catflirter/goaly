@@ -144,6 +144,21 @@ async def test_a_cut_off_or_empty_reply_is_retried(reply: GlmReply, says: str) -
     assert says in gateway.bodies[1]["messages"][-1]["content"]
 
 
+async def test_a_cut_off_reply_is_retried_with_its_reasoning_replayed() -> None:
+    cut = GlmReply("", reasoning="Thinking until the tokens ran out", finish_reason="length")
+    gateway = FakeGlm(cut, VALID)
+    reply = await ask(gateway)
+    assert reply.value.count == 2
+    assert len(reply.call_ids) == 2
+    retry = gateway.bodies[1]["messages"]
+    assert retry[2] == {
+        "role": "assistant",
+        "content": "",
+        "reasoning_content": "Thinking until the tokens ran out",
+    }
+    assert "cut off at the token limit" in retry[3]["content"]
+
+
 async def test_the_context_reaches_the_validators() -> None:
     gateway = FakeGlm(VALID, json.dumps({"text": "y", "count": 1}))
     reply = await ask(gateway, context={"limit": 1})
