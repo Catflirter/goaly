@@ -4,14 +4,15 @@ Each phase compares a candidate with the lane's best on the same tasks, through
 :func:`goaly.bench.effisql.metrics.compare` on the checked credit, and returns a :class:`Verdict`:
 the PhaseResult the ledger records, and every rule the candidate failed, in the order checked.
 
-- :func:`screen`: any prediction flagged ``hard_coded`` or ``literal_result`` fails, and so does
-  no net gain (Δ ≤ 0).
+- :func:`screen`: any prediction flagged ``hard_coded`` or ``literal_result`` fails, and so do
+  the efficiency cap, when v0's numbers on the same tasks are given, and no net gain (Δ ≤ 0).
 - :func:`validate`, in this order: a flagged prediction; the efficiency cap, at most 3x v0's
   mean cost and mean wall time per task; a gain ΔR-VES of at least 5 points, or 10 once the cost
   guardrail tripped (above 1.5x the best's mean tokens or wall time per task); the one-sided
   sign test's p ≤ 0.1; at most 1 regression.
 - :func:`confirm`: a flagged prediction; the efficiency cap; a gain of at least 3 points over
-  both seeds, or 6 under the guardrail.
+  both seeds, or 6 under the guardrail. Both thresholds double together: a guardrail that trips
+  only on the confirmation's numbers also holds the validation's gain to 10 points.
 - :func:`rank`: of the candidates that passed validation, the largest Δ wins.
 
 A task's credit is its mean over the version's seeds, so the best's table holds all its val
@@ -20,8 +21,9 @@ config sets (:class:`DecisionConfig`), and every PhaseResult records the thresho
 
 Tokens, cost and wall time per task are :class:`CostStats`, which the evaluator reports from the
 LLM proxy's records and the host's clock: files written in the solve container are untrusted
-(spec §6.1, §9; ruling V27). A ratio whose basis is 0 or unknown is left unset, and its rule then
-does not apply.
+(spec §6.1, §9; ruling V27). A positive value over a basis of 0 is an infinite ratio, which trips
+its rule. A ratio with an unknown value or basis is left unset: its rule is skipped, with a
+WARNING, and :func:`describe` says which went unchecked.
 
 :func:`describe` puts a verdict into words with aggregates only, never a task ID, so the
 decision_reason and the lessons drawn from it stay clean of per-task val data (spec §7).
@@ -124,6 +126,15 @@ class CostStats:
     mean_wall_time_s: float
     count: int = 1
 
+    def __post_init__(self) -> None:
+        means = [self.mean_tokens, self.mean_wall_time_s]
+        if self.mean_cost_usd is not None:
+            means.append(self.mean_cost_usd)
+        if not all(math.isfinite(mean) and mean >= 0 for mean in means):
+            raise ValueError(f"cost statistics must be finite and at least 0: {self}")
+        if self.count < 1:
+            raise ValueError(f"cost statistics cover at least one task, not {self.count}")
+
     @classmethod
     def from_results(cls, results: Iterable[TaskResult]) -> "CostStats":
         """Average ``results``' usage and wall time, for results whose numbers the host itself
@@ -167,17 +178,22 @@ class Measured:
     run_ids: tuple[str, ...]
 
     @classmethod
-    def from_results(
-        cls, results: Sequence[TaskResult], stats: CostStats | None = None
-    ) -> "Measured":
-        """Measure a version from its graded results, which name their runs, and the evaluator's
-        ``stats``; without them, from the results' own numbers (CostStats.from_results).
+    def from_results(cls, results: Sequence[TaskResult], stats: CostStats) -> "Measured":
+        """Measure a version from its graded results, which name their runs, and the
+        evaluator's host-side ``stats`` (V27).
         """
         return cls(
             table=GradeTable.from_results(results),
-            stats=CostStats.from_results(results) if stats is None else stats,
+            stats=stats,
             run_ids=tuple(dict.fromkeys(result.run_id for result in results)),
         )
+
+    @classmethod
+    def host_measured(cls, results: Sequence[TaskResult]) -> "Measured":
+        """Measure a version from results whose usage and wall time the host itself measured,
+        as in the one-process mode and the tests; never from a solve container's numbers.
+        """
+        return cls.from_results(results, CostStats.from_results(results))
 
 
 @dataclass(frozen=True, slots=True)
@@ -193,14 +209,23 @@ class Verdict:
         return not self.reasons
 
 
-def screen(split: Split.ValueType, best: Measured, candidate: Measured) -> Verdict:
+def screen(
+    split: Split.ValueType,
+    best: Measured,
+    candidate: Measured,
+    *,
+    v0: Measured | None = None,
+    config: DecisionConfig | None = None,
+) -> Verdict:
     """Screen ``candidate`` against ``best`` on the same tasks: it needs a net gain, Δ > 0, and
-    no flagged prediction (spec §8.2 step 4).
+    no flagged prediction (spec §8.2 step 4). Given ``v0`` on the same tasks and ``config``, it
+    also applies the efficiency cap, so a candidate far over it never spends a val run.
     """
-    phase = _phase(split, best, candidate, v0=None)
-    reasons: list[RejectionReason.ValueType] = []
-    if phase.flagged_instance_ids:
-        reasons.append(REJECTION_REASON_HARD_CODED)
+    phase = _phase(split, best, candidate, v0=v0)
+    if config is None:
+        reasons = [REJECTION_REASON_HARD_CODED] if phase.flagged_instance_ids else []
+    else:
+        reasons = _outright(phase, config)
     if not phase.delta > 0:
         reasons.append(REJECTION_REASON_NO_SCREEN_GAIN)
     return Verdict(phase, tuple(reasons), guardrail=False)
@@ -239,19 +264,24 @@ def confirm(
     *,
     v0: Measured,
     config: DecisionConfig,
-    guardrail: bool,
+    validation: PhaseResult,
 ) -> Verdict:
     """Confirm ``candidate``, measured over its validation and confirmation seeds together: its
     gain must still be at least confirm_min_delta (spec §8.2 step 7).
 
-    The threshold doubles if the guardrail tripped in the validation, ``guardrail``, or trips
-    on the confirmation's own numbers.
+    The cost guardrail doubles both thresholds (spec §8.3). It holds if it tripped in the
+    ``validation``, whose effective_min_delta then shows it, or trips on the confirmation's own
+    numbers. In that second case the validation's gain is held to the doubled min_delta too, and
+    a shortfall is COST_GUARDRAIL.
     """
     phase = _phase(split, best, candidate, v0=v0)
-    guardrail = guardrail or _guardrail(phase, config)
+    tripped_before = validation.effective_min_delta > config.min_delta
+    guardrail = tripped_before or _guardrail(phase, config)
     factor = _GUARDRAIL_FACTOR if guardrail else 1.0
     phase.effective_min_delta = config.confirm_min_delta * factor
     reasons = _outright(phase, config)
+    if guardrail and validation.delta < config.min_delta * _GUARDRAIL_FACTOR:
+        reasons.append(REJECTION_REASON_COST_GUARDRAIL)
     if phase.delta < phase.effective_min_delta:
         reasons.append(REJECTION_REASON_NOT_CONFIRMED)
     return Verdict(phase, tuple(reasons), guardrail)
@@ -282,6 +312,10 @@ def describe(name: str, verdict: Verdict) -> str:
     if phase.flagged_instance_ids:
         parts.append(f"{len(phase.flagged_instance_ids)} flagged tasks")
     parts.extend(_LABELS[field].format(value) for field, value in _ratios(phase, *_LABELS))
+    checked = _VS_BEST if not phase.v0_run_ids else (*_VS_BEST, *_VS_V0)
+    unknown = [field for field in checked if not phase.HasField(field)]
+    if unknown:
+        parts.append(f"not checked, unknown: {', '.join(unknown)}")
     if verdict.guardrail:
         parts.append("cost guardrail tripped")
     failed = ", ".join(RejectionReason.Name(reason) for reason in verdict.reasons)
@@ -321,6 +355,9 @@ def _phase(
 def _set_ratio(phase: PhaseResult, field: _Ratio, value: float | None, basis: float | None) -> None:
     if value is not None and basis is not None and basis > 0:
         setattr(phase, field, value / basis)
+        return
+    if value is not None and basis == 0:
+        setattr(phase, field, math.inf if value > 0 else 1.0)  # Nothing over nothing is even.
         return
     # Until the evaluator reports host-side numbers for every task, cached ones included.
     _logger.warning(
