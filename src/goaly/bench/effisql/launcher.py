@@ -160,13 +160,13 @@ class DockerSandbox:
     ) -> SandboxResult:
         if self._image is None:
             raise RuntimeError("prepare() builds the image first")
-        # TODO(T18 #48): mount request.inputs_dir read-only, once run_solve takes inputs_dir.
         return await asyncio.to_thread(
             run_solve,
             self._image,
             checkout,
             request.solve_dir,
-            staged_instances,
+            None,  # A staged organizers' file lies in inputs_dir, which mounts it already.
+            inputs_dir=request.inputs_dir,
             environment=environment,
             argv=argv,
             timeout_s=timeout_s,
@@ -246,6 +246,9 @@ class EffiSqlLauncher:
     async def __call__(self, request: SolveRequestLike) -> None:
         if not request.tasks:
             raise ValueError("a solve request names at least one task")
+        for what, path in (("solve", request.solve_dir), ("inputs", request.inputs_dir)):
+            if path != path.resolve():  # The sandbox mounts each at its host path, as named.
+                raise ValueError(f"the {what} directory must be a canonical path: {path}")
         inputs = SolveInputs(request.inputs_dir)
         staged = await asyncio.to_thread(stage_inputs, inputs, self.paths(), request.instances_file)
         checkout = await asyncio.to_thread(
