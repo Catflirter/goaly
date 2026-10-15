@@ -272,7 +272,9 @@ Adding a benchmark takes a `Benchmark` adapter and a capability pack. core does 
 - One data directory is copied into 5 instances, each pinned with cpuset (§6.2): 2 solving instances and 3 grading instances, 2 physical cores each. Solving and grading never share an instance.
 - Every grading instance also holds an **alternate TPC-H database** at a smaller scale, such as SF0.3, built the same way. Its data differs from SF3's, which the robustness check (Grader, below) relies on.
 - Agent sessions connect with a read-only role. It has only the `SELECT` privilege and no `CREATE`, so the agent cannot create indexes or change data: the official evaluation runs on the pristine database. The statement timeout is enforced by client-side cancellation, because a session can change its own `statement_timeout` and `default_transaction_read_only`.
+- The agent role can log in only on the 2 solving instances. Its CONNECT on the grading instances, and on the alternate database wherever that exists, is revoked explicitly. Its `temp_file_limit` is 5 GB on every instance.
 - The grader runs predictions under a `SELECT`-only role too, in a read-only transaction, with client-side cancellation. Both roles default to `default_transaction_read_only = on`, as defense in depth; the privileges are what actually block writes.
+- Each role cancels and terminates only its own backends, which `pg_cancel_backend` and `pg_terminate_backend` allow for the same role. The solving pool holds only the agent role's credentials, and no runtime process holds admin or superuser credentials; those are used only to set the instances up. A cancel or terminate that fails is logged at WARNING, never dropped silently.
 - Every instance requires password authentication. Grading credentials never enter the repository or the implementer sandbox (§8.5).
 
 **Grader**
@@ -284,7 +286,12 @@ Adding a benchmark takes a `Benchmark` adapter and a capability pack. core does 
 - **Result signatures.** Results can be large. At least 56 gradable tasks return more than 1M rows on SF3, counted from the plans that record actual rows at SF3. The largest SF3 results are around 18–20M rows: a full `lineitem` is 17,996,609 rows (task 1), and task 45's join returns 19,719,920. The setup measures the exact counts on SF3. The grader therefore reads rows through a server-side cursor and hashes them off the event loop. It keeps an order-independent compact digest, the sum of the row hashes mod 2^256 plus the row count, and never a dictionary of row hashes.
 - **Hard-coding checks.** A prediction can return the base query's result as constants, for example `SELECT 12345.67 AS revenue` or `SELECT * FROM (VALUES …)`. Such a prediction matches and scores τ = 1000. Many tasks are exposed: of the 154 tasks whose plan records actual rows, 25 return a single row. Two checks therefore run on every matched prediction, in both grading modes:
   1. **Robustness check.** The prediction must also return `base_sql`'s result on the alternate database. Otherwise its credit is 0, and it is flagged `hard_coded` (contract field `EffiSqlGrade.alt_matched`).
-  2. **Plan check.** `EXPLAIN (FORMAT JSON)` runs on every prediction before its comparison run, and a `ModifyTable` plan is refused there (below). The `literal_result` test applies only once the prediction has matched. Its credit is then 0, and it is flagged `literal_result`, if its plan scans none of the base query's relations, or if its output comes from a Values Scan or Result subtree with no relation scan beneath it. `VALUES` itself stays allowed: 3 golds use it, such as task 1, which unpivots with `VALUES (t.l_extendedprice), …`. This check closes the gap the first one leaves: `region` and `nation` have the same rows at every TPC-H scale, so a constant answer over them matches on both databases.
+  2. **Plan check.** `EXPLAIN (FORMAT JSON)` runs on every prediction before its comparison run, and a `ModifyTable` plan is refused there (below). The `literal_result` test applies only once the prediction has matched. Its credit is then 0, and it is flagged `literal_result`, if any of these holds:
+     - its plan scans none of the base query's relations;
+     - its output comes from a Values Scan or Result subtree with no relation scan beneath it;
+     - it can emit precomputed rows conditionally. That covers any reference to an environment-introspection function, such as `current_database`, `current_catalog`, `current_setting`, `current_user`, `session_user`, `inet_server_*`, `inet_client_*`, `pg_backend_pid`, `version` or `pg_postmaster_start_time`, and any read of a system catalog or statistics view. It also covers a scan-free subtree, such as a Values Scan, a Result, or an Append of them, that yields more than 1 row and reaches the output through an Append, a union or a CASE.
+
+     The check follows CTEs and initplans, including those attached at the top node: a CTE's rows count where a CTE Scan reads them, and a relation scan inside an initplan that only feeds a filter does not make constant output count as scanned. `VALUES` itself stays allowed: 3 golds use it, such as task 1, which unpivots with `VALUES (t.l_extendedprice), …`. T10 runs the check on all 300 golds, from the dataset's SQL and stored plans, and it must flag none. One of them, task 278 outside TPC-H, is a constant list because its base query reads no relation, so the check does not apply to a task whose base query reads none. This check closes the gap the first one leaves: `region` and `nation` have the same rows at every TPC-H scale, so a constant answer over them matches on both databases.
 
   Three rules govern how the checks apply:
 
@@ -300,6 +307,9 @@ Adding a benchmark takes a `Benchmark` adapter and a capability pack. core does 
   - **Data check:** a task's base row count must equal the root `Actual Rows` of its `base_explain_analyze`, for the tasks whose plan records actual rows at SF3: 143 of the 154, once the 11 plans recorded at SF10 are set aside. For example, task 1 returns 17,996,609 rows. This catches a dbgen data mismatch. A mismatch on a plan recorded at another scale is a dataset anomaly, not a data mismatch: it neither fails the check nor counts toward the 10% stop rule.
   - **Exclusion bound:** if more than 10% of tasks are excluded, stop and investigate before RSI starts.
 - **Excluded tasks.** A task is excluded if, on this machine, its base query errors or exceeds 300 s, or the gold `optimized_sql` does not match or is less than 1.2× faster. These are times we measure; the file's `base_time` is not used, since some were recorded at SF10. A task is also excluded if its gold fails the robustness check or the plan check and review finds the gold, not the check, at fault. On such a task either nothing can be scored or even the gold shows no reliable gain, so keeping it would only add noise to development and to accept/reject decisions. Exclusions are applied after splitting (§7), and the excluded tasks are committed with the reason for each. This affects only our own splits: the harness still handles any such task in the organizers' held-out set.
+  - The setup tool writes the measured exclusions. It refuses to write them from a subset or an incomplete run.
+  - Exclusions decided by review, where the gold is at fault, live in a separate committed file, `effisql_exclusions_manual.json`, with the same schema. The tool merges it in before it applies the stop rule.
+  - A grader error is retried, never turned into an exclusion.
 - **Noise.** Tier boundaries make a τ near 1 flip between credit 0.25 and 0.5 from one run to the next (§12). In dev mode, the fixed identity τ removes this noise for identity submissions.
 
 **Reference numbers for the TPC-H subset**, from the dataset's own timings:
@@ -585,6 +595,7 @@ In the RSI phase a lane's GLM share covers its analyst, its implementers and its
 - **Tokens.** An Effi-SQL val pass is 30 tasks × 1 seed. At about 15 calls per task and about 1.5K output tokens per call, that is about 0.7M output tokens, only a few minutes of gateway time. Most of those tokens are spent on thinking, so a policy that uses fewer tokens also speeds up RSI iterations.
 - **Solving capacity.** A typical task runs the base once and then 1–2 rewrites: about 50–75 core-seconds on a solving instance.
   - Each solving instance runs at most 2 statements at once, and the others queue. `execute_sql` reports the queue wait separately from the execution time, so the timing the agent sees stays meaningful.
+  - That limit is a semaphore inside each process, and every solve container is a process of its own. The runner's concurrency budgets therefore split the solving capacity between processes: each launcher passes its container an explicit share of statement slots and task concurrency, and the lane's runs and v0's held-out run have separate shares in config. The shares add up to at most 2 statements per instance.
   - The agent's statement timeout is 120 s. The base median is 12 s and the p90 is 69 s. By the file's timings, 12 base queries exceed 120 s, 7 of them gradable, including task 1 at 130.8 s. Half of the 12 were timed at SF10 (§4.1), so the setup's own measurements decide which tasks these are. For such a task the agent cannot time the base and works from its plan.
   - The Effi-SQL lane therefore runs about 16 tasks at once. That task concurrency is the binding limit, set by the solving instances rather than by tokens; the Qwen shares above remain upper bounds on requests. Background runs use the same solving instances.
   - T12 measures the queue wait.
@@ -608,7 +619,7 @@ In the RSI phase a lane's GLM share covers its analyst, its implementers and its
 
 A solving instance that grades, in setup or after final solving, also holds the alternate database. The agent's role cannot connect to it.
 
-**`goaly-smoke` gradings go first.** They jump the queue ahead of every phase above. There are at most 2 per hypothesis, graded in dev mode, and each waits at most for the evaluation already running on its instance. The grading-instance pool (T09's API) carries these priorities, and T10's scheduler drives it.
+**`goaly-smoke` gradings go first.** They jump the queue ahead of every phase above. There are at most 2 per hypothesis, graded in dev mode, and each waits at most for the evaluation already running on its instance. T10's grading scheduler, `grading_pool`, is the only scheduler. Its priority levels put `goaly-smoke` first, and T20 and T21 take the priority from it. T09's `pg_grading` keeps only the per-instance connection pools: opening, closing and lookup.
 
 **Inside a process**
 
@@ -621,7 +632,7 @@ A solving instance that grades, in setup or after final solving, also holds the 
 
 | Physical cores | Logical CPUs | Used for |
 |---|---|---|
-| 0–1 | 0, 1, 12, 13 | system, dockerd and our Python processes, which are confined to these CPUs, plus the implementer sandboxes (§8.8), with a 4 GB memory limit each |
+| 0–1 | 0, 1, 12, 13 | system, dockerd and our Python processes, which are confined to these CPUs, plus the implementer sandboxes and the solve containers (§6.1, §8.8), with a 4 GB memory limit each |
 | 2–5 | 2–5, 14–17 | 2 solving instances, 2 physical cores each |
 | 6–11 | 6–11, 18–23 | 3 grading instances, 2 physical cores each |
 
@@ -633,8 +644,8 @@ Each PostgreSQL instance is pinned with cpuset to both SMT siblings of its physi
 
 | Resource | Limit | How it is enforced |
 |---|---|---|
-| Solving instances | 2, each running at most 2 statements at once; every agent session reaches them through the read-only role | psycopg async pools with a per-instance statement queue (T09). Client-side cancellation enforces the 120 s statement timeout |
-| Grading instances | 3, each running one evaluation at a time, so evaluations never disturb each other's timings. Each holds the main and the alternate database | The grading-instance pool (T09's API), which serves work by priority, `goaly-smoke` gradings first. T10's scheduler drives it and checks each instance's catalog fingerprint before every batch (§8.5) |
+| Solving instances | 2, each running at most 2 statements at once; every agent session reaches them through the read-only role | psycopg async pools with a per-instance statement queue (T09), holding only the agent role's credentials. Client-side cancellation, by the agent role on its own backends, enforces the 120 s statement timeout |
+| Grading instances | 3, each running one evaluation at a time, so evaluations never disturb each other's timings. Each holds the main and the alternate database | T10's grading scheduler, the only one, which serves work by priority, `goaly-smoke` gradings first, over T09's per-instance connection pools. It checks each instance's catalog fingerprint before every batch (§8.5) |
 | SWE solving and evaluation (on hold) | 8 solving slots or 4 evaluation workers, never both at once | The slot scheduler (T14) pins containers with cpuset and switches mode between waves |
 | Disk (SWE, on hold) | Image budget | Images are pruned in batches (T13) |
 
@@ -884,14 +895,20 @@ The implementer is mini-swe-agent's `DefaultAgent` (`mini-swe-agent==2.4.6`, MIT
 - The container runs as the host user's uid and gid, with a read-only root filesystem, a tmpfs `/tmp`, no capabilities, `no-new-privileges`, and process, memory and CPU limits, on cores 0–1 (§6.2).
 - No host environment variable is passed in, and no key reaches the sandbox.
 - Every command runs under `timeout` inside the container, because a timed-out `docker exec` leaves its command running. Containers carry the experiment ID as a label, and a lane removes any it finds left over when it starts.
-- The shared builder in `goaly.bench` makes this container and the solve-phase container of every evaluation (§6.1, Isolated evaluation). The solve container differs in three ways: an extra writable mount for the run directory, the gold-free runtime file mounted read-only, and an explicit environment allowlist.
+- The shared builder in `goaly.bench` makes this container and the solve container of every evaluation (§6.1, Isolated evaluation). Both get the same image, the host user's uid and gid, a read-only root, a tmpfs `/tmp`, no capabilities, `no-new-privileges` and the same limits, on CPUs 0, 1, 12 and 13. The solve container's layout is its own, set by T18's `solve_options`, and shares nothing writable with this one:
+  - the candidate's snapshot (§8.2 step 3), fully read-only, pack directories included;
+  - no `.git`;
+  - `<run>/solve/`, its only writable mount;
+  - the gold-free runtime file, read-only;
+  - an explicit environment allowlist: the per-run proxy token, `GOALY_BASE_URL` and the agent role's password.
 
 **`goaly-smoke`.** `goaly-smoke <instance_id>` is the only command the sandbox does not run itself. The host:
 
 1. refuses any instance that is not in train, and any call after the second;
-2. runs the step-3 guards on the worktree as it stands;
-3. runs the candidate on that task through the isolated two-phase path (§6.1), with one seed. Its grading goes ahead of every other phase on the grading instances (§6.2);
-4. returns the score, the stop reason, the step count, the cost and the last tool error.
+2. stops and removes the sandbox, then pins the packs as they stand to a commit no branch holds (Finishing, below), and runs the step-3 guards on that commit's snapshot;
+3. if the guards pass, runs the snapshot on that task through the isolated two-phase path (§6.1), with one seed. Its grading goes ahead of every other phase on the grading instances (§6.2);
+4. starts a fresh sandbox on the same worktree, whatever the outcome, so the agent continues where it was, with an empty `/tmp`;
+5. returns the score, the stop reason, the step count, the cost and the last tool error.
 
 **Limits.** These are config values. Our adapter enforces 60 steps, $3 of GLM and 30 minutes per hypothesis; the agent also stops after 3 format errors in a row, and each command times out after 120 s.
 
@@ -899,9 +916,12 @@ The implementer is mini-swe-agent's `DefaultAgent` (`mini-swe-agent==2.4.6`, MIT
 
 **Finishing.** The agent finishes by running `echo COMPLETE_TASK_AND_SUBMIT_FINAL_OUTPUT` with a short summary. goaly.rsi then, on the host:
 
-1. checks that every changed path is inside the pack directories;
-2. stages only those directories;
-3. commits once, as `rsi(<lane>): <summary>`, with `Experiment-Id` and `Hypothesis-Id` trailers.
+1. stops and removes the sandbox, and verifies that no container carries the experiment's label. Host git never reads the worktree while a sandbox could still change it;
+2. checks that every changed path is inside the pack directories;
+3. walks those directories with `lstat`, refusing anything that is not a regular file or a directory, such as a symlink, and stages only them;
+4. commits once, as `rsi(<lane>): <summary>`, with `Experiment-Id` and `Hypothesis-Id` trailers.
+
+Pinning a snapshot for `goaly-smoke` follows the same steps 1–3.
 
 **Endings without a commit.**
 
@@ -1052,7 +1072,7 @@ The fast case assumes 4-minute tasks, 55 s of dev grading per task, 1 candidate 
 
 - Round 1 finishes before the 20:00 freeze if T11 lands by about 13:30. If T11 lands at 14:30 and the rounds are slow, round 1 ends just after the freeze.
 - A second round fits only when the rounds run at the fast end, whenever T11 lands. At the slow end, round 2 ends after 22:00.
-- If the lane starts after 16:00, every time shifts by the delay. No round may then finish, and the §12 risk "RSI completes no round before the freeze" applies.
+- If the lane starts after 16:00, every round's time shifts by the delay; the freeze and the lane's deadline do not (§8.4). No round may then finish, and the §12 risk "RSI completes no round before the freeze" applies.
 - The freeze does not wait for a round that is still running. That round is reported as incomplete, and the best stays as it was before it.
 
 The project lead's review latency is budgeted. PRs stack, so no slot waits for a review, and the 14:30–16:00 slot leaves time to review the code the lane runs on before it starts.
