@@ -558,9 +558,18 @@ async def test_reads_a_cost_in_exponent_notation() -> None:
     assert reply.usage.cost_usd == 4.7e-06
 
 
-@pytest.mark.parametrize("value", ["free", "-0.01", "nan", "inf"])
+@pytest.mark.parametrize(
+    ("value", "logged"),
+    [
+        ("free", "free"),
+        ("-0.01", "-0.01"),
+        ("nan", "nan"),
+        ("inf", "inf"),
+        pytest.param(f"key {KEY}", "key [redacted]", id="holds-the-key"),
+    ],
+)
 async def test_ignores_a_malformed_cost_with_a_warning(
-    value: str, caplog: pytest.LogCaptureFixture
+    value: str, logged: str, caplog: pytest.LogCaptureFixture
 ) -> None:
     gateway = Gateway(completion(cost=value))
     async with connect(gateway) as llm:
@@ -568,7 +577,12 @@ async def test_ignores_a_malformed_cost_with_a_warning(
 
     assert not reply.usage.HasField("cost_usd")
     (warning,) = [entry for entry in caplog.records if entry.levelno == logging.WARNING]
-    assert getattr(warning, "event", None) == "llm_bad_cost"
+    assert {key: getattr(warning, key) for key in ("event", "call_id", "model", "value")} == {
+        "event": "llm_bad_cost",
+        "call_id": reply.record.call_id,
+        "model": QWEN,
+        "value": logged,
+    }
 
 
 async def test_sums_the_cost_of_every_attempt() -> None:

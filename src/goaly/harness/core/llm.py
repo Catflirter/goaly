@@ -386,7 +386,7 @@ class LlmClient:
         """Make attempts until one succeeds, one fails for good, or the retries run out."""
         delay = 0.0
         while True:
-            outcome = await self._attempt(record.attempts.add(), body, delay)
+            outcome = await self._attempt(record, record.attempts.add(), body, delay)
             if outcome.cost_usd is not None:
                 record.usage.cost_usd += outcome.cost_usd  # Every attempt the gateway billed.
             if outcome.response is not None:
@@ -399,7 +399,9 @@ class LlmClient:
             delay = self._retry.delay_s(retries, outcome.retry_after_s, self._rng)
             self._log_backoff(record, outcome, delay)
 
-    async def _attempt(self, attempt: LlmCallAttempt, body: bytes, delay: float) -> _Outcome:
+    async def _attempt(
+        self, record: LlmCallRecord, attempt: LlmCallAttempt, body: bytes, delay: float
+    ) -> _Outcome:
         """Wait ``delay``, send the request once, and fill in ``attempt`` with how it went."""
         attempt.started_at.GetCurrentTime()
         began = self._clock.monotonic()
@@ -408,7 +410,7 @@ class LlmClient:
             if delay > 0:
                 await self._clock.sleep(delay)
             sent = self._clock.monotonic()
-            outcome = await self._request(body)
+            outcome = await self._request(body, record)
         except asyncio.CancelledError:
             attempt.status = _S.LLM_CALL_STATUS_CANCELLED
             raise
@@ -422,7 +424,7 @@ class LlmClient:
             attempt.retry_after_s = outcome.retry_after_s
         return outcome
 
-    async def _request(self, body: bytes) -> _Outcome:
+    async def _request(self, body: bytes, record: LlmCallRecord) -> _Outcome:
         """Send the request and say how it went. Only cancellation and bugs raise."""
         try:
             async with asyncio.timeout(self._retry.timeout_s):
@@ -443,13 +445,13 @@ class LlmClient:
         except httpx.RequestError as error:  # For example, a body that cannot be decoded.
             detail = self._quote(f"unreadable response: {type(error).__name__}: {error}")
             return _Outcome(_S.LLM_CALL_STATUS_INVALID_RESPONSE, detail=detail)
-        return self._outcome(response)
+        return self._outcome(response, record)
 
-    def _outcome(self, response: httpx.Response) -> _Outcome:
+    def _outcome(self, response: httpx.Response, record: LlmCallRecord) -> _Outcome:
         """Say how an attempt that got ``response`` ended (spec §5.1)."""
         code = response.status_code
         retry_after = _retry_after_s(response.headers)
-        cost = _cost_usd(response.headers)
+        cost = self._cost_usd(response.headers, record)
         if response.is_success:
             try:
                 parsed = _WireResponse.model_validate_json(response.content)
@@ -476,6 +478,28 @@ class LlmClient:
             status = _S.LLM_CALL_STATUS_INVALID_RESPONSE
         detail = f"HTTP {code}: {_cut(said)}" if said else f"HTTP {code}"
         return _Outcome(status, code, detail, retry_after, cost)
+
+    def _cost_usd(self, headers: httpx.Headers, record: LlmCallRecord) -> float | None:
+        """Return the cost the gateway reported in x-litellm-response-cost, or None for none."""
+        value = headers.get("x-litellm-response-cost")
+        if value is None:
+            return None
+        try:
+            cost = float(value)
+        except ValueError:
+            cost = math.nan
+        if math.isfinite(cost) and cost >= 0:
+            return cost
+        _logger.warning(
+            "ignored a malformed cost header",
+            extra={
+                "event": "llm_bad_cost",
+                "model": record.model,
+                "call_id": record.call_id,
+                "value": self._redact(value)[:40],  # Redacted first: a cut could split the key.
+            },
+        )
+        return None
 
     def _read_usage(self, response: _WireResponse, record: LlmCallRecord) -> None:
         """Copy the tokens the gateway reported into ``record``, whose cost is already in."""
@@ -662,23 +686,6 @@ def _retry_after_s(headers: httpx.Headers) -> float | None:
             moment = moment.replace(tzinfo=UTC)
         return max((moment - datetime.now(UTC)).total_seconds(), 0.0)
     return seconds if math.isfinite(seconds) and seconds >= 0 else None
-
-
-def _cost_usd(headers: httpx.Headers) -> float | None:
-    """Return the cost the gateway reported in x-litellm-response-cost, or None for none."""
-    value = headers.get("x-litellm-response-cost")
-    if value is None:
-        return None
-    try:
-        cost = float(value)
-    except ValueError:
-        cost = math.nan
-    if math.isfinite(cost) and cost >= 0:
-        return cost
-    _logger.warning(
-        "ignored a malformed cost header", extra={"event": "llm_bad_cost", "value": value[:40]}
-    )
-    return None
 
 
 def _problems(error: ValidationError) -> str:
