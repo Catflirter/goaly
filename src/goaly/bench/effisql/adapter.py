@@ -21,7 +21,13 @@ same.
 A query the format cannot carry faithfully, such as two statements or one that mentions the
 final-answer marker in a literal, has no official form: :func:`official_answer` says why, and the
 record's ``prediction`` is empty, which fails in both modes. The grade phase grades the official
-form, so a grade is always what the official runner would see.
+form, so a grade is what the official runner would see, with one known gap in end2end mode.
+end2end splits statements with sqlparse, whose lexer differs from PostgreSQL's in rare
+literals: it reads ``\'`` as an escape inside a standard string, which PostgreSQL does not, and
+``#`` as a line comment, where PostgreSQL's ``#`` is XOR. A query with such a literal or
+operator, say ``'C:\'`` followed later by ``';'``, can be split there by end2end and fail it while
+patch mode and our grade accept it. TPC-H rewrites do not use either, and all 600 base and gold
+queries of the dataset come back exactly in both modes (the integration test).
 """
 
 import re
@@ -61,6 +67,8 @@ _DIFF_HAZARDS = ("```", "---", "+++")
 _DROPPED_PREFIXES = ("```", "###", "diagnosis", "analysis")
 # What end2end accepts: one statement that begins with SELECT or WITH and a blank.
 _QUERY_START = re.compile(r"(?:select|with)\s", re.IGNORECASE)
+# A leading SELECT or WITH glued to what follows it, such as SELECT(1) or SELECT*FROM t.
+_GLUED_START = re.compile(r"(?:select|with)(?=[^\s\w$])", re.IGNORECASE)
 # The line separators that str.splitlines, and so the runner, splits at, besides a line feed.
 _OTHER_LINE_BREAKS = frozenset(
     "\r\x0b\x0c\x1c\x1d\x1e\x85\N{LINE SEPARATOR}\N{PARAGRAPH SEPARATOR}"
@@ -144,8 +152,9 @@ def official_query(sql: str) -> str:
     """Return the official form of ``sql``: the query both blocks of the record carry.
 
     The form is ``sql`` with CRLF line ends made LF, comments dropped, the space at each line's
-    end and blank lines removed, a final ``;`` dropped, and every line the runner's extractors
-    would misread joined onto the line before it with one space. Raises QueryFormatError if no
+    end and blank lines removed, a final ``;`` dropped, a space put after a leading SELECT or
+    WITH glued to punctuation (``SELECT(1)``), and every line the runner's extractors would
+    misread joined onto the line before it with one space. Raises QueryFormatError if no
     form can carry ``sql`` faithfully in both of the runner's modes.
     """
     text = sql.replace("\r\n", "\n")
@@ -157,6 +166,10 @@ def official_query(sql: str) -> str:
         raise QueryFormatError("the query is empty")
     if any(c == ";" and is_code for c, is_code in zip(chars, code, strict=True)):
         raise QueryFormatError("the answer holds more than one statement")
+    glued = _GLUED_START.match("".join(chars))
+    if glued:  # SELECT(... or SELECT*...: a space after the keyword changes nothing.
+        chars.insert(glued.end(), " ")
+        code.insert(glued.end(), True)
     query = "".join(chars)
     if not _QUERY_START.match(query):
         raise QueryFormatError("the query does not begin with SELECT or WITH")
@@ -185,7 +198,7 @@ def _strip_comments(text: str) -> tuple[list[str], list[bool]]:
             i = _block_comment_end(text, i)
             chars.append(" ")
             code.append(True)
-        elif c in "'\"" or (c == "$" and _DOLLAR_TAG.match(text, i)) or _escape_string(text, i):
+        elif c in "'\"" or _dollar_quote(text, i) or _escape_string(text, i):
             end = _dollar_quote_end(text, i) if c == "$" else _quoted_end(text, i)
             chars.extend(text[i:end])
             code.extend([False] * (end - i))
@@ -197,12 +210,26 @@ def _strip_comments(text: str) -> tuple[list[str], list[bool]]:
     return chars, code
 
 
+def _dollar_quote(text: str, i: int) -> bool:
+    """Whether a dollar-quoted string starts at ``i``: never inside an identifier, which may hold
+    ``$`` after its first character, as in ``a$b``."""
+    return (
+        text[i] == "$"
+        and _DOLLAR_TAG.match(text, i) is not None
+        and (i == 0 or not _identifier_char(text[i - 1]))
+    )
+
+
+def _identifier_char(char: str) -> bool:
+    return char.isalnum() or char in "_$"
+
+
 def _escape_string(text: str, i: int) -> bool:
     """Whether an E'...' string, with backslash escapes, starts at ``i``."""
     return (
         text[i] in "eE"
         and text[i + 1 : i + 2] == "'"
-        and (i == 0 or not (text[i - 1].isalnum() or text[i - 1] in "_$"))
+        and (i == 0 or not _identifier_char(text[i - 1]))
     )
 
 
