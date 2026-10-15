@@ -231,10 +231,10 @@ class Benchmark[InstanceT: Instance, EnvT: Environment](Protocol):
         """Grade ``prediction`` for ``inst`` with the benchmark's grader.
 
         Effi-SQL compares the prediction's result with ``base_sql``'s and needs no gold answer;
-        SWE runs the task's PASS_TO_PASS tests and compares the workload's speedup with the expert
-        patch's. Grading uses its own environment, never the one the task was solved in (spec
-        §4.1). Grading trouble does not raise: the returned Grade's ``status`` says what went
-        wrong, such as a prediction that failed to run, a timeout, or the grader's own failure.
+        SWE runs the task's tests and compares the workload's speedup with the expert patch's.
+        Grading uses its own environment, never the one the task was solved in (spec §4.1).
+        Grading trouble does not raise: the returned Grade's ``status`` says what went wrong, such
+        as a prediction that failed to run, a timeout, or the grader's own failure.
         Runs on SPLIT_EXTERNAL are not graded, so callers never call ``grade`` for them.
 
         A prediction with no benchmark branch set, as after a crash, is graded as the

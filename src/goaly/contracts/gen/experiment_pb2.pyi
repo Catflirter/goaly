@@ -151,7 +151,10 @@ class ImplementerExit(_ImplementerExit, metaclass=_ImplementerExitEnumTypeWrappe
     a commit. Every other ending makes none, and the candidate is rejected as not implemented
     (REJECTION_REASON_IMPLEMENTATION_FAILED), except after IMPLEMENTER_EXIT_INFRASTRUCTURE or
     IMPLEMENTER_EXIT_INTERRUPTED: neither says anything about the hypothesis, so the experiment is
-    aborted instead.
+    aborted instead. A model call that fails ends the run as follows. IMPLEMENTER_EXIT_INFRASTRUCTURE
+    is a gateway outage that outlasted its retries (LLM_CALL_STATUS_RATE_LIMITED, SERVER_ERROR,
+    TIMEOUT or CONNECTION_ERROR) or an open breaker. IMPLEMENTER_EXIT_CRASHED is
+    LLM_CALL_STATUS_CONTEXT_OVERFLOW, INVALID_RESPONSE or CLIENT_ERROR.
     """
 
 IMPLEMENTER_EXIT_UNSPECIFIED: ImplementerExit.ValueType  # 0
@@ -197,8 +200,9 @@ class _GuardEnumTypeWrapper(_enum_type_wrapper._EnumTypeWrapper[_Guard.ValueType
     scans only gold-only windows: windows of any split's gold optimized_sql, 40 or more
     characters long after normalization, that occur in no base_sql and not in the schema DDL.
     It also rejects pack changes that embed large literal lists, above a size set in config.
-    For SWE (on hold) it rejects any fragment of a gold patch 40 or more characters long after
-    normalization, and any instance_id from any split.
+    For SWE (on hold) it applies the same gold-only-fragment rule to the gold patches, with
+    windows 40 or more characters long after normalization, and also rejects any instance_id
+    from any split.
     """
     GUARD_PACK_CODE_ALLOWLIST: _Guard.ValueType  # 5
     """The static AST allowlist passes on the candidate's pack code, which runs on the host during
@@ -231,8 +235,9 @@ GUARD_HARD_CODING_SCAN: Guard.ValueType  # 3
 scans only gold-only windows: windows of any split's gold optimized_sql, 40 or more
 characters long after normalization, that occur in no base_sql and not in the schema DDL.
 It also rejects pack changes that embed large literal lists, above a size set in config.
-For SWE (on hold) it rejects any fragment of a gold patch 40 or more characters long after
-normalization, and any instance_id from any split.
+For SWE (on hold) it applies the same gold-only-fragment rule to the gold patches, with
+windows 40 or more characters long after normalization, and also rejects any instance_id
+from any split.
 """
 GUARD_PACK_CODE_ALLOWLIST: Guard.ValueType  # 5
 """The static AST allowlist passes on the candidate's pack code, which runs on the host during
@@ -681,8 +686,9 @@ class SmokeTest(_message.Message):
     """The smoke run that holds the task's result and trajectory; empty if the candidate never ran."""
     score: _builtins.float
     """The task's score, as its benchmark defines it: for Effi-SQL, the credit. Unset if the
-    candidate never ran, because the host refused the call or a guard failed. It is optional so
-    that such a call stays distinct from a run that scored 0.
+    candidate never ran, because the host refused the call or a guard failed, and also if it ran
+    but grading failed. It is optional so that such a call stays distinct from a run that scored
+    0.
     """
     detail: _builtins.str
     """What goaly-smoke told the agent besides the score: the stop reason, the step count, the cost
@@ -838,7 +844,8 @@ class PhaseResult(_message.Message):
         flags are hard_coded, which is EffiSqlGrade.alt_matched false, and literal_result. An
         unmatched prediction is never checked, so it is never listed. Each task's grade, in the runs
         candidate_run_ids names, says which check flagged it. One flagged task fails the candidate
-        outright, as REJECTION_REASON_HARD_CODED.
+        outright, as REJECTION_REASON_HARD_CODED. On the validation and the confirmation these are
+        per-task val IDs, so the analyst's ledger summary strips them (spec §7).
         """
 
     @_builtins.property
