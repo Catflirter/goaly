@@ -106,6 +106,7 @@ agent:
     Hard-coding is forbidden:
     - no task's answer or part of one: no gold SQL, no query result written out as constants;
     - no special cases for particular tasks or instance IDs, and no large literal lists;
+    - the pack must never lead the executor to return precomputed or constant results instead of computing them, including constants behind a data check, such as `CASE WHEN (SELECT count(*) ...) > N THEN <constant>`, or a constant `UNION ALL` behind a one-time filter. The grader flags such predictions, a flagged prediction fails the candidate, and the project lead reviews every results PR;
     - general techniques only, which would help on tasks you have never seen.
 
     Python in `{{ pack_dirs[0] }}/` must pass a static allowlist:
