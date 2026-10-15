@@ -25,7 +25,7 @@ We hand over the frozen harness. The organizers evaluate it on a hidden held-out
 ### 1.2 Deliverables
 
 1. **The frozen harness**: code, configs, prompts, skills and pinned dependencies. The organizers run it with the `goaly run` CLI. They pass in a task file in the benchmark's official format and get predictions back in the official format (§6.4).
-2. **The RSI system**: code, an experiment ledger and lessons. It runs several improvement rounds on its own.
+2. **The RSI system**: code, an experiment ledger and lessons. It runs several improvement rounds on its own, with no assistant or person in the loop (§8.0).
 3. **A report** that covers:
    - baseline and final scores;
    - how much the score varies across 3 repeated runs;
@@ -61,7 +61,7 @@ We hand over the frozen harness. The organizers evaluate it on a hidden held-out
 | Lessons learned: what was tried, what worked, what failed and why, backed by experiments | Experiment ledger and lessons (§8.6) | `experiments.jsonl`, `lessons.jsonl`, and the generated `lessons.md` |
 | Efficiency: time, tokens, compute and cost reported alongside the score | Cost and tokens are recorded for every call (§9). Two limits in the decision rules (§8.3): a cost guardrail, and a hard cap that keeps the final harness at or below 3× v0's mean cost and wall time per task | Report tables, including the final harness's cost and time relative to v0 |
 | Reproducibility: code, configs, prompts, tool versions and a single command | uv lockfile, run manifests, `make final` (§10) | T23, T24 |
-| Automation: several improvement rounds with little human help | `goaly rsi run` (§8) | Ledger entries across rounds |
+| Automation: several improvement rounds with little human help | One command, `goaly rsi run`, runs every round with no person or AI assistant in the loop. A supervisor restarts a crashed lane, and the code opens the results PRs and sends the notifications itself (§8.0, §8.7) | Ledger entries across rounds; the supervisor log |
 | Regression check: keep the best harness; new changes must not break tasks that already pass | Best-version tags and a regression rule (§8.3) | Decision log |
 
 ## 3. Architecture
@@ -89,8 +89,9 @@ import-linter checks these rules in CI:
 - `bench` may import `contracts` and `harness`.
 - `rsi` may import `contracts`, `harness` and `bench`.
 - `goaly.cli` may import every layer. Its `goaly rsi …` subcommands import `rsi` lazily, so `goaly run` never loads it.
+- Only `rsi` may import `minisweagent`, the third-party agent loop the implementer runs on (§8.8). A `forbidden` contract checks this, with `include_external_packages = true`.
 
-**What ships.** The organizers receive `contracts`, `harness`, `bench` and the CLI. `rsi` is only for development, and nothing on the evaluation path imports it.
+**What ships.** The organizers receive `contracts`, `harness`, `bench` and the CLI. `rsi` is only for development, and nothing on the evaluation path imports it. Its third-party dependencies, mini-swe-agent among them, live in the `rsi` dependency group, which a plain `uv sync` does not install (§11).
 
 ### 3.2 Repository layout
 
@@ -112,9 +113,14 @@ src/goaly/
     runner.py, metrics.py, manifest.py
     splits/          split ID lists
   rsi/
-    ledger.py, workspace.py, guards.py, analyst.py, implementer.py, decide.py, lane.py
+    ledger.py, workspace.py, guards.py, sandbox.py, analyst.py, decide.py, lane.py,
+    supervisor.py, results.py, notify.py
+    implementer/     mini-swe-agent adapter: model.py (GLM through core's client), environment.py
+                     (the sandbox as a mini-swe-agent environment, goaly-smoke), run.py (run, commit,
+                     record), implementer.yaml (prompt and limits)
   cli.py             `goaly run …` and `goaly rsi …`
 tests/               mirrors src/; tests that need Docker, a database or the real API are marked `integration`
+docker/rsi-sandbox.Dockerfile     the implementer's sandbox image (§8.8)
 docs/superpowers/specs/           design docs (the Linear tickets serve as the implementation plan)
 docs/results/                     experiment results
 runs/                             run artifacts (not committed)
@@ -136,7 +142,7 @@ Every shared type lives in `goaly.contracts`. These types come in two kinds, and
 | `TaskResult` | `result.proto` | Per-task record: score, correctness, time, tokens, cost, steps and error type |
 | `RunManifest` | `manifest.proto` | Commit, content and config hashes, dataset revision, model settings, timestamps and machine |
 | `LlmCallRecord` | `llm_call.proto` | One LLM call: purpose, model, tokens, cost, latency and status |
-| `ExperimentRecord`, `Hypothesis`, `Lesson` | `experiment.proto` | The RSI ledger |
+| `ExperimentRecord`, `Hypothesis`, `Lesson`, `ImplementerRun`, `LaneEvent` | `experiment.proto` | The RSI ledger: experiments with their implementer runs (§8.8), lessons, and lane events such as restarts and results PRs (§8.7) |
 
 - On disk, messages are stored as JSONL using protobuf's standard JSON mapping, keeping the original field names. People and the GLM analyst read trajectories directly, so a readable text format matters more than a compact binary one.
 - Files written today must stay readable after the schema changes. Field numbers are never reused. On disk, field names are the JSON keys and enum values are written by name, so a field or an enum value is never renamed either, and when one is removed, its name is reserved as well as its number.
@@ -352,7 +358,12 @@ Adding a benchmark takes a `Benchmark` adapter and a capability pack. core does 
 - Writes one JSONL record per call, labeled with the purpose of the call.
 - Turns context overflow and similar failures into specific exception types.
 
-**Model allowlist:** at runtime the harness client may call only the configured executor model (`qwen3.6-35b-a3b`). Calling any other model raises an error.
+**Model allowlist.** The allowlist is per purpose, lives in core, and RSI cannot edit it:
+
+- Executor calls (purpose `exec`) may use only `qwen3.6-35b-a3b`, so at runtime the harness calls nothing else.
+- RSI calls (purposes `rsi-*`) use `glm-5.3`.
+
+A call to a model its purpose does not allow raises an error.
 
 **Model-specific handling**
 
@@ -364,6 +375,7 @@ Adding a benchmark takes a `Benchmark` adapter and a capability pack. core does 
 - GLM (used only by RSI):
   - Thinking is always on. The gateway rejects the `thinking` parameter.
   - `reasoning_content` is sent back unchanged in the message history.
+  - The RSI implementer runs on mini-swe-agent, which is synchronous, in worker threads (§8.8). Its model adapter schedules each call on the lane process's event loop with `asyncio.run_coroutine_threadsafe`. Implementer calls therefore get the same GLM profile, retries, concurrency limits and call records as every other call.
 
 **Tool executor**
 
@@ -489,6 +501,8 @@ The SWE lane is on hold (2026-10-15) and has no share. If it resumes, the shares
 
 An agent never has more than one LLM request in flight, so a process runs at most as many tasks at once as its Qwen share. Each share is an upper limit: adaptive limiting (below) lowers it when the gateway is busy. Shares are config values, so changing them does not require a code change. In the Effi-SQL lane the binding limit is lower still: it is task concurrency, set by the solving instances (Throughput planning, below).
 
+In the RSI phase a lane's GLM share covers its analyst, its implementers and its lesson writer. A lane runs at most k implementers at once (k as in §8.2), each with at most one call in flight, so k stays well below the share.
+
 **Adaptive limiting** (in the LLM client, T03)
 
 - On a 429 or 503, wait for `Retry-After` if the response has one. Otherwise back off exponentially with full jitter: 1 s base, 60 s cap.
@@ -532,12 +546,13 @@ A solving instance that grades, in setup or after final solving, also holds the 
 - Each process runs one asyncio event loop.
 - Blocking work (Docker SDK calls, subprocesses, file I/O, git) goes through async APIs or `asyncio.to_thread`. Threads never share mutable state.
 - The HTTP client keeps one connection pool per model, sized to the process's share.
+- Implementers are mini-swe-agent agents, which are synchronous. Each lane runs them on its own thread pool of k threads. A thread reaches the LLM client only through the event loop, so the client's state never crosses threads, and no code on the event-loop thread may call an implementer directly.
 
 **CPU partition.** The machine has 12 physical cores (24 hardware threads).
 
 | Physical cores | Logical CPUs | Used for |
 |---|---|---|
-| 0–1 | 0, 1, 12, 13 | system, dockerd and our Python processes, which are confined to these CPUs |
+| 0–1 | 0, 1, 12, 13 | system, dockerd and our Python processes, which are confined to these CPUs, plus the implementer sandboxes (§8.8), with a 4 GB memory limit each |
 | 2–5 | 2–5, 14–17 | 2 solving instances, 2 physical cores each |
 | 6–11 | 6–11, 18–23 | 3 grading instances, 2 physical cores each |
 
@@ -605,6 +620,21 @@ Each PostgreSQL instance is pinned with cpuset to both SMT siblings of its physi
 
 ## 8. RSI system (goaly.rsi)
 
+### 8.0 Autonomy
+
+Once `goaly rsi run` starts, the loop runs as a program until every lane stops. Only GLM-5.3, called through core's LLM client, and goaly's own code act. No Claude Code, no other assistant and no person takes part in any step: Claude Code only builds the system and starts it, and people review the results PRs afterwards.
+
+| Step | Done by |
+|---|---|
+| Analysis and hypotheses | GLM, one structured call per round (§8.2) |
+| Implementation | GLM, in mini-swe-agent's non-interactive agent (§8.8) |
+| Guards, screening, validation and decisions | goaly code |
+| Ledger and lessons | goaly code; GLM writes the lesson text in one structured call |
+| Results PRs and notifications | goaly code, through the GitHub REST API and ntfy.sh (§8.7) |
+| Crash recovery and stopping | goaly's supervisor and the stopping rules (§8.4, §8.7) |
+
+Every external call has a timeout. Every agent run has step, cost and time limits. The lane processes run with no terminal input, so nothing can wait for an answer. When a step fails, the code decides what follows: retry, reject, abort the experiment, or stop the lane and notify.
+
 ### 8.1 Lanes
 
 - One lane is active: Effi-SQL. The SWE lane is on hold (2026-10-15). Its design below stays, so it can resume, and the two lanes would then run in parallel.
@@ -613,7 +643,7 @@ Each PostgreSQL instance is pinned with cpuset to both SMT siblings of its physi
 
 ### 8.2 One round
 
-1. **Analyze** (GLM, purpose `rsi-analyst`)
+1. **Analyze** (GLM, purpose `rsi-analyst`). One structured call through core's client, with no tools and no agent loop. Invalid output is retried.
    - Inputs:
      - a summary of the ledger, rejected attempts included, with the per-task val results stripped (§7);
      - the current best's per-task results on train;
@@ -627,25 +657,26 @@ Each PostgreSQL instance is pinned with cpuset to both SMT siblings of its physi
      - the expected effect and the risk;
      - where the idea came from: the idea bank, or GLM's own analysis.
 2. **Implement** (GLM coding agent, purpose `rsi-impl`)
-   - The top k hypotheses (k=3 for Effi-SQL, k=2 for SWE, on hold) are built in parallel, each in its own git worktree.
-   - The agent may:
+   - The top k hypotheses (k=3 for Effi-SQL, k=2 for SWE, on hold) are built in parallel. Each gets its own git worktree, on the branch `rsi/<lane>/<experiment_id>` from the lane's best.
+   - Each hypothesis is one run of the implementer agent (§8.8): mini-swe-agent's `DefaultAgent` in a Docker sandbox. The agent's one tool is bash, run inside the sandbox. With it the agent can:
      - read anything in the repository;
-     - write only to `src/goaly/harness/packs/<lane>/` and `tests/harness/packs/<lane>/`;
-     - run the pack's unit tests;
-     - smoke-test on 1–2 tasks.
-   - Each hypothesis ends as one commit.
+     - write only to `src/goaly/harness/packs/<lane>/` and `tests/harness/packs/<lane>/`. Every other path is mounted read-only, so the kernel refuses the write;
+     - run the pack's unit tests in the sandbox;
+     - smoke-test on 1–2 train tasks with `goaly-smoke <instance_id>`, the one command the host runs on the agent's behalf.
+   - Each hypothesis ends as one commit, which goaly.rsi makes on the host after the agent finishes, staging only the pack paths. A run that ends any other way, or that changed nothing, makes no commit, and the candidate is rejected as not implemented.
 3. **Guards.** The candidate is rejected if any of these fails:
    - the diff stays inside the allowed paths;
-   - the `bench/` and `core/` checksums are unchanged;
-   - the hard-coding scan passes;
-   - the pack's unit tests pass.
+   - the `bench/`, `harness/core/` and `contracts/` checksums are unchanged;
+   - the hard-coding scan passes (§8.5);
+   - the static AST allowlist passes on the candidate's pack code (§8.5);
+   - the pack's unit tests pass. They run in a fresh sandbox with the whole worktree read-only, never on the host, because the agent may have written them.
 4. **Screen.** The candidate's results are compared with the best's cached results on the same tasks. No net gain means rejection. In screening, validation and confirmation alike, a candidate with any prediction flagged `hard_coded` or `literal_result` (§4.1) fails outright.
    - Effi-SQL: up to 15 train failures the hypothesis targets, plus 5 train tasks the best already solves, 1 seed. Solved and failed are as defined in §6.3.
    - SWE (on hold): the 3 train tasks the hypothesis targets.
 5. **Validate.** Effi-SQL runs all 30 val tasks with 1 seed. SWE (on hold) runs all 12 val tasks with 1 seed.
 6. **Decide** using the rules in §8.3. If more than one candidate passes, the one with the largest Δ is accepted. The other passing hypotheses go back in the queue and are rebuilt on the new best next round.
 7. **Confirm** (Effi-SQL only). The accepted candidate runs on val with 1 more seed. The best changes only if ΔR-VES over both seeds is still at least 3 points (§8.3).
-8. **Record.** Every candidate goes into the ledger, with any hard-coding flags. For each one, GLM writes a lesson: what was tried, what happened and why, citing the experiment ID. A lesson about a flagged candidate says what was flagged.
+8. **Record.** Every candidate goes into the ledger, with any hard-coding flags. For each one, GLM writes a lesson in one structured call (purpose `rsi-lesson`): what was tried, what happened and why, citing the experiment ID. A lesson about a flagged candidate says what was flagged.
 
 ### 8.3 Decision rules
 
@@ -677,16 +708,22 @@ All thresholds are set in config, and every decision records the thresholds it u
 
 A lane stops after 4 rounds in a row with no accepted change, or when its time budget runs out.
 
+A lane that stops writes a stop record to the ledger, opens its final results PR, notifies the project lead, and exits normally. The supervisor does not restart it, and the supervisor exits once every lane has stopped (§8.7).
+
 ### 8.5 Anti-gaming and safety boundaries
 
 | Risk | Defense |
 |---|---|
-| Editing the grader, core or contracts | The implementer can write only to its lane's directories, and a candidate whose diff touches any other path is rejected. The `bench/`, `harness/core/` and `contracts/` checksums are verified before every evaluation |
-| Hard-coded answers | A scan of the diff rejects it if it contains a gold-only fragment of any split's gold answer, at least 40 characters after normalization: gold `optimized_sql` for Effi-SQL, the gold patch for SWE (on hold). A gold-only fragment is a window of the gold that occurs in no `base_sql` and not in the schema DDL. Scanning every gold window would reject legitimate skills: 147 of the 238 golds share such a window with their own `base_sql`, and standard TPC-H joins recur across many golds. The scan also rejects pack changes that embed large literal lists, above a size set in config. Effi-SQL instance ids are not scanned: they are small integers, so a match would mean nothing. There is no database-name rule either, since every task runs on the one `tpch` database. The SWE scan (on hold) also rejects an instance_id from any split |
+| Editing the grader, core or contracts | **Prevented.** The implementer works in a Docker sandbox in which only its lane's two pack directories are writable. Every other write fails with a read-only filesystem error, and the sandbox cannot commit. **Detected.** A candidate whose commit touches any other path is rejected. The `bench/`, `harness/core/` and `contracts/` checksums are verified before every evaluation |
+| Reading val or held-out data, or gold answers | The sandbox mounts only the candidate's worktree, which holds split ID lists but no gold answers: benchmark files with gold answers are never committed. `goaly-smoke` accepts train tasks only. The data files loaded while a candidate is evaluated hold only agent-visible and grading fields; Effi-SQL grading compares against `base_sql`, so it needs no gold at all. The full dataset, gold included, is read only by the setup and exclusion tools, and by the analyst for train only |
+| Leaking or misusing the API key | The key never enters the sandbox: no host environment variable is passed in, and `~/.config` is not mounted. Model calls are made by the lane process, outside the sandbox. mini-swe-agent's local environment, which passes on the parent's environment and protects nothing, is never used for the implementer |
+| Running code the agent wrote | Agent-written tests run only in sandboxes, during implementation and in the unit-test guard. Candidate pack code also runs on the host, in the runner, during smoke tests, screening and validation, so a static AST allowlist checks it first. Imports must come from an approved list: `goaly.contracts`, `goaly.harness.core`, pydantic, and pure stdlib modules such as json, re, typing, dataclasses, math, statistics, collections, itertools, functools, textwrap and enum. `open`, `eval`, `exec`, `compile` and `__import__` are banned, and so are `importlib`, `subprocess`, `os`, `sys`, `socket`, `pathlib`, `shutil`, `ctypes` and attribute access to dunder internals |
+| The sandbox reaching other services | Host networking is the only mode that works here, so the sandbox can reach localhost and the internet. It holds no secret: PostgreSQL requires a password the sandbox never gets, the gateway is useless without the key, and the Docker socket is never mounted |
+| Hard-coded answers | A scan of the diff rejects it if it contains a gold-only fragment of any split's gold answer, at least 40 characters after normalization: gold `optimized_sql` for Effi-SQL, the gold patch for SWE (on hold). A gold-only fragment is a window of the gold that occurs in no `base_sql` and not in the schema DDL. The setup tools compute these windows and keep them outside the repository, like the dataset, so the sandbox never sees them. Scanning every gold window would reject legitimate skills: 147 of the 238 golds share such a window with their own `base_sql`, and standard TPC-H joins recur across many golds. The scan also rejects pack changes that embed large literal lists, above a size set in config. Effi-SQL instance ids are not scanned: they are small integers, so a match would mean nothing. There is no database-name rule either, since every task runs on the one `tpch` database. The SWE scan (on hold) also rejects an instance_id from any split |
 | Hard-coded results: a prediction that returns the base query's result as constants | The grader's robustness check, on the alternate database, and its plan check give such a prediction credit 0 and flag it (§4.1). A flagged prediction fails its candidate outright, and the ledger and the lessons record it. The report gives both the official and the checked R-VES |
 | Changing the database: indexes or data | Agent sessions use a role with only the `SELECT` privilege and no `CREATE` (§4.1), and client-side cancellation enforces their timeout. Grading runs on its own instances, and the official evaluation runs on the pristine database |
 | Tampering with the grading instances | Before each grading batch, the grader verifies the instance's catalog fingerprint: its indexes, its relation sizes (`relpages`) and its write counters. Every instance requires password authentication. Grading credentials never enter the repository or the implementer sandbox, which has host networking but no credentials |
-| Relying on the improvement model | The model allowlist lives in core, which RSI cannot edit |
+| Relying on the improvement model | The per-purpose model allowlist lives in core, which RSI cannot edit: executor calls may use only Qwen (§5.1) |
 | Special-casing the workload or caching between timing runs (SWE, on hold) | The official grader times each repetition in a fresh process and checks for stack inspection; the prompt and skills forbid both; held-out results expose this kind of overfitting |
 | Editing test files (SWE, on hold) | The official grader resets test files before it runs them |
 | Overfitting to val | The analyst never sees per-task val results or val trajectories, and lessons cite only the aggregate decision (§7). Held-out is used only for v0's baseline runs and the final runs |
@@ -696,16 +733,91 @@ A lane stops after 4 rounds in a row with no accepted change, or when its time b
 - `experiments.jsonl` (`ExperimentRecord` contract): each record holds the experiment ID, lane, parent version, hypothesis and where it came from (idea bank or GLM's own analysis), kind of change, diff stats, screening and validation metrics, decision and reasoning, and cost. The report states how many accepted changes came from each source.
 - `lessons.jsonl` (`Lesson` contract) is the source of truth for lessons. Entries are added one at a time, as in ACE, and each entry counts how often it helped or hurt. GLM maintains the file and can delete entries, but never rewrites it in one go, so nothing is lost by accident.
 - `lessons.md` is generated from `lessons.jsonl` for human readers. Counters embedded in hand-edited markdown could not be updated reliably.
+- Each experiment record holds the implementer's run (`ImplementerRun`): how it ended, its step count and wall time, its smoke tests, its closing summary, and a link to its trajectory, which stays in mini-swe-agent's own format under `runs/` (§8.8).
+- `lane_events.jsonl` (`LaneEvent` contract) records what happens to a lane outside any one experiment: starts, restarts, a failed recovery, stops, results PRs and notifications (§8.7).
 
 ### 8.7 Operations
 
-- **Processes.** Each lane runs as its own background process. Every step is recorded in the ledger, so a lane that crashes restarts from the ledger and picks up where it stopped.
-- **Results PRs.** A lane opens an "RSI results" PR when it has 3 accepted changes since its last PR, or when 3 hours have passed since then, whichever happens first. A final results PR is opened before the freeze. Each PR contains the accepted pack changes, the ledger entries and the lessons. Results PRs wait for the project lead's review; the lane does not pause for them.
-- **Notifications.** The project lead receives a push notification when:
-  - a lane crashes and automatic recovery fails;
-  - the gateway circuit breaker trips repeatedly;
-  - a results PR is opened;
-  - a lane stops because 4 rounds in a row accepted nothing.
+**Supervisor.** This machine has no systemd and no cron, so goaly supervises itself. `goaly rsi run --detach` starts one supervisor process in its own session, with no terminal input, and returns. A lock file keeps it to one instance, and a minimal shell loop restarts the supervisor itself if it crashes.
+
+- The supervisor runs each lane as its own process. Each lane writes a heartbeat every 30 s; a lane whose heartbeat is 10 minutes old is killed and counted as crashed.
+- A crashed lane is restarted from the ledger after a backoff of 30 s, 1, 2 and 5 minutes, then every 10 minutes. After 5 crashes within an hour, automatic recovery has failed: the lane is stopped and the project lead is notified.
+- Before every start the supervisor checks Docker, PostgreSQL, the sandbox image, the gateway and free disk. A start that fails these checks counts as a crash.
+- Monitoring means only these health checks. No assistant monitors the run, and nothing in it waits for a person; the project lead may read the logs, but the run never depends on it.
+
+**Resuming.** Every step is recorded in the ledger, so a restarted lane picks up where it stopped:
+
+- an experiment interrupted before its commit is aborted, and its hypothesis goes back in the queue;
+- one interrupted after its commit resumes at its next phase, and cached evaluations make finished tasks free;
+- the round number, the rounds without an accepted change and the time budget are recomputed from the ledger, and the time budget counts from the lane's first start;
+- leftover sandbox containers and worktrees are removed.
+
+The project lead manages the Coder workspace's auto-stop. If the workspace stops, every process stops with it, and running `goaly rsi run` again after the restart resumes every lane from the ledger.
+
+**Results PRs.** A lane opens an "RSI results" PR when it has 3 accepted changes since its last PR, or when 3 hours have passed since then, whichever happens first, and a final one when it stops. goaly.rsi does this itself:
+
+1. it builds an `rsi/<lane>/results-<n>` branch from `main` with the accepted pack commits, the ledger entries and the lessons;
+2. it pushes only that branch;
+3. it opens the PR through the GitHub REST API, with a body generated from the ledger.
+
+The PR number goes into the ledger, so a restart never opens a duplicate. The GitHub token is read at run time and never appears in a URL, an argument, a log or the sandbox. The code never merges, approves or pushes outside `rsi/*`. Results PRs wait for the project lead's review, and the lane does not pause for them.
+
+**Notifications.** goaly.rsi sends them itself, over HTTPS to an ntfy.sh topic. The topic name is a secret, read from `~/.config/goaly/.env` as `GOALY_NTFY_TOPIC`, and the project lead subscribes to it in the ntfy app. A notification goes out when:
+
+- a lane crashes and automatic recovery fails;
+- the gateway circuit breaker trips repeatedly;
+- a results PR is opened;
+- a lane stops.
+
+Every notification is also written to the lane's event log and listed in the next results PR. A failed delivery is retried and never blocks the loop, and a notification never carries a secret or task data.
+
+### 8.8 Implementer agent
+
+The implementer is mini-swe-agent's `DefaultAgent` (`mini-swe-agent==2.4.6`, MIT), used as a library and unchanged. goaly.rsi supplies its model and its environment, and owns everything around the run. `DefaultAgent` is mini-swe-agent's non-interactive agent: the `mini` CLI's interactive agent, which asks a person to confirm each step, is never used.
+
+**Model adapter.** A goaly `Model` implements mini-swe-agent's model protocol on top of core's LLM client (T03):
+
+- Each step is one client call to `glm-5.3` with purpose `rsi-impl`, and the experiment ID as the run ID. The client applies its accounting, retries, `Retry-After`, AIMD, the circuit breaker and the lane's GLM share, and writes the `LlmCallRecord`.
+- The assistant message goes into the history exactly as returned, `reasoning_content` and `tool_calls` included.
+- A step's cost is the gateway's `x-litellm-response-cost`, so the agent's cost limit counts real spend. mini-swe-agent's litellm model is not used, and litellm is not installed; its price table has no entry for `glm-5.3` anyway.
+- Each step records its call ID, which joins it to its `LlmCallRecord`.
+- **Fallback.** If T03's client is late, a small subclass of mini-swe-agent's `LitellmModel` that reads the gateway's cost header stands in. It needs litellm only while it is used, and switching back to core's client changes one class.
+
+**Sandbox.** One Docker container per hypothesis, with `--network=host`, the only mode that works on this machine (§1.3):
+
+- The image is `goaly-rsi-sandbox:<uv.lock hash>`: Python 3.12, git, ripgrep and the locked dev dependencies.
+- Mounts: the worktree, read-only, at its own path; the lane's two pack directories, `src/goaly/harness/packs/<lane>/` and `tests/harness/packs/<lane>/`, read-write; and the main repository's `.git`, read-only, so `git diff` works but nothing can be committed. Nothing else from the host is mounted: no `~/data`, no `runs/`, no other worktree and no `~/.config`.
+- The container runs as the host user's uid and gid, with a read-only root filesystem, a tmpfs `/tmp`, no capabilities, `no-new-privileges`, and process, memory and CPU limits, on cores 0–1 (§6.2).
+- No host environment variable is passed in, and no key reaches the sandbox.
+- Every command runs under `timeout` inside the container, because a timed-out `docker exec` leaves its command running. Containers carry the experiment ID as a label, and a lane removes any it finds left over when it starts.
+
+**`goaly-smoke`.** `goaly-smoke <instance_id>` is the only command the sandbox does not run itself. The host:
+
+1. refuses any instance that is not in train, and any call after the second;
+2. runs the step-3 guards on the worktree as it stands;
+3. runs the candidate on that task with the bench runner, with one seed;
+4. returns the score, the stop reason, the step count, the cost and the last tool error.
+
+**Limits.** These are config values. Our adapter enforces 60 steps, $3 of GLM and 30 minutes per hypothesis; the agent also stops after 3 format errors in a row, and each command times out after 120 s.
+
+**The prompt** (`implementer.yaml`) gives the hypothesis, the pack layout (§5.2) and the allowed paths, how to run the unit tests and smoke tests, the hard-coding rules and the AST allowlist (§8.5), and how to finish.
+
+**Finishing.** The agent finishes by running `echo COMPLETE_TASK_AND_SUBMIT_FINAL_OUTPUT` with a short summary. goaly.rsi then, on the host:
+
+1. checks that every changed path is inside the pack directories;
+2. stages only those directories;
+3. commits once, as `rsi(<lane>): <summary>`, with `Experiment-Id` and `Hypothesis-Id` trailers.
+
+**Endings without a commit.**
+
+- A limit, repeated format errors, or a finish with no change: the candidate is rejected as not implemented.
+- A gateway or Docker failure: the experiment is aborted, not rejected.
+
+**Trajectory.** mini-swe-agent saves it after every step, in its own format, to `runs/rsi/<lane>/<experiment_id>/implementer.traj.json`. The experiment record links to it (§8.6).
+
+**The analyst and the lesson writer** stay single structured GLM calls through core's client (§8.2). They are not agents: their input is already summarized, and their output is JSON that pydantic validates.
+
+**Why mini-swe-agent.** The implementer needs a bash coding agent, not the executor's loop. mini-swe-agent provides one that is small, MIT-licensed, widely used on SWE-bench, and runs in a Docker sandbox. Keeping it apart from core also means that changes to the executor's loop cannot break RSI, and the implementer no longer waits for T04 or T05.
 
 ## 9. Cost and efficiency accounting
 
@@ -713,6 +825,7 @@ A lane stops after 4 rounds in a row with no accepted change, or when its time b
 - The report shows two costs separately:
   - what the final harness costs, in money and time, to run on the held-out set;
   - what the RSI experiments cost in total, by lane and by purpose.
+- Implementer calls are recorded by core's LLM client like every other call, with purpose `rsi-impl` and the experiment ID as the run ID. mini-swe-agent's own cost tracking is not used. A smoke test's Qwen calls are `exec` calls in a smoke run attributed to the experiment, and they count toward its cost.
 - On the machine side, we record wall time per task, how long each Effi-SQL evaluation holds its grading instance, and the CPU time used by SWE evaluation (on hold).
 - The report compares the final harness's mean cost and wall time per task with v0's, against the 3× efficiency cap (§8.3).
 
@@ -736,7 +849,7 @@ A lane stops after 4 rounds in a row with no accepted change, or when its time b
   3. grades the results;
   4. generates the report.
 
-  The report reads v0's held-out results from the runs archived during the baseline phase. A separate `make baseline` reruns v0 for anyone who wants to reproduce it too. We keep the two commands apart because rerunning v0 as part of `make final` would add about 3 hours of official-mode grading (§6.2).
+  The report reads v0's held-out results from the runs archived during the baseline phase. A separate `make baseline` reruns v0 for anyone who wants to reproduce it too. We keep the two commands apart because rerunning v0 as part of `make final` would add about 3.5 hours of official-mode grading (§6.2).
 
   Dependencies are pinned in `uv.lock`, and the manifests record every version.
 
@@ -754,6 +867,16 @@ A lane stops after 4 rounds in a row with no accepted change, or when its time b
 - Secrets are read only from environment variables or `~/.config/goaly/.env`.
 - Logs are structured JSON.
 
+**Third-party agent framework (RSI only)**
+
+- `mini-swe-agent==2.4.6` (MIT) is pinned exactly, in a separate `rsi` dependency group. The adapter relies on its message format and helper functions, so every upgrade is a deliberate PR. 2.4.6 was released on 2026-07-23, so it satisfies the lock's `exclude-newer` cutoff of 2026-10-11.
+- A `[tool.uv] exclude-dependencies` entry scoped to mini-swe-agent drops its unused heavy dependencies: `litellm`, `openai`, `datasets`, `textual` and `prompt-toolkit`. The group then adds about 12 small packages, and the classes we use never import the excluded ones. This also keeps litellm, whose 1.82.7 and 1.82.8 releases were compromised in March 2026, out of the process that holds the API key.
+- `make setup` and CI install every group. The organizers' plain `uv sync --locked` leaves the `rsi` group out.
+- An import-linter contract lets only `goaly.rsi` import `minisweagent` (§3.1).
+- Before the first import, goaly sets `MSWEA_SILENT_STARTUP=1` and points `MSWEA_GLOBAL_CONFIG_DIR` at an empty directory it owns. mini-swe-agent then neither prints a banner nor loads a `.env` file into the environment. Its logger is routed into our JSON logs.
+- mini-swe-agent ships `py.typed` but leaves many functions unannotated, so one adapter module wraps every call into it, under a mypy override scoped to that module.
+- Unit tests drive the implementer with mini-swe-agent's `DeterministicToolcallModel`, or with a FakeLLM behind core's client, and a fake environment. Tests that start a sandbox are marked `integration`.
+
 **Language:** everything in the repository is written in English, including code, comments, design docs, the README and reports.
 
 **Collaboration**
@@ -762,7 +885,7 @@ A lane stops after 4 rounds in a row with no accepted change, or when its time b
 - A ticket usually maps to one PR. A larger ticket is split into a short series of stacked PRs, and each PR in the series references the ticket. Tickets themselves are not split.
 - PRs that depend on each other are stacked.
 - The project lead reviews and merges every PR. Review feedback is fixed in new commits, never by force-pushing.
-- Changes that RSI makes on its own go only to `rsi/*` branches. They are bundled into "RSI results" PRs from time to time.
+- Changes that RSI makes on its own go only to `rsi/*` branches. goaly.rsi pushes them and opens the "RSI results" PRs itself (§8.7). It never merges.
 
 ## 12. Risks and mitigations
 
@@ -777,6 +900,13 @@ A lane stops after 4 rounds in a row with no accepted change, or when its time b
 | The official evaluator's repository has no license | We reimplement its algorithm (§4.1) rather than vendor its code. Negative self-checks, which a broken matcher would fail, test the reimplementation together with the gold, identity and data checks |
 | SWE on hold: the PDF's "gains on more than one benchmark" is at risk (§2) | Nothing within this deadline; the report states the gap plainly. The SWE design stays in this document and the RSI machinery has no benchmark-specific code, so the lane can resume without a redesign |
 | Tight schedule: 21 hours from 2026-10-15 03:00 UTC to the deadline | One active lane. Contracts come first, then component PRs in parallel; stacked PRs keep review from blocking work. RSI must be running by about 16:00 UTC, and the plan counts on 1–2 rounds (§13) |
+| The implementer writes outside its pack: bash can write anywhere | The Docker sandbox with read-only mounts prevents it (§8.8), and the guards and checksums detect it. A unit-tested function builds the mount arguments, and an integration test asserts the read-only refusal |
+| Candidate pack code runs on the host during smoke tests, screening and validation | The static AST allowlist (§8.5) checks it before every run, and the checksums are verified before every evaluation |
+| mini-swe-agent changes or breaks | An exact pin. The adapter uses only `DefaultAgent`, `DockerEnvironment`, its exceptions and two helper functions. Vendoring them, about 450 lines under MIT, is the fallback |
+| T03's client is late for the implementer | The fallback model, a small `LitellmModel` subclass that reads the gateway's cost header (§8.8). Switching back to core's client later changes one class |
+| A lane hangs or crashes during the unattended run | Heartbeats, bounded restarts with backoff, and resuming from the ledger (§8.7). A notification when recovery fails |
+| The Coder workspace stops during the run | The project lead manages its auto-stop. Running `goaly rsi run` again after a restart resumes every lane from the ledger |
+| GitHub or ntfy.sh is down | Retries, and nothing in the loop waits for them. Notifications are also logged and listed in the next results PR |
 | Upstream interfaces change during review | Settle the interfaces first, in T05 and T06. Downstream PRs rebase |
 | Malformed Qwen tool calls | Fallback parsing and fault tolerance in core (T04) |
 | The gateway gets overloaded, possibly because other teams share it | Concurrency budgets at about 75% of measured capacity; adaptive limiting and a circuit breaker (§6.2) |
@@ -794,9 +924,9 @@ The schedule runs from now, 2026-10-15 03:00 UTC, to the deadline, 2026-10-16 00
 | 05:00–07:30 | T03, T04, T08 and T09 in parallel. T09 generates and loads TPC-H SF3 and the alternate database in the background |
 | 07:30–09:30 | T05 and T10 |
 | 09:30–12:30 | T06, then T07 and T18. As soon as T10 lands, the setup runs on all 5 instances: the base cache, the identity τ, the alternate-database signatures, the self-checks and the exclusion list, about 3 h |
-| 12:30–14:30 | T11, T19 and T20. v0's dev runs (T12) start as soon as T11 lands. T11 is on the grading instances' critical path |
+| 12:30–14:30 | T11, T19 and T20; T20 needs only T03 and T18, not T04 or T05. v0's dev runs (T12) start as soon as T11 lands. T11 is on the grading instances' critical path |
 | 14:30–16:00 | T21. v0's held-out runs start as soon as its train and val dev runs are done, and take about 3.5 h. The project lead reviews the stack the lane runs on |
-| 16:00–20:00 | T22: the Effi-SQL lane runs. Its grading queues behind v0's held-out runs (§6.2), so plan for 1–2 rounds; more are upside. It must be running by about 16:00 |
+| 16:00–20:00 | T22: the Effi-SQL lane runs under the supervisor, with no assistant in the loop (§8.0). Its grading queues behind v0's held-out runs (§6.2), so plan for 1–2 rounds; more are upside. It must be running by about 16:00 |
 | 20:00–23:30 | T23: the freeze; final solving, then grading on all 5 instances, about 2.5–3.5 h in all; the report |
 | 23:30–00:00 | T24, and buffer before the deadline |
 
