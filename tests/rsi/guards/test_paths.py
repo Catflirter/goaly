@@ -1,11 +1,13 @@
 """Tests for goaly.rsi.guards.paths: a candidate changes only its lane's pack."""
 
+import subprocess
 from pathlib import Path
 
 import pytest
 
 from goaly.contracts.gen.experiment_pb2 import GUARD_ALLOWED_PATHS, LANE_EFFISQL
-from goaly.rsi.guards.paths import check_allowed_paths
+from goaly.rsi.git import GitError
+from goaly.rsi.guards.paths import PathsConfig, check_allowed_paths
 from tests.rsi.gitrepo import git, make_repo, write
 
 PACK = "src/goaly/harness/packs/effisql"
@@ -103,7 +105,7 @@ def test_a_gitlink_in_the_pack_fails(repo: Path) -> None:
     git(repo, "commit", "--quiet", "--message=a gitlink")
     commit = git(repo, "rev-parse", "HEAD").strip()
 
-    assert check(repo, commit) == (False, f"{PACK}/sub: mode 160000, not a regular file")
+    assert check(repo, commit) == (False, f"{PACK}/sub: a gitlink")
 
 
 def test_an_executable_file_in_the_pack_passes(repo: Path) -> None:
@@ -124,3 +126,102 @@ def test_every_problem_is_listed(repo: Path) -> None:
         "README.md: outside the lane's pack directories",
         f"{PACK}/x.so: a pack holds no .so files",
     ]
+
+
+def test_a_git_directory_anywhere_in_a_path_fails(repo: Path) -> None:
+    # git add refuses such a path, but a commit made with plumbing can hold one.
+    blob = run_stdin(repo, ["hash-object", "-w", "--stdin"], "x = 1\n")
+    inner = run_stdin(repo, ["mktree"], f"100644 blob {blob}\thooks.py\n")
+    head_tree = git(repo, "rev-parse", "HEAD^{tree}").strip()
+    tree = with_entry(repo, head_tree, PACK.split("/"), f"040000 tree {inner}\t.git")
+    commit = run_stdin(repo, ["commit-tree", tree, "-p", "HEAD", "-m", "plumbing"], "")
+
+    assert check(repo, commit) == (False, f"{PACK}/.git/hooks.py: git's own file")
+
+
+def run_stdin(repo: Path, args: list[str], text: str) -> str:
+    return subprocess.run(  # noqa: S603  (git with arguments built by the test)
+        ["git", *args],  # noqa: S607
+        cwd=repo,
+        input=text,
+        check=True,
+        capture_output=True,
+        text=True,
+    ).stdout.strip()
+
+
+def with_entry(repo: Path, tree: str, parts: list[str], entry: str) -> str:
+    """``tree`` with ``entry``, a line of ls-tree's output, added in its subtree at ``parts``."""
+    lines = git(repo, "ls-tree", tree).splitlines()
+    if not parts:
+        return run_stdin(repo, ["mktree"], "\n".join([*lines, entry]) + "\n")
+    changed = []
+    for line in lines:
+        meta, name = line.split("\t")
+        if name == parts[0]:
+            line = f"040000 tree {with_entry(repo, meta.split(' ')[2], parts[1:], entry)}\t{name}"
+        changed.append(line)
+    return run_stdin(repo, ["mktree"], "\n".join(changed) + "\n")
+
+
+def test_a_gitlink_shows_whatever_the_repository_config_says(repo: Path) -> None:
+    git(repo, "config", "diff.ignoreSubmodules", "all")
+    head = git(repo, "rev-parse", "HEAD").strip()
+    git(repo, "update-index", "--add", "--cacheinfo", f"160000,{head},{PACK}/sub")
+    git(repo, "commit", "--quiet", "--message=a gitlink")
+    commit = git(repo, "rev-parse", "HEAD").strip()
+
+    assert check(repo, commit) == (False, f"{PACK}/sub: a gitlink")
+
+
+def test_a_revision_that_looks_like_an_option_is_never_read_as_one(
+    repo: Path, tmp_path: Path
+) -> None:
+    planted = tmp_path / "planted"
+
+    with pytest.raises(GitError):
+        check_allowed_paths(repo, LANE_EFFISQL, parent=f"--output={planted}", candidate="HEAD")
+
+    assert not planted.exists()
+
+
+def test_a_path_that_is_not_plain_text_is_shown_quoted(repo: Path) -> None:
+    commit = candidate(repo, {"src/goaly/bench/a\nPASS b.py": "x\n"})
+
+    passed, detail = check(repo, commit)
+
+    assert not passed
+    assert detail.splitlines() == [
+        '"src/goaly/bench/a\\nPASS b.py": outside the lane\'s pack directories'
+    ]
+
+
+def test_a_file_larger_than_the_limit_fails(repo: Path) -> None:
+    commit = candidate(repo, {f"{PACK}/table.json": "x" * 2048})
+    config = PathsConfig(max_file_bytes=1024)
+
+    result = check_allowed_paths(
+        repo, LANE_EFFISQL, parent="best/effisql", candidate=commit, config=config
+    )
+
+    assert (result.passed, result.detail) == (
+        False,
+        f"{PACK}/table.json: 2048 bytes, more than 1024",
+    )
+
+
+def test_files_larger_together_than_the_limit_fail(repo: Path) -> None:
+    commit = candidate(repo, {f"{PACK}/a.md": "x" * 600, f"{PACK}/b.md": "y" * 600})
+    config = PathsConfig(max_total_bytes=1000)
+
+    result = check_allowed_paths(
+        repo, LANE_EFFISQL, parent="best/effisql", candidate=commit, config=config
+    )
+
+    assert result.detail == "the changed files hold 1200 bytes, more than 1000"
+
+
+def test_a_candidate_that_only_deletes_needs_no_size_check(repo: Path) -> None:
+    commit = candidate(repo, {}, delete=(f"{PACK}/policy.py",))
+
+    assert check(repo, commit) == (True, "1 changed path, all in the pack")

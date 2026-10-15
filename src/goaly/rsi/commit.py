@@ -64,8 +64,10 @@ def commit_candidate(
     message = _message(info.name, summary, worktree.experiment_id, hypothesis_id)
     with workspace.lock():
         workspace.check_registered(worktree)
+        workspace.check_stopped(worktree)  # Host git never reads a worktree a sandbox can change.
         check_pack_files(worktree)  # Before any git command runs in the worktree.
-        check_modes(pack_modes(worktree), "in its best version")
+        timeout = workspace.git_timeout_s
+        check_modes(pack_modes(worktree, timeout_s=timeout), "in its best version")
         _check_branch(worktree)
         changed = [PurePosixPath(path) for path in _changed_paths(worktree)]
         outside = sorted(
@@ -82,9 +84,11 @@ def commit_candidate(
             for pack in info.pack_dirs
             if (worktree.path / pack).exists() or any(path.is_relative_to(pack) for path in changed)
         ]
+        if not staged:  # Neither pack exists or changed; git add without a path adds all.
+            return None
         run_git(["add", "--all", "--", *staged], cwd=worktree.path)
         try:
-            check_modes(pack_modes(worktree, staged=True), "staged")
+            check_modes(pack_modes(worktree, staged=True, timeout_s=timeout), "staged")
         except UnsafePackError:
             run_git(["reset", "--quiet", "--", *staged], cwd=worktree.path)
             raise

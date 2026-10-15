@@ -7,7 +7,8 @@ import pytest
 
 from goaly.contracts.gen.experiment_pb2 import GUARD_CHECKSUMS
 from goaly.rsi.guards.checksums import FROZEN_DIRS, check_checksums, frozen_checksums
-from tests.rsi.gitrepo import make_repo, write
+from goaly.rsi.workspace import Workspace
+from tests.rsi.gitrepo import git, make_repo, write
 
 
 @pytest.fixture
@@ -81,11 +82,26 @@ def test_a_symlinks_target_counts(tree: Path) -> None:
     assert not check_checksums(tree, expected).passed
 
 
-def test_bytecode_caches_do_not_count(tree: Path) -> None:
+def test_committed_bytecode_counts(tree: Path) -> None:
+    # A snapshot holds only committed files, so bytecode in it was committed, and could run.
     expected = frozen_checksums(tree)
     write(tree, {"src/goaly/harness/core/__pycache__/tools.cpython-312.pyc": "bytecode"})
 
-    assert check_checksums(tree, expected).passed
+    assert not check_checksums(tree, expected).passed
+
+
+def test_the_checksums_hold_on_a_real_snapshot(tmp_path: Path) -> None:
+    workspace = Workspace(make_repo(tmp_path / "repo"), root=tmp_path / "worktrees")
+    with workspace.snapshot("best/effisql") as snapshot:
+        expected = frozen_checksums(snapshot)
+    write(workspace.repo, {"src/goaly/harness/core/llm.py": "KEY = 'changed'\n"})
+    git(workspace.repo, "add", "--all")
+    git(workspace.repo, "commit", "--quiet", "--message=core changed")
+
+    with workspace.snapshot("HEAD") as snapshot:
+        assert check_checksums(snapshot, expected).detail == "src/goaly/harness/core changed"
+    with workspace.snapshot("best/effisql") as snapshot:
+        assert check_checksums(snapshot, expected).passed
 
 
 def test_a_missing_expected_checksum_fails(tree: Path) -> None:

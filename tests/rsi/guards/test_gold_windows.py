@@ -156,9 +156,101 @@ def test_the_module_runs_as_a_command(tmp_path: Path) -> None:
     assert GoldWindows.load(out) == build_from_files(dataset, [schema])
 
 
-def test_a_store_inside_a_git_directory_is_allowed(gold: GoldWindows, tmp_path: Path) -> None:
+@pytest.mark.parametrize(
+    "where", [".git/gold_windows.json", "rsi/ledger/gold_windows.json", "ignored/gold.json"]
+)
+def test_a_store_anywhere_in_a_repository_is_refused(
+    gold: GoldWindows, tmp_path: Path, where: str
+) -> None:
     repo = make_repo(tmp_path / "repo")
+    (repo / ".gitignore").write_text("rsi/ledger/\nignored/\n", encoding="utf-8")
 
-    gold.save(repo / ".git" / "gold_windows.json")  # Never part of a commit.
+    with pytest.raises(ValueError, match="outside any repository"):
+        gold.save(repo / where)
 
-    assert GoldWindows.load(repo / ".git" / "gold_windows.json") == gold
+
+def test_a_relative_store_path_is_resolved_before_it_is_checked(
+    gold: GoldWindows, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    repo = make_repo(tmp_path / "repo")
+    monkeypatch.chdir(repo)
+
+    with pytest.raises(ValueError, match="outside any repository"):
+        gold.save(Path("sub") / "gold_windows.json")
+
+
+def test_the_store_is_private_to_its_owner(gold: GoldWindows, tmp_path: Path) -> None:
+    out = tmp_path / "cache" / "gold" / "gold_windows.json"
+
+    gold.save(out)
+
+    assert out.stat().st_mode & 0o777 == 0o600
+    assert out.parent.stat().st_mode & 0o777 == 0o700
+
+
+def test_an_empty_store_is_never_saved_or_loaded(tmp_path: Path) -> None:
+    out = tmp_path / "gold_windows.json"
+
+    with pytest.raises(ValueError, match="no gold-only window"):
+        GoldWindows(frozenset()).save(out)
+    out.write_text(
+        json.dumps(
+            {"format": "goaly-gold-windows/1", "width": 40, "dataset_sha256": "", "windows": []}
+        ),
+        encoding="utf-8",
+    )
+    with pytest.raises(ValueError, match="not a gold windows store"):
+        GoldWindows.load(out)
+
+
+@pytest.mark.parametrize(
+    "change",
+    [
+        {"width": 100000},  # Every scan would be a no-op.
+        {"windows": "abc"},
+        {"windows": ["not-a-hash"]},
+        {"extra": 1},
+        {"dataset_sha256": "x"},
+    ],
+)
+def test_a_store_that_was_tampered_with_is_refused(
+    gold: GoldWindows, tmp_path: Path, change: dict[str, object]
+) -> None:
+    out = tmp_path / "gold_windows.json"
+    gold.save(out)
+    document = json.loads(out.read_text(encoding="utf-8"))
+    out.write_text(json.dumps({**document, **change}), encoding="utf-8")
+
+    with pytest.raises(ValueError, match=r"gold windows store|SHA-256"):
+        GoldWindows.load(out)
+
+
+def test_the_runtime_file_has_no_gold_to_build_from(tmp_path: Path) -> None:
+    runtime = tmp_path / "effi-sql-pg.runtime.jsonl"
+    runtime.write_text(json.dumps({"id": 1, "base_sql": BASE}) + "\n", encoding="utf-8")
+    schema = tmp_path / "schema_snapshot.json"
+    schema.write_text(json.dumps({"ddl": DDL}), encoding="utf-8")
+
+    with pytest.raises(ValueError, match=r"runtime\.jsonl:1: not a task with base_sql"):
+        build_from_files(runtime, [schema])
+
+
+def test_normalize_drops_invisible_characters_and_folds_lookalikes() -> None:
+    assert normalize("SE\u200bLECT\u00a0\uff21") == "select a"
+
+
+def test_windows_of_another_width_are_refused() -> None:
+    with pytest.raises(ValueError, match="10 characters wide"):
+        GoldWindows(frozenset({"a" * 64}), width=10).check()
+
+
+def test_a_store_of_another_format_with_every_field_is_refused(
+    gold: GoldWindows, tmp_path: Path
+) -> None:
+    out = tmp_path / "gold_windows.json"
+    gold.save(out)
+    document = json.loads(out.read_text(encoding="utf-8"))
+    out.write_text(json.dumps({**document, "format": "goaly-gold-windows/0"}), encoding="utf-8")
+
+    with pytest.raises(ValueError, match="in the format goaly-gold-windows/1"):
+        GoldWindows.load(out)

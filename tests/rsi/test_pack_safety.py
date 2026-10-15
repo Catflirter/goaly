@@ -6,7 +6,8 @@ command runs in the worktree, and what git stages is checked again before anythi
 """
 
 import os
-from collections.abc import Callable, Sequence
+import shutil
+from collections.abc import Callable, Iterator, Sequence
 from pathlib import Path
 from typing import Any
 
@@ -16,11 +17,20 @@ from goaly.contracts.gen.experiment_pb2 import LANE_EFFISQL
 from goaly.rsi import commit, workspace
 from goaly.rsi.commit import commit_candidate
 from goaly.rsi.git import run_git
-from goaly.rsi.workspace import UnsafePackError, Workspace, Worktree, check_pack_files
+from goaly.rsi.workspace import (
+    UnsafePackError,
+    Workspace,
+    WorkspaceError,
+    Worktree,
+    check_pack_files,
+)
 from tests.rsi.gitrepo import git, make_repo, write
 
 PACK = "src/goaly/harness/packs/effisql"
 PACK_TESTS = "tests/harness/packs/effisql"
+
+# Root ignores permission bits, so the tests of unreadable entries need another user.
+needs_non_root = pytest.mark.skipif(os.geteuid() == 0, reason="root ignores permission bits")
 
 
 @pytest.fixture
@@ -36,6 +46,25 @@ def space(repo: Path, tmp_path: Path) -> Workspace:
 @pytest.fixture
 def worktree(space: Workspace) -> Worktree:
     return space.create(LANE_EFFISQL, "exp-1")
+
+
+@pytest.fixture
+def readable_again(worktree: Worktree) -> Iterator[None]:
+    """Give everything under the worktree its owner's permissions back after the test, even if
+    it failed, so that pytest can delete its temporary directory.
+    """
+    yield
+    pending = [worktree.path] if worktree.path.is_dir() else []
+    while pending:
+        directory = pending.pop()
+        directory.chmod(0o755)  # Before listing it, which a mode of 000 would refuse.
+        for entry in directory.iterdir():
+            if entry.is_symlink():
+                continue
+            if entry.is_dir():
+                pending.append(entry)
+            elif entry.is_file():
+                entry.chmod(0o644)
 
 
 @pytest.fixture
@@ -98,6 +127,19 @@ def fifo(worktree: Worktree) -> None:
     os.mkfifo(worktree.path / PACK_TESTS / "pipe")
 
 
+def unreadable_directory(mode: int) -> Callable[[Worktree], None]:
+    def plant(worktree: Worktree) -> None:
+        write(worktree.path, {f"{PACK}/hidden/notes.md": "x\n"})
+        (worktree.path / PACK / "hidden").chmod(mode)
+
+    return plant
+
+
+def unreadable_file(worktree: Worktree) -> None:
+    write(worktree.path, {f"{PACK}/notes.md": "x\n"})
+    (worktree.path / PACK / "notes.md").chmod(0o000)
+
+
 def git_control_file(name: str) -> Callable[[Worktree], None]:
     def plant(worktree: Worktree) -> None:
         write(worktree.path, {f"{PACK}/{name}": "* -text\n"})
@@ -116,8 +158,33 @@ def git_control_file(name: str) -> Callable[[Worktree], None]:
         (git_control_file(".gitattributes"), f"{PACK}/.gitattributes: git's own file"),
         (git_control_file(".gitmodules"), f"{PACK}/.gitmodules: git's own file"),
         (git_control_file(".gitignore"), f"{PACK}/.gitignore: git's own file"),
+        pytest.param(
+            unreadable_directory(0o000),
+            f"{PACK}/hidden: cannot be read",
+            marks=needs_non_root,
+            id="unreadable-directory",
+        ),
+        pytest.param(
+            unreadable_directory(0o111),
+            f"{PACK}/hidden: cannot be read",
+            marks=needs_non_root,
+            id="unlistable-directory",
+        ),
+        pytest.param(
+            unreadable_directory(0o444),
+            f"{PACK}/hidden: cannot be read",
+            marks=needs_non_root,
+            id="unsearchable-directory",
+        ),
+        pytest.param(
+            unreadable_file,
+            f"{PACK}/notes.md: cannot be read",
+            marks=needs_non_root,
+            id="unreadable-file",
+        ),
     ],
 )
+@pytest.mark.usefixtures("readable_again")
 def test_an_unsafe_pack_is_refused_before_git_runs_in_the_worktree(
     space: Workspace,
     worktree: Worktree,
@@ -205,16 +272,33 @@ def test_a_pack_directory_replaced_by_a_symlink_is_refused(
         check_pack_files(worktree)
 
 
-def test_remove_deletes_what_the_sandbox_made_read_only(
-    space: Workspace, worktree: Worktree
+@needs_non_root
+@pytest.mark.parametrize("mode", [0o000, 0o111, 0o444, 0o555])
+@pytest.mark.usefixtures("readable_again")
+def test_remove_deletes_what_the_sandbox_made_unreadable_or_read_only(
+    space: Workspace, worktree: Worktree, repo: Path, mode: int
 ) -> None:
-    locked = worktree.path / PACK / "locked"
-    write(worktree.path, {f"{PACK}/locked/notes.md": "x\n"})
-    locked.chmod(0o555)
+    write(worktree.path, {f"{PACK}/locked/deep/notes.md": "x\n", f"{PACK_TESTS}/test_x.py": ""})
+    for directory in ("locked/deep", "locked", ""):  # The deepest first, the pack itself last.
+        (worktree.path / PACK / directory).chmod(mode)
+    (worktree.path / PACK_TESTS).chmod(mode)
 
     space.remove(worktree)
 
     assert not worktree.path.exists()
+    assert str(worktree.path) not in git(repo, "worktree", "list")
+
+
+def test_a_pack_that_cannot_be_removed_is_a_workspace_error(
+    space: Workspace, worktree: Worktree, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    def fail(path: Path) -> None:
+        raise PermissionError(13, "Permission denied", str(path))
+
+    monkeypatch.setattr(shutil, "rmtree", fail)
+
+    with pytest.raises(WorkspaceError, match="cannot remove"):
+        space.remove(worktree)
 
 
 def test_a_git_file_the_best_version_holds_is_refused(repo: Path, space: Workspace) -> None:
@@ -228,3 +312,24 @@ def test_a_git_file_the_best_version_holds_is_refused(repo: Path, space: Workspa
 
     with pytest.raises(UnsafePackError, match=r"\.gitattributes: git's own file in its best"):
         try_commit(space, later)
+
+
+def test_with_neither_pack_directory_nothing_is_staged(
+    repo: Path, space: Workspace, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    git(repo, "rm", "--quiet", "-r", PACK)
+    git(repo, "commit", "--quiet", "--message=no pack")
+    git(repo, "tag", "--force", "best/effisql")
+    bare = space.create(LANE_EFFISQL, "exp-2")
+    for pack in bare.pack_dirs:
+        pack.rmdir()
+    commands: list[list[str]] = []
+
+    def spy(args: Sequence[str], *, cwd: Path, **options: Any) -> str:
+        commands.append(list(args))
+        return run_git(args, cwd=cwd, **options)
+
+    monkeypatch.setattr(commit, "run_git", spy)
+
+    assert commit_candidate(space, bare, hypothesis_id="hyp-1", summary="x") is None
+    assert not [args for args in commands if args[:1] == ["add"]]

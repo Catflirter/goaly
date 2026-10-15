@@ -1,9 +1,14 @@
 # The RSI sandbox image (spec §8.8): Python 3.12, git, ripgrep, uv and goaly's locked dependencies,
 # the dev group included, so that a pack's tests can run in it.
 #
-# goaly.rsi.sandbox builds it as goaly-rsi-sandbox:<uv.lock hash>, from a context that holds only
-# pyproject.toml and uv.lock. The worktree is mounted when a container starts, never copied in,
-# and goaly itself is not installed: PYTHONPATH points at the mounted worktree's src/.
+# goaly.rsi.sandbox builds it as goaly-rsi-sandbox:<hash of uv.lock and this file>, from a context
+# that holds only pyproject.toml and uv.lock. The worktree is mounted when a container starts,
+# never copied in, and goaly itself is not installed: PYTHONPATH points at the mounted worktree's
+# src/.
+#
+# git and ripgrep come from Debian unpinned, on purpose: pinned versions disappear from Debian's
+# mirrors and would break the build. So two builds with one tag can differ by Debian's updates to
+# those two tools, which run no code of the candidate's.
 
 FROM ghcr.io/astral-sh/uv:0.13.1@sha256:4a1f3666816dafadd20ceb71eac9a7d56d7ef30279f7d64048519ab901ada336 AS uv
 
