@@ -46,6 +46,17 @@ async def test_a_worker_thread_calls_through_the_clients_own_loop() -> None:
     assert reply.record.purpose == CallPurpose.CALL_PURPOSE_RSI_IMPL
 
 
+async def test_a_worker_thread_may_give_its_call_longer_attempts() -> None:
+    gateway = Gateway(completion())
+    async with connect(gateway) as llm:
+        await asyncio.to_thread(
+            llm.complete_sync, [user("hi")], model=GLM, tags=IMPL, attempt_timeout_s=900
+        )
+
+    (request,) = gateway.requests
+    assert request.extensions["timeout"]["read"] == 900
+
+
 async def test_calls_from_threads_and_from_the_loop_share_one_limit() -> None:
     in_flight, peak = 0, 0
 
