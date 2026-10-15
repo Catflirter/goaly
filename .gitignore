@@ -1,9 +1,11 @@
 # Secrets: they live in the environment or ~/.config/goaly/.env, never in the repository.
 .env
 .env.*
+*.env
+.envrc
 
-# Run artifacts.
-runs/
+# Run artifacts, at the top level only.
+/runs/
 
 # Python and packaging.
 .venv/
