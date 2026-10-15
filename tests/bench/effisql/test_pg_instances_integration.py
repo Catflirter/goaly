@@ -182,6 +182,29 @@ def test_every_role_needs_its_password_over_tcp(pg_env: PgEnv, role: str) -> Non
         )
 
 
+def test_every_instance_answers_through_its_socket_directory_and_only_with_a_password(
+    pg_env: PgEnv,
+) -> None:
+    # What the solve container does, with no IP at all (V28): libpq's host is the directory.
+    for instance in pg_env.instances:
+        with pg_env.connect(instance, GRADER_ROLE, "tpch", socket=True) as conn:
+            # No TCP address on either end: the session came through the Unix socket.
+            assert conn.execute("SELECT inet_server_addr(), inet_client_addr()").fetchone() == (
+                None,
+                None,
+            )
+            assert conn.execute("SELECT count(*) FROM region").fetchone() == (5,)
+    instance = pg_env.instance("solving")
+    with pytest.raises(psycopg.OperationalError, match="password authentication failed"):
+        psycopg.connect(
+            host=str(pg_env.config.socket_dir(instance.name)),
+            port=instance.port,
+            user=AGENT_ROLE,
+            password="wrong",  # noqa: S106  # A deliberately wrong test value.
+            dbname="tpch",
+        )
+
+
 def test_even_the_local_socket_inside_the_container_needs_a_password(pg_env: PgEnv) -> None:
     instance = pg_env.instance("grading")
     completed = subprocess.run(  # noqa: S603

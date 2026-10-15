@@ -11,8 +11,11 @@ never on the real instances' cores.
 
 import os
 import secrets
+import shutil
+import tempfile
 from collections.abc import Iterator
 from dataclasses import dataclass
+from pathlib import Path
 from typing import Any
 
 import psycopg
@@ -87,15 +90,16 @@ class PgEnv:
         pytest.skip(f"no {kind} instance in GOALY_EFFISQL_ITEST_INSTANCES")
 
     def connect(
-        self, instance: Instance, role: str, db: str, **kwargs: Any
+        self, instance: Instance, role: str, db: str, *, socket: bool = False, **kwargs: Any
     ) -> psycopg.Connection[Any]:
+        """Connect as ``role`` over TCP, or through the instance's Unix socket."""
         passwords = {
             ADMIN_ROLE: self.credentials.admin_password,
             AGENT_ROLE: self.credentials.agent_password,
             GRADER_ROLE: self.credentials.grader_password,
         }
         return psycopg.connect(
-            host=self.config.host,
+            host=str(self.config.socket_dir(instance.name)) if socket else self.config.host,
             port=instance.port,
             user=role,
             password=passwords[role].get_secret_value(),
@@ -119,11 +123,14 @@ def pg_env(tmp_path_factory: pytest.TempPathFactory) -> Iterator[PgEnv]:
     if real_dbgen.is_dir():
         (root / "dbgen").symlink_to(real_dbgen)
     test_cpus = ",".join(str(cpu) for cpu in PYTHON_CPUS)  # Never the real instances' cores.
+    # A short directory of its own, so every socket path fits in a Unix socket address.
+    sockets = Path(tempfile.mkdtemp(prefix="goaly-pg-", dir="/tmp"))
     config = PgEnvConfig(
         data_root=root,
         build_port=25451,
         build_container="goaly-effisql-itest-env-build",
         build_cpuset=test_cpus,
+        socket_root=sockets,
     )
     credentials = PgCredentials(
         admin_password=SecretStr(secrets.token_urlsafe(16)),
@@ -141,6 +148,7 @@ def pg_env(tmp_path_factory: pytest.TempPathFactory) -> Iterator[PgEnv]:
     finally:
         for instance in instances:
             pg_containers.remove(instance.container, force=True)
+        shutil.rmtree(sockets, ignore_errors=True)
 
 
 @pytest.fixture

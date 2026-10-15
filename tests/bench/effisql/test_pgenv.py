@@ -27,10 +27,19 @@ def pgenv(monkeypatch: pytest.MonkeyPatch) -> ModuleType:
     return module
 
 
-def _status(name: str, *, accepting: bool = True, cpuset: str | None = None) -> InstanceStatus:
+def _status(
+    name: str, *, accepting: bool = True, socket: bool = True, cpuset: str | None = None
+) -> InstanceStatus:
     instance = next(i for i in INSTANCES if i.name == name)
     pinned = ",".join(str(cpu) for cpu in instance.cpus)
-    return InstanceStatus(instance, "running", pinned if cpuset is None else cpuset, accepting)
+    return InstanceStatus(
+        instance,
+        "running",
+        pinned if cpuset is None else cpuset,
+        accepting=accepting,
+        socket_dir=Path("/sockets") / name,
+        socket_accepting=socket,
+    )
 
 
 def test_status_passes_only_when_every_instance_is_up_and_pinned_right(
@@ -48,6 +57,17 @@ def test_status_passes_only_when_every_instance_is_up_and_pinned_right(
     down = [_status("solve-1", accepting=False)]
     monkeypatch.setattr(pgenv, "instance_status", lambda config: down)
     assert pgenv._status(PgEnvConfig(data_root=tmp_path), check=False) == 1
+
+
+def test_status_names_each_socket_and_fails_when_one_does_not_answer(
+    pgenv: ModuleType, monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    statuses = [_status("solve-1"), _status("grade-1", socket=False)]
+    monkeypatch.setattr(pgenv, "instance_status", lambda config: statuses)
+
+    assert pgenv._status(PgEnvConfig(data_root=tmp_path), check=False) == 1
+    assert pgenv.written[0].endswith("socket /sockets/solve-1")
+    assert pgenv.written[1].endswith("socket /sockets/grade-1 (NOT accepting connections there)")
 
 
 def test_stop_fails_when_a_server_did_not_shut_down_cleanly(

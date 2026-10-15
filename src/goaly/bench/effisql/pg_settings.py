@@ -67,6 +67,9 @@ class PgEnvConfig(BaseModel):
     # to the system and our Python processes (spec §6.2).
     build_cpuset: str | None = "2-11,14-23"
     build_container: str = "goaly-effisql-build"
+    # Where each instance's Unix-socket directory lives on the host; default data_root/sockets.
+    # A socket's path must fit in 107 bytes, which a deep temporary directory can exceed.
+    socket_root: Path | None = None
 
     @property
     def dbgen_dir(self) -> Path:
@@ -90,6 +93,15 @@ class PgEnvConfig(BaseModel):
     def snapshot_path(self, db: str) -> Path:
         """The schema snapshot of database ``db``, the hand-off to T08."""
         return self.data_root / "snapshots" / db / "schema_snapshot.json"
+
+    def socket_dir(self, instance: str) -> Path:
+        """The host directory that holds the Unix socket of the instance named ``instance``.
+
+        The server inside the container writes its socket there, so a sandbox with no network
+        connects through that directory, mounted read-only (spec §6.1, V28).
+        """
+        root = self.socket_root if self.socket_root is not None else self.data_root / "sockets"
+        return root / instance
 
     @property
     def plans_path(self) -> Path:
