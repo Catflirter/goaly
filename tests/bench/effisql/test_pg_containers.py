@@ -7,12 +7,16 @@ import pytest
 from goaly.bench.effisql.pg_containers import (
     CONTAINER_PREFIX,
     PGDATA,
+    SPEC_LABEL,
     ContainerError,
     ContainerSpec,
     Mount,
+    ensure,
+    inspect,
     logs,
     remove,
     run_args,
+    spec_digest,
     start,
     state,
     stop,
@@ -90,8 +94,22 @@ def test_environment_variables_are_passed_in_a_stable_order() -> None:
     assert _option(args, "--env") == ["A=1", "B=2"]
 
 
-def test_every_container_carries_the_goaly_label() -> None:
-    assert _option(run_args(_spec()), "--label") == ["goaly.component=effisql-postgres"]
+def test_every_container_carries_the_goaly_label_and_its_specs_digest() -> None:
+    labels = _option(run_args(_spec()), "--label")
+
+    assert labels == ["goaly.component=effisql-postgres", f"{SPEC_LABEL}={spec_digest(_spec())}"]
+
+
+def test_the_digest_changes_with_anything_that_changes_the_server() -> None:
+    digests = {
+        spec_digest(_spec()),
+        spec_digest(_spec(cpuset="6,7,18,19")),
+        spec_digest(_spec(port=55441)),
+        spec_digest(_spec(image="postgres@sha256:" + "1" * 64)),
+    }
+
+    assert len(digests) == 4
+    assert spec_digest(_spec()) == spec_digest(_spec())
 
 
 @pytest.mark.parametrize("name", ["postgres", "goaly-other", f"{CONTAINER_PREFIX}bad name"])
@@ -113,6 +131,7 @@ class FakeDocker:
         self.calls: list[list[str]] = []
         self.status = status
         self.exit_code = exit_code
+        self.digest = spec_digest(_spec())
 
     def __call__(self, args: list[str], **kwargs: object) -> subprocess.CompletedProcess[str]:
         assert args[0] == "/usr/bin/docker"
@@ -121,7 +140,12 @@ class FakeDocker:
         if call[:2] == ["container", "inspect"]:
             if self.status is None:
                 return subprocess.CompletedProcess(args, 1, "", "Error: No such container: x")
-            value = self.exit_code if "ExitCode" in call[3] else self.status
+            if "ExitCode" in call[3]:
+                value = self.exit_code
+            elif SPEC_LABEL in call[3]:
+                value = self.digest
+            else:
+                value = self.status
             return subprocess.CompletedProcess(args, 0, value + "\n", "")
         if call[0] == "logs":
             return subprocess.CompletedProcess(args, 0, "out line\n", "err line\n")
@@ -194,6 +218,36 @@ def test_a_missing_docker_binary_is_reported(monkeypatch: pytest.MonkeyPatch) ->
         state(NAME)
 
 
+def _verbs(docker: FakeDocker) -> list[str]:
+    return [call[0] for call in docker.calls if call[:2] != ["container", "inspect"]]
+
+
+def test_ensure_creates_a_missing_container(docker: FakeDocker) -> None:
+    docker.status = None
+
+    assert ensure(_spec()) == "created"
+    assert _verbs(docker) == ["run"]
+
+
+def test_ensure_leaves_a_matching_running_container_alone(docker: FakeDocker) -> None:
+    assert ensure(_spec()) == "running"
+    assert _verbs(docker) == []
+
+
+def test_ensure_restarts_a_matching_stopped_container_keeping_it(docker: FakeDocker) -> None:
+    docker.status = "exited"
+
+    assert ensure(_spec()) == "started"
+    assert _verbs(docker) == ["start"]
+
+
+def test_ensure_replaces_a_container_whose_spec_changed(docker: FakeDocker) -> None:
+    docker.digest = "stale"
+
+    assert ensure(_spec()) == "replaced"
+    assert _verbs(docker) == ["stop", "rm", "run"]
+
+
 @pytest.mark.parametrize(
     "call",
     [
@@ -201,8 +255,10 @@ def test_a_missing_docker_binary_is_reported(monkeypatch: pytest.MonkeyPatch) ->
         lambda name: stop(name, timeout_s=1),
         lambda name: remove(name, force=True),
         lambda name: logs(name),
+        lambda name: inspect(name, "{{.Id}}"),
+        lambda name: ensure(_spec(name=name)),
     ],
-    ids=["state", "stop", "remove", "logs"],
+    ids=["state", "stop", "remove", "logs", "inspect", "ensure"],
 )
 def test_no_command_touches_a_container_outside_our_namespace(
     docker: FakeDocker, call: object
@@ -211,3 +267,43 @@ def test_no_command_touches_a_container_outside_our_namespace(
         call("postgres")  # type: ignore[operator]  # A lambda from parametrize.
 
     assert docker.calls == []
+
+
+def test_ensure_leaves_a_restarting_container_to_docker(docker: FakeDocker) -> None:
+    docker.status = "restarting"  # Its restart policy is already bringing it back.
+
+    assert ensure(_spec()) == "running"
+    assert _verbs(docker) == []
+
+
+def test_ensure_unpauses_a_matching_paused_container(docker: FakeDocker) -> None:
+    docker.status = "paused"
+
+    assert ensure(_spec()) == "started"
+    assert _verbs(docker) == ["unpause"]
+
+
+def test_ensure_replaces_a_stopped_container_whose_spec_changed(docker: FakeDocker) -> None:
+    docker.status = "exited"
+    docker.digest = "stale"
+
+    assert ensure(_spec()) == "replaced"
+    assert [call for call in docker.calls if call[0] in ("rm", "stop")] == [["rm", "--force", NAME]]
+
+
+def test_ensure_refuses_to_replace_a_server_that_did_not_shut_down_cleanly(
+    docker: FakeDocker,
+) -> None:
+    docker.digest = "stale"
+    docker.exit_code = "137"
+
+    with pytest.raises(ContainerError, match="exited with code 137"):
+        ensure(_spec())
+    assert "rm" not in _verbs(docker)
+
+
+def test_the_spec_label_comes_before_the_image_whatever_the_server_options() -> None:
+    args = run_args(_spec())
+    image_at = args.index(IMAGE)
+
+    assert f"{SPEC_LABEL}={spec_digest(_spec())}" in args[:image_at]
