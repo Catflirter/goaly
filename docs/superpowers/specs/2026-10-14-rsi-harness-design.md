@@ -388,7 +388,7 @@ A call to a model its purpose does not allow raises an error. In isolated runs, 
   - Known issue: argument JSON can be truncated or malformed. We repair it where possible and otherwise send the error back to the model.
 - GLM (used only by RSI):
   - Thinking is always on. The gateway rejects the `thinking` parameter.
-  - `reasoning_content` is sent back unchanged in the message history.
+  - `reasoning_content` is sent back unchanged in the message history. Every GLM chat replays its reasoning unchanged: the analyst's, the implementer's and the lesson writer's (§8). The executor's replay rule below does not apply to them.
   - The RSI implementer runs on mini-swe-agent, which is synchronous, in worker threads (§8.8). Its model adapter schedules each call on the lane process's event loop with `asyncio.run_coroutine_threadsafe`. Implementer calls therefore get the same GLM profile, retries, concurrency limits and call records as every other call.
 
 **Tool executor**
@@ -403,10 +403,16 @@ A call to a model its purpose does not allow raises an error. In isolated runs, 
 - After 3 consecutive errors the loop reminds the model of the tool schemas. After 5 it stops.
 - Calling the same tool with the same arguments 3 times in a row triggers a hint.
 - Context management: Qwen gets a 128K context budget. Past 96K, older tool outputs are folded into summaries. The system prompt, the task and the last 8 turns stay as they are.
+- **Replay rule.** When the executor's chat is rebuilt for the next request:
+  - XML tool-call markup is stripped from the replayed content and reasoning, whether or not a call was executed from it;
+  - `reasoning_content` is replayed only within the last keep_turns = 8 steps. Earlier steps keep their content and drop their reasoning;
+  - keep_turns is recorded with the trajectory, where the rebuild reads it.
+
+  GLM chats replay their reasoning unchanged (model-specific handling, above).
 - When a budget runs out, the policy's fallback submits a result.
 - No exception can take down a batch.
 
-**Trajectories** use the `Trajectory` and `Step` contracts (§3.3) and are written as JSONL. Each step records messages, tool calls and their results, token usage and latency. The trajectory ends with the final prediction and its grade.
+**Trajectories** use the `Trajectory` and `Step` contracts (§3.3) and are written as JSONL. Each step records messages, tool calls and their results, token usage and latency. The trajectory ends with the final prediction. In the one-process mode it also carries the grade. In two-phase runs it carries none: readers take grades from `results.jsonl` (§6.1).
 
 ### 5.2 Capability packs (the only part RSI can edit)
 
@@ -461,15 +467,15 @@ The first option costs more tokens, although the gateway's prefix cache absorbs 
 
 - Built on asyncio, with separate resource pools for: LLM concurrency, the solving and grading database instances, and, for SWE (on hold), solving CPU slots and evaluation workers (at most 4).
 - An exception in one task never affects the others. Each task's result is written to disk as soon as it's done, so an interrupted run can resume.
-- Evaluations are cached by (harness content hash, task, seed).
+- Evaluations are cached by (harness content hash, task, seed). Cache entries carry the grade.
 
 **Isolated evaluation.** The project lead decided on 2026-10-15 to isolate candidate code. The static allowlist (§8.5) kept leaking, and pack code shared a process with the API key, the LLM client and the grader. One bypass could therefore steal the key, patch the grader in memory, or call GLM. The isolation closes this structurally, and the allowlist stays as a second layer.
 
 1. **Two phases, two processes.** `goaly run` has a solve phase and a grade phase (`--phase solve|grade|all`, §6.4).
    - The solve phase runs the pack's policy. It writes predictions, the official records, trajectories, ungraded `TaskResult`s and `llm_calls.jsonl` to the run directory.
-   - The grade phase runs on the host, as a separate process. It reads the run directory and grades with the grader role, and it never imports pack code: only `bench` and `core` are loaded. It then writes the grades into the `TaskResult`s.
+   - The grade phase runs on the host, as a separate process. It reads the run directory and grades with the grader role, and it never imports pack code: only `bench` and `core` are loaded. It then appends a graded copy of each `TaskResult` to `results.jsonl`, where the last line for a task wins. A two-phase trajectory carries no grade, so readers take grades from `results.jsonl`.
    - Every real Effi-SQL run takes the two-phase path, so v0 and candidates are measured the same way. That covers the T12 baseline, every RSI evaluation (smoke, screening, validation and confirmation) and the final runs. The one-process mode stays for unit tests and the toy benchmark only.
-2. **The solve phase runs in the sandbox container,** with `--network=host`. It is built by the same builder as the implementer's sandbox (§8.8), which lives in `goaly.bench` so that `goaly run` can use it without loading `goaly.rsi` (§3.1).
+2. **The solve phase runs in the sandbox container,** with `--network=host`. It is built by the same builder as the implementer's sandbox (§8.8). The project lead decided that this builder lives in `goaly.bench`, so `goaly run` can use it without loading `goaly.rsi` (§3.1), and that T18 owns it.
    - Mounts: the candidate's worktree and the gold-free runtime data file, both read-only, and the run directory, writable.
    - Environment: a per-run dummy token; `GOALY_BASE_URL`, pointing at the local proxy (below); and the agent role's PostgreSQL password. That role is `SELECT`-only on `tpch` and cannot connect to the alternate database.
    - Never present: `~/.config`, the real API key, grader credentials and gold.
@@ -478,14 +484,14 @@ The first option costs more tokens, although the gateway's prefix cache absorbs 
    - It forwards each request to the gateway with the real key, and passes the response back unchanged, `x-litellm-response-cost` included.
    - It allows only the executor model, `qwen3.6-35b-a3b`. Any other model gets a 403, which is logged.
    - Inside the container, the client is core's LLM client (T03), configured with the proxy's URL and the dummy token, so throttling and call records work as before.
-   - Files written in the container are untrusted, so the decision rules take their cost and token numbers from the proxy, which sees every call.
+   - Files written in the container are untrusted. The decision rules therefore take their cost and token numbers from the proxy's records, which cover every call; the project lead has decided this.
 4. **What this closes.** Pack code can no longer see the key, reach GLM, or touch the grader or the grading data. A bypass inside the container reaches only three things:
    - the read-only agent role;
    - Qwen, through the proxy;
    - the run directory, from which the grader reads only predictions, never code.
 5. **The guards are unchanged.** Paths, checksums, the hard-coding scan, the AST allowlist and the unit-test guard still run first (§8.2 step 3).
 
-The organizers' entry point (§6.4) needs only the solve phase. Whether it also requires the container, and so Docker on their machine, is an open question for the project lead.
+The organizers' entry point (§6.4) needs only the solve phase, and it runs that phase in the same container. Reproducing our results therefore needs Docker, by the project lead's decision, and there is no non-Docker fallback for official runs (§11).
 
 **Seeds and reproducibility.** In this document a *seed* means one independent replicate run, not a sampler seed.
 
@@ -636,15 +642,16 @@ Each PostgreSQL instance is pinned with cpuset to both SMT siblings of its physi
   - `--phase solve` runs the isolated solve phase and leaves ungraded results.
   - `--phase grade` grades a run directory on the host.
   - `--phase all`, the default, runs both in turn (§6.1).
+  - `--out` names a run directory, never a single file. Grades go to `results.jsonl` in it, where the grade phase appends a graded copy of each result and the last line wins (§6.1).
 - `--instances <official-format jsonl>` runs any task file. The organizers use this for their held-out set, and the README documents it as the official entry point. They need only the solve phase:
 
   ```
-  goaly run --bench effisql --instances heldout.jsonl --harness final --phase solve --out predictions.jsonl
+  goaly run --bench effisql --instances heldout.jsonl --harness final --phase solve --out runs/heldout
   ```
 
-  The output is the official prediction file: each input record plus its `prediction` field, which holds both the diff and the SQL (§3.3).
+  The official predictions land in the run directory as `official/seed-<k>.jsonl`, one file per seed. Each is the official prediction file: every input record plus its `prediction` field, which holds both the diff and the SQL (§3.3).
 
-  This needs only the executor API and the matching environment: a PostgreSQL database for Effi-SQL, Docker for SWE (on hold). Whether the organizers' solve phase also needs the container, and so Docker, is open (§6.1).
+  This needs the executor API, a PostgreSQL database for Effi-SQL, and Docker. The solve phase always runs in its container (§6.1), so there is no non-Docker fallback for official runs (§11). SWE (on hold) would need Docker for its task containers too.
 
 ## 7. Data splits
 
@@ -874,7 +881,7 @@ The implementer is mini-swe-agent's `DefaultAgent` (`mini-swe-agent==2.4.6`, MIT
 
 **Trajectory.** mini-swe-agent saves it after every step, in its own format, to `runs/rsi/<lane>/<experiment_id>/implementer.traj.json`. The experiment record links to it (§8.6).
 
-**The analyst and the lesson writer** stay single structured GLM calls through core's client (§8.2). They are not agents: their input is already summarized, and their output is JSON that pydantic validates.
+**The analyst and the lesson writer** stay single structured GLM calls through core's client (§8.2). They are not agents: their input is already summarized, and their output is JSON that pydantic validates. When one of their chats is replayed, for example to retry invalid output, its reasoning goes back unchanged, as in every GLM chat (§5.1).
 
 **Why mini-swe-agent.** The implementer needs a bash coding agent, not the executor's loop. mini-swe-agent provides one that is small, MIT-licensed, widely used on SWE-bench, and runs in a Docker sandbox. Keeping it apart from core also means that changes to the executor's loop cannot break RSI, and the implementer no longer waits for T04 or T05.
 
@@ -903,7 +910,7 @@ The implementer is mini-swe-agent's `DefaultAgent` (`mini-swe-agent==2.4.6`, MIT
   - a plot of score by round;
   - lessons, each citing experiment IDs.
 - **Reproduction:** `make final` does the following in order:
-  1. prepares environments (the TPC-H database and its PostgreSQL instances; SWE images only if that lane resumes);
+  1. prepares environments: the TPC-H database and its PostgreSQL instances, and the sandbox image for the solve phase (§6.1). SWE images are built only if that lane resumes;
   2. runs final;
   3. grades the results;
   4. generates the report.
@@ -919,6 +926,12 @@ The implementer is mini-swe-agent's `DefaultAgent` (`mini-swe-agent==2.4.6`, MIT
 - Python 3.12 + uv, ruff, mypy --strict, import-linter, pre-commit and GitHub Actions.
 - Protobuf for the shared data contracts (§3.3): `grpcio-tools` and `mypy-protobuf`, regenerated with `make proto`. CI fails if the generated code is out of date.
 - pytest, written test-first. Unit tests never touch the network. Tests that need Docker, a database or the real API are marked `integration` and are skipped in CI.
+
+**Requirements for running goaly**
+
+- Docker is required, the organizers' reproduction included. Every real run's solve phase runs in the sandbox container (§6.1), and there is no non-Docker fallback for official runs; the project lead decided this. The README lists Docker among its prerequisites.
+- On this machine Docker works only with `--network=host` (§1.3), which the container also needs to reach the proxy and PostgreSQL on localhost.
+- Also required: uv with Python 3.12, PostgreSQL 16 with TPC-H SF3 (which `make final` prepares), and the executor API's key.
 
 **Config and logging**
 

@@ -10,6 +10,9 @@ SWE-fficiency and BIRD-CRITIC tasks. The design is in
 - [uv](https://docs.astral.sh/uv/). It installs Python 3.12 (pinned in `.python-version`) and
   every dependency at the version locked in `uv.lock`.
 - GNU make.
+- Docker. Every real run's solve phase runs in a sandbox container, the organizers' official
+  runs included, and there is no non-Docker fallback (design spec §6.1 and §11). Inside a
+  nested container, Docker may work only with `--network=host`.
 
 ## Configuration
 
