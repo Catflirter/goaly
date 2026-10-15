@@ -25,6 +25,7 @@ from goaly.contracts.gen.task_pb2 import EffiSqlPrediction, Prediction
 from goaly.contracts.gen.trajectory_pb2 import (
     ChatMessage,
     ChatRole,
+    ContextFold,
     Step,
     StopReason,
     ToolCall,
@@ -36,6 +37,7 @@ from goaly.contracts.interfaces import Environment, SqlEnvironment
 from goaly.contracts.jsonl import append_jsonl, read_jsonl
 from goaly.harness.core.agent import AgentContext, AgentHooks, run_agent
 from goaly.harness.core.budgets import CALLS_PER_REPLY, Budgets, BudgetUse
+from goaly.harness.core.context_window import ContextWindow
 from goaly.harness.core.llm import BoundLlm, CallTags, LlmClient, LlmReply
 from goaly.harness.core.llm_errors import ContextOverflow, ServerError
 from goaly.harness.core.llm_models import EXECUTOR_MODEL, ModelParams
@@ -137,6 +139,28 @@ class PairTool:
         return ToolResult(content="Both ran.")
 
 
+def big(n: int) -> str:
+    """A 4,000-character output, a different one for each ``n``."""
+    return f"{n}".ljust(4000, "x")
+
+
+class PageArgs(BaseModel):
+    """PageTool's arguments."""
+
+    n: int
+
+
+class PageTool:
+    """A short call with a long output, as reading a big plan is: page ``n`` is big(n)."""
+
+    name = "page"
+    description = "Read page n."
+    args_model = PageArgs
+
+    async def run(self, args: PageArgs, env: Environment) -> ToolResult:
+        return ToolResult(content=big(args.n))
+
+
 def environment() -> FakeSqlEnvironment:
     return FakeSqlEnvironment(
         {
@@ -151,11 +175,17 @@ def environment() -> FakeSqlEnvironment:
 
 def registry() -> ToolRegistry[SqlEnvironment]:
     return ToolRegistry[SqlEnvironment](
-        [bind(ExecuteSql()), bind(SubmitTool()), bind(FragileTool()), bind(PairTool())]
+        [
+            bind(ExecuteSql()),
+            bind(SubmitTool()),
+            bind(FragileTool()),
+            bind(PairTool()),
+            bind(PageTool()),
+        ]
     )
 
 
-TOOL_NAMES = "execute_sql, submit, fragile, pair"
+TOOL_NAMES = "execute_sql, submit, fragile, pair, page"
 SCHEMAS = registry().json_schemas()
 
 
@@ -179,9 +209,9 @@ def hooks(
     )
 
 
-def context(llm: BoundLlm, **budgets: Any) -> AgentContext:
+def context(llm: BoundLlm, *, window: ContextWindow | None = None, **budgets: Any) -> AgentContext:
     limits = Budgets.model_validate({"steps": 30, "wall_clock_s": 600.0} | budgets)
-    return AgentContext(llm, budgets=limits, params=PARAMS)
+    return AgentContext(llm, budgets=limits, params=PARAMS, window=window)
 
 
 def execute_sql(sql: str) -> ToolCall:
@@ -287,10 +317,10 @@ async def test_every_prompt_can_be_rebuilt_from_the_trajectory() -> None:
         qwen_reply("standard_call"),
         reply(content="The query is already fast."),
         qwen_reply("xml_in_content"),
-        qwen_reply("call_in_reasoning"),
+        qwen_reply("call_in_reasoning"),  # Its call repeats the content's: the first failure.
         qwen_reply("truncated_standard_call"),
-        reply(tool_call("explain_query", {"sql": QWEN_BASE_SQL})),
-        reply(content="Done."),  # The third failed reply in a row: a nudge and the reminder.
+        reply(tool_call("explain_query", {"sql": QWEN_BASE_SQL})),  # The third: the reminder.
+        reply(content="Done."),  # A nudge.
         reply(submit()),
     ]
     llm = FakeLLM(script)
@@ -308,7 +338,7 @@ async def test_every_prompt_can_be_rebuilt_from_the_trajectory() -> None:
     trajectory = ctx.trajectory()
     assert trajectory.stop_reason == SUBMITTED
     assert len(trajectory.steps) == len(script)
-    assert trajectory.steps[6].injected[1].content.startswith("You have made 3 errors in a row.")
+    assert trajectory.steps[5].injected[0].content.startswith("You have made 3 errors in a row.")
     assert reference_prompts(trajectory) == sent(llm)
 
 
@@ -374,12 +404,47 @@ async def test_replies_go_out_without_call_markup_and_older_ones_without_reasoni
     assert trajectory.steps[3].assistant.content == f"Also {WRAPPED_CALL}"  # Kept as it came.
 
 
-async def test_the_loop_sends_the_prompts_the_contracts_reference_rebuilds() -> None:
+@pytest.mark.parametrize("keep_turns", [0, 2, 8])
+async def test_the_loop_sends_the_prompts_the_contracts_reference_rebuilds(keep_turns: int) -> None:
     llm = FakeLLM(markup_script())
+    ctx = context(llm, window=ContextWindow(keep_turns=keep_turns))
+
+    await run_agent(environment(), ctx, hooks())
+
+    trajectory = ctx.trajectory()
+    assert [chat.keep_turns for chat in trajectory.chats] == [keep_turns]
+    assert reference_prompts(trajectory) == sent(llm)
+
+
+async def test_a_window_of_0_replays_the_chat_unchanged() -> None:
+    llm = FakeLLM(markup_script())
+    ctx = context(llm, window=ContextWindow(keep_turns=0))
+
+    await run_agent(environment(), ctx, hooks())
+
+    as_written = [
+        (s.assistant.content, s.assistant.reasoning_content) for s in ctx.trajectory().steps
+    ]
+    assert replies_sent(llm, 10) == as_written[:10]  # Markup and reasoning, all as they came.
+
+
+async def test_no_call_markup_reaches_the_model_whatever_the_reply() -> None:
+    drafted_submit = tool_call_block("submit", QWEN_BASE_SQL)
+    script = [
+        # A standard call, whose reasoning drafted a submit that never ran.
+        reply(execute_sql(FAST), reasoning=f"Or submit it now?\n{drafted_submit}"),
+        # No call at all: its <tool_call> was never closed.
+        reply(
+            content=f"Done.\n<tool_call>\n{function_block('submit', FAST)}", finish_reason="stop"
+        ),
+        reply(submit()),
+    ]
+    llm = FakeLLM(script)
     ctx = context(llm)
 
     await run_agent(environment(), ctx, hooks())
 
+    assert replies_sent(llm, 2) == [("", "Or submit it now?\n"), ("Done.\n", "")]
     assert reference_prompts(ctx.trajectory()) == sent(llm)
 
 
@@ -1175,3 +1240,253 @@ async def test_the_wall_clock_cancels_a_real_call_and_its_record_says_so() -> No
     assert ctx.trajectory().stop_reason == TIME
     [record] = recorder.records
     assert record.status == LlmCallStatus.LLM_CALL_STATUS_CANCELLED
+
+
+# Context folding (spec §5.1): older tool outputs fold, and older reasoning stays behind.
+
+FOLD_MARKER = "\n[... folded: the first 500 of 4000 characters ...]"
+
+
+def folded(n: int) -> str:
+    return big(n)[:500] + FOLD_MARKER
+
+
+def page(n: int) -> ToolCall:
+    return tool_call("page", {"n": n})
+
+
+def counted(input_tokens: int) -> Usage:
+    """The usage of a call whose prompt the gateway counted as ``input_tokens``."""
+    return Usage(input_tokens=input_tokens, output_tokens=10)
+
+
+async def test_a_long_chat_folds_its_oldest_tool_outputs() -> None:
+    calls = [page(n) for n in range(4)]
+    script = [
+        reply(call, usage=counted(n))
+        for call, n in zip(calls, (500, 1500, 2500, 3500), strict=True)
+    ]
+    llm = FakeLLM([*script, reply(submit())])
+    ctx = context(llm, window=ContextWindow(fold_above_tokens=3000, keep_turns=2))
+
+    prediction = await run_agent(environment(), ctx, hooks())
+
+    assert prediction == SUBMISSION
+    trajectory = ctx.trajectory()
+    assert [list(step.folds) for step in trajectory.steps] == [
+        [],
+        [],
+        [],
+        [ContextFold(step=0, tool_call_id=calls[0].id, replacement=folded(0))],
+        [ContextFold(step=1, tool_call_id=calls[1].id, replacement=folded(1))],
+    ]
+    # Each step records the estimate the threshold compared, before any fold: past 3,000, the
+    # fourth call folded one output, the fifth another, and went though still past it.
+    estimates = [step.estimated_prompt_tokens for step in trajectory.steps]
+    assert 0 < estimates[0] < estimates[1] < estimates[2] < 3000 < estimates[3] < estimates[4]
+    assert [step.tool_results[0].content for step in trajectory.steps[:4]] == [
+        big(n) for n in range(4)
+    ]
+    assert [m.content for m in sent(llm)[4] if m.role == TOOL] == [
+        folded(0),
+        folded(1),
+        big(2),
+        big(3),
+    ]
+    assert reference_prompts(trajectory) == sent(llm)
+
+
+async def test_the_last_eight_turns_never_fold() -> None:
+    calls = [page(n) for n in range(10)]
+    script = [reply(call, usage=counted(10_000 * (n + 1))) for n, call in enumerate(calls)]
+    llm = FakeLLM([*script, reply(submit())])
+    ctx = context(llm, window=ContextWindow(fold_above_tokens=1000))  # The default 8-turn tail.
+
+    await run_agent(environment(), ctx, hooks())
+
+    last = [m.content for m in sent(llm)[10] if m.role == TOOL]
+    assert last == [folded(0), folded(1), *(big(n) for n in range(2, 10))]
+    assert reference_prompts(ctx.trajectory()) == sent(llm)
+
+
+async def test_each_prompt_keeps_the_reasoning_of_the_chats_last_turns_before_it() -> None:
+    script = [reply(execute_sql(f"SELECT {n}"), reasoning=f"Thought {n}.") for n in range(4)]
+    llm = FakeLLM([*script, reply(submit())])
+    ctx = context(llm, window=ContextWindow(keep_turns=2))
+
+    await run_agent(environment(), ctx, hooks())
+
+    kept = [[m.reasoning_content for m in prompt if m.role == ASSISTANT] for prompt in sent(llm)]
+    assert kept == [
+        [],
+        ["Thought 0."],
+        ["Thought 0.", "Thought 1."],
+        ["", "Thought 1.", "Thought 2."],
+        ["", "", "Thought 2.", "Thought 3."],
+    ]
+    assert reference_prompts(ctx.trajectory()) == sent(llm)
+
+
+async def test_only_the_last_turns_go_out_with_their_reasoning() -> None:
+    script = [reply(execute_sql(FAST), reasoning=f"Thought {n}.") for n in range(3)]
+    llm = FakeLLM([*script, reply(submit())])
+    ctx = context(llm, window=ContextWindow(keep_turns=2))
+
+    await run_agent(environment(), ctx, hooks())
+
+    replies = [m for m in sent(llm)[3] if m.role == ASSISTANT]
+    assert [m.reasoning_content for m in replies] == ["", "Thought 1.", "Thought 2."]
+    trajectory = ctx.trajectory()
+    assert trajectory.steps[0].assistant.reasoning_content == "Thought 0."  # Kept here.
+    assert reference_prompts(trajectory) == sent(llm)
+
+
+async def test_a_prompt_too_long_for_the_model_folds_and_goes_once_more() -> None:
+    overflow = ContextOverflow("qwen3.6-35b-a3b: HTTP 400: maximum context length is 131072")
+    calls = [page(n) for n in range(3)]
+    llm = FakeLLM([*(reply(call) for call in calls), overflow, reply(submit())])
+    ctx = context(llm, window=ContextWindow(keep_turns=1))  # The estimate never passes 96K.
+
+    prediction = await run_agent(environment(), ctx, hooks())
+
+    assert prediction == SUBMISSION
+    trajectory = ctx.trajectory()
+    assert trajectory.stop_reason == SUBMITTED
+    assert len(trajectory.steps) == 4  # The call that overflowed has no step.
+    assert [(fold.step, fold.tool_call_id) for fold in trajectory.steps[3].folds] == [
+        (0, calls[0].id),
+        (1, calls[1].id),
+    ]
+    # The estimate before the folds: 1,000 counted, and the last turn's 4,012 characters.
+    assert trajectory.steps[3].estimated_prompt_tokens == 2003
+    overflowed, retried = sent(llm)[3], sent(llm)[4]
+    assert [m.content for m in overflowed if m.role == TOOL] == [big(0), big(1), big(2)]
+    assert [m.content for m in retried if m.role == TOOL] == [folded(0), folded(1), big(2)]
+    assert reference_prompts(trajectory) == [*sent(llm)[:3], retried]
+
+
+async def test_a_prompt_too_long_after_its_fold_ends_in_the_fallback() -> None:
+    first = ContextOverflow("too long")
+    second = ContextOverflow("still too long")
+    llm = FakeLLM([reply(page(0)), reply(page(1)), first, second])
+    ctx = context(llm, window=ContextWindow(keep_turns=1))
+
+    prediction = await run_agent(environment(), ctx, hooks())
+
+    assert prediction.fallback
+    assert len(llm.requests) == 4
+    trajectory = ctx.trajectory()
+    assert trajectory.stop_reason == TOKENS
+    assert trajectory.error_message == "ContextOverflow: still too long"
+
+
+async def test_a_prompt_too_long_with_nothing_to_fold_is_not_sent_again() -> None:
+    llm = FakeLLM([reply(page(0)), ContextOverflow("too long")])
+    ctx = context(llm, window=ContextWindow(keep_turns=1))  # The one turn is the tail.
+
+    prediction = await run_agent(environment(), ctx, hooks())
+
+    assert prediction.fallback
+    assert len(llm.requests) == 2
+    assert ctx.trajectory().error_message == "ContextOverflow: too long"
+
+
+# Repeated calls (spec §5.1): the same call again counts as an error, and says so.
+
+REPEATED = (
+    "Note: this call repeats your previous one, the same tool with the same arguments, so its "
+    "result is unchanged, apart from timing. Repeating a call does not help: change the "
+    "arguments or try another approach."
+)
+
+
+async def test_a_call_that_repeats_the_one_before_runs_with_a_note_and_counts_as_an_error() -> None:
+    env = environment()
+    llm = FakeLLM([*(reply(execute_sql(FAST)) for _ in range(4)), reply(submit())])
+    ctx = context(llm)
+
+    prediction = await run_agent(env, ctx, hooks())
+
+    assert prediction == SUBMISSION
+    assert [sql for sql, _ in env.executed] == [FAST] * 4  # Each repeat still ran.
+    steps = ctx.trajectory().steps
+    assert steps[0].tool_results[0].content == "rows: 1"
+    for step in steps[1:4]:
+        assert step.tool_results[0].content == f"rows: 1\n\n{REPEATED}"
+        assert not step.tool_results[0].is_error
+    # The three repeats are three failed replies in a row: the reminder came after them.
+    assert injected(ctx.trajectory())[:3] == [[], [], []]
+    assert steps[3].injected[0].content.startswith("You have made 3 errors in a row.")
+
+
+async def test_a_drafted_submission_is_not_the_call_a_real_one_repeats() -> None:
+    drafted = reply(reasoning=f"Submit it.\n{tool_call_block('submit', FAST)}")
+    ctx = context(FakeLLM([drafted, reply(submit(FAST))]))
+
+    prediction = await run_agent(environment(), ctx, hooks())
+
+    assert prediction == SUBMISSION
+    assert ctx.trajectory().steps[1].tool_results[0].content == "Submitted."  # No repeat note.
+
+
+async def test_a_repaired_call_and_the_same_call_written_well_repeat() -> None:
+    truncated = tool_call("execute_sql", '{"sql": "' + FAST + '"')  # Repaired to {"sql": FAST}.
+    ctx = context(FakeLLM([reply(truncated), reply(execute_sql(FAST)), reply(submit())]))
+
+    await run_agent(environment(), ctx, hooks())
+
+    assert ctx.trajectory().steps[1].tool_results[0].content.endswith(REPEATED)
+
+
+async def test_arguments_that_differ_only_in_layout_repeat() -> None:
+    one = tool_call("execute_sql", f'{{"sql": "{FAST}",  "limit": 20}}')
+    other = tool_call("execute_sql", f'{{"limit":20,"sql":"{FAST}"}}')
+    ctx = context(FakeLLM([reply(one), reply(other), reply(submit())]))
+
+    await run_agent(environment(), ctx, hooks())
+
+    assert ctx.trajectory().steps[1].tool_results[0].content.endswith(REPEATED)
+
+
+async def test_a_repeat_in_the_same_reply_counts() -> None:
+    ctx = context(FakeLLM([reply(execute_sql(FAST), execute_sql(FAST)), reply(submit())]))
+
+    await run_agent(environment(), ctx, hooks())
+
+    results = ctx.trajectory().steps[0].tool_results
+    assert [result.content.endswith(REPEATED) for result in results] == [False, True]
+
+
+async def test_only_the_immediately_preceding_call_that_ran_counts() -> None:
+    cut = reply(execute_sql(EXPLAIN), finish_reason="length")  # It does not run.
+    script = [
+        reply(execute_sql(FAST)),
+        reply(execute_sql(EXPLAIN)),
+        reply(execute_sql(FAST)),  # Not right after the other FAST.
+        cut,
+        reply(execute_sql(EXPLAIN)),  # The cut-off call came between, but never ran.
+        reply(submit()),
+    ]
+    ctx = context(FakeLLM(script))
+
+    await run_agent(environment(), ctx, hooks())
+
+    contents = [step.tool_results[0].content for step in ctx.trajectory().steps]
+    assert [content.endswith(REPEATED) for content in contents] == [False] * 6
+
+
+async def test_the_pack_sees_the_note_and_its_guidance_follows_it() -> None:
+    seen: list[str] = []
+
+    def guide(call: ToolCall, result: ToolResult) -> str:
+        seen.append(result.content)
+        return "Hint: try a join."
+
+    ctx = context(FakeLLM([reply(execute_sql(FAST)), reply(execute_sql(FAST)), reply(submit())]))
+
+    await run_agent(environment(), ctx, hooks(on_tool_result=guide))
+
+    assert seen[1] == f"rows: 1\n\n{REPEATED}"
+    assert ctx.trajectory().steps[1].tool_results[0].content == (
+        f"rows: 1\n\n{REPEATED}\n\nHint: try a join."
+    )
