@@ -6,7 +6,7 @@ import hashlib
 import json
 import logging
 import threading
-from pathlib import Path
+from pathlib import Path, PurePath
 
 import pytest
 
@@ -27,6 +27,8 @@ from goaly.harness.core.eval_cache import CachedEvaluation, CacheKey, EvalCache,
 pytestmark = pytest.mark.anyio
 
 TASK = TaskInput(effisql=EffiSqlTaskInput(db="tpch", base_sql="SELECT 1"))
+OTHER_TASK = TaskInput(effisql=EffiSqlTaskInput(base_sql="SELECT 3"))
+NAMESPACE = "dev-0a1b2c3d"
 KEY = CacheKey(
     harness_hash="0123abcd" * 8,
     benchmark="effisql",
@@ -36,7 +38,9 @@ KEY = CacheKey(
 )
 
 
-def evaluation(key: CacheKey = KEY, *, sql: str = "SELECT 2") -> CachedEvaluation:
+def evaluation(
+    key: CacheKey = KEY, *, sql: str = "SELECT 2", task: TaskInput = TASK
+) -> CachedEvaluation:
     grade = Grade(instance_id=key.instance_id, score=0.75, correct=True, status=GRADE_STATUS_GRADED)
     usage = Usage(input_tokens=1200, output_tokens=300, cost_usd=0.002)
     result = TaskResult(
@@ -54,7 +58,7 @@ def evaluation(key: CacheKey = KEY, *, sql: str = "SELECT 2") -> CachedEvaluatio
         run_id="run-a",
         instance_id=key.instance_id,
         seed=key.seed,
-        task=TASK,
+        task=task,
         steps=[Step(index=0, usage=usage), Step(index=1)],
         prediction=Prediction(instance_id=key.instance_id, effisql=EffiSqlPrediction(sql=sql)),
         grade=grade,
@@ -72,7 +76,7 @@ def root(tmp_path: Path) -> Path:
 
 @pytest.fixture
 def cache(root: Path) -> EvalCache:
-    return EvalCache(root)
+    return EvalCache(root, NAMESPACE)
 
 
 def every_file(root: Path) -> list[Path]:
@@ -133,19 +137,35 @@ async def test_put_copies_the_evaluation_before_it_waits(
         {"benchmark": "swefficiency"},
         {"instance_id": "18"},
         {"seed": 2},
-        {"task_digest": task_digest(TaskInput(effisql=EffiSqlTaskInput(base_sql="SELECT 3")))},
+        {"task_digest": task_digest(OTHER_TASK)},
     ],
 )
 async def test_every_part_of_the_key_tells_entries_apart(
     cache: EvalCache, change: dict[str, str | int]
 ) -> None:
     other = dataclasses.replace(KEY, **change)  # type: ignore[arg-type]  # Fields vary by case.
+    task = OTHER_TASK if "task_digest" in change else TASK
     await cache.put(KEY, evaluation())
 
     assert await cache.get(other) is None
-    await cache.put(other, evaluation(other, sql="SELECT 3"))
+    await cache.put(other, evaluation(other, sql="SELECT 3", task=task))
     assert await cache.get(KEY) == evaluation()
-    assert await cache.get(other) == evaluation(other, sql="SELECT 3")
+    assert await cache.get(other) == evaluation(other, sql="SELECT 3", task=task)
+
+
+async def test_caches_of_two_namespaces_share_no_entry(root: Path) -> None:
+    dev, official = EvalCache(root, "dev-0a1b2c3d"), EvalCache(root, "official-0a1b2c3d")
+    await dev.put(KEY, evaluation())
+
+    # An official-mode run never gets a dev-mode grade, nor one from other grading code.
+    assert await official.get(KEY) is None
+    assert dev.path(KEY).parent.parent == root / "dev-0a1b2c3d"
+
+
+@pytest.mark.parametrize("namespace", ["", "..", "dev/0a1b", "dev 0a1b", "dev.0a1b"])
+def test_refuses_a_namespace_that_is_not_a_plain_name(root: Path, namespace: str) -> None:
+    with pytest.raises(ValueError, match="namespace must be a plain name"):
+        EvalCache(root, namespace)
 
 
 async def test_a_later_put_replaces_the_entry(cache: EvalCache, root: Path) -> None:
@@ -180,7 +200,7 @@ async def test_an_entry_is_one_json_file_under_its_harness_hash(
     await cache.put(KEY, stored)
 
     path = cache.path(KEY)
-    assert path.parent == root / KEY.harness_hash
+    assert path.parent == root / NAMESPACE / KEY.harness_hash
     assert path.suffix == ".json"
     text = path.read_text(encoding="utf-8")
     assert text.endswith("\n")
@@ -250,6 +270,10 @@ def corrupt_entries() -> dict[str, bytes]:
         "result of the wrong type": changed(result={"seed": "not a number"}),
         "result of another seed": changed(result=other_result),
         "trajectory of another task": changed(trajectory={"instance_id": "18", "seed": 1}),
+        "trajectory of another input": changed(
+            trajectory=json.loads(to_json_line(evaluation(task=OTHER_TASK).trajectory))
+        ),
+        "nested too deeply": b"[" * 100_000 + b"]" * 100_000,
     }
 
 
@@ -318,6 +342,37 @@ async def test_refuses_an_evaluation_of_another_task_or_seed(
     with pytest.raises(ValueError, match="does not match"):
         await cache.put(KEY, stored)
     assert every_file(root) == []
+
+
+async def test_refuses_an_evaluation_of_another_input(cache: EvalCache, root: Path) -> None:
+    with pytest.raises(ValueError, match="another digest than the key's"):
+        await cache.put(KEY, evaluation(task=OTHER_TASK))
+
+    assert every_file(root) == []
+
+
+# Atomic entries.
+
+
+async def test_an_entry_is_written_by_a_rename_in_its_own_directory(
+    cache: EvalCache, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    # Only a rename within one directory, so one file system, replaces a file atomically.
+    renames: list[tuple[Path, Path]] = []
+    replace = Path.replace
+
+    def recording_replace(source: Path, target: str | PurePath) -> Path:
+        renames.append((source, Path(target)))
+        return replace(source, target)
+
+    monkeypatch.setattr(Path, "replace", recording_replace)
+
+    await cache.put(KEY, evaluation())
+
+    ((source, target),) = renames
+    assert target == cache.path(KEY)
+    assert source.parent == target.parent
+    assert source != target
 
 
 # Task digests.
