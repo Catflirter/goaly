@@ -6,7 +6,7 @@ package goaly.v1;
 
 // A data split (spec §7).
 enum Split {
-  // Not one of our splits: a task file from elsewhere, such as the organizers' --instances file.
+  // Not set.
   SPLIT_UNSPECIFIED = 0;
   // The analyst may see its trajectories, grader feedback and gold answers.
   SPLIT_TRAIN = 1;
@@ -14,6 +14,8 @@ enum Split {
   SPLIT_VAL = 2;
   // Used only by the final evaluation and by v0's baseline runs.
   SPLIT_HELDOUT = 3;
+  // A task file outside our splits, such as the organizers' --instances file.
+  SPLIT_EXTERNAL = 4;
 }
 
 // What the agent may see of a task (spec §3.3, §4): nothing gold, and nothing that gives it away.
@@ -55,13 +57,14 @@ message SweTaskInput {
   string repo = 1;
   // The commit that /testbed is checked out at.
   string base_commit = 2;
-  // The Python script whose run time is measured.
+  // The source text of the workload script, whose run time is measured.
   string workload = 3;
   // The command that runs the repository's tests.
   string test_cmd = 4;
   // The command that rebuilds the package after the code changes, e.g. to compile extensions.
   string rebuild_cmd = 5;
-  // The test files the dataset lists as covering the task, as paths inside the container.
+  // The test files that cover the task, as the dataset lists them: paths under /testbed for
+  // some tasks, paths relative to the repository for others. T13 normalizes them.
   repeated string covering_tests = 6;
 }
 
@@ -99,7 +102,8 @@ message Grade {
   string instance_id = 1;
   // The score: BIRD 1 or 0; SWE SR_i (spec §4.2), already floored at 0.001.
   double score = 2;
-  // BIRD: the prediction passed every test case. SWE: the patch applied and the tests passed.
+  // BIRD: the prediction passed every test case. SWE: the patch applied and the tests passed;
+  // never true for an empty patch.
   bool correct = 3;
   // How grading went.
   GradeStatus status = 4;
@@ -153,7 +157,8 @@ message SweGrade {
   bool patch_applied = 1;
   // True if the tests passed with the patch applied.
   bool tests_passed = 2;
-  // True if the patch was empty, so the task was scored without an evaluation run.
+  // True if the patch was empty, so the task was scored without an evaluation run. Then
+  // patch_applied, tests_passed and the grade's correct are all false.
   bool empty_patch = 3;
   // The agent's speedup, T_pre / T_post. A patch that is empty, does not apply or fails the
   // tests counts as 1: no speedup.
@@ -166,6 +171,12 @@ message SweGrade {
   double t_pre_s = 7;
   // How long the workload ran with the patch (T_post), in seconds; 0 if it was not measured.
   double t_post_s = 8;
+  // How long the evaluation run took, in seconds of wall time. 0 for an empty patch, which is
+  // never evaluated; a cached grade keeps the original run's times.
+  double eval_wall_s = 10;
+  // How much CPU time the evaluation run used, in seconds (spec §9). 0 for an empty patch, which
+  // is never evaluated; a cached grade keeps the original run's times.
+  double eval_cpu_s = 11;
   // True if the result came from the evaluation cache, keyed by patch hash and task, instead of
   // a new evaluation run.
   bool cached = 9;

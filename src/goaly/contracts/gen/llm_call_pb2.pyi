@@ -73,7 +73,11 @@ class _LlmCallStatusEnumTypeWrapper(_enum_type_wrapper._EnumTypeWrapper[_LlmCall
     LLM_CALL_STATUS_INVALID_RESPONSE: _LlmCallStatus.ValueType  # 7
     """A response arrived but could not be used, for example because it was malformed."""
     LLM_CALL_STATUS_CLIENT_ERROR: _LlmCallStatus.ValueType  # 8
-    """The gateway refused the request with another 4xx status, such as for a parameter it rejects."""
+    """Any other 4xx: not 429 and not a context overflow, which LiteLLM also reports as a 400."""
+    LLM_CALL_STATUS_CANCELLED: _LlmCallStatus.ValueType  # 9
+    """Our own code cancelled the call, for example when a task's wall-clock budget ran out. The
+    gateway may still have billed it.
+    """
 
 class LlmCallStatus(_LlmCallStatus, metaclass=_LlmCallStatusEnumTypeWrapper):
     """How an LLM call ended. A failed call reports the error of its last attempt."""
@@ -95,7 +99,11 @@ LLM_CALL_STATUS_CONTEXT_OVERFLOW: LlmCallStatus.ValueType  # 6
 LLM_CALL_STATUS_INVALID_RESPONSE: LlmCallStatus.ValueType  # 7
 """A response arrived but could not be used, for example because it was malformed."""
 LLM_CALL_STATUS_CLIENT_ERROR: LlmCallStatus.ValueType  # 8
-"""The gateway refused the request with another 4xx status, such as for a parameter it rejects."""
+"""Any other 4xx: not 429 and not a context overflow, which LiteLLM also reports as a 400."""
+LLM_CALL_STATUS_CANCELLED: LlmCallStatus.ValueType  # 9
+"""Our own code cancelled the call, for example when a task's wall-clock budget ran out. The
+gateway may still have billed it.
+"""
 Global___LlmCallStatus: _TypeAlias = LlmCallStatus  # noqa: Y015
 
 @_typing.final
@@ -107,6 +115,7 @@ class LlmCallRecord(_message.Message):
     CALL_ID_FIELD_NUMBER: _builtins.int
     RUN_ID_FIELD_NUMBER: _builtins.int
     INSTANCE_ID_FIELD_NUMBER: _builtins.int
+    SEED_FIELD_NUMBER: _builtins.int
     PURPOSE_FIELD_NUMBER: _builtins.int
     MODEL_FIELD_NUMBER: _builtins.int
     USAGE_FIELD_NUMBER: _builtins.int
@@ -122,6 +131,10 @@ class LlmCallRecord(_message.Message):
     """The run the call belongs to, or empty if it belongs to none."""
     instance_id: _builtins.str
     """The task the call works on, or empty if none, as for an RSI analyst call."""
+    seed: _builtins.int
+    """The replicate index, as in Trajectory.seed. Calls join to trajectories on run_id,
+    instance_id and seed.
+    """
     purpose: Global___CallPurpose.ValueType
     """Why the call was made."""
     model: _builtins.str
@@ -142,7 +155,7 @@ class LlmCallRecord(_message.Message):
 
     @_builtins.property
     def started_at(self) -> _timestamp_pb2.Timestamp:
-        """When the call started."""
+        """When the call began, before any wait for a concurrency slot."""
 
     def __init__(
         self,
@@ -150,6 +163,7 @@ class LlmCallRecord(_message.Message):
         call_id: _builtins.str = ...,
         run_id: _builtins.str = ...,
         instance_id: _builtins.str = ...,
+        seed: _builtins.int = ...,
         purpose: Global___CallPurpose.ValueType = ...,
         model: _builtins.str = ...,
         usage: Global___Usage | None = ...,
@@ -162,7 +176,7 @@ class LlmCallRecord(_message.Message):
     ) -> None: ...
     _HasFieldArgType: _TypeAlias = _typing.Literal["started_at", b"started_at", "usage", b"usage"]  # noqa: Y015
     def HasField(self, field_name: _HasFieldArgType) -> _builtins.bool: ...
-    _ClearFieldArgType: _TypeAlias = _typing.Literal["attempts", b"attempts", "call_id", b"call_id", "http_status", b"http_status", "instance_id", b"instance_id", "latency_s", b"latency_s", "model", b"model", "purpose", b"purpose", "run_id", b"run_id", "started_at", b"started_at", "status", b"status", "usage", b"usage", "wait_s", b"wait_s"]  # noqa: Y015
+    _ClearFieldArgType: _TypeAlias = _typing.Literal["attempts", b"attempts", "call_id", b"call_id", "http_status", b"http_status", "instance_id", b"instance_id", "latency_s", b"latency_s", "model", b"model", "purpose", b"purpose", "run_id", b"run_id", "seed", b"seed", "started_at", b"started_at", "status", b"status", "usage", b"usage", "wait_s", b"wait_s"]  # noqa: Y015
     def ClearField(self, field_name: _ClearFieldArgType) -> None: ...
     def WhichOneof(self, oneof_group: _Never) -> None: ...
 

@@ -1,4 +1,8 @@
-"""The conventions every contract in proto/goaly/v1/ follows (spec §3.3)."""
+"""The conventions every contract in proto/goaly/v1/ follows (spec §3.3).
+
+One rule no test can check: JSONL files key fields and enum values by name, so never rename one;
+when one is removed, reserve its name as well as its number.
+"""
 
 import re
 import subprocess

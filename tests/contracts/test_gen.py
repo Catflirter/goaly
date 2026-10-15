@@ -3,6 +3,8 @@
 import importlib
 import pickle
 import pkgutil
+import re
+import tomllib
 from collections.abc import Iterable, Iterator
 from pathlib import Path
 from types import ModuleType
@@ -18,19 +20,22 @@ import goaly.contracts.gen
 from goaly.contracts.gen.task_pb2 import Grade, Prediction, TaskInput
 from goaly.contracts.jsonl import from_json_line, to_json_line
 
-PROTO_PACKAGE_DIR = Path(__file__).resolve().parents[2] / "proto" / "goaly" / "v1"
+REPO_ROOT = Path(__file__).resolve().parents[2]
+PROTO_PACKAGE_DIR = REPO_ROOT / "proto" / "goaly" / "v1"
+# protoc's header in every generated module, e.g. "# Protobuf Python Version: 7.35.1".
+GENERATED_FOR = re.compile(r"^# Protobuf Python Version: (\S+)$", re.MULTILINE)
 
-# Dataset fields the agent must never see (spec §4): gold answers and what would give them away.
-HIDDEN_FROM_THE_AGENT = {
-    # BIRD-CRITIC: the gold SQL and the test cases that check a prediction.
-    "sol_sql",
-    "test_cases",
-    # SWE-fficiency: the expert patch, its tests, the issue text and hints, and the gold speedup.
-    "patch",
-    "test_patch",
-    "problem_statement",
-    "hints_text",
-    "speedup",
+# Every field the agent sees, by message: all that TaskInput reaches (spec §3.3, §4). Gold
+# answers, and whatever would give them away, must never appear here. So a field added anywhere
+# TaskInput reaches fails the test below until someone reviews it and adds it here.
+AGENT_VISIBLE = {
+    "goaly.v1.TaskInput": {"instance_id", "bird", "swe"},
+    "goaly.v1.BirdTaskInput": {
+        *("db_id", "query", "issue_sql", "preprocess_sql", "clean_up_sql", "category", "schema"),
+    },
+    "goaly.v1.SweTaskInput": {
+        *("repo", "base_commit", "workload", "test_cmd", "rebuild_cmd", "covering_tests"),
+    },
 }
 
 
@@ -74,6 +79,25 @@ def test_descriptors_keep_the_proto_names(module: ModuleType) -> None:
     assert module.DESCRIPTOR.package == "goaly.v1"
 
 
+def test_the_protobuf_floor_is_the_version_the_code_was_generated_for() -> None:
+    # The generated code refuses a runtime older than this version, so it must be the floor.
+    project = tomllib.loads((REPO_ROOT / "pyproject.toml").read_text(encoding="utf-8"))
+    floors = [
+        requirement.removeprefix("protobuf>=")
+        for requirement in project["project"]["dependencies"]
+        if requirement.startswith("protobuf")
+    ]
+    versions = set()
+    for module in MODULES:
+        assert module.__file__ is not None
+        header = GENERATED_FOR.search(Path(module.__file__).read_text(encoding="utf-8"))
+        assert header is not None, module.__name__
+        versions.add(header[1])
+
+    (version,) = versions  # One protoc generated every module.
+    assert floors == [version]
+
+
 @pytest.mark.parametrize("message_type", MESSAGES, ids=lambda cls: cls.DESCRIPTOR.full_name)
 def test_messages_pickle_through_the_module_they_live_in(message_type: type[Message]) -> None:
     message = message_type()
@@ -103,16 +127,33 @@ def test_task_messages_have_one_variant_per_benchmark(
     assert found == variants
 
 
-def test_task_input_holds_nothing_the_agent_must_not_see() -> None:
-    names: set[str] = set()
-    pending = [TaskInput.DESCRIPTOR]
+def reachable_fields(start: Descriptor) -> dict[str, set[str]]:
+    """Map each message type ``start`` reaches, itself included, to its field names."""
+    reachable: dict[str, set[str]] = {}
+    pending = [start]
     while pending:
         descriptor = pending.pop()
-        names.update(descriptor.fields_by_name)
-        pending.extend(field.message_type for field in descriptor.fields if field.message_type)
+        if descriptor.full_name not in reachable:  # Visit each type once: types can form cycles.
+            reachable[descriptor.full_name] = set(descriptor.fields_by_name)
+            pending.extend(field.message_type for field in descriptor.fields if field.message_type)
+    return reachable
 
-    assert {"instance_id", "db_id", "repo"} <= names  # The walk reached both variants.
-    assert names.isdisjoint(HIDDEN_FROM_THE_AGENT)
+
+def test_the_agent_sees_only_the_reviewed_task_fields() -> None:
+    assert reachable_fields(TaskInput.DESCRIPTOR) == AGENT_VISIBLE
+
+
+def test_the_walk_ends_on_types_that_form_a_cycle() -> None:
+    # Struct holds Values, a Value can hold a ListValue, and a ListValue holds Values.
+    assert reachable_fields(Struct.DESCRIPTOR) == {
+        "google.protobuf.Struct": {"fields"},
+        "google.protobuf.Struct.FieldsEntry": {"key", "value"},
+        "google.protobuf.Value": {
+            *("null_value", "number_value", "string_value", "bool_value"),
+            *("struct_value", "list_value"),
+        },
+        "google.protobuf.ListValue": {"values"},
+    }
 
 
 # Round trips through JSONL (acceptance 1). The samples are built from the descriptors, so every

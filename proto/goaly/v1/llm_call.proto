@@ -13,6 +13,9 @@ message LlmCallRecord {
   string run_id = 2;
   // The task the call works on, or empty if none, as for an RSI analyst call.
   string instance_id = 3;
+  // The replicate index, as in Trajectory.seed. Calls join to trajectories on run_id,
+  // instance_id and seed.
+  int32 seed = 13;
   // Why the call was made.
   CallPurpose purpose = 4;
   // The model called, such as "qwen3.6-35b-a3b".
@@ -29,7 +32,7 @@ message LlmCallRecord {
   LlmCallStatus status = 10;
   // The HTTP status of the last response, or 0 if no response arrived.
   int32 http_status = 11;
-  // When the call started.
+  // When the call began, before any wait for a concurrency slot.
   google.protobuf.Timestamp started_at = 12;
 }
 
@@ -65,8 +68,11 @@ enum LlmCallStatus {
   LLM_CALL_STATUS_CONTEXT_OVERFLOW = 6;
   // A response arrived but could not be used, for example because it was malformed.
   LLM_CALL_STATUS_INVALID_RESPONSE = 7;
-  // The gateway refused the request with another 4xx status, such as for a parameter it rejects.
+  // Any other 4xx: not 429 and not a context overflow, which LiteLLM also reports as a 400.
   LLM_CALL_STATUS_CLIENT_ERROR = 8;
+  // Our own code cancelled the call, for example when a task's wall-clock budget ran out. The
+  // gateway may still have billed it.
+  LLM_CALL_STATUS_CANCELLED = 9;
 }
 
 // Tokens and cost, of one call or summed over many.

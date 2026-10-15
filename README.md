@@ -33,7 +33,8 @@ the full history on every PR.
 
 ```sh
 make setup             # create .venv from uv.lock and install the git hooks
-make check             # lint, type check, import contracts and unit tests, as CI runs them
+make check             # as CI runs it: lint, type check, import contracts, generated code
+                       # up to date, unit tests
 make test              # unit tests with branch coverage
 make test-integration  # tests that need Docker, a database or the real model API
 make proto             # regenerate src/goaly/contracts/gen/ after editing proto/

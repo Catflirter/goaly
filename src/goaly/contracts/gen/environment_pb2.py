@@ -25,7 +25,7 @@ _sym_db = _symbol_database.Default()
 from google.protobuf import struct_pb2 as google_dot_protobuf_dot_struct__pb2
 
 
-DESCRIPTOR = _descriptor_pool.Default().AddSerializedFile(b'\n\x1agoaly/v1/environment.proto\x12\x08goaly.v1\x1a\x1cgoogle/protobuf/struct.proto\"\x8e\x01\n\tSqlResult\x12\x0f\n\x07\x63olumns\x18\x01 \x03(\t\x12(\n\x04rows\x18\x02 \x03(\x0b\x32\x1a.google.protobuf.ListValue\x12\x11\n\trow_count\x18\x03 \x01(\x03\x12\x11\n\ttruncated\x18\x04 \x01(\x08\x12\r\n\x05\x65rror\x18\x05 \x01(\t\x12\x11\n\telapsed_s\x18\x06 \x01(\x01\"f\n\x0bShellResult\x12\x11\n\texit_code\x18\x01 \x01(\x05\x12\x0e\n\x06stdout\x18\x02 \x01(\t\x12\x0e\n\x06stderr\x18\x03 \x01(\t\x12\x11\n\ttimed_out\x18\x04 \x01(\x08\x12\x11\n\telapsed_s\x18\x05 \x01(\x01\x62\x06proto3')
+DESCRIPTOR = _descriptor_pool.Default().AddSerializedFile(b'\n\x1agoaly/v1/environment.proto\x12\x08goaly.v1\x1a\x1cgoogle/protobuf/struct.proto\"\x8e\x01\n\tSqlResult\x12\x0f\n\x07\x63olumns\x18\x01 \x03(\t\x12(\n\x04rows\x18\x02 \x03(\x0b\x32\x1a.google.protobuf.ListValue\x12\x11\n\trow_count\x18\x03 \x01(\x05\x12\x11\n\ttruncated\x18\x04 \x01(\x08\x12\r\n\x05\x65rror\x18\x05 \x01(\t\x12\x11\n\telapsed_s\x18\x06 \x01(\x01\"y\n\x0bShellResult\x12\x11\n\texit_code\x18\x01 \x01(\x05\x12\x0e\n\x06stdout\x18\x02 \x01(\t\x12\x0e\n\x06stderr\x18\x03 \x01(\t\x12\x11\n\ttruncated\x18\x06 \x01(\x08\x12\x11\n\ttimed_out\x18\x04 \x01(\x08\x12\x11\n\telapsed_s\x18\x05 \x01(\x01\x62\x06proto3')
 
 _globals = globals()
 _builder.BuildMessageAndEnumDescriptors(DESCRIPTOR, _globals)
@@ -35,5 +35,5 @@ if not _descriptor._USE_C_DESCRIPTORS:
   _globals['_SQLRESULT']._serialized_start=71
   _globals['_SQLRESULT']._serialized_end=213
   _globals['_SHELLRESULT']._serialized_start=215
-  _globals['_SHELLRESULT']._serialized_end=317
+  _globals['_SHELLRESULT']._serialized_end=336
 # @@protoc_insertion_point(module_scope)

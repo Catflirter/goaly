@@ -28,25 +28,29 @@ class _Split:
 class _SplitEnumTypeWrapper(_enum_type_wrapper._EnumTypeWrapper[_Split.ValueType], _builtins.type):
     DESCRIPTOR: _descriptor.EnumDescriptor
     SPLIT_UNSPECIFIED: _Split.ValueType  # 0
-    """Not one of our splits: a task file from elsewhere, such as the organizers' --instances file."""
+    """Not set."""
     SPLIT_TRAIN: _Split.ValueType  # 1
     """The analyst may see its trajectories, grader feedback and gold answers."""
     SPLIT_VAL: _Split.ValueType  # 2
     """Only the decision step sees its results."""
     SPLIT_HELDOUT: _Split.ValueType  # 3
     """Used only by the final evaluation and by v0's baseline runs."""
+    SPLIT_EXTERNAL: _Split.ValueType  # 4
+    """A task file outside our splits, such as the organizers' --instances file."""
 
 class Split(_Split, metaclass=_SplitEnumTypeWrapper):
     """A data split (spec §7)."""
 
 SPLIT_UNSPECIFIED: Split.ValueType  # 0
-"""Not one of our splits: a task file from elsewhere, such as the organizers' --instances file."""
+"""Not set."""
 SPLIT_TRAIN: Split.ValueType  # 1
 """The analyst may see its trajectories, grader feedback and gold answers."""
 SPLIT_VAL: Split.ValueType  # 2
 """Only the decision step sees its results."""
 SPLIT_HELDOUT: Split.ValueType  # 3
 """Used only by the final evaluation and by v0's baseline runs."""
+SPLIT_EXTERNAL: Split.ValueType  # 4
+"""A task file outside our splits, such as the organizers' --instances file."""
 Global___Split: _TypeAlias = Split  # noqa: Y015
 
 class _GradeStatus:
@@ -188,14 +192,16 @@ class SweTaskInput(_message.Message):
     base_commit: _builtins.str
     """The commit that /testbed is checked out at."""
     workload: _builtins.str
-    """The Python script whose run time is measured."""
+    """The source text of the workload script, whose run time is measured."""
     test_cmd: _builtins.str
     """The command that runs the repository's tests."""
     rebuild_cmd: _builtins.str
     """The command that rebuilds the package after the code changes, e.g. to compile extensions."""
     @_builtins.property
     def covering_tests(self) -> _containers.RepeatedScalarFieldContainer[_builtins.str]:
-        """The test files the dataset lists as covering the task, as paths inside the container."""
+        """The test files that cover the task, as the dataset lists them: paths under /testbed for
+        some tasks, paths relative to the repository for others. T13 normalizes them.
+        """
 
     def __init__(
         self,
@@ -319,7 +325,9 @@ class Grade(_message.Message):
     score: _builtins.float
     """The score: BIRD 1 or 0; SWE SR_i (spec §4.2), already floored at 0.001."""
     correct: _builtins.bool
-    """BIRD: the prediction passed every test case. SWE: the patch applied and the tests passed."""
+    """BIRD: the prediction passed every test case. SWE: the patch applied and the tests passed;
+    never true for an empty patch.
+    """
     status: Global___GradeStatus.ValueType
     """How grading went."""
     feedback: _builtins.str
@@ -425,13 +433,17 @@ class SweGrade(_message.Message):
     SR_FIELD_NUMBER: _builtins.int
     T_PRE_S_FIELD_NUMBER: _builtins.int
     T_POST_S_FIELD_NUMBER: _builtins.int
+    EVAL_WALL_S_FIELD_NUMBER: _builtins.int
+    EVAL_CPU_S_FIELD_NUMBER: _builtins.int
     CACHED_FIELD_NUMBER: _builtins.int
     patch_applied: _builtins.bool
     """True if the patch applied to base_commit."""
     tests_passed: _builtins.bool
     """True if the tests passed with the patch applied."""
     empty_patch: _builtins.bool
-    """True if the patch was empty, so the task was scored without an evaluation run."""
+    """True if the patch was empty, so the task was scored without an evaluation run. Then
+    patch_applied, tests_passed and the grade's correct are all false.
+    """
     speedup: _builtins.float
     """The agent's speedup, T_pre / T_post. A patch that is empty, does not apply or fails the
     tests counts as 1: no speedup.
@@ -444,6 +456,14 @@ class SweGrade(_message.Message):
     """How long the workload ran before the patch (T_pre), in seconds."""
     t_post_s: _builtins.float
     """How long the workload ran with the patch (T_post), in seconds; 0 if it was not measured."""
+    eval_wall_s: _builtins.float
+    """How long the evaluation run took, in seconds of wall time. 0 for an empty patch, which is
+    never evaluated; a cached grade keeps the original run's times.
+    """
+    eval_cpu_s: _builtins.float
+    """How much CPU time the evaluation run used, in seconds (spec §9). 0 for an empty patch, which
+    is never evaluated; a cached grade keeps the original run's times.
+    """
     cached: _builtins.bool
     """True if the result came from the evaluation cache, keyed by patch hash and task, instead of
     a new evaluation run.
@@ -459,11 +479,13 @@ class SweGrade(_message.Message):
         sr: _builtins.float = ...,
         t_pre_s: _builtins.float = ...,
         t_post_s: _builtins.float = ...,
+        eval_wall_s: _builtins.float = ...,
+        eval_cpu_s: _builtins.float = ...,
         cached: _builtins.bool = ...,
     ) -> None: ...
     _HasFieldArgType: _TypeAlias = _Never  # noqa: Y015
     def HasField(self, field_name: _HasFieldArgType) -> _builtins.bool: ...
-    _ClearFieldArgType: _TypeAlias = _typing.Literal["cached", b"cached", "empty_patch", b"empty_patch", "gold_speedup", b"gold_speedup", "patch_applied", b"patch_applied", "speedup", b"speedup", "sr", b"sr", "t_post_s", b"t_post_s", "t_pre_s", b"t_pre_s", "tests_passed", b"tests_passed"]  # noqa: Y015
+    _ClearFieldArgType: _TypeAlias = _typing.Literal["cached", b"cached", "empty_patch", b"empty_patch", "eval_cpu_s", b"eval_cpu_s", "eval_wall_s", b"eval_wall_s", "gold_speedup", b"gold_speedup", "patch_applied", b"patch_applied", "speedup", b"speedup", "sr", b"sr", "t_post_s", b"t_post_s", "t_pre_s", b"t_pre_s", "tests_passed", b"tests_passed"]  # noqa: Y015
     def ClearField(self, field_name: _ClearFieldArgType) -> None: ...
     def WhichOneof(self, oneof_group: _Never) -> None: ...
 
