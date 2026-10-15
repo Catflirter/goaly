@@ -92,8 +92,12 @@ CREATE UNIQUE INDEX lineitem_pkey ON public.lineitem USING btree (l_orderkey, l_
 CREATE UNIQUE INDEX orders_pkey ON public.orders USING btree (o_orderkey);
 """
 
-# EXPLAIN (FORMAT JSON) output, as the plan cache holds it.
-CACHED_PLAN = json.dumps([{"Plan": {"Node Type": "Seq Scan", "Relation Name": "orders"}}], indent=2)
+# A plan as the plan cache holds it: EXPLAIN (FORMAT JSON) output. The agent sees only its root
+# node, the "Plan" object, as indented JSON: CACHED_TEXT.
+CACHED_ROOT: dict[str, JsonValue] = {"Node Type": "Seq Scan", "Relation Name": "orders"}
+CACHED_PLAN = json.dumps([{"Plan": CACHED_ROOT, "Planning Time": 0.1}], indent=2)
+CACHED_TEXT = json.dumps(CACHED_ROOT, indent=2)
+OTHER_PLAN = json.dumps([{"Plan": {"Node Type": "Result"}}])
 
 # The forms of an empty plan, which counts as no plan (controller's ruling).
 EMPTY_PLANS: list[JsonValue] = [None, {}, [], "", " \n\t"]
@@ -224,11 +228,11 @@ def write_plans(path: Path, plans: object) -> Path:
 
 
 def test_loads_the_plan_cache(tmp_path: Path) -> None:
-    path = write_plans(tmp_path / "plans.json", {"7": CACHED_PLAN, "8": '{"Plan": {}}'})
+    path = write_plans(tmp_path / "plans.json", {"7": CACHED_PLAN, "8": OTHER_PLAN})
 
     plans = load_plans(path)
 
-    assert dict(plans) == {"7": CACHED_PLAN, "8": '{"Plan": {}}'}
+    assert dict(plans) == {"7": CACHED_PLAN, "8": OTHER_PLAN}
     with pytest.raises(TypeError):
         plans["9"] = CACHED_PLAN  # type: ignore[index]  # The cache is read-only.
 
@@ -242,6 +246,10 @@ def test_loads_the_plan_cache(tmp_path: Path) -> None:
         {"7": "42"},
         {"7": "[]"},
         {"7": " {} "},
+        {"7": '{"Plan": {"Node Type": "Result"}}'},
+        {"7": '[{"Node Type": "Result"}]'},
+        {"7": '[{"Plan": {}}]'},
+        {"7": '[{"Plan": {"Node Type": "Result"}}, {"Plan": {"Node Type": "Result"}}]'},
         {"": CACHED_PLAN},
         [CACHED_PLAN],
     ],
@@ -252,6 +260,10 @@ def test_loads_the_plan_cache(tmp_path: Path) -> None:
         "not-a-plan",
         "empty-array",
         "empty-object",
+        "not-an-array",
+        "no-plan-key",
+        "empty-plan",
+        "two-statements",
         "blank-id",
         "array",
     ],
@@ -284,9 +296,44 @@ def test_copies_what_the_agent_may_see() -> None:
 
 def test_the_plan_cache_wins_over_the_task_files_plan() -> None:
     # Some recorded plans come from TPC-H SF10, so T09's cache replaces them.
-    task_input = agent_input(instance(id=7), snapshot(), {"7": CACHED_PLAN, "8": '{"Plan": {}}'})
+    task_input = agent_input(instance(id=7), snapshot(), {"7": CACHED_PLAN, "8": OTHER_PLAN})
 
-    assert task_input.effisql.base_plan == CACHED_PLAN
+    assert task_input.effisql.base_plan == CACHED_TEXT
+
+
+def test_both_sources_show_the_same_plan_byte_for_byte() -> None:
+    # One shape for the agent (controller's ruling): the root node, without top-level timings.
+    explain = [{"Plan": BASE_PLAN, "Planning Time": 0.5, "Execution Time": 12.5, "Triggers": []}]
+    no_plan = without(task(id=7), "base_explain_analyze")
+
+    from_file = agent_input(instance(id=7), snapshot(), {})
+    from_cache = agent_input(
+        EffiSqlInstance.model_validate(no_plan), snapshot(), {"7": json.dumps(explain, indent=4)}
+    )
+
+    assert from_cache.effisql.base_plan == from_file.effisql.base_plan
+    assert from_file.effisql.base_plan == json.dumps(BASE_PLAN, indent=2)
+
+
+@pytest.mark.parametrize(
+    "plan",
+    [
+        {**BASE_PLAN, "Planning Time": 0.5, "Execution Time": 12.5},
+        {"Plan": BASE_PLAN, "Execution Time": 12.5},
+    ],
+    ids=["timings-in-the-root", "explain-object"],
+)
+def test_a_file_plan_shows_only_its_root_node(plan: JsonValue) -> None:
+    task_input = agent_input(instance(base_explain_analyze=plan), snapshot(), {})
+
+    assert task_input.effisql.base_plan == json.dumps(BASE_PLAN, indent=2)
+
+
+@pytest.mark.parametrize("entry", ["42", "[]", '[{"Plan": []}]', '{"Plan": {}}'])
+def test_a_cached_plan_that_is_not_a_plan_is_an_error(entry: str) -> None:
+    # load_plans rejects such an entry; a mapping built some other way still gets a clear error.
+    with pytest.raises(ValueError, match=r"^task 7 has a base plan that is not a query plan$"):
+        agent_input(instance(id=7), snapshot(), {"7": entry})
 
 
 def test_the_task_files_plan_is_used_when_the_cache_has_no_entry() -> None:
@@ -301,7 +348,7 @@ def test_an_empty_plan_falls_through_to_the_cache(plan: JsonValue) -> None:
         instance(id=7, base_explain_analyze=plan), snapshot(), {"7": CACHED_PLAN}
     )
 
-    assert task_input.effisql.base_plan == CACHED_PLAN
+    assert task_input.effisql.base_plan == CACHED_TEXT
 
 
 @pytest.mark.parametrize("plan", EMPTY_PLANS, ids=EMPTY_PLAN_IDS)
@@ -338,7 +385,7 @@ def test_a_task_without_gold_difficulty_base_time_or_plan_gives_a_valid_input() 
 
     task_input = agent_input(inst, snapshot(), {"7": CACHED_PLAN})
 
-    assert task_input.effisql.base_plan == CACHED_PLAN
+    assert task_input.effisql.base_plan == CACHED_TEXT
     assert task_input.effisql.difficulty == ""
     assert task_input.effisql.base_sql == BASE_SQL
 

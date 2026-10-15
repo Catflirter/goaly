@@ -7,7 +7,8 @@ T09's environment setup writes two files, and the adapter loads each of them onc
 - ``plans.json``, which maps instance IDs to base plans, each the text of an
   ``EXPLAIN (FORMAT JSON)``. load_plans reads it.
 
-agent_input builds a task's EffiSqlTaskInput from the task and those two, and does no I/O.
+agent_input builds a task's EffiSqlTaskInput from the task and those two, and does no I/O. The
+agent sees a plan in one shape whatever its source: its root node, as indented JSON.
 """
 
 import json
@@ -20,6 +21,7 @@ from pydantic import AfterValidator, BaseModel, ConfigDict, Field, TypeAdapter, 
 
 from goaly.bench.effisql.data import EffiSqlInstance, NonBlankStr
 from goaly.contracts.gen.task_pb2 import EffiSqlTaskInput, TaskInput
+from goaly.contracts.interfaces import JsonValue
 
 __all__ = [
     "Column",
@@ -35,6 +37,8 @@ __all__ = [
 
 # The snapshot is read strictly: no unknown key, and no value of another type.
 _STRICT = ConfigDict(frozen=True, extra="forbid", strict=True)
+# Timings that EXPLAIN ANALYZE reports beside the plan, which the agent's plan leaves out.
+_TIMINGS = ("Planning Time", "Execution Time")
 
 
 class Column(BaseModel):
@@ -111,27 +115,31 @@ def load_schema_snapshot(path: Path) -> SchemaSnapshot:
     return SchemaSnapshot.model_validate_json(path.read_bytes())
 
 
-def _json_plan(text: str) -> str:
-    """Check that ``text`` is a plan as EXPLAIN (FORMAT JSON) writes it: a JSON array or object."""
+def _explain_output(text: str) -> str:
+    """Check that ``text`` is one statement's EXPLAIN (FORMAT JSON) output, with a plan."""
     try:
-        plan = json.loads(text)
+        output = json.loads(text)
     except ValueError:
-        plan = None
-    if not plan or not isinstance(plan, list | dict):
-        raise ValueError("must be the text of a JSON plan that is not empty")
+        output = None
+    statement = output[0] if isinstance(output, list) and len(output) == 1 else None
+    root = statement.get("Plan") if isinstance(statement, dict) else None
+    if not isinstance(root, dict) or not root:
+        raise ValueError('must be EXPLAIN (FORMAT JSON) output, [{"Plan": {...}}], with a plan')
     return text
 
 
 _PLANS = TypeAdapter(
-    dict[NonBlankStr, Annotated[str, AfterValidator(_json_plan)]], config=ConfigDict(strict=True)
+    dict[NonBlankStr, Annotated[str, AfterValidator(_explain_output)]],
+    config=ConfigDict(strict=True),
 )
 
 
 def load_plans(path: Path) -> Mapping[str, str]:
     """Read the plan cache in the file at ``path``: base plans by instance ID, as JSON text.
 
+    Each plan is one statement's ``EXPLAIN (FORMAT JSON)`` output, ``[{"Plan": {...}, ...}]``.
     The mapping is read-only. Raises pydantic's ValidationError, a ValueError, if the file does
-    not map instance IDs to plans.
+    not map instance IDs to such plans.
     """
     return MappingProxyType(_PLANS.validate_json(path.read_bytes()))
 
@@ -172,9 +180,12 @@ def agent_input(
     1. ``plans``, the plan cache, when it has the task. T09's setup writes an entry for each
        task whose file has no plan, and for each whose file plan was recorded at another scale:
        some recorded plans come from TPC-H SF10, not SF3;
-    2. otherwise the task file's ``base_explain_analyze``, as JSON text. An empty plan counts
-       as none (EffiSqlInstance);
+    2. otherwise the task file's ``base_explain_analyze``. An empty plan counts as none
+       (EffiSqlInstance);
     3. otherwise nowhere: ValueError, naming the task.
+
+    Either way the agent sees the plan's root node, as indented JSON (see _root_node), so the
+    same plan gives the same text from either source.
 
     ``snapshot`` must be the schema of the task's database; otherwise ValueError.
     """
@@ -196,11 +207,25 @@ def agent_input(
 
 def _base_plan(inst: EffiSqlInstance, plans: Mapping[str, str]) -> str:
     cached = plans.get(inst.instance_id)
-    if cached is not None:
-        return cached
-    if inst.base_explain_analyze is not None:
-        return json.dumps(inst.base_explain_analyze, indent=2, ensure_ascii=False)
-    raise ValueError(
-        f"task {inst.instance_id} has no base plan: plans.json has no entry for it, and its task "
-        "file has no base_explain_analyze"
-    )
+    plan: JsonValue = json.loads(cached) if cached is not None else inst.base_explain_analyze
+    if plan is None:
+        raise ValueError(
+            f"task {inst.instance_id} has no base plan: plans.json has no entry for it, and its "
+            "task file has no base_explain_analyze"
+        )
+    return json.dumps(_root_node(plan, inst.instance_id), indent=2, ensure_ascii=False)
+
+
+def _root_node(plan: JsonValue, instance_id: str) -> dict[str, JsonValue]:
+    """Return ``plan``'s root node, without the timings EXPLAIN ANALYZE reports beside it.
+
+    ``EXPLAIN (FORMAT JSON)`` writes ``[{"Plan": root, "Planning Time": ..., ...}]``, whose
+    root is the "Plan" object. The dataset's plans are root nodes already.
+    """
+    if isinstance(plan, list) and len(plan) == 1:
+        plan = plan[0]
+    if isinstance(plan, dict) and "Plan" in plan:  # A root node has no "Plan", only "Plans".
+        plan = plan["Plan"]
+    if not isinstance(plan, dict) or not plan:
+        raise ValueError(f"task {instance_id} has a base plan that is not a query plan")
+    return {key: value for key, value in plan.items() if key not in _TIMINGS}
