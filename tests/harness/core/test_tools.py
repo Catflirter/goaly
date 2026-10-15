@@ -817,3 +817,68 @@ async def test_a_failing_task_group_in_a_tool_leaves_no_cancel_request_on_the_ca
         "(1 sub-exception):\n- ValueError: bad row"
     )
     assert caller.cancelling() == before
+
+
+async def test_a_failure_leaf_with_its_own_cause_keeps_it_and_has_the_group_as_context() -> None:
+    reset = ConnectionResetError("the connection was reset by peer")
+    try:
+        raise EnvironmentFailure("the database connection died") from reset
+    except EnvironmentFailure as error:
+        died = error
+    tool = FailingGroupTool(died)
+
+    with pytest.raises(EnvironmentFailure) as raised:
+        await bind(tool).invoke("{}", FakeSqlEnvironment())
+
+    assert raised.value is died
+    assert raised.value.__cause__ is reset
+    group = raised.value.__context__
+    assert isinstance(group, ExceptionGroup)
+    assert group.exceptions == (died,)
+
+
+async def test_a_caller_with_a_cancel_request_already_pending_still_gets_results() -> None:
+    # Only a cancel request that arrives during the call counts as the caller's cancellation;
+    # one already pending when the call starts, as an earlier swallowed one leaves, does not.
+    caller = asyncio.current_task()
+    assert caller is not None
+    caller.cancel()
+    with pytest.raises(asyncio.CancelledError):
+        await asyncio.sleep(0)
+    assert caller.cancelling() == 1
+    try:
+        echoed = await bind(EchoTool()).invoke('{"text": "hello"}', FakeSqlEnvironment())
+        failed = await bind(RaisingTool(ValueError("bad row"))).invoke("{}", FakeSqlEnvironment())
+    finally:
+        caller.uncancel()
+
+    assert (echoed.content, echoed.is_error) == ("hello", False)
+    assert (failed.content, failed.is_error) == (
+        "Error: fragile failed with ValueError: bad row",
+        True,
+    )
+
+
+async def test_exactly_10_invalid_arguments_are_all_listed_with_none_counted() -> None:
+    arguments_json = json.dumps({"pattern": "x", "paths": list(range(10))})
+
+    result = await bind(SearchTool()).invoke(arguments_json, FakeSqlEnvironment())
+
+    assert result.content == "Error: invalid arguments for search:\n" + "\n".join(
+        f"- paths.{index}: Input should be a valid string" for index in range(10)
+    )
+
+
+async def test_the_callers_cancellation_wins_over_an_environment_failure() -> None:
+    # The caller is being cancelled, say at its wall-clock budget, and the tool raises an
+    # EnvironmentFailure as it stops: the cancellation propagates, with the failure as its cause.
+    died = EnvironmentFailure("the connection died while the statement was cancelled")
+    tool = bind(StubbornTool(died), timeout_s=60.0)
+
+    with pytest.raises(TimeoutError) as raised:  # The outer timeout's, from its cancellation.
+        async with asyncio.timeout(0.05):
+            await tool.invoke("{}", FakeSqlEnvironment())
+
+    cancelled = raised.value.__cause__
+    assert isinstance(cancelled, asyncio.CancelledError)
+    assert cancelled.__cause__ is died
