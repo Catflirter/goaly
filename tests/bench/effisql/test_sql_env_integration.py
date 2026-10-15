@@ -376,8 +376,10 @@ async def test_the_statement_cap_holds_and_queue_wait_is_reported_apart(
 
 
 async def test_least_loaded_assignment_spreads_tasks_over_the_solving_instances(
-    pool: SolvingPool,
+    pool: SolvingPool, pg_env: PgEnv
 ) -> None:
+    if len(_solving(pg_env)) < 2:
+        pytest.skip("needs both solving instances")
     async with pool.environment() as first, pool.environment() as second:
         assert first.instance != second.instance
         assert set(pool.load().values()) == {1}
