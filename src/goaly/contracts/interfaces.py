@@ -237,8 +237,8 @@ class Benchmark[InstanceT: Instance, EnvT: Environment](Protocol):
 
         A prediction with no benchmark branch set, as after a crash, is graded as the
         benchmark's empty answer, the one :meth:`to_official` writes for it: Effi-SQL's
-        ``base_sql`` unchanged, which gets the identity credit (that of a speedup of 1), or an
-        empty SWE patch, scored 1/gold.
+        ``base_sql`` unchanged, which gets the credit of its measured identity τ, or an empty SWE
+        patch, scored 1/gold.
         """
 
     def to_official(self, inst: InstanceT, prediction: Prediction) -> dict[str, JsonValue]:
