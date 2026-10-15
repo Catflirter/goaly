@@ -89,8 +89,9 @@ enum LlmCallStatus {
   LLM_CALL_STATUS_INVALID_RESPONSE = 7;
   // Any other 4xx: not 429 and not a context overflow, which LiteLLM also reports as a 400.
   LLM_CALL_STATUS_CLIENT_ERROR = 8;
-  // Our own code cancelled the call, for example when a task's wall-clock budget ran out. The
-  // gateway may still have billed it.
+  // Our own code cancelled this one call, for example when a task's wall-clock budget ran out;
+  // the gateway may still have billed it. A whole task that the runner cancels is
+  // TASK_ERROR_TYPE_TIMEOUT.
   LLM_CALL_STATUS_CANCELLED = 9;
 }
 

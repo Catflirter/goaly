@@ -69,7 +69,9 @@ class _GradeStatusEnumTypeWrapper(_enum_type_wrapper._EnumTypeWrapper[_GradeStat
     GRADE_STATUS_TIMEOUT: _GradeStatus.ValueType  # 3
     """The prediction ran past the grader's time limit."""
     GRADE_STATUS_GRADER_ERROR: _GradeStatus.ValueType  # 4
-    """The grader's own infrastructure failed, so the score says nothing about the prediction."""
+    """The grader's infrastructure failed: no property of the prediction, so the score means
+    nothing. Regrade the task before computing metrics.
+    """
 
 class GradeStatus(_GradeStatus, metaclass=_GradeStatusEnumTypeWrapper):
     """How grading went."""
@@ -83,7 +85,9 @@ GRADE_STATUS_PREDICTION_FAILED: GradeStatus.ValueType  # 2
 GRADE_STATUS_TIMEOUT: GradeStatus.ValueType  # 3
 """The prediction ran past the grader's time limit."""
 GRADE_STATUS_GRADER_ERROR: GradeStatus.ValueType  # 4
-"""The grader's own infrastructure failed, so the score says nothing about the prediction."""
+"""The grader's infrastructure failed: no property of the prediction, so the score means
+nothing. Regrade the task before computing metrics.
+"""
 Global___GradeStatus: _TypeAlias = GradeStatus  # noqa: Y015
 
 @_typing.final
