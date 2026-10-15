@@ -122,6 +122,21 @@ def test_a_call_with_no_usage_keeps_the_estimate() -> None:
     assert prompt.estimated_tokens == before
 
 
+def test_a_prompt_exactly_at_the_threshold_does_not_fold() -> None:
+    prompt = chat(["x" * 4000] * 3, keep_turns=1)  # The threshold is 1,000.
+
+    prompt.sent(1000)
+
+    assert prompt.fold() == []
+
+
+def test_a_message_needs_a_turn_to_join() -> None:
+    prompt = ChatPrompt(OPENING, TOOLS, window())
+
+    with pytest.raises(ValueError, match="add_turn"):
+        prompt.add(tool("c0", "rows: 1"))
+
+
 def test_nothing_is_folded_up_to_the_threshold() -> None:
     prompt = chat(["x" * 2000] * 12, fold_above_tokens=100_000)
 
@@ -236,7 +251,9 @@ def test_reasoning_goes_out_only_within_the_last_turns() -> None:
     assert [reply.tool_calls[0].id for reply in replies] == ["c0", "c1", "c2", "c3"]
 
 
-def test_reasoning_that_leaves_the_last_turns_comes_off_the_estimate() -> None:
+def test_reasoning_the_gateway_counted_stays_in_the_estimate_when_it_leaves() -> None:
+    # The count may never have held it, as the chat template may have dropped it: an estimate
+    # that took it off could go below the prompt's size.
     prompt = ChatPrompt(OPENING, TOOLS, window(keep_turns=1))
     prompt.add_turn(0, thinking(0, "r" * 400))
     prompt.sent(1000)
@@ -244,7 +261,28 @@ def test_reasoning_that_leaves_the_last_turns_comes_off_the_estimate() -> None:
     prompt.add_turn(1, thinking(1, ""))
 
     added = len("Done.") + len("execute_sql") + len("{}")
-    assert prompt.estimated_tokens == math.ceil(1000 + added / 4 - 400 / 4)
+    assert prompt.estimated_tokens == math.ceil(1000 + added / 4)
+
+
+def test_reasoning_added_since_the_last_count_comes_off_the_estimate_when_it_leaves() -> None:
+    prompt = ChatPrompt(OPENING, TOOLS, window(keep_turns=1))
+    before = prompt.estimated_tokens
+    prompt.add_turn(0, thinking(0, "r" * 400))
+    prompt.sent(0)  # The gateway reported no usage, so no count covers the turn.
+
+    prompt.add_turn(1, thinking(1, ""))
+
+    added = 2 * (len("Done.") + len("execute_sql") + len("{}"))
+    assert abs(prompt.estimated_tokens - (before + added / 4)) <= 1  # The 400 came off.
+
+
+def test_the_estimate_never_goes_below_0() -> None:
+    prompt = chat(["x" * 4000] * 2, keep_turns=1)
+    prompt.sent(100)  # A count far below the characters' estimate, as for dense text.
+
+    prompt.fold(everything_older=True)
+
+    assert prompt.estimated_tokens == 0
 
 
 def test_a_window_of_0_replays_reasoning_unchanged() -> None:
