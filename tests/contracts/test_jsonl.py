@@ -1,0 +1,250 @@
+"""Tests for goaly.contracts.jsonl."""
+
+import json
+import math
+import stat
+from collections.abc import Iterator
+from datetime import UTC, datetime
+from pathlib import Path
+from typing import Any, assert_type
+
+import pytest
+from google.protobuf.json_format import ParseError
+from google.protobuf.timestamp_pb2 import Timestamp
+
+from goaly.contracts.gen.environment_pb2 import ShellResult
+from goaly.contracts.gen.llm_call_pb2 import LlmCallRecord, Usage
+from goaly.contracts.gen.task_pb2 import BirdTaskInput, Grade, GradeStatus, TaskInput
+from goaly.contracts.jsonl import (
+    JsonlError,
+    append_jsonl,
+    from_json_line,
+    read_jsonl,
+    to_json_line,
+    write_jsonl,
+)
+
+TEXT = "naïve 日本語\nsecond line\u2028after a line separator"
+
+
+def reject_constant(name: str) -> None:
+    raise ValueError(f"not valid JSON: {name}")
+
+
+def parse(line: str) -> dict[str, Any]:
+    """Parse ``line`` as strict JSON: NaN and Infinity are not JSON."""
+    fields = json.loads(line, parse_constant=reject_constant)
+    assert isinstance(fields, dict)
+    return fields
+
+
+# to_json_line.
+
+
+def test_writes_a_compact_line_with_the_proto_field_names() -> None:
+    line = to_json_line(ShellResult(exit_code=1, stdout="hi", timed_out=True, elapsed_s=0.5))
+
+    assert " " not in line
+    assert parse(line) == {
+        "exit_code": 1,
+        "stdout": "hi",
+        "stderr": "",
+        "timed_out": True,
+        "elapsed_s": 0.5,
+    }
+
+
+def test_writes_default_values_but_not_unset_messages() -> None:
+    line = to_json_line(Grade(instance_id="t1", status=GradeStatus.GRADE_STATUS_GRADED))
+
+    # A failed task shows "correct": false; the benchmark variant, never set, is left out.
+    assert parse(line) == {
+        "instance_id": "t1",
+        "score": 0.0,
+        "correct": False,
+        "status": "GRADE_STATUS_GRADED",
+        "feedback": "",
+    }
+
+
+def test_writes_timestamps_in_rfc_3339() -> None:
+    started_at = Timestamp()
+    started_at.FromDatetime(datetime(2026, 10, 15, 1, 2, 3, 456000, tzinfo=UTC))
+
+    line = to_json_line(LlmCallRecord(started_at=started_at))
+
+    assert parse(line)["started_at"] == "2026-10-15T01:02:03.456Z"
+
+
+def test_keeps_text_as_is_on_a_single_line() -> None:
+    message = Grade(feedback=TEXT)
+
+    line = to_json_line(message)
+
+    assert "\n" not in line
+    assert "naïve 日本語" in line  # Not \u escapes.
+    assert "\u2028" in line
+    assert from_json_line(line, Grade) == message
+
+
+def test_writes_int64_values_as_strings_without_losing_precision() -> None:
+    message = Usage(input_tokens=2**53 + 1)
+
+    line = to_json_line(message)
+
+    assert parse(line)["input_tokens"] == "9007199254740993"
+    assert from_json_line(line, Usage) == message
+
+
+@pytest.mark.parametrize(
+    ("value", "written"), [(math.nan, "NaN"), (math.inf, "Infinity"), (-math.inf, "-Infinity")]
+)
+def test_writes_non_finite_doubles_as_strings(value: float, written: str) -> None:
+    line = to_json_line(Grade(score=value))
+
+    assert parse(line)["score"] == written
+    read = from_json_line(line, Grade).score
+    assert math.isnan(read) if math.isnan(value) else read == value
+
+
+# from_json_line.
+
+
+def test_reads_a_line_into_the_requested_type() -> None:
+    message = from_json_line('{"instance_id":"t1","bird":{"db_id":"films"}}', TaskInput)
+
+    assert_type(message, TaskInput)
+    assert message == TaskInput(instance_id="t1", bird=BirdTaskInput(db_id="films"))
+
+
+def test_ignores_unknown_fields_at_any_depth() -> None:
+    line = '{"instance_id":"t1","dropped":1,"bird":{"db_id":"films","also_dropped":[true]}}'
+
+    message = from_json_line(line, TaskInput)
+
+    assert message == TaskInput(instance_id="t1", bird=BirdTaskInput(db_id="films"))
+
+
+@pytest.mark.parametrize(
+    "line",
+    [
+        # protobuf alone would read these two as an empty message.
+        '"instance_id"',
+        '["instance_id"]',
+        "[]",
+        "7",
+        "null",
+        "{not json",
+        '{"instance_id":7}',
+    ],
+)
+def test_rejects_a_line_that_is_not_a_valid_message(line: str) -> None:
+    with pytest.raises(ParseError):
+        from_json_line(line, TaskInput)
+
+
+# read_jsonl.
+
+
+def test_reads_every_message_in_order_and_skips_blank_lines(tmp_path: Path) -> None:
+    path = tmp_path / "tasks.jsonl"
+    path.write_bytes(b'{"instance_id":"a"}\n\n{"instance_id":"b"}\r\n  \n{"instance_id":"c"}')
+
+    messages = read_jsonl(path, TaskInput)
+
+    assert_type(messages, Iterator[TaskInput])
+    assert list(messages) == [TaskInput(instance_id=name) for name in "abc"]
+
+
+def test_splits_records_on_newlines_only(tmp_path: Path) -> None:
+    # str.splitlines() would also split at U+2028, U+2029 and U+0085, all valid inside JSON text.
+    path = tmp_path / "tasks.jsonl"
+    path.write_text('{"instance_id":"a\u2028b\u2029c\x85d"}\n', encoding="utf-8")
+
+    assert list(read_jsonl(path, TaskInput)) == [TaskInput(instance_id="a\u2028b\u2029c\x85d")]
+
+
+def test_names_the_file_and_line_of_a_malformed_record(tmp_path: Path) -> None:
+    path = tmp_path / "tasks.jsonl"
+    path.write_text('{"instance_id":"a"}\n\n{"instance_id": oops}\n{"instance_id":"c"}\n', "utf-8")
+    read: list[TaskInput] = []
+
+    with pytest.raises(JsonlError) as raised:
+        read.extend(read_jsonl(path, TaskInput))
+
+    assert read == [TaskInput(instance_id="a")]
+    assert str(raised.value).startswith(f"{path}:3: not a valid goaly.v1.TaskInput: ")
+    assert (raised.value.path, raised.value.line_number) == (path, 3)
+    assert isinstance(raised.value.__cause__, ParseError)
+
+
+def test_names_the_file_and_line_of_text_that_is_not_utf8(tmp_path: Path) -> None:
+    path = tmp_path / "tasks.jsonl"
+    path.write_bytes(b'{"instance_id":"a"}\n{"instance_id":"\xff"}\n')
+
+    with pytest.raises(JsonlError, match=r":2: not valid UTF-8 at byte 16$") as raised:
+        list(read_jsonl(path, TaskInput))
+
+    assert (raised.value.path, raised.value.line_number) == (path, 2)
+
+
+# write_jsonl and append_jsonl.
+
+
+@pytest.fixture
+def directory(tmp_path: Path) -> Path:
+    """An empty directory: tmp_path also holds the isolated HOME of conftest.py."""
+    path = tmp_path / "out"
+    path.mkdir()
+    return path
+
+
+def test_writes_one_line_per_message(tmp_path: Path) -> None:
+    path = tmp_path / "tasks.jsonl"
+
+    write_jsonl(path, [TaskInput(instance_id="a"), TaskInput(instance_id="b")])
+
+    assert path.read_text(encoding="utf-8") == '{"instance_id":"a"}\n{"instance_id":"b"}\n'
+
+
+def test_write_replaces_the_whole_file(directory: Path) -> None:
+    path = directory / "tasks.jsonl"
+    path.write_text('{"instance_id":"old"}\n' * 3, encoding="utf-8")
+
+    write_jsonl(path, [])
+
+    assert path.read_bytes() == b""
+    assert list(directory.iterdir()) == [path]
+
+
+def test_a_failed_write_leaves_the_file_as_it_was(directory: Path) -> None:
+    path = directory / "tasks.jsonl"
+    path.write_text('{"instance_id":"old"}\n', encoding="utf-8")
+
+    def messages() -> Iterator[TaskInput]:
+        yield TaskInput(instance_id="new")
+        raise RuntimeError("the producer failed")
+
+    with pytest.raises(RuntimeError, match="the producer failed"):
+        write_jsonl(path, messages())
+
+    assert path.read_text(encoding="utf-8") == '{"instance_id":"old"}\n'
+    assert list(directory.iterdir()) == [path]  # No temporary file is left behind.
+
+
+def test_a_written_file_gets_the_permissions_of_any_new_file(tmp_path: Path) -> None:
+    path, reference = tmp_path / "tasks.jsonl", tmp_path / "reference"
+    reference.touch()
+
+    write_jsonl(path, [TaskInput(instance_id="a")])
+
+    assert stat.S_IMODE(path.stat().st_mode) == stat.S_IMODE(reference.stat().st_mode)
+
+
+def test_appends_one_line_per_call(tmp_path: Path) -> None:
+    path = tmp_path / "calls.jsonl"
+
+    append_jsonl(path, TaskInput(instance_id="a"))
+    append_jsonl(path, TaskInput(instance_id="b"))
+
+    assert path.read_text(encoding="utf-8") == '{"instance_id":"a"}\n{"instance_id":"b"}\n'
