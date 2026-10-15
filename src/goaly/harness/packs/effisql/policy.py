@@ -2,6 +2,7 @@
 
 The harness factory reads prompt.md and config.yaml, gives core the sampling, the budgets and the
 context window, and calls :func:`build_policy` with the config's ``pack`` section and the prompt.
+The system prompt carries the pack's skill guides, whose text :data:`SKILLS` holds (spec §5.2).
 When a budget runs out before submit, the fallback submits ``base_sql`` unchanged, which the
 grader credits with its identity τ (spec §5.4).
 """
@@ -23,6 +24,36 @@ from goaly.harness.core.tools import ToolRegistry, bind
 
 from .tools import ExecuteSql, ExecuteSqlConfig, Submit
 
+# The pack's skill guides (spec §5.2): one rewrite each, in the guide's own words. Pack code
+# may not read files, so each guide's text is held here as well as in skills/<name>.md, and the
+# pack's tests check the two are the same, so a guide cannot drift from what the model reads.
+DECORRELATE_JOIN = (
+    "# Decorrelate a correlated scalar subquery into a LEFT JOIN\n"
+    "\n"
+    "When a SELECT computes a correlated scalar subquery (SELECT expr FROM other o\n"
+    "WHERE o.k = t.k [AND o.k2 = t.k2 ...]) per outer row t, rewrite as SELECT t.*, s.expr FROM\n"
+    "(outer) t LEFT JOIN (SELECT k, k2, expr FROM other) s ON (s.k, s.k2) = (t.k, t.k2).\n"
+    "Put every correlation predicate as an equality join condition on exactly those columns;\n"
+    "keep LEFT JOIN so unmatched outer rows keep NULL like the subquery does; move the\n"
+    "subquery's other WHERE conditions into the derived table. Only use the direct join when\n"
+    "the correlation columns are unique in the subquery's table (a key); otherwise GROUP BY the\n"
+    "correlation columns in the derived table. This turns a per-row scan into one hash join,\n"
+    "usually >=2x on large outer tables.\n"
+)
+
+# Every guide the executor is shown, in the order the system prompt carries them.
+SKILLS = (DECORRELATE_JOIN,)
+
+
+def with_skills(system_prompt: str) -> str:
+    """The system prompt with the pack's skill guides appended, as spec §5.2 allows.
+
+    A guide reaches the model through the system prompt, not a tool it must remember to call,
+    so the rewrite is in front of it from the first step of a task.
+    """
+    guides = "\n\n".join(guide.rstrip() for guide in SKILLS)
+    return f"{system_prompt.rstrip()}\n\nSkills:\n\n{guides}\n"
+
 
 class PackConfig(BaseModel):
     """The pack's own settings: the ``pack`` section of config.yaml."""
@@ -39,7 +70,8 @@ class EffiSqlPolicy:
 
     def __init__(self, config: PackConfig, system_prompt: str) -> None:
         self.config = config
-        self.system_prompt = system_prompt
+        # What the model reads: prompt.md, then the pack's skill guides.
+        self.system_prompt = with_skills(system_prompt)
 
     async def solve(self, task: TaskInput, env: SqlEnvironment, ctx: AgentContext) -> Prediction:
         """Run the agent on ``task`` in ``env`` until it submits or a budget runs out."""

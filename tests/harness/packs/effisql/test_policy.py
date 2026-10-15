@@ -23,6 +23,7 @@ from goaly.harness.packs.effisql.policy import (
     build_policy,
     fallback,
     task_prompt,
+    with_skills,
 )
 from tests.fakes import FakeSqlEnvironment
 from tests.harness.core.agent_fakes import FakeLLM, reply, tool_call
@@ -86,7 +87,8 @@ class TestSolve:
         await policy().solve(TASK, FakeSqlEnvironment(), context(llm))
 
         system, user = llm.requests[0].messages
-        assert system.content == (PACK / "prompt.md").read_text(encoding="utf-8")
+        # prompt.md, with the pack's skill guides appended (tests/.../test_skills.py).
+        assert system.content == with_skills((PACK / "prompt.md").read_text(encoding="utf-8"))
         assert user.content == task_prompt(
             TASK.effisql, PackConfig(), Budgets(steps=30, wall_clock_s=600)
         )
