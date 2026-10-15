@@ -15,7 +15,7 @@ import contextlib
 import os
 import signal
 import subprocess
-from collections.abc import Sequence
+from collections.abc import Mapping, Sequence
 from pathlib import Path
 
 __all__ = ["GitError", "run_git", "run_git_unless_no"]
@@ -55,11 +55,14 @@ def run_git(
     cwd: Path,
     timeout_s: float = 120.0,
     input_text: str | None = None,
+    env: Mapping[str, str] | None = None,
 ) -> str:
     """Run ``git <args>`` in ``cwd`` and return its standard output.
 
-    Bytes that are not UTF-8, as in a path, come back as surrogate escapes. Raises GitError if
-    git fails, or after ``timeout_s``, when git and every process it started are killed.
+    ``env`` adds variables once the environment is cleaned, such as a GIT_INDEX_FILE of the
+    caller's own. Bytes that are not UTF-8, as in a path, come back as surrogate escapes. Raises
+    GitError if git fails, or after ``timeout_s``, when git and every process it started are
+    killed.
     """
     settings = [item for setting in _SETTINGS for item in ("-c", setting)]
     environment = {
@@ -75,6 +78,7 @@ def run_git(
         GIT_PAGER="cat",
         LC_ALL="C",
     )
+    environment.update(env or {})
     with subprocess.Popen(  # noqa: S603  (git, with arguments goaly.rsi builds)
         ["git", *settings, *args],  # noqa: S607  (git from PATH)
         cwd=cwd,

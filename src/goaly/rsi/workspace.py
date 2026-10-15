@@ -15,6 +15,11 @@ symlink included, and git on the host must never act on that: :func:`check_pack_
 the packs before any git command runs in a candidate's worktree, and :meth:`Workspace.remove`
 deletes a worktree's files itself before git forgets the worktree.
 
+A candidate is evaluated only from a snapshot of a commit, never from its live worktree, which
+the implementer's sandbox may still change: the guards, the unit-test guard, goaly-smoke and
+screening all see the same immutable files. :meth:`Workspace.pin` commits a worktree as it
+stands, for goaly-smoke while the implementer still runs.
+
 For T22: best/<lane> can move to a commit that does not descend from the remote's tag, so
 pushing it must force the tag.
 """
@@ -23,11 +28,13 @@ import logging
 import os
 import shutil
 import stat
-from collections.abc import Callable, Iterator
+import tarfile
+import tempfile
+from collections.abc import Callable, Iterator, Mapping
 from contextlib import contextmanager
 from dataclasses import dataclass
 from functools import cached_property
-from pathlib import Path
+from pathlib import Path, PurePosixPath
 
 from goaly.contracts.gen.experiment_pb2 import Lane
 from goaly.rsi.git import GitError, run_git, run_git_unless_no
@@ -42,13 +49,17 @@ __all__ = [
     "Workspace",
     "WorkspaceError",
     "Worktree",
+    "check_modes",
     "check_pack_files",
+    "pack_modes",
 ]
 
 DEFAULT_ROOT = Path("~/goaly-rsi-worktrees")
 _LOCK = "goaly-rsi.lock"  # In the main repository's git directory, shared by all its worktrees.
 # Files that tell git how to treat a tree; a pack may hold none of them.
 GIT_FILES = frozenset({".git", ".gitattributes", ".gitmodules", ".gitignore"})
+# git's modes for a file; 120000 is a symlink and 160000 a gitlink.
+_REGULAR = frozenset({"100644", "100755"})
 
 _logger = logging.getLogger(__name__)
 
@@ -156,6 +167,59 @@ class Workspace:
         """Return the commit the worktree has checked out."""
         return self._git(["rev-parse", "--verify", "HEAD^{commit}"], cwd=worktree.path).strip()
 
+    @contextmanager
+    def snapshot(self, commit: str) -> Iterator[Path]:
+        """Yield a read-only copy of ``commit``'s files, in a new temporary directory that is
+        removed afterwards.
+
+        Only committed files are in it: nothing untracked or ignored, such as bytecode, and
+        nothing the live worktree gains later. Raises WorkspaceError if ``commit`` is not a
+        commit, or if its tree holds a link that leads out of it.
+        """
+        sha = self._commit_of(commit)
+        with tempfile.TemporaryDirectory(prefix=f"goaly-rsi-snapshot-{sha[:12]}-") as scratch:
+            archive = Path(scratch) / "tree.tar"
+            root = Path(scratch) / "tree"
+            self._git(["archive", "--format=tar", f"--output={archive}", sha])
+            try:
+                with tarfile.open(archive) as tar:
+                    tar.extractall(root, filter="data")  # Refuses links that leave root.
+            except tarfile.FilterError as error:
+                raise WorkspaceError(f"cannot snapshot {sha}: {error}") from error
+            archive.unlink()
+            _set_writable(root, writable=False)
+            try:
+                yield root
+            finally:
+                _set_writable(root, writable=True)  # So that the directory can be removed.
+
+    def pin(self, worktree: Worktree) -> str:
+        """Commit the worktree's pack directories as they stand, on top of its HEAD, and return
+        the commit, which no branch holds.
+
+        Ignored files are left out, and so is any change outside the pack. The worktree, its
+        index and its branch stay as they are. Raises UnsafePackError, pinning nothing, if a
+        pack holds anything but regular files and directories, as the commit helper does.
+        """
+        check_pack_files(worktree)  # Before any git command runs in the worktree.
+        with tempfile.TemporaryDirectory(prefix="goaly-rsi-pin-") as scratch:
+            index = {"GIT_INDEX_FILE": str(Path(scratch) / "index")}  # Never the worktree's own.
+            self._git(["read-tree", "HEAD"], cwd=worktree.path, env=index)
+            packs = [
+                str(relative)
+                for relative, directory in zip(
+                    lane_info(worktree.lane).pack_dirs, worktree.pack_dirs, strict=True
+                )
+                if directory.exists()
+            ]
+            self._git(["add", "--all", "--", *packs], cwd=worktree.path, env=index)
+            check_modes(pack_modes(worktree, staged=True, env=index), "staged")
+            tree = self._git(["write-tree"], cwd=worktree.path, env=index).strip()
+        message = f"goaly-smoke: {worktree.experiment_id} as it stands"
+        return self._git(
+            ["commit-tree", tree, "-p", "HEAD", f"-m{message}"], cwd=worktree.path
+        ).strip()
+
     def worktrees(self, lane: Lane.ValueType) -> list[Worktree]:
         """Return the worktrees git knows of in the lane's directory, by directory, including any
         whose directory is gone, in the order git lists them.
@@ -244,8 +308,12 @@ class Workspace:
         output = self._git(["rev-parse", "--path-format=absolute", "--git-common-dir"])
         return Path(output.strip())
 
-    def _git(self, args: list[str], *, cwd: Path | None = None) -> str:
-        return run_git(args, cwd=self.repo if cwd is None else cwd, timeout_s=self.git_timeout_s)
+    def _git(
+        self, args: list[str], *, cwd: Path | None = None, env: Mapping[str, str] | None = None
+    ) -> str:
+        return run_git(
+            args, cwd=self.repo if cwd is None else cwd, timeout_s=self.git_timeout_s, env=env
+        )
 
     def _resolve(self, revision: str) -> str | None:
         """Return the object ``revision`` names, or None if it names nothing."""
@@ -320,6 +388,39 @@ def check_pack_files(worktree: Worktree) -> None:
         raise UnsafePackError(problems)
 
 
+def pack_modes(
+    worktree: Worktree, *, staged: bool = False, env: Mapping[str, str] | None = None
+) -> dict[str, str]:
+    """Return the git mode of every path in the worktree's packs: as HEAD holds it, or as the
+    index does with ``staged``. ``env`` can name another index. Neither reads a file of the
+    worktree.
+    """
+    packs = [str(pack) for pack in lane_info(worktree.lane).pack_dirs]
+    if staged:  # Each entry is "<mode> <object> <stage>\t<path>".
+        command = ["ls-files", "--stage", "-z", "--", *packs]
+    else:  # Each entry is "<mode> <type> <object>\t<path>".
+        command = ["ls-tree", "-r", "-z", "HEAD", "--", *packs]
+    output = run_git(command, cwd=worktree.path, env=env)
+    entries = (entry.partition("\t") for entry in output.split("\0") if entry)
+    return {path: meta.split(" ")[0] for meta, _, path in entries}
+
+
+def check_modes(modes: Mapping[str, str], where: str) -> None:
+    """Raise UnsafePackError for every path in ``modes`` that is not a regular file, or that is
+    one of git's own files, saying ``where`` it was found.
+    """
+    problems = []
+    for path, mode in sorted(modes.items()):
+        if mode == "160000":
+            problems.append(f"{path}: a gitlink {where}")
+        elif mode not in _REGULAR:
+            problems.append(f"{path}: mode {mode} {where}")
+        elif PurePosixPath(path).name in GIT_FILES:
+            problems.append(f"{path}: git's own file {where}")
+    if problems:
+        raise UnsafePackError(problems)
+
+
 def _problem(name: str, mode: int) -> str | None:
     if name == ".git":
         return "a nested repository"
@@ -338,6 +439,16 @@ def _writable_and_retry(function: Callable[[str], object], path: str, error: Bas
     """
     Path(path).parent.chmod(0o700)
     function(path)
+
+
+def _set_writable(root: Path, *, writable: bool) -> None:
+    """Make every file and directory under ``root`` writable by its owner, or nothing writable."""
+    for directory, _, names in os.walk(root, topdown=False):
+        for name in names:
+            path = Path(directory) / name
+            if not path.is_symlink():  # chmod would follow it.
+                path.chmod(0o644 if writable else 0o444)
+        Path(directory).chmod(0o755 if writable else 0o555)
 
 
 def _make_pack_dirs(worktree: Worktree) -> None:
