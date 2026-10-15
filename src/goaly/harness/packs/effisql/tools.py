@@ -25,7 +25,8 @@ class ExecuteSqlConfig(BaseModel):
 
     # The statement timeout, enforced by client-side cancellation in the environment. The
     # solving instances' capacity rests on it (spec §6.2), so a pack may lower it but never
-    # raise it: the trusted environment caps every statement at 120 s whatever is asked.
+    # raise it: the trusted environment runs each statement for at most its own timeout
+    # (SqlEnvOptions.timeout_s, which the wiring sets to 120 s), whatever is asked here.
     statement_timeout_s: float = Field(default=120.0, gt=0, le=120)
     # How many rows the model sees, at most; the environment keeps no more than its own limit.
     rows_shown: int = Field(default=100, ge=0)
