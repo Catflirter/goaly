@@ -181,6 +181,46 @@ class UnreadableError(Exception):
         raise RuntimeError("no message")
 
 
+class StubbornTool:
+    """Sleeps a minute; when cancelled, it returns or raises what it was given instead."""
+
+    name = "stubborn"
+    description = "Sleep, and resist cancellation."
+    args_model = NoArgs
+
+    def __init__(self, on_cancel: ToolResult | Exception) -> None:
+        self.on_cancel = on_cancel
+
+    async def run(self, args: NoArgs, env: Environment) -> ToolResult:
+        try:
+            await asyncio.sleep(60)
+        except asyncio.CancelledError:
+            if isinstance(self.on_cancel, Exception):
+                raise self.on_cancel from None
+            return self.on_cancel
+        return ToolResult(content="slept")
+
+
+class FailingGroupTool:
+    """Runs a TaskGroup in which one child raises the exception it was given."""
+
+    name = "group"
+    description = "Run two jobs at once."
+    args_model = NoArgs
+
+    def __init__(self, error: Exception) -> None:
+        self.error = error
+
+    async def run(self, args: NoArgs, env: Environment) -> ToolResult:
+        async def fail() -> None:
+            raise self.error
+
+        async with asyncio.TaskGroup() as group:
+            group.create_task(asyncio.sleep(60))
+            group.create_task(fail())
+        return ToolResult(content="Both ran.")
+
+
 class CallbackArgs(BaseModel):
     """Arguments that no JSON Schema can describe."""
 
@@ -462,7 +502,9 @@ async def test_a_call_that_runs_past_its_timeout_is_stopped_and_gives_an_error_r
         result = await tool.invoke(SLEEP_60, env)
 
     assert without_elapsed(result) == ToolResult(
-        name="query", is_error=True, content="Error: query timed out after 0.05 s and was stopped."
+        name="query",
+        is_error=True,
+        content="Error: query timed out after 0.05 s and was cancelled.",
     )
     assert result.elapsed_s >= 0.05
     assert env.stopped == ["SELECT pg_sleep(60)"]
@@ -697,3 +739,69 @@ async def test_a_tool_that_returns_something_other_than_a_result_gives_an_error_
         is_error=True,
         content="Error: wrong failed with TypeError: wrong returned str, not a ToolResult",
     )
+
+
+async def test_a_tool_that_swallows_its_timeout_still_gets_the_timeout_error() -> None:
+    tool = bind(StubbornTool(ToolResult(content="partial")), timeout_s=0.05)
+
+    async with asyncio.timeout(10):  # Fails the test, rather than hanging it, if the call runs on.
+        result = await tool.invoke("{}", FakeSqlEnvironment())
+
+    assert without_elapsed(result) == ToolResult(
+        name="stubborn",
+        is_error=True,
+        content="Error: stubborn timed out after 0.05 s and was cancelled.",
+    )
+
+
+@pytest.mark.parametrize(
+    "on_cancel",
+    [ToolResult(content="partial"), RuntimeError("interrupted")],
+    ids=["swallowed", "turned into an exception"],
+)
+async def test_an_outer_cancellation_the_tool_resists_still_propagates(
+    on_cancel: ToolResult | Exception,
+) -> None:
+    tool = bind(StubbornTool(on_cancel), timeout_s=60.0)
+
+    # The outer timeout raises TimeoutError only if its cancellation came back out of invoke.
+    with pytest.raises(TimeoutError):
+        async with asyncio.timeout(0.05):
+            await tool.invoke("{}", FakeSqlEnvironment())
+
+
+async def test_when_the_calls_deadline_meets_an_outer_budget_the_outer_one_wins() -> None:
+    env = sleepy_environment()
+    tool = bind(QueryTool(), timeout_s=0.05)
+
+    with pytest.raises(TimeoutError):  # The outer budget's, not an error result.
+        async with asyncio.timeout(0.05):
+            await tool.invoke(SLEEP_60, env)
+
+    assert env.stopped == ["SELECT pg_sleep(60)"]
+
+
+async def test_an_environment_failure_wins_over_the_calls_expired_timeout() -> None:
+    died = EnvironmentFailure("the connection died while the statement was cancelled")
+    tool = bind(StubbornTool(died), timeout_s=0.05)
+
+    with pytest.raises(EnvironmentFailure) as raised:
+        await tool.invoke("{}", FakeSqlEnvironment())
+
+    assert raised.value is died
+
+
+async def test_a_failing_task_group_in_a_tool_leaves_no_cancel_request_on_the_caller() -> None:
+    # Python 3.12's TaskGroup leaves an extra cancel request on its parent task when a child
+    # fails while it exits. It must not reach the caller's task, nor pass for its cancellation.
+    caller = asyncio.current_task()
+    assert caller is not None
+    before = caller.cancelling()
+
+    result = await bind(FailingGroupTool(ValueError("bad row"))).invoke("{}", FakeSqlEnvironment())
+
+    assert result.content == (
+        "Error: group failed with ExceptionGroup: unhandled errors in a TaskGroup "
+        "(1 sub-exception):\n- ValueError: bad row"
+    )
+    assert caller.cancelling() == before

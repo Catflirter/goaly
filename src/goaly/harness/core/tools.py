@@ -144,31 +144,43 @@ class _Binding[A: BaseModel, E: Environment](BoundTool[E]):
             )
             content = f"Error: invalid arguments for {self.name}: {_describe(error)}"
             return _result(self.name, content, is_error=True)
+        cancel_requests = _cancel_requests()
         timeout = asyncio.timeout(self.timeout_s)
         try:
             async with timeout:
-                # Typed as object: pack code, which RSI writes, can break the Tool contract.
-                returned: object = await self.tool.run(args, env)
+                # The tool runs in a task of its own, which a cancellation of this one cancels,
+                # so that its cancellation bookkeeping never touches this task's: Python 3.12's
+                # TaskGroup leaves an extra cancel request on its parent when a child fails
+                # while it exits. The result is an object: pack code can break the contract.
+                returned: object = await asyncio.create_task(self.tool.run(args, env))
             if not isinstance(returned, ToolResult):
                 kind = type(returned).__name__
                 raise TypeError(f"{self.name} returned {kind}, not a ToolResult")
         except Exception as error:
+            if _cancel_requests() > cancel_requests:
+                # The tool turned an outer cancellation into an exception; it still propagates.
+                raise asyncio.CancelledError from error
             _reraise_environment_failure(error)
             if timeout.expired():
-                content = (
-                    f"Error: {self.name} timed out after {self.timeout_s:g} s and was stopped."
-                )
-            else:
-                _logger.warning(
-                    "the tool %s raised an exception",
-                    self.name,
-                    extra={"tool": self.name},
-                    exc_info=error,
-                )
-                content = f"Error: {self.name} failed with {_describe(error)}"
+                return self._timed_out()
+            _logger.warning(
+                "the tool %s raised an exception",
+                self.name,
+                extra={"tool": self.name},
+                exc_info=error,
+            )
+            content = f"Error: {self.name} failed with {_describe(error)}"
             return _result(self.name, content, is_error=True)
+        if _cancel_requests() > cancel_requests:
+            raise asyncio.CancelledError  # The tool swallowed an outer cancellation.
+        if timeout.expired():
+            return self._timed_out()  # The tool swallowed its timeout's cancellation.
         submission = returned.submission if returned.HasField("submission") else None
         return _result(self.name, returned.content, submission=submission)
+
+    def _timed_out(self) -> ToolResult:
+        content = f"Error: {self.name} timed out after {self.timeout_s:g} s and was cancelled."
+        return _result(self.name, content, is_error=True)
 
 
 class ToolRegistry[E: Environment]:
@@ -256,6 +268,12 @@ def _leaves(error: BaseException) -> Iterator[BaseException]:
             yield from _leaves(inner)
     else:
         yield error
+
+
+def _cancel_requests() -> int:
+    """How many requests to cancel the current task are pending, as Task.cancelling counts."""
+    task = asyncio.current_task()
+    return 0 if task is None else task.cancelling()
 
 
 def _invalid_arguments(name: str, error: ValidationError) -> str:
