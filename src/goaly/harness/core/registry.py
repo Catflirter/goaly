@@ -5,6 +5,11 @@ with. The composition root (``goaly.cli``) registers each harness under its benc
 its own: T11 registers Effi-SQL's v0 pack, and tests register the toy benchmark. Adding a
 benchmark registers it here; core does not change (spec §3.3).
 
+The grade phase of a two-phase run (spec V24) needs the benchmark alone: a Grading, which the
+composition root registers with add_benchmark(). Opening one must not import any pack code, so
+a harness factory imports its pack's modules inside itself, never at the top of the module that
+registers it.
+
 A harness factory is an async context manager, so it owns what the harness needs for the run,
 such as the LLM client and the writer of the run's LLM call log, and closes them after it. It
 binds the harness's types, the benchmark's instance and environment and the policy's context,
@@ -21,6 +26,7 @@ from goaly.contracts.gen.manifest_pb2 import ModelSettings, RunManifest
 from goaly.contracts.gen.task_pb2 import Split
 from goaly.contracts.interfaces import Benchmark, Environment, Instance, Policy
 from goaly.harness.core.eval_cache import EvalCache
+from goaly.harness.core.grading import Grader
 from goaly.harness.core.runner import (
     ContextFactory,
     ErrorClassifier,
@@ -34,11 +40,16 @@ from goaly.harness.core.runner import (
 
 __all__ = [
     "Dataset",
+    "GradesRuns",
+    "Grading",
+    "GradingFactory",
+    "GradingOptions",
     "Harness",
     "HarnessFactory",
     "HarnessOptions",
     "Registry",
     "RegistryError",
+    "RunnableGrading",
     "RunnableHarness",
     "RunsTasks",
 ]
@@ -86,6 +97,7 @@ class RunsTasks(Protocol):
         instance_ids: Collection[str] | None = None,
         resume: bool = False,
         lock: RunLock | None = None,
+        grading: bool = True,
     ) -> RunSummary:
         """Run the tasks and record them, as Runner.run does."""
 
@@ -160,11 +172,64 @@ class Harness[InstanceT: Instance, EnvT: Environment, CtxT: TaskContext]:
 type HarnessFactory = Callable[[HarnessOptions], AbstractAsyncContextManager[RunnableHarness]]
 
 
+@dataclass(frozen=True)
+class GradingOptions:
+    """What `goaly run --phase grade` gives a benchmark's grading factory."""
+
+    # The run's directory.
+    files: RunFiles
+
+
+class GradesRuns(Protocol):
+    """A Grader, whatever its types."""
+
+    async def grade(self, run_dir: Path, *, lock: RunLock | None = None) -> RunSummary:
+        """Grade the run's ungraded tasks, as Grader.grade does."""
+
+
+class RunnableGrading(Protocol):
+    """A Grading, whatever its types: what the grade phase needs."""
+
+    @property
+    def benchmark_name(self) -> str:
+        """The benchmark adapter's name."""
+
+    @property
+    def cache_namespace(self) -> str:
+        """The grading identity the evaluation cache is kept under; empty for none."""
+
+    def grader(self, *, cache: EvalCache | None) -> GradesRuns:
+        """Return the Grader of this benchmark, with this cache."""
+
+
+@dataclass(frozen=True)
+class Grading[InstanceT: Instance, EnvT: Environment]:
+    """A benchmark adapter alone, as the grade phase uses it: its grader, and no pack code."""
+
+    benchmark: Benchmark[InstanceT, EnvT]
+    # As Harness.cache_namespace: the grading identity that keys the evaluation cache.
+    cache_namespace: str = ""
+
+    @property
+    def benchmark_name(self) -> str:
+        """The benchmark adapter's name."""
+        return self.benchmark.name
+
+    def grader(self, *, cache: EvalCache | None) -> Grader[InstanceT, EnvT]:
+        """Return the Grader of this benchmark, with this cache."""
+        return Grader(self.benchmark, cache=cache)
+
+
+# Opens a benchmark for one grade phase, and closes what it holds when it is over.
+type GradingFactory = Callable[[GradingOptions], AbstractAsyncContextManager[RunnableGrading]]
+
+
 class Registry:
     """The harnesses `goaly run` can run, by benchmark name, then by harness name."""
 
     def __init__(self) -> None:
         self._harnesses: dict[str, dict[str, HarnessFactory]] = {}
+        self._gradings: dict[str, GradingFactory] = {}
 
     def add(self, benchmark: str, harness: str, factory: HarnessFactory) -> None:
         """Register ``factory`` as ``benchmark``'s harness ``harness``, a name it has once."""
@@ -173,8 +238,22 @@ class Registry:
             raise ValueError(f"{benchmark!r} already has a harness {harness!r}")
         harnesses[harness] = factory
 
+    def add_benchmark(self, benchmark: str, factory: GradingFactory) -> None:
+        """Register ``factory`` as the grading of ``benchmark``, which has one."""
+        if benchmark in self._gradings:
+            raise ValueError(f"{benchmark!r} already has a grading")
+        self._gradings[benchmark] = factory
+
+    def grading(self, benchmark: str) -> GradingFactory:
+        """Return the factory of ``benchmark``'s grading, or raise RegistryError."""
+        if benchmark not in self._gradings:
+            known = ", ".join(sorted(self._gradings))
+            there = f"the benchmarks that grade are: {known}" if known else "none is registered"
+            raise RegistryError(f"no benchmark {benchmark!r} to grade with; {there}")
+        return self._gradings[benchmark]
+
     def benchmarks(self) -> list[str]:
-        """The benchmarks registered, in name order."""
+        """The benchmarks registered with a harness, in name order."""
         return sorted(self._harnesses)
 
     def harnesses(self, benchmark: str) -> list[str]:

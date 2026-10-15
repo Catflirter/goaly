@@ -13,10 +13,13 @@ from goaly.contracts.jsonl import read_jsonl
 from goaly.harness.core.eval_cache import EvalCache
 from goaly.harness.core.registry import (
     Dataset,
+    Grading,
+    GradingOptions,
     Harness,
     HarnessOptions,
     Registry,
     RegistryError,
+    RunnableGrading,
     RunnableHarness,
 )
 from goaly.harness.core.runner import RunFiles, error_classifier
@@ -119,6 +122,61 @@ def test_a_name_is_registered_once() -> None:
     with pytest.raises(ValueError, match="'toy' already has a harness 'v0'"):
         registry.add("toy", "v0", other)
     assert registry.factory("toy", "v0") is toy
+
+
+# Gradings, for the grade phase.
+
+
+@asynccontextmanager
+async def toy_grading(
+    options: GradingOptions,
+) -> AsyncIterator[Grading[ToyInstance, FakeSqlEnvironment]]:
+    yield Grading(benchmark=ScriptedBenchmark(toy_instances(2)), cache_namespace="toy-dev")
+
+
+def test_finds_a_benchmarks_grading_apart_from_its_harnesses() -> None:
+    registry = Registry()
+    registry.add_benchmark("toy", toy_grading)
+
+    assert registry.grading("toy") is toy_grading
+    assert registry.benchmarks() == []  # It has no harness.
+
+
+def test_a_benchmark_has_one_grading() -> None:
+    registry = Registry()
+    registry.add_benchmark("toy", toy_grading)
+
+    with pytest.raises(ValueError, match="'toy' already has a grading"):
+        registry.add_benchmark("toy", toy_grading)
+
+
+def test_an_unknown_grading_lists_those_there_are() -> None:
+    registry = Registry()
+
+    with pytest.raises(RegistryError, match="no benchmark 'toy' to grade with; none is registered"):
+        registry.grading("toy")
+    registry.add_benchmark("effisql", toy_grading)
+    with pytest.raises(RegistryError, match="the benchmarks that grade are: effisql"):
+        registry.grading("toy")
+
+
+async def test_a_grading_grades_a_solved_run(tmp_path: Path) -> None:
+    runner = toy_harness().runner(cache=None, max_tasks=2, task_timeout_s=None)
+    await runner.run(
+        tmp_path,
+        RunManifest(run_id="r", harness_hash="h"),
+        split=SPLIT_TRAIN,
+        seeds=[0],
+        grading=False,
+    )
+
+    async with toy_grading(GradingOptions(files=RunFiles(tmp_path))) as grading:
+        runnable: RunnableGrading = grading
+        summary = await runnable.grader(cache=None).grade(tmp_path)
+
+    assert runnable.benchmark_name == "toy"
+    assert runnable.cache_namespace == "toy-dev"
+    assert summary.ran == 2
 
 
 # Harnesses.
