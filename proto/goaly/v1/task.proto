@@ -11,9 +11,9 @@ enum Split {
   SPLIT_UNSPECIFIED = 0;
   // The analyst may see its trajectories, grader feedback and gold answers.
   SPLIT_TRAIN = 1;
-  // Only the decision step sees its results.
+  // Its results go to the decision step and to the final report; the analyst never sees them.
   SPLIT_VAL = 2;
-  // Used only by the final evaluation and by v0's baseline runs.
+  // Used only for baseline v0's runs and for the final runs.
   SPLIT_HELDOUT = 3;
   // A task file outside our splits, such as the organizers' --instances file.
   SPLIT_EXTERNAL = 4;

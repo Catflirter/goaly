@@ -33,9 +33,9 @@ class _SplitEnumTypeWrapper(_enum_type_wrapper._EnumTypeWrapper[_Split.ValueType
     SPLIT_TRAIN: _Split.ValueType  # 1
     """The analyst may see its trajectories, grader feedback and gold answers."""
     SPLIT_VAL: _Split.ValueType  # 2
-    """Only the decision step sees its results."""
+    """Its results go to the decision step and to the final report; the analyst never sees them."""
     SPLIT_HELDOUT: _Split.ValueType  # 3
-    """Used only by the final evaluation and by v0's baseline runs."""
+    """Used only for baseline v0's runs and for the final runs."""
     SPLIT_EXTERNAL: _Split.ValueType  # 4
     """A task file outside our splits, such as the organizers' --instances file."""
 
@@ -47,9 +47,9 @@ SPLIT_UNSPECIFIED: Split.ValueType  # 0
 SPLIT_TRAIN: Split.ValueType  # 1
 """The analyst may see its trajectories, grader feedback and gold answers."""
 SPLIT_VAL: Split.ValueType  # 2
-"""Only the decision step sees its results."""
+"""Its results go to the decision step and to the final report; the analyst never sees them."""
 SPLIT_HELDOUT: Split.ValueType  # 3
-"""Used only by the final evaluation and by v0's baseline runs."""
+"""Used only for baseline v0's runs and for the final runs."""
 SPLIT_EXTERNAL: Split.ValueType  # 4
 """A task file outside our splits, such as the organizers' --instances file."""
 Global___Split: _TypeAlias = Split  # noqa: Y015
