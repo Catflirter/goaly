@@ -425,6 +425,8 @@ class SweGrade(_message.Message):
     SR_FIELD_NUMBER: _builtins.int
     T_PRE_S_FIELD_NUMBER: _builtins.int
     T_POST_S_FIELD_NUMBER: _builtins.int
+    EVAL_WALL_S_FIELD_NUMBER: _builtins.int
+    EVAL_CPU_S_FIELD_NUMBER: _builtins.int
     CACHED_FIELD_NUMBER: _builtins.int
     patch_applied: _builtins.bool
     """True if the patch applied to base_commit."""
@@ -444,6 +446,14 @@ class SweGrade(_message.Message):
     """How long the workload ran before the patch (T_pre), in seconds."""
     t_post_s: _builtins.float
     """How long the workload ran with the patch (T_post), in seconds; 0 if it was not measured."""
+    eval_wall_s: _builtins.float
+    """How long the evaluation run took, in seconds of wall time. 0 for an empty patch, which is
+    never evaluated; a cached grade keeps the original run's times.
+    """
+    eval_cpu_s: _builtins.float
+    """How much CPU time the evaluation run used, in seconds (spec §9). 0 for an empty patch, which
+    is never evaluated; a cached grade keeps the original run's times.
+    """
     cached: _builtins.bool
     """True if the result came from the evaluation cache, keyed by patch hash and task, instead of
     a new evaluation run.
@@ -459,11 +469,13 @@ class SweGrade(_message.Message):
         sr: _builtins.float = ...,
         t_pre_s: _builtins.float = ...,
         t_post_s: _builtins.float = ...,
+        eval_wall_s: _builtins.float = ...,
+        eval_cpu_s: _builtins.float = ...,
         cached: _builtins.bool = ...,
     ) -> None: ...
     _HasFieldArgType: _TypeAlias = _Never  # noqa: Y015
     def HasField(self, field_name: _HasFieldArgType) -> _builtins.bool: ...
-    _ClearFieldArgType: _TypeAlias = _typing.Literal["cached", b"cached", "empty_patch", b"empty_patch", "gold_speedup", b"gold_speedup", "patch_applied", b"patch_applied", "speedup", b"speedup", "sr", b"sr", "t_post_s", b"t_post_s", "t_pre_s", b"t_pre_s", "tests_passed", b"tests_passed"]  # noqa: Y015
+    _ClearFieldArgType: _TypeAlias = _typing.Literal["cached", b"cached", "empty_patch", b"empty_patch", "eval_cpu_s", b"eval_cpu_s", "eval_wall_s", b"eval_wall_s", "gold_speedup", b"gold_speedup", "patch_applied", b"patch_applied", "speedup", b"speedup", "sr", b"sr", "t_post_s", b"t_post_s", "t_pre_s", b"t_pre_s", "tests_passed", b"tests_passed"]  # noqa: Y015
     def ClearField(self, field_name: _ClearFieldArgType) -> None: ...
     def WhichOneof(self, oneof_group: _Never) -> None: ...
 

@@ -166,6 +166,12 @@ message SweGrade {
   double t_pre_s = 7;
   // How long the workload ran with the patch (T_post), in seconds; 0 if it was not measured.
   double t_post_s = 8;
+  // How long the evaluation run took, in seconds of wall time. 0 for an empty patch, which is
+  // never evaluated; a cached grade keeps the original run's times.
+  double eval_wall_s = 10;
+  // How much CPU time the evaluation run used, in seconds (spec §9). 0 for an empty patch, which
+  // is never evaluated; a cached grade keeps the original run's times.
+  double eval_cpu_s = 11;
   // True if the result came from the evaluation cache, keyed by patch hash and task, instead of
   // a new evaluation run.
   bool cached = 9;
