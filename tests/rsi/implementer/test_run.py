@@ -23,8 +23,9 @@ from goaly.contracts.gen.experiment_pb2 import (
 )
 from goaly.contracts.gen.llm_call_pb2 import CallPurpose
 from goaly.harness.core.llm_errors import ContextOverflow, InvalidResponse, ServerError, TimedOut
+from goaly.rsi.commit import commit_candidate
 from goaly.rsi.implementer import msa
-from goaly.rsi.implementer.environment import HostCommand
+from goaly.rsi.implementer.environment import HostCommand, SandboxStoppedError
 from goaly.rsi.implementer.model import (
     EXIT_COST_LIMIT,
     EXIT_INTERRUPTED,
@@ -169,6 +170,12 @@ def test_the_prompt_gives_the_hypothesis_paths_rules_and_limits(lane: Lane) -> N
     assert "json, math, re" in task  # The allowlist's stdlib modules, in plain words.
     assert "`goaly.harness.core.tools`" in task
     assert "Literal" in task
+    assert "do not use the network" in system
+    assert "git does not work in the sandbox" in task
+    assert "never `import goaly.harness.core.<module>`" in task
+    assert 'never `data["key"]`' in task
+    assert "no `from_attributes`" in task
+    assert "A class body may define no dunder" in task
     assert "COMPLETE_TASK_AND_SUBMIT_FINAL_OUTPUT" in task
 
 
@@ -382,7 +389,7 @@ async def test_by_default_glm_runs_in_the_sandbox(tmp_path: Path, lane: Lane) ->
 
     assert done.run.exit == E.IMPLEMENTER_EXIT_NO_CHANGES
     assert done.run.summary == "Nothing to change."
-    assert docker.commands() == ["run", "exec", "rm"]
+    assert docker.commands() == ["ps", "run", "exec", "rm", "ps", "ps"]
     (record,) = recorder.records
     assert (record.purpose, record.run_id) == (CallPurpose.CALL_PURPOSE_RSI_IMPL, EXPERIMENT)
     assert lane.trajectory()["info"]["config"]["model"]["run_id"] == EXPERIMENT
@@ -406,6 +413,7 @@ def test_the_runs_smoke_tests_are_recorded_and_offered_in_the_prompt(lane: Lane)
     assert [test.instance_id for test in done.run.smoke_tests] == ["12", "31", "40", "77"]
     assert [test.HasField("score") for test in done.run.smoke_tests] == [True, False, True, False]
     assert [instance for _, instance in runner.ran] == ["12", "40"]
+    assert lane.environment.events == ["paused", "resumed"] * 2  # Once per smoke run.
     task = lane.trajectory()["messages"][1]["content"]
     assert "run `goaly-smoke <instance_id>`" in task
     assert "at most 2 runs per hypothesis" in task
@@ -416,3 +424,122 @@ def test_without_a_runner_goaly_smoke_is_not_offered(lane: Lane) -> None:
 
     assert len(done.run.smoke_tests) == 0
     assert "goaly-smoke" not in lane.trajectory()["messages"][1]["content"]
+
+
+@pytest.mark.parametrize(
+    "lock_out",
+    [
+        pytest.param(f"chmod 000 {SKILL}", id="unreadable-file"),
+        pytest.param(f"chmod 000 $(dirname {SKILL})", id="unsearchable-directory"),
+    ],
+)
+def test_a_pack_the_host_cannot_read_rejects_the_candidate(lane: Lane, lock_out: str) -> None:
+    done = lane.run(WRITE_SKILL, lock_out, submit("Add a skill"))
+
+    assert done.run.exit == E.IMPLEMENTER_EXIT_CRASHED  # Rejected: neither aborted nor empty.
+    assert done.commit is None
+    assert lane.commits() == []
+    # Give the test's cleanup a readable tree.
+    (lane.worktree.path / SKILL).parent.chmod(0o755)
+    (lane.worktree.path / SKILL).chmod(0o644)
+
+
+def test_the_commit_comes_only_after_the_sandbox_is_gone(
+    lane: Lane, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    events: list[str] = []
+    environment_exit = FakeEnvironment.__exit__
+
+    def record_cleanup(self: FakeEnvironment, *exc_info: object) -> None:
+        events.append("sandbox removed")
+        environment_exit(self, *exc_info)
+
+    def record_commit(*args: Any, **kwargs: Any) -> str | None:
+        events.append("commit")
+        return commit_candidate(*args, **kwargs)
+
+    monkeypatch.setattr(FakeEnvironment, "__exit__", record_cleanup)
+    monkeypatch.setattr("goaly.rsi.implementer.run.commit_candidate", record_commit)
+
+    done = lane.run(WRITE_SKILL, submit("Add a skill"))
+
+    assert done.commit is not None
+    assert events == ["sandbox removed", "commit"]
+
+
+def test_a_sandbox_the_agent_stopped_rejects_the_candidate(lane: Lane) -> None:
+    def stopped(command: str) -> dict[str, Any]:
+        raise SandboxStoppedError("the sandbox container stopped: its init exited (0)")
+
+    lane.environment = FakeEnvironment(stopped)
+
+    done = lane.run("pkill sleep", submit())
+
+    assert done.run.exit == E.IMPLEMENTER_EXIT_CRASHED
+
+
+def test_a_stopped_run_is_interrupted_whatever_it_saw(lane: Lane) -> None:
+    stop = threading.Event()
+
+    def removed(command: str) -> dict[str, Any]:
+        stop.set()  # As implement() does when cancelled, removing the sandbox under the run.
+        raise SandboxError("the sandbox container is not running")
+
+    lane.environment = FakeEnvironment(removed)
+
+    done = lane.implementer(WRITE_SKILL, submit()).run(HYPOTHESIS, lane.worktree, stop)
+
+    assert done.run.exit == E.IMPLEMENTER_EXIT_INTERRUPTED
+
+
+def test_the_summary_is_cleaned_and_bounded(lane: Lane) -> None:
+    noisy = "Added a skill\\t\\x1b[31mred\\x1b[0m\\n" + "y" * 5000
+    done = lane.run(WRITE_SKILL, f"printf '%b\\n' {msa.SUBMIT_MARKER} '{noisy}'")
+
+    assert done.run.summary.startswith("Added a skill [31mred[0m\n")
+    assert len(done.run.summary) == 4000
+
+
+@pytest.mark.anyio
+async def test_cancelling_removes_the_sandbox_under_the_command_in_flight(
+    tmp_path: Path, lane: Lane
+) -> None:
+    docker = FakeDocker(tmp_path / "docker")
+    docker.script({"exec": {"sleep": 2}})
+    implementer = Implementer(
+        NoLlm(),
+        lane.workspace,
+        image="goaly-rsi-sandbox:test",
+        runs_dir=lane.runs,
+        pool=lane.pool,
+        sandbox=SandboxConfig(docker=str(docker.path)),
+        make_model=lambda experiment_id, stop: ScriptedModel(WRITE_SKILL, submit()),
+    )
+    task = asyncio.create_task(implementer.implement(HYPOTHESIS, lane.worktree))
+    while "exec" not in docker.commands():
+        await asyncio.sleep(0.05)
+
+    task.cancel()
+    with pytest.raises(asyncio.CancelledError):
+        await task
+    await asyncio.to_thread(lane.pool.shutdown, wait=True)
+
+    # Right after the exec began: the removal of the experiment's containers, by label.
+    assert docker.commands()[3] == "ps"
+    assert docker.calls()[3]["args"][-1] == "--filter=label=goaly.rsi.experiment=exp-1"
+    assert lane.commits() == []
+
+
+def test_a_failed_removal_on_cancel_is_logged(lane: Lane, caplog: pytest.LogCaptureFixture) -> None:
+    implementer = Implementer(
+        NoLlm(),
+        lane.workspace,
+        image="unused",
+        runs_dir=lane.runs,
+        pool=lane.pool,
+        sandbox=SandboxConfig(docker="/nonexistent/docker"),
+    )
+
+    implementer._abandon(lane.worktree)
+
+    assert "could not remove a stopped run's sandbox" in caplog.text

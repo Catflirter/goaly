@@ -30,7 +30,7 @@ import shutil
 import stat
 import tarfile
 import tempfile
-from collections.abc import Callable, Iterator, Mapping
+from collections.abc import Iterator, Mapping
 from contextlib import contextmanager
 from dataclasses import dataclass
 from functools import cached_property
@@ -153,10 +153,11 @@ class Workspace:
                     f"the branch {worktree.branch} already exists: an experiment ID is used once"
                 )
             worktree.path.parent.mkdir(parents=True, exist_ok=True)
-            self._git(
-                ["worktree", "add", "--quiet", "-b", worktree.branch, str(worktree.path), base]
-            )
             try:
+                # git can fail, or time out, after it has made the branch.
+                self._git(
+                    ["worktree", "add", "--quiet", "-b", worktree.branch, str(worktree.path), base]
+                )
                 _make_pack_dirs(worktree)
             except BaseException:
                 self._discard(worktree)
@@ -256,15 +257,17 @@ class Workspace:
     def remove(self, worktree: Worktree) -> None:
         """Remove the worktree's directory, untracked files included, and keep its branch.
 
+        Whatever modes the sandbox left on the pack's files and directories, they are deleted.
         Removing it again does nothing. Raises WorkspaceError, deleting nothing, for a path
-        outside the root, or for a directory git does not know as a worktree.
+        outside the root, or for a directory git does not know as a worktree; and WorkspaceError
+        if its files cannot be deleted.
         """
         if not worktree.path.is_relative_to(self.root):
             raise WorkspaceError(f"{worktree.path} lies outside the worktree root {self.root}")
         with self.lock():
             if worktree.path in {path for path, _ in self._registered()}:
                 if worktree.path.exists():  # Deleted here, so that git never reads its files.
-                    shutil.rmtree(worktree.path, onexc=_writable_and_retry)
+                    _remove_tree(worktree.path)
                 # Twice forced: also when the worktree is locked.
                 self._git(["worktree", "remove", "--force", "--force", str(worktree.path)])
             elif worktree.path.exists() or worktree.path.is_symlink():
@@ -368,24 +371,39 @@ def check_pack_files(worktree: Worktree) -> None:
     Call it before any git command runs in a candidate's worktree. Every entry under the pack
     directories is examined with lstat, and nothing is followed. Raises UnsafePackError naming
     every nested repository (a .git file or directory), each of git's .gitattributes, .gitmodules
-    and .gitignore, every symlink, and anything that is neither a regular file nor a directory.
+    and .gitignore, every symlink, anything that is neither a regular file nor a directory, and
+    every file or directory this user cannot read, which the walk could not examine and git could
+    not add.
     """
-    problems = []
+    problems: dict[str, None] = {}  # In the order found, each once.
+
+    def note(path: Path, problem: str) -> None:
+        problems.setdefault(f"{path.relative_to(worktree.path)}: {problem}")
+
+    def unreadable(error: OSError) -> None:
+        note(Path(error.filename), _UNREADABLE)
+
     for pack in worktree.pack_dirs:
         if not pack.exists() and not pack.is_symlink():
             continue
         if pack.is_symlink() or not pack.is_dir():
-            problems.append(f"{pack.relative_to(worktree.path)}: not a directory")
+            note(pack, "not a directory")
             continue
-        for directory, subdirectories, files in os.walk(pack):  # Never enters a symlink.
+        # os.walk never enters a symlink, and reports a directory it cannot list.
+        for directory, subdirectories, files in os.walk(pack, onerror=unreadable):
             for name in sorted([*subdirectories, *files]):
                 path = Path(directory) / name
-                problem = _problem(name, path.lstat().st_mode)
+                try:
+                    mode = path.lstat().st_mode
+                except OSError:  # Its directory can be listed but not searched.
+                    note(path, _UNREADABLE)
+                    continue
+                problem = _problem(path, mode)
                 if problem:
-                    problems.append(f"{path.relative_to(worktree.path)}: {problem}")
+                    note(path, problem)
             subdirectories[:] = [name for name in subdirectories if name not in GIT_FILES]
     if problems:
-        raise UnsafePackError(problems)
+        raise UnsafePackError(list(problems))
 
 
 def pack_modes(
@@ -421,24 +439,43 @@ def check_modes(modes: Mapping[str, str], where: str) -> None:
         raise UnsafePackError(problems)
 
 
-def _problem(name: str, mode: int) -> str | None:
-    if name == ".git":
+_UNREADABLE = "cannot be read"
+
+
+def _problem(path: Path, mode: int) -> str | None:
+    if path.name == ".git":
         return "a nested repository"
-    if name in GIT_FILES:
+    if path.name in GIT_FILES:
         return "git's own file"
     if stat.S_ISLNK(mode):
         return "a symlink"
     if not (stat.S_ISREG(mode) or stat.S_ISDIR(mode)):
         return "not a regular file"
+    access = os.R_OK | os.X_OK if stat.S_ISDIR(mode) else os.R_OK
+    if not os.access(path, access, follow_symlinks=False):
+        return _UNREADABLE
     return None
 
 
-def _writable_and_retry(function: Callable[[str], object], path: str, error: BaseException) -> None:
-    """Let rmtree delete what the sandbox made read-only: open up the parent and try once more,
-    which raises if that was not the problem.
+def _remove_tree(root: Path) -> None:
+    """Delete ``root`` and everything under it, whatever modes the sandbox left: each directory
+    first gets its owner's read, write and search bits, top-down and without following links.
+    Raises WorkspaceError if that fails.
     """
-    Path(path).parent.chmod(0o700)
-    function(path)
+    try:
+        pending = [root]
+        while pending:
+            directory = pending.pop()
+            mode = stat.S_IMODE(directory.lstat().st_mode)
+            if mode & stat.S_IRWXU != stat.S_IRWXU:
+                directory.chmod(mode | stat.S_IRWXU)
+            with os.scandir(directory) as entries:
+                pending += [
+                    Path(entry.path) for entry in entries if entry.is_dir(follow_symlinks=False)
+                ]
+        shutil.rmtree(root)
+    except OSError as error:
+        raise WorkspaceError(f"cannot remove {root}: {error}") from error
 
 
 def _set_writable(root: Path, *, writable: bool) -> None:

@@ -25,6 +25,8 @@ from contextlib import contextmanager
 from pathlib import Path
 from typing import Any, Final, cast
 
+import yaml  # type: ignore[import-untyped]  # PyYAML ships no types; mini-swe-agent requires it.
+
 from goaly.contracts.interfaces import JsonValue
 
 __all__ = [
@@ -73,7 +75,6 @@ with _contained_import():
     import minisweagent
     from minisweagent import Environment, Model
     from minisweagent.agents.default import DefaultAgent
-    from minisweagent.config import get_config_from_spec
     from minisweagent.environments.docker import DockerEnvironment
     from minisweagent.exceptions import (
         FormatError,
@@ -195,6 +196,11 @@ def make_agent(
 
 
 def load_yaml(path: Path) -> object:
-    """Return the YAML document at ``path``, read with mini-swe-agent's safe loader."""
-    document: object = get_config_from_spec(path)
+    """Return the YAML document at ``path``, read with PyYAML's safe loader.
+
+    It reads ``path`` and nothing else: mini-swe-agent's own config lookup would fall back to its
+    built-in configs. Raises FileNotFoundError if ``path`` does not exist, and yaml.YAMLError if
+    it is not YAML.
+    """
+    document: object = yaml.safe_load(path.read_text(encoding="utf-8"))
     return document

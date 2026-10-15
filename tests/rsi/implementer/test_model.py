@@ -177,6 +177,15 @@ async def test_the_run_stops_at_the_cost_limit() -> None:
     assert len(run.recorder.records) == 3
 
 
+async def test_the_run_stops_as_soon_as_the_cost_reaches_the_limit_exactly() -> None:
+    run = Run(Gateway(*(reply("ls", cost="1.5") for _ in range(3))))
+
+    await run.go()
+
+    assert run.result == {"exit_status": EXIT_COST_LIMIT, "submission": ""}
+    assert len(run.gateway.requests) == 2  # $1.50 and $1.50 make $3.00, the limit.
+
+
 async def test_the_run_stops_at_the_step_limit() -> None:
     run = Run(Gateway(*(reply("ls") for _ in range(5))))
 
