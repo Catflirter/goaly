@@ -338,7 +338,7 @@ class Runner[InstanceT: Instance, EnvT: Environment, CtxT: TaskContext]:
         own_lock = None if lock is not None else await asyncio.to_thread(lock_run_dir, files)
         try:
             plan = await asyncio.to_thread(
-                self._plan, files, manifest, split, seeds, instance_ids, resume
+                self._plan, files, manifest, split, seeds, instance_ids, resume, grading
             )
             run = await self._run_tasks(files, plan, grading=grading)
             await asyncio.to_thread(self._finish, files, plan, grading=grading)
@@ -366,6 +366,7 @@ class Runner[InstanceT: Instance, EnvT: Environment, CtxT: TaskContext]:
         seeds: list[int],
         instance_ids: Collection[str] | None,
         resume: bool,
+        grading: bool,
     ) -> "_Plan[InstanceT]":
         instances = self._instances(split, instance_ids)
         manifest = RunManifest()
@@ -392,7 +393,15 @@ class Runner[InstanceT: Instance, EnvT: Environment, CtxT: TaskContext]:
                     f"the run {stored.run_id} in {files.root} does not match this one in:"
                     f" {', '.join(different)}"
                 )
-            done = _recorded(files, keys)
+            recorded = _recorded(files, keys)
+            ungraded = [key for key, result in recorded.items() if not result.HasField("grade")]
+            if grading and split != SPLIT_EXTERNAL and ungraded:
+                # A graded resume would finish the run with these tasks never graded.
+                raise RunDirectoryError(
+                    f"the run {stored.run_id} in {files.root} has {len(ungraded)} tasks its solve"
+                    " phase left ungraded: its grade phase grades it (goaly run --phase grade)"
+                )
+            done = set(recorded)
             _logger.info(
                 "resuming run %s: %d of %d tasks recorded", stored.run_id, len(done), len(keys)
             )
@@ -757,14 +766,17 @@ def _checked_seeds(seeds: Sequence[int]) -> list[int]:
     return list(seeds)
 
 
-def _recorded(files: RunFiles, keys: set[_Key]) -> set[_Key]:
-    """The tasks of ``keys`` that the run's results file records. A torn last line is skipped,
-    and the next write cuts it off. A run directory holds one run, so every line is the run's."""
+def _recorded(files: RunFiles, keys: set[_Key]) -> dict[_Key, TaskResult]:
+    """The last result of each task of ``keys`` that the run's results file records. A torn last
+    line is skipped, and the next write cuts it off. A run directory holds one run, so every line
+    is the run's."""
     if not files.results.exists():  # Interrupted before its records files were created.
-        return set()
+        return {}
     return {
-        (result.instance_id, result.seed) for result in read_jsonl(files.results, TaskResult)
-    } & keys
+        key: result
+        for key, result in last_records(files.results, TaskResult).items()
+        if key in keys
+    }
 
 
 def last_records[M: (TaskResult, Trajectory)](path: Path, kind: type[M]) -> dict[_Key, M]:

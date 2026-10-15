@@ -868,6 +868,40 @@ async def test_a_solve_phase_takes_a_graded_evaluation_from_the_cache(tmp_path: 
     assert summary.cached == 2
 
 
+async def test_a_graded_resume_refuses_a_run_its_solve_phase_left_ungraded(
+    tmp_path: Path,
+) -> None:
+    async with asyncio.timeout(GUARD_S):
+        await make_runner(ScriptedBenchmark(toy_instances(2))).run(
+            tmp_path, template(), split=SPLIT_TRAIN, seeds=[0], grading=False
+        )
+
+    # Resuming it as a graded run would finish it with every task ungraded.
+    with pytest.raises(RunDirectoryError, match="its grade phase grades it"):
+        await run(make_runner(ScriptedBenchmark(toy_instances(2))), tmp_path, resume=True)
+
+    assert not read_manifest(RunFiles(tmp_path).manifest).HasField("finished_at")
+
+
+async def test_a_solve_phase_may_resume_a_run_and_leave_it_to_the_grade_phase(
+    tmp_path: Path,
+) -> None:
+    await interrupt_after(
+        make_runner(
+            ScriptedBenchmark(toy_instances(2)), ScriptedPolicy({"t1": waiting(asyncio.Event())})
+        ),
+        tmp_path,
+        1,
+    )
+
+    async with asyncio.timeout(GUARD_S):
+        summary = await make_runner(ScriptedBenchmark(toy_instances(2))).run(
+            tmp_path, template(), split=SPLIT_TRAIN, seeds=[0], resume=True, grading=False
+        )
+
+    assert (summary.resumed, summary.ran) == (1, 1)
+
+
 async def test_a_solve_phase_of_an_external_run_finishes_it(tmp_path: Path) -> None:
     organizers = [replace(inst, split=SPLIT_EXTERNAL, gold_sql=None) for inst in toy_instances(1)]
     benchmark = ScriptedBenchmark(toy_instances(1), external=organizers)
