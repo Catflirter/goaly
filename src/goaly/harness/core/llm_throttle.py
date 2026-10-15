@@ -4,10 +4,12 @@ A process may have at most its share of each model's global budget in flight: th
 config sets, or the whole budget for a process that runs alone. Other teams share the gateway,
 so its capacity can drop at any moment, and each model's limit adapts below the share:
 
-- AIMD. After a burst of 429s, 503s or timeouts the limit halves, never below 1. After every
-  20 successes in a row it grows by 1, never above the share. A burst is the congestion reported
-  by requests sent before the last halving: they ran under the old limit, so only a request sent
-  after it can show that the new limit is still too high.
+- AIMD. A burst of congestion halves the limit once, never below 1: 429s, 502s, 503s, 504s
+  or timeouts, 408s included. A burst is the congestion reported by requests sent before the
+  last halving: they ran under the old limit, so only a request sent after it can show that the
+  new limit is still too high. After every 20 successes in a row it grows by 1, never above the
+  share. Any failure ends the run, and only requests sent after the last halving count toward
+  it. A 500 or a connection error is a failure, not congestion: it lowers nothing.
 - Circuit breaker. When more than half of a model's attempts in the last 2 minutes failed (429,
   5xx, timeout or connection error), no new attempt starts for 60 s; the breaker then judges
   afresh. A retry is a new attempt, so it waits too, while requests already sent run on.
@@ -32,6 +34,7 @@ from goaly.contracts.gen.llm_call_pb2 import CallPurpose, LlmCallRecord, LlmCall
 from goaly.harness.core.llm_models import EXECUTOR_MODEL, IMPROVEMENT_MODEL
 
 __all__ = [
+    "CONGESTION_HTTP_STATUSES",
     "DEFAULT_SHARES",
     "TRANSIENT_FAILURES",
     "Clock",
@@ -54,7 +57,8 @@ TRANSIENT_FAILURES: Final = frozenset(
         _S.LLM_CALL_STATUS_CONNECTION_ERROR,
     }
 )
-_SERVICE_UNAVAILABLE: Final = 503
+# AIMD's congestion (spec §6.2): these responses, and any timeout, a 408 included.
+CONGESTION_HTTP_STATUSES: Final = frozenset({429, 502, 503, 504})
 
 # Each model's global budget (spec §6.2): all that a process running alone may use.
 DEFAULT_SHARES: Final[Mapping[str, int]] = MappingProxyType(
@@ -150,20 +154,22 @@ class ModelThrottle:
     ) -> None:
         """Take in how an attempt sent at ``sent_at`` ended: feed AIMD and the breaker."""
         now = self._clock.monotonic()
-        self._judge(status in TRANSIENT_FAILURES, now, record)
-        if status == _S.LLM_CALL_STATUS_OK:
-            self._successes += 1
+        failed = status in TRANSIENT_FAILURES
+        self._judge(failed, now, record)
+        if failed:
+            self._successes = 0  # Any failure ends the run of successes.
+            congested = status == _S.LLM_CALL_STATUS_TIMEOUT or (
+                http_status in CONGESTION_HTTP_STATUSES
+            )
+            if congested and sent_at > self._halved_at:  # The first sign of a new burst.
+                self._halved_at = now
+                self._halve(status, http_status, record)
+        elif status == _S.LLM_CALL_STATUS_OK and sent_at > self._halved_at:
+            self._successes += 1  # Sent under the current limit, so it speaks for that limit.
             if self._successes >= self._policy.successes_to_grow:
                 self._successes = 0
                 if self._limit < self.share:
                     self._grow(record)
-        elif status in (_S.LLM_CALL_STATUS_RATE_LIMITED, _S.LLM_CALL_STATUS_TIMEOUT) or (
-            status == _S.LLM_CALL_STATUS_SERVER_ERROR and http_status == _SERVICE_UNAVAILABLE
-        ):
-            self._successes = 0
-            if sent_at > self._halved_at:  # The first sign of a new burst.
-                self._halved_at = now
-                self._halve(status, http_status, record)
 
     async def _acquire(self, record: LlmCallRecord) -> None:
         while True:

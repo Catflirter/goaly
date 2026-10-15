@@ -206,12 +206,16 @@ async def test_a_call_that_raises_gives_its_slot_back() -> None:
 
 @pytest.mark.parametrize(
     ("status", "http_status"),
-    [(RATE_LIMITED, 429), (SERVER_ERROR, 503), (TIMEOUT, 0)],
-    ids=["429", "503", "timeout"],
+    [
+        pytest.param(RATE_LIMITED, 429, id="429"),
+        pytest.param(SERVER_ERROR, 502, id="502"),
+        pytest.param(SERVER_ERROR, 503, id="503"),
+        pytest.param(SERVER_ERROR, 504, id="504"),
+        pytest.param(TIMEOUT, 0, id="timeout"),
+        pytest.param(TIMEOUT, 408, id="408"),
+    ],
 )
-def test_halves_the_limit_after_a_429_a_503_or_a_timeout(
-    status: LlmCallStatus.ValueType, http_status: int
-) -> None:
+def test_halves_the_limit_on_congestion(status: LlmCallStatus.ValueType, http_status: int) -> None:
     clock = FakeClock()
     limiter = new_throttle(share=8, clock=clock)
 
@@ -223,12 +227,12 @@ def test_halves_the_limit_after_a_429_a_503_or_a_timeout(
 @pytest.mark.parametrize(
     ("status", "http_status"),
     [
-        (OK, 200),
-        (SERVER_ERROR, 500),
-        (SERVER_ERROR, 502),
-        (CONNECTION_ERROR, 0),
-        (CLIENT_ERROR, 400),
-        (CONTEXT_OVERFLOW, 400),
+        pytest.param(OK, 200, id="ok"),
+        pytest.param(SERVER_ERROR, 500, id="500"),
+        pytest.param(CONNECTION_ERROR, 0, id="connection-error"),
+        pytest.param(CLIENT_ERROR, 400, id="400"),
+        pytest.param(CONTEXT_OVERFLOW, 400, id="context-overflow"),
+        pytest.param(INVALID_RESPONSE, 200, id="invalid-response"),
     ],
 )
 def test_other_outcomes_do_not_lower_the_limit(
@@ -260,6 +264,19 @@ def test_halves_once_per_burst() -> None:
     assert limiter.limit == 2
 
 
+def test_a_burst_spread_over_time_still_halves_once() -> None:
+    clock = FakeClock()
+    limiter = new_throttle(share=8, clock=clock)
+    first_sent, second_sent = clock.now, clock.now + 0.5
+    clock.now += 1.0  # The first congested reply comes back, after both were sent.
+
+    observe(limiter, RATE_LIMITED, 429, first_sent)
+    clock.now += 0.2
+    observe(limiter, SERVER_ERROR, 503, second_sent)  # Sent before the halving: same burst.
+
+    assert limiter.limit == 4
+
+
 def test_never_halves_below_one() -> None:
     clock = FakeClock()
     limiter = new_throttle(share=3, clock=clock)
@@ -274,6 +291,7 @@ def test_grows_by_one_after_every_20_consecutive_successes() -> None:
     clock = FakeClock()
     limiter = new_throttle(share=8, clock=clock)
     observe(limiter, RATE_LIMITED, 429, clock.now)
+    clock.now += 1.0  # The successes below are of requests sent after the halving.
 
     succeed(limiter, clock, 19)
     assert limiter.limit == 4
@@ -283,19 +301,66 @@ def test_grows_by_one_after_every_20_consecutive_successes() -> None:
     assert limiter.limit == 6
 
 
-def test_congestion_restarts_the_count_of_successes() -> None:
+@pytest.mark.parametrize(
+    ("status", "http_status"),
+    [
+        pytest.param(RATE_LIMITED, 429, id="old-burst-429"),
+        pytest.param(SERVER_ERROR, 500, id="500"),
+        pytest.param(CONNECTION_ERROR, 0, id="connection-error"),
+    ],
+)
+def test_any_failure_restarts_the_run_of_successes(
+    status: LlmCallStatus.ValueType, http_status: int
+) -> None:
+    clock = FakeClock()
+    limiter = new_throttle(share=8, clock=clock)
+    sent = clock.now
+    clock.now += 1.0
+    observe(limiter, RATE_LIMITED, 429, sent)
+    clock.now += 1.0
+
+    succeed(limiter, clock, 19)
+    observe(limiter, status, http_status, sent)  # No halving: a 500, or the old burst's 429.
+    succeed(limiter, clock, 19)
+    assert limiter.limit == 4
+    succeed(limiter, clock, 1)
+    assert limiter.limit == 5
+
+
+@pytest.mark.parametrize(
+    ("status", "http_status"),
+    [
+        pytest.param(CLIENT_ERROR, 400, id="400"),
+        pytest.param(CONTEXT_OVERFLOW, 400, id="context-overflow"),
+        pytest.param(INVALID_RESPONSE, 200, id="invalid-response"),
+    ],
+)
+def test_a_refused_request_leaves_the_run_of_successes_alone(
+    status: LlmCallStatus.ValueType, http_status: int
+) -> None:
+    clock = FakeClock()
+    limiter = new_throttle(share=8, clock=clock)
+    observe(limiter, RATE_LIMITED, 429, clock.now)
+    clock.now += 1.0
+
+    succeed(limiter, clock, 19)
+    observe(limiter, status, http_status, clock.now)
+    succeed(limiter, clock, 1)
+
+    assert limiter.limit == 5
+
+
+def test_successes_sent_before_the_last_halving_do_not_count() -> None:
     clock = FakeClock()
     limiter = new_throttle(share=8, clock=clock)
     sent = clock.now
     clock.now += 1.0
     observe(limiter, RATE_LIMITED, 429, sent)
 
-    succeed(limiter, clock, 19)
-    observe(limiter, RATE_LIMITED, 429, sent)  # Part of the old burst: no halving, but a reset.
-    succeed(limiter, clock, 19)
+    for _ in range(40):  # They ran under the old limit, so they say nothing of the new one.
+        observe(limiter, OK, 200, sent)
+
     assert limiter.limit == 4
-    succeed(limiter, clock, 1)
-    assert limiter.limit == 5
 
 
 def test_never_grows_above_the_share() -> None:
@@ -331,6 +396,7 @@ async def test_a_higher_limit_lets_a_waiting_call_start() -> None:
     clock = FakeClock()
     limiter = new_throttle(share=2, clock=clock)
     observe(limiter, RATE_LIMITED, 429, clock.now)
+    clock.now += 1.0
     done, entered = asyncio.Event(), list[int]()
     tasks = [asyncio.create_task(hold(limiter, done, entered, n)) for n in range(2)]
     await settle()
@@ -352,14 +418,15 @@ def test_logs_each_change_of_the_limit_with_the_purpose_and_model(
     limiter = new_throttle(share=8, clock=clock)
 
     observe(limiter, RATE_LIMITED, 429, clock.now)
+    clock.now += 1.0
     succeed(limiter, clock, 20)
 
     (down,) = events(caplog, "llm_limit_down")
     (up,) = events(caplog, "llm_limit_up")
     assert down.levelno == logging.WARNING
     assert up.levelno == logging.INFO
-    fields = ["model", "purpose", "call_id", "limit", "previous_limit", "share"]
-    assert {key: getattr(down, key) for key in [*fields, "after", "http_status"]} == {
+    keys = ["model", "purpose", "call_id", "limit", "previous_limit", "share"]
+    assert {key: getattr(down, key) for key in [*keys, "after", "http_status"]} == {
         "model": QWEN,
         "purpose": "CALL_PURPOSE_EXEC",
         "call_id": "c-1",
@@ -369,7 +436,7 @@ def test_logs_each_change_of_the_limit_with_the_purpose_and_model(
         "after": "LLM_CALL_STATUS_RATE_LIMITED",
         "http_status": 429,
     }
-    assert {key: getattr(up, key) for key in fields} == {
+    assert {key: getattr(up, key) for key in keys} == {
         "model": QWEN,
         "purpose": "CALL_PURPOSE_EXEC",
         "call_id": "c-1",
