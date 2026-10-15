@@ -276,13 +276,13 @@ Adding a benchmark takes a `Benchmark` adapter and a capability pack. core does 
 - **Result signatures.** Results can be large. At least 56 gradable tasks return more than 1M rows on SF3, counted from the plans that record actual rows at SF3. The largest SF3 results are around 18–20M rows: a full `lineitem` is 17,996,609 rows (task 1), and task 45's join returns 19,719,920. The setup measures the exact counts on SF3. The grader therefore reads rows through a server-side cursor and hashes them off the event loop. It keeps an order-independent compact digest, the sum of the row hashes mod 2^256 plus the row count, and never a dictionary of row hashes.
 - **Hard-coding checks.** A prediction can return the base query's result as constants, for example `SELECT 12345.67 AS revenue` or `SELECT * FROM (VALUES …)`. Such a prediction matches and scores τ = 1000. Many tasks are exposed: of the 154 tasks whose plan records actual rows, 25 return a single row. Two checks therefore run on every matched prediction, in both grading modes:
   1. **Robustness check.** The prediction must also return `base_sql`'s result on the alternate database. Otherwise its credit is 0, and it is flagged `hard_coded` (contract field `EffiSqlGrade.alt_matched`).
-  2. **Plan check.** `EXPLAIN (FORMAT JSON)` runs on the prediction. Its credit is 0, and it is flagged `literal_result`, if its plan scans none of the base query's relations, or if its output comes from a Values Scan or Result subtree with no relation scan beneath it. `VALUES` itself stays allowed: 3 golds use it, such as task 1, which unpivots with `VALUES (t.l_extendedprice), …`. This check closes the gap the first one leaves: `region` and `nation` have the same rows at every TPC-H scale, so a constant answer over them matches on both databases.
+  2. **Plan check.** `EXPLAIN (FORMAT JSON)` runs on every prediction before its comparison run, and a `ModifyTable` plan is refused there (below). The `literal_result` test applies only once the prediction has matched. Its credit is then 0, and it is flagged `literal_result`, if its plan scans none of the base query's relations, or if its output comes from a Values Scan or Result subtree with no relation scan beneath it. `VALUES` itself stays allowed: 3 golds use it, such as task 1, which unpivots with `VALUES (t.l_extendedprice), …`. This check closes the gap the first one leaves: `region` and `nation` have the same rows at every TPC-H scale, so a constant answer over them matches on both databases.
 
   Three rules govern how the checks apply:
 
   - **Matched predictions only.** A wrong rewrite also fails on the alternate database, so checking it would flag nearly every rejected candidate as hard-coded. An unmatched prediction's flags therefore stay unset.
   - **Flags do not stop timing.** A matched prediction is timed even when a check flags it.
-  - **Data-modifying plans are refused, not flagged.** A plan with a `ModifyTable` node is refused before it runs, and the prediction counts as not matched (`PREDICTION_FAILED`).
+  - **Data-modifying plans are refused, not flagged.** A plan with a `ModifyTable` node is refused at that first `EXPLAIN`, before the prediction runs, and the prediction counts as not matched (`PREDICTION_FAILED`).
 
   Gold mode must pass every gold that is not excluded, which calibrates both checks. In dev mode a flagged prediction gets credit 0, and in RSI it fails its candidate outright; the ledger and the lessons record the flag (§8.2). In official mode the official R-VES stays as the evaluator computes it, and the **checked R-VES** gives flagged predictions credit 0. The report gives both. In the grade contract, `credit` is the checked credit; the official credit is g(`speedup`) when matched. The checked Coverage@2x and GMS also leave out flagged tasks, because a hard-coded task stays matched with τ ≈ 1000 in the official numbers.
 - **Self-checks.** The gold check alone is circular, because a gold that fails is excluded, and a matcher that always says "match" would pass both the gold and the identity check. The self-checks therefore include checks that can fail:
@@ -536,7 +536,7 @@ In the RSI phase a lane's GLM share covers its analyst, its implementers and its
   - T12 measures the queue wait.
 - **Fetching and hashing.** Every comparison run fetches and hashes the whole result, at a few microseconds per row. At least 56 gradable tasks return more than 1M rows on SF3, and each of the largest SF3 results, around 18–20M rows, takes over a minute. The setup measures the exact counts (§4.1), and the estimates below include this time.
 - **Grading time per candidate** (dev mode, §4.1). A prediction costs one comparison run, up to 3 timed runs and the robustness check on the alternate database. From the dataset's timings, leaving out the 5 tasks over 300 s, that is about 55 s per task at gold speed and about 110 s at τ ≈ 1; an identity submission costs nothing. On the 3 grading instances, screening a candidate (20 tasks) takes about 6–12 minutes and validating it (30 tasks) about 9–18 minutes. A round of 3 candidates spends about 40–110 minutes on grading, depending on how many reach validation.
-- **Official mode** times both sides with no cache: about 2.5–3.5 minutes per task, so a 60-task held-out run takes about 55–70 minutes on 3 instances. v0's single held-out run therefore takes about an hour of grading.
+- **Official mode** times both sides with no cache: about 2.5–3.5 minutes per task, so a 60-task held-out run takes about 50–70 minutes on 3 instances. v0's single held-out run therefore takes about an hour of grading.
 - **One-time setup.** The base cache, the identity τ, the alternate-database signatures, the gold check and the exclusions take about 14 instance-hours: about 3 hours on all 5 instances.
 - **Rounds.** An Effi-SQL round takes about 85–190 minutes end to end, the fast and slow cases of §13: analysis and implementation, then screening, validation and one confirmation rerun, with solving and grading overlapping. The schedule (§13) plans 1 round, with a second as upside, and gives the conditions for each.
 - These figures are estimates from the file's timings, which come from the authors' hardware and partly from SF10 (§4.1), so they lean high. T10 and T12 measure the real times on this machine, and these numbers will be updated from those measurements.
@@ -721,9 +721,18 @@ All thresholds are set in config, and every decision records the thresholds it u
 
 ### 8.4 Stopping
 
-A lane stops after 4 rounds in a row with no accepted change, or when its time budget runs out.
+A lane stops after 4 rounds in a row with no accepted change, or at its deadline. The deadline is an absolute time in config, set to the freeze time (§13), so a restart never moves it.
 
-A lane that stops writes a stop record to the ledger, opens its final results PR, notifies the project lead, and exits normally. The supervisor does not restart it, and the supervisor exits once every lane has stopped (§8.7).
+When the deadline is reached, the lane:
+
+1. aborts the running round's in-flight experiments and records them as aborted;
+2. keeps the best;
+3. writes the stop record;
+4. opens the final results PR;
+5. notifies the project lead;
+6. exits 0.
+
+A lane that stops after 4 rounds with no accepted change does steps 3–6. The supervisor does not restart a lane that exits 0, and it exits once every lane has stopped (§8.7).
 
 ### 8.5 Anti-gaming and safety boundaries
 
@@ -764,7 +773,7 @@ A lane that stops writes a stop record to the ledger, opens its final results PR
 
 - an experiment interrupted before its commit is aborted, and its hypothesis goes back in the queue;
 - one interrupted after its commit resumes at its next phase, and cached evaluations make finished tasks free;
-- the round number, the rounds without an accepted change and the time budget are recomputed from the ledger, and the time budget counts from the lane's first start;
+- the round number and the rounds without an accepted change are recomputed from the ledger. The deadline is absolute (§8.4), so a restart never extends it;
 - leftover sandbox containers and worktrees are removed.
 
 The project lead manages the Coder workspace's auto-stop. If the workspace stops, every process stops with it, and running `goaly rsi run` again after the restart resumes every lane from the ledger.
@@ -911,7 +920,7 @@ The implementer is mini-swe-agent's `DefaultAgent` (`mini-swe-agent==2.4.6`, MIT
 
 | Risk | Mitigation |
 |---|---|
-| Grading time. Grading capacity binds the whole day: the setup takes about 14 instance-hours, each official held-out run about 55–70 minutes, and dev mode about 40–110 minutes per round (§6.2). A slow prediction can hold an instance for up to the 300 s statement timeout on each run | The grading-instance plan (§6.2) fixes each phase's instances and priority. Dev mode caches the base side and grades identity submissions for free, and the setup and the final also use the 2 solving instances. v0's held-out run, 1 seed, starts as soon as v0's train and val dev runs are done (T12). T10 measures the real times first, and the schedule (§13) plans 1 RSI round, with a second as upside |
+| Grading time. Grading capacity binds the whole day: the setup takes about 14 instance-hours, each official held-out run about 50–70 minutes, and dev mode about 40–110 minutes per round (§6.2). A slow prediction can hold an instance for up to the 300 s statement timeout on each run | The grading-instance plan (§6.2) fixes each phase's instances and priority. Dev mode caches the base side and grades identity submissions for free, and the setup and the final also use the 2 solving instances. v0's held-out run, 1 seed, starts as soon as v0's train and val dev runs are done (T12). T10 measures the real times first, and the schedule (§13) plans 1 RSI round, with a second as upside |
 | RSI completes no round before the freeze: a late T11 or a late lane start, with slow rounds (§13) | Report it honestly: the final harness is then v0, and the report says that no round completed. Keep what the partial round learned: its hypotheses, implementations, screening results and lessons are in the ledger and go into the report |
 | Solving capacity. Every agent statement runs on the 2 solving instances, at about 50–75 core-seconds per task | At most 2 statements in flight per solving instance, with the queue wait reported to the agent separately; a 120 s statement timeout; about 16 lane tasks at once (§6.2). T12 measures the queue wait |
 | Hard-coded results: a prediction that returns the base result as constants matches and scores τ = 1000 | The robustness check on the alternate database and the plan check (§4.1). A flagged candidate fails outright, and the report gives the checked R-VES next to the official one |
