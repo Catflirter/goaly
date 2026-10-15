@@ -63,3 +63,29 @@ def test_a_file_that_cannot_be_checked_fails(tmp_path: Path, name: str, text: st
 
     with pytest.raises(GoldDataError, match=name):
         check_gold_free([path])
+
+
+def test_a_line_separator_inside_a_value_splits_no_line(tmp_path: Path) -> None:
+    task = {**RUNTIME_TASK, "base_sql": "SELECT 1 -- a\u2028b\u0085c"}
+    path = tmp_path / "tasks.jsonl"
+    path.write_text(json.dumps(task, ensure_ascii=False) + "\n", encoding="utf-8")
+
+    check_gold_free([path])
+
+
+def test_a_gold_field_inside_a_list_is_found(tmp_path: Path) -> None:
+    path = tmp_path / "plans.json"
+    path.write_text(json.dumps([{"id": 1}, {"optimized_sql": "SELECT 1"}]), encoding="utf-8")
+
+    with pytest.raises(GoldDataError) as caught:
+        check_gold_free([path])
+
+    assert caught.value.problems == [f"{path}:1: optimized_sql"]
+
+
+def test_a_file_nested_too_deeply_to_check_fails(tmp_path: Path) -> None:
+    path = tmp_path / "deep.json"
+    path.write_text("[" * 100_000 + "]" * 100_000, encoding="utf-8")
+
+    with pytest.raises(GoldDataError, match="cannot be checked"):
+        check_gold_free([path])

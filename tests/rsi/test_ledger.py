@@ -1,5 +1,6 @@
 """Tests for goaly.rsi.ledger: the experiments log, its lock and the replay helpers."""
 
+import errno
 import logging
 import os
 import subprocess
@@ -73,6 +74,24 @@ def raw_append(ledger: Ledger, record: ExperimentRecord) -> None:
     """Append ``record`` as a hand edit would, past the ledger's checks."""
     ledger.directory.mkdir(parents=True, exist_ok=True)
     append_jsonl(ledger.directory / "experiments.jsonl", record)
+
+
+# Root ignores a directory's missing write bit, so these tests need another user.
+needs_non_root = pytest.mark.skipif(os.geteuid() == 0, reason="root ignores the write bit")
+
+FINAL = [DECISION_ACCEPTED, DECISION_REJECTED, DECISION_ABORTED]
+
+
+def no_lock_file(monkeypatch: pytest.MonkeyPatch, code: int) -> None:
+    """Make creating or opening a lock file fail with ``code``, as a read-only mount does."""
+    real_open = os.open
+
+    def fake_open(path: str | os.PathLike[str], flags: int, mode: int = 0o777) -> int:
+        if os.fspath(path).endswith(".lock"):
+            raise OSError(code, os.strerror(code), os.fspath(path))
+        return real_open(path, flags, mode)
+
+    monkeypatch.setattr(os, "open", fake_open)
 
 
 @pytest.fixture
@@ -180,7 +199,7 @@ def test_an_invalid_record_is_refused_and_nothing_is_written(
     with pytest.raises(ValueError, match=problem):
         ledger.record_experiment(record)
 
-    assert not (ledger.directory / "experiments.jsonl").exists()
+    assert not ledger.directory.exists()  # Not even the directory or its lock file.
 
 
 def test_an_accepted_record_needs_its_commit(ledger: Ledger) -> None:
@@ -207,15 +226,42 @@ def test_an_experiments_round_never_changes(ledger: Ledger) -> None:
         ledger.record_experiment(experiment("e1", DECISION_REJECTED, round_number=3))
 
 
-@pytest.mark.parametrize("final", [DECISION_ACCEPTED, DECISION_REJECTED, DECISION_ABORTED])
+@pytest.mark.parametrize("final", FINAL)
 def test_a_decided_experiment_never_goes_back_to_pending(
     ledger: Ledger, final: Decision.ValueType
 ) -> None:
     ledger.record_experiment(experiment("e1"))
     ledger.record_experiment(experiment("e1", final))
 
-    with pytest.raises(ValueError, match="pending"):
+    with pytest.raises(ValueError, match="cannot become DECISION_PENDING"):
         ledger.record_experiment(experiment("e1"))
+
+    assert len(ledger.experiments()) == 2
+
+
+@pytest.mark.parametrize(
+    ("final", "other"),
+    [(final, other) for final in FINAL for other in FINAL if other != final],
+)
+def test_a_decided_experiment_keeps_its_decision(
+    ledger: Ledger, final: Decision.ValueType, other: Decision.ValueType
+) -> None:
+    ledger.record_experiment(experiment("e1", final))
+
+    with pytest.raises(ValueError, match=f"decided as {Decision.Name(final)}"):
+        ledger.record_experiment(experiment("e1", other))
+
+    assert ledger.best_version(LANE_EFFISQL) == (
+        "e1-commit" if final == DECISION_ACCEPTED else None
+    )
+
+
+@pytest.mark.parametrize("final", FINAL)
+def test_a_decision_can_be_written_again_unchanged(
+    ledger: Ledger, final: Decision.ValueType
+) -> None:
+    ledger.record_experiment(experiment("e1", final))
+    ledger.record_experiment(experiment("e1", final))  # A resumed lane repeats its last write.
 
     assert len(ledger.experiments()) == 2
 
@@ -240,6 +286,7 @@ def test_a_read_waits_for_a_write_in_progress(tmp_path: Path) -> None:
         ledger.experiments()
 
 
+@needs_non_root
 @pytest.mark.usefixtures("writable_again")
 def test_a_ledger_without_write_access_can_still_be_read(
     ledger: Ledger, caplog: pytest.LogCaptureFixture
@@ -410,7 +457,8 @@ def test_the_best_version_is_the_candidate_accepted_in_the_latest_round(ledger: 
 def test_an_acceptance_overwritten_by_a_later_record_no_longer_counts(ledger: Ledger) -> None:
     ledger.record_experiment(experiment("e1", DECISION_ACCEPTED, round_number=1, commit="c1"))
     ledger.record_experiment(experiment("e2", DECISION_ACCEPTED, round_number=2, commit="c2"))
-    ledger.record_experiment(experiment("e2", DECISION_REJECTED, round_number=2))
+    # Only a hand edit can change a decision; the replay still takes the last line.
+    raw_append(ledger, experiment("e2", DECISION_REJECTED, round_number=2))
 
     assert ledger.best_version(LANE_EFFISQL) == "c1"
 
@@ -529,6 +577,31 @@ def test_a_session_refuses_an_invalid_lesson(ledger: Ledger, lesson: Lesson, pro
     assert not (ledger.directory / "lessons.jsonl").exists()
 
 
+def test_a_ledger_on_a_read_only_file_system_can_still_be_read(
+    ledger: Ledger, monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
+) -> None:
+    ledger.record_experiment(experiment("e1"))
+    (ledger.directory / ".lock").unlink()  # A copy made with cp *.jsonl has none.
+    no_lock_file(monkeypatch, errno.EROFS)
+
+    with caplog.at_level(logging.WARNING):
+        assert ledger.experiments() == [experiment("e1")]
+    assert "without the lock" in caplog.text
+    with pytest.raises(OSError, match="Read-only file system"):
+        ledger.record_experiment(experiment("e2"))
+
+
+def test_any_other_failure_to_open_the_lock_is_raised(
+    ledger: Ledger, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    ledger.record_experiment(experiment("e1"))
+    no_lock_file(monkeypatch, errno.EIO)
+
+    with pytest.raises(OSError, match="Input/output error"):
+        ledger.experiments()
+
+
+@needs_non_root
 @pytest.mark.usefixtures("writable_again")
 def test_a_write_without_a_lock_file_it_can_create_fails(ledger: Ledger) -> None:
     ledger.record_experiment(experiment("e1"))

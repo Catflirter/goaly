@@ -1,0 +1,681 @@
+"""Tests for goaly.bench.effisql.harness: the Effi-SQL factories, through `goaly run`.
+
+The runs here are the FakeLLM dry run: synthetic tasks, a scripted model, fake solving
+instances and a fake grader, wired through the real CLI, runner and grade phase.
+"""
+
+import asyncio
+import dataclasses
+import hashlib
+import json
+import logging
+import subprocess
+import sys
+from collections.abc import Iterator
+from pathlib import Path
+
+import pytest
+from pydantic import SecretStr, ValidationError
+
+from goaly import cli as goaly_cli
+from goaly.bench.effisql.data import (
+    DATASET_FILE,
+    DATASET_REVISION,
+    DATASET_SHA256,
+    RUNTIME_FILE,
+    ChecksumMismatchError,
+    EffiSqlInstance,
+    fetch_dataset,
+)
+from goaly.bench.effisql.grading import Mode
+from goaly.bench.effisql.grading_pool import Priority
+from goaly.bench.effisql.harness import (
+    GRADING_INSTANCE_SETS,
+    PACK_DIR,
+    SOLVING_STATEMENT_TIMEOUT_S,
+    EffiSqlPaths,
+    EffiSqlWiring,
+    LazyGrader,
+    PackRunConfig,
+    PlanLog,
+    RunCallLog,
+    _full_shares,  # The share rule, tested directly.
+    classify_error,
+    context_factory,
+    grading_priority,
+    load_pack,
+    load_tasks,
+    model_settings,
+    named_priority,
+    open_harness,
+    open_host,
+    pack_models,
+    recorded_priority,
+)
+from goaly.bench.effisql.pg_instances import SOLVING
+from goaly.bench.effisql.pg_settings import AgentCredentials, PgCredentials
+from goaly.bench.effisql.splits import load_splits
+from goaly.bench.effisql.sql_env import STATEMENT_TIMEOUT, PgSqlEnvironment, SolvingPool
+from goaly.contracts.errors import EnvironmentFailure
+from goaly.contracts.gen.llm_call_pb2 import CALL_PURPOSE_EXEC, LlmCallRecord
+from goaly.contracts.gen.manifest_pb2 import RunManifest
+from goaly.contracts.gen.result_pb2 import (
+    TASK_ERROR_TYPE_ENVIRONMENT,
+    TASK_ERROR_TYPE_LLM,
+    TASK_ERROR_TYPE_POLICY_CRASH,
+    TaskResult,
+)
+from goaly.contracts.gen.task_pb2 import (
+    SPLIT_EXTERNAL,
+    SPLIT_HELDOUT,
+    SPLIT_TRAIN,
+    SPLIT_VAL,
+    EffiSqlPrediction,
+    Prediction,
+)
+from goaly.contracts.jsonl import read_jsonl
+from goaly.harness.core import cli
+from goaly.harness.core.budgets import Budgets
+from goaly.harness.core.grading import GRADING_TASK
+from goaly.harness.core.jsonl_writer import JsonlWriter
+from goaly.harness.core.llm import BoundLlmClient, CallTags, LlmClient
+from goaly.harness.core.llm_errors import (
+    ClientError,
+    ConnectionFailed,
+    ContextOverflow,
+    InvalidResponse,
+    ModelNotAllowed,
+    RateLimited,
+    ServerError,
+    TimedOut,
+)
+from goaly.harness.core.llm_models import EXECUTOR_MODEL, IMPROVEMENT_MODEL, ModelParams
+from goaly.harness.core.manifest import read_manifest, write_manifest
+from goaly.harness.core.registry import HarnessOptions, HostOptions, Registry
+from goaly.harness.core.runner import RunFiles, RunIdentity
+from goaly.harness.core.tools import bind
+from goaly.harness.packs.effisql.tools import ExecuteSql, ExecuteSqlConfig
+from tests.bench.effisql.fake_run import (
+    OFFICIAL_FORM,
+    FakeClient,
+    FakeGrader,
+    FakeWiring,
+    fake_wiring,
+    write_inputs,
+)
+from tests.bench.effisql.synthetic import task
+from tests.bench.effisql.test_sql_env import Scenario
+
+pytestmark = pytest.mark.anyio
+
+_PACK_MODULES = "goaly.harness.packs"
+VAL_ID = load_splits().val[0]
+
+
+@pytest.fixture(autouse=True)
+def _restore_logging() -> Iterator[None]:
+    """cli.main configures logging for the process: put it back after each test."""
+    root = logging.getLogger()
+    handlers, level = list(root.handlers), root.level
+    yield
+    for handler in list(root.handlers):
+        if handler not in handlers:
+            root.removeHandler(handler)
+    root.setLevel(level)
+
+
+def registry(fakes: FakeWiring) -> Registry:
+    registry = Registry()
+    registry.add(
+        "effisql",
+        "v0",
+        lambda options: open_harness(options, fakes.wiring),
+        pack_dir=PACK_DIR,
+        models=pack_models(),
+    )
+    registry.add_benchmark("effisql", lambda options: open_host(options, fakes.wiring))
+    return registry
+
+
+def goaly_run(fakes: FakeWiring, *args: str) -> int:
+    # Part (c)'s host side has no launcher yet: one process, with the fakes (part (d) isolates).
+    if "--phase" not in args or args[args.index("--phase") + 1] != "grade":
+        args = (*args, "--in-process")
+    return cli.main(
+        ["run", "--bench", "effisql", *args], registry(fakes), budgets_file=goaly_cli.BUDGETS_FILE
+    )
+
+
+def results(run: Path) -> list[TaskResult]:
+    return list(read_jsonl(run / "results.jsonl", TaskResult))
+
+
+class TestPack:
+    def test_the_pack_config_loads_into_core_types(self) -> None:
+        config, prompt = load_pack(PACK_DIR)
+
+        assert config.model == ModelParams(
+            enable_thinking=True, temperature=0.6, top_p=0.95, top_k=20, max_tokens=16000
+        )
+        assert config.budgets == Budgets(steps=30, wall_clock_s=600)
+        assert config.pack["execute_sql"] == {
+            "statement_timeout_s": 120,
+            "rows_shown": 100,
+            "value_chars": 2000,
+        }
+        assert "compute its result from the tables" in prompt
+
+    def test_an_unknown_section_is_refused(self, tmp_path: Path) -> None:
+        (tmp_path / "config.yaml").write_text(
+            "model: {}\nbudgets: {steps: 1, wall_clock_s: 1}\nx: 1\n"
+        )
+        (tmp_path / "prompt.md").write_text("p")
+
+        with pytest.raises(ValidationError):
+            load_pack(tmp_path)
+
+    def test_importing_the_composition_root_imports_no_pack_code(self) -> None:
+        code = (
+            "import sys, goaly.cli; "
+            f"print(sorted(m for m in sys.modules if m.startswith({_PACK_MODULES!r})))"
+        )
+        # A fixed command: this interpreter running a constant string.
+        out = subprocess.run(  # noqa: S603
+            [sys.executable, "-c", code], capture_output=True, text=True, check=True, timeout=60
+        )
+
+        assert out.stdout.strip() == "[]"
+
+
+class TestPieces:
+    @pytest.mark.parametrize("error", [RateLimited, ServerError, TimedOut, ConnectionFailed])
+    def test_a_gateway_outage_is_an_llm_error(self, error: type[Exception]) -> None:
+        assert classify_error(error("down")) == TASK_ERROR_TYPE_LLM
+
+    @pytest.mark.parametrize(
+        "error", [ContextOverflow, InvalidResponse, ClientError, ModelNotAllowed, ValueError]
+    )
+    def test_other_failures_end_the_task_as_a_crash(self, error: type[Exception]) -> None:
+        assert classify_error(error("bad")) == TASK_ERROR_TYPE_POLICY_CRASH
+
+    def test_an_environment_failure_stays_the_environments(self) -> None:
+        assert classify_error(EnvironmentFailure("pg")) == TASK_ERROR_TYPE_ENVIRONMENT
+        group = ExceptionGroup("g", [RateLimited("down")])
+        assert classify_error(group) == TASK_ERROR_TYPE_LLM
+
+    @pytest.mark.parametrize(
+        ("split", "phase", "priority"),
+        [
+            (SPLIT_TRAIN, "baseline", Priority.BASELINE),
+            (SPLIT_HELDOUT, "baseline", Priority.BASELINE_HELDOUT),
+            (SPLIT_VAL, "rsi", Priority.RSI),
+            (SPLIT_HELDOUT, "final", Priority.FINAL),
+            (None, None, Priority.RSI),
+        ],
+    )
+    def test_grading_priority(
+        self, split: int | None, phase: str | None, priority: Priority
+    ) -> None:
+        assert grading_priority(split, phase) is priority  # type: ignore[arg-type]
+
+    async def test_each_task_binds_the_executor_model_to_itself(self) -> None:
+        client = FakeClient()
+        config = PackRunConfig(
+            model=ModelParams(temperature=0.6), budgets=Budgets(steps=3, wall_clock_s=9)
+        )
+        factory = context_factory(client, config)
+        inst = EffiSqlInstance.model_validate(task(id=5))
+
+        async with factory(inst, 2, RunIdentity("run-1", "effisql", SPLIT_TRAIN)) as ctx:
+            assert ctx.budgets == Budgets(steps=3, wall_clock_s=9)
+
+        model, tags = client.bound[0]
+        assert model == EXECUTOR_MODEL
+        assert (tags.purpose, tags.run_id, tags.instance_id, tags.seed) == (
+            CALL_PURPOSE_EXEC,
+            "run-1",
+            "5",
+            2,
+        )
+
+    async def test_the_call_log_writes_records_and_never_raises(self, tmp_path: Path) -> None:
+        path = tmp_path / "llm_calls.jsonl"
+        writer = JsonlWriter[LlmCallRecord](path)
+        log = RunCallLog(writer)
+        async with writer:
+            log.record(LlmCallRecord(call_id="a"))
+        log.record(LlmCallRecord(call_id="after-close"))  # Logged and dropped.
+
+        assert [r.call_id for r in read_jsonl(path, LlmCallRecord)] == ["a"]
+
+
+class TestDryRun:
+    def test_one_process_run_solves_grades_and_writes_official_records(
+        self, tmp_path: Path, capsys: pytest.CaptureFixture[str]
+    ) -> None:
+        fakes = fake_wiring(tmp_path)
+        run = tmp_path / "run"
+
+        status = goaly_run(
+            fakes, "--split", "train", "--only", "1", "3", "--budget-phase", "baseline",
+            "--out", str(run),
+        )  # fmt: skip
+
+        assert status == 0, capsys.readouterr().err
+        assert fakes.solving.preflights == 1
+        assert sorted(r.instance_id for r in results(run)) == ["1", "3"]
+        assert all(r.grade.score == 0.5 for r in results(run))
+        assert sorted(fakes.grader.graded) == [
+            ("1", OFFICIAL_FORM, False, Mode.DEV, Priority.BASELINE),
+            ("3", OFFICIAL_FORM, False, Mode.DEV, Priority.BASELINE),
+        ]
+        official = [
+            json.loads(line)
+            for line in (run / "official" / "seed-0.jsonl").read_text().splitlines()
+        ]
+        assert [record["id"] for record in official] == [1, 3]
+        assert all(
+            record["prediction"].startswith(f"```sql\n{OFFICIAL_FORM};") for record in official
+        )
+        assert "optimized_sql" not in official[0]
+        manifest = read_manifest(run / "manifest.json")
+        assert manifest.dataset_sha256 == DATASET_SHA256
+        assert manifest.dataset_revision == DATASET_REVISION
+        assert dict(manifest.environment_settings) == {
+            "grading_mode": "dev",
+            "grading_priority": "baseline",
+        }
+        assert [m.model for m in manifest.models] == [EXECUTOR_MODEL]
+        assert manifest.models[0].max_tokens == 16000
+        assert fakes.shares == [{EXECUTOR_MODEL: 40}]
+        assert fakes.grader.closed
+
+    async def test_the_host_side_grades_with_no_pack_code_loaded(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        fakes = fake_wiring(tmp_path)
+        for name in [m for m in sys.modules if m.startswith(_PACK_MODULES)]:
+            monkeypatch.delitem(sys.modules, name)
+        options = HostOptions(RunFiles(tmp_path / "run"), None, SPLIT_VAL, "rsi")
+        inst = EffiSqlInstance.model_validate(task(id=int(VAL_ID)))
+        prediction = Prediction(instance_id=VAL_ID, effisql=EffiSqlPrediction(sql=OFFICIAL_FORM))
+
+        async with open_host(options, fakes.wiring) as host:
+            grade = await host.benchmark.grade(inst, prediction)  # type: ignore[attr-defined]
+
+        assert grade.score == 0.5
+        assert not [m for m in sys.modules if m.startswith(_PACK_MODULES)]
+        assert fakes.grader.graded == [(VAL_ID, OFFICIAL_FORM, False, Mode.DEV, Priority.RSI)]
+
+    def test_a_held_out_run_grades_in_official_mode(
+        self, tmp_path: Path, capsys: pytest.CaptureFixture[str]
+    ) -> None:
+        fakes = fake_wiring(tmp_path)
+        run = tmp_path / "run"
+        heldout = load_splits().heldout[0]
+
+        status = goaly_run(
+            fakes, "--split", "heldout", "--only", heldout, "--budget-phase", "baseline",
+            "--out", str(run),
+        )  # fmt: skip
+
+        assert status == 0, capsys.readouterr().err
+        assert fakes.grader.graded[0][3:] == (Mode.OFFICIAL, Priority.BASELINE_HELDOUT)
+
+    async def test_the_host_side_refuses_a_manifest_that_names_another_mode(
+        self, tmp_path: Path
+    ) -> None:
+        fakes = fake_wiring(tmp_path)
+        files = RunFiles(tmp_path / "run")
+        files.root.mkdir()
+        settings = {"grading_mode": "official"}
+        write_manifest(files.manifest, RunManifest(split=SPLIT_VAL, environment_settings=settings))
+
+        with pytest.raises(ValueError, match="grading mode 'official'"):
+            async with open_host(HostOptions(files, None, SPLIT_VAL, None), fakes.wiring):
+                pass
+        assert fakes.grader.graded == []
+
+    def test_an_organizers_file_is_solved_but_not_graded(
+        self, tmp_path: Path, capsys: pytest.CaptureFixture[str]
+    ) -> None:
+        fakes = fake_wiring(tmp_path)
+        run = tmp_path / "run"
+        organizers = tmp_path / "heldout.jsonl"
+        organizers.write_text(json.dumps(task(id=901)) + "\n")
+
+        status = goaly_run(
+            fakes, "--instances", str(organizers), "--budget-phase", "final",
+            "--out", str(run),
+        )  # fmt: skip
+
+        assert status == 0, capsys.readouterr().err
+        official = [
+            json.loads(line)
+            for line in (run / "official" / "seed-0.jsonl").read_text().splitlines()
+        ]
+        assert [record["id"] for record in official] == [901]
+        assert "optimized_sql" not in official[0]
+        manifest = read_manifest(run / "manifest.json")
+        assert manifest.environment_settings["grading_mode"] == "none"
+        assert manifest.dataset_revision == ""
+        assert fakes.grader.graded == []
+
+
+class TestRealWiring:
+    async def test_the_real_client_reads_the_settings_and_fills_every_share(
+        self, monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+    ) -> None:
+        monkeypatch.setenv("GOALY_API_KEY", "test-key-not-real")
+        monkeypatch.setenv("GOALY_BASE_URL", "http://127.0.0.1:9/v1")
+        recorder = RunCallLog(JsonlWriter[LlmCallRecord](tmp_path / "calls.jsonl"))
+
+        client = await EffiSqlWiring().llm(recorder, {EXECUTOR_MODEL: 7})
+
+        async with client as opened:
+            assert isinstance(opened, LlmClient)
+            bound = opened.bind(model=EXECUTOR_MODEL, tags=CallTags(purpose=CALL_PURPOSE_EXEC))
+            assert isinstance(bound, BoundLlmClient)
+
+    def test_the_default_paths_are_the_hosts(self) -> None:
+        paths = EffiSqlPaths.default()
+
+        assert paths.tasks_file.name == RUNTIME_FILE
+        assert paths.snapshot.name == "schema_snapshot.json"
+        assert paths.plans.name == "plans.json"
+        assert paths.grading_cache_root.name == "grader"
+
+    def test_model_settings_leave_out_what_the_profile_does_not_set(self) -> None:
+        settings = model_settings(ModelParams(enable_thinking=False))
+
+        assert settings.model == EXECUTOR_MODEL
+        assert not settings.thinking
+        assert settings.temperature == 0.6  # The profile's default.
+
+    @pytest.mark.parametrize(
+        ("recorded", "priority"),
+        [
+            ("final", Priority.FINAL),
+            ("setup", Priority.RSI),
+            ("nonsense", Priority.RSI),
+            ("", Priority.RSI),
+        ],
+    )
+    def test_the_recorded_priority(self, recorded: str, priority: Priority) -> None:
+        manifest = RunManifest(environment_settings={"grading_priority": recorded})
+
+        assert recorded_priority(manifest) is priority
+
+    async def test_an_external_runs_host_side_has_no_grader(self, tmp_path: Path) -> None:
+        fakes = fake_wiring(tmp_path)
+        files = RunFiles(tmp_path / "run")
+        files.root.mkdir()
+        write_manifest(files.manifest, RunManifest(run_id="r", split=SPLIT_EXTERNAL))
+        options = HostOptions(files, None, SPLIT_EXTERNAL, None)
+
+        async with open_host(options, fakes.wiring) as host:
+            assert host.cache_namespace == ""
+        assert fakes.grader.graded == []
+
+    async def test_a_grade_phase_takes_the_priority_the_manifest_recorded(
+        self, tmp_path: Path
+    ) -> None:
+        fakes = fake_wiring(tmp_path)
+        files = RunFiles(tmp_path / "run")
+        files.root.mkdir()
+        settings = {"grading_mode": "dev", "grading_priority": "baseline"}
+        write_manifest(files.manifest, RunManifest(split=SPLIT_VAL, environment_settings=settings))
+
+        async with open_host(HostOptions(files, None, SPLIT_VAL, None), fakes.wiring) as host:
+            fields = host.benchmark.manifest_fields()  # type: ignore[attr-defined]
+        assert fields.environment_settings["grading_priority"] == "baseline"
+
+
+class TestReviewFixes:
+    def test_the_executor_needs_a_share_and_every_model_gets_one(self) -> None:
+        assert _full_shares({EXECUTOR_MODEL: 7}) == {EXECUTOR_MODEL: 7, IMPROVEMENT_MODEL: 1}
+        with pytest.raises(ValueError, match="no share of qwen"):
+            _full_shares({IMPROVEMENT_MODEL: 3})
+
+    def test_a_changed_runtime_copy_is_refused(self, tmp_path: Path) -> None:
+        paths = write_inputs(tmp_path)
+        pinned = dataclasses.replace(paths, tasks_sha256="0" * 64)
+
+        with pytest.raises(ChecksumMismatchError, match="runtime copy"):
+            load_tasks(pinned, None, Mode.DEV, {})
+
+    def test_a_missing_runtime_copy_is_derived_from_the_dataset(self, tmp_path: Path) -> None:
+        source = write_inputs(tmp_path)
+        cache = tmp_path / "cache"
+        cache.mkdir()
+        dataset = cache / DATASET_FILE
+        dataset.write_bytes(source.tasks_file.read_bytes())
+        digest = hashlib.sha256(dataset.read_bytes()).hexdigest()
+        paths = dataclasses.replace(
+            source, tasks_file=cache / RUNTIME_FILE, dataset_cache=cache, tasks_sha256=None
+        )
+        monkeypatch_fetch = pytest.MonkeyPatch()
+        monkeypatch_fetch.setattr(
+            "goaly.bench.effisql.harness.fetch_dataset",
+            lambda root: fetch_dataset(root, url=dataset.as_uri(), sha256=digest),
+        )
+        try:
+            loaded = load_tasks(paths, None, Mode.DEV, {})
+        finally:
+            monkeypatch_fetch.undo()
+
+        assert (cache / RUNTIME_FILE).exists()
+        assert "optimized_sql" not in (cache / RUNTIME_FILE).read_text()
+        assert loaded.benchmark.tasks
+
+    def test_the_dev_namespace_changes_with_the_base_cache(self, tmp_path: Path) -> None:
+        paths = write_inputs(tmp_path)
+        before = load_tasks(paths, None, Mode.DEV, {}).namespace
+        (paths.grading_cache_root / "dev").mkdir(parents=True)
+        (paths.grading_cache_root / "dev" / "1.json").write_text("{}")
+        after = load_tasks(paths, None, Mode.DEV, {}).namespace
+        official = load_tasks(paths, None, Mode.OFFICIAL, {}).namespace
+
+        assert before.endswith("-nobase")
+        assert after.startswith("dev-")
+        assert after != before
+        assert official.startswith("official-")
+        assert official.count("-") == 1
+
+    def test_a_broken_pack_config_gives_no_models(self, tmp_path: Path) -> None:
+        (tmp_path / "config.yaml").write_text("model: [unclosed\n")
+
+        assert pack_models(tmp_path) == ()
+        assert [m.model for m in pack_models()] == [EXECUTOR_MODEL]
+
+    def test_main_confines_on_the_host_only(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        confined: list[bool] = []
+        monkeypatch.setattr(cli, "main", lambda argv, registry, budgets_file: 0)
+
+        def confine() -> None:
+            confined.append(True)
+            raise OSError(22, "Invalid argument")  # A cpuset without the Python CPUs.
+
+        monkeypatch.setattr(goaly_cli, "confine_to_python_cpus", confine)
+        monkeypatch.setattr(sys, "argv", ["goaly", "run", "--phase", "solve", "--in-container"])
+        assert goaly_cli.main() == 0
+        assert confined == []
+        monkeypatch.setattr(sys, "argv", ["goaly", "run"])
+        assert goaly_cli.main() == 0  # EINVAL is a warning, not a failure.
+        assert confined == [True]
+
+
+class TestSolvingTrust:
+    async def test_the_solving_pool_holds_the_agent_password_alone(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        every = PgCredentials(
+            admin_password=SecretStr("admin"),
+            agent_password=SecretStr("agent-only"),
+            grader_password=SecretStr("grader"),
+        )
+        monkeypatch.setattr("goaly.bench.effisql.harness.load_credentials", lambda: every)
+
+        pool = await EffiSqlWiring().solving()
+
+        # SolvingPool takes AgentCredentials alone (T09): the others stay on the host's file.
+        assert isinstance(pool, SolvingPool)
+        assert pool.options.timeout_s == SOLVING_STATEMENT_TIMEOUT_S == 120
+        assert not hasattr(AgentCredentials(agent_password=SecretStr("x")), "admin_password")
+
+    async def test_the_trusted_cap_stops_a_lifted_pack_timeout_end_to_end(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        monkeypatch.setattr("goaly.bench.effisql.harness.SOLVING_STATEMENT_TIMEOUT_S", 0.2)
+        monkeypatch.setattr(
+            "goaly.bench.effisql.harness._agent_credentials",
+            lambda: AgentCredentials(agent_password=SecretStr("agent-only")),
+        )
+        pool = await EffiSqlWiring().solving()
+        assert isinstance(pool, SolvingPool)
+        scenario = Scenario("cancellable")
+        env = PgSqlEnvironment(
+            SOLVING[0],
+            asyncio.Semaphore(2),
+            pool.options,  # The wiring's options: the trusted side's cap.
+            connect=scenario.connect,
+            runner=scenario.run,
+        )
+        await env.open()
+        lifted = ExecuteSqlConfig.model_construct(statement_timeout_s=1e9)  # As pack code may.
+
+        result = await bind(ExecuteSql(lifted), timeout_s=600).invoke(
+            json.dumps({"sql": "SELECT pg_sleep(1e9)"}), env
+        )
+
+        assert result.content.startswith(f"The query failed: {STATEMENT_TIMEOUT}\n")
+        assert result.elapsed_s < 1
+        await env.close()
+
+
+class TestPlanAudit:
+    async def test_each_graded_plan_goes_to_its_seeds_file(self, tmp_path: Path) -> None:
+        grader = fake_wiring(tmp_path).grader
+        lazy = LazyGrader(lambda: grader, Mode.DEV, Priority.RSI, PlanLog(tmp_path / "run"))
+        inst = EffiSqlInstance.model_validate(task(id=5))
+        prediction = Prediction(instance_id="5", effisql=EffiSqlPrediction(sql="SELECT 1"))
+
+        token = GRADING_TASK.set(("5", 2))
+        try:
+            await lazy(inst, prediction)
+        finally:
+            GRADING_TASK.reset(token)
+        await lazy(inst, prediction)  # No task known: nothing is written.
+
+        lines = (tmp_path / "run" / "plans" / "seed-2.jsonl").read_text().splitlines()
+        assert [json.loads(line) for line in lines] == [
+            {"instance_id": "5", "plan": {"Node Type": "Aggregate"}}
+        ]
+        assert sorted(p.name for p in (tmp_path / "run" / "plans").iterdir()) == ["seed-2.jsonl"]
+
+
+class TestGradingOptions:
+    @pytest.mark.parametrize("name", ["smoke", "rsi", "baseline_heldout", "final"])
+    def test_a_named_priority(self, name: str) -> None:
+        assert named_priority(name).name.lower() == name
+
+    @pytest.mark.parametrize("name", ["setup", "urgent"])
+    def test_an_unknown_or_setup_priority_is_refused(self, name: str) -> None:
+        with pytest.raises(ValueError, match="no grading priority"):
+            named_priority(name)
+
+    async def test_all_instances_grade_on_the_five(self, tmp_path: Path) -> None:
+        fakes = fake_wiring(tmp_path)
+        chosen: list[str] = []
+        wiring = dataclasses.replace(
+            fakes.wiring,
+            grader=lambda _root, _check, instances: _chosen(chosen, instances, fakes.grader),
+        )
+        files = RunFiles(tmp_path / "run")
+        options = HostOptions(
+            files, None, SPLIT_VAL, "final", grading_priority="smoke", grading_instances="all"
+        )
+        inst = EffiSqlInstance.model_validate(task(id=int(VAL_ID)))
+        prediction = Prediction(instance_id=VAL_ID, effisql=EffiSqlPrediction(sql="SELECT 1"))
+
+        async with open_host(options, wiring) as host:
+            await host.benchmark.grade(inst, prediction)  # type: ignore[attr-defined]
+
+        assert chosen == ["all"]
+        assert [len(GRADING_INSTANCE_SETS[k]) for k in ("grading", "all")] == [3, 5]
+        assert fakes.grader.graded[0][4] is Priority.SMOKE
+
+    async def test_an_unknown_instance_set_is_refused(self, tmp_path: Path) -> None:
+        options = HostOptions(RunFiles(tmp_path), None, SPLIT_VAL, None, grading_instances="x")
+
+        with pytest.raises(ValueError, match="--grading-instances"):
+            async with open_host(options, fake_wiring(tmp_path).wiring):
+                pass
+
+
+def _chosen(chosen: list[str], instances: str, grader: FakeGrader) -> FakeGrader:
+    chosen.append(instances)
+    return grader
+
+
+class TestInContainer:
+    def test_the_container_reads_its_inputs_directory(self, tmp_path: Path) -> None:
+        paths = EffiSqlWiring.in_container(tmp_path / "inputs").paths()
+
+        assert paths.tasks_file == tmp_path / "inputs" / "tasks.jsonl"
+        assert paths.snapshot == tmp_path / "inputs" / "schema_snapshot.json"
+        assert paths.plans == tmp_path / "inputs" / "plans.json"
+        assert paths.tasks_sha256 is None  # An organizers' staged file has its own sha.
+
+    async def test_the_container_reaches_the_solving_sockets_as_the_agent_alone(
+        self, monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+    ) -> None:
+        dirs = [tmp_path / instance.name for instance in SOLVING]
+        monkeypatch.setenv("GOALY_PG_SOCKET_DIRS", ",".join(map(str, dirs)))
+        monkeypatch.setenv("GOALY_PG_AGENT_PASSWORD", "agent-secret")
+
+        def refuse(*_: object) -> None:
+            raise AssertionError("the container never reads a credentials file")
+
+        monkeypatch.setattr("goaly.bench.effisql.pg_settings.load_credentials", refuse)
+        monkeypatch.setattr("goaly.bench.effisql.harness.load_credentials", refuse)
+
+        pool = await EffiSqlWiring.in_container(tmp_path).solving()
+
+        assert isinstance(pool, SolvingPool)
+        assert sorted(pool.load()) == sorted(i.name for i in SOLVING)
+        assert pool.options.timeout_s == SOLVING_STATEMENT_TIMEOUT_S
+
+    @pytest.mark.parametrize(
+        ("dirs", "message"),
+        [(None, "GOALY_PG_SOCKET_DIRS"), ("/a", "2 absolute"), ("a,b", "2 absolute")],
+    )
+    async def test_missing_or_wrong_settings_fail_the_environment(
+        self, monkeypatch: pytest.MonkeyPatch, tmp_path: Path, dirs: str | None, message: str
+    ) -> None:
+        monkeypatch.setenv("GOALY_PG_AGENT_PASSWORD", "agent-secret")
+        if dirs is None:
+            monkeypatch.delenv("GOALY_PG_SOCKET_DIRS", raising=False)
+        else:
+            monkeypatch.setenv("GOALY_PG_SOCKET_DIRS", dirs)
+
+        with pytest.raises(EnvironmentFailure, match=message):
+            await EffiSqlWiring.in_container(tmp_path).solving()
+
+    def test_the_container_grades_nothing(self, tmp_path: Path) -> None:
+        with pytest.raises(RuntimeError, match="grades nothing"):
+            EffiSqlWiring.in_container(tmp_path).grader(tmp_path, None, "grading")
+
+    async def test_the_container_needs_its_inputs(self, tmp_path: Path) -> None:
+        options = HarnessOptions(
+            files=RunFiles(tmp_path),
+            instances_file=None,
+            llm_shares={},
+            split=SPLIT_TRAIN,
+            budget_phase="rsi",
+            in_container=True,
+        )
+
+        with pytest.raises(ValueError, match="--inputs"):
+            async with open_harness(options):
+                pass

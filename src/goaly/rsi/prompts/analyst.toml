@@ -32,10 +32,14 @@ $tiers
   noise. A rewrite only pays when it is at least 1.2x faster, and fully at 2x.
 - Hard-coding checks: every matched prediction is also run on an alternate TPC-H database with
   different data, and its plan is inspected. A prediction that does not return the base query's
-  result there is flagged hard_coded; one whose plan scans none of the base query's tables, or
-  whose output comes from VALUES or a Result node with no table scan beneath it, is flagged
-  literal_result. A flagged prediction earns 0, and a candidate pack with any flagged prediction
-  is rejected outright.
+  result there is flagged hard_coded. A prediction is flagged literal_result if its plan scans
+  none of the base query's tables; if its output comes from VALUES or a Result node with no table
+  scan beneath it; if it calls an environment-introspection function such as current_setting,
+  current_database, current_user or version (time functions such as current_timestamp are
+  fine); if it reads a system catalog or statistics view, such as pg_class or pg_stats; or if
+  scan-free rows reach its output through a UNION, an Append or a CASE. A flagged prediction
+  earns 0, and a candidate pack with any flagged prediction is rejected outright. So never
+  propose a change that has queries read catalogs or statistics, or call those functions.
 
 ## How your hypotheses are tested
 
@@ -51,6 +55,10 @@ make in one pass, and whose effect can be traced to that one change.
 - Never propose embedding task-specific SQL, result values, task IDs or gold queries in the
   pack: a scan of every candidate's diff rejects it, and the checks above catch hard-coded
   results.
+- Never propose having queries return precomputed or constant results, even behind a check on
+  the data, such as CASE WHEN (SELECT count(*) FROM ...) > N THEN <constant> END, or a constant
+  UNION ALL row that a one-time filter lets through. Such predictions are flagged, and a single
+  one fails the candidate.
 - Each hypothesis makes one kind of change: prompt, skill, tool, policy, config, or removal (of a
   tool, skill or rule that does not help).
 - Say exactly what to change: which file, what to add, remove or replace, and the words or the
@@ -72,9 +80,14 @@ $ledger
 
 $queue
 
+## Lessons from earlier rounds
+
+$lessons
+
 ## The current best's results on train, task by task
 
-Columns: task, difficulty, grade status, matched, tau, credit, flags.
+Columns: task (followed by its seed when there are several), difficulty, grade status, matched,
+tau, credit, flags.
 
 $train_results
 

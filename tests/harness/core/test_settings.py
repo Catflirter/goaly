@@ -453,3 +453,28 @@ def test_an_invalid_ntfy_topic_is_refused_without_echoing_it(tmp_path: Path, top
 def test_a_github_token_with_whitespace_is_refused(tmp_path: Path) -> None:
     with pytest.raises(ValidationError, match="printable ASCII"):
         Settings(api_key=SecretStr("k"), github_token=SecretStr("ghu abc"))
+
+
+# The Unix socket to the host's LLM proxy (spec §6.1, V28).
+
+
+def test_reads_the_llm_socket_from_the_environment(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setenv("GOALY_API_KEY", "env-key")
+    monkeypatch.setenv("GOALY_LLM_UDS", "/run/goaly/llm/proxy.sock")
+
+    assert load_settings().llm_uds == Path("/run/goaly/llm/proxy.sock")
+
+
+def test_has_no_llm_socket_unless_one_is_set(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setenv("GOALY_API_KEY", "env-key")
+    monkeypatch.setenv("GOALY_LLM_UDS", "  ")  # Blank counts as absent.
+
+    assert load_settings().llm_uds is None
+
+
+def test_rejects_an_llm_socket_given_as_a_relative_path(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setenv("GOALY_API_KEY", "env-key")
+    monkeypatch.setenv("GOALY_LLM_UDS", "proxy.sock")
+
+    with pytest.raises(SettingsError, match="GOALY_LLM_UDS is invalid: must be an absolute path"):
+        load_settings()
