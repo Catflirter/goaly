@@ -2,6 +2,7 @@
 
 import asyncio
 import concurrent.futures
+import threading
 from pathlib import Path
 
 import pytest
@@ -47,7 +48,7 @@ async def test_a_smoke_run_is_one_train_task_with_smoke_priority(tmp_path: Path)
     )
     assert await asyncio.to_thread(runner.guard, commit) is None
     assert guarded == [(f"smoke-{commit[:12]}", head, commit)]
-    outcome = await asyncio.to_thread(runner.run, commit, "6")
+    outcome = await asyncio.to_thread(runner.run, commit, "6", threading.Event())
     (request,) = evaluator.requests
     assert request.phase == EvalPhase.SMOKE
     assert request.priority == Priority.SMOKE
@@ -76,7 +77,7 @@ async def test_a_failed_guard_and_an_ungraded_task_are_reported(tmp_path: Path) 
         Ungraded(), guards, repo, asyncio.get_running_loop(), train_ids=TRAIN
     )
     assert await asyncio.to_thread(runner.guard, commit) == "GUARD_UNIT_TESTS: 2 failed"
-    outcome = await asyncio.to_thread(runner.run, commit, "1")
+    outcome = await asyncio.to_thread(runner.run, commit, "1", threading.Event())
     assert outcome.score is None
     assert outcome.cost_usd == 0.0
     assert outcome.last_tool_error == "psycopg: connection lost"
@@ -93,7 +94,7 @@ async def test_a_smoke_run_without_its_result_says_so(tmp_path: Path) -> None:
     runner = EvaluatorSmokeRunner(
         Empty(), lambda *_: [], repo, asyncio.get_running_loop(), train_ids=TRAIN
     )
-    outcome = await asyncio.to_thread(runner.run, commit, "1")
+    outcome = await asyncio.to_thread(runner.run, commit, "1", threading.Event())
     assert outcome.score is None
     assert "returned none" in outcome.last_tool_error
 
@@ -105,13 +106,13 @@ async def test_a_failed_or_slow_smoke_evaluation_is_the_infrastructures(tmp_path
     failing = ToyEvaluator(smoke_error=True)
     runner = EvaluatorSmokeRunner(failing, lambda *_: [], repo, loop, train_ids=TRAIN)
     with pytest.raises(SmokeInfrastructureError, match="exited with 137"):
-        await asyncio.to_thread(runner.run, commit, "1")
+        await asyncio.to_thread(runner.run, commit, "1", threading.Event())
     assert issubclass(SmokeInfrastructureError, SandboxError)  # T20 maps it to INFRASTRUCTURE.
     assert exit_for_error(SmokeInfrastructureError("x")) == IMPLEMENTER_EXIT_INFRASTRUCTURE
     slow = ToyEvaluator(smoke_gate=asyncio.Event())
     runner = EvaluatorSmokeRunner(slow, lambda *_: [], repo, loop, train_ids=TRAIN, timeout_s=0.2)
     with pytest.raises(SmokeInfrastructureError, match="took over"):
-        await asyncio.to_thread(runner.run, commit, "1")
+        await asyncio.to_thread(runner.run, commit, "1", threading.Event())
     await asyncio.sleep(0.05)
     assert slow.in_flight == 0  # The timed-out evaluation was cancelled, not left running.
 
@@ -123,7 +124,7 @@ async def test_cancel_all_releases_a_waiting_implementer(tmp_path: Path) -> None
     runner = EvaluatorSmokeRunner(
         stuck, lambda *_: [], repo, asyncio.get_running_loop(), train_ids=TRAIN
     )
-    waiting = asyncio.ensure_future(asyncio.to_thread(runner.run, commit, "1"))
+    waiting = asyncio.ensure_future(asyncio.to_thread(runner.run, commit, "1", threading.Event()))
     while not stuck.requests:
         await asyncio.sleep(0.01)
     assert runner.cancel_all() == 1
@@ -139,7 +140,25 @@ async def test_a_task_outside_train_is_refused_here_too(tmp_path: Path) -> None:
     runner = EvaluatorSmokeRunner(
         evaluator, lambda *_: [], repo, asyncio.get_running_loop(), train_ids=TRAIN
     )
-    outcome = await asyncio.to_thread(runner.run, commit, "101")
+    outcome = await asyncio.to_thread(runner.run, commit, "101", threading.Event())
     assert outcome.score is None
     assert "not a train task" in outcome.last_tool_error
     assert evaluator.requests == []
+
+
+async def test_a_stopped_implementer_cancels_its_smoke_run(tmp_path: Path) -> None:
+    repo = make_repo(tmp_path / "repo")
+    commit, _ = pinned(repo)
+    stuck = ToyEvaluator(smoke_gate=asyncio.Event())
+    runner = EvaluatorSmokeRunner(
+        stuck, lambda *_: [], repo, asyncio.get_running_loop(), train_ids=TRAIN
+    )
+    stop = threading.Event()
+    waiting = asyncio.ensure_future(asyncio.to_thread(runner.run, commit, "1", stop))
+    while not stuck.requests:
+        await asyncio.sleep(0.01)
+    stop.set()  # The implementer's run is ending.
+    with pytest.raises(asyncio.CancelledError):
+        await waiting
+    await asyncio.sleep(0.05)
+    assert stuck.in_flight == 0

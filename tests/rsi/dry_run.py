@@ -46,7 +46,6 @@ from goaly.rsi.implementer.config import load_config
 from goaly.rsi.implementer.environment import HostCommand
 from goaly.rsi.implementer.model import GlmModel
 from goaly.rsi.implementer.run import Implementer
-from goaly.rsi.implementer.smoke import mentions_smoke
 from goaly.rsi.lane import LaneHooks, StopInfo
 from goaly.rsi.ledger import Ledger
 from goaly.rsi.lessons import LessonStore
@@ -154,14 +153,14 @@ async def dry_run(settings: Any) -> AsyncIterator[DryRun]:
         local = shell(worktree.path)
 
         def handle(command: str) -> dict[str, Any]:
-            if host is not None and mentions_smoke(command):
-                return host(command)
             time.sleep(0.05)  # Long enough for the runs to overlap.
             return local(command)
 
+        sandbox = FakeEnvironment(handle)
+        sandbox.smoke = host  # goaly-smoke's host side, as the sandbox hands it on.
         agents.enter()
         try:
-            yield FakeEnvironment(handle)
+            yield sandbox
         finally:
             agents.leave()
 

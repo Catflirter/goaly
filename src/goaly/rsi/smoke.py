@@ -16,6 +16,7 @@ stops, so no implementer thread waits on a loop that is going away.
 import asyncio
 import concurrent.futures
 import threading
+import time
 from collections.abc import Collection
 from pathlib import Path
 
@@ -42,6 +43,7 @@ from goaly.rsi.sandbox import SandboxError
 
 __all__ = ["EvaluatorSmokeRunner", "SmokeInfrastructureError"]
 
+_POLL_S = 0.5  # How often a waiting smoke run looks at its stop event.
 _SCORED = frozenset({GRADE_STATUS_GRADED, GRADE_STATUS_PREDICTION_FAILED, GRADE_STATUS_TIMEOUT})
 
 
@@ -73,6 +75,23 @@ class EvaluatorSmokeRunner:
         self._lock = threading.Lock()
         self._pending: set[concurrent.futures.Future[Evaluation]] = set()
 
+    def _wait(
+        self, future: "concurrent.futures.Future[Evaluation]", stop: threading.Event
+    ) -> Evaluation:
+        """The evaluation's result: wait at most timeout_s, and no longer once ``stop`` is set."""
+        deadline = time.monotonic() + self._timeout_s
+        while True:
+            if stop.is_set():
+                future.cancel()
+                raise concurrent.futures.CancelledError
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                raise TimeoutError
+            try:
+                return future.result(timeout=min(remaining, _POLL_S))
+            except TimeoutError:
+                continue
+
     def cancel_all(self) -> int:
         """Cancel the evaluations in flight, as when the lane stops; return how many."""
         with self._lock:
@@ -88,11 +107,12 @@ class EvaluatorSmokeRunner:
             return None
         return "; ".join(f"{Guard.Name(r.guard)}: {r.detail or 'failed'}" for r in failed)
 
-    def run(self, commit: str, instance_id: str) -> SmokeOutcome:
+    def run(self, commit: str, instance_id: str, stop: threading.Event) -> SmokeOutcome:
         """Evaluate the commit on one train task, with SMOKE priority, and wait for it.
 
         Raises SmokeInfrastructureError if the evaluation fails or times out, and
-        concurrent.futures.CancelledError if the lane cancelled it.
+        concurrent.futures.CancelledError if the lane cancelled it, or ``stop`` was set: the
+        implementer's run is ending, so its smoke run is cancelled at once.
         """
         if instance_id not in self._train_ids:  # SmokeService refuses these first.
             return SmokeOutcome("", None, "refused", 0, 0.0, f"{instance_id} is not a train task")
@@ -117,7 +137,7 @@ class EvaluatorSmokeRunner:
         with self._lock:
             self._pending.add(future)
         try:
-            evaluation = future.result(timeout=self._timeout_s)
+            evaluation = self._wait(future, stop)
         except concurrent.futures.CancelledError:
             raise
         except TimeoutError as error:
