@@ -58,10 +58,10 @@ def main(argv: Sequence[str] | None = None) -> int:
 
     try:
         splits = draw(fetch_dataset(args.cache_dir, url=args.url))
-    except DatasetError as error:
+        write(splits, out)
+    except (DatasetError, OSError) as error:  # OSError: the cache or --out cannot be written.
         sys.stderr.write(f"make_splits: {error}\n")
         return 1
-    write(splits, out)
     sys.stdout.write(
         f"make_splits: wrote {out}: {len(splits.train)} train, {len(splits.val)} val,"
         f" {len(splits.heldout)} held-out\n"
