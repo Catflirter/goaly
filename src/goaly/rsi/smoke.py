@@ -10,7 +10,7 @@ implementer's worker thread, so the evaluation runs on the lane's event loop and
 import asyncio
 from pathlib import Path
 
-from goaly.contracts.gen.experiment_pb2 import Guard
+from goaly.contracts.gen.experiment_pb2 import LANE_EFFISQL, Guard
 from goaly.contracts.gen.task_pb2 import (
     GRADE_STATUS_GRADED,
     GRADE_STATUS_PREDICTION_FAILED,
@@ -20,7 +20,8 @@ from goaly.contracts.gen.task_pb2 import (
 from goaly.contracts.gen.trajectory_pb2 import StopReason
 from goaly.rsi.git import run_git
 from goaly.rsi.implementer.smoke import SmokeOutcome
-from goaly.rsi.round import EvalPhase, EvaluationRequest, Evaluator, GuardRunner
+from goaly.rsi.lanes import lane_info
+from goaly.rsi.round import EvalPhase, EvaluationRequest, Evaluator, GuardRunner, tasks_digest
 
 __all__ = ["EvaluatorSmokeRunner"]
 
@@ -58,10 +59,22 @@ class EvaluatorSmokeRunner:
 
     def run(self, commit: str, instance_id: str) -> SmokeOutcome:
         """Evaluate the commit on one train task, with SMOKE priority, and wait for it."""
-        tree = run_git(["rev-parse", f"{commit}^{{tree}}"], cwd=self._repo).strip()
+        pack = lane_info(LANE_EFFISQL).pack_dirs[0]
+        tree, pack_tree = run_git(
+            ["rev-parse", f"{commit}^{{tree}}", f"{commit}:{pack}"], cwd=self._repo
+        ).split()
         run_id = f"smoke-{commit[:12]}-{instance_id}"
+        tasks, seeds = (instance_id,), (self._seed,)
         request = EvaluationRequest(
-            EvalPhase.SMOKE, commit, tree, SPLIT_TRAIN, (instance_id,), (self._seed,), run_id
+            EvalPhase.SMOKE,
+            commit,
+            tree,
+            SPLIT_TRAIN,
+            tasks,
+            seeds,
+            run_id,
+            pack_tree=pack_tree,
+            tasks_digest=tasks_digest(SPLIT_TRAIN, tasks, seeds),
         )
         future = asyncio.run_coroutine_threadsafe(self._evaluator.evaluate(request), self._loop)
         evaluation = future.result(timeout=self._timeout_s)

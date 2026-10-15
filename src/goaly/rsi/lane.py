@@ -277,6 +277,7 @@ class LaneRunner:
             now=deps.clock(),
             uncommitted_only=True,
             usage=deps.usage,
+            max_requeues=self._config.round.max_requeues,
         )
 
     def _reconcile(self) -> str:
@@ -349,6 +350,7 @@ class LaneRunner:
                 now=deps.clock(),
                 uncommitted_only=False,
                 usage=deps.usage,
+                max_requeues=self._config.round.max_requeues,
             )
         best = await asyncio.to_thread(deps.workspace.best_commit, deps.lane)
         await self._record_event(LANE_EVENT_KIND_STOPPED, f"{rule}: {detail}")

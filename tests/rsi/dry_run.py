@@ -18,8 +18,10 @@ accepts once and then stops after 4 rounds without an accepted change.
 import asyncio
 import concurrent.futures
 import json
-from collections.abc import AsyncIterator, Awaitable, Callable
-from contextlib import asynccontextmanager
+import threading
+import time
+from collections.abc import AsyncIterator, Awaitable, Callable, Iterator
+from contextlib import asynccontextmanager, contextmanager
 from dataclasses import dataclass
 from datetime import datetime
 from pathlib import Path
@@ -60,6 +62,25 @@ class DryRun:
     hooks: LaneHooks
     evaluator: ToyEvaluator
     glm: ScriptedGlm
+    agents: "Agents"
+
+
+class Agents:
+    """Counts the implementer runs in progress, to check the implementer pool's size."""
+
+    def __init__(self) -> None:
+        self._lock = threading.Lock()
+        self.active = 0
+        self.most = 0
+
+    def enter(self) -> None:
+        with self._lock:
+            self.active += 1
+            self.most = max(self.most, self.active)
+
+    def leave(self) -> None:
+        with self._lock:
+            self.active -= 1
 
 
 def analyst_rounds() -> list[list[str]]:
@@ -105,15 +126,23 @@ async def dry_run(settings: Any) -> AsyncIterator[DryRun]:
             submit(f"Wrote {kind} to kind.txt"),
         )
 
-    def environment(worktree: Worktree, host: HostCommand | None) -> FakeEnvironment:
+    agents = Agents()
+
+    @contextmanager
+    def environment(worktree: Worktree, host: HostCommand | None) -> Iterator[FakeEnvironment]:
         local = shell(worktree.path)
 
         def handle(command: str) -> dict[str, Any]:
             if host is not None and mentions_smoke(command):
                 return host(command)
+            time.sleep(0.05)  # Long enough for the runs to overlap.
             return local(command)
 
-        return FakeEnvironment(handle)
+        agents.enter()
+        try:
+            yield FakeEnvironment(handle)
+        finally:
+            agents.leave()
 
     loop = asyncio.get_running_loop()
     with concurrent.futures.ThreadPoolExecutor(
@@ -150,7 +179,7 @@ async def dry_run(settings: Any) -> AsyncIterator[DryRun]:
             hooks = LaneHooks(
                 results_pr=_hook(repo, "results_pr", ledger), notify=_hook(repo, "notify", ledger)
             )
-            yield DryRun(deps, hooks, evaluator, glm)
+            yield DryRun(deps, hooks, evaluator, glm, agents)
 
 
 def write_config(tmp_path: Path, deadline: datetime) -> tuple[Path, Path]:

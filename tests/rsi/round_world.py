@@ -154,17 +154,18 @@ class ToyEvaluator:
             raise RuntimeError("the solve container exited with 137")
         if self.gate is not None and request.phase == "validation":
             await self.gate.wait()
-        results = []
-        for task in request.instance_ids:
-            for seed in request.seeds:
-                async with self._limit:
-                    self.in_flight += 1
-                    self.most_in_flight = max(self.most_in_flight, self.in_flight)
-                    await asyncio.sleep(0)
-                    self.in_flight -= 1
-                flagged = kind == "flag" and task == VAL[0]
-                value = credit(kind, task, seed)
-                results.append(task_result(request.run_id, task, seed, value, flagged=flagged))
+        pairs = [(task, seed) for task in request.instance_ids for seed in request.seeds]
+        await asyncio.gather(*(self._solve() for _ in pairs))  # The tasks run concurrently.
+        results = [
+            task_result(
+                request.run_id,
+                task,
+                seed,
+                credit(kind, task, seed),
+                flagged=kind == "flag" and task == VAL[0],
+            )
+            for task, seed in pairs
+        ]
         if request.phase == "validation" and kind == "short":
             results.pop()
         if request.phase == "validation" and kind == "graderr":
@@ -178,6 +179,13 @@ class ToyEvaluator:
         count = len(results)
         stats = CostStats(1000.0, 0.01, 10.0, count=count)
         return Evaluation(results, stats, infra_failures=infra)
+
+    async def _solve(self) -> None:
+        async with self._limit:
+            self.in_flight += 1
+            self.most_in_flight = max(self.most_in_flight, self.in_flight)
+            await asyncio.sleep(0.001)
+            self.in_flight -= 1
 
     def _kind(self, commit: str) -> str:
         if commit in self.kinds:

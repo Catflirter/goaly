@@ -247,3 +247,15 @@ async def test_the_lane_runs_inside_its_running_hook_and_reports_each_round(
         config = settings.lane.model_copy(update={"max_rounds_without_accept": 2})
         assert await LaneRunner(parts.deps, config, hooks=hooks).run() == 0
     assert seen == ["start", "round 1", "round 2", "end"]
+
+
+async def test_the_lane_wires_its_task_and_implementer_limits(tmp_path: Path) -> None:
+    _, settings = settings_for(tmp_path, 3600)
+    limits = {"task_concurrency": 4, "implementer_threads": 2, "max_rounds_without_accept": 1}
+    settings = settings.model_copy(update={"lane": settings.lane.model_copy(update=limits)})
+    async with dry_run(settings) as parts:
+        assert await lane(parts, settings).run() == 0
+        # Three hypotheses on two implementer threads: two at once, never three.
+        assert parts.agents.most == 2
+        # 8 val tasks x 2 seeds per reference, on at most 4 at once: the cap is reached.
+        assert parts.evaluator.most_in_flight == 4
