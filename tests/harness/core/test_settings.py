@@ -7,10 +7,12 @@ from pathlib import Path
 import pytest
 from pydantic import SecretStr, ValidationError
 from pydantic_core import ErrorDetails
+from pydantic_settings import EnvSettingsSource
 
 from goaly.harness.core.settings import (
     Settings,
     SettingsError,
+    _BlankIsAbsent,
     _describe,
     default_env_file,
     load_settings,
@@ -208,15 +210,53 @@ def test_a_blank_key_in_the_env_file_counts_as_missing() -> None:
         load_settings()
 
 
-def test_an_empty_variable_falls_back_to_the_next_source(monkeypatch: pytest.MonkeyPatch) -> None:
-    write_env_file(default_env_file(), "GOALY_API_KEY=file-key")
-    monkeypatch.setenv("GOALY_API_KEY", "")
-    monkeypatch.setenv("GOALY_BASE_URL", "")
+@pytest.mark.parametrize("blank", ["", "   ", "\t\n"])
+def test_a_blank_variable_falls_back_to_the_env_file(
+    blank: str, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    write_env_file(
+        default_env_file(), "GOALY_API_KEY=file-key", "GOALY_BASE_URL=https://file.test/v1"
+    )
+    monkeypatch.setenv("GOALY_API_KEY", blank)
+    monkeypatch.setenv("GOALY_BASE_URL", blank)
 
     settings = load_settings()
 
     assert settings.api_key.get_secret_value() == "file-key"
-    assert settings.base_url == DEFAULT_BASE_URL
+    assert settings.base_url == "https://file.test/v1"
+
+
+@pytest.mark.parametrize("blank", ["", "   "])
+def test_a_base_url_blank_everywhere_falls_back_to_the_default(
+    blank: str, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    write_env_file(default_env_file(), "GOALY_API_KEY=file-key", f'GOALY_BASE_URL="{blank}"')
+    monkeypatch.setenv("GOALY_BASE_URL", blank)
+
+    assert load_settings().base_url == DEFAULT_BASE_URL
+
+
+def test_a_key_blank_everywhere_is_not_set(monkeypatch: pytest.MonkeyPatch) -> None:
+    write_env_file(default_env_file(), 'GOALY_API_KEY="   "')
+    monkeypatch.setenv("GOALY_API_KEY", "  ")
+
+    with pytest.raises(SettingsError) as raised:
+        load_settings()
+
+    assert str(raised.value) == (
+        "GOALY_API_KEY is not set. Export it, or add the line GOALY_API_KEY=<value> "
+        f"to {default_env_file()}."
+    )
+
+
+def test_the_blank_filter_still_answers_field_lookups(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setenv("GOALY_API_KEY", "env-key")
+    field = Settings.model_fields["api_key"]
+    env_source = EnvSettingsSource(Settings)
+
+    lookup = _BlankIsAbsent(env_source).get_field_value(field, "api_key")
+
+    assert lookup == env_source.get_field_value(field, "api_key")
 
 
 def test_strips_whitespace_around_the_key(monkeypatch: pytest.MonkeyPatch) -> None:

@@ -9,7 +9,7 @@ description = "Self-evolving harness: GLM-5.3 improves the agent harness Qwen us
 requires-python = ">=3.12,<3.13"
 dependencies = [
     "pydantic>=2.4", # 2.4 added ValidationError.errors(include_input=...)
-    "pydantic-settings>=2.2", # 2.2 added env_ignore_empty
+    "pydantic-settings>=2",
 ]
 
 [dependency-groups]

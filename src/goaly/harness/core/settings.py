@@ -5,9 +5,11 @@ environment variables, the env file (``~/.config/goaly/.env`` by default), the f
 """
 
 from pathlib import Path
+from typing import Any
 from urllib.parse import urlsplit
 
 from pydantic import SecretStr, ValidationError, field_validator
+from pydantic.fields import FieldInfo
 from pydantic_core import ErrorDetails, PydanticCustomError, PydanticKnownError
 from pydantic_settings import BaseSettings, PydanticBaseSettingsSource, SettingsConfigDict
 
@@ -25,7 +27,6 @@ class Settings(BaseSettings):
 
     model_config = SettingsConfigDict(
         env_prefix=_ENV_PREFIX,
-        env_ignore_empty=True,  # An empty variable counts as unset, so the next source applies.
         env_file_encoding="utf-8",  # Not the locale's encoding.
         extra="ignore",
         frozen=True,
@@ -45,7 +46,8 @@ class Settings(BaseSettings):
     ) -> tuple[PydanticBaseSettingsSource, ...]:
         # Highest priority first, and nothing else: no secrets directory, and the dotenv source
         # reads only the file load_settings passes in, never a `.env` in the working directory.
-        return init_settings, env_settings, dotenv_settings
+        # A blank value in the environment or the env file counts as absent, so the next applies.
+        return init_settings, _BlankIsAbsent(env_settings), _BlankIsAbsent(dotenv_settings)
 
     @field_validator("api_key", mode="before")
     @classmethod
@@ -55,7 +57,7 @@ class Settings(BaseSettings):
         if isinstance(value, str):
             value = value.strip()
             if not value:
-                raise PydanticKnownError("missing")  # A blank key counts as missing.
+                raise PydanticKnownError("missing")  # A blank key argument counts as missing.
         return value
 
     @field_validator("base_url")
@@ -97,6 +99,24 @@ def load_settings(env_file: Path | None = None) -> Settings:
     if unreadable:
         raise SettingsError(f"Cannot read {env_file}: {unreadable}.") from None
     raise SettingsError("\n".join(_describe(detail, env_file) for detail in details)) from None
+
+
+class _BlankIsAbsent(PydanticBaseSettingsSource):
+    """Wraps a source and drops its blank values, so that a later source supplies those fields."""
+
+    def __init__(self, source: PydanticBaseSettingsSource) -> None:
+        super().__init__(source.settings_cls)
+        self._source = source
+
+    def get_field_value(self, field: FieldInfo, field_name: str) -> tuple[Any, str, bool]:
+        return self._source.get_field_value(field, field_name)
+
+    def __call__(self) -> dict[str, Any]:
+        return {name: value for name, value in self._source().items() if not _is_blank(value)}
+
+
+def _is_blank(value: object) -> bool:
+    return isinstance(value, str) and not value.strip()
 
 
 def _is_absolute_http_url(value: str) -> bool:
