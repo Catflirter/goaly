@@ -440,42 +440,53 @@ class Runner[InstanceT: Instance, EnvT: Environment, CtxT: TaskContext]:
     async def _attempt(
         self, run: "_Run", inst: InstanceT, seed: int, task: TaskInput
     ) -> "_Attempt":
-        """Provision the task's environment and context, and solve it, in one of the slots."""
+        """Provision the task's environment and context, and solve it, in one of the slots.
+
+        The slot's work runs in a task of its own, and so does solve within it. Python 3.12's
+        TaskGroup leaves a cancel request on its task when a child fails while the group exits,
+        though nothing cancelled that task; adapter, wiring or pack code that handles such a
+        failure leaves it there, never on this task, which compares cancel requests to tell an
+        outer cancellation from a task's own failure.
+        """
         async with run.slots:
             attempt = _Attempt(started_at=_now())
-            start = time.monotonic()
             cancel_requests = _cancel_requests()
             deadline = asyncio.timeout(self._task_timeout_s)
             try:
-                async with (
-                    deadline,
-                    self._benchmark.provision(inst) as env,
-                    self._contexts(inst, seed, run.identity) as ctx,
-                ):
-                    attempt.provision_s = time.monotonic() - start
-                    await self._solve(attempt, task, env, ctx)
-            except Exception as error:
-                if _cancel_requests() > cancel_requests:
-                    # Pack code turned an outer cancellation into an exception: it propagates.
-                    raise asyncio.CancelledError from error
+                async with deadline:
+                    await asyncio.create_task(
+                        self._provision_and_solve(attempt, run, inst, seed, task)
+                    )
+            except Exception as error:  # noqa: BLE001 - The task's failure; see _fail.
+                _propagate_cancellation(cancel_requests, error, "solving the task")
                 if deadline.expired():
                     self._time_out(attempt, inst, seed)
                 else:
                     self._fail(attempt, error, inst, seed)
             else:
-                if _cancel_requests() > cancel_requests:
-                    raise asyncio.CancelledError  # Pack code swallowed an outer cancellation.
+                _propagate_cancellation(cancel_requests, None, "solving the task")
                 if deadline.expired():
                     self._time_out(attempt, inst, seed)  # It answered too late.
         return attempt
+
+    async def _provision_and_solve(
+        self, attempt: "_Attempt", run: "_Run", inst: InstanceT, seed: int, task: TaskInput
+    ) -> None:
+        start = time.monotonic()
+        async with (
+            self._benchmark.provision(inst) as env,
+            self._contexts(inst, seed, run.identity) as ctx,
+        ):
+            attempt.provision_s = time.monotonic() - start
+            await self._solve(attempt, task, env, ctx)
 
     async def _solve(self, attempt: "_Attempt", task: TaskInput, env: EnvT, ctx: CtxT) -> None:
         attempt.solve_started_at = _now()
         start = time.monotonic()
         trajectory_error = None
         try:
-            # In a task of its own, so that the policy's cancellation bookkeeping, such as
-            # Python 3.12's extra cancel request from a failing TaskGroup, stays out of this one.
+            # In a task of its own too, so that a cancel request the policy leaves on it never
+            # reaches the code that closes the context and the environment.
             attempt.prediction = await asyncio.create_task(self._policy.solve(task, env, ctx))
         finally:
             attempt.wall_time_s = time.monotonic() - start
@@ -502,10 +513,10 @@ class Runner[InstanceT: Instance, EnvT: Environment, CtxT: TaskContext]:
     async def _grade(self, inst: InstanceT, prediction: Prediction) -> Grade:
         cancel_requests = _cancel_requests()
         try:
-            return await self._benchmark.grade(inst, prediction)
+            # In a task of its own, as solving is: see _attempt.
+            grade = await asyncio.create_task(self._benchmark.grade(inst, prediction))
         except Exception as error:
-            if _cancel_requests() > cancel_requests:
-                raise asyncio.CancelledError from error
+            _propagate_cancellation(cancel_requests, error, "grading")
             _logger.warning(
                 "grading %s raised an exception",
                 inst.instance_id,
@@ -516,6 +527,8 @@ class Runner[InstanceT: Instance, EnvT: Environment, CtxT: TaskContext]:
             return Grade(
                 instance_id=inst.instance_id, status=GRADE_STATUS_GRADER_ERROR, feedback=feedback
             )
+        _propagate_cancellation(cancel_requests, None, "grading")
+        return grade
 
     def _records(
         self,
@@ -794,3 +807,22 @@ def _cancel_requests() -> int:
     """How many requests to cancel the current task are pending, as Task.cancelling counts."""
     task = asyncio.current_task()
     return 0 if task is None else task.cancelling()
+
+
+def _propagate_cancellation(before: int, error: Exception | None, what: str) -> None:
+    """Raise CancelledError if the current task was cancelled since it had ``before`` requests.
+
+    Adapter, wiring or pack code ``what`` ran turned that cancellation into ``error``, or
+    swallowed it if ``error`` is None. The cancellation propagates all the same, and is logged.
+    """
+    if _cancel_requests() <= before:
+        return
+    if error is None:
+        _logger.warning("%s swallowed a cancellation, which propagates", what)
+    else:
+        _logger.warning(
+            "%s turned a cancellation into %s, which propagates as a cancellation",
+            what,
+            _describe(error),
+        )
+    raise asyncio.CancelledError from error
