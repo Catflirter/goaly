@@ -3,7 +3,7 @@
 from pathlib import Path
 from typing import Final
 
-from pydantic import BaseModel, ConfigDict, PositiveFloat, PositiveInt
+from pydantic import BaseModel, ConfigDict, NonNegativeInt, PositiveFloat, PositiveInt
 
 from goaly.rsi.implementer.msa import load_yaml
 
@@ -34,6 +34,8 @@ class Limits(BaseModel):
     max_consecutive_format_errors: PositiveInt
     # Each command, inside the sandbox.
     command_timeout_s: PositiveFloat
+    # goaly-smoke runs per hypothesis; 0 turns goaly-smoke off.
+    smoke_limit: NonNegativeInt
 
 
 class ModelTemplates(BaseModel):

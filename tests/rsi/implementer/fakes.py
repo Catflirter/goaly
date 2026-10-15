@@ -11,6 +11,7 @@ from pathlib import Path
 from typing import Any, Final, Self
 
 from goaly.rsi.implementer import msa
+from goaly.rsi.implementer.smoke import SmokeOutcome, mentions_smoke
 
 # After msa, which makes the first import of minisweagent.
 from minisweagent.models.test_models import (  # isort: skip
@@ -55,6 +56,8 @@ class FakeEnvironment:
         self.config: dict[str, Any] = {}
         self.commands: list[str] = []
         self.cleanups = 0
+        # goaly-smoke's host side, which answers any command that names it, as in the sandbox.
+        self.smoke: Handler | None = None
         self._handler = handler
 
     def __enter__(self) -> Self:
@@ -66,6 +69,8 @@ class FakeEnvironment:
     def execute(self, action: dict[str, Any], cwd: str = "") -> dict[str, Any]:
         command = action["command"]
         self.commands.append(command)
+        if self.smoke is not None and mentions_smoke(command):
+            return self.smoke(command)
         output: dict[str, Any] = {"output": "", "returncode": 0, "exception_info": ""}
         if self._handler is not None:
             output.update(self._handler(command))
@@ -163,3 +168,31 @@ class NoLlm:
 
     def complete_sync(self, *args: Any, **kwargs: Any) -> Any:
         raise AssertionError("the scripted model makes no call")
+
+
+class FakeRunner:
+    """A SmokeRunner that records what it was asked, and answers as told."""
+
+    def __init__(self, *, guard_failure: str | None = None, score: float | None = 0.75) -> None:
+        self.guarded: list[str] = []
+        self.ran: list[tuple[str, str]] = []
+        self._guard_failure = guard_failure
+        self._score = score
+        self.error: Exception | None = None
+
+    def guard(self, commit: str) -> str | None:
+        self.guarded.append(commit)
+        return self._guard_failure
+
+    def run(self, commit: str, instance_id: str) -> SmokeOutcome:
+        self.ran.append((commit, instance_id))
+        if self.error is not None:
+            raise self.error
+        return SmokeOutcome(
+            run_id=f"smoke-{len(self.ran)}",
+            score=self._score,
+            stop_reason="STOP_REASON_SUBMITTED",
+            steps=7,
+            cost_usd=0.0123,
+            last_tool_error="",
+        )

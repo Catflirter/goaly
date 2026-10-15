@@ -17,20 +17,25 @@ import logging
 import os
 import secrets
 import subprocess
+from collections.abc import Callable
 from types import TracebackType
 from typing import Any, Final, Self
 
 from goaly.rsi.implementer import msa
+from goaly.rsi.implementer.smoke import mentions_smoke
 from goaly.rsi.lanes import lane_info
 from goaly.rsi.sandbox import SandboxConfig, SandboxError, run_options, timed_shell
 from goaly.rsi.workspace import Worktree
 
-__all__ = ["PURPOSE", "SandboxEnvironment"]
+__all__ = ["PURPOSE", "HostCommand", "SandboxEnvironment"]
 
 PURPOSE: Final = "implementer"  # The sandbox's purpose label.
 _TIMED_OUT: Final = 124  # timeout's exit status once it has stopped the command.
 
 _logger = logging.getLogger(__name__)
+
+# Answers, on the host, a command the sandbox must not run, as that command's output.
+type HostCommand = Callable[[str], dict[str, Any]]
 
 
 class SandboxEnvironment(msa.DockerEnvironment):
@@ -38,7 +43,9 @@ class SandboxEnvironment(msa.DockerEnvironment):
 
     The container starts when the environment is made, and :meth:`cleanup` removes it before it
     returns; use the environment as a context manager. Each command runs in a fresh bash in the
-    worktree, for at most ``command_timeout_s``. Raises SandboxError if docker fails or hangs.
+    worktree, for at most ``command_timeout_s``, except that a command naming goaly-smoke goes to
+    ``smoke`` on the host (goaly.rsi.implementer.smoke) and never reaches the container. Raises
+    SandboxError if docker fails or hangs.
     """
 
     def __init__(
@@ -48,8 +55,10 @@ class SandboxEnvironment(msa.DockerEnvironment):
         worktree: Worktree,
         command_timeout_s: float,
         sandbox: SandboxConfig = SandboxConfig(),  # noqa: B008  (frozen, so one default is safe)
+        smoke: HostCommand | None = None,
     ) -> None:
         self._worktree = worktree
+        self._smoke = smoke
         self._sandbox = sandbox
         self._command_timeout_s = command_timeout_s
         self._name = (
@@ -107,10 +116,13 @@ class SandboxEnvironment(msa.DockerEnvironment):
     ) -> dict[str, Any]:
         """Run the action's bash command in the container and return its output.
 
-        A command that fails or times out is an output for the agent. A command that ends the run
+        A command that fails or times out is an output for the agent, and so is goaly-smoke's
+        answer. A command that ends the run
         (see msa.SUBMIT_MARKER) raises msa.Submitted. Raises SandboxError if docker fails, hangs,
         or the container is no longer running.
         """
+        if self._smoke is not None and mentions_smoke(action.get("command", "")):
+            return self._smoke(action["command"])
         container = self.container_id
         if container is None:
             raise SandboxError("the sandbox container is not running")

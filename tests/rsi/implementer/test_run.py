@@ -8,7 +8,7 @@ import asyncio
 import concurrent.futures
 import json
 import threading
-from collections.abc import Callable, Iterator
+from collections.abc import Iterator
 from pathlib import Path
 from typing import Any
 
@@ -24,6 +24,7 @@ from goaly.contracts.gen.experiment_pb2 import (
 from goaly.contracts.gen.llm_call_pb2 import CallPurpose
 from goaly.harness.core.llm_errors import ContextOverflow, InvalidResponse, ServerError, TimedOut
 from goaly.rsi.implementer import msa
+from goaly.rsi.implementer.environment import HostCommand
 from goaly.rsi.implementer.model import (
     EXIT_COST_LIMIT,
     EXIT_INTERRUPTED,
@@ -31,11 +32,13 @@ from goaly.rsi.implementer.model import (
     EXIT_TIME_LIMIT,
 )
 from goaly.rsi.implementer.run import (
+    EnvironmentFactory,
     Implementation,
     Implementer,
     exit_for_error,
     exit_for_status,
 )
+from goaly.rsi.implementer.smoke import SmokeRunner
 from goaly.rsi.sandbox import SandboxConfig, SandboxError
 from goaly.rsi.workspace import Workspace, WorkspaceError, Worktree
 from tests.harness.core.llm_fakes import Gateway, Recorder, completion, connect
@@ -43,6 +46,7 @@ from tests.rsi.fakedocker import FakeDocker
 from tests.rsi.gitrepo import git, make_repo
 from tests.rsi.implementer.fakes import (
     FakeEnvironment,
+    FakeRunner,
     NoLlm,
     ScriptedModel,
     bash_call,
@@ -61,6 +65,7 @@ HYPOTHESIS = Hypothesis(
     expected_effect="More rewrites of correlated subqueries.",
     risk="Longer prompts.",
 )
+TRAIN_IDS = ("12", "40", "77")
 SKILL = "src/goaly/harness/packs/effisql/skills/decorrelate.md"
 WRITE_SKILL = f"mkdir -p $(dirname {SKILL}) && printf 'Join instead.\\n' > {SKILL}"
 
@@ -88,7 +93,8 @@ class Lane:
     def implementer(
         self,
         *commands: str | BaseException,
-        make_environment: Callable[[Worktree], FakeEnvironment] | None = None,
+        make_environment: EnvironmentFactory | None = None,
+        smoke: SmokeRunner | None = None,
     ) -> Implementer:
         def make_model(experiment_id: str, stop: threading.Event) -> msa.Model:
             assert experiment_id == EXPERIMENT
@@ -101,9 +107,15 @@ class Lane:
             image="unused",
             runs_dir=self.runs,
             pool=self.pool,
-            make_environment=make_environment or (lambda worktree: self.environment),
+            make_environment=make_environment or self.fake_sandbox,
             make_model=make_model,
+            smoke=smoke,
+            train_ids=TRAIN_IDS,
         )
+
+    def fake_sandbox(self, worktree: Worktree, smoke: HostCommand | None) -> FakeEnvironment:
+        self.environment.smoke = smoke
+        return self.environment
 
     def run(self, *commands: str | BaseException) -> Implementation:
         return self.implementer(*commands).run(HYPOTHESIS, self.worktree, threading.Event())
@@ -247,7 +259,7 @@ def test_a_docker_failure_mid_run_aborts_the_experiment(lane: Lane) -> None:
 
 
 def test_a_sandbox_that_never_starts_aborts_the_experiment(lane: Lane) -> None:
-    def no_docker(worktree: Worktree) -> FakeEnvironment:
+    def no_docker(worktree: Worktree, smoke: HostCommand | None) -> FakeEnvironment:
         raise SandboxError("cannot run docker")
 
     implementer = lane.implementer(submit(), make_environment=no_docker)
@@ -374,3 +386,33 @@ async def test_by_default_glm_runs_in_the_sandbox(tmp_path: Path, lane: Lane) ->
     (record,) = recorder.records
     assert (record.purpose, record.run_id) == (CallPurpose.CALL_PURPOSE_RSI_IMPL, EXPERIMENT)
     assert lane.trajectory()["info"]["config"]["model"]["run_id"] == EXPERIMENT
+
+
+def test_the_runs_smoke_tests_are_recorded_and_offered_in_the_prompt(lane: Lane) -> None:
+    runner = FakeRunner()
+    implementer = lane.implementer(
+        WRITE_SKILL,
+        "goaly-smoke 12",
+        "goaly-smoke 31",  # Not a train task.
+        "goaly-smoke 40",
+        "goaly-smoke 77",  # The third run.
+        submit("Add a skill"),
+        smoke=runner,
+    )
+
+    done = implementer.run(HYPOTHESIS, lane.worktree, threading.Event())
+
+    assert done.run.exit == E.IMPLEMENTER_EXIT_SUBMITTED
+    assert [test.instance_id for test in done.run.smoke_tests] == ["12", "31", "40", "77"]
+    assert [test.HasField("score") for test in done.run.smoke_tests] == [True, False, True, False]
+    assert [instance for _, instance in runner.ran] == ["12", "40"]
+    task = lane.trajectory()["messages"][1]["content"]
+    assert "run `goaly-smoke <instance_id>`" in task
+    assert "at most 2 runs per hypothesis" in task
+
+
+def test_without_a_runner_goaly_smoke_is_not_offered(lane: Lane) -> None:
+    done = lane.run(submit())
+
+    assert len(done.run.smoke_tests) == 0
+    assert "goaly-smoke" not in lane.trajectory()["messages"][1]["content"]

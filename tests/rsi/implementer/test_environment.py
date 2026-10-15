@@ -221,3 +221,23 @@ def test_the_trajectory_records_the_sandbox_without_a_secret(
     assert config["image"] == "goaly-rsi-sandbox:test"
     assert "--read-only" in config["run_args"]
     assert SECRET not in str(data)
+
+
+def test_goaly_smoke_is_answered_on_the_host_and_never_reaches_the_container(
+    docker: FakeDocker, worktree: Worktree
+) -> None:
+    asked: list[str] = []
+
+    def smoke(command: str) -> dict[str, Any]:
+        asked.append(command)
+        return {"output": "goaly-smoke 3: score 1\n", "returncode": 0, "exception_info": ""}
+
+    with SandboxEnvironment(
+        image="image", worktree=worktree, command_timeout_s=5, sandbox=sandbox(docker), smoke=smoke
+    ) as environment:
+        output = environment.execute({"command": "goaly-smoke 3"})
+        environment.execute({"command": "ls"})
+
+    assert asked == ["goaly-smoke 3"]
+    assert output["output"] == "goaly-smoke 3: score 1\n"
+    assert docker.commands() == ["run", "exec", "rm"]
