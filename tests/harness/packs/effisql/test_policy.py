@@ -150,6 +150,22 @@ class TestPrompt:
         assert "is invalid" in text
         assert "begins with SELECT or WITH" in text
 
+    def test_the_system_prompt_carries_the_equivalence_checklist(self) -> None:
+        lines = (PACK / "prompt.md").read_text(encoding="utf-8").splitlines()
+        start = next(i for i, line in enumerate(lines) if line.startswith("Before you submit"))
+        checklist = [line for line in lines[start:] if line.strip()]
+        text = " ".join(" ".join(checklist).split())
+
+        assert len(checklist) <= 10  # The prompt is sent on every task: keep the section short.
+        assert "Before you submit - equivalence checklist" in text
+        assert "diff it against the base query" in text
+        assert "including computed columns" in text
+        assert "COUNT(col) counts non-NULL values of col" in text
+        assert "keep COUNT(col) inside the aggregation" in text
+        assert "coalesce when switching" in text
+        assert "cast the split aggregate ::numeric" in text
+        assert "keep the base's join shape or submit base_sql" in text
+
     def test_the_task_prompt_shows_the_task_and_the_limits(self) -> None:
         text = task_prompt(TASK.effisql, PackConfig(), Budgets(steps=30, wall_clock_s=600))
 
