@@ -149,11 +149,16 @@ Every shared type lives in `goaly.contracts`. These types come in two kinds, and
 - On disk, messages are stored as JSONL using protobuf's standard JSON mapping, keeping the original field names. People and the GLM analyst read trajectories directly, so a readable text format matters more than a compact binary one.
 - Files written today must stay readable after the schema changes. Field numbers are never reused. On disk, field names are the JSON keys and enum values are written by name, so a field or an enum value is never renamed either, and when one is removed, its name is reserved as well as its number.
 - The official submission formats (Effi-SQL's prediction records, SWE predictions) are not our contracts. Each adapter converts to them and keeps the official field names exactly.
-- **Effi-SQL's prediction record** is the input task record plus a `prediction` field, because the official runner reads `base_sql` and `db` from the same record. The runner's default mode, `EVAL_SQL_MODE=patch`, applies the first diff-like block in `prediction` to `base_sql`. Plain SQL therefore fails as "Patch Apply Failed" and scores 0, and the README's command for `effi-sql-pg.jsonl` uses this mode. The other mode, `end2end`, skips diff blocks and takes the SQL. So `prediction` holds both forms, as two fenced blocks and nothing else:
-  1. A `diff` block that replaces every line of the base with the new query. The applier drops one base line per `-` line without comparing their text, so the block has exactly one `-` line per base line. Its `-` and `+` lines may not begin with `---` or `+++`, which the applier reads as headers.
-  2. A `sql` block with the full query: one statement beginning with `SELECT` or `WITH`, which is all `end2end` accepts. It must not look like a diff, so comments are stripped: no line may begin with `---`, `+++` or `@@`, and at most one with `-` or `+`.
+- **Effi-SQL's prediction record** is the input task record plus a `prediction` field, because the official runner reads `base_sql` and `db` from the same record. The runner's default mode, `EVAL_SQL_MODE=patch`, applies the first diff-like block in `prediction` to `base_sql`. Plain SQL therefore fails as "Patch Apply Failed" and scores 0, and the README's command for `effi-sql-pg.jsonl` uses this mode. The other mode, `end2end`, skips diff blocks and takes the SQL. So `prediction` holds both forms, as two fenced blocks in this order and nothing else:
+  1. A `sql` block with the full query: one statement beginning with `SELECT` or `WITH`, which is all `end2end` accepts. It must not look like a diff, so comments are stripped: no line may begin with `---`, `+++` or `@@`, and at most one with `-` or `+`.
+  2. A `diff` block that replaces every line of the base with the new query. The applier drops one base line per `-` line without comparing their text, so the block has exactly one `-` line per base line. Its `-` and `+` lines may not begin with `---` or `+++`, which the applier reads as headers.
 
-  Both blocks carry the same comment-stripped query. A comment such as `-- final query` in the diff's `+` lines would match the runner's final-answer marker (`FINAL_SQL_MARKER_RE`) and add a competing `end2end` candidate. The v0 fallback (§5.4) is encoded the same way, as an identity diff plus `base_sql`. An empty prediction fails. Which mode the organizers run is unknown (§12).
+  Both blocks carry the same comment-stripped query, ending with `;`.
+  - **Why `sql` comes first.** `end2end`'s plausibility test rejects some valid queries. 12 of the dataset's 300 base queries use `WITH x AS MATERIALIZED (`, which it refuses, and `end2end` then falls back to parsing the whole field. With the diff first, 7 of those 12 came back as garbage, which broke the identity fallback. With the `sql` block first and the `;`, every one of the 300 base and gold queries comes back exactly in both modes, as T11 verified.
+  - Patch mode still applies the first diff-like block, and the `sql` block never looks like a diff.
+  - A comment such as `-- final query` in either block would match the runner's final-answer marker (`FINAL_SQL_MARKER_RE`) and add a competing `end2end` candidate.
+
+  The v0 fallback (§5.4) is encoded the same way, as `base_sql` plus an identity diff. A query the format cannot carry, such as several statements or a marker phrase inside a string literal, becomes an empty prediction with the problem stated. It is graded `PREDICTION_FAILED`, so our grade matches what the official runner sees; an empty prediction always fails. Which mode the organizers run is unknown (§12).
 - Toolchain:
   - `grpcio-tools` bundles protoc, so no system package is needed.
   - `mypy-protobuf` generates type stubs, so the generated code passes `mypy --strict`.
@@ -453,7 +458,7 @@ The first option costs more tokens, although the gateway's prefix cache absorbs 
   - Thinking is on. Sampling is T=0.6, top_p=0.95, top_k=20, with max_tokens 16K per call.
   - Solving budgets are 30 steps or 10 minutes for Effi-SQL, and 60 steps or 45 minutes for SWE.
 - Fallback when a budget runs out before `submit`: v0 still submits something rather than nothing.
-  - Effi-SQL submits `base_sql` unchanged. That gives τ ≈ 1, so a credit of 0.25–0.5. Its official record holds an identity diff plus `base_sql` (§3.3).
+  - Effi-SQL submits `base_sql` unchanged. That gives τ ≈ 1, so a credit of 0.25–0.5. Its official record holds `base_sql` plus an identity diff (§3.3).
   - SWE submits the container's final git diff, as OpenHands and other common agents do.
 
   The SWE fallback does not check whether the agent's diff is any good, and the Effi-SQL fallback ignores any faster rewrite the agent found. Smarter policies, such as submitting the fastest rewrite the agent verified, or never submitting an unverified patch, are left for RSI to discover.
@@ -649,7 +654,7 @@ Each PostgreSQL instance is pinned with cpuset to both SMT siblings of its physi
   goaly run --bench effisql --instances heldout.jsonl --harness final --phase solve --out runs/heldout
   ```
 
-  The official predictions land in the run directory as `official/seed-<k>.jsonl`, one file per seed. Each is the official prediction file: every input record plus its `prediction` field, which holds both the diff and the SQL (§3.3).
+  The official predictions land in the run directory as `official/seed-<k>.jsonl`, one file per seed. Each is the official prediction file: every input record plus its `prediction` field, which holds both the SQL and the diff, in that order (§3.3).
 
   This needs the executor API, a PostgreSQL database for Effi-SQL, and Docker. The solve phase always runs in its container (§6.1), so there is no non-Docker fallback for official runs (§11). SWE (on hold) would need Docker for its task containers too.
 
