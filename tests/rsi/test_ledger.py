@@ -7,6 +7,7 @@ import sys
 from pathlib import Path
 
 import pytest
+from google.protobuf.timestamp_pb2 import Timestamp
 
 from goaly.contracts.gen.experiment_pb2 import (
     DECISION_ABORTED,
@@ -21,6 +22,8 @@ from goaly.contracts.gen.experiment_pb2 import (
     ExperimentRecord,
     Hypothesis,
     Lane,
+    LaneEvent,
+    LaneEventKind,
 )
 from goaly.contracts.jsonl import append_jsonl
 from goaly.rsi.ledger import Ledger, LedgerError, check_id, default_ledger_dir
@@ -318,3 +321,77 @@ def test_a_read_session_refuses_writes(ledger: Ledger) -> None:
         files.append("experiments.jsonl", experiment("e2"))
 
     assert ledger.experiments() == [experiment("e1")]
+
+
+# Lane events.
+
+AT = Timestamp(seconds=1_760_529_600)
+STARTED = LaneEventKind.LANE_EVENT_KIND_STARTED
+
+
+def test_lane_events_read_back_in_order(ledger: Ledger) -> None:
+    events = [
+        LaneEvent(lane=LANE_EFFISQL, occurred_at=AT, kind=STARTED),
+        LaneEvent(lane=LANE_SWE, occurred_at=AT, kind=STARTED),
+        LaneEvent(
+            lane=LANE_EFFISQL,
+            occurred_at=AT,
+            kind=LaneEventKind.LANE_EVENT_KIND_RESULTS_PR,
+            pr_number=21,
+            pr_url="https://github.com/Catflirter/goaly/pull/21",
+            head_commit="abc123",
+            experiment_ids=["e1", "e4"],
+        ),
+        LaneEvent(
+            lane=LANE_EFFISQL,
+            occurred_at=AT,
+            kind=LaneEventKind.LANE_EVENT_KIND_STOPPED,
+            detail="4 rounds without a gain",
+        ),
+    ]
+
+    for lane_event in events:
+        ledger.record_lane_event(lane_event)
+
+    assert ledger.lane_events() == events
+    assert ledger.lane_events(LANE_EFFISQL) == [events[0], events[2], events[3]]
+    assert ledger.lane_events(LANE_SWE) == [events[1]]
+    assert len(lines(ledger.directory / "lane_events.jsonl")) == 4
+
+
+def test_a_ledger_without_lane_events_has_none(ledger: Ledger) -> None:
+    ledger.record_experiment(experiment("e1"))
+
+    assert ledger.lane_events() == []
+
+
+@pytest.mark.parametrize(
+    ("lane_event", "problem"),
+    [
+        (LaneEvent(lane=LANE_UNSPECIFIED, occurred_at=AT, kind=STARTED), "lane"),
+        (
+            LaneEvent(
+                lane=LANE_EFFISQL, occurred_at=AT, kind=LaneEventKind.LANE_EVENT_KIND_UNSPECIFIED
+            ),
+            "kind",
+        ),
+        (LaneEvent(lane=LANE_EFFISQL, occurred_at=AT, kind=LaneEventKind.ValueType(99)), "kind"),
+        (LaneEvent(lane=LANE_EFFISQL, kind=STARTED), "occurred_at"),
+        (
+            LaneEvent(
+                lane=LANE_EFFISQL,
+                occurred_at=AT,
+                kind=LaneEventKind.LANE_EVENT_KIND_RESULTS_PR,
+                pr_url="https://github.com/Catflirter/goaly/pull/21",
+            ),
+            "pr_number",
+        ),
+    ],
+)
+def test_an_invalid_lane_event_is_refused_and_nothing_is_written(
+    ledger: Ledger, lane_event: LaneEvent, problem: str
+) -> None:
+    with pytest.raises(ValueError, match=problem):
+        ledger.record_lane_event(lane_event)
+
+    assert not (ledger.directory / "lane_events.jsonl").exists()

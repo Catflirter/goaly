@@ -6,6 +6,8 @@ The ledger is one directory of JSONL files, shared by the lanes, which run as se
 - ``experiments.jsonl``, one ExperimentRecord per line. A lane writes an experiment's record as it
   goes (spec §8.7), and the last line for an experiment_id wins.
 - ``lessons.jsonl`` and the ``lessons.md`` generated from it (goaly.rsi.lessons).
+- ``lane_events.jsonl``, one LaneEvent per line: what happens to a lane outside any one
+  experiment, such as starts, restarts, stops, results PRs and notifications (spec §8.7).
 
 Every write appends one line under the ledger's exclusive lock and syncs it to disk before the
 lock is released, so a crash loses at most the line being written. Reads take the shared lock, so
@@ -27,8 +29,12 @@ from goaly.contracts.gen.experiment_pb2 import (
     DECISION_ACCEPTED,
     DECISION_PENDING,
     DECISION_REJECTED,
+    LANE_EVENT_KIND_RESULTS_PR,
+    LANE_EVENT_KIND_UNSPECIFIED,
     ExperimentRecord,
     Lane,
+    LaneEvent,
+    LaneEventKind,
 )
 from goaly.contracts.jsonl import append_jsonl, read_jsonl
 from goaly.rsi.lanes import lane_info
@@ -36,6 +42,7 @@ from goaly.rsi.locks import file_lock
 
 __all__ = [
     "EXPERIMENTS",
+    "LANE_EVENTS",
     "LESSONS",
     "LESSONS_MARKDOWN",
     "Ledger",
@@ -48,6 +55,7 @@ __all__ = [
 EXPERIMENTS = "experiments.jsonl"
 LESSONS = "lessons.jsonl"
 LESSONS_MARKDOWN = "lessons.md"
+LANE_EVENTS = "lane_events.jsonl"
 _LOCK = ".lock"
 
 # IDs name branches, worktrees, run directories and container labels, so they stay plain.
@@ -199,6 +207,29 @@ class Ledger:
         if not best.candidate_commit:
             raise LedgerError(f"experiment {best.experiment_id} is accepted but has no commit")
         return best.candidate_commit
+
+    def record_lane_event(self, event: LaneEvent) -> None:
+        """Append ``event`` to lane_events.jsonl.
+
+        Raises ValueError, writing nothing, if its lane or kind is unset or unknown, it has no
+        occurred_at, or it is a results PR without its pr_number, which keeps a restarted lane
+        from opening the PR again (spec §8.7).
+        """
+        lane_info(event.lane)
+        if event.kind == LANE_EVENT_KIND_UNSPECIFIED or event.kind not in LaneEventKind.values():
+            raise ValueError(f"a lane event's kind must be set and known; got {event.kind}")
+        if not event.HasField("occurred_at"):
+            raise ValueError("a lane event needs its occurred_at")
+        if event.kind == LANE_EVENT_KIND_RESULTS_PR and event.pr_number < 1:
+            raise ValueError("a results PR event needs its pr_number")
+        with self.session(write=True) as files:
+            files.append(LANE_EVENTS, event)
+
+    def lane_events(self, lane: Lane.ValueType | None = None) -> list[LaneEvent]:
+        """Return the events of one ``lane``, or of all, in the order they were recorded."""
+        with self.session() as files:
+            events = files.read(LANE_EVENTS, LaneEvent)
+        return [event for event in events if lane in (None, event.lane)]
 
 
 def _check_experiment(record: ExperimentRecord) -> None:
