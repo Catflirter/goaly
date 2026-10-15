@@ -139,3 +139,20 @@ def test_a_process_that_left_the_group_holding_the_pipes_does_not_stall_a_timeou
         run_git(["slow"], cwd=repo, timeout_s=0.3)
 
     assert time.monotonic() - started < 2
+
+
+@pytest.mark.parametrize("name", ["GIT_DIR", "GIT_CONFIG_GLOBAL", "GIT_WORK_TREE", "PATH"])
+def test_a_caller_cannot_set_a_variable_that_redirects_git(tmp_path: Path, name: str) -> None:
+    repo = make_repo(tmp_path / "repo")
+
+    with pytest.raises(ValueError, match=name):
+        run_git(["status"], cwd=repo, env={name: "/elsewhere"})
+
+
+def test_a_caller_can_name_an_index_of_its_own(tmp_path: Path) -> None:
+    repo = make_repo(tmp_path / "repo")
+    index = {"GIT_INDEX_FILE": str(tmp_path / "index")}
+
+    run_git(["read-tree", "HEAD"], cwd=repo, env=index)
+
+    assert (tmp_path / "index").exists()

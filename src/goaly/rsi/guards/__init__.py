@@ -2,4 +2,6 @@
 
 Each guard checks a candidate's commit, through git or a read-only snapshot of it
 (goaly.rsi.workspace.Workspace.snapshot), never its live worktree, and returns a GuardResult.
+check_gold_free is not one of them: it is a precondition of every evaluation, and it raises
+GoldDataError instead.
 """

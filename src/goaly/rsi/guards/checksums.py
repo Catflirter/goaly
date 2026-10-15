@@ -2,7 +2,8 @@
 
 bench, harness core and contracts are frozen while RSI runs (spec §8.1). A lane takes their
 checksums when it starts, from its first best version's snapshot, and checks a candidate's
-snapshot against them before every evaluation.
+snapshot against them before every evaluation. Every file counts, bytecode included: a snapshot
+holds only committed files, and committed bytecode could change what the layer does.
 """
 
 import hashlib
@@ -14,7 +15,6 @@ from goaly.contracts.gen.experiment_pb2 import GUARD_CHECKSUMS, GuardResult
 __all__ = ["FROZEN_DIRS", "check_checksums", "frozen_checksums"]
 
 FROZEN_DIRS = ("src/goaly/bench", "src/goaly/harness/core", "src/goaly/contracts")
-_CACHE = "__pycache__"  # Bytecode Python writes as it imports; never part of a layer.
 
 
 def frozen_checksums(root: Path) -> dict[str, str]:
@@ -42,8 +42,6 @@ def _tree_checksum(directory: Path) -> str:
     if directory.is_dir():
         for path in sorted(directory.rglob("*")):
             relative = path.relative_to(directory)
-            if _CACHE in relative.parts:
-                continue
             if path.is_symlink():
                 entry = f"link\0{relative.as_posix()}\0{path.readlink()}"
             elif path.is_file():
