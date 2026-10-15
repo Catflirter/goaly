@@ -121,6 +121,8 @@ def test_an_override_cannot_switch_glm_thinking() -> None:
         ("top_p", 1.01),
         ("top_k", 0),
         ("max_tokens", 0),
+        ("presence_penalty", -2.1),
+        ("presence_penalty", 2.1),
     ],
 )
 def test_params_reject_values_out_of_range(field: str, value: float) -> None:

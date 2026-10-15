@@ -272,7 +272,9 @@ async def test_sends_qwen_its_thinking_switch_and_recommended_sampling() -> None
 
 async def test_a_call_overrides_the_profile_field_by_field() -> None:
     gateway = Gateway(completion(), completion())
-    params = ModelParams(temperature=0.0, max_tokens=512, enable_thinking=False)
+    params = ModelParams(
+        temperature=0.0, max_tokens=512, presence_penalty=1.5, enable_thinking=False
+    )
     async with connect(gateway) as llm:
         await llm.complete([user("hi")], model=QWEN, tags=EXEC, params=params)
         await llm.complete(
@@ -287,9 +289,11 @@ async def test_a_call_overrides_the_profile_field_by_field() -> None:
         "top_p": 0.95,
         "top_k": 20,
         "max_tokens": 512,
+        "presence_penalty": 1.5,
         "chat_template_kwargs": {"enable_thinking": False},
     }
     assert second["chat_template_kwargs"] == {"enable_thinking": True, "preserve_thinking": True}
+    assert "presence_penalty" not in second  # Not sent unless set.
 
 
 async def test_sends_glm_no_thinking_parameter_and_no_sampling_defaults() -> None:

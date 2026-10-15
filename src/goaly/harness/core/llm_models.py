@@ -62,6 +62,8 @@ class ModelParams(BaseModel):
     top_p: float | None = Field(default=None, gt=0, le=1)
     top_k: int | None = Field(default=None, ge=1)
     max_tokens: int | None = Field(default=None, ge=1)
+    # Discourages repeating what is already in the text; a pack may tune it, as core sets none.
+    presence_penalty: float | None = Field(default=None, ge=-2, le=2)
     # Qwen only: whether the model thinks before it answers.
     enable_thinking: bool | None = None
     # Qwen only: whether the chat template keeps the reasoning of earlier turns in the prompt.
