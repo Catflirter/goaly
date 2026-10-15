@@ -1,5 +1,6 @@
 """Tests for scripts/freeze.py, on a throwaway repository with a bare origin."""
 
+import subprocess
 from pathlib import Path
 
 import pytest
@@ -72,15 +73,71 @@ def test_takes_main_from_the_remote_not_the_local_branch(tmp_path: Path) -> None
 
 def test_an_existing_tag_on_the_commit_is_done_and_on_another_refused(tmp_path: Path) -> None:
     repo, _ = repo_with_origin(tmp_path)
-    git(repo, "tag", "--annotate", "final", "--message", "x")
+    plan = freeze_plan(repo)
+    plan.apply(repo)
 
+    assert freeze_plan(repo).done
     assert freeze_plan(repo).steps() == [
-        f"# final already marks {freeze_plan(repo).commit[:12]}: nothing to do"
+        f"# final marks {plan.commit[:12]} here and on origin: nothing to do"
     ]
 
     commit_pack(repo, "v2")
     git(repo, "push", "--quiet", "origin", "main")
-    with pytest.raises(FreezeError, match="already marks"):
+    with pytest.raises(FreezeError, match=r"already marks .* here"):
+        freeze_plan(repo)
+
+
+def test_pushes_again_a_tag_whose_push_failed(tmp_path: Path) -> None:
+    repo, origin = repo_with_origin(tmp_path)
+    hook = origin / "hooks" / "pre-receive"
+    hook.write_text("#!/bin/sh\nexit 1\n", encoding="utf-8")
+    hook.chmod(0o755)
+
+    with pytest.raises(subprocess.CalledProcessError):
+        freeze_plan(repo).apply(repo)
+    assert remote_tags(origin) == ""
+    hook.unlink()
+    plan = freeze_plan(repo)
+
+    assert (plan.tagged, plan.pushed) == (True, False)
+    assert plan.steps()[-1] == "git push origin refs/tags/final:refs/tags/final"
+    plan.apply(repo)
+    assert remote_tags(origin) == "final"
+
+
+def test_refuses_when_the_remote_final_marks_another_commit(tmp_path: Path) -> None:
+    repo, origin = repo_with_origin(tmp_path)
+    old = git(repo, "rev-parse", "HEAD")
+    git(origin, "tag", "final", old)
+    commit_pack(repo, "v2")
+    git(repo, "push", "--quiet", "origin", "main")
+
+    with pytest.raises(FreezeError, match=r"already marks .* origin"):
+        freeze_plan(repo)
+
+
+def test_refuses_a_best_tag_on_the_remote_that_differs_here(tmp_path: Path) -> None:
+    repo, origin = repo_with_origin(tmp_path)
+    git(origin, "tag", "best/effisql", git(repo, "rev-parse", "HEAD"))
+
+    with pytest.raises(FreezeError, match="fetch the lane's tag first"):
+        freeze_plan(repo)
+
+    git(repo, "fetch", "--quiet", "origin", "tag", "best/effisql")
+    assert "its Effi-SQL pack is best/effisql's" in freeze_plan(repo).message
+
+
+def test_compares_the_pack_tests_too(tmp_path: Path) -> None:
+    repo, _ = repo_with_origin(tmp_path)
+    tests = repo / "tests" / "harness" / "packs" / "effisql"
+    tests.mkdir(parents=True)
+    (tests / "test_policy.py").write_text("# best's\n", encoding="utf-8")
+    git(repo, "add", "-A")
+    git(repo, "commit", "--quiet", "--message", "best's tests")
+    git(repo, "tag", "best/effisql")
+    git(repo, "reset", "--quiet", "--hard", "HEAD~1")
+
+    with pytest.raises(FreezeError, match="tests/harness/packs/effisql"):
         freeze_plan(repo)
 
 
@@ -119,3 +176,14 @@ def test_main_reports_a_failed_git_command(
 
     assert freeze.main(["--remote", "nowhere"]) == 1
     assert "git -C" in capsys.readouterr().err
+
+
+def test_fails_unless_the_remote_has_the_tag_after_the_push(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    repo, _ = repo_with_origin(tmp_path)
+    plan = freeze_plan(repo)
+    monkeypatch.setattr(freeze, "_remote_tags", lambda repo, remote: {})
+
+    with pytest.raises(FreezeError, match="does not have final"):
+        plan.apply(repo)

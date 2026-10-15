@@ -3,6 +3,7 @@
 import asyncio
 import itertools
 import json
+import os
 import sys
 from pathlib import Path
 
@@ -215,3 +216,34 @@ def test_the_baseline_never_grades_wide(tmp_path: Path) -> None:
     stages = plan(PRESETS["baseline"], root=tmp_path, harness="v0", goaly=["goaly"], wide=True)
 
     assert not any(s.after_solves or "--grading-instances" in s.argv for s in stages)
+
+
+def test_refuses_untracked_files_in_the_code(tmp_path: Path) -> None:
+    repo, _ = repo_with_origin(tmp_path)
+    git(repo, "tag", "final")
+    (repo / "src" / "goaly" / "harness" / "packs" / "effisql" / "extra.py").write_text("x = 1")
+    (repo / "runs").mkdir()
+    (repo / "runs" / "elsewhere.txt").write_text("run artifacts are fine")
+
+    with pytest.raises(PlanError, match=r"untracked files under src/, such as .*extra\.py"):
+        check_checkout("final", repo)
+
+
+def test_a_cancelled_stage_stops_its_goaly_run(tmp_path: Path) -> None:
+    pid_file = tmp_path / "pid"
+    script = "import os, sys, time; open(sys.argv[1], 'w').write(str(os.getpid())); time.sleep(60)"
+    stage = Stage("val", "solve", (sys.executable, "-c", script, str(pid_file)))
+
+    async def cancel_it() -> None:
+        task = asyncio.ensure_future(execute([stage], tmp_path / "runs"))
+        while not pid_file.exists():
+            await asyncio.sleep(0.05)
+        task.cancel()
+        with pytest.raises(asyncio.CancelledError):
+            await task
+
+    asyncio.run(cancel_it())
+
+    pid = int(pid_file.read_text())
+    with pytest.raises(ProcessLookupError):
+        os.kill(pid, 0)  # Terminated and reaped.

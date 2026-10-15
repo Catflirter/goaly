@@ -47,6 +47,7 @@ check: lint typecheck imports proto-check test ## Run everything CI runs
 # grading. These need Docker, PostgreSQL and the executor API's key; `make final-plan` prints the
 # final's plan without running anything.
 FINAL_RUNS ?= runs/final
+# Where v0's runs are; point it at T12's archived runs if they live elsewhere.
 BASELINE_RUNS ?= runs/baseline
 HARNESS ?= v0
 V0_REF ?= v0
@@ -73,6 +74,7 @@ baseline: prepare ## Rerun v0 at V0_REF: train x1 and val x2 in dev mode, then h
 
 report: ## Write the final report from the runs and the ledger; REPORT_ARGS=--allow-partial drafts it
 	$(UV_RUN) python scripts/effisql/final_report.py --template docs/results/final-report-template.md \
-		--out $(REPORT) $(call report_run,v0-heldout,$(BASELINE_RUNS)/heldout) \
+		--out $(REPORT) --verdicts docs/results/audit-verdicts.json \
+		$(call report_run,v0-heldout,$(BASELINE_RUNS)/heldout) \
 		$(call report_run,v0-val,$(BASELINE_RUNS)/val) $(call report_run,final-heldout,$(FINAL_RUNS)/heldout) \
 		$(call report_run,final-val,$(FINAL_RUNS)/val) $(REPORT_ARGS)

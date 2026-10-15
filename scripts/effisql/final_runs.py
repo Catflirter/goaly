@@ -40,6 +40,7 @@ from goaly.bench.effisql.report_inputs import RunDirError, load_run
 REPO = Path(__file__).resolve().parents[2]
 # T11's host option to grade on all 5 instances, the 2 solving ones included (spec §6.2, §10).
 ALL_INSTANCES = ("--grading-instances", "all")
+_STOP_TIMEOUT_S = 60  # How long a cancelled goaly run gets to stop before it is killed.
 
 
 @dataclass(frozen=True)
@@ -135,6 +136,10 @@ def check_checkout(ref: str, repo: Path) -> str:
         raise PlanError(f"the checkout is at {head[:12]}, not {ref} ({commit[:12]}): check it out")
     if _git(repo, "status", "--porcelain", "--untracked-files=no"):
         raise PlanError("the checkout has uncommitted changes, which no manifest would record")
+    # The solve container mounts the checkout, so an untracked file in the code would run too.
+    if untracked := _git(repo, "status", "--porcelain", "--untracked-files=all", "--", "src"):
+        first = untracked.splitlines()[0].removeprefix("?? ")
+        raise PlanError(f"the checkout has untracked files under src/, such as {first}")
     return commit
 
 
@@ -183,13 +188,27 @@ async def _run_stage(stage: Stage, root: Path) -> int:
         process = await asyncio.create_subprocess_exec(
             *stage.argv, cwd=REPO, stdout=output, stderr=subprocess.STDOUT
         )
-        status = await process.wait()
+        try:
+            status = await process.wait()
+        finally:  # Cancelled or interrupted: stop the goaly run too, so no instance stays busy.
+            if process.returncode is None:
+                await _stop(process)
     record: dict[str, object] = {"run": stage.run, "phase": stage.phase, "argv": list(stage.argv)}
     record |= {"started_at": started, "finished_at": time.time(), "exit_status": status}
     with (root / "stages.jsonl").open("a", encoding="utf-8") as file:
         file.write(json.dumps(record) + "\n")
     _say(f"{stage.run} {stage.phase}: exit {status} after {time.time() - started:.0f} s; {log}")
     return status
+
+
+async def _stop(process: asyncio.subprocess.Process) -> None:
+    """Terminate ``process``, which then interrupts its run as Ctrl-C would, or kill it."""
+    process.terminate()
+    try:
+        await asyncio.wait_for(process.wait(), _STOP_TIMEOUT_S)
+    except TimeoutError:
+        process.kill()
+        await process.wait()
 
 
 def grades_wide(goaly: Sequence[str]) -> bool:

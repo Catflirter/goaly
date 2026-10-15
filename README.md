@@ -59,5 +59,8 @@ make baseline V0_REF=<v0>   # rerun v0 at its commit: train x1, val x2, then hel
 make report REPORT_ARGS=--allow-partial   # draft docs/results/final-report.md while runs grade
 ```
 
+The report reads v0's runs from `runs/baseline/{heldout,val}`. If T12's archived runs live
+elsewhere, pass their root, as in `make report BASELINE_RUNS=/path/to/baseline`. Record the
+constant-branch audit's verdicts in `docs/results/audit-verdicts.json` before publishing.
 Rerunning `make final` or `make baseline` continues where it stopped. Each phase's log is in
 `runs/<final|baseline>/logs/`.
