@@ -17,7 +17,7 @@ from psycopg import errors
 from pydantic import SecretStr
 
 from goaly.bench.effisql.pg_build import connector, read_golden_record
-from goaly.bench.effisql.pg_instances import apply_roles, socket_dirs
+from goaly.bench.effisql.pg_instances import ROLE_DEFAULTS, apply_roles, socket_dirs
 from goaly.bench.effisql.pg_settings import ADMIN_ROLE, AGENT_ROLE, AgentCredentials
 from goaly.bench.effisql.sql_env import (
     STATEMENT_TIMEOUT,
@@ -500,6 +500,5 @@ async def test_defaults_set_on_the_agent_role_never_reach_a_session(
         apply_roles(admin, writable_env.credentials, instance.kind)
 
     assert _rows(settings) == [["4MB", "on", "5GB"]]
-    assert [(db, sorted(config)) for db, config in stored] == [
-        (None, ["default_transaction_read_only=on", "temp_file_limit=5GB"])
-    ]
+    expected = sorted(f"{name}={value}" for name, value in ROLE_DEFAULTS[AGENT_ROLE].items())
+    assert [(db, sorted(config)) for db, config in stored] == [(None, expected)]
