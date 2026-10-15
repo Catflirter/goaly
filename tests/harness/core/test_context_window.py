@@ -122,6 +122,21 @@ def test_a_call_with_no_usage_keeps_the_estimate() -> None:
     assert prompt.estimated_tokens == before
 
 
+def test_a_prompt_exactly_at_the_threshold_does_not_fold() -> None:
+    prompt = chat(["x" * 4000] * 3, keep_turns=1)  # The threshold is 1,000.
+
+    prompt.sent(1000)
+
+    assert prompt.fold() == []
+
+
+def test_a_message_needs_a_turn_to_join() -> None:
+    prompt = ChatPrompt(OPENING, TOOLS, window())
+
+    with pytest.raises(ValueError, match="add_turn"):
+        prompt.add(tool("c0", "rows: 1"))
+
+
 def test_nothing_is_folded_up_to_the_threshold() -> None:
     prompt = chat(["x" * 2000] * 12, fold_above_tokens=100_000)
 

@@ -428,6 +428,26 @@ async def test_a_window_of_0_replays_the_chat_unchanged() -> None:
     assert replies_sent(llm, 10) == as_written[:10]  # Markup and reasoning, all as they came.
 
 
+async def test_no_call_markup_reaches_the_model_whatever_the_reply() -> None:
+    drafted_submit = tool_call_block("submit", QWEN_BASE_SQL)
+    script = [
+        # A standard call, whose reasoning drafted a submit that never ran.
+        reply(execute_sql(FAST), reasoning=f"Or submit it now?\n{drafted_submit}"),
+        # No call at all: its <tool_call> was never closed.
+        reply(
+            content=f"Done.\n<tool_call>\n{function_block('submit', FAST)}", finish_reason="stop"
+        ),
+        reply(submit()),
+    ]
+    llm = FakeLLM(script)
+    ctx = context(llm)
+
+    await run_agent(environment(), ctx, hooks())
+
+    assert replies_sent(llm, 2) == [("", "Or submit it now?\n"), ("Done.\n", "")]
+    assert reference_prompts(ctx.trajectory()) == sent(llm)
+
+
 async def test_a_trajectory_round_trips_through_jsonl(tmp_path: Path) -> None:
     ctx = context(FakeLLM([qwen_reply("xml_in_content"), reply(submit())]))
     await run_agent(environment(), ctx, hooks())

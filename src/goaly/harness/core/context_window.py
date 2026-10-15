@@ -1,12 +1,11 @@
 """Context management (spec §5.1): keeping a chat's prompt within the model's context.
 
-Qwen has a 128K-token context. Once the prompt of a chat's next call would pass 96K tokens, the
-loop folds older tool outputs, oldest first, until the prompt is back under: a folded output
-keeps its first 500 characters and a marker that gives its full length. The system prompt, the
-task and the last 8 turns, each an assistant message with its tool results, stay as they are.
-The fold is deterministic, with no model call, and only the prompt is folded: the trajectory
-keeps every output whole and records each fold (Step.folds), so every step's prompt can still be
-rebuilt from it.
+Qwen has a 128K-token context. Once the prompt of a chat's next call would pass 96K tokens, the loop
+folds older tool outputs, oldest first, until the prompt is back at or under that: a folded output
+keeps its first 500 characters and a marker that gives its full length. The system prompt, the task
+and the last 8 turns, each an assistant message with its tool results, stay as they are. The fold is
+deterministic, with no model call, and only the prompt is folded: the trajectory keeps every output
+whole and records each fold (Step.folds), so every step's prompt can still be rebuilt from it.
 
 Only the turns of that verbatim tail go out with their reasoning: an assistant message that
 leaves it is sent without its reasoning_content from then on, whatever the prompt's size. The
@@ -40,6 +39,8 @@ class ContextWindow(BaseModel):
     Once the next call's prompt would pass ``fold_above_tokens``, older tool outputs fold to
     their first ``folded_chars`` characters, and the last ``keep_turns`` turns never fold. The
     default threshold leaves 32K of Qwen's 128K for the reply and for the estimate's error.
+    The threshold is no guarantee: the last turns never fold, and with long outputs they can pass
+    it alone. Then the gateway's overflow, and the loop's fold and retry, are the backstop.
 
     ``keep_turns`` is also the chat's replay window (Chat.keep_turns): only the last
     ``keep_turns`` replies keep their reasoning, and every reply loses its call markup. With 0,
@@ -100,7 +101,9 @@ class ChatPrompt:
             self._drop_reasoning(leaving)
 
     def add(self, message: ChatMessage) -> None:
-        """Add a tool message, or an injected one, to the last turn."""
+        """Add a tool message, or an injected one, to the last turn; add_turn starts one."""
+        if not self._turns:
+            raise ValueError("a message joins a turn, so add_turn must start one first")
         self._turns[-1].messages.append(message)
         self._estimate += _chars(message) / _CHARS_PER_TOKEN
 
