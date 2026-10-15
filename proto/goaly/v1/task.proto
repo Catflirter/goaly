@@ -42,8 +42,10 @@ message EffiSqlTaskInput {
   string base_sql = 2;
   // The database's DDL, row counts and indexes, as text.
   string schema = 3;
-  // The base query's plan, as JSON text: the task file's base_explain_analyze when it has one,
-  // otherwise our own EXPLAIN (FORMAT JSON).
+  // The base query's plan, as JSON text: our plans.json entry for the task when there is one,
+  // otherwise the task file's base_explain_analyze. plans.json holds our own EXPLAIN (FORMAT
+  // JSON) for the tasks whose file has no plan and for those whose plan was recorded at another
+  // scale (spec §4.1).
   string base_plan = 4;
   // The dataset's difficulty label: easy, medium or hard.
   string difficulty = 5;
@@ -99,7 +101,7 @@ message SwePrediction {
 message Grade {
   // The task graded.
   string instance_id = 1;
-  // The score: Effi-SQL the R-VES credit (EffiSqlGrade.credit); SWE SR_i (spec §4.2), already
+  // The score: Effi-SQL the checked credit (EffiSqlGrade.credit); SWE SR_i (spec §4.2), already
   // floored at 0.001.
   double score = 2;
   // Effi-SQL: EffiSqlGrade.matched, and no check against hard-coded results flagged the
@@ -126,7 +128,8 @@ enum GradeStatus {
   GRADE_STATUS_UNSPECIFIED = 0;
   // The grader evaluated the prediction.
   GRADE_STATUS_GRADED = 1;
-  // The prediction failed to run (Effi-SQL: the query raised an error) or to apply (SWE).
+  // The prediction failed to run (Effi-SQL: the query raised an error or was refused, e.g. a plan
+  // that modifies data) or to apply (SWE).
   GRADE_STATUS_PREDICTION_FAILED = 2;
   // The prediction ran past the grader's time limit.
   GRADE_STATUS_TIMEOUT = 3;
@@ -142,7 +145,9 @@ enum GradeStatus {
 // true, and is never true unless the status is GRADE_STATUS_GRADED.
 message EffiSqlGrade {
   // True if the prediction ran without an error or a timeout and its result equals the base
-  // query's: the same row count and the same multiset of row hashes.
+  // query's: the same row count and the same multiset of row hashes. A plan that would modify
+  // data, with a ModifyTable node, is refused before it runs: the grade is then not matched, and
+  // its status is GRADE_STATUS_PREDICTION_FAILED.
   bool matched = 1;
   // The robustness check against hard-coded results: whether a matched prediction also returns
   // the base query's result on an alternate TPC-H database with different data. Set only when the
@@ -172,7 +177,7 @@ message EffiSqlGrade {
   // official credit ignores both flags: it is g(speedup) when matched, an unset speedup counting
   // as 0, and 0 otherwise.
   double credit = 5;
-  // How many timed runs the times come from.
+  // How many timed runs the times come from; 0 for an identity-cached grade.
   int32 timing_runs = 6;
   // How many rows the prediction returned.
   int32 pred_row_count = 7;
@@ -185,8 +190,9 @@ message EffiSqlGrade {
   bool base_cached = 9;
   // True if dev mode graded a prediction identical to base_sql after normalization with the
   // identity τ measured during setup, and that τ's credit, without timing it again (spec §4.1).
-  // Official mode always times the prediction, identity submissions included, so it is false
-  // there.
+  // Such a grade has matched true, speedup the setup's identity τ, base_time_s the cached value,
+  // pred_time_s unset, timing_runs 0 and eval_wall_s unset. Official mode always times the
+  // prediction, identity submissions included, so it is false there.
   bool identity_cached = 13;
 }
 

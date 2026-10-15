@@ -71,7 +71,9 @@ class _GradeStatusEnumTypeWrapper(_enum_type_wrapper._EnumTypeWrapper[_GradeStat
     GRADE_STATUS_GRADED: _GradeStatus.ValueType  # 1
     """The grader evaluated the prediction."""
     GRADE_STATUS_PREDICTION_FAILED: _GradeStatus.ValueType  # 2
-    """The prediction failed to run (Effi-SQL: the query raised an error) or to apply (SWE)."""
+    """The prediction failed to run (Effi-SQL: the query raised an error or was refused, e.g. a plan
+    that modifies data) or to apply (SWE).
+    """
     GRADE_STATUS_TIMEOUT: _GradeStatus.ValueType  # 3
     """The prediction ran past the grader's time limit."""
     GRADE_STATUS_GRADER_ERROR: _GradeStatus.ValueType  # 4
@@ -87,7 +89,9 @@ GRADE_STATUS_UNSPECIFIED: GradeStatus.ValueType  # 0
 GRADE_STATUS_GRADED: GradeStatus.ValueType  # 1
 """The grader evaluated the prediction."""
 GRADE_STATUS_PREDICTION_FAILED: GradeStatus.ValueType  # 2
-"""The prediction failed to run (Effi-SQL: the query raised an error) or to apply (SWE)."""
+"""The prediction failed to run (Effi-SQL: the query raised an error or was refused, e.g. a plan
+that modifies data) or to apply (SWE).
+"""
 GRADE_STATUS_TIMEOUT: GradeStatus.ValueType  # 3
 """The prediction ran past the grader's time limit."""
 GRADE_STATUS_GRADER_ERROR: GradeStatus.ValueType  # 4
@@ -150,8 +154,10 @@ class EffiSqlTaskInput(_message.Message):
     schema: _builtins.str
     """The database's DDL, row counts and indexes, as text."""
     base_plan: _builtins.str
-    """The base query's plan, as JSON text: the task file's base_explain_analyze when it has one,
-    otherwise our own EXPLAIN (FORMAT JSON).
+    """The base query's plan, as JSON text: our plans.json entry for the task when there is one,
+    otherwise the task file's base_explain_analyze. plans.json holds our own EXPLAIN (FORMAT
+    JSON) for the tasks whose file has no plan and for those whose plan was recorded at another
+    scale (spec §4.1).
     """
     difficulty: _builtins.str
     """The dataset's difficulty label: easy, medium or hard."""
@@ -320,7 +326,7 @@ class Grade(_message.Message):
     instance_id: _builtins.str
     """The task graded."""
     score: _builtins.float
-    """The score: Effi-SQL the R-VES credit (EffiSqlGrade.credit); SWE SR_i (spec §4.2), already
+    """The score: Effi-SQL the checked credit (EffiSqlGrade.credit); SWE SR_i (spec §4.2), already
     floored at 0.001.
     """
     correct: _builtins.bool
@@ -387,7 +393,9 @@ class EffiSqlGrade(_message.Message):
     IDENTITY_CACHED_FIELD_NUMBER: _builtins.int
     matched: _builtins.bool
     """True if the prediction ran without an error or a timeout and its result equals the base
-    query's: the same row count and the same multiset of row hashes.
+    query's: the same row count and the same multiset of row hashes. A plan that would modify
+    data, with a ModifyTable node, is refused before it runs: the grade is then not matched, and
+    its status is GRADE_STATUS_PREDICTION_FAILED.
     """
     alt_matched: _builtins.bool
     """The robustness check against hard-coded results: whether a matched prediction also returns
@@ -422,7 +430,7 @@ class EffiSqlGrade(_message.Message):
     as 0, and 0 otherwise.
     """
     timing_runs: _builtins.int
-    """How many timed runs the times come from."""
+    """How many timed runs the times come from; 0 for an identity-cached grade."""
     pred_row_count: _builtins.int
     """How many rows the prediction returned."""
     base_row_count: _builtins.int
@@ -436,8 +444,9 @@ class EffiSqlGrade(_message.Message):
     identity_cached: _builtins.bool
     """True if dev mode graded a prediction identical to base_sql after normalization with the
     identity τ measured during setup, and that τ's credit, without timing it again (spec §4.1).
-    Official mode always times the prediction, identity submissions included, so it is false
-    there.
+    Such a grade has matched true, speedup the setup's identity τ, base_time_s the cached value,
+    pred_time_s unset, timing_runs 0 and eval_wall_s unset. Official mode always times the
+    prediction, identity submissions included, so it is false there.
     """
     def __init__(
         self,
