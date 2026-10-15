@@ -4,7 +4,6 @@ Run with ``GOALY_EFFISQL_ITEST_REAL=1 pytest --integration``: these tests only r
 on the running environment. Without the variable they skip.
 """
 
-import os
 from collections.abc import Iterator
 from datetime import UTC, date, datetime, timedelta
 from decimal import Decimal
@@ -18,26 +17,15 @@ from goaly.bench.effisql.grader import (
     QueryTimeoutError,
     speedup,
 )
-from goaly.bench.effisql.pg_build import connector
-from goaly.bench.effisql.pg_settings import ALT_DB, GRADER_ROLE, MAIN_DB, load_credentials
+from goaly.bench.effisql.pg_settings import ALT_DB
+from tests.bench.effisql.real_grading import GRADE_1_PORT, GRADE_2_PORT, real_session
 
 pytestmark = pytest.mark.integration
-
-GRADE_1_PORT = 55434
-GRADE_2_PORT = 55435
-
-
-def _session(port: int, db: str = MAIN_DB, *, timeout_s: float = 300.0) -> PgSession:
-    if os.environ.get("GOALY_EFFISQL_ITEST_REAL") != "1":
-        pytest.skip("needs the real instances: set GOALY_EFFISQL_ITEST_REAL=1")
-    password = load_credentials().grader_password
-    connect = connector("127.0.0.1", port, password, user=GRADER_ROLE)
-    return PgSession.open(connect, db, timeout_s=timeout_s)
 
 
 @pytest.fixture
 def session() -> Iterator[PgSession]:
-    opened = _session(GRADE_1_PORT)
+    opened = real_session(GRADE_1_PORT)
     yield opened
     opened.close()
 
@@ -79,7 +67,7 @@ def test_rows_load_as_psycopg2_builds_them(session: PgSession) -> None:
 
 def test_a_tpch_result_digests_the_same_on_two_instances(session: PgSession) -> None:
     query = "SELECT * FROM lineitem WHERE l_orderkey < 2000 ORDER BY random()"
-    other = _session(GRADE_2_PORT)
+    other = real_session(GRADE_2_PORT)
     try:
         first, second = session.digest(query), other.digest(query)
     finally:
@@ -89,7 +77,7 @@ def test_a_tpch_result_digests_the_same_on_two_instances(session: PgSession) -> 
 
 
 def test_the_alternate_database_gives_a_different_result() -> None:
-    main, alt = _session(GRADE_1_PORT), _session(GRADE_1_PORT, ALT_DB)
+    main, alt = real_session(GRADE_1_PORT), real_session(GRADE_1_PORT, ALT_DB)
     try:
         query = "SELECT count(*), sum(l_extendedprice) FROM lineitem"
         assert not main.digest(query).matches(alt.digest(query))
@@ -107,7 +95,7 @@ def test_a_row_limit_stops_the_fetch_early(session: PgSession) -> None:
 
 
 def test_a_slow_statement_is_cancelled_and_the_session_survives() -> None:
-    slow = _session(GRADE_1_PORT, timeout_s=0.5)
+    slow = real_session(GRADE_1_PORT, timeout_s=0.5)
     try:
         with pytest.raises(QueryTimeoutError):
             slow.digest("SELECT pg_sleep(5)")
@@ -119,7 +107,7 @@ def test_a_slow_statement_is_cancelled_and_the_session_survives() -> None:
 
 
 def test_a_query_cannot_lift_its_own_timeout() -> None:
-    slow = _session(GRADE_1_PORT, timeout_s=0.5)
+    slow = real_session(GRADE_1_PORT, timeout_s=0.5)
     try:
         with pytest.raises(QueryTimeoutError):
             slow.digest("SELECT set_config('statement_timeout', '0', true), pg_sleep(5)")
