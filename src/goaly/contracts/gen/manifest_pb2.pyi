@@ -26,6 +26,26 @@ class RunManifest(_message.Message):
 
     DESCRIPTOR: _descriptor.Descriptor
 
+    @_typing.final
+    class EnvironmentSettingsEntry(_message.Message):
+        DESCRIPTOR: _descriptor.Descriptor
+
+        KEY_FIELD_NUMBER: _builtins.int
+        VALUE_FIELD_NUMBER: _builtins.int
+        key: _builtins.str
+        value: _builtins.str
+        def __init__(
+            self,
+            *,
+            key: _builtins.str = ...,
+            value: _builtins.str = ...,
+        ) -> None: ...
+        _HasFieldArgType: _TypeAlias = _Never  # noqa: Y015
+        def HasField(self, field_name: _HasFieldArgType) -> _builtins.bool: ...
+        _ClearFieldArgType: _TypeAlias = _typing.Literal["key", b"key", "value", b"value"]  # noqa: Y015
+        def ClearField(self, field_name: _ClearFieldArgType) -> None: ...
+        def WhichOneof(self, oneof_group: _Never) -> None: ...
+
     RUN_ID_FIELD_NUMBER: _builtins.int
     BENCHMARK_FIELD_NUMBER: _builtins.int
     SPLIT_FIELD_NUMBER: _builtins.int
@@ -43,6 +63,7 @@ class RunManifest(_message.Message):
     STARTED_AT_FIELD_NUMBER: _builtins.int
     FINISHED_AT_FIELD_NUMBER: _builtins.int
     MACHINE_FIELD_NUMBER: _builtins.int
+    ENVIRONMENT_SETTINGS_FIELD_NUMBER: _builtins.int
     UV_LOCK_SHA256_FIELD_NUMBER: _builtins.int
     run_id: _builtins.str
     """A unique ID for the run."""
@@ -112,6 +133,15 @@ class RunManifest(_message.Message):
     def machine(self) -> Global___MachineInfo:
         """The machine the run ran on."""
 
+    @_builtins.property
+    def environment_settings(self) -> _containers.ScalarMap[_builtins.str, _builtins.str]:
+        """The settings of the benchmark's environment that can change results, keyed by the
+        adapter's name for each setting; empty if the benchmark has none. For Effi-SQL: the
+        PostgreSQL image digest; the server settings shared_buffers, work_mem, jit and the
+        parallel-worker settings; the dbgen build; the generated data's checksums; and each
+        instance's cpuset. The benchmark's adapter fills it, and the runner writes it.
+        """
+
     def __init__(
         self,
         *,
@@ -132,11 +162,12 @@ class RunManifest(_message.Message):
         started_at: _timestamp_pb2.Timestamp | None = ...,
         finished_at: _timestamp_pb2.Timestamp | None = ...,
         machine: Global___MachineInfo | None = ...,
+        environment_settings: _abc.Mapping[_builtins.str, _builtins.str] | None = ...,
         uv_lock_sha256: _builtins.str = ...,
     ) -> None: ...
     _HasFieldArgType: _TypeAlias = _typing.Literal["finished_at", b"finished_at", "machine", b"machine", "started_at", b"started_at"]  # noqa: Y015
     def HasField(self, field_name: _HasFieldArgType) -> _builtins.bool: ...
-    _ClearFieldArgType: _TypeAlias = _typing.Literal["benchmark", b"benchmark", "command_line", b"command_line", "config_hash", b"config_hash", "dataset_notes", b"dataset_notes", "dataset_revision", b"dataset_revision", "finished_at", b"finished_at", "git_commit", b"git_commit", "git_dirty", b"git_dirty", "gold_sha256", b"gold_sha256", "harness_hash", b"harness_hash", "instance_ids", b"instance_ids", "machine", b"machine", "models", b"models", "run_id", b"run_id", "seeds", b"seeds", "split", b"split", "started_at", b"started_at", "uv_lock_sha256", b"uv_lock_sha256"]  # noqa: Y015
+    _ClearFieldArgType: _TypeAlias = _typing.Literal["benchmark", b"benchmark", "command_line", b"command_line", "config_hash", b"config_hash", "dataset_notes", b"dataset_notes", "dataset_revision", b"dataset_revision", "environment_settings", b"environment_settings", "finished_at", b"finished_at", "git_commit", b"git_commit", "git_dirty", b"git_dirty", "gold_sha256", b"gold_sha256", "harness_hash", b"harness_hash", "instance_ids", b"instance_ids", "machine", b"machine", "models", b"models", "run_id", b"run_id", "seeds", b"seeds", "split", b"split", "started_at", b"started_at", "uv_lock_sha256", b"uv_lock_sha256"]  # noqa: Y015
     def ClearField(self, field_name: _ClearFieldArgType) -> None: ...
     def WhichOneof(self, oneof_group: _Never) -> None: ...
 

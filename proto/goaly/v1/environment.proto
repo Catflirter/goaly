@@ -22,8 +22,13 @@ message SqlResult {
   bool truncated = 4;
   // The database's error message, or empty if the statement succeeded.
   string error = 5;
-  // How long the statement ran, in seconds.
+  // How long the statement ran, in seconds. It leaves out the wait for a statement slot, which
+  // is queue_wait_s.
   double elapsed_s = 6;
+  // How long the statement waited for a statement slot on its instance before it started, in
+  // seconds. Each solving instance runs at most 2 statements at once, and the others queue (spec
+  // §6.2). The agent sees this apart from elapsed_s, so the run time it reads stays meaningful.
+  double queue_wait_s = 7;
 }
 
 // The result of running a shell command in a task's container.

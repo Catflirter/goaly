@@ -188,7 +188,7 @@ class Trajectory(_message.Message):
     @_builtins.property
     def grade(self) -> _task_pb2.Grade:
         """How the prediction was graded, as in the task's TaskResult; absent until it is graded, and
-        in a run without gold answers.
+        in a run that is not graded.
         """
 
     @_builtins.property
