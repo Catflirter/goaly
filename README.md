@@ -26,7 +26,8 @@ GOALY_API_KEY=<your key>
 ```
 
 Environment variables take precedence over the file. Never commit secrets: `.env` files are
-git-ignored, and a gitleaks pre-commit hook scans every commit.
+git-ignored. After `make setup`, a gitleaks pre-commit hook scans staged changes, and CI scans
+the full history on every PR.
 
 ## Development
 
