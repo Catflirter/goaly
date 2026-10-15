@@ -6,9 +6,10 @@ import threading
 import httpx
 import pytest
 
-from goaly.contracts.gen.llm_call_pb2 import CallPurpose
+from goaly.contracts.gen.llm_call_pb2 import CallPurpose, LlmCallStatus
 from goaly.harness.core.llm import CallTags, LlmClient
-from goaly.harness.core.llm_errors import ClientError
+from goaly.harness.core.llm_errors import ClientError, ModelNotAllowed
+from goaly.harness.core.llm_models import ModelParams
 from tests.harness.core.llm_fakes import (
     GLM,
     QWEN,
@@ -17,6 +18,7 @@ from tests.harness.core.llm_fakes import (
     completion,
     connect,
     failure,
+    hang,
     settings,
     user,
 )
@@ -84,7 +86,8 @@ async def test_refuses_to_block_the_thread_its_loop_runs_in() -> None:
     gateway = Gateway()
     async with connect(gateway) as llm:
         with pytest.raises(RuntimeError, match="await complete"):
-            llm.complete_sync([user("hi")], model=GLM, tags=IMPL)
+            # The timeout is a watchdog: were the guard gone, this would fail, not hang.
+            llm.complete_sync([user("hi")], model=GLM, tags=IMPL, timeout_s=5)
 
     assert gateway.requests == []
 
@@ -122,3 +125,94 @@ def test_refuses_once_its_loop_has_stopped() -> None:
 
     with pytest.raises(RuntimeError, match="not running"):
         llm.complete_sync([user("hi")], model=GLM, tags=IMPL)
+
+
+async def test_a_call_after_the_client_closed_is_refused_with_no_record() -> None:
+    gateway, recorder = Gateway(), Recorder()
+    async with connect(gateway, recorder=recorder) as llm:
+        pass
+
+    with pytest.raises(RuntimeError, match="closed"):
+        await llm.complete([user("hi")], model=GLM, tags=IMPL)
+    with pytest.raises(RuntimeError, match="closed"):  # A worker left running, say.
+        await asyncio.to_thread(llm.complete_sync, [user("hi")], model=GLM, tags=IMPL)
+    assert (gateway.requests, recorder.records) == ([], [])
+
+
+@pytest.mark.parametrize(
+    ("kwargs", "error"),
+    [
+        pytest.param({"model": QWEN}, ModelNotAllowed, id="model-not-allowed"),
+        pytest.param({"params": ModelParams(enable_thinking=False)}, ValueError, id="bad-params"),
+    ],
+)
+async def test_a_refused_call_reaches_the_calling_thread_with_no_io_and_no_record(
+    kwargs: dict[str, object], error: type[Exception]
+) -> None:
+    gateway, recorder = Gateway(), Recorder()
+    call: dict[str, object] = {"model": GLM, "tags": IMPL, **kwargs}
+    async with connect(gateway, recorder=recorder) as llm:
+        with pytest.raises(error):
+            await asyncio.to_thread(lambda: llm.complete_sync([user("hi")], **call))  # type: ignore[arg-type]  # The kwargs vary by case.
+
+    assert (gateway.requests, recorder.records) == ([], [])
+
+
+async def test_a_call_past_its_timeout_is_cancelled_and_recorded() -> None:
+    gateway, recorder = Gateway(hang), Recorder()
+    async with connect(gateway, recorder=recorder) as llm:
+        with pytest.raises(TimeoutError, match=r"no reply within 0\.05 s"):
+            await asyncio.to_thread(
+                llm.complete_sync, [user("hi")], model=GLM, tags=IMPL, timeout_s=0.05
+            )
+        while not recorder.records:  # The loop takes in the cancellation after the thread.
+            await asyncio.sleep(0.01)
+
+    (record,) = recorder.records
+    assert record.status == LlmCallStatus.LLM_CALL_STATUS_CANCELLED
+
+
+async def test_a_call_the_loop_cancels_reaches_the_thread_as_a_cancellation() -> None:
+    arrived = asyncio.Event()
+
+    async def hold(request: httpx.Request) -> httpx.Response:
+        arrived.set()
+        return await hang(request)
+
+    gateway, recorder = Gateway(hold), Recorder()
+    outcome: list[BaseException] = []
+
+    def worker(llm: LlmClient) -> None:
+        try:
+            llm.complete_sync([user("hi")], model=GLM, tags=IMPL)
+        except BaseException as error:  # noqa: BLE001 - The test inspects whatever it was.
+            outcome.append(error)
+
+    async with connect(gateway, recorder=recorder) as llm:
+        thread = threading.Thread(target=worker, args=(llm,))
+        thread.start()
+        await arrived.wait()
+        for task in asyncio.all_tasks():  # The call's own task on the loop, as at shutdown.
+            if task.get_coro().cr_code.co_name == "complete":  # type: ignore[union-attr]  # A coroutine.
+                task.cancel()
+        await asyncio.to_thread(thread.join)
+
+    (error,) = outcome
+    assert type(error) is asyncio.CancelledError  # Not swallowed by an `except Exception`.
+    (record,) = recorder.records
+    assert record.status == LlmCallStatus.LLM_CALL_STATUS_CANCELLED
+
+
+async def test_a_loop_closing_as_the_call_is_sent_leaves_no_coroutine_behind(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    def closed(*args: object) -> object:
+        raise RuntimeError("Event loop is closed")
+
+    gateway = Gateway()
+    async with connect(gateway) as llm:
+        monkeypatch.setattr(asyncio, "run_coroutine_threadsafe", closed)
+        with pytest.raises(RuntimeError, match="Event loop is closed"):
+            await asyncio.to_thread(llm.complete_sync, [user("hi")], model=GLM, tags=IMPL)
+
+    assert gateway.requests == []  # And no warning of a coroutine never awaited.
