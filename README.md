@@ -36,6 +36,7 @@ make setup             # create .venv from uv.lock and install the git hooks
 make check             # lint, type check, import contracts and unit tests, as CI runs them
 make test              # unit tests with branch coverage
 make test-integration  # tests that need Docker, a database or the real model API
+make proto             # regenerate src/goaly/contracts/gen/ after editing proto/
 ```
 
 Run `make` to list every target.
