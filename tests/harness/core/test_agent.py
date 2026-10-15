@@ -1132,7 +1132,7 @@ async def test_a_later_loop_gets_only_the_time_left() -> None:
 
 def test_the_model_handle_takes_no_purpose_or_model() -> None:
     parameters = inspect.signature(BoundLlm.complete).parameters
-    assert list(parameters) == ["self", "messages", "tools", "params"]
+    assert list(parameters) == ["self", "messages", "tools", "params", "attempt_timeout_s"]
 
 
 def test_the_context_exposes_no_model_handle() -> None:
