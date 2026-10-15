@@ -10,8 +10,10 @@ idempotent, and this process keeps to CPUs 0, 1, 12 and 13.
         Start the 5 instances from the golden build, or shut them down cleanly. A restart
         reuses their data; start also reapplies the roles and privileges.
     uv run python scripts/effisql/pgenv.py status [--check]
-        Show each instance's container, CPUs and readiness; --check also compares every
-        instance's row counts with the golden build's.
+        Show each instance's container, CPUs, socket directory and readiness, and fail if one
+        is down, unreachable through its socket or pinned to the wrong CPUs. --check also
+        compares every instance's row counts with the golden build's: it scans every table on
+        every instance, so never run it during timed grading.
     uv run python scripts/effisql/pgenv.py snapshot [--port PORT]
         Rewrite the schema snapshots from a running server (default: solve-1).
     uv run python scripts/effisql/pgenv.py plans --tasks FILE [--port PORT] [--out PATH]
@@ -21,6 +23,17 @@ idempotent, and this process keeps to CPUs 0, 1, 12 and 13.
 The data lives under ~/data/effisql/ and the passwords in ~/.config/goaly/pg.env (mode 0600);
 the build creates that file. Progress is logged to stderr as JSON lines; no output holds a
 password.
+
+Runbook notes:
+- Every goaly process keeps to CPUs 0, 1, 12 and 13 by calling
+  ``goaly.bench.effisql.pg_instances.confine_to_python_cpus()`` at startup (T06's CLI does);
+  any other command runs under ``taskset -c 0,1,12,13``.
+- Each instance's Unix socket is in ~/data/effisql/sockets/<instance>/, which start creates
+  and bind-mounts into its container. The solve container, which may not use IP, mounts the
+  solving instances' directories read-only and connects through them (V28).
+- The instances' ports 55432-55436 lie in Linux's ephemeral range. Reserving them, with
+  ``sysctl net.ipv4.ip_local_reserved_ports=55432-55439``, stops a client socket from briefly
+  holding one while its server starts; without it, Docker's restart policy retries.
 """
 
 import argparse
@@ -36,7 +49,6 @@ from goaly.bench.effisql.pg_build import (
     BuildError,
     build_golden,
     connector,
-    read_golden_record,
 )
 from goaly.bench.effisql.pg_containers import ContainerError
 from goaly.bench.effisql.pg_instances import (
@@ -46,6 +58,7 @@ from goaly.bench.effisql.pg_instances import (
     confine_to_python_cpus,
     count_problems,
     instance_status,
+    require_golden_record,
     start_instances,
     stop_instances,
     table_counts,
@@ -78,7 +91,11 @@ def main(argv: Sequence[str] | None = None) -> int:
     commands.add_parser("start", help="start the instances")
     commands.add_parser("stop", help="stop the instances cleanly")
     status = commands.add_parser("status", help="show the instances")
-    status.add_argument("--check", action="store_true", help="also compare row counts")
+    status.add_argument(
+        "--check",
+        action="store_true",
+        help="also compare row counts; it scans every table, so not during timed grading",
+    )
     snapshot = commands.add_parser("snapshot", help="rewrite the schema snapshots")
     snapshot.add_argument("--port", type=int, default=SOLVING[0].port)
     plans = commands.add_parser("plans", help="write the plan cache for a task file")
@@ -87,12 +104,19 @@ def main(argv: Sequence[str] | None = None) -> int:
     plans.add_argument("--out", type=Path, help="default: ~/data/effisql/plans.json")
     args = parser.parse_args(argv)
 
-    confine_to_python_cpus()
     try:
+        confine_to_python_cpus()
         configure_logging()
         config = PgEnvConfig()
         return _run(args, config)
-    except (BuildError, ContainerError, InstanceError, PgSettingsError, psycopg.Error) as error:
+    except (
+        BuildError,
+        ContainerError,
+        InstanceError,
+        PgSettingsError,
+        psycopg.Error,
+        OSError,
+    ) as error:
         _log.error("pgenv %s failed: %s", args.command, error)
         return 1
 
@@ -112,9 +136,10 @@ def _run(args: argparse.Namespace, config: PgEnvConfig) -> int:
             _write(f"{name}: {action}")
         return _status(config, check=args.command == "setup")
     if args.command == "stop":
-        for name, result in stop_instances().items():
+        results = stop_instances()
+        for name, result in results.items():
             _write(f"{name}: {result}")
-        return 0
+        return 0 if all(result in ("stopped", "not running") for result in results.values()) else 1
     if args.command == "status":
         return _status(config, check=args.check)
     if args.command == "snapshot":
@@ -122,7 +147,9 @@ def _run(args: argparse.Namespace, config: PgEnvConfig) -> int:
         write_snapshots(connector(config.host, args.port, password), config, _DBS)
         _write(f"schema snapshots written under {config.data_root / 'snapshots'}")
         return 0
-    return _plans(config, args.tasks, args.port, args.out or config.plans_path)
+    if args.command == "plans":
+        return _plans(config, args.tasks, args.port, args.out or config.plans_path)
+    raise InstanceError(f"unknown command {args.command!r}")
 
 
 def _status(config: PgEnvConfig, *, check: bool) -> int:
@@ -130,15 +157,17 @@ def _status(config: PgEnvConfig, *, check: bool) -> int:
     for status in instance_status(config):
         instance = status.instance
         ready = "accepting connections" if status.accepting else "NOT accepting connections"
-        healthy &= status.accepting
+        socket = "" if status.socket_accepting else " (NOT accepting connections there)"
+        pinning = (
+            "" if status.pinned else f" (WRONG: should be {','.join(map(str, instance.cpus))})"
+        )
+        healthy &= status.healthy
         _write(
-            f"{instance.name:8} {instance.kind:8} port {instance.port}  cpus {status.cpuset}  "
-            f"{status.state or 'absent'}, {ready}"
+            f"{instance.name:8} {instance.kind:8} port {instance.port}  cpus {status.cpuset}"
+            f"{pinning}  {status.state or 'absent'}, {ready}  socket {status.socket_dir}{socket}"
         )
     if check:
-        record = read_golden_record(config.golden_record)
-        if record is None:
-            raise InstanceError("there is no golden build yet: run `pgenv.py build` first")
+        record = require_golden_record(config)
         password = load_credentials().admin_password
         counts = {i.name: table_counts(connector(config.host, i.port, password)) for i in INSTANCES}
         problems = count_problems(counts, record)
