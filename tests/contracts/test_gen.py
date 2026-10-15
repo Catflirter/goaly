@@ -3,6 +3,8 @@
 import importlib
 import pickle
 import pkgutil
+import re
+import tomllib
 from collections.abc import Iterable, Iterator
 from pathlib import Path
 from types import ModuleType
@@ -18,7 +20,10 @@ import goaly.contracts.gen
 from goaly.contracts.gen.task_pb2 import Grade, Prediction, TaskInput
 from goaly.contracts.jsonl import from_json_line, to_json_line
 
-PROTO_PACKAGE_DIR = Path(__file__).resolve().parents[2] / "proto" / "goaly" / "v1"
+REPO_ROOT = Path(__file__).resolve().parents[2]
+PROTO_PACKAGE_DIR = REPO_ROOT / "proto" / "goaly" / "v1"
+# protoc's header in every generated module, e.g. "# Protobuf Python Version: 7.35.1".
+GENERATED_FOR = re.compile(r"^# Protobuf Python Version: (\S+)$", re.MULTILINE)
 
 # Every field the agent sees, by message: all that TaskInput reaches (spec §3.3, §4). Gold
 # answers, and whatever would give them away, must never appear here. So a field added anywhere
@@ -72,6 +77,25 @@ def test_descriptors_keep_the_proto_names(module: ModuleType) -> None:
 
     assert module.DESCRIPTOR.name == f"goaly/v1/{proto}.proto"
     assert module.DESCRIPTOR.package == "goaly.v1"
+
+
+def test_the_protobuf_floor_is_the_version_the_code_was_generated_for() -> None:
+    # The generated code refuses a runtime older than this version, so it must be the floor.
+    project = tomllib.loads((REPO_ROOT / "pyproject.toml").read_text(encoding="utf-8"))
+    floors = [
+        requirement.removeprefix("protobuf>=")
+        for requirement in project["project"]["dependencies"]
+        if requirement.startswith("protobuf")
+    ]
+    versions = set()
+    for module in MODULES:
+        assert module.__file__ is not None
+        header = GENERATED_FOR.search(Path(module.__file__).read_text(encoding="utf-8"))
+        assert header is not None, module.__name__
+        versions.add(header[1])
+
+    (version,) = versions  # One protoc generated every module.
+    assert floors == [version]
 
 
 @pytest.mark.parametrize("message_type", MESSAGES, ids=lambda cls: cls.DESCRIPTOR.full_name)
