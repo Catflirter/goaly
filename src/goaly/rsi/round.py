@@ -155,6 +155,12 @@ class EvaluationRequest:
 class Evaluation:
     """An evaluation's graded results, one per task and seed, and its cost statistics, which
     come from the LLM proxy's records and the host's clock (V27), cached tasks included.
+
+    The host attributes each proxy record to its request's (instance_id, seed) tag, and the
+    cache entry and the graded results.jsonl line keep the attributed usage and host wall
+    time, so a cached task brings its original numbers. The tags are the container's, but the
+    run total is the proxy's own: the evaluator flags a sum that differs from it by over 1%.
+    Numbers it cannot give are left out, and the rules that need them are skipped (decision).
     """
 
     results: Sequence[TaskResult]
