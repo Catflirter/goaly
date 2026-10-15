@@ -377,10 +377,20 @@ class LlmClient:
         return BoundLlmClient(self, model, tags)
 
     def _refuse(self, model: str, tags: CallTags) -> ModelNotAllowed:
-        purpose = CallPurpose.Name(tags.purpose)
+        try:
+            purpose = CallPurpose.Name(tags.purpose)
+        except ValueError:  # A value no CallPurpose has, as only a cast can make one.
+            purpose = str(tags.purpose)
         _logger.warning(
             "refused an LLM call: its purpose may not use the model",
-            extra={"event": "llm_model_not_allowed", "model": model, "purpose": purpose},
+            extra={
+                "event": "llm_model_not_allowed",
+                "model": model,
+                "purpose": purpose,
+                "run_id": tags.run_id,
+                "instance_id": tags.instance_id,
+                "seed": tags.seed,
+            },
         )
         allowed = allowed_model(tags.purpose)
         may = f"it may call only {allowed}" if allowed else "it may call no model"

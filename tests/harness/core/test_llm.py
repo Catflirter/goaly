@@ -1146,6 +1146,8 @@ async def test_bound_clients_call_through_the_one_client_that_bound_them() -> No
         pytest.param(QWEN, CallTags(CallPurpose.CALL_PURPOSE_RSI_IMPL), id="impl-qwen"),
         pytest.param("gpt-4o", EXEC, id="exec-other"),
         pytest.param(QWEN, CallTags(CallPurpose.CALL_PURPOSE_UNSPECIFIED), id="no-purpose"),
+        # A value no CallPurpose has, as only a cast can make one.
+        pytest.param(QWEN, CallTags(CallPurpose.ValueType(99), seed=1), id="unknown-purpose"),
     ],
 )
 async def test_refuses_a_model_the_purpose_may_not_use_before_any_io(
@@ -1160,11 +1162,17 @@ async def test_refuses_a_model_the_purpose_may_not_use_before_any_io(
     assert recorder.records == []
     assert raised.value.record is None
     (warning,) = [entry for entry in caplog.records if entry.levelno == logging.WARNING]
-    assert getattr(warning, "event", None) == "llm_model_not_allowed"
-    assert (getattr(warning, "model", None), getattr(warning, "purpose", None)) == (
-        model,
-        CallPurpose.Name(tags.purpose),
-    )
+    fields = ["event", "model", "purpose", "run_id", "instance_id", "seed"]
+    purpose = "99" if tags.purpose == 99 else CallPurpose.Name(tags.purpose)
+    assert {key: getattr(warning, key) for key in fields} == {
+        "event": "llm_model_not_allowed",
+        "model": model,
+        "purpose": purpose,
+        "run_id": tags.run_id,
+        "instance_id": tags.instance_id,
+        "seed": tags.seed,
+    }
+    assert str(raised.value).startswith(f"{purpose} may not call {model}")
 
 
 # Records.

@@ -82,8 +82,8 @@ class InvalidResponse(LlmError):
 class ModelNotAllowed(LlmError):
     """The call's purpose may not use the model it named (the model allowlist, spec §5.1).
 
-    The client raises it before any I/O, so the call has no record. Its status is that of a
-    request the gateway refuses.
+    The client raises it before any I/O: no call was made, and no record exists. Its status is
+    nominal, since no record carries it: that of a request the gateway refuses.
     """
 
     status = LlmCallStatus.LLM_CALL_STATUS_CLIENT_ERROR
