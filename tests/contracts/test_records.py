@@ -2,9 +2,30 @@
 
 import json
 from collections.abc import Sequence
+from datetime import UTC, datetime
+from pathlib import Path
 
-from goaly.contracts.gen.experiment_pb2 import DecisionThresholds, Lane, PhaseResult
-from goaly.contracts.gen.task_pb2 import Prediction
+from google.protobuf.message import Message
+from google.protobuf.timestamp_pb2 import Timestamp
+
+from goaly.contracts.gen.experiment_pb2 import (
+    Decision,
+    DecisionThresholds,
+    ExperimentRecord,
+    Guard,
+    GuardResult,
+    ImplementerExit,
+    ImplementerRun,
+    Lane,
+    LaneEvent,
+    LaneEventKind,
+    Lesson,
+    PhaseResult,
+    RejectionReason,
+    SmokeTest,
+)
+from goaly.contracts.gen.manifest_pb2 import RunManifest
+from goaly.contracts.gen.task_pb2 import Prediction, Split
 from goaly.contracts.gen.trajectory_pb2 import (
     Chat,
     ChatMessage,
@@ -15,7 +36,7 @@ from goaly.contracts.gen.trajectory_pb2 import (
     ToolResult,
     Trajectory,
 )
-from goaly.contracts.jsonl import from_json_line, to_json_line
+from goaly.contracts.jsonl import append_jsonl, from_json_line, read_jsonl, to_json_line
 
 # Rebuilding the prompt a step's model call was sent, by the rule in Step's comment
 # (proto/goaly/v1/trajectory.proto). These helpers are that rule's reference implementation.
@@ -199,3 +220,185 @@ def test_a_tool_result_says_whether_a_tool_submitted() -> None:
     assert from_json_line(to_json_line(submitted), ToolResult).HasField("submission")
     assert "submission" not in json.loads(to_json_line(plain))
     assert not from_json_line(to_json_line(plain), ToolResult).HasField("submission")
+
+
+def test_a_manifest_records_the_environment_settings_that_can_change_results() -> None:
+    settings = {
+        "postgres_image": "postgres@sha256:" + "ab" * 32,
+        "shared_buffers": "2GB",
+        "jit": "off",
+        "max_parallel_workers_per_gather": "2",
+        "cpuset.grade-1": "6,7,18,19",
+    }
+    manifest = RunManifest(run_id="run-1", environment_settings=settings)
+
+    line = to_json_line(manifest)
+
+    assert json.loads(line)["environment_settings"] == settings
+    assert from_json_line(line, RunManifest) == manifest
+    assert json.loads(to_json_line(RunManifest()))["environment_settings"] == {}
+
+
+# The RSI ledger: experiments, lane events and lessons (spec §8.2, §8.5-§8.8).
+
+
+def test_a_guard_result_names_the_pack_code_allowlist() -> None:
+    result = GuardResult(
+        guard=Guard.GUARD_PACK_CODE_ALLOWLIST, passed=False, detail="policy.py:3: import os"
+    )
+
+    line = to_json_line(result)
+
+    assert json.loads(line)["guard"] == "GUARD_PACK_CODE_ALLOWLIST"
+    assert from_json_line(line, GuardResult) == result
+
+
+def test_a_phase_lists_the_tasks_a_hard_coding_check_flagged() -> None:
+    # One flagged prediction fails the candidate outright (spec §8.2 step 4).
+    screening = PhaseResult(
+        split=Split.SPLIT_TRAIN, task_count=20, flagged_instance_ids=["17", "203"]
+    )
+    record = ExperimentRecord(
+        experiment_id="exp-3",
+        screening=screening,
+        decision=Decision.DECISION_REJECTED,
+        rejection_reasons=[RejectionReason.REJECTION_REASON_HARD_CODED],
+    )
+
+    line = to_json_line(record)
+
+    fields = json.loads(line)
+    assert fields["screening"]["flagged_instance_ids"] == ["17", "203"]
+    assert fields["rejection_reasons"] == ["REJECTION_REASON_HARD_CODED"]
+    assert from_json_line(line, ExperimentRecord) == record
+
+
+def set_fields(*messages: Message) -> set[str]:
+    """The names of the fields that hold something other than their default in ``messages``."""
+    return {field.name for message in messages for field, _ in message.ListFields()}
+
+
+def test_an_experiment_records_its_implementer_run_and_smoke_tests() -> None:
+    run = ImplementerRun(
+        exit=ImplementerExit.IMPLEMENTER_EXIT_SUBMITTED,
+        steps=23,
+        wall_time_s=812.5,
+        trajectory_path="rsi/effisql/exp-3/implementer.traj.json",
+        smoke_tests=[
+            SmokeTest(
+                instance_id="17",
+                run_id="smoke-exp-3-17",
+                score=0.75,
+                detail="credit 0.75; stop reason: submitted; 9 steps; $0.02; no tool error",
+            ),
+            SmokeTest(instance_id="250", detail="refused: 250 is not in train"),
+        ],
+        summary="Added a skill that turns correlated subqueries into joins; unit tests pass.",
+    )
+    record = ExperimentRecord(experiment_id="exp-3", lane=Lane.LANE_EFFISQL, implementer=run)
+
+    read = from_json_line(to_json_line(record), ExperimentRecord)
+
+    assert read.implementer == run
+    assert set_fields(run) == set(ImplementerRun.DESCRIPTOR.fields_by_name)
+    assert set_fields(run.smoke_tests[0]) == set(SmokeTest.DESCRIPTOR.fields_by_name)
+
+
+def test_an_implementer_that_never_started_leaves_no_run() -> None:
+    line = to_json_line(ExperimentRecord(experiment_id="exp-3"))
+
+    assert "implementer" not in json.loads(line)
+    assert not from_json_line(line, ExperimentRecord).HasField("implementer")
+
+
+def test_a_smoke_test_that_never_ran_the_candidate_has_no_score() -> None:
+    # The host refused the call, or a guard failed: no run, so no score. A score of 0 was earned.
+    refused = to_json_line(SmokeTest(instance_id="250", detail="refused: 250 is not in train"))
+    scored_zero = to_json_line(SmokeTest(instance_id="17", run_id="smoke-exp-3-17", score=0.0))
+
+    assert "score" not in json.loads(refused)
+    assert json.loads(scored_zero)["score"] == 0.0
+    assert not from_json_line(refused, SmokeTest).HasField("score")
+    assert from_json_line(scored_zero, SmokeTest).HasField("score")
+
+
+def at(hour: int, minute: int) -> Timestamp:
+    """A point in time on 2026-10-15, in UTC."""
+    timestamp = Timestamp()
+    timestamp.FromDatetime(datetime(2026, 10, 15, hour, minute, tzinfo=UTC))
+    return timestamp
+
+
+def test_lane_events_are_appended_to_lane_events_jsonl_and_read_back(tmp_path: Path) -> None:
+    lane, kind = Lane.LANE_EFFISQL, LaneEventKind
+    pr_opened = "effisql: results PR #12 is open"
+    events = [
+        LaneEvent(lane=lane, occurred_at=at(16, 0), kind=kind.LANE_EVENT_KIND_STARTED),
+        LaneEvent(
+            lane=lane,
+            occurred_at=at(17, 31),
+            kind=kind.LANE_EVENT_KIND_RESTARTED,
+            detail="killed after 10 minutes without a heartbeat; restarted after 30 s",
+        ),
+        LaneEvent(
+            lane=lane,
+            occurred_at=at(19, 0),
+            kind=kind.LANE_EVENT_KIND_RESULTS_PR,
+            detail="3 accepted changes since the last results PR",
+            pr_number=12,
+            pr_url="https://github.com/Catflirter/goaly/pull/12",
+            head_commit="4f2c0de1b6a8e3f9c7d5b1a2e4f6c8d0a9b7e5f3",
+            experiment_ids=["exp-3", "exp-7", "exp-8"],
+        ),
+        LaneEvent(
+            lane=lane,
+            occurred_at=at(19, 1),
+            kind=kind.LANE_EVENT_KIND_NOTIFY_FAILED,
+            detail="HTTP 502 from ntfy.sh",
+            notification=pr_opened,
+        ),
+        LaneEvent(
+            lane=lane,
+            occurred_at=at(19, 2),
+            kind=kind.LANE_EVENT_KIND_NOTIFIED,
+            notification=pr_opened,
+        ),
+        LaneEvent(
+            lane=lane,
+            occurred_at=at(23, 40),
+            kind=kind.LANE_EVENT_KIND_STOPPED,
+            detail="4 rounds in a row with no accepted change",
+        ),
+    ]
+    path = tmp_path / "lane_events.jsonl"
+
+    for event in events:
+        append_jsonl(path, event)
+
+    assert path.read_bytes().count(b"\n") == len(events)
+    assert list(read_jsonl(path, LaneEvent)) == events
+    assert set_fields(*events) == set(LaneEvent.DESCRIPTOR.fields_by_name)
+
+
+def test_a_deleted_lesson_keeps_its_earlier_lines_and_its_last_line_says_when(
+    tmp_path: Path,
+) -> None:
+    standing = Lesson(
+        lesson_id="lesson-4",
+        lane=Lane.LANE_EFFISQL,
+        text="Rewriting IN subqueries as joins helped on 3 tasks (exp-3).",
+        experiment_ids=["exp-3"],
+        created_at=at(18, 0),
+        updated_at=at(18, 0),
+    )
+    deleted = Lesson()
+    deleted.CopyFrom(standing)
+    deleted.updated_at.CopyFrom(at(21, 15))
+    deleted.deleted_at.CopyFrom(at(21, 15))
+    path = tmp_path / "lessons.jsonl"
+
+    append_jsonl(path, standing)
+    append_jsonl(path, deleted)
+
+    assert "deleted_at" not in json.loads(to_json_line(standing))
+    assert list(read_jsonl(path, Lesson)) == [standing, deleted]

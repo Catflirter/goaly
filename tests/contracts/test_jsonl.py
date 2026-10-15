@@ -209,12 +209,32 @@ def test_leaves_out_usage_the_gateway_did_not_report() -> None:
 
 
 def test_tells_a_robustness_check_that_did_not_run_from_one_that_failed() -> None:
-    # Unset: no check ran, as for the official-protocol numbers. False: hard-coded results.
+    # Unset: the check did not run. False: hard-coded results.
     unchecked = parse(to_json_line(EffiSqlGrade(matched=True)))
     hard_coded = parse(to_json_line(EffiSqlGrade(matched=True, alt_matched=False)))
 
     assert "alt_matched" not in unchecked
     assert hard_coded["alt_matched"] is False
+
+
+def test_tells_a_plan_check_that_did_not_run_from_one_that_passed() -> None:
+    # Unset: the check did not run. True: a literal result.
+    unchecked = parse(to_json_line(EffiSqlGrade(matched=True)))
+    passed = parse(to_json_line(EffiSqlGrade(matched=True, literal_result=False)))
+    literal = parse(to_json_line(EffiSqlGrade(matched=True, literal_result=True)))
+
+    assert "literal_result" not in unchecked
+    assert passed["literal_result"] is False
+    assert literal["literal_result"] is True
+
+
+def test_always_writes_whether_dev_mode_reused_the_identity_speedup() -> None:
+    # A plain bool: false whenever the prediction was timed, as official mode always times it.
+    measured = parse(to_json_line(EffiSqlGrade(matched=True)))
+    cached = EffiSqlGrade(matched=True, speedup=1.02, credit=0.5, identity_cached=True)
+
+    assert measured["identity_cached"] is False
+    assert from_json_line(to_json_line(cached), EffiSqlGrade) == cached
 
 
 def test_writes_timestamps_in_rfc_3339() -> None:
@@ -249,6 +269,15 @@ def test_writes_int64_values_as_strings_without_losing_precision() -> None:
 def test_writes_a_row_count_as_a_json_number() -> None:
     # Counts are int32, which JSON holds as numbers; int64 would be a string such as "3".
     assert parse(to_json_line(SqlResult(row_count=3)))["row_count"] == 3
+
+
+def test_writes_a_statement_s_wait_for_its_slot_apart_from_its_run_time() -> None:
+    result = SqlResult(row_count=3, elapsed_s=0.25, queue_wait_s=4.0)
+
+    line = to_json_line(result)
+
+    assert (parse(line)["elapsed_s"], parse(line)["queue_wait_s"]) == (0.25, 4.0)
+    assert from_json_line(line, SqlResult) == result
 
 
 @pytest.mark.parametrize(
