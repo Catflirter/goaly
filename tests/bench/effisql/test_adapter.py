@@ -6,6 +6,7 @@ it. Every task here is synthetic.
 """
 
 import json
+import os
 from pathlib import Path
 
 import pytest
@@ -19,7 +20,7 @@ from goaly.bench.effisql.adapter import (
     official_query,
     to_official,
 )
-from goaly.bench.effisql.data import GOLD_FIELDS, EffiSqlInstance
+from goaly.bench.effisql.data import GOLD_FIELDS, EffiSqlInstance, load_instances
 from goaly.contracts.gen.task_pb2 import EffiSqlPrediction, Prediction, SwePrediction
 from tests.bench.effisql.official_extractor import (
     FINAL_SQL_MARKER,
@@ -136,6 +137,23 @@ PARITY_CASES = {
         "SELECT 'first  \n\n  second'\nFROM t",
         "SELECT 'first  \n\n  second'\nFROM t",
     ),
+    "a line that begins with the @@ operator": (
+        BASE_SQL,
+        "SELECT count(*) FROM docs\nWHERE to_tsvector(body)\n@@ to_tsquery('x')",
+        "SELECT count(*) FROM docs\nWHERE to_tsvector(body) @@ to_tsquery('x')",
+    ),
+    "a SELECT glued to a parenthesis": (BASE_SQL, "SELECT(1) FROM t", "SELECT (1) FROM t"),
+    "a SELECT glued to a star": (BASE_SQL, "SELECT*FROM t", "SELECT *FROM t"),
+    "a WITH glued to a quoted name": (
+        BASE_SQL,
+        'WITH"d" AS (SELECT 1 AS x FROM t) SELECT x FROM "d"',
+        'WITH "d" AS (SELECT 1 AS x FROM t) SELECT x FROM "d"',
+    ),
+    "dollar signs inside identifiers": (
+        BASE_SQL,
+        "SELECT a$b$c, $1 FROM t$x -- $b$ is no quote here",
+        "SELECT a$b$c, $1 FROM t$x",
+    ),
     "a base line holding a marker or diff header text": (
         "SELECT 'final answer' AS a,\n'+++' AS b,\n'<think>' AS c\nFROM t -- @@ ```\nWHERE 1 = 1",
         "SELECT 1 AS a\nFROM t",
@@ -234,7 +252,6 @@ class TestNoOfficialForm:
             ("SELECT ';' FROM t; DELETE FROM t", "more than one statement"),
             ("EXPLAIN SELECT 1 FROM t", "does not begin with SELECT or WITH"),
             ("(SELECT 1 FROM t) UNION (SELECT 2 FROM t)", "does not begin with SELECT or WITH"),
-            ("SELECT(1) FROM t", "does not begin with SELECT or WITH"),
             ("SELECT 'open FROM t", "unterminated literal"),
             ('SELECT "open FROM t', "unterminated literal"),
             ("SELECT $a$ open FROM t", "unterminated dollar-quoted"),
@@ -292,3 +309,26 @@ class TestRecord:
 
     def test_a_dollar_parameter_is_not_a_dollar_quote(self) -> None:
         assert official_query("SELECT $1 FROM t -- x") == "SELECT $1 FROM t"
+
+
+@pytest.mark.integration
+def test_every_dataset_query_comes_back_exactly_in_both_modes() -> None:
+    """The ticket's acceptance sweep: all 300 base and 300 gold queries of the real dataset."""
+    local_copy = os.environ.get("GOALY_EFFISQL_DATA")
+    if not local_copy:
+        pytest.skip("set GOALY_EFFISQL_DATA to a local copy of effi-sql-pg.jsonl")
+    instances = load_instances(Path(local_copy))
+    materialized = 0
+    checked = 0
+    for inst in instances:
+        materialized += "as materialized" in " ".join(inst.base_sql.lower().split())
+        for sql in (inst.base_sql, inst.optimized_sql):
+            if sql is None:
+                continue
+            query = official_query(sql)
+            assert_both_modes_extract(inst.base_sql, encode_prediction(inst.base_sql, query), query)
+            checked += 1
+
+    assert len(instances) == 300
+    assert checked == 600
+    assert materialized == 12
