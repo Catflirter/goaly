@@ -917,6 +917,18 @@ async def test_a_call_may_give_its_attempts_longer() -> None:
     assert request_timeouts(gateway) == [0.2]
 
 
+async def test_a_longer_attempt_timeout_lets_a_slow_reply_arrive() -> None:
+    async def slow(request: httpx.Request) -> httpx.Response:
+        await asyncio.sleep(0.1)  # Past the default 0.05 s, within the call's own 0.5 s.
+        return completion()
+
+    gateway = Gateway(slow)
+    async with connect(gateway, retry=RetryPolicy(timeout_s=0.05, max_retries=0)) as llm:
+        reply = await llm.complete([user("hi")], model=QWEN, tags=EXEC, attempt_timeout_s=0.5)
+
+    assert attempts(reply.record) == [(OK, 200)]
+
+
 async def test_a_longer_attempt_timeout_holds_for_every_retry_of_that_call_only() -> None:
     gateway = Gateway(failure(503), completion(), completion())
     async with connect(gateway, retry=RetryPolicy(timeout_s=30)) as llm:
