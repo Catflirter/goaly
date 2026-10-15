@@ -40,6 +40,7 @@ WRITES = [
     "CREATE TEMP TABLE itest_tmp (x int)",
     "SELECT lo_create(0)",
     "SELECT pg_cancel_backend(pg_backend_pid())",
+    "SELECT pg_terminate_backend(pg_backend_pid())",
     "DO $$ BEGIN PERFORM 1; END $$",
 ]
 
@@ -157,21 +158,33 @@ def test_the_agent_reaches_tpch_on_solving_instances_and_nothing_on_grading_ones
                 pg_env.connect(instance, AGENT_ROLE, db)
 
 
-def test_only_the_agent_may_end_sessions_and_only_its_own_roles(pg_env: PgEnv) -> None:
+def test_no_role_may_cancel_or_end_another_session(pg_env: PgEnv) -> None:
     solving = pg_env.instance("solving")
     with (
         pg_env.connect(solving, AGENT_ROLE, "tpch", autocommit=True) as agent,
         pg_env.connect(solving, AGENT_ROLE, "tpch", autocommit=True) as other,
         pg_env.connect(solving, GRADER_ROLE, "tpch", autocommit=True) as grader,
     ):
-        # The agent may end another agent session: SolvingPool stops a stuck statement so.
-        ended = agent.execute("SELECT pg_terminate_backend(%s)", [other.info.backend_pid])
-        assert ended.fetchone() == (True,)
-        with pytest.raises(errors.InsufficientPrivilege, match="terminate process"):
-            agent.execute("SELECT pg_terminate_backend(%s)", [grader.info.backend_pid])
-        with pytest.raises(errors.InsufficientPrivilege):  # The grader may end no session.
-            grader.execute("SELECT pg_terminate_backend(%s)", [agent.info.backend_pid])
+        # Not even a session of the same role: one task never stops another task's statement.
+        for conn, target in ((agent, other), (agent, grader), (grader, agent)):
+            for function in ("pg_cancel_backend", "pg_terminate_backend"):
+                with pytest.raises(errors.InsufficientPrivilege, match="permission denied"):
+                    conn.execute(f"SELECT {function}(%s)", [target.info.backend_pid])
+        assert other.execute("SELECT 1").fetchone() == (1,)
         assert grader.execute("SELECT 1").fetchone() == (1,)
+
+
+def test_agent_sessions_start_with_the_server_side_backstops(pg_env: PgEnv) -> None:
+    solving = pg_env.instance("solving")
+    with pg_env.connect(solving, AGENT_ROLE, "tpch", autocommit=True) as agent:
+        settings = agent.execute(
+            "SELECT current_setting('statement_timeout'), "
+            "current_setting('client_connection_check_interval'), "
+            "current_setting('temp_file_limit'), "
+            "current_setting('default_transaction_read_only')"
+        ).fetchone()
+
+    assert settings == ("130s", "5s", "5GB", "on")
 
 
 def test_the_grader_reads_both_databases_read_only_by_default(pg_env: PgEnv) -> None:

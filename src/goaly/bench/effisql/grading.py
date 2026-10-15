@@ -403,8 +403,12 @@ def evaluate(
     *,
     cache: BaseCache | None,
     rng: random.Random,
+    plans: list[dict[str, Any]] | None = None,
 ) -> Grade:
     """Grade ``sql`` for ``inst`` in ``mode``; blocking, so run it in a worker.
+
+    With ``plans``, the prediction's ``EXPLAIN (FORMAT JSON)`` document is appended to it, once
+    the plan was taken, for the run's audit trail.
 
     ``cache`` is dev mode's base cache; official mode ignores it. A base query that times out
     is graded TIMEOUT and scored 0, as the official evaluator scores it; the setup excludes such
@@ -415,7 +419,7 @@ def evaluate(
         return quick or grader_error(inst, "grader: no SQL")
     started = time.monotonic()
     try:
-        details, status, feedback = _evaluate(sessions, inst, sql, mode, cache, rng)
+        details, status, feedback = _evaluate(sessions, inst, sql, mode, cache, rng, plans)
     except _BaseQueryError as error:
         status = GRADE_STATUS_TIMEOUT if error.timed_out else GRADE_STATUS_GRADER_ERROR
         details, feedback = EffiSqlGrade(), f"the base query failed, so nothing was graded: {error}"
@@ -447,11 +451,14 @@ def _evaluate(
     mode: Mode,
     cache: BaseCache | None,
     rng: random.Random,
+    plans: list[dict[str, Any]] | None = None,
 ) -> _Result:
     main, base_sql = sessions.main, inst.base_sql
     entry = cache.get(inst) if mode is Mode.DEV and cache is not None else None
     try:
         plan = main.plan(sql)
+        if plans is not None:
+            plans.append(plan)
     except QueryError as error:
         return EffiSqlGrade(), GRADE_STATUS_PREDICTION_FAILED, f"the prediction failed: {error}"
     except QueryTimeoutError as error:
@@ -677,11 +684,20 @@ class GradingSlot:
             sessions.close()
 
     def evaluate(
-        self, inst: EffiSqlInstance, sql: str | None, mode: Mode, cache: BaseCache | None
+        self,
+        inst: EffiSqlInstance,
+        sql: str | None,
+        mode: Mode,
+        cache: BaseCache | None,
+        plans: list[dict[str, Any]] | None = None,
     ) -> Grade:
-        """Grade on this slot. Any failure but a cancel is a GRADER_ERROR grade and a reset."""
+        """Grade on this slot. Any failure but a cancel is a GRADER_ERROR grade and a reset.
+
+        With ``plans``, the prediction's plan is appended to it once it was taken.
+        """
         try:
-            grade = evaluate(self.sessions(), inst, sql, mode, cache=cache, rng=self.rng)
+            sessions = self.sessions()
+            grade = evaluate(sessions, inst, sql, mode, cache=cache, rng=self.rng, plans=plans)
         except AbortedError:
             raise
         except Exception as error:  # noqa: BLE001  # Never raise for grading trouble.

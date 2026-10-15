@@ -326,7 +326,7 @@ class TestDryRun:
 
         status = goaly_run(fakes, "--phase", "grade", "--out", str(run))
 
-        assert status == 2
+        assert status == 1  # The host side refuses it as it opens: the run fails.
         assert "grading mode 'official'" in capsys.readouterr().err
         assert fakes.grader.graded == []
 
@@ -534,7 +534,6 @@ class TestSolvingTrust:
             asyncio.Semaphore(2),
             pool.options,  # The wiring's options: the trusted side's cap.
             connect=scenario.connect,
-            terminate=scenario.terminate,
             runner=scenario.run,
         )
         await env.open()

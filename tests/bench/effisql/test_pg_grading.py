@@ -1,57 +1,72 @@
 import asyncio
+import logging
 from collections.abc import AsyncIterator
 from contextlib import asynccontextmanager
 from typing import Any
 
 import pytest
+from psycopg_pool import PoolTimeout
 from pydantic import SecretStr
 
-from goaly.bench.effisql.pg_grading import GradingPool, GradingPriority
-from goaly.bench.effisql.pg_instances import GRADING, SOLVING, Instance
-from goaly.bench.effisql.pg_settings import PgCredentials, PgEnvConfig
+from goaly.bench.effisql.pg_grading import GradingConnections
+from goaly.bench.effisql.pg_instances import GRADING, Instance
+from goaly.bench.effisql.pg_settings import PgEnvConfig
 
 pytestmark = pytest.mark.anyio
 
-CREDENTIALS = PgCredentials(
-    admin_password=SecretStr("a"),
-    agent_password=SecretStr("b"),
-    grader_password=SecretStr("c"),
-    _env_file=None,
-)
+PASSWORD = SecretStr("grader-pw")
 
 
 class FakeConnectionPool:
-    def __init__(self, instance: Instance, db: str) -> None:
+    """A psycopg_pool pool that lends its key; ``gate`` holds its open until set."""
+
+    def __init__(self, instance: Instance, db: str, gate: asyncio.Event | None = None) -> None:
         self.key = (instance.name, db)
-        self.opened = False
+        self.gate = gate
+        self.open_error: BaseException | None = None
+        self.close_error: BaseException | None = None
+        self.opened_with: tuple[bool, float] | None = None
         self.closed = False
         self.lent = 0
+        self.returned = 0
 
     async def open(self, wait: bool = False, timeout: float = 30.0) -> None:
-        self.opened = True
+        if self.gate is not None:
+            await self.gate.wait()
+        if self.open_error is not None:
+            raise self.open_error
+        self.opened_with = (wait, timeout)
 
     @asynccontextmanager
-    async def connection(self) -> AsyncIterator[Any]:
+    async def connection(self, timeout: float | None = None) -> AsyncIterator[Any]:
         self.lent += 1
-        yield self.key
+        try:
+            yield self.key
+        finally:
+            self.returned += 1
 
-    async def close(self) -> None:
+    async def close(self, timeout: float = 5.0) -> None:
         self.closed = True
+        if self.close_error is not None:
+            raise self.close_error
 
 
 class FakePools:
     def __init__(self) -> None:
         self.made: list[FakeConnectionPool] = []
+        self.gates: dict[tuple[str, str], asyncio.Event] = {}
+        self.open_errors: list[BaseException] = []
 
     def __call__(self, instance: Instance, db: str) -> Any:
-        pool = FakeConnectionPool(instance, db)
+        pool = FakeConnectionPool(instance, db, self.gates.get((instance.name, db)))
+        if self.open_errors:
+            pool.open_error = self.open_errors.pop(0)
         self.made.append(pool)
         return pool
 
 
-def _pool(*instances: Instance, pools: FakePools | None = None) -> GradingPool:
-    factory = pools if pools is not None else FakePools()
-    return GradingPool(PgEnvConfig(), CREDENTIALS, instances or GRADING[:1], pool_factory=factory)
+def _connections(pools: FakePools, **kwargs: Any) -> GradingConnections:
+    return GradingConnections(PgEnvConfig(), PASSWORD, pool_factory=pools, **kwargs)
 
 
 async def _settle() -> None:
@@ -59,140 +74,186 @@ async def _settle() -> None:
         await asyncio.sleep(0)
 
 
-async def test_acquiring_an_instance_is_exclusive() -> None:
-    pool = _pool()
-    async with pool.acquire() as lease:
-        assert lease.instance == GRADING[0]
-        second = asyncio.create_task(_take(pool, GradingPriority.NORMAL, []))
-        await _settle()
-        assert not second.done()  # One evaluation at a time on an instance.
-    await second
-
-
-async def _take(
-    pool: GradingPool, priority: GradingPriority, order: list[str], name: str = ""
-) -> None:
-    async with pool.acquire(priority):
-        order.append(name or priority.name)
-        await _settle()
-
-
-async def test_a_smoke_request_queued_behind_normal_ones_gets_the_next_free_instance() -> None:
-    pool = _pool()
-    order: list[str] = []
-    async with pool.acquire():
-        normal = [
-            asyncio.create_task(_take(pool, GradingPriority.NORMAL, order, f"normal-{i}"))
-            for i in (1, 2)
-        ]
-        await _settle()
-        smoke = asyncio.create_task(_take(pool, GradingPriority.SMOKE, order, "smoke"))
-        await _settle()
-    await asyncio.gather(*normal, smoke)
-
-    assert order == ["smoke", "normal-1", "normal-2"]
-
-
-async def test_levels_are_served_lowest_first_and_in_arrival_order_within_one() -> None:
-    pool = _pool()
-    order: list[str] = []
-    async with pool.acquire():
-        tasks = []
-        for name, priority in [
-            ("low", GradingPriority.LOW),
-            ("normal-1", GradingPriority.NORMAL),
-            ("high", GradingPriority.HIGH),
-            ("normal-2", GradingPriority.NORMAL),
-        ]:
-            tasks.append(asyncio.create_task(_take(pool, priority, order, name)))
-            await _settle()
-    await asyncio.gather(*tasks)
-
-    assert order == ["high", "normal-1", "normal-2", "low"]
-    assert sorted(GradingPriority) == [
-        GradingPriority.SMOKE,
-        GradingPriority.HIGH,
-        GradingPriority.NORMAL,
-        GradingPriority.LOW,
-    ]
-
-
-async def test_a_cancelled_waiter_leaves_the_queue() -> None:
-    pool = _pool()
-    order: list[str] = []
-    async with pool.acquire():
-        gone = asyncio.create_task(_take(pool, GradingPriority.SMOKE, order, "gone"))
-        kept = asyncio.create_task(_take(pool, GradingPriority.NORMAL, order, "kept"))
-        await _settle()
-        gone.cancel()
-        await _settle()
-    await kept
-
-    assert order == ["kept"]
-    assert gone.cancelled()
-
-
-async def test_a_waiter_cancelled_as_its_instance_arrives_hands_it_on() -> None:
-    pool = _pool()
-    order: list[str] = []
-    holder = pool.acquire()
-    await holder.__aenter__()
-    first = asyncio.create_task(_take(pool, GradingPriority.NORMAL, order, "first"))
-    second = asyncio.create_task(_take(pool, GradingPriority.NORMAL, order, "second"))
-    await _settle()
-
-    await holder.__aexit__(None, None, None)  # The instance goes to "first"...
-    first.cancel()  # ...which is cancelled before it runs.
-    await asyncio.gather(first, second, return_exceptions=True)
-
-    assert order == ["second"]  # The instance was not lost.
-
-
-async def test_added_instances_serve_waiting_requests_at_once() -> None:
-    pool = _pool()
-    order: list[str] = []
-    async with pool.acquire():
-        waiting = asyncio.create_task(_take(pool, GradingPriority.NORMAL, order, "waiting"))
-        await _settle()
-        pool.add(SOLVING)  # After final solving, the solving instances grade too.
-        await waiting
-
-    assert order == ["waiting"]
-    assert pool.instances == GRADING[:1] + SOLVING
-
-
-async def test_a_lease_lends_grader_connections_from_one_pool_per_instance_and_database() -> None:
+async def test_one_pool_per_instance_and_database_lends_the_connections() -> None:
     pools = FakePools()
-    pool = _pool(GRADING[0], GRADING[1], pools=pools)
+    connections = _connections(pools, open_timeout_s=7.0)
+    grade_1 = GRADING[0]
+    assert connections.lookup(grade_1, "tpch") is None
 
-    async with pool.acquire() as lease:
-        async with lease.connection("tpch") as main, lease.connection("tpch_alt") as alt:
-            lent: list[object] = [main, alt]  # The fake lends its key, not a connection.
-            assert lent == [("grade-1", "tpch"), ("grade-1", "tpch_alt")]
-        async with lease.connection("tpch"):
-            pass
+    async with (
+        connections.connection(grade_1, "tpch") as main,
+        connections.connection(grade_1, "tpch_alt") as alt,
+    ):
+        lent: list[object] = [main, alt]  # The fake lends its key, not a connection.
+        assert lent == [("grade-1", "tpch"), ("grade-1", "tpch_alt")]
+    async with connections.connection(grade_1, "tpch"):
+        pass
 
     assert [made.key for made in pools.made] == [("grade-1", "tpch"), ("grade-1", "tpch_alt")]
-    assert all(made.opened for made in pools.made)
-    assert pools.made[0].lent == 2  # The second use reused the pool.
+    assert all(made.opened_with == (True, 7.0) for made in pools.made)
+    assert pools.made[0].lent == pools.made[0].returned == 2  # The second loan reused it.
+    assert connections.lookup(grade_1, "tpch") is pools.made[0]
     with pytest.raises(ValueError, match="tpch or tpch_alt"):
-        async with pool.acquire() as lease, lease.connection("postgres"):
+        async with connections.connection(grade_1, "postgres"):
             pass
 
-    await pool.close()
+
+async def test_an_instance_whose_pool_is_slow_to_open_holds_up_no_other() -> None:
+    pools = FakePools()
+    pools.gates[("grade-1", "tpch")] = asyncio.Event()  # grade-1 never answers.
+    connections = _connections(pools)
+    stuck = asyncio.create_task(connections.open(GRADING[0], "tpch"))
+    await _settle()
+
+    async with asyncio.timeout(1), connections.connection(GRADING[1], "tpch") as conn:
+        lent: object = conn  # The fake lends its key, not a connection.
+        assert lent == ("grade-2", "tpch")
+
+    assert not stuck.done()
+    stuck.cancel()
+    await connections.close()
+
+
+async def test_callers_that_ask_at_once_share_one_opening() -> None:
+    pools = FakePools()
+    gate = pools.gates[("grade-1", "tpch")] = asyncio.Event()
+    connections = _connections(pools)
+
+    first = asyncio.create_task(connections.open(GRADING[0], "tpch"))
+    second = asyncio.create_task(connections.open(GRADING[0], "tpch"))
+    await _settle()
+    gate.set()
+
+    assert await first is await second
+    assert len(pools.made) == 1
+
+
+async def test_a_caller_cancelled_while_its_pool_opens_leaks_nothing() -> None:
+    pools = FakePools()
+    gate = pools.gates[("grade-1", "tpch")] = asyncio.Event()
+    connections = _connections(pools)
+
+    caller = asyncio.create_task(connections.open(GRADING[0], "tpch"))
+    await _settle()
+    caller.cancel()  # A time limit, say, while the instance is slow to answer.
+    with pytest.raises(asyncio.CancelledError):
+        await caller
+    gate.set()
+    await _settle()
+
+    pool = pools.made[0]
+    assert connections.lookup(GRADING[0], "tpch") is pool  # Kept for the next caller,
+    await connections.close()
+    assert pool.closed  # and closed with the others.
+
+
+async def test_close_also_closes_a_pool_still_opening() -> None:
+    pools = FakePools()
+    pools.gates[("grade-1", "tpch")] = asyncio.Event()  # It never finishes opening.
+    connections = _connections(pools)
+    opening = asyncio.create_task(connections.open(GRADING[0], "tpch"))
+    await _settle()
+
+    async with asyncio.timeout(1):
+        await connections.close()
+
+    assert pools.made[0].closed
+    assert connections.lookup(GRADING[0], "tpch") is None
+    with pytest.raises(asyncio.CancelledError):
+        await opening
+    with pytest.raises(RuntimeError, match="closed"):
+        await connections.open(GRADING[1], "tpch")
+
+
+async def test_a_pool_that_fails_to_open_is_closed_and_the_next_call_tries_again() -> None:
+    pools = FakePools()
+    pools.open_errors = [PoolTimeout("couldn't get a connection after 30.00 sec")]
+    connections = _connections(pools)
+
+    with pytest.raises(PoolTimeout):
+        await connections.open(GRADING[0], "tpch")
+    again = await connections.open(GRADING[0], "tpch")
+
+    assert pools.made[0].closed  # The failed pool's workers do not linger.
+    assert again is pools.made[1]
+
+
+async def test_a_connection_goes_back_however_its_block_exits() -> None:
+    pools = FakePools()
+    connections = _connections(pools)
+
+    with pytest.raises(ZeroDivisionError):
+        async with connections.connection(GRADING[0], "tpch"):
+            raise ZeroDivisionError
+
+    async def hold() -> None:
+        async with connections.connection(GRADING[0], "tpch"):
+            await asyncio.sleep(60)
+
+    holder = asyncio.create_task(hold())
+    await _settle()
+    holder.cancel()
+    async with asyncio.timeout(1):
+        with pytest.raises(asyncio.CancelledError):
+            await holder
+
+    pool = pools.made[0]
+    assert pool.lent == pool.returned == 2
+
+
+async def test_close_closes_every_pool_even_when_one_fails(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    pools = FakePools()
+    connections = _connections(pools)
+    for instance in GRADING:
+        await connections.open(instance, "tpch")
+    pools.made[0].close_error = OSError("the socket is gone")
+
+    with caplog.at_level(logging.WARNING, logger="goaly.bench.effisql.pg_grading"):
+        await connections.close()
+
     assert all(made.closed for made in pools.made)
+    failed = next(r for r in caplog.records if "closing the tpch pool on grade-1" in r.getMessage())
+    assert failed.exc_info is not None
+    assert all(connections.lookup(instance, "tpch") is None for instance in GRADING)
 
 
-async def test_the_default_connection_pools_use_the_grader_role_in_autocommit() -> None:
-    pool = GradingPool(PgEnvConfig(), CREDENTIALS, GRADING[:1])
+def test_the_default_pools_connect_as_the_grader_role_in_autocommit() -> None:
+    connections = GradingConnections(PgEnvConfig(), PASSWORD, max_size=3)
 
-    connections = pool._new_pool(GRADING[0], "tpch_alt")  # Built, never opened.
+    pool = connections._new_pool(GRADING[0], "tpch_alt")  # Built, never opened.
 
-    kwargs = connections.kwargs
-    assert isinstance(kwargs, dict)
-    assert kwargs["user"] == "effisql_grader"
-    assert kwargs["dbname"] == "tpch_alt"
-    assert kwargs["port"] == 55434
-    assert kwargs["autocommit"] is True
-    assert kwargs["password"] == CREDENTIALS.grader_password.get_secret_value()
-    assert connections.max_size == 2
+    assert pool.kwargs == {
+        "host": "127.0.0.1",
+        "port": 55434,
+        "user": "effisql_grader",
+        "password": "grader-pw",
+        "dbname": "tpch_alt",
+        "autocommit": True,
+        "connect_timeout": 10,
+        "application_name": "goaly-effisql-grader",
+    }
+    assert (pool.min_size, pool.max_size) == (1, 3)
+    assert pool.name == "grading-grade-1-tpch_alt"
+
+
+async def test_a_returned_connection_is_discarded_to_a_fresh_session() -> None:
+    connections = GradingConnections(PgEnvConfig(), PASSWORD)
+    pool = connections._new_pool(GRADING[0], "tpch")
+    executed: list[str] = []
+
+    class Conn:
+        async def execute(self, query: str) -> None:
+            executed.append(query)
+
+    assert pool._reset is not None
+    await pool._reset(Conn())  # type: ignore[arg-type]
+
+    assert executed == ["DISCARD ALL"]
+    assert pool._check is not None  # A connection is checked before each loan.
+
+
+def test_a_pool_needs_room_for_a_connection() -> None:
+    with pytest.raises(ValueError, match="max_size must be at least 1"):
+        GradingConnections(PgEnvConfig(), PASSWORD, max_size=0)

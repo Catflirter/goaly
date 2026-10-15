@@ -134,9 +134,16 @@ class FakeSlot:
         self.aborts.append(token)
 
     def evaluate(
-        self, inst: EffiSqlInstance, sql: str | None, mode: Mode, cache: BaseCache | None
+        self,
+        inst: EffiSqlInstance,
+        sql: str | None,
+        mode: Mode,
+        cache: BaseCache | None,
+        plans: list[dict[str, Any]] | None = None,
     ) -> Grade:
         self.calls.append((inst.instance_id, sql, mode, cache))
+        if plans is not None:
+            plans.append({"Plan": {"Node Type": "Seq Scan", "call": len(self.calls)}})
         if self.work is not None:
             return self.work()  # type: ignore[no-any-return]  # The test's own work.
         return Grade(instance_id=inst.instance_id, status=GRADE_STATUS_GRADED)
@@ -399,8 +406,9 @@ class TestWorkerPlumbing:
 
     def test_grade_on_slot_evaluates(self) -> None:
         slot = FakeSlot()
-        grade = grading_service.grade_on_slot(slot, INST, "SELECT 1", Mode.DEV, None)  # type: ignore[arg-type]  # A fake.
+        grade, plan = grading_service.grade_on_slot(slot, INST, "SELECT 1", Mode.DEV, None)  # type: ignore[arg-type]  # A fake.
         assert grade.status == GRADE_STATUS_GRADED
+        assert plan == {"Plan": {"Node Type": "Seq Scan", "call": 1}}
 
 
 class TestProcessRunner:
@@ -521,3 +529,33 @@ class TestRulingAdditions:
         with pytest.raises(GraderError, match="identity probe failed"):
             grading_service.probe_identity(slot, INST)  # type: ignore[arg-type]  # A fake.
         assert slot.resets == 1
+
+
+class TestPlanHook:
+    @run_async
+    async def test_the_graded_attempts_plan_root_reaches_the_hook(self, tmp_path: Path) -> None:
+        outcomes = [Grade(status=GRADE_STATUS_GRADER_ERROR), Grade(status=GRADE_STATUS_GRADED)]
+        slot = FakeSlot(lambda: outcomes.pop(0))
+        seen: list[tuple[str, Any]] = []
+        grader = grader_on(slot, tmp_path)
+        await grader.grade(
+            INST, answer("SELECT 1"), Mode.OFFICIAL, on_plan=lambda i, p: seen.append((i, p))
+        )
+        assert seen == [(INST.instance_id, {"Node Type": "Seq Scan", "call": 2})]
+
+    @run_async
+    async def test_a_grade_without_a_plan_calls_no_hook(self, tmp_path: Path) -> None:
+        seen: list[Any] = []
+        grader = grader_on(FakeSlot(), tmp_path)
+        await grader.grade(INST, answer(""), Mode.DEV, on_plan=lambda i, p: seen.append(i))
+        assert seen == []
+
+    @run_async
+    async def test_a_failing_hook_never_fails_the_grade(self, tmp_path: Path) -> None:
+        def broken(_i: str, _p: Any) -> None:
+            raise OSError("disk full")
+
+        grade = await grader_on(FakeSlot(), tmp_path).grade(
+            INST, answer("SELECT 1"), Mode.OFFICIAL, on_plan=broken
+        )
+        assert grade.status == GRADE_STATUS_GRADED

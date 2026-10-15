@@ -12,6 +12,7 @@ import os
 from collections.abc import AsyncIterator
 from contextlib import AbstractAsyncContextManager, asynccontextmanager
 from pathlib import Path
+from unittest.mock import patch
 
 import pytest
 from pydantic import SecretStr
@@ -67,9 +68,16 @@ class FakeContainer:
             return SandboxResult(0, "solved nothing", timed_out=False)
         registry = Registry()
         registry.add("effisql", "v0", self._open)
-        status = await asyncio.to_thread(
-            cli.main, argv[3:], registry, budgets_file=goaly_cli.BUDGETS_FILE
-        )
+        # A real container runs goaly in its own main thread; this worker thread cannot take
+        # the CLI's SIGTERM handler, so the loop's handler methods do nothing meanwhile.
+        loop_class = type(asyncio.get_running_loop())
+        with (
+            patch.object(loop_class, "add_signal_handler", lambda *_: None),
+            patch.object(loop_class, "remove_signal_handler", lambda *_: True),
+        ):
+            status = await asyncio.to_thread(
+                cli.main, argv[3:], registry, budgets_file=goaly_cli.BUDGETS_FILE
+            )
         return SandboxResult(status, "", timed_out=False)
 
     def _open(self, options: HarnessOptions) -> AbstractAsyncContextManager[RunnableHarness]:
