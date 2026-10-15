@@ -9,9 +9,27 @@ pytest imports tests/ as a namespace package, so any test can import them, e.g.
 ``from tests.fakes import FakeSqlEnvironment``.
 """
 
-from collections.abc import Mapping
+from collections.abc import AsyncIterator, Mapping, Sequence
+from contextlib import asynccontextmanager
+from dataclasses import dataclass
+
+from pydantic import BaseModel
 
 from goaly.contracts.gen.environment_pb2 import ShellResult, SqlResult
+from goaly.contracts.gen.task_pb2 import (
+    GRADE_STATUS_GRADED,
+    SPLIT_TRAIN,
+    SPLIT_VAL,
+    BirdPrediction,
+    BirdTaskInput,
+    Grade,
+    Prediction,
+    Split,
+    SwePrediction,
+    TaskInput,
+)
+from goaly.contracts.gen.trajectory_pb2 import ToolResult
+from goaly.contracts.interfaces import Environment, JsonValue
 
 # The exit status a shell gives for a command it cannot find.
 COMMAND_NOT_FOUND = 127
@@ -91,3 +109,117 @@ class FakeShellEnvironment(FakeEnvironment):
     async def write_file(self, path: str, content: str) -> None:
         self._ensure_open()
         self.files[path] = content
+
+
+class EchoArgs(BaseModel):
+    """EchoTool's arguments."""
+
+    text: str
+
+
+class EchoTool:
+    """A Tool that answers with its ``text`` argument. It works in any environment."""
+
+    name = "echo"
+    description = "Reply with the given text."
+    args_model = EchoArgs
+
+    async def run(self, args: EchoArgs, env: Environment) -> ToolResult:
+        return ToolResult(content=args.text)
+
+
+class DoNothingPolicy:
+    """A Policy that submits the do-nothing answer: BIRD's issue_sql unchanged, or no SWE patch.
+
+    It works in any environment and with any context. ``tasks`` records each task it solved.
+    """
+
+    def __init__(self) -> None:
+        self.tasks: list[TaskInput] = []
+
+    async def solve(self, task: TaskInput, env: Environment, ctx: object) -> Prediction:
+        self.tasks.append(task)
+        if task.HasField("swe"):
+            return Prediction(instance_id=task.instance_id, swe=SwePrediction())
+        sqls = task.bird.issue_sql
+        return Prediction(instance_id=task.instance_id, bird=BirdPrediction(sqls=sqls))
+
+
+@dataclass(frozen=True)
+class ToyInstance:
+    """A ToyBenchmark task: the benchmark's own record, so it holds the gold answer."""
+
+    instance_id: str
+    split: Split.ValueType
+    query: str
+    issue_sql: str
+    gold_sql: str
+
+
+TOY_INSTANCES = (
+    ToyInstance(
+        instance_id="toy-1",
+        split=SPLIT_TRAIN,
+        query="How many users are there?",
+        issue_sql="SELECT count(*) FROM user",
+        gold_sql="SELECT count(*) FROM users",
+    ),
+    ToyInstance(  # Its issue SQL is already right, so the do-nothing answer passes.
+        instance_id="toy-2",
+        split=SPLIT_TRAIN,
+        query="What are the users' names?",
+        issue_sql="SELECT name FROM users",
+        gold_sql="SELECT name FROM users",
+    ),
+    ToyInstance(
+        instance_id="toy-3",
+        split=SPLIT_VAL,
+        query="Who joined first?",
+        issue_sql="SELECT min(name) FROM users",
+        gold_sql="SELECT name FROM users ORDER BY id LIMIT 1",
+    ),
+)
+
+
+class ToyBenchmark:
+    """A Benchmark of BIRD-style SQL tasks held in memory, each solved in a FakeSqlEnvironment.
+
+    A task's environment runs only the task's gold SQL, which returns no rows. A prediction is
+    correct if its last statement is the gold SQL. ``environments`` records each environment
+    provisioned.
+    """
+
+    name = "toy"
+
+    def __init__(self, instances: Sequence[ToyInstance] = TOY_INSTANCES) -> None:
+        self.instances = tuple(instances)
+        self.environments: list[FakeSqlEnvironment] = []
+
+    def load_instances(self, split: Split.ValueType) -> list[ToyInstance]:
+        return [inst for inst in self.instances if inst.split == split]
+
+    @asynccontextmanager
+    async def provision(self, inst: ToyInstance) -> AsyncIterator[FakeSqlEnvironment]:
+        env = FakeSqlEnvironment({inst.gold_sql: SqlResult()})
+        self.environments.append(env)
+        try:
+            yield env
+        finally:
+            await env.close()
+
+    def agent_input(self, inst: ToyInstance) -> TaskInput:
+        bird = BirdTaskInput(db_id="toy", query=inst.query, issue_sql=[inst.issue_sql])
+        return TaskInput(instance_id=inst.instance_id, bird=bird)
+
+    async def grade(self, inst: ToyInstance, prediction: Prediction) -> Grade:
+        sqls = prediction.bird.sqls
+        correct = len(sqls) > 0 and sqls[-1] == inst.gold_sql
+        return Grade(
+            instance_id=inst.instance_id,
+            score=float(correct),
+            correct=correct,
+            status=GRADE_STATUS_GRADED,
+        )
+
+    def to_official(self, inst: ToyInstance, prediction: Prediction) -> dict[str, JsonValue]:
+        return {"instance_id": inst.instance_id, "pred_sqls": list(prediction.bird.sqls)}

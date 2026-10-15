@@ -8,11 +8,12 @@
 
 import asyncio
 import inspect
+import json
 from collections.abc import Awaitable, Callable, Iterator, Sequence
 from contextlib import AbstractAsyncContextManager
 from pathlib import Path
 from types import NoneType
-from typing import Any, Protocol, TypeVar, get_args, get_origin, get_type_hints
+from typing import Any, Protocol, TypeVar, assert_type, get_args, get_origin, get_type_hints
 
 import pytest
 from google.protobuf.message import Message
@@ -20,8 +21,41 @@ from pydantic import BaseModel
 
 from goaly.contracts import interfaces
 from goaly.contracts.gen.environment_pb2 import ShellResult, SqlResult
-from goaly.contracts.interfaces import Environment, ShellEnvironment, SqlEnvironment
-from tests.fakes import COMMAND_NOT_FOUND, FakeEnvironment, FakeShellEnvironment, FakeSqlEnvironment
+from goaly.contracts.gen.task_pb2 import (
+    GRADE_STATUS_GRADED,
+    SPLIT_TRAIN,
+    SPLIT_VAL,
+    BirdPrediction,
+    BirdTaskInput,
+    Grade,
+    Prediction,
+    SwePrediction,
+    SweTaskInput,
+    TaskInput,
+)
+from goaly.contracts.gen.trajectory_pb2 import ToolResult
+from goaly.contracts.interfaces import (
+    Benchmark,
+    Environment,
+    JsonValue,
+    Policy,
+    ShellEnvironment,
+    SqlEnvironment,
+    Tool,
+)
+from goaly.contracts.jsonl import to_json_line
+from tests.fakes import (
+    COMMAND_NOT_FOUND,
+    TOY_INSTANCES,
+    DoNothingPolicy,
+    EchoArgs,
+    EchoTool,
+    FakeEnvironment,
+    FakeShellEnvironment,
+    FakeSqlEnvironment,
+    ToyBenchmark,
+    ToyInstance,
+)
 
 CLASSES = [
     value
@@ -34,14 +68,21 @@ PROTOCOLS = [cls for cls in CLASSES if vars(cls).get("_is_protocol", False)]
 # int at runtime.
 SCALARS = (bool, bytes, float, int, str)
 
+# The one documented exception (spec §3.3, and Tool's docstring): a tool's arguments are a
+# pydantic model, so ArgsT is bound to BaseModel and args_model returns the model class.
+DOCUMENTED_EXCEPTIONS = {
+    "Tool": ["Tool[ArgsT] is bound to BaseModel", "Tool.args_model returns type[ArgsT]"],
+}
+
 
 def describe(hint: object) -> str:
     return hint.__qualname__ if isinstance(hint, type) else repr(hint)
 
 
 def is_plain(hint: object, type_params: Sequence[object]) -> bool:
-    """Whether ``hint`` is a type parameter, a contract message, a builtin scalar or None."""
-    if hint in type_params or hint in (*SCALARS, NoneType):
+    """Whether ``hint`` is a type parameter, a contract message, a builtin scalar, None or JSON."""
+    # dict[str, JsonValue] is a JSON object: the branch of JsonValue that to_official returns.
+    if hint in type_params or hint in (*SCALARS, NoneType, JsonValue, dict[str, JsonValue]):
         return True
     return (
         isinstance(hint, type)
@@ -89,14 +130,21 @@ def violations(protocol: type) -> list[str]:
     return found
 
 
-def test_every_class_in_the_module_is_a_protocol() -> None:
-    assert CLASSES
+def test_the_module_defines_the_six_protocols_and_nothing_else() -> None:
     assert PROTOCOLS == CLASSES
+    assert sorted(cls.__name__ for cls in PROTOCOLS) == [
+        "Benchmark",
+        "Environment",
+        "Policy",
+        "ShellEnvironment",
+        "SqlEnvironment",
+        "Tool",
+    ]
 
 
 @pytest.mark.parametrize("protocol", PROTOCOLS, ids=lambda protocol: protocol.__name__)
 def test_protocols_take_and_return_only_contract_messages_and_plain_values(protocol: type) -> None:
-    assert violations(protocol) == []
+    assert violations(protocol) == DOCUMENTED_EXCEPTIONS.get(protocol.__name__, [])
 
 
 class Leaky[ModelT: BaseModel](Protocol):
@@ -231,3 +279,151 @@ def test_a_closed_fake_shell_environment_refuses_every_call(
     with pytest.raises(RuntimeError, match="the environment is closed"):
         asyncio.run(scenario())
     assert (fake.commands, fake.files) == ([], {"notes.txt": "old"})
+
+
+def test_echo_tool_answers_with_its_text_in_any_environment() -> None:
+    # EnvT is contravariant, so a tool for any environment fits a SQL pack and a shell pack.
+    sql_tool: Tool[EchoArgs, SqlEnvironment] = EchoTool()
+    shell_tool: Tool[EchoArgs, ShellEnvironment] = EchoTool()
+
+    args = sql_tool.args_model.model_validate_json('{"text": "hello"}')
+
+    async def scenario() -> tuple[ToolResult, ToolResult]:
+        return (
+            await sql_tool.run(args, FakeSqlEnvironment()),
+            await shell_tool.run(args, FakeShellEnvironment()),
+        )
+
+    assert_type(args, EchoArgs)
+    assert asyncio.run(scenario()) == (ToolResult(content="hello"), ToolResult(content="hello"))
+    assert (sql_tool.name, sql_tool.description) == ("echo", "Reply with the given text.")
+
+
+class StandInContext:
+    """Stands in for harness core's AgentContext, which contracts cannot import."""
+
+
+def test_do_nothing_policy_submits_the_issue_sql_of_a_bird_task() -> None:
+    fake = DoNothingPolicy()
+    # EnvT and CtxT are contravariant, so a policy for any environment and context fits here.
+    policy: Policy[SqlEnvironment, StandInContext] = fake
+    task = TaskInput(instance_id="t", bird=BirdTaskInput(issue_sql=["SELECT 1", "SELECT 2"]))
+
+    prediction = asyncio.run(policy.solve(task, FakeSqlEnvironment(), StandInContext()))
+
+    assert prediction == Prediction(
+        instance_id="t", bird=BirdPrediction(sqls=["SELECT 1", "SELECT 2"])
+    )
+    assert fake.tasks == [task]
+
+
+def test_do_nothing_policy_submits_no_patch_for_a_swe_task() -> None:
+    policy: Policy[ShellEnvironment, StandInContext] = DoNothingPolicy()
+    task = TaskInput(instance_id="t", swe=SweTaskInput(repo="astropy/astropy"))
+
+    prediction = asyncio.run(policy.solve(task, FakeShellEnvironment(), StandInContext()))
+
+    assert prediction == Prediction(instance_id="t", swe=SwePrediction(patch=""))
+    assert prediction.WhichOneof("benchmark") == "swe"
+
+
+def test_toy_benchmark_loads_the_instances_of_a_split() -> None:
+    # EnvT is covariant, so a benchmark that provisions fakes fits a SQL benchmark's slot.
+    benchmark: Benchmark[ToyInstance, SqlEnvironment] = ToyBenchmark()
+
+    train = benchmark.load_instances(SPLIT_TRAIN)
+
+    assert_type(train, Sequence[ToyInstance])
+    assert [inst.instance_id for inst in train] == ["toy-1", "toy-2"]
+    assert [inst.instance_id for inst in benchmark.load_instances(SPLIT_VAL)] == ["toy-3"]
+    assert benchmark.name == "toy"
+
+
+def test_toy_benchmark_shows_the_agent_no_gold_answer() -> None:
+    benchmark: Benchmark[ToyInstance, SqlEnvironment] = ToyBenchmark()
+    inst = TOY_INSTANCES[0]
+
+    task = benchmark.agent_input(inst)
+
+    assert task == TaskInput(
+        instance_id="toy-1",
+        bird=BirdTaskInput(db_id="toy", query=inst.query, issue_sql=[inst.issue_sql]),
+    )
+    assert inst.gold_sql not in to_json_line(task)
+
+
+def test_toy_benchmark_closes_the_environment_it_provisions() -> None:
+    fake = ToyBenchmark()
+    benchmark: Benchmark[ToyInstance, SqlEnvironment] = fake
+    inst = TOY_INSTANCES[0]
+
+    async def scenario() -> tuple[SqlResult, SqlResult]:
+        async with benchmark.provision(inst) as env:
+            return (
+                await env.execute(inst.gold_sql, timeout_s=1.0),
+                await env.execute(inst.issue_sql, timeout_s=1.0),
+            )
+
+    gold, issue = asyncio.run(scenario())
+
+    assert gold == SqlResult()
+    assert issue.error
+    assert [env.closed for env in fake.environments] == [True]
+
+
+@pytest.mark.parametrize(
+    ("sqls", "correct"),
+    [
+        (["SELECT count(*) FROM users"], True),
+        (["SELECT 1", "SELECT count(*) FROM users"], True),
+        (["SELECT count(*) FROM users", "SELECT 1"], False),
+        ([], False),
+    ],
+)
+def test_toy_benchmark_grades_the_last_statement(sqls: list[str], correct: bool) -> None:
+    benchmark: Benchmark[ToyInstance, SqlEnvironment] = ToyBenchmark()
+    prediction = Prediction(instance_id="toy-1", bird=BirdPrediction(sqls=sqls))
+
+    grade = asyncio.run(benchmark.grade(TOY_INSTANCES[0], prediction))
+
+    assert grade == Grade(
+        instance_id="toy-1", score=float(correct), correct=correct, status=GRADE_STATUS_GRADED
+    )
+
+
+def test_toy_benchmark_writes_the_official_bird_format() -> None:
+    benchmark: Benchmark[ToyInstance, SqlEnvironment] = ToyBenchmark()
+    prediction = Prediction(instance_id="toy-1", bird=BirdPrediction(sqls=["SELECT 1"]))
+
+    record = benchmark.to_official(TOY_INSTANCES[0], prediction)
+
+    assert json.loads(json.dumps(record)) == {"instance_id": "toy-1", "pred_sqls": ["SELECT 1"]}
+
+
+async def solve_and_grade[InstanceT, EnvT: Environment, CtxT](
+    benchmark: Benchmark[InstanceT, EnvT], policy: Policy[EnvT, CtxT], inst: InstanceT, ctx: CtxT
+) -> Grade:
+    """Solve and grade one task as the runner will, through the Protocols alone."""
+    async with benchmark.provision(inst) as env:
+        prediction = await policy.solve(benchmark.agent_input(inst), env, ctx)
+    return await benchmark.grade(inst, prediction)
+
+
+def test_the_fakes_run_a_split_end_to_end() -> None:
+    benchmark = ToyBenchmark()
+    policy = DoNothingPolicy()
+
+    async def run_split() -> list[Grade]:
+        return [
+            await solve_and_grade(benchmark, policy, inst, StandInContext())
+            for inst in benchmark.load_instances(SPLIT_TRAIN)
+        ]
+
+    grades = asyncio.run(run_split())
+
+    assert [(grade.instance_id, grade.correct) for grade in grades] == [
+        ("toy-1", False),
+        ("toy-2", True),
+    ]
+    assert [task.instance_id for task in policy.tasks] == ["toy-1", "toy-2"]
+    assert [env.closed for env in benchmark.environments] == [True, True]
