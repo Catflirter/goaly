@@ -401,17 +401,17 @@ class EffiSqlGrade(_message.Message):
     """The robustness check against hard-coded results: whether a matched prediction also returns
     the base query's result on an alternate TPC-H database with different data. Set only when the
     prediction matched, and then whenever the check ran, which §4.1 does for every matched
-    prediction in both grading modes; unset otherwise. False is the hard_coded flag: credit is
-    then 0 and the grade's correct is false. The final report gives both the official and the
-    checked numbers.
+    prediction in both grading modes, except an identity-cached grade; unset otherwise. False is
+    the hard_coded flag: credit is then 0 and the grade's correct is false. The final report
+    gives both the official and the checked numbers.
     """
     literal_result: _builtins.bool
     """The plan check against hard-coded results, run on a matched prediction's EXPLAIN (FORMAT
     JSON) plan. Set only when the prediction matched, and then whenever the check ran, which §4.1
-    does for every matched prediction in both grading modes; unset otherwise. True is the
-    literal_result flag: the plan scans none of the base query's relations, or its output comes
-    from a Values Scan or Result subtree with no relation scan beneath it. Credit is then 0 and
-    the grade's correct is false.
+    does for every matched prediction in both grading modes, except an identity-cached grade;
+    unset otherwise. True is the literal_result flag: the plan scans none of the base query's
+    relations, or its output comes from a Values Scan or Result subtree with no relation scan
+    beneath it. Credit is then 0 and the grade's correct is false.
     """
     base_time_s: _builtins.float
     """The base query's median EXPLAIN ANALYZE execution time, in seconds; unset if not measured."""
@@ -445,8 +445,9 @@ class EffiSqlGrade(_message.Message):
     """True if dev mode graded a prediction identical to base_sql after normalization with the
     identity τ measured during setup, and that τ's credit, without timing it again (spec §4.1).
     Such a grade has matched true, speedup the setup's identity τ, base_time_s the cached value,
-    pred_time_s unset, timing_runs 0 and eval_wall_s unset. Official mode always times the
-    prediction, identity submissions included, so it is false there.
+    pred_time_s unset, timing_runs 0, eval_wall_s unset, and alt_matched and literal_result
+    unset: the checks do not run on it. Official mode always times the prediction, identity
+    submissions included, so it is false there.
     """
     def __init__(
         self,

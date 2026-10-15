@@ -154,7 +154,8 @@ class ImplementerExit(_ImplementerExit, metaclass=_ImplementerExitEnumTypeWrappe
     aborted instead. A model call that fails ends the run as follows. IMPLEMENTER_EXIT_INFRASTRUCTURE
     is a gateway outage that outlasted its retries (LLM_CALL_STATUS_RATE_LIMITED, SERVER_ERROR,
     TIMEOUT or CONNECTION_ERROR) or an open breaker. IMPLEMENTER_EXIT_CRASHED is
-    LLM_CALL_STATUS_CONTEXT_OVERFLOW, INVALID_RESPONSE or CLIENT_ERROR.
+    LLM_CALL_STATUS_CONTEXT_OVERFLOW, INVALID_RESPONSE or CLIENT_ERROR. IMPLEMENTER_EXIT_INTERRUPTED
+    is LLM_CALL_STATUS_CANCELLED: our code cancelled the call.
     """
 
 IMPLEMENTER_EXIT_UNSPECIFIED: ImplementerExit.ValueType  # 0
@@ -207,18 +208,10 @@ class _GuardEnumTypeWrapper(_enum_type_wrapper._EnumTypeWrapper[_Guard.ValueType
     GUARD_UNIT_TESTS: _Guard.ValueType  # 4
     """The pack's unit tests pass."""
     GUARD_PACK_CODE_ALLOWLIST: _Guard.ValueType  # 5
-    """The static AST allowlist passes on the candidate's pack code, which runs on the host during
-    smoke tests, screening and validation (spec §8.5). It is a static defense in depth, not a
-    sandbox. Imports may come only from: an explicit list of goaly.harness.core modules, which
-    leaves out settings and every llm* module; goaly.contracts; pydantic; relative imports and
-    goaly.harness.packs.<lane>, the lane's own pack; a closed list of pure stdlib modules, such
-    as json, re and typing; and asyncio, for concurrency only. Banned: the builtins open, eval,
-    exec, compile, __import__, getattr, setattr, delattr, vars, globals, locals, dir, type,
-    breakpoint, input and memoryview; any attribute name that starts with _, except on self or
-    cls; calls to .format and .format_map; the frame and coroutine attributes f_*, gi_*, cr_*,
-    ag_* and tb_*; any attribute of an imported module that is itself a module; and the attribute
-    names sys, os, modules, builtins and subprocess, and asyncio's process, socket and pipe
-    functions.
+    """The static AST allowlist passes on the candidate's pack code. Spec §8.5 is the authority on
+    its rules: the imports it allows and the names, attributes and calls it bans. It is a static
+    defense in depth; the candidate's code itself is isolated in the keyless solve container
+    (spec §6.1).
     """
 
 class Guard(_Guard, metaclass=_GuardEnumTypeWrapper):
@@ -245,18 +238,10 @@ from any split.
 GUARD_UNIT_TESTS: Guard.ValueType  # 4
 """The pack's unit tests pass."""
 GUARD_PACK_CODE_ALLOWLIST: Guard.ValueType  # 5
-"""The static AST allowlist passes on the candidate's pack code, which runs on the host during
-smoke tests, screening and validation (spec §8.5). It is a static defense in depth, not a
-sandbox. Imports may come only from: an explicit list of goaly.harness.core modules, which
-leaves out settings and every llm* module; goaly.contracts; pydantic; relative imports and
-goaly.harness.packs.<lane>, the lane's own pack; a closed list of pure stdlib modules, such
-as json, re and typing; and asyncio, for concurrency only. Banned: the builtins open, eval,
-exec, compile, __import__, getattr, setattr, delattr, vars, globals, locals, dir, type,
-breakpoint, input and memoryview; any attribute name that starts with _, except on self or
-cls; calls to .format and .format_map; the frame and coroutine attributes f_*, gi_*, cr_*,
-ag_* and tb_*; any attribute of an imported module that is itself a module; and the attribute
-names sys, os, modules, builtins and subprocess, and asyncio's process, socket and pipe
-functions.
+"""The static AST allowlist passes on the candidate's pack code. Spec §8.5 is the authority on
+its rules: the imports it allows and the names, attributes and calls it bans. It is a static
+defense in depth; the candidate's code itself is isolated in the keyless solve container
+(spec §6.1).
 """
 Global___Guard: _TypeAlias = Guard  # noqa: Y015
 
@@ -341,9 +326,10 @@ class _RejectionReasonEnumTypeWrapper(_enum_type_wrapper._EnumTypeWrapper[_Rejec
 
 class RejectionReason(_RejectionReason, metaclass=_RejectionReasonEnumTypeWrapper):
     """A rule that rejects a candidate: one value for each way spec §8.2 and §8.3 reject one. The
-    values are declared by number. The decision code checks them in the order of the round's
-    steps: IMPLEMENTATION_FAILED, GUARD_FAILED, HARD_CODED, NO_SCREEN_GAIN, EFFICIENCY_CAP,
-    INSUFFICIENT_GAIN, COST_GUARDRAIL, NOT_SIGNIFICANT, REGRESSION, OUTRANKED, then NOT_CONFIRMED.
+    values are declared by number. Roughly in evaluation order, they are: IMPLEMENTATION_FAILED,
+    GUARD_FAILED, HARD_CODED, NO_SCREEN_GAIN, EFFICIENCY_CAP, INSUFFICIENT_GAIN, COST_GUARDRAIL,
+    NOT_SIGNIFICANT, REGRESSION, OUTRANKED and NOT_CONFIRMED. HARD_CODED can also come up in the
+    validation or the confirmation. The decision code (T21) owns the exact order.
     """
 
 REJECTION_REASON_UNSPECIFIED: RejectionReason.ValueType  # 0
@@ -390,13 +376,15 @@ class _LaneEventKindEnumTypeWrapper(_enum_type_wrapper._EnumTypeWrapper[_LaneEve
     """Not set."""
     LANE_EVENT_KIND_STARTED: _LaneEventKind.ValueType  # 1
     """The lane started: the first time, or when a new goaly rsi run resumed it from the ledger,
-    as after the workspace stopped. The lane's time budget counts from its first start.
+    as after the workspace stopped. deadline_at records the lane's deadline.
     """
     LANE_EVENT_KIND_RESTARTED: _LaneEventKind.ValueType  # 2
-    """The supervisor restarted the lane after it crashed; detail says how it crashed."""
+    """The supervisor restarted the lane after a LANE_EVENT_KIND_CRASHED; detail gives only the
+    backoff it waited, since the crash event holds the cause.
+    """
     LANE_EVENT_KIND_RECOVERY_FAILED: _LaneEventKind.ValueType  # 3
-    """The lane crashed too often for automatic recovery, so the supervisor stopped it and notified
-    the project lead.
+    """Automatic recovery failed, at 5 LANE_EVENT_KIND_CRASHED events within an hour (spec §8.7), so
+    the supervisor stopped the lane and notified the project lead.
     """
     LANE_EVENT_KIND_STOPPED: _LaneEventKind.ValueType  # 4
     """The lane stopped by a stopping rule (spec §8.4); detail names the rule."""
@@ -407,8 +395,9 @@ class _LaneEventKindEnumTypeWrapper(_enum_type_wrapper._EnumTypeWrapper[_LaneEve
     LANE_EVENT_KIND_NOTIFY_FAILED: _LaneEventKind.ValueType  # 7
     """A notification could not be delivered; it is retried."""
     LANE_EVENT_KIND_CRASHED: _LaneEventKind.ValueType  # 8
-    """The lane crashed, or a start failed the supervisor's preflight checks, which counts as a crash
-    (spec §8.7); detail says how.
+    """The supervisor counted the lane as crashed (spec §8.7): its process died, its heartbeat was 10
+    minutes old so it was killed, or a start failed the preflight checks. The supervisor writes
+    it, since a killed lane cannot, and detail gives the cause. Recovery counts these events.
     """
 
 class LaneEventKind(_LaneEventKind, metaclass=_LaneEventKindEnumTypeWrapper):
@@ -418,13 +407,15 @@ LANE_EVENT_KIND_UNSPECIFIED: LaneEventKind.ValueType  # 0
 """Not set."""
 LANE_EVENT_KIND_STARTED: LaneEventKind.ValueType  # 1
 """The lane started: the first time, or when a new goaly rsi run resumed it from the ledger,
-as after the workspace stopped. The lane's time budget counts from its first start.
+as after the workspace stopped. deadline_at records the lane's deadline.
 """
 LANE_EVENT_KIND_RESTARTED: LaneEventKind.ValueType  # 2
-"""The supervisor restarted the lane after it crashed; detail says how it crashed."""
+"""The supervisor restarted the lane after a LANE_EVENT_KIND_CRASHED; detail gives only the
+backoff it waited, since the crash event holds the cause.
+"""
 LANE_EVENT_KIND_RECOVERY_FAILED: LaneEventKind.ValueType  # 3
-"""The lane crashed too often for automatic recovery, so the supervisor stopped it and notified
-the project lead.
+"""Automatic recovery failed, at 5 LANE_EVENT_KIND_CRASHED events within an hour (spec §8.7), so
+the supervisor stopped the lane and notified the project lead.
 """
 LANE_EVENT_KIND_STOPPED: LaneEventKind.ValueType  # 4
 """The lane stopped by a stopping rule (spec §8.4); detail names the rule."""
@@ -435,8 +426,9 @@ LANE_EVENT_KIND_NOTIFIED: LaneEventKind.ValueType  # 6
 LANE_EVENT_KIND_NOTIFY_FAILED: LaneEventKind.ValueType  # 7
 """A notification could not be delivered; it is retried."""
 LANE_EVENT_KIND_CRASHED: LaneEventKind.ValueType  # 8
-"""The lane crashed, or a start failed the supervisor's preflight checks, which counts as a crash
-(spec §8.7); detail says how.
+"""The supervisor counted the lane as crashed (spec §8.7): its process died, its heartbeat was 10
+minutes old so it was killed, or a start failed the preflight checks. The supervisor writes
+it, since a killed lane cannot, and detail gives the cause. Recovery counts these events.
 """
 Global___LaneEventKind: _TypeAlias = LaneEventKind  # noqa: Y015
 
@@ -694,8 +686,9 @@ Global___ImplementerRun: _TypeAlias = ImplementerRun  # noqa: Y015
 class SmokeTest(_message.Message):
     """One goaly-smoke call by the implementer agent (spec §8.8). The host refuses any task that is
     not in train, and any call after the second; otherwise it runs the step-3 guards on the
-    worktree as it stands, then the candidate on the task with the bench runner and one seed. The
-    smoke run's model calls count toward the experiment's usage_by_purpose (spec §9).
+    worktree as it stands, then the candidate on the task through the isolated two-phase path
+    (spec §6.1), with one seed. The smoke run's model calls count toward the experiment's
+    usage_by_purpose (spec §9).
     """
 
     DESCRIPTOR: _descriptor.Descriptor
@@ -1195,6 +1188,7 @@ class LaneEvent(_message.Message):
     EXPERIMENT_IDS_FIELD_NUMBER: _builtins.int
     NOTIFICATION_FIELD_NUMBER: _builtins.int
     NOTIFICATION_ID_FIELD_NUMBER: _builtins.int
+    DEADLINE_AT_FIELD_NUMBER: _builtins.int
     lane: Global___Lane.ValueType
     """The lane."""
     kind: Global___LaneEventKind.ValueType
@@ -1233,6 +1227,12 @@ class LaneEvent(_message.Message):
         empty for other kinds.
         """
 
+    @_builtins.property
+    def deadline_at(self) -> _timestamp_pb2.Timestamp:
+        """For LANE_EVENT_KIND_STARTED: the lane's deadline, an absolute time from config that a restart
+        never moves (spec §8.4); absent for other kinds.
+        """
+
     def __init__(
         self,
         *,
@@ -1246,10 +1246,11 @@ class LaneEvent(_message.Message):
         experiment_ids: _abc.Iterable[_builtins.str] | None = ...,
         notification: _builtins.str = ...,
         notification_id: _builtins.str = ...,
+        deadline_at: _timestamp_pb2.Timestamp | None = ...,
     ) -> None: ...
-    _HasFieldArgType: _TypeAlias = _typing.Literal["occurred_at", b"occurred_at"]  # noqa: Y015
+    _HasFieldArgType: _TypeAlias = _typing.Literal["deadline_at", b"deadline_at", "occurred_at", b"occurred_at"]  # noqa: Y015
     def HasField(self, field_name: _HasFieldArgType) -> _builtins.bool: ...
-    _ClearFieldArgType: _TypeAlias = _typing.Literal["detail", b"detail", "experiment_ids", b"experiment_ids", "head_commit", b"head_commit", "kind", b"kind", "lane", b"lane", "notification", b"notification", "notification_id", b"notification_id", "occurred_at", b"occurred_at", "pr_number", b"pr_number", "pr_url", b"pr_url"]  # noqa: Y015
+    _ClearFieldArgType: _TypeAlias = _typing.Literal["deadline_at", b"deadline_at", "detail", b"detail", "experiment_ids", b"experiment_ids", "head_commit", b"head_commit", "kind", b"kind", "lane", b"lane", "notification", b"notification", "notification_id", b"notification_id", "occurred_at", b"occurred_at", "pr_number", b"pr_number", "pr_url", b"pr_url"]  # noqa: Y015
     def ClearField(self, field_name: _ClearFieldArgType) -> None: ...
     def WhichOneof(self, oneof_group: _Never) -> None: ...
 

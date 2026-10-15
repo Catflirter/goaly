@@ -237,7 +237,9 @@ class Benchmark[InstanceT: Instance, EnvT: Environment](Protocol):
 
         Effi-SQL compares the prediction's result with ``base_sql``'s and needs no gold answer;
         SWE runs the task's tests and compares the workload's speedup with the expert patch's.
-        Grading uses its own environment, never the one the task was solved in (spec §4.1).
+        Grading uses its own environment, never the one the task was solved in (spec §4.1). In
+        every real run it is the grade phase: a separate process on the host that never imports
+        pack code (spec §6.1).
         Grading trouble does not raise: the returned Grade's ``status`` says what went wrong, such
         as a prediction that failed to run, a timeout, or the grader's own failure.
         Runs on SPLIT_EXTERNAL are not graded, so callers never call ``grade`` for them.
@@ -252,9 +254,12 @@ class Benchmark[InstanceT: Instance, EnvT: Environment](Protocol):
         """Return the run manifest's fields that only the adapter knows, for the runner to merge.
 
         The partial manifest sets at most ``dataset_revision``, ``dataset_notes``,
-        ``environment_settings`` and ``dataset_sha256``; the runner fills every other field and
-        merges this one in. ``environment_settings["grading_mode"]`` names the grader's mode, such
-        as Effi-SQL's "dev" or "official".
+        ``environment_settings`` and ``dataset_sha256``. The runner sets none of these four
+        itself: it fills every other field and merges this manifest in, so each of the four,
+        ``dataset_notes`` included, comes only from here. A resumed run must match all four, so a
+        run never resumes on another dataset or in another grading mode.
+        ``environment_settings["grading_mode"]`` names the grader's mode, such as Effi-SQL's
+        "dev" or "official".
         """
 
     def to_official(self, inst: InstanceT, prediction: Prediction) -> dict[str, JsonValue]:
