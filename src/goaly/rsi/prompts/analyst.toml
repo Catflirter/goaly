@@ -55,6 +55,10 @@ make in one pass, and whose effect can be traced to that one change.
 - Never propose embedding task-specific SQL, result values, task IDs or gold queries in the
   pack: a scan of every candidate's diff rejects it, and the checks above catch hard-coded
   results.
+- Never propose having queries return precomputed or constant results, even behind a check on
+  the data, such as CASE WHEN (SELECT count(*) FROM ...) > N THEN <constant> END, or a constant
+  UNION ALL row that a one-time filter lets through. Such predictions are flagged, and a single
+  one fails the candidate.
 - Each hypothesis makes one kind of change: prompt, skill, tool, policy, config, or removal (of a
   tool, skill or rule that does not help).
 - Say exactly what to change: which file, what to add, remove or replace, and the words or the

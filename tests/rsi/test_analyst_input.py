@@ -348,6 +348,10 @@ def test_the_input_holds_the_rules_and_the_idea_bank(tmp_path: Path) -> None:
     )
     assert "solved when its credit is at least 0.75;" in analyst_input.system
     assert "between 0.25 and 0.5" in analyst_input.system
+    assert "precomputed or constant results, even behind a check on\n  the data" in (
+        analyst_input.system
+    )
+    assert "pg_stats" in analyst_input.system  # The introspection and catalog rule.
     assert "Decorrelate subqueries" in analyst_input.user
     assert "$" not in prompt(analyst_input)  # Every placeholder was filled.
 
