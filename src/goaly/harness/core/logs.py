@@ -8,6 +8,7 @@ structured fields through ``extra``::
 
 import json
 import logging
+import math
 import sys
 from datetime import UTC, datetime
 from typing import TextIO
@@ -27,8 +28,8 @@ class JsonFormatter(logging.Formatter):
 
     Keys, in order: ``timestamp`` (UTC, RFC 3339, milliseconds), ``level``, ``logger``,
     ``message``, then each ``extra`` field, then ``exception`` and ``stack`` when present.
-    The formatter's own keys win: an extra with the same name is dropped. Values JSON cannot
-    encode are rendered with ``str()``.
+    The formatter's own keys win: an extra with the same name is dropped. Keys that are not
+    strings are rendered with ``str()`` at every level, and so are values JSON cannot encode.
     """
 
     def format(self, record: logging.LogRecord) -> str:
@@ -81,16 +82,25 @@ def _to_json(entry: dict[str, object]) -> str:
     try:
         return _dumps(entry)
     except (TypeError, ValueError):
-        # A value holds a non-string dict key, NaN or infinity, or a reference cycle.
-        return _dumps({key: _encodable(value) for key, value in entry.items()})
+        # A key that is not a string, NaN or infinity, or a reference cycle, at any depth.
+        return _dumps(_jsonable(entry, frozenset()))
 
 
-def _encodable(value: object) -> object:
-    try:
-        _dumps(value)
-    except (TypeError, ValueError):
-        return str(value)
-    return value
+def _jsonable(value: object, seen: frozenset[int]) -> object:
+    """Copy ``value`` into something json encodes as is; ``seen`` stops reference cycles."""
+    if value is None or isinstance(value, str | int):  # bool is an int.
+        return value
+    if isinstance(value, float):
+        return value if math.isfinite(value) else str(value)
+    if isinstance(value, dict | list | tuple) and id(value) not in seen:
+        inside = seen | {id(value)}
+        if isinstance(value, dict):
+            return {
+                key if isinstance(key, str) else str(key): _jsonable(item, inside)
+                for key, item in value.items()
+            }
+        return [_jsonable(item, inside) for item in value]
+    return str(value)
 
 
 def _dumps(value: object) -> str:

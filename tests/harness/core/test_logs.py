@@ -110,28 +110,30 @@ def test_renders_values_json_cannot_encode_with_str(capture: Capture) -> None:
     looped: list[object] = []
     looped.append(looped)
     marker = object()
+    extra: dict[Any, object] = {
+        "path": Path("/srv/runs"),
+        "marker": marker,
+        "score": math.nan,
+        "limit": math.inf,
+        "pairs": {(1, 2): "tuple key"},
+        "nested": {"inner": {(3, 4): "deep"}},
+        "looped": looped,
+        "fine": [1, "two", None],
+        (5, 6): "top-level tuple key",
+    }
 
-    capture.logger.info(
-        "odd values",
-        extra={
-            "path": Path("/srv/runs"),
-            "marker": marker,
-            "score": math.nan,
-            "limit": math.inf,
-            "pairs": {(1, 2): "tuple key"},
-            "looped": looped,
-            "fine": [1, "two", None],
-        },
-    )
+    capture.logger.info("odd values", extra=extra)
 
     entry = capture.entry()
     assert entry["path"] == "/srv/runs"
     assert entry["marker"] == str(marker)
     assert entry["score"] == "nan"
     assert entry["limit"] == "inf"
-    assert entry["pairs"] == "{(1, 2): 'tuple key'}"
-    assert entry["looped"] == "[[...]]"
+    assert entry["pairs"] == {"(1, 2)": "tuple key"}
+    assert entry["nested"] == {"inner": {"(3, 4)": "deep"}}
+    assert entry["looped"] == ["[[...]]"]
     assert entry["fine"] == [1, "two", None]
+    assert entry["(5, 6)"] == "top-level tuple key"
 
 
 @pytest.mark.parametrize(
@@ -248,6 +250,19 @@ def test_configure_logging_replaces_its_own_handler(root: logging.Logger) -> Non
     assert len(json_handlers(root)) == 1
     assert first.getvalue() == ""
     assert parse_line(second.getvalue())["message"] == "once"
+
+
+def test_configure_logging_rejects_an_unknown_level_and_changes_nothing(
+    root: logging.Logger,
+) -> None:
+    configure_logging(stream=io.StringIO())
+    handlers, level = list(root.handlers), root.level
+
+    with pytest.raises(ValueError, match="NOPE"):
+        configure_logging("NOPE")
+
+    assert root.handlers == handlers
+    assert root.level == level
 
 
 def test_configure_logging_leaves_other_handlers_alone(root: logging.Logger) -> None:
