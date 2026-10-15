@@ -135,8 +135,7 @@ Global___ToolCallSource: _TypeAlias = ToolCallSource  # noqa: Y015
 @_typing.final
 class Trajectory(_message.Message):
     """Everything the agent did on one task, one seed, in one run (spec §5.1): one line of the run's
-    trajectories file. If several lines share run_id, instance_id and seed, the last one wins, so
-    a late grade is appended as a new line.
+    trajectories file. If several lines share run_id, instance_id and seed, the last one wins.
     """
 
     DESCRIPTOR: _descriptor.Descriptor
@@ -187,8 +186,9 @@ class Trajectory(_message.Message):
 
     @_builtins.property
     def grade(self) -> _task_pb2.Grade:
-        """How the prediction was graded, as in the task's TaskResult; absent until it is graded, and
-        in a run without gold answers.
+        """How the prediction was graded, as in the task's TaskResult. Only the one-process mode fills
+        it. A two-phase run's trajectory carries no grade: readers take grades from the results
+        file, results.jsonl (spec §5.1, §6.1). Also absent in a run that is not graded.
         """
 
     @_builtins.property
@@ -240,12 +240,19 @@ class Chat(_message.Message):
     LABEL_FIELD_NUMBER: _builtins.int
     FORKED_FROM_STEP_FIELD_NUMBER: _builtins.int
     INITIAL_MESSAGES_FIELD_NUMBER: _builtins.int
+    KEEP_TURNS_FIELD_NUMBER: _builtins.int
     label: _builtins.str
     """A name the policy gives the chat, such as "main", "sample-2" or "verify"."""
     forked_from_step: _builtins.int
     """The step whose full context the chat continues, as an index into Trajectory.steps; absent
     if the chat starts afresh. That context is the step's prompt, then its assistant message,
     tool results and injected messages, and it comes before initial_messages.
+    """
+    keep_turns: _builtins.int
+    """The replay window, from the run's context configuration (spec §5.1; the rule is in Step's
+    comment). More than 0 on every executor chat: how many of the latest steps in a prompt keep
+    their assistant message's reasoning_content, 8 for baseline v0. Unset or 0: not an executor
+    chat, so its messages are replayed unchanged, as GLM's are.
     """
     @_builtins.property
     def initial_messages(self) -> _containers.RepeatedCompositeFieldContainer[Global___ChatMessage]:
@@ -259,26 +266,45 @@ class Chat(_message.Message):
         label: _builtins.str = ...,
         forked_from_step: _builtins.int | None = ...,
         initial_messages: _abc.Iterable[Global___ChatMessage] | None = ...,
+        keep_turns: _builtins.int | None = ...,
     ) -> None: ...
-    _HasFieldArgType: _TypeAlias = _typing.Literal["_forked_from_step", b"_forked_from_step", "forked_from_step", b"forked_from_step"]  # noqa: Y015
+    _HasFieldArgType: _TypeAlias = _typing.Literal["_forked_from_step", b"_forked_from_step", "_keep_turns", b"_keep_turns", "forked_from_step", b"forked_from_step", "keep_turns", b"keep_turns"]  # noqa: Y015
     def HasField(self, field_name: _HasFieldArgType) -> _builtins.bool: ...
-    _ClearFieldArgType: _TypeAlias = _typing.Literal["_forked_from_step", b"_forked_from_step", "forked_from_step", b"forked_from_step", "initial_messages", b"initial_messages", "label", b"label"]  # noqa: Y015
+    _ClearFieldArgType: _TypeAlias = _typing.Literal["_forked_from_step", b"_forked_from_step", "_keep_turns", b"_keep_turns", "forked_from_step", b"forked_from_step", "initial_messages", b"initial_messages", "keep_turns", b"keep_turns", "label", b"label"]  # noqa: Y015
     def ClearField(self, field_name: _ClearFieldArgType) -> None: ...
     _WhichOneofReturnType__forked_from_step: _TypeAlias = _typing.Literal["forked_from_step"]  # noqa: Y015
     _WhichOneofArgType__forked_from_step: _TypeAlias = _typing.Literal["_forked_from_step", b"_forked_from_step"]  # noqa: Y015
+    _WhichOneofReturnType__keep_turns: _TypeAlias = _typing.Literal["keep_turns"]  # noqa: Y015
+    _WhichOneofArgType__keep_turns: _TypeAlias = _typing.Literal["_keep_turns", b"_keep_turns"]  # noqa: Y015
+    @_typing.overload
     def WhichOneof(self, oneof_group: _WhichOneofArgType__forked_from_step) -> _WhichOneofReturnType__forked_from_step | None: ...
+    @_typing.overload
+    def WhichOneof(self, oneof_group: _WhichOneofArgType__keep_turns) -> _WhichOneofReturnType__keep_turns | None: ...
 
 Global___Chat: _TypeAlias = Chat  # noqa: Y015
 
 @_typing.final
 class Step(_message.Message):
     """One model call and the tool calls it made (spec §5.1). A step holds only what it adds to its
-    chat, never the history before it. The prompt its call was sent is, in order:
+    chat, never the history before it, and the trajectory stores every message in full. The prompt
+    its call was sent is, in order:
       1. the forked context of its chat, if any;
       2. the chat's initial_messages;
       3. each earlier step of the same chat: its assistant message, its tool results as tool
          messages, and its injected messages.
-    Then every fold in effect at the step replaces the content of the tool message it names.
+    Then every fold in effect at the step replaces the content of the tool message it names. In an
+    executor chat, one whose keep_turns is more than 0, two replay rules also apply to the whole
+    prompt, forked context included (spec §5.1):
+      - XML markup: every replayed assistant message loses all Qwen3-Coder tool-call markup from
+        its content and its reasoning_content: each <tool_call> block, then each bare
+        <function=...> block. A block ends at its closing tag, at the next block of its kind or at
+        the end of the text. This holds whether or not a call was parsed from the markup, and
+        whatever the source of the message's tool_calls, which it keeps.
+      - Reasoning: an assistant message keeps its reasoning_content only while its step is among
+        the last keep_turns steps whose assistant messages the prompt holds, counted back from the
+        newest and through the forked context. Older assistant messages keep their content and are
+        sent without reasoning.
+    Any other chat, as GLM's, replays its messages unchanged.
     """
 
     DESCRIPTOR: _descriptor.Descriptor

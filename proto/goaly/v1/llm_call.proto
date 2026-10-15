@@ -75,7 +75,7 @@ enum LlmCallStatus {
   LLM_CALL_STATUS_UNSPECIFIED = 0;
   // The call returned a usable response.
   LLM_CALL_STATUS_OK = 1;
-  // The request timed out.
+  // The request timed out, at our client or at the gateway (HTTP 408).
   LLM_CALL_STATUS_TIMEOUT = 2;
   // The gateway answered 429 Too Many Requests.
   LLM_CALL_STATUS_RATE_LIMITED = 3;
@@ -87,7 +87,8 @@ enum LlmCallStatus {
   LLM_CALL_STATUS_CONTEXT_OVERFLOW = 6;
   // A response arrived but could not be used, for example because it was malformed.
   LLM_CALL_STATUS_INVALID_RESPONSE = 7;
-  // Any other 4xx: not 429 and not a context overflow, which LiteLLM also reports as a 400.
+  // Any other 4xx: not 408, not 429 and not a context overflow, which LiteLLM also reports as a
+  // 400.
   LLM_CALL_STATUS_CLIENT_ERROR = 8;
   // Our own code cancelled this one call, for example when a task's wall-clock budget ran out;
   // the gateway may still have billed it. A whole task that the runner cancels is

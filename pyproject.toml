@@ -16,6 +16,7 @@ dependencies = [
 
 [dependency-groups]
 dev = [
+    "anyio>=4", # Its pytest plugin runs the async tests (tests/conftest.py)
     "grpcio-tools>=1.84", # Bundles protoc 35.1; after changing its version, run `make proto`
     "import-linter>=2.14", # 2.14 added --no-logo
     "mypy>=2",
@@ -24,12 +25,24 @@ dev = [
     "pytest>=9",
     "pytest-cov>=7",
     "ruff>=0.17", # ruff is pre-1.0: its minor releases are its breaking releases
+    "sqlparse==0.5.2", # The official Effi-SQL runner's pin; the extractor parity tests use it
     "types-protobuf>=7",
+]
+# RSI only (spec §8.8, §11): `make setup` and CI install it, a plain `uv sync` leaves it out.
+rsi = [
+    "mini-swe-agent==2.4.6", # Exact: the implementer relies on its message format and helpers
 ]
 
 [tool.uv]
 # Cooldown: lock nothing released in the 3 days before locking; move the date deliberately.
 exclude-newer = "2026-10-11T00:00:00Z"
+# mini-swe-agent requires these, but the classes goaly.rsi uses never import them (spec §11).
+# Leaving out litellm also keeps it out of the process that holds the API key.
+exclude-dependencies = [
+    { package = { name = "mini-swe-agent" }, dependencies = [
+        "litellm", "openai", "datasets", "textual", "prompt-toolkit",
+    ] },
+]
 
 [tool.hatch.build.targets.wheel]
 packages = ["src/goaly"]
@@ -65,10 +78,20 @@ plugins = ["pydantic.mypy"]
 enable_error_code = ["ignore-without-code"]
 warn_unreachable = true
 
+[[tool.mypy.overrides]]
+# sqlparse 0.5.2, the official runner's pin, ships no type information; only the tests use it.
+module = ["sqlparse", "sqlparse.*"]
+ignore_missing_imports = true
+
 [tool.pydantic-mypy]
 init_forbid_extra = true
 init_typed = true
 warn_required_dynamic_aliases = true
+
+[[tool.mypy.overrides]]
+# The one module that calls into mini-swe-agent, which leaves many functions unannotated (spec §11).
+module = ["goaly.rsi.implementer.msa"]
+disallow_untyped_calls = false
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]
@@ -93,9 +116,17 @@ show_missing = true
 
 [tool.importlinter]
 root_package = "goaly"
+# Lets the contracts name third-party packages, such as minisweagent.
+include_external_packages = true
 
 # T06 adds goaly.cli above goaly.rsi.
 [[tool.importlinter.contracts]]
 name = "Layers: rsi > bench > harness > contracts"
 type = "layers"
 layers = ["goaly.rsi", "goaly.bench", "goaly.harness", "goaly.contracts"]
+
+[[tool.importlinter.contracts]]
+name = "Only goaly.rsi may import mini-swe-agent"
+type = "forbidden"
+source_modules = ["goaly.contracts", "goaly.harness", "goaly.bench"]
+forbidden_modules = ["minisweagent"]
