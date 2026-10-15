@@ -731,6 +731,36 @@ async def test_a_submission_drafted_in_the_reasoning_does_not_submit() -> None:
     )
 
 
+SUBMIT_XML = f"<function=submit>\n<parameter=sql>\n{QWEN_BASE_SQL}\n</parameter>\n</function>"
+
+
+@pytest.mark.parametrize(
+    ("field", "text"),
+    [
+        ("content", f"Done.\n<tool_call>\n{SUBMIT_XML}"),  # Never closed.
+        ("reasoning", f"Submit it.\n<tool_call>\n{SUBMIT_XML}"),  # Never closed.
+        ("reasoning", f"Submit it.\n{SUBMIT_XML}"),  # No <tool_call> around it.
+    ],
+    ids=["unclosed-in-content", "unclosed-in-reasoning", "bare-in-reasoning"],
+)
+async def test_a_submission_that_is_no_call_never_submits(field: str, text: str) -> None:
+    unfinished = (
+        reply(content=text, finish_reason="stop")
+        if field == "content"
+        else reply(reasoning=text, finish_reason="stop")
+    )
+    llm = FakeLLM([unfinished, reply(submit())])
+    ctx = context(llm)
+
+    prediction = await run_agent(environment(), ctx, hooks())
+
+    assert prediction == SUBMISSION  # The submit of the next reply.
+    first = ctx.trajectory().steps[0]
+    assert not first.assistant.tool_calls  # The parser read no call there.
+    assert not first.tool_results
+    assert first.injected[0].content.startswith("Error: your reply called no tool.")
+
+
 async def test_calls_after_a_submission_are_answered_but_not_run() -> None:
     env = environment()
     ctx = context(FakeLLM([reply(submit(), execute_sql(FAST))]))

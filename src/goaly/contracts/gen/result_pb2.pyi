@@ -80,7 +80,7 @@ Global___TaskErrorType: _TypeAlias = TaskErrorType  # noqa: Y015
 @_typing.final
 class TaskResult(_message.Message):
     """How one task, one seed, went in one run (spec §6.1): one line of the run's results file. Its
-    score and correctness are in its grade, and in a run with gold answers every task gets one.
+    score and correctness are in its grade, and in a graded run every task gets one.
     If several lines share run_id, instance_id and seed, the last one wins, so a late SWE grade is
     appended as a new line. Breakdowns, by difficulty for Effi-SQL or by repository for SWE, join
     on instance_id with the task's TaskInput, as its Trajectory records it: TaskInput itself
@@ -131,9 +131,13 @@ class TaskResult(_message.Message):
     """The error's message; empty when error_type is TASK_ERROR_TYPE_NONE."""
     @_builtins.property
     def grade(self) -> _task_pb2.Grade:
-        """How the task was graded. A task with no prediction, after a crash or an error, is graded as
-        an empty prediction: Effi-SQL scores 0, and SWE scores 1/gold speedup without an evaluation
-        run (spec §4.2). Absent only in a run without gold answers, such as an organizers' run.
+        """How the benchmark's grader graded the task. Effi-SQL compares the prediction's result with
+        base_sql's and needs no gold answer; SWE runs the task's PASS_TO_PASS tests and compares the
+        workload's speedup with the expert patch's. A task with no prediction, after a crash or an
+        error, is graded as the benchmark's empty answer, the same one Benchmark.to_official writes:
+        Effi-SQL's base_sql unchanged, with the identity credit, and SWE an empty patch, which scores
+        1/gold speedup without an evaluation run (spec §4.2). Absent only in a run that is not
+        graded, such as an organizers' run on SPLIT_EXTERNAL.
         """
 
     @_builtins.property
