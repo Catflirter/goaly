@@ -18,6 +18,11 @@ A process uses one client, on its event loop::
             messages, model=EXECUTOR_MODEL, tags=CallTags(CallPurpose.CALL_PURPOSE_EXEC)
         )
 
+A task gets a client bound to one model and one call's tags, ``LlmClient.bind``, which offers
+just ``complete(messages, *, tools, params)``: whoever holds it cannot choose another purpose or
+model. T11's per-task factory binds CALL_PURPOSE_EXEC with the task's run, instance and seed;
+only goaly.rsi binds the rsi-* purposes.
+
 The API key goes in the Authorization header and nowhere else: no message, log line, repr or
 record holds it, and the client removes it from any text it quotes from the gateway.
 """
@@ -49,6 +54,7 @@ from goaly.contracts.gen.llm_call_pb2 import (
     Usage,
 )
 from goaly.contracts.gen.trajectory_pb2 import ChatMessage, ChatRole, ToolCall, ToolCallSource
+from goaly.contracts.interfaces import JsonValue
 from goaly.contracts.jsonl import append_jsonl
 from goaly.harness.core.llm_errors import ModelNotAllowed, error_type
 from goaly.harness.core.llm_models import (
@@ -60,6 +66,8 @@ from goaly.harness.core.llm_models import (
 from goaly.harness.core.settings import Settings
 
 __all__ = [
+    "BoundLlm",
+    "BoundLlmClient",
     "CallRecorder",
     "CallTags",
     "Clock",
@@ -99,8 +107,8 @@ class RetryPolicy(BaseModel):
     """How long an attempt may take, and how the client retries a failed one (spec §5.1, §6.2).
 
     ``timeout_s`` runs from sending an attempt's request to reading all of its response. A retry
-    waits for the server's Retry-After when it sends one, and otherwise for full jitter on an
-    exponential backoff; either way no longer than ``backoff_cap_s``.
+    waits for full jitter on an exponential backoff, or for the server's Retry-After when that is
+    longer; either way no longer than ``backoff_cap_s``.
     """
 
     model_config = ConfigDict(frozen=True, extra="forbid", allow_inf_nan=False)
@@ -112,10 +120,12 @@ class RetryPolicy(BaseModel):
 
     def delay_s(self, retry: int, retry_after_s: float | None, rng: random.Random) -> float:
         """Return the wait before retry number ``retry``, counting from 0."""
-        if retry_after_s is not None:
-            return min(retry_after_s, self.backoff_cap_s)
         ceiling = self.backoff_base_s * 2.0 ** min(retry, 64)  # The bound keeps it a float.
-        return rng.uniform(0.0, min(ceiling, self.backoff_cap_s))
+        jitter = rng.uniform(0.0, min(ceiling, self.backoff_cap_s))
+        if retry_after_s is None:
+            return jitter
+        # Even a Retry-After of 0, or a date in the past, waits for the backoff.
+        return min(max(retry_after_s, jitter), self.backoff_cap_s)
 
 
 @dataclass(frozen=True, slots=True)
@@ -157,7 +167,9 @@ class CallRecorder(Protocol):
         """Take ``record``, which is the recorder's own copy.
 
         The client calls this on its event loop, so it must not block for long: the runner's
-        single-writer call log (T06) only queues the record.
+        single-writer call log (T06) only queues the record. It must not raise either. If it
+        does, the client logs the lost record and goes on, so a call never loses its reply or
+        its own error to its recorder.
         """
 
 
@@ -246,6 +258,22 @@ class _Outcome:
     response: _WireResponse | None = None
 
 
+class BoundLlm(Protocol):
+    """A model to chat with, its purpose and tags fixed: what T05's agent loop calls.
+
+    LlmClient.bind makes one; tests may stand in their own.
+    """
+
+    async def complete(
+        self,
+        messages: Sequence[ChatMessage],
+        *,
+        tools: Sequence[Mapping[str, JsonValue]] = (),
+        params: ModelParams | None = None,
+    ) -> LlmReply:
+        """Send ``messages`` and return the assistant's reply, as LlmClient.complete does."""
+
+
 class LlmClient:
     """An async client of the OpenAI-compatible model gateway; the module docstring has more.
 
@@ -303,7 +331,7 @@ class LlmClient:
         *,
         model: str,
         tags: CallTags,
-        tools: Sequence[Mapping[str, object]] = (),
+        tools: Sequence[Mapping[str, JsonValue]] = (),
         params: ModelParams | None = None,
     ) -> LlmReply:
         """Send ``messages`` to ``model`` and return the assistant's reply.
@@ -337,11 +365,32 @@ class LlmClient:
         choice = response.choices[0]
         return LlmReply(_assistant_message(choice.message), choice.finish_reason or "", record)
 
+    def bind(self, *, model: str, tags: CallTags) -> "BoundLlmClient":
+        """Return a client whose calls all go to ``model``, tagged ``tags``.
+
+        The pair is checked against the model allowlist now, before any I/O: a purpose that
+        may not use ``model`` raises ModelNotAllowed. Every bound client calls through this
+        one, so all of them share its limits, connections and recorder.
+        """
+        if allowed_model(tags.purpose) != model:
+            raise self._refuse(model, tags)
+        return BoundLlmClient(self, model, tags)
+
     def _refuse(self, model: str, tags: CallTags) -> ModelNotAllowed:
-        purpose = CallPurpose.Name(tags.purpose)
+        try:
+            purpose = CallPurpose.Name(tags.purpose)
+        except ValueError:  # A value no CallPurpose has, as only a cast can make one.
+            purpose = str(tags.purpose)
         _logger.warning(
             "refused an LLM call: its purpose may not use the model",
-            extra={"event": "llm_model_not_allowed", "model": model, "purpose": purpose},
+            extra={
+                "event": "llm_model_not_allowed",
+                "model": model,
+                "purpose": purpose,
+                "run_id": tags.run_id,
+                "instance_id": tags.instance_id,
+                "seed": tags.seed,
+            },
         )
         allowed = allowed_model(tags.purpose)
         may = f"it may call only {allowed}" if allowed else "it may call no model"
@@ -351,7 +400,7 @@ class LlmClient:
         """Make attempts until one succeeds, one fails for good, or the retries run out."""
         delay = 0.0
         while True:
-            outcome = await self._attempt(record.attempts.add(), body, delay)
+            outcome = await self._attempt(record, record.attempts.add(), body, delay)
             if outcome.cost_usd is not None:
                 record.usage.cost_usd += outcome.cost_usd  # Every attempt the gateway billed.
             if outcome.response is not None:
@@ -364,7 +413,9 @@ class LlmClient:
             delay = self._retry.delay_s(retries, outcome.retry_after_s, self._rng)
             self._log_backoff(record, outcome, delay)
 
-    async def _attempt(self, attempt: LlmCallAttempt, body: bytes, delay: float) -> _Outcome:
+    async def _attempt(
+        self, record: LlmCallRecord, attempt: LlmCallAttempt, body: bytes, delay: float
+    ) -> _Outcome:
         """Wait ``delay``, send the request once, and fill in ``attempt`` with how it went."""
         attempt.started_at.GetCurrentTime()
         began = self._clock.monotonic()
@@ -373,7 +424,7 @@ class LlmClient:
             if delay > 0:
                 await self._clock.sleep(delay)
             sent = self._clock.monotonic()
-            outcome = await self._request(body)
+            outcome = await self._request(body, record)
         except asyncio.CancelledError:
             attempt.status = _S.LLM_CALL_STATUS_CANCELLED
             raise
@@ -387,7 +438,7 @@ class LlmClient:
             attempt.retry_after_s = outcome.retry_after_s
         return outcome
 
-    async def _request(self, body: bytes) -> _Outcome:
+    async def _request(self, body: bytes, record: LlmCallRecord) -> _Outcome:
         """Send the request and say how it went. Only cancellation and bugs raise."""
         try:
             async with asyncio.timeout(self._retry.timeout_s):
@@ -397,19 +448,24 @@ class LlmClient:
         except (TimeoutError, httpx.TimeoutException):
             detail = f"no response within {self._retry.timeout_s:g} s"
             return _Outcome(_S.LLM_CALL_STATUS_TIMEOUT, detail=detail)
+        except httpx.LocalProtocolError as error:
+            # The request itself breaks HTTP, so a retry fails the same way. The error's text
+            # quotes the offending header, which may be the one holding the key: leave it out.
+            detail = f"httpx refused to send the request ({type(error).__name__})"
+            return _Outcome(_S.LLM_CALL_STATUS_CLIENT_ERROR, detail=detail)
         except httpx.TransportError as error:
             detail = self._quote(f"connection failed: {type(error).__name__}: {error}")
             return _Outcome(_S.LLM_CALL_STATUS_CONNECTION_ERROR, detail=detail)
         except httpx.RequestError as error:  # For example, a body that cannot be decoded.
             detail = self._quote(f"unreadable response: {type(error).__name__}: {error}")
             return _Outcome(_S.LLM_CALL_STATUS_INVALID_RESPONSE, detail=detail)
-        return self._outcome(response)
+        return self._outcome(response, record)
 
-    def _outcome(self, response: httpx.Response) -> _Outcome:
+    def _outcome(self, response: httpx.Response, record: LlmCallRecord) -> _Outcome:
         """Say how an attempt that got ``response`` ended (spec §5.1)."""
         code = response.status_code
         retry_after = _retry_after_s(response.headers)
-        cost = _cost_usd(response.headers)
+        cost = self._cost_usd(response.headers, record)
         if response.is_success:
             try:
                 parsed = _WireResponse.model_validate_json(response.content)
@@ -422,6 +478,8 @@ class LlmClient:
         said = self._redact(_error_message(response))
         if code == httpx.codes.TOO_MANY_REQUESTS:
             status = _S.LLM_CALL_STATUS_RATE_LIMITED
+        elif code == httpx.codes.REQUEST_TIMEOUT:  # LiteLLM's own upstream request timed out.
+            status = _S.LLM_CALL_STATUS_TIMEOUT
         elif code >= httpx.codes.INTERNAL_SERVER_ERROR:
             status = _S.LLM_CALL_STATUS_SERVER_ERROR
         elif code == httpx.codes.BAD_REQUEST and any(
@@ -434,6 +492,28 @@ class LlmClient:
             status = _S.LLM_CALL_STATUS_INVALID_RESPONSE
         detail = f"HTTP {code}: {_cut(said)}" if said else f"HTTP {code}"
         return _Outcome(status, code, detail, retry_after, cost)
+
+    def _cost_usd(self, headers: httpx.Headers, record: LlmCallRecord) -> float | None:
+        """Return the cost the gateway reported in x-litellm-response-cost, or None for none."""
+        value = headers.get("x-litellm-response-cost")
+        if value is None:
+            return None
+        try:
+            cost = float(value)
+        except ValueError:
+            cost = math.nan
+        if math.isfinite(cost) and cost >= 0:
+            return cost
+        _logger.warning(
+            "ignored a malformed cost header",
+            extra={
+                "event": "llm_bad_cost",
+                "model": record.model,
+                "call_id": record.call_id,
+                "value": self._redact(value)[:40],  # Redacted first: a cut could split the key.
+            },
+        )
+        return None
 
     def _read_usage(self, response: _WireResponse, record: LlmCallRecord) -> None:
         """Copy the tokens the gateway reported into ``record``, whose cost is already in."""
@@ -459,7 +539,17 @@ class LlmClient:
         record.http_status = last.http_status
         copy = LlmCallRecord()
         copy.CopyFrom(record)
-        self._recorder.record(copy)
+        try:
+            self._recorder.record(copy)
+        except Exception:  # A broken recorder must not take the call's outcome with it.
+            _logger.exception(
+                "the call recorder failed, so this call's record is lost",
+                extra={
+                    "event": "llm_record_lost",
+                    "model": record.model,
+                    "call_id": record.call_id,
+                },
+            )
 
     def _log_backoff(self, record: LlmCallRecord, outcome: _Outcome, delay: float) -> None:
         """Log a throttling event (spec §6.2): the wait before the next attempt, and why."""
@@ -486,8 +576,33 @@ class LlmClient:
         return _cut(self._redact(text))
 
 
+class BoundLlmClient:
+    """A BoundLlm that calls through the LlmClient that bound it; build one with bind()."""
+
+    __slots__ = ("_client", "_model", "_tags")
+
+    def __init__(self, client: LlmClient, model: str, tags: CallTags) -> None:
+        self._client = client
+        self._model = model
+        self._tags = tags
+
+    async def complete(
+        self,
+        messages: Sequence[ChatMessage],
+        *,
+        tools: Sequence[Mapping[str, JsonValue]] = (),
+        params: ModelParams | None = None,
+    ) -> LlmReply:
+        """Send ``messages`` to the bound model with the bound tags; see LlmClient.complete."""
+        return await self._client.complete(
+            messages, model=self._model, tags=self._tags, tools=tools, params=params
+        )
+
+
 def _request_body(
-    profile: ModelProfile, messages: Sequence[ChatMessage], tools: Sequence[Mapping[str, object]]
+    profile: ModelProfile,
+    messages: Sequence[ChatMessage],
+    tools: Sequence[Mapping[str, JsonValue]],
 ) -> bytes:
     """Build the request as JSON. Qwen's thinking switches go in chat_template_kwargs."""
     body: dict[str, object] = {
@@ -513,6 +628,10 @@ def _wire_message(message: ChatMessage) -> dict[str, object]:
     role = _ROLES.get(message.role)
     if role is None:
         raise ValueError(f"a message needs a role, not {ChatRole.Name(message.role)}")
+    if message.role == ChatRole.CHAT_ROLE_TOOL and not message.tool_call_id:
+        raise ValueError("a tool message needs the tool_call_id of the call it answers")
+    if any(not call.id for call in message.tool_calls):
+        raise ValueError("every tool call needs an id; the parser gives one to any call without")
     wire: dict[str, object] = {"role": role, "content": message.content}
     if message.reasoning_content:
         wire["reasoning_content"] = message.reasoning_content
@@ -533,16 +652,23 @@ def _wire_message(message: ChatMessage) -> dict[str, object]:
 def _wire_arguments(call: ToolCall) -> str:
     """Return the arguments to send back for ``call``: those its tool ran with, a JSON object.
 
-    The gateway answers 400 to a history whose tool arguments are not JSON (seen 2026-10-15). So
-    arguments that neither parse nor were repaired go back as {}, and the tool result that
-    answers the call tells the model what was wrong with them.
+    That is the repaired arguments if there are any, since the original was malformed, and
+    otherwise the arguments as the model wrote them. The gateway answers 400 to a history whose
+    tool arguments are not JSON (seen 2026-10-15), so arguments that are not a JSON object go
+    back as {}, with a warning. The tool result that answers the call tells the model why.
     """
     arguments = call.repaired_arguments_json or call.arguments_json
     try:
         parsed = json.loads(arguments)
-    except ValueError:
-        return "{}"
-    return arguments if isinstance(parsed, dict) else "{}"
+    except (ValueError, RecursionError):  # RecursionError: nested too deep to parse.
+        parsed = None
+    if isinstance(parsed, dict):
+        return arguments
+    _logger.warning(
+        "sent a tool call's arguments back as {}: they are not a JSON object",
+        extra={"event": "llm_arguments_replaced", "tool_call_id": call.id, "tool": call.name},
+    )
+    return "{}"
 
 
 def _assistant_message(message: _WireMessage) -> ChatMessage:
@@ -588,23 +714,6 @@ def _retry_after_s(headers: httpx.Headers) -> float | None:
             moment = moment.replace(tzinfo=UTC)
         return max((moment - datetime.now(UTC)).total_seconds(), 0.0)
     return seconds if math.isfinite(seconds) and seconds >= 0 else None
-
-
-def _cost_usd(headers: httpx.Headers) -> float | None:
-    """Return the cost the gateway reported in x-litellm-response-cost, or None for none."""
-    value = headers.get("x-litellm-response-cost")
-    if value is None:
-        return None
-    try:
-        cost = float(value)
-    except ValueError:
-        cost = math.nan
-    if math.isfinite(cost) and cost >= 0:
-        return cost
-    _logger.warning(
-        "ignored a malformed cost header", extra={"event": "llm_bad_cost", "value": value[:40]}
-    )
-    return None
 
 
 def _problems(error: ValidationError) -> str:
