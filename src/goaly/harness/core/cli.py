@@ -20,6 +20,7 @@ import asyncio
 import json
 import logging
 import math
+import re
 import sys
 from collections.abc import Sequence
 from pathlib import Path
@@ -37,6 +38,7 @@ from goaly.harness.core.manifest import (
     harness_hash,
     new_run_id,
     provenance,
+    read_manifest,
     sha256_file,
 )
 from goaly.harness.core.registry import HarnessOptions, Registry, RegistryError, RunnableHarness
@@ -46,6 +48,7 @@ from goaly.harness.core.runner import (
     RunFiles,
     RunLock,
     RunSummary,
+    UsageError,
     lock_run_dir,
 )
 
@@ -59,8 +62,11 @@ USAGE = 2  # As argparse exits.
 INTERRUPTED = 130  # As a shell reports a process that SIGINT ended.
 
 _SPLITS = {"train": SPLIT_TRAIN, "val": SPLIT_VAL, "heldout": SPLIT_HELDOUT}
-# Errors that mean the command cannot run as asked; the message says what to change.
-_USAGE_ERRORS = (BudgetsError, RegistryError, RunDirectoryError, ValueError)
+# Errors that mean the command cannot run as asked; the message says what to change. Any other
+# error, a ValueError included, fails the run, with its traceback logged.
+_USAGE_ERRORS = (BudgetsError, RegistryError, RunDirectoryError, UsageError)
+# A run ID names the run's records and files, so it is a plain name.
+_RUN_ID = re.compile(r"[0-9A-Za-z_-]+")
 
 
 def build_parser(budgets_file: Path) -> argparse.ArgumentParser:
@@ -128,7 +134,9 @@ def build_parser(budgets_file: Path) -> argparse.ArgumentParser:
         metavar="DIR",
         help="the evaluation cache; runs that grade differently use different ones",
     )
-    run.add_argument("--run-id", metavar="ID", help="the run's ID (default: a new one)")
+    run.add_argument(
+        "--run-id", type=_run_id, metavar="ID", help="the run's ID (default: a new one)"
+    )
     run.add_argument("--log-level", default="INFO", choices=["DEBUG", "INFO", "WARNING", "ERROR"])
     return parser
 
@@ -171,7 +179,7 @@ def main(argv: Sequence[str], registry: Registry, *, budgets_file: Path) -> int:
 
 async def _run(args: argparse.Namespace, command_line: list[str], registry: Registry) -> RunSummary:
     if args.instances is not None and not args.instances.is_file():
-        raise ValueError(f"no such task file: {args.instances}")
+        raise UsageError(f"no such task file: {args.instances}")
     factory = registry.factory(args.bench, args.harness)  # First: the benchmark names the share.
     harness_name = args.harness or registry.harnesses(args.bench)[0]
     share = args.share or args.bench
@@ -180,6 +188,7 @@ async def _run(args: argparse.Namespace, command_line: list[str], registry: Regi
     # Locked before the harness opens, so that nothing it writes there, such as the LLM call log,
     # can meet another process's run.
     with await asyncio.to_thread(lock_run_dir, files) as lock:
+        await asyncio.to_thread(_preflight, args, files)
         options = HarnessOptions(files=files, instances_file=args.instances, llm_shares=llm_shares)
         async with factory(options) as harness:
             return await _run_harness(args, command_line, harness, harness_name, llm_shares, lock)
@@ -201,7 +210,7 @@ async def _run_harness(
     cache = None
     if args.cache is not None:
         if not harness.cache_namespace:
-            raise ValueError(f"the harness {harness_name!r} names no grading namespace for --cache")
+            raise UsageError(f"the harness {harness_name!r} names no grading namespace for --cache")
         cache = EvalCache(args.cache, harness.cache_namespace)
     seeds = list(range(args.first_seed, args.first_seed + args.seeds))
     # Every option that shapes the run: not where it is written, cached or logged.
@@ -247,6 +256,33 @@ def _manifest(
     manifest.models.extend(harness.models)
     manifest.command_line[:] = command_line
     return manifest
+
+
+def _preflight(args: argparse.Namespace, files: RunFiles) -> None:
+    """Refuse, before the harness opens, a run directory the runner would refuse.
+
+    The runner checks the rest, once the harness can tell it what the run is.
+    """
+    if not files.manifest.exists():
+        return
+    if not args.resume:
+        stored = read_manifest(files.manifest)
+        raise RunDirectoryError(
+            f"{files.root} already holds the run {stored.run_id}: resume it with --resume,"
+            " or choose another directory"
+        )
+    if args.run_id is not None and (stored := read_manifest(files.manifest)).run_id != args.run_id:
+        raise UsageError(
+            f"{files.root} holds the run {stored.run_id}, not {args.run_id}: a resumed run"
+            " keeps its run ID"
+        )
+
+
+def _run_id(text: str) -> str:
+    """An argument that is a plain name: letters, digits, '-' and '_'."""
+    if not _RUN_ID.fullmatch(text):
+        raise argparse.ArgumentTypeError(f"must be letters, digits, '-' and '_' only: {text!r}")
+    return text
 
 
 def _say(message: str) -> None:

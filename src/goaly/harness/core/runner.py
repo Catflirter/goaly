@@ -80,6 +80,7 @@ __all__ = [
     "RunSummary",
     "Runner",
     "TaskContext",
+    "UsageError",
     "classify_error",
     "error_classifier",
     "lock_run_dir",
@@ -114,6 +115,14 @@ type _Key = tuple[str, int]  # (instance ID, seed)
 
 class RunDirectoryError(Exception):
     """The run directory cannot be used: it holds another run, or another process uses it."""
+
+
+class UsageError(ValueError):
+    """The caller asked for a run that cannot run as asked; the message says what to change.
+
+    `goaly run` exits with its usage status for this error, and for any other ValueError exits
+    as a failed run, with the traceback logged: such an error is a bug to debug.
+    """
 
 
 @dataclass(frozen=True)
@@ -160,8 +169,18 @@ class RunLock:
     """
 
     def __init__(self, files: RunFiles, handle: BinaryIO) -> None:
-        self.files = files
+        self._files = files
         self._handle = handle
+
+    @property
+    def files(self) -> RunFiles:
+        """The run directory it locks."""
+        return self._files
+
+    @property
+    def released(self) -> bool:
+        """Whether it was released, so that it keeps no other process out any more."""
+        return self._handle.closed
 
     def release(self) -> None:
         """Release the lock."""
@@ -180,7 +199,10 @@ def lock_run_dir(files: RunFiles) -> RunLock:
     Raise RunDirectoryError if another process holds its lock. It opens a file, so run it in a
     worker thread from the event loop.
     """
-    files.root.mkdir(parents=True, exist_ok=True)
+    try:
+        files.root.mkdir(parents=True, exist_ok=True)
+    except (FileExistsError, NotADirectoryError) as error:  # It, or a parent, is a file.
+        raise RunDirectoryError(f"{files.root} cannot be a run directory: {error}") from error
     handle = files.lock.open("ab")
     try:
         fcntl.flock(handle, fcntl.LOCK_EX | fcntl.LOCK_NB)
@@ -289,9 +311,9 @@ class Runner[InstanceT: Instance, EnvT: Environment, CtxT: TaskContext]:
         task_timeout_s: float | None = None,
     ) -> None:
         if max_tasks < 1:
-            raise ValueError(f"max_tasks must be at least 1: {max_tasks}")
+            raise UsageError(f"max_tasks must be at least 1: {max_tasks}")
         if task_timeout_s is not None and not 0 < task_timeout_s < math.inf:
-            raise ValueError(f"task_timeout_s must be a positive, finite number: {task_timeout_s}")
+            raise UsageError(f"task_timeout_s must be a positive, finite number: {task_timeout_s}")
         self._benchmark = benchmark
         self._policy = policy
         self._contexts = contexts
@@ -334,13 +356,15 @@ class Runner[InstanceT: Instance, EnvT: Environment, CtxT: TaskContext]:
         `goaly run` does from before it opens the harness, passes it as ``lock``.
         """
         if not manifest.run_id:
-            raise ValueError("the manifest has no run_id")
+            raise UsageError("the manifest has no run_id")
         if self._cache is not None and not manifest.harness_hash:
-            raise ValueError("the evaluation cache needs the manifest's harness_hash")
+            raise UsageError("the evaluation cache needs the manifest's harness_hash")
         seeds = _checked_seeds(seeds)
         files = RunFiles(run_dir)
         if lock is not None and lock.files != files:
-            raise ValueError(f"the lock given is on {lock.files.root}, not on {run_dir}")
+            raise UsageError(f"the lock given is on {lock.files.root}, not on {run_dir}")
+        if lock is not None and lock.released:
+            raise UsageError(f"the lock given on {run_dir} is released already")
         own_lock = None if lock is not None else await asyncio.to_thread(lock_run_dir, files)
         try:
             plan = await asyncio.to_thread(
@@ -438,7 +462,7 @@ class Runner[InstanceT: Instance, EnvT: Environment, CtxT: TaskContext]:
             return instances
         unknown = sorted(set(instance_ids) - known)
         if unknown:
-            raise ValueError(f"{Split.Name(split)} has no instance {', '.join(map(repr, unknown))}")
+            raise UsageError(f"{Split.Name(split)} has no instance {', '.join(map(repr, unknown))}")
         return [inst for inst in instances if inst.instance_id in instance_ids]
 
     def _finish(self, files: RunFiles, plan: "_Plan[InstanceT]") -> None:
@@ -818,9 +842,9 @@ class _Attempt:
 
 def _checked_seeds(seeds: Sequence[int]) -> list[int]:
     if not seeds:
-        raise ValueError("a run needs at least one seed")
+        raise UsageError("a run needs at least one seed")
     if any(seed < 0 for seed in seeds) or len(set(seeds)) != len(seeds):
-        raise ValueError(f"the seeds must be distinct replicate indices, 0 or more: {list(seeds)}")
+        raise UsageError(f"the seeds must be distinct replicate indices, 0 or more: {list(seeds)}")
     return list(seeds)
 
 

@@ -13,7 +13,7 @@ import pytest
 
 from goaly.contracts.gen.manifest_pb2 import ModelSettings
 from goaly.contracts.gen.result_pb2 import TASK_ERROR_TYPE_TIMEOUT, TaskResult
-from goaly.contracts.gen.task_pb2 import SPLIT_EXTERNAL, SPLIT_TRAIN, SPLIT_VAL
+from goaly.contracts.gen.task_pb2 import SPLIT_EXTERNAL, SPLIT_TRAIN, SPLIT_VAL, Split
 from goaly.contracts.jsonl import read_jsonl
 from goaly.harness.core import cli
 from goaly.harness.core.manifest import CORE_DIR, git_state, harness_hash, read_manifest
@@ -54,6 +54,7 @@ class ToyFactory:
     pack_dir: Path | None = None
     name: str = "toy"
     cache_namespace: str = "toy-dev"
+    benchmark_type: type[ScriptedBenchmark] = ScriptedBenchmark
     options: list[HarnessOptions] = field(default_factory=list)
     benchmarks: list[ScriptedBenchmark] = field(default_factory=list)
     closed: bool = False
@@ -69,7 +70,7 @@ class ToyFactory:
                 for record in map(json.loads, lines)
             ]
         instances = [*toy_instances(3), ToyInstance("v0", SPLIT_VAL, base_sql(9), "SELECT 9")]
-        benchmark = ScriptedBenchmark(instances, external=external)
+        benchmark = self.benchmark_type(instances, external=external)
         benchmark.name = self.name
         self.benchmarks.append(benchmark)
         try:
@@ -726,6 +727,115 @@ def test_a_run_that_fails_exits_1_and_logs_why(
     assert "goaly run: the run failed: RuntimeError: the gateway key is missing" in outcome.stderr
     logged = [json.loads(line) for line in outcome.stderr.splitlines() if line.startswith("{")]
     assert any("Traceback" in entry.get("exception", "") for entry in logged)
+
+
+class UnreadableData(ScriptedBenchmark):
+    """An adapter that cannot read its data: a bug to debug, not a mistake in the command."""
+
+    def load_instances(self, split: Split.ValueType) -> list[ToyInstance]:
+        raise ValueError("row 7 of the dataset has no base_sql")
+
+
+def test_any_other_value_error_fails_the_run_with_its_traceback(
+    capsys: pytest.CaptureFixture[str], budgets: Path, tmp_path: Path
+) -> None:
+    registry = Registry()
+    registry.add("toy", "v0", ToyFactory(benchmark_type=UnreadableData))
+
+    outcome = goaly(
+        capsys,
+        registry,
+        budgets,
+        "--bench",
+        "toy",
+        "--split",
+        "train",
+        "--phase",
+        "test",
+        "--out",
+        str(tmp_path / "r"),
+    )
+
+    assert outcome.status == cli.FAILED
+    assert "the run failed: ValueError: row 7 of the dataset has no base_sql" in outcome.stderr
+    logged = [json.loads(line) for line in outcome.stderr.splitlines() if line.startswith("{")]
+    assert any("Traceback" in entry.get("exception", "") for entry in logged)
+
+
+def test_an_out_that_is_a_file_is_a_usage_error(
+    capsys: pytest.CaptureFixture[str], registry: Registry, budgets: Path, tmp_path: Path
+) -> None:
+    out = tmp_path / "run"
+    out.write_text("not a directory\n", encoding="utf-8")
+
+    outcome = goaly(
+        capsys,
+        registry,
+        budgets,
+        "--bench",
+        "toy",
+        "--split",
+        "train",
+        "--phase",
+        "test",
+        "--out",
+        str(out),
+    )
+
+    assert outcome.status == cli.USAGE
+    assert "cannot be a run directory" in outcome.stderr
+
+
+@pytest.mark.parametrize("run_id", ["../up", "a b", "", "run/1", "r\u00e9"])
+def test_a_run_id_is_a_plain_name(
+    capsys: pytest.CaptureFixture[str],
+    registry: Registry,
+    budgets: Path,
+    tmp_path: Path,
+    run_id: str,
+) -> None:
+    with pytest.raises(SystemExit) as refused:
+        goaly(
+            capsys,
+            registry,
+            budgets,
+            "--bench",
+            "toy",
+            "--split",
+            "train",
+            "--phase",
+            "test",
+            "--out",
+            str(tmp_path / "r"),
+            "--run-id",
+            run_id,
+        )
+
+    assert refused.value.code == cli.USAGE
+    assert "letters, digits, '-' and '_'" in capsys.readouterr().err
+
+
+def test_a_used_directory_is_refused_before_the_harness_opens(
+    capsys: pytest.CaptureFixture[str],
+    registry: Registry,
+    budgets: Path,
+    factory: ToyFactory,
+    tmp_path: Path,
+) -> None:
+    argv = ["--bench", "toy", "--split", "train", "--phase", "test", "--out", str(tmp_path / "r")]
+    goaly(capsys, registry, budgets, *argv, "--run-id", "first")
+    factory.options.clear()
+
+    again = goaly(capsys, registry, budgets, *argv)
+    other = goaly(capsys, registry, budgets, *argv, "--resume", "--run-id", "second")
+    same = goaly(capsys, registry, budgets, *argv, "--resume", "--run-id", "first")
+
+    assert again.status == cli.USAGE
+    assert "already holds the run first" in again.stderr
+    assert other.status == cli.USAGE
+    assert "holds the run first, not second" in other.stderr
+    assert len(factory.options) == 1  # Only the resume that can go on opened the harness.
+    assert same.status == 0, same.stderr
 
 
 def test_an_interrupted_run_says_how_to_continue(
