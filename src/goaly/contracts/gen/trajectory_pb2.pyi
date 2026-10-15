@@ -241,7 +241,9 @@ class Step(_message.Message):
     call_id: _builtins.str
     """The call_id of the LlmCallRecord of this step's model call."""
     latency_s: _builtins.float
-    """How long the model call took, in seconds, as LlmCallRecord.latency_s counts it."""
+    """How long the whole model call took, in seconds, including any wait for a concurrency slot
+    or a backoff: the same as its LlmCallRecord.latency_s.
+    """
     prompt_tokens: _builtins.int
     """The context size at this call: how many tokens its prompt held."""
     context_folded: _builtins.bool

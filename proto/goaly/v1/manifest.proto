@@ -13,8 +13,8 @@ message RunManifest {
   // The benchmark, by its adapter's name, the same as the CLI's --bench: "birdcritic" or
   // "swefficiency".
   string benchmark = 2;
-  // The split the tasks came from; SPLIT_UNSPECIFIED for another task file, such as the
-  // organizers' --instances file.
+  // The split the tasks came from; SPLIT_EXTERNAL for a task file from outside our splits, such
+  // as the organizers' --instances file.
   Split split = 3;
   // The commit the code was checked out at.
   string git_commit = 4;

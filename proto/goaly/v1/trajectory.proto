@@ -70,7 +70,8 @@ message Step {
   string call_id = 2;
   // When the model call started.
   google.protobuf.Timestamp started_at = 3;
-  // How long the model call took, in seconds, as LlmCallRecord.latency_s counts it.
+  // How long the whole model call took, in seconds, including any wait for a concurrency slot
+  // or a backoff: the same as its LlmCallRecord.latency_s.
   double latency_s = 4;
   // The tokens and cost of the model call.
   Usage usage = 5;

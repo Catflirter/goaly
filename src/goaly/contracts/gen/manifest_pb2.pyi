@@ -50,8 +50,8 @@ class RunManifest(_message.Message):
     "swefficiency".
     """
     split: _task_pb2.Split.ValueType
-    """The split the tasks came from; SPLIT_UNSPECIFIED for another task file, such as the
-    organizers' --instances file.
+    """The split the tasks came from; SPLIT_EXTERNAL for a task file from outside our splits, such
+    as the organizers' --instances file.
     """
     git_commit: _builtins.str
     """The commit the code was checked out at."""
