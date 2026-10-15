@@ -2,7 +2,8 @@
 
 Each guard checks a candidate's commit, through git or a read-only snapshot of it
 (goaly.rsi.workspace.Workspace.snapshot), never its live worktree, and returns a GuardResult.
-:func:`run_guards` runs them all in the spec's order.
+:func:`run_guards` runs them all in the spec's order. check_gold_free is not one of them: it
+is a precondition of every evaluation, and it raises GoldDataError instead.
 """
 
 from collections.abc import Callable, Mapping
@@ -14,7 +15,7 @@ from goaly.rsi.guards.allowlist import check_pack_code
 from goaly.rsi.guards.checksums import check_checksums
 from goaly.rsi.guards.gold_windows import GoldWindows
 from goaly.rsi.guards.hardcoding import HardCodingConfig, check_hard_coding
-from goaly.rsi.guards.paths import check_allowed_paths
+from goaly.rsi.guards.paths import PathsConfig, check_allowed_paths, commit_of
 from goaly.rsi.guards.unit_tests import check_unit_tests
 from goaly.rsi.sandbox import SandboxConfig
 from goaly.rsi.workspace import Workspace
@@ -27,6 +28,7 @@ class GuardsConfig(BaseModel):
 
     model_config = ConfigDict(frozen=True, extra="forbid")
 
+    paths: PathsConfig = PathsConfig()
     hard_coding: HardCodingConfig = HardCodingConfig()
     unit_test_timeout_s: float = Field(default=600.0, gt=0)
     sandbox: SandboxConfig = SandboxConfig()
@@ -55,7 +57,12 @@ def run_guards(
     Raises goaly.rsi.sandbox.SandboxError if Docker fails, which aborts the experiment rather
     than rejecting the candidate.
     """
-    paths = check_allowed_paths(workspace.repo, lane, parent=parent, candidate=candidate)
+    # Each is resolved once, so that a moving best/<lane> cannot make two guards see two commits.
+    parent = commit_of(workspace.repo, parent)
+    candidate = commit_of(workspace.repo, candidate)
+    paths = check_allowed_paths(
+        workspace.repo, lane, parent=parent, candidate=candidate, config=config.paths
+    )
     if not paths.passed:
         return [paths]
     results = [paths]
@@ -64,7 +71,6 @@ def run_guards(
             lambda: check_checksums(snapshot, frozen),
             lambda: check_hard_coding(
                 workspace.repo,
-                lane,
                 parent=parent,
                 candidate=candidate,
                 snapshot=snapshot,

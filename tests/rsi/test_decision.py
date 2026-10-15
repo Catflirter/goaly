@@ -1,5 +1,6 @@
 """Tests for goaly.rsi.decision: the Effi-SQL decision rules of spec §8.3."""
 
+import math
 from collections.abc import Mapping, Sequence
 
 import pytest
@@ -16,6 +17,7 @@ from goaly.contracts.gen.experiment_pb2 import (
     REJECTION_REASON_REGRESSION,
     DecisionThresholds,
     EffiSqlThresholds,
+    PhaseResult,
 )
 from goaly.contracts.gen.llm_call_pb2 import Usage
 from goaly.contracts.gen.result_pb2 import TaskResult
@@ -97,7 +99,7 @@ def measured(
         for task, values in credits.items()
         for index, credit in enumerate(values)
     ]
-    return Measured.from_results(results)
+    return Measured.host_measured(results)
 
 
 def val(changes: Mapping[str, float] | None = None, *, seeds: int = 1) -> dict[str, list[float]]:
@@ -108,6 +110,10 @@ def val(changes: Mapping[str, float] | None = None, *, seeds: int = 1) -> dict[s
     return table
 
 
+# Validations the confirmation follows: one that passed at 5 points, and one at 13.3 points that
+# passed the doubled 10 under the guardrail.
+PASSED = PhaseResult(delta=2 / 30, effective_min_delta=0.05)
+TRIPPED = PhaseResult(delta=4 / 30, effective_min_delta=0.10)
 BEST = measured(val(seeds=2), run_id="best", seeds=[0, 1])
 V0 = measured(val(seeds=2), run_id="v0", seeds=[0, 1])
 # Four tasks go from 0.5 to 1.0: ΔR-VES = 2/30 = 6.7 points, 4 wins and no loss, p = 1/16.
@@ -144,7 +150,7 @@ def test_a_gain_of_exactly_five_points_meets_the_threshold() -> None:
 
 def test_a_positive_net_gain_with_too_many_regressions_is_rejected() -> None:
     best = measured(val({"29": 1.0, "30": 1.0}, seeds=2), seeds=[0, 1])
-    # Eight tasks from 0.5 to 1.0, but two solved tasks drop to 0: Δ = 20 points, p = 0.055.
+    # Eight tasks from 0.5 to 1.0, but two solved tasks drop to 0: Δ = 6.7 points, p = 0.055.
     gains = {f"{n}": 1.0 for n in range(1, 9)}
     candidate = measured(val({**gains, "29": 0.0, "30": 0.0}))
     verdict = validate(SPLIT_VAL, best, candidate, v0=V0, config=CONFIG)
@@ -187,7 +193,7 @@ def test_a_gain_that_passes_validation_but_fails_confirmation_is_rejected() -> N
         both[task] = [1.0, 0.5]
     both["5"] = [0.5, 0.0]
     candidate = measured(both, run_id="val", seeds=[0, 1])
-    verdict = confirm(SPLIT_VAL, BEST, candidate, v0=V0, config=CONFIG, guardrail=False)
+    verdict = confirm(SPLIT_VAL, BEST, candidate, v0=V0, config=CONFIG, validation=PASSED)
     assert verdict.phase.seed_count == 2
     assert verdict.phase.delta == pytest.approx(0.75 / 30)
     assert verdict.phase.effective_min_delta == pytest.approx(0.03)
@@ -199,7 +205,7 @@ def test_a_gain_that_holds_over_both_seeds_is_confirmed() -> None:
     for task in ("1", "2", "3", "4"):
         both[task] = [1.0, 0.75]
     verdict = confirm(
-        SPLIT_VAL, BEST, measured(both, seeds=[0, 1]), v0=V0, config=CONFIG, guardrail=False
+        SPLIT_VAL, BEST, measured(both, seeds=[0, 1]), v0=V0, config=CONFIG, validation=PASSED
     )
     assert verdict.phase.delta == pytest.approx(1.5 / 30)
     assert verdict.passed
@@ -226,14 +232,31 @@ def test_the_cost_guardrail_doubles_the_confirmation_threshold() -> None:
     for task in ("1", "2", "3", "4"):
         both[task] = [1.0, 0.75]
     candidate = measured(both, seeds=[0, 1])
-    carried = confirm(SPLIT_VAL, BEST, candidate, v0=V0, config=CONFIG, guardrail=True)
+    carried = confirm(SPLIT_VAL, BEST, candidate, v0=V0, config=CONFIG, validation=TRIPPED)
+    assert carried.guardrail
     assert carried.phase.effective_min_delta == pytest.approx(0.06)
     assert carried.reasons == (REJECTION_REASON_NOT_CONFIRMED,)
     # The guardrail also trips on the confirmation's own numbers.
     heavy = measured(both, seeds=[0, 1], tokens=2000)
-    own = confirm(SPLIT_VAL, BEST, heavy, v0=V0, config=CONFIG, guardrail=False)
+    own = confirm(SPLIT_VAL, BEST, heavy, v0=V0, config=CONFIG, validation=TRIPPED)
     assert own.guardrail
     assert own.reasons == (REJECTION_REASON_NOT_CONFIRMED,)
+
+
+def test_a_guardrail_that_trips_only_at_confirmation_doubles_both_thresholds() -> None:
+    # Over both seeds four tasks gain 0.5 each: 6.7 points, above the doubled 6. But the
+    # validation's 6.7 points fall short of the doubled 10 once the tokens reach 1.6x.
+    both = val(seeds=2)
+    for task in ("1", "2", "3", "4"):
+        both[task] = [1.0, 1.0]
+    heavy = measured(both, seeds=[0, 1], tokens=1600)
+    verdict = confirm(SPLIT_VAL, BEST, heavy, v0=V0, config=CONFIG, validation=PASSED)
+    assert verdict.guardrail
+    assert verdict.phase.effective_min_delta == pytest.approx(0.06)
+    assert verdict.reasons == (REJECTION_REASON_COST_GUARDRAIL,)
+    # A validation gain that clears 10 points passes.
+    clear = confirm(SPLIT_VAL, BEST, heavy, v0=V0, config=CONFIG, validation=TRIPPED)
+    assert clear.passed
 
 
 def test_a_ratio_at_the_guardrail_does_not_trip_it() -> None:
@@ -257,7 +280,7 @@ def test_the_efficiency_cap_rejects_a_candidate_whatever_its_gain(
     assert ratio == pytest.approx(3.1 if field == "cost" else 3.05)
     both = {task: [credit[0], credit[0]] for task, credit in val(gains).items()}
     twice = measured(both, seeds=[0, 1], cost=cost, wall=wall)
-    confirmed = confirm(SPLIT_VAL, BEST, twice, v0=V0, config=CONFIG, guardrail=False)
+    confirmed = confirm(SPLIT_VAL, BEST, twice, v0=V0, config=CONFIG, validation=TRIPPED)
     assert confirmed.reasons == (REJECTION_REASON_EFFICIENCY_CAP,)
 
 
@@ -271,7 +294,7 @@ def test_a_flagged_prediction_fails_the_candidate_in_every_phase() -> None:
     assert validated.reasons == (REJECTION_REASON_HARD_CODED,)
     both = {task: [credit[0], credit[0]] for task, credit in val(gains).items()}
     twice = measured(both, seeds=[0, 1], flagged=frozenset({"7"}))
-    confirmed = confirm(SPLIT_VAL, BEST, twice, v0=V0, config=CONFIG, guardrail=False)
+    confirmed = confirm(SPLIT_VAL, BEST, twice, v0=V0, config=CONFIG, validation=PASSED)
     assert confirmed.reasons == (REJECTION_REASON_HARD_CODED,)
 
 
@@ -344,15 +367,19 @@ def test_cost_stats_average_per_task_and_seed() -> None:
         CostStats.from_results([])
 
 
-def test_a_ratio_without_a_basis_is_left_unset() -> None:
+def test_a_ratio_without_a_basis_is_left_unset(caplog: pytest.LogCaptureFixture) -> None:
     best = measured(val(seeds=2), seeds=[0, 1], tokens=0, wall=0.0)
     v0 = measured(val(seeds=2), seeds=[0, 1], cost=None)
     candidate = measured(val(FOUR_WINS), tokens=5000, wall=99.0, cost=1.0)
     verdict = validate(SPLIT_VAL, best, candidate, v0=v0, config=CONFIG)
-    for field in ("token_ratio_vs_best", "time_ratio_vs_best", "cost_ratio_vs_v0"):
-        assert not verdict.phase.HasField(field)
+    # Something over nothing trips the guardrail; an unknown cost leaves its cap unchecked.
+    assert verdict.phase.token_ratio_vs_best == math.inf
+    assert verdict.phase.time_ratio_vs_best == math.inf
+    assert not verdict.phase.HasField("cost_ratio_vs_v0")
     assert verdict.phase.time_ratio_vs_v0 == pytest.approx(9.9)
-    assert verdict.reasons == (REJECTION_REASON_EFFICIENCY_CAP,)
+    skipped = [r.getMessage() for r in caplog.records if r.levelname == "WARNING"]
+    assert skipped == ["cost_ratio_vs_v0 is unknown, so its rule is skipped"]
+    assert verdict.reasons == (REJECTION_REASON_EFFICIENCY_CAP, REJECTION_REASON_COST_GUARDRAIL)
 
 
 def test_cost_stats_combine_weighted_by_count() -> None:
@@ -372,7 +399,7 @@ def test_measured_takes_the_evaluators_stats_over_the_results_own() -> None:
     results = [result("1", 0, 1.0, run_id="r", tokens=999, wall=99.0)]
     stats = CostStats(10.0, 0.5, 1.0)
     assert Measured.from_results(results, stats).stats is stats
-    assert Measured.from_results(results).stats.mean_tokens == 999.0
+    assert Measured.host_measured(results).stats.mean_tokens == 999.0
 
 
 def test_measured_names_each_run_once_in_order() -> None:
@@ -381,4 +408,88 @@ def test_measured_names_each_run_once_in_order() -> None:
         result("2", 0, 1.0, run_id="a"),
         result("3", 0, 1.0, run_id="b"),
     ]
-    assert Measured.from_results(results).run_ids == ("b", "a")
+    assert Measured.host_measured(results).run_ids == ("b", "a")
+
+
+def test_the_rules_score_the_checked_credit() -> None:
+    # The best's task 30 is flagged: checked, it scores 0, so a candidate at 0.5 gains there.
+    # Officially, the best's flagged prediction would score 1.0, and the candidate would lose.
+    best = measured(val({"30": 1.0}, seeds=2), seeds=[0, 1], flagged=frozenset({"30"}))
+    candidate = measured(val(FOUR_WINS))
+    verdict = validate(SPLIT_VAL, best, candidate, v0=V0, config=CONFIG)
+    assert verdict.phase.best_score == pytest.approx(14.5 / 30)
+    assert verdict.phase.delta == pytest.approx(2.5 / 30)
+    assert (verdict.phase.wins, verdict.phase.losses) == (5, 0)
+    assert verdict.passed
+
+
+def test_the_boundaries_are_inclusive_as_the_spec_states() -> None:
+    # Exactly 3x v0's wall time is within the cap; 1.5x the best's would be within the guardrail,
+    # but 3x is above it, so 8 wins (13.3 points) are used to clear the doubled threshold.
+    gains = {f"{n}": 1.0 for n in range(1, 9)}
+    at_cap = validate(SPLIT_VAL, BEST, measured(val(gains), wall=30.0), v0=V0, config=CONFIG)
+    assert at_cap.phase.time_ratio_vs_v0 == 3.0
+    assert at_cap.passed
+    # p exactly at the threshold passes: 4 wins and no loss give p = 1/16.
+    exact_p = DecisionConfig(sign_test_max_p=1 / 16)
+    assert validate(SPLIT_VAL, BEST, measured(val(FOUR_WINS)), v0=V0, config=exact_p).passed
+    # A confirmation gain exactly at its threshold passes: four tasks of 0.25 over 30 tasks.
+    both = val(seeds=2)
+    for task in ("1", "2", "3", "4"):
+        both[task] = [1.0, 0.5]
+    exact = DecisionConfig(confirm_min_delta=1 / 30)
+    twice = measured(both, seeds=[0, 1])
+    verdict = confirm(SPLIT_VAL, BEST, twice, v0=V0, config=exact, validation=PASSED)
+    assert verdict.phase.delta == 1 / 30
+    assert verdict.passed
+
+
+def test_a_cost_over_a_zero_basis_trips_the_cap(caplog: pytest.LogCaptureFixture) -> None:
+    free = measured(val(seeds=2), seeds=[0, 1], cost=0.0)
+    verdict = validate(SPLIT_VAL, BEST, measured(val(FOUR_WINS)), v0=free, config=CONFIG)
+    assert verdict.phase.cost_ratio_vs_v0 == math.inf
+    assert verdict.reasons == (REJECTION_REASON_EFFICIENCY_CAP,)
+    both_free = validate(SPLIT_VAL, BEST, measured(val(FOUR_WINS), cost=0.0), v0=free,
+                         config=CONFIG)  # fmt: skip
+    assert both_free.phase.cost_ratio_vs_v0 == 1.0
+    assert both_free.passed
+    assert not caplog.records
+
+
+def test_describe_names_the_rules_it_could_not_check() -> None:
+    unknown = measured(val(seeds=2), seeds=[0, 1], cost=None)
+    verdict = validate(SPLIT_VAL, BEST, measured(val(FOUR_WINS)), v0=unknown, config=CONFIG)
+    assert "not checked, unknown: cost_ratio_vs_v0" in describe("validation", verdict)
+    screened = screen(SPLIT_TRAIN, BEST, measured(val(FOUR_WINS)))
+    assert "not checked" not in describe("screen", screened)
+
+
+@pytest.mark.parametrize(
+    "fields",
+    [
+        {"mean_tokens": -1.0},
+        {"mean_wall_time_s": math.nan},
+        {"mean_cost_usd": math.inf},
+        {"count": 0},
+    ],
+)
+def test_cost_stats_must_be_finite_and_cover_a_task(fields: dict[str, float]) -> None:
+    values: dict[str, float | None] = {
+        "mean_tokens": 1.0, "mean_cost_usd": 0.1, "mean_wall_time_s": 1.0, "count": 1,
+    }  # fmt: skip
+    values.update(fields)
+    with pytest.raises(ValueError, match="cost statistics"):
+        CostStats(**values)  # type: ignore[arg-type]  # The keywords are CostStats' fields.
+
+
+def test_the_screen_applies_the_cap_when_v0_is_given() -> None:
+    candidate = measured(val(FOUR_WINS), cost=0.05)
+    capped = screen(SPLIT_TRAIN, BEST, candidate, v0=V0, config=CONFIG)
+    assert capped.reasons == (REJECTION_REASON_EFFICIENCY_CAP,)
+    assert capped.phase.cost_ratio_vs_v0 == pytest.approx(5.0)
+    assert screen(SPLIT_TRAIN, BEST, candidate).passed
+
+
+def test_a_config_comes_back_from_its_recorded_thresholds() -> None:
+    config = DecisionConfig(min_delta=0.07, confirm_min_delta=0.02, max_regressions=2)
+    assert DecisionConfig.from_thresholds(config.thresholds()) == config

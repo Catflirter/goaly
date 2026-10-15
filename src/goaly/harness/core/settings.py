@@ -1,4 +1,5 @@
-"""Process settings: the model gateway's API key and base URL, and the RSI lane's secrets.
+"""Process settings: the model gateway's API key, base URL and socket, and the RSI lane's
+secrets.
 
 Each value comes from the first of these that provides it: explicit arguments, ``GOALY_*``
 environment variables, the env file (``~/.config/goaly/.env`` by default), the field default.
@@ -46,6 +47,9 @@ class Settings(BaseSettings):
     # The GitHub token for results PRs (spec §8.7), read at run time: goaly.rsi reloads the
     # settings for each use, and falls back to the Coder workspace's token when this is unset.
     github_token: SecretStr | None = None
+    # A Unix socket to reach the gateway through instead of TCP, as the solve container reaches
+    # the host's LLM proxy (spec §6.1). The base URL then only names the host in each request.
+    llm_uds: Path | None = None
 
     @classmethod
     def settings_customise_sources(
@@ -102,6 +106,13 @@ class Settings(BaseSettings):
         if problem is not None:
             raise PydanticCustomError("invalid_url", problem)
         return url.rstrip("/")
+
+    @field_validator("llm_uds")
+    @classmethod
+    def _check_llm_uds(cls, value: Path | None) -> Path | None:
+        if value is not None and not value.is_absolute():
+            raise PydanticCustomError("invalid_path", "must be an absolute path")
+        return value
 
 
 def _optional_secret(value: object) -> object:

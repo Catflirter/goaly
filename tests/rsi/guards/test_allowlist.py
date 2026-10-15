@@ -1,6 +1,8 @@
 """Tests for goaly.rsi.guards.allowlist: the static AST allowlist on candidate pack code."""
 
 import asyncio
+import importlib
+import importlib.util
 import sys
 import textwrap
 import types
@@ -26,7 +28,7 @@ from enum import Enum
 from pydantic import BaseModel, ConfigDict, Field
 
 from goaly.contracts.gen.task_pb2 import EffiSqlPrediction, Prediction, TaskInput
-from goaly.harness.core import budgets
+from goaly.harness.core.budgets import Budgets
 from goaly.harness.core.tools import Tool
 
 from . import prompts
@@ -60,12 +62,12 @@ class Policy(Tool):
     """Best of two rewrites."""
 
     def __init__(self, tools: Sequence[Tool]) -> None:
-        super().__init__()
         self.tools = tools
         self.__tries = 0  # Name-mangled: private to this class.
-        self.name = Policy.__name__
-        self.help = Policy.__doc__
-        self.limits = budgets.Budgets()
+        self.name = "policy"
+        self.limits = Budgets()
+        self.options = {"steps": 3}
+        self.steps = self.options.get("steps", 3)
 
     async def solve(self, task: TaskInput) -> Prediction:
         async with asyncio.timeout(60):
@@ -79,7 +81,7 @@ class Policy(Tool):
     async def rewrite(self, task: TaskInput, seed: int) -> str:
         self.__tries += 1
         shown = f"{seed}: {task.effisql.base_sql}"
-        return prompts.render(shown, len(self.tools)) + ExecuteSql.__name__
+        return prompts.render(shown, len(self.tools)) + ExecuteSql.NAME
 '''
 
 
@@ -114,21 +116,40 @@ def test_ordinary_pack_code_passes() -> None:
 @pytest.mark.parametrize(
     "source",
     [
-        "import math, statistics, itertools, functools, textwrap, enum, abc, string, datetime\n",
+        "import json, re, typing, dataclasses, math, statistics, collections\n",
+        "import itertools, functools, textwrap, enum, asyncio\n",
+        "from collections.abc import Sequence\nfrom collections import abc\n",
         "from collections import Counter, defaultdict\n",
         "import pydantic\npydantic.BaseModel\n",
         "from pydantic.fields import FieldInfo\n",
         "from goaly.contracts import interfaces\n",
         "from goaly.contracts.gen import task_pb2\ntask_pb2.TaskInput\n",
         "from goaly.contracts.errors import EnvironmentFailure\n",
-        "from goaly.harness.core import agent, budgets, logs\nagent.run_agent()\n",
+        "from goaly.harness.core.agent import run_agent\nrun_agent()\n",
         "from goaly.harness.packs.effisql.tools import ExecuteSql\n",
-        "import goaly.harness.core.tools as tools\ntools.Tool\n",
+        "from goaly.harness.core.tools import Tool\nclass T(Tool): ...\n",
+        "from pydantic import TypeAdapter\nTypeAdapter(list[int])\n",
+        "from typing import NamedTuple\nP = NamedTuple('P', [('x', int), ('y', float)])\n",
+        "from typing import TypedDict\nTD = TypedDict('TD', {'x': int}, total=False)\n",
+        "from dataclasses import make_dataclass\nC = make_dataclass('C', ['a', ('b', int)])\n",
+        "from typing import TypeVar\nT = TypeVar('T', bound=int)\n",
+        "from typing import NamedTuple\nclass P(NamedTuple):\n    x: int\n",
+        "row = {'k': 1}\nrow.get('k')\nrow.update({'k': 2})\n",
+        "SCHEMA = {'type': 'object', 'properties': {'sql': {'type': 'string'}}}\n",
+        "class A:\n    __limit = 3\n    def __helper(self):\n        return self.__limit\n",
+        "class A:\n    def f(self):\n        def g():\n"
+        "            return self.__x\n        return g\n",
         "import asyncio\nasyncio.TaskGroup\nasyncio.gather\nasyncio.timeout\n",
         "class A:\n    def f(self):\n        return self.__x\n",
         "from goaly.harness.packs import effisql\n",
         "import json\njson.not_there\n",  # An AttributeError when it runs, not a way out.
-        "f(**options)\n",
+        "f(*options)\n",
+        "from pydantic import BaseModel, ConfigDict\n"
+        "class M(BaseModel):\n    model_config = ConfigDict(frozen=True, extra='forbid')\n",
+        "from pydantic import BaseModel, ConfigDict\n"
+        "class M(BaseModel):\n    model_config: ConfigDict = ConfigDict(title='m')\n",
+        "from pydantic import BaseModel, ConfigDict\nclass M(BaseModel):\n"
+        "    model_config = ConfigDict(json_schema_extra={'examples': [1, (2, 3)]})\n",
         "try:\n    pass\nexcept ValueError:\n    pass\n",
         "TEXT = 'call __init__ first, then len(x)'\n",
         "match p:\n    case [first, *rest]:\n        pass\n    case {'k': v, **others}:\n"
@@ -169,20 +190,20 @@ def test_a_relative_import_within_the_pack_passes() -> None:
         ("from pydantic._internal import x\n", "import of pydantic._internal is not allowed"),
         ("from pydantic.v1 import BaseModel\n", "import of pydantic.v1 is not allowed"),
         # Ruling V3: only the listed core modules; never settings or the LLM client.
-        ("from goaly.harness.core import settings\n", "import of goaly.harness.core.settings"),
+        ("from goaly.harness.core import settings\n", "from goaly.harness.core import settings"),
         ("from goaly.harness.core.settings import load_settings\n", "goaly.harness.core.settings"),
-        ("import goaly.harness.core.llm as llm\n", "import of goaly.harness.core.llm is"),
-        ("from goaly.harness.core import llm\n", "import of goaly.harness.core.llm is"),
+        ("import goaly.harness.core.llm as llm\n", "reach core only with from"),
+        ("from goaly.harness.core import llm\n", "from goaly.harness.core import llm"),
         ("from goaly.harness.core.llm_models import X\n", "goaly.harness.core.llm_models"),
-        ("from goaly.harness.core import llm_throttle\n", "goaly.harness.core.llm_throttle"),
-        ("import goaly.harness.core\n", "import of goaly.harness.core is not allowed"),
+        ("from goaly.harness.core import llm_throttle\n", "import llm_throttle"),
+        ("import goaly.harness.core\n", "import goaly.harness.core: reach core only"),
         ("from goaly.contracts.jsonl import write_jsonl\n", "import of goaly.contracts.jsonl"),
-        ("from goaly.contracts import jsonl\n", "import of goaly.contracts.jsonl"),
+        ("from goaly.contracts import jsonl\n", "banned name jsonl"),
         ("from goaly.bench import runner\n", "import of goaly.bench is not allowed"),
         ("from goaly.harness.packs.swefficiency import x\n", "goaly.harness.packs.swefficiency"),
-        ("from goaly.harness.core import context_window\n", "cannot import"),
+        ("from goaly.harness.core import context_window\n", "import its names instead"),
         # Binding the goaly package would reach every module the process has loaded.
-        ("import goaly.harness.core.tools\n", "policy.py:1: banned name goaly"),
+        ("import goaly.contracts.errors\n", "policy.py:1: banned name goaly"),
         ("from .. import helpers\n", "policy.py:1: a relative import that leaves the pack"),
         ("from typing import *\n", "policy.py:1: import * from typing"),
         # Builtins (rule b adds dir and type).
@@ -245,8 +266,8 @@ def test_a_relative_import_within_the_pack_passes() -> None:
         ("x.builtins\n", "banned name builtins"),
         ("import json\njson.codecs.open('f')\n", "policy.py:2: json.codecs is a module"),
         # Rule e: a module an allowed module imported is out of reach too.
-        ("from goaly.harness.core import agent\nagent.llm.complete()\n", "agent.llm is a module"),
-        ("from goaly.harness.core import tools\ntools.asyncio.run(f())\n", "tools.asyncio is a"),
+        ("from goaly.harness.core.agent import llm\n", "goaly.harness.core.agent.llm is a module"),
+        ("from goaly.harness.core.tools import asyncio\n", "tools.asyncio is a module"),
         ("import collections\ncollections.abc.Sequence\n", "collections.abc is a module"),
         # Frames and coroutines (rule d), getattr by another name, import by string, the key.
         ("next(g).gi_frame\n", "policy.py:1: banned attribute gi_frame"),
@@ -258,7 +279,7 @@ def test_a_relative_import_within_the_pack_passes() -> None:
         ("api_key.get_secret_value()\n", "banned name get_secret_value"),
         ("ctx.settings\n", "banned name settings"),
         # A string pydantic or typing would evaluate as code.
-        ("x: \"open('/etc/passwd').read()\"\n", "a string Python could evaluate calls open"),
+        ("x: \"open('/etc/passwd').read()\"\n", "evaluate: banned builtin open"),
         # N1: no private attribute, on any object; only self.__x inside a class body.
         ("class A:\n    def f(self):\n        return self._client\n", "private attribute _client"),
         (
@@ -291,7 +312,7 @@ def test_a_relative_import_within_the_pack_passes() -> None:
             "from goaly.harness.core.tools import read_key\n",
             "comes from goaly.harness.core.settings",
         ),
-        ("from goaly.harness.core import agent\nagent.Client\n", "agent.Client comes from"),
+        ("from goaly.harness.core.agent import Client as C\n", "Client comes from"),
         # Names in every place a name can stand.
         ("def f():\n    global sys\n", "policy.py:2: banned name sys"),
         ("def f():\n    nonlocal __x__\n", "policy.py:2: dunder name __x__"),
@@ -302,8 +323,8 @@ def test_a_relative_import_within_the_pack_passes() -> None:
         ('type Ids = list["int"]\n', "policy.py:1: a string in an annotation"),
         # What cannot be imported, and a module behind another module's name.
         ("from json import not_there\n", "cannot import not_there from json"),
-        ("import pydantic.not_there as x\n", "cannot import pydantic.not_there"),
-        ("from pydantic.not_there import x\n", "cannot import x from pydantic.not_there"),
+        ("import pydantic.not_there as x\n", "import of pydantic.not_there is not allowed"),
+        ("from pydantic.not_there import x\n", "import of pydantic.not_there is not allowed"),
         ("from dataclasses import inspect\n", "policy.py:1: dataclasses.inspect is a module"),
         # Code that does not parse cannot be checked.
         ("def broken(:\n", "policy.py:1: cannot be parsed"),
@@ -315,10 +336,14 @@ def test_refused_code_names_its_file_and_line(source: str, problem: str) -> None
     assert any(problem in line for line in found), found
 
 
-def test_a_submodule_that_fails_to_import_is_refused(monkeypatch: pytest.MonkeyPatch) -> None:
-    monkeypatch.setattr(allowlist, "_import", lambda module: None)
+def test_a_module_that_fails_to_import_is_refused_with_why(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(allowlist, "_import", lambda module: "ImportError")
 
-    assert check("from collections import abc\n") == ["policy.py:1: cannot import collections.abc"]
+    assert check("from collections import abc\n") == [
+        "policy.py:1: cannot import collections.abc: ImportError"
+    ]
 
 
 def test_every_violation_is_listed_in_file_order() -> None:
@@ -376,8 +401,8 @@ def test_a_module_another_pack_file_imported_is_out_of_reach(tmp_path: Path) -> 
     write_pack(
         tmp_path,
         {
-            "helpers.py": "import json\nfrom goaly.harness.core import agent\nLIMIT = 3\n",
-            "policy.py": "from . import helpers\nhelpers.LIMIT\nhelpers.agent.llm\n"
+            "helpers.py": "import json\nimport dataclasses\nLIMIT = 3\n",
+            "policy.py": "from . import helpers\nhelpers.LIMIT\nhelpers.dataclasses.field\n"
             "helpers.json.loads('1')\n",
         },
     )
@@ -385,7 +410,7 @@ def test_a_module_another_pack_file_imported_is_out_of_reach(tmp_path: Path) -> 
     result = check_pack_code(tmp_path, LANE_EFFISQL)
 
     assert result.detail.splitlines() == [
-        "src/goaly/harness/packs/effisql/policy.py:3: helpers.agent is a module",
+        "src/goaly/harness/packs/effisql/policy.py:3: helpers.dataclasses is a module",
         "src/goaly/harness/packs/effisql/policy.py:4: helpers.json is a module",
     ]
 
@@ -397,9 +422,9 @@ def test_a_module_reached_through_a_from_import_of_the_pack_is_out_of_reach(
         tmp_path,
         {
             "__init__.py": "",
-            "helpers.py": "from goaly.harness.core import agent\n"
+            "helpers.py": "import dataclasses\n"
             "import goaly.harness.packs.effisql.policy as policy\n",
-            "policy.py": "from .helpers import agent\nagent.llm\n",
+            "policy.py": "from .helpers import dataclasses\ndataclasses.inspect\n",
             "broken.py": "def broken(:\n",
         },
     )
@@ -408,7 +433,8 @@ def test_a_module_reached_through_a_from_import_of_the_pack_is_out_of_reach(
 
     assert result.detail.splitlines() == [
         "src/goaly/harness/packs/effisql/broken.py:1: cannot be parsed: invalid syntax",
-        "src/goaly/harness/packs/effisql/policy.py:2: agent.llm is a module",
+        "src/goaly/harness/packs/effisql/policy.py:2: banned name inspect",
+        "src/goaly/harness/packs/effisql/policy.py:2: dataclasses.inspect is a module",
     ]
 
 
@@ -440,3 +466,325 @@ def test_the_guard_passes_a_clean_pack(tmp_path: Path) -> None:
 
     assert result.passed, result.detail
     assert result.detail == "3 Python files checked"
+
+
+# The review wave of 2026-10-15 and spec §8.5 at e71d9f1.
+@pytest.mark.parametrize(
+    ("source", "problem"),
+    [
+        # Exactly the spec's stdlib modules, and no __future__ (M4, M5).
+        ("import abc\n", "import of abc is not allowed"),
+        ("import string\n", "import of string is not allowed"),
+        ("import datetime\n", "import of datetime is not allowed"),
+        ("from __future__ import annotations\n", "import of __future__ is not allowed"),
+        # Modules a candidate names are refused before anything imports them (#40 C1).
+        ("import this as t\n", "import of this is not allowed"),
+        ("import unittest.__main__ as m\n", "import of unittest.__main__ is not allowed"),
+        ("from tkinter import x\n", "import of tkinter is not allowed"),
+        # N5: core only as from goaly.harness.core.<module> import <name>.
+        ("import goaly.harness.core.tools as tools\n", "reach core only with from"),
+        ("from goaly.harness.core import agent\n", "from goaly.harness.core import agent"),
+        ("from goaly.harness.core.tools import read_key\n", "comes from goaly.harness.core."),
+        # TypeAdapter under another name, or with a keyword (#40 I1).
+        ("from pydantic import TypeAdapter as TA\nTA('x')\n", "TypeAdapter imported under"),
+        ("from pydantic import TypeAdapter\nTA = TypeAdapter\n", "TypeAdapter used other than"),
+        ("from pydantic import TypeAdapter\nTypeAdapter(type='int')\n", "TypeAdapter of a str"),
+        ("import pydantic\npydantic.TypeAdapter(list['int'])\n", "TypeAdapter of a string"),
+        # Strings typing or pydantic evaluate, wherever they stand (#40 I2, spec).
+        ('Rows = list["int"]\n', "policy.py:1: a string in a subscript"),
+        ("import typing\nRows = typing.List['int']\n", "a string in a subscript"),
+        ("row['k']\n", "policy.py:1: a string in a subscript"),
+        ("row['k'] = 1\n", "a string in a subscript"),
+        ("row[f'{k}']\n", "a string in a subscript"),
+        (
+            "X = \"typing.sys.modules['os'].getpid()\"\n",
+            "policy.py:1: in a string Python could evaluate: banned name sys",
+        ),
+        ("X: 'TypeAlias' = \"open('f')\"\n", "evaluate: banned builtin open"),
+        ("from typing import TypeVar\nT = TypeVar('T', bound='open(1)')\n", "a string as a type"),
+        ("from typing import TypeVar\nT = TypeVar('T', 'int', 'str')\n", "a string as a type"),
+        ("from typing import NewType\nU = NewType('U', 'int')\n", "a string as a type in NewType"),
+        ("PROMPT = '" + "x " * 2000 + "' + open('f')\n", "banned builtin open"),
+        ("X = '" + " " * 3000 + "open(1)'\n", "evaluate: banned builtin open"),
+        ("X = 'self._client'\n", "evaluate: private attribute _client"),
+        (
+            "from typing import NamedTuple\nP = NamedTuple('P', [('x', 'int')])\n",
+            "a string as a field type in NamedTuple",
+        ),
+        ("from typing import NamedTuple\nP = NamedTuple('P', x='int')\n", "field type"),
+        ("from typing import NamedTuple\nP = NamedTuple('P', fields)\n", "not listed literally"),
+        ("from typing import NamedTuple\nP = NamedTuple('P', *fields)\n", "unpacked arguments"),
+        ("from typing import TypedDict\nT = TypedDict('T', {'x': 'int'})\n", "field type"),
+        (
+            "from dataclasses import make_dataclass\nC = make_dataclass('C', [('x', 'int')])\n",
+            "a string as a field type in make_dataclass",
+        ),
+        ("from pydantic import BaseModel\nclass M(BaseModel):\n    x: 'int'\n", "annotation"),
+        # A module only as the value of an attribute it is read from (#40 I3).
+        ("import typing\nt = typing\nt.types.FunctionType\n", "the module typing used as a"),
+        ("import typing\n[typing][0].types.CodeType\n", "the module typing used as a value"),
+        ("import typing\ndef f(m=typing):\n    return m.types\n", "the module typing used"),
+        ("import asyncio\nm = asyncio\n", "the module asyncio used as a value"),
+        ("import json\njson = 1\n", "the module json rebound"),
+        ("from . import prompts\nf(prompts)\n", None),  # Unbound without the pack's imports.
+        # Dunders: none but __init__ and __post_init__ defined in a class body (spec).
+        ("class A:\n    __match_args__ = ('x',)\n", "policy.py:2: dunder name __match_args__"),
+        ("class A:\n    __slots__ = ()\n", "dunder name __slots__"),
+        ("class A:\n    def __eq__(self, other): ...\n", "dunder name __eq__"),
+        ("def __init__(self): ...\n", "policy.py:1: dunder name __init__"),
+        ("class A:\n    def f(self):\n        super().__init__()\n", "dunder name __init__"),
+        ("x.__name__\n", "dunder name __name__"),
+        ("x.__doc__\n", "dunder name __doc__"),
+        # P8: a dataclass's __match_args__ reads class-body names with one underscore.
+        (
+            "import dataclasses\nimport typing\n@dataclasses.dataclass\n"
+            "@typing.runtime_checkable\nclass K(typing.Protocol):\n    _client: typing.Any\n"
+            "match obj:\n    case K(c):\n        pass\n",
+            "policy.py:6: a class binds _client",
+        ),
+        ("import typing\n@typing.runtime_checkable\nclass K: ...\n", "banned name runtime"),
+        ("class A:\n    _x = 1\n", "policy.py:2: a class binds _x"),
+        ("class A:\n    def _helper(self): ...\n", "policy.py:2: a class binds _helper"),
+        # Attribute reads through pydantic (spec).
+        ("from pydantic import ConfigDict\nConfigDict(from_attributes=True)\n", "from_attr"),
+        ("config = {'from_attributes': True}\n", "the string from_attributes"),
+        ("M.model_validate(obj, from_attributes=True)\n", "banned keyword from_attributes"),
+        ("from pydantic import Field\nField(alias='_client')\n", "banned keyword alias"),
+        ("from pydantic import Field\nField(validation_alias='x')\n", "banned keyword validation"),
+        ("from pydantic import AliasPath\n", "banned name AliasPath"),
+        ("from pydantic import AliasChoices\n", "banned name AliasChoices"),
+        # pydantic's deprecated methods, and serialized objects (#47).
+        (
+            "M.parse_raw(data, proto='pickle', allow_pickle=True)\n",
+            "policy.py:1: banned attribute parse_raw",
+        ),
+        ("M.parse_raw(data, proto='pickle', allow_pickle=True)\n", "banned keyword allow_pickle"),
+        ("M.parse_raw(data, proto='pickle', allow_pickle=True)\n", "banned keyword proto"),
+        ("M.parse_obj(data)\n", "banned attribute parse_obj"),
+        ("M.parse_file(path)\n", "banned name parse_file"),
+        ("M.from_orm(obj)\n", "banned attribute from_orm"),
+        ("M.construct(x=1)\n", "banned attribute construct"),
+        ("M.schema_json()\n", "banned attribute schema_json"),
+        ("m.copy(update={'x': 1})\n", "banned attribute copy"),
+        ("M.update_forward_refs()\n", "banned attribute update_forward_refs"),
+        ("loads_pickle(x)\n", "banned name loads_pickle"),
+        ("x.unmarshal()\n", "banned name unmarshal"),
+        ("f(shelve_it=1)\n", "banned name shelve_it"),
+        # Names (M6, M7) and self (M6).
+        ("class _:\n    pass\n", "a class named _, which mangles nothing"),
+        ("class __:\n    pass\n", "a class named __"),
+        ("class __LlmClient:\n    pass\n", "banned name __LlmClient"),
+        ("class A:\n    def f(self, other):\n        self = other\n", "self assigned"),
+        ("class A:\n    def f(self, other):\n        return other.__x\n", "private attribute"),
+        ("help(x)\n", "banned builtin help"),
+        ("exit(1)\n", "banned builtin exit"),
+        ("quit()\n", "banned builtin quit"),
+        ("license()\n", "banned builtin license"),
+        ("copyright\n", "banned builtin copyright"),
+        ("credits\n", "banned builtin credits"),
+    ],
+)
+def test_the_review_waves_escapes_are_refused(source: str, problem: str | None) -> None:
+    found = check(source)
+
+    if problem is None:
+        assert found == []
+    else:
+        assert any(problem in line for line in found), found
+
+
+def test_no_module_a_candidate_names_is_imported_or_looked_for(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    requested: list[str] = []
+    real_import = importlib.import_module
+
+    def spy(name: str, package: str | None = None) -> types.ModuleType:
+        requested.append(name)
+        return real_import(name, package)
+
+    def no_lookups(name: str, package: str | None = None) -> None:
+        requested.append(f"find_spec {name}")
+
+    monkeypatch.setattr(importlib, "import_module", spy)
+    monkeypatch.setattr(importlib.util, "find_spec", no_lookups)
+    source = (
+        "import this as t\nimport unittest.__main__ as m\nfrom tkinter import x\n"
+        "from json import tool\nfrom pydantic import not_there\nimport antigravity as a\n"
+    )
+
+    found = check(source)
+
+    assert all(name in {"json", "pydantic"} for name in requested), requested
+    assert len(found) >= 6
+
+
+def test_an_expression_too_deep_to_parse_fails_the_check() -> None:
+    found = check("x = " + "+".join(["1"] * 100_000) + "\n")
+
+    assert len(found) == 1
+    assert "cannot be" in found[0]
+
+
+def test_a_directory_named_like_a_python_file_fails_the_guard(tmp_path: Path) -> None:
+    write_pack(tmp_path, {"notes.py/readme.md": "x\n", "policy.py": "X = 1\n"})
+
+    result = check_pack_code(tmp_path, LANE_EFFISQL)
+
+    assert result.detail.splitlines() == [
+        "src/goaly/harness/packs/effisql/notes.py:1: not a regular Python file"
+    ]
+
+
+def test_violations_are_listed_by_file_then_line(tmp_path: Path) -> None:
+    write_pack(
+        tmp_path,
+        {"a.py": "\n" * 8 + "import os\nimport sys\n", "b.py": "open('x')\n"},
+    )
+
+    result = check_pack_code(tmp_path, LANE_EFFISQL)
+
+    assert result.detail.splitlines() == [
+        "src/goaly/harness/packs/effisql/a.py:9: import of os is not allowed",
+        "src/goaly/harness/packs/effisql/a.py:10: import of sys is not allowed",
+        "src/goaly/harness/packs/effisql/b.py:1: banned builtin open",
+    ]
+
+
+def test_a_module_the_pack_imported_is_out_of_reach_as_a_value_too(tmp_path: Path) -> None:
+    write_pack(
+        tmp_path,
+        {
+            "helpers.py": "import json\nLIMIT = 3\n",
+            "policy.py": "from . import helpers\nhelpers.LIMIT\nuse(helpers)\n",
+        },
+    )
+
+    result = check_pack_code(tmp_path, LANE_EFFISQL)
+
+    assert result.detail.splitlines() == [
+        "src/goaly/harness/packs/effisql/policy.py:3: the module helpers used as a value; "
+        "only its attributes may be read"
+    ]
+
+
+@pytest.mark.parametrize(
+    ("source", "problem"),
+    [
+        ("from goaly.harness.core.logs import not_there\n", "cannot import not_there from"),
+        ("import pydantic\nf(pydantic.TypeAdapter)\n", "TypeAdapter used other than called"),
+        ("import json\njson.loads = f\n", "only its attributes may be read"),  # Not written.
+        ("class A(base()):\n    pass\n", None),
+        ("from dataclasses import make_dataclass\nmake_dataclass('C', [spec])\n", "literally"),
+    ],
+)
+def test_the_rules_edges(source: str, problem: str | None) -> None:
+    found = check(source)
+
+    if problem is None:
+        assert found == []
+    else:
+        assert any(problem in line for line in found), found
+
+
+@pytest.mark.parametrize(
+    "source",
+    ["from goaly.harness.core.tools import Tool\n", "from json import loads\n"],
+)
+def test_a_listed_module_that_fails_to_import_is_refused(
+    monkeypatch: pytest.MonkeyPatch, source: str
+) -> None:
+    monkeypatch.setattr(allowlist, "_import", lambda module: "SyntaxError")
+
+    assert check(source)[0].endswith(": SyntaxError")
+
+
+def test_the_importer_refuses_any_module_off_the_table() -> None:
+    assert allowlist._import("this") == "it is not in the table"
+    assert "this" not in sys.modules or sys.modules["this"] is not None
+
+
+@pytest.mark.parametrize(("raised", "outcome"), [(SystemExit, "SystemExit"), (ValueError, "")])
+def test_an_import_that_raises_anything_is_a_reason_not_a_crash(
+    monkeypatch: pytest.MonkeyPatch, raised: type[BaseException], outcome: str
+) -> None:
+    def failing(name: str, package: str | None = None) -> types.ModuleType:
+        raise raised("boom")
+
+    monkeypatch.setattr(importlib, "import_module", failing)
+
+    assert allowlist._import("json") == (outcome or "ValueError")
+
+
+def test_an_interrupt_while_importing_is_not_swallowed(monkeypatch: pytest.MonkeyPatch) -> None:
+    def interrupted(name: str, package: str | None = None) -> types.ModuleType:
+        raise KeyboardInterrupt
+
+    monkeypatch.setattr(importlib, "import_module", interrupted)
+
+    with pytest.raises(KeyboardInterrupt):
+        allowlist._import("json")
+
+
+def test_code_too_deep_to_check_fails_the_check(monkeypatch: pytest.MonkeyPatch) -> None:
+    def too_deep(self: object, node: object) -> None:
+        raise RecursionError
+
+    monkeypatch.setattr(allowlist._Checker, "visit", too_deep)
+
+    assert check("x = 1\n") == ["policy.py:1: cannot be checked: it nests too deeply"]
+
+
+def test_a_submodule_another_pack_file_imported_is_bound_as_a_module(tmp_path: Path) -> None:
+    write_pack(
+        tmp_path,
+        {
+            "helpers.py": "from collections import abc\n",
+            "policy.py": "from .helpers import abc\nabc.Sequence\nuse(abc)\n",
+        },
+    )
+
+    result = check_pack_code(tmp_path, LANE_EFFISQL)
+
+    assert result.detail.splitlines() == [
+        "src/goaly/harness/packs/effisql/policy.py:3: the module abc used as a value; "
+        "only its attributes may be read"
+    ]
+
+
+# P9, from the final review: a pydantic config built at run time.
+@pytest.mark.parametrize(
+    ("source", "problem"),
+    [
+        (
+            "import typing\nimport pydantic\ndef hidden(name: str) -> str:\n"
+            "    return 'x' + name\nclass M(pydantic.BaseModel):\n"
+            "    model_config = {'from_' + 'attributes': True, 'alias_generator': hidden}\n"
+            "    client: typing.Any = None\nM.model_validate(obj).client\n",
+            "policy.py:6: model_config must be a ConfigDict(...) of literals",
+        ),
+        (
+            "from pydantic import BaseModel, ConfigDict, Field\nclass M(BaseModel):\n"
+            "    model_config = ConfigDict(**{'from_' + 'attributes': True})\n"
+            "    client: int = Field(**{'validation_' + 'alias': 'cl' + 'ient'})\n",
+            "keyword arguments unpacked with **",
+        ),
+        ("f(**options)\n", "policy.py:1: keyword arguments unpacked with **"),
+        (
+            "from pydantic import BaseModel, ConfigDict\nclass M(BaseModel):\n"
+            "    model_config = ConfigDict(frozen=flag)\n",
+            "model_config must be a ConfigDict(...) of literals",
+        ),
+        (
+            "from pydantic import BaseModel, ConfigDict\nclass M(BaseModel):\n"
+            "    model_config = make_config()\n",
+            "model_config must be a ConfigDict(...) of literals",
+        ),
+        ("from pydantic import AliasGenerator\n", "banned name AliasGenerator"),
+        ("from pydantic import ConfigDict\nConfigDict(alias_generator=f)\n", "alias_generator"),
+    ],
+)
+def test_a_pydantic_config_built_at_run_time_is_refused(source: str, problem: str) -> None:
+    found = check(source)
+
+    assert any(problem in line for line in found), found

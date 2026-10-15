@@ -22,6 +22,10 @@ commit's snapshot. Rules come from goaly.rsi.decision.
 the gateway, git or an evaluation that failed or came back incomplete, aborts the experiment
 (DECISION_ABORTED) and queues its hypothesis again.
 
+A winner that fails its confirmation leaves the best as it was. The candidates it outranked
+were already queued again, and are rebuilt on the unchanged best next round, rather than
+confirmed in turn: a design choice, since the spec is silent and a rebuild costs no val run.
+
 **Resuming** (spec §8.7). The ledger holds each experiment's latest state, and a pending record's
 steps so far all passed. Given the round's records, :meth:`RoundRunner.run` resumes each pending
 experiment at its next step, and starts no new one, so no experiment is duplicated. The lane
@@ -30,20 +34,29 @@ first aborts the pending experiments that had no commit yet (goaly.rsi.resume).
 
 import asyncio
 import enum
+import functools
 import hashlib
+import json
 import logging
 import secrets
-from collections.abc import Callable, Sequence
+import time
+from collections.abc import Callable, Collection, Sequence
 from dataclasses import dataclass, field
 from datetime import UTC, datetime
-from typing import Protocol
+from typing import Final, Protocol
 
 from google.protobuf.timestamp_pb2 import Timestamp
 from pydantic import BaseModel, ConfigDict, Field, model_validator
 
 from goaly.bench.effisql.grading import Mode
 from goaly.bench.effisql.grading_pool import Priority
-from goaly.bench.effisql.metrics import GradeTable, Scoring, solved, task_credits
+from goaly.bench.effisql.metrics import (
+    SCORED_STATUSES,
+    GradeTable,
+    Scoring,
+    solved,
+    task_credits,
+)
 from goaly.contracts.gen.experiment_pb2 import (
     DECISION_ABORTED,
     DECISION_ACCEPTED,
@@ -54,7 +67,6 @@ from goaly.contracts.gen.experiment_pb2 import (
     IMPLEMENTER_EXIT_SUBMITTED,
     REJECTION_REASON_GUARD_FAILED,
     REJECTION_REASON_IMPLEMENTATION_FAILED,
-    REJECTION_REASON_NO_SCREEN_GAIN,
     REJECTION_REASON_OUTRANKED,
     DiffStats,
     ExperimentRecord,
@@ -66,11 +78,12 @@ from goaly.contracts.gen.experiment_pb2 import (
     RejectionReason,
 )
 from goaly.contracts.gen.llm_call_pb2 import CallPurpose, Usage
-from goaly.contracts.gen.result_pb2 import TaskResult
+from goaly.contracts.gen.result_pb2 import (
+    TASK_ERROR_TYPE_ENVIRONMENT,
+    TASK_ERROR_TYPE_LLM,
+    TaskResult,
+)
 from goaly.contracts.gen.task_pb2 import (
-    GRADE_STATUS_GRADED,
-    GRADE_STATUS_PREDICTION_FAILED,
-    GRADE_STATUS_TIMEOUT,
     SPLIT_TRAIN,
     SPLIT_VAL,
     Split,
@@ -79,7 +92,7 @@ from goaly.contracts.gen.trajectory_pb2 import Trajectory
 from goaly.harness.core.llm import LlmClient
 from goaly.harness.core.llm_errors import LlmError
 from goaly.rsi import decision
-from goaly.rsi.analyst import Analysis, AnalystInput, analyze
+from goaly.rsi.analyst import Analysis, AnalysisSkipped, AnalystInput, analyze
 from goaly.rsi.decision import CostStats, DecisionConfig, Measured, Verdict
 from goaly.rsi.git import run_git
 from goaly.rsi.hypothesis_queue import HypothesisQueue
@@ -87,7 +100,14 @@ from goaly.rsi.lanes import lane_info
 from goaly.rsi.ledger import Ledger
 from goaly.rsi.lesson_writer import write_lesson
 from goaly.rsi.lessons import LessonStore
-from goaly.rsi.resume import UsageSource, abort_record, merge_usage
+from goaly.rsi.resume import (
+    MAX_REQUEUES,
+    UsageSource,
+    abort_record,
+    finish,
+    merge_usage,
+    timestamp,
+)
 from goaly.rsi.structured import StructuredOutputError
 from goaly.rsi.workspace import Workspace, Worktree
 
@@ -105,11 +125,17 @@ __all__ = [
     "RoundOutcome",
     "RoundRunner",
     "lesson_id",
+    "tasks_digest",
 ]
 
 _logger = logging.getLogger(__name__)
 
-_SCORED = frozenset({GRADE_STATUS_GRADED, GRADE_STATUS_PREDICTION_FAILED, GRADE_STATUS_TIMEOUT})
+# A task the infrastructure failed, by the container's own word, until the host counts them.
+_INFRA_ERRORS = frozenset({TASK_ERROR_TYPE_LLM, TASK_ERROR_TYPE_ENVIRONMENT})
+
+type _Key = tuple[str, Split.ValueType, tuple[str, ...], tuple[int, ...]]
+_ACCEPT_RETRIES_S: Final = (1.0, 2.0, 4.0, 8.0, 16.0)
+_REASON_CHARS: Final = 300  # How much of an infrastructure error an abort reason keeps.
 
 
 class EvalPhase(enum.StrEnum):
@@ -145,6 +171,13 @@ class EvaluationRequest:
     seeds: tuple[int, ...]
     run_id: str
     mode: Mode = Mode.DEV  # RSI grades in dev mode; official mode is for the final runs.
+    # The pack's tree at ``commit``: the harness identity, which the host run's harness hash
+    # must match, as T06's planner computes it from the snapshot's pack directory.
+    pack_tree: str = ""
+    # sha256 of the split, the task IDs and the seeds: the expected set, which the host run's
+    # plan must match exactly. The run's config hash and the dataset's task digests are the
+    # host planner's, computed from the snapshot and the dataset, never from solve/ (V27).
+    tasks_digest: str = ""
 
     @property
     def priority(self) -> Priority:
@@ -153,12 +186,23 @@ class EvaluationRequest:
 
 @dataclass(frozen=True, slots=True)
 class Evaluation:
-    """An evaluation's graded results, one per task and seed, and its cost statistics, which
-    come from the LLM proxy's records and the host's clock (V27), cached tasks included.
+    """An evaluation's graded results, one per task and seed, its cost statistics, and the
+    tasks and seeds the infrastructure failed.
+
+    ``stats`` must be host-verified (V27, controller ruling): tokens and cost are the LLM
+    proxy's own run totals divided by the tasks evaluated, and wall time is the host's clock
+    around the solve segments, a cached task bringing the host numbers stored with it. The
+    solve container's per-task numbers are informational only and never reach a decision.
+
+    ``infra_failed`` names the (task, seed) pairs the infrastructure failed, as the host saw it:
+    proxy records whose retries ran out, and environment failures. None until the host can name
+    them; the round then takes the results' LLM and environment errors instead. The round drops
+    a failed task from every version it compares, and aborts beyond ``max_infra_share``.
     """
 
     results: Sequence[TaskResult]
     stats: CostStats
+    infra_failed: Collection[tuple[str, int]] | None = None
 
 
 class Evaluator(Protocol):
@@ -209,6 +253,9 @@ class RoundConfig(BaseModel):
     validation_seed: int = 0
     confirmation_seed: int = 1
     decision: DecisionConfig = DecisionConfig()
+    # Above this share of tasks failed by the infrastructure, an evaluation aborts its experiment.
+    max_infra_share: float = Field(default=0.2, ge=0, le=1)
+    max_requeues: int = Field(default=MAX_REQUEUES, ge=0)
 
     @model_validator(mode="after")
     def _check_seeds(self) -> "RoundConfig":
@@ -268,6 +315,10 @@ class _AbortedError(Exception):
     """An experiment cannot go on for a reason that says nothing about its hypothesis."""
 
 
+class _RoundAbortedError(Exception):
+    """The round could not start for a reason that says nothing about any hypothesis."""
+
+
 class RoundRunner:
     """Runs a lane's rounds, one :meth:`run` at a time."""
 
@@ -275,9 +326,22 @@ class RoundRunner:
         self._deps = deps
         self._config = config
         self._info = lane_info(deps.lane)
+        # The round's evaluations, by what they evaluate: the k candidates share the best's and
+        # v0's references, and the confirmation reuses the validation's.
+        self._evaluations: dict[_Key, asyncio.Future[Evaluation]] = {}
 
     async def run(self, round_no: int, *, resume: Sequence[ExperimentRecord] = ()) -> RoundOutcome:
         """Run round ``round_no``, or resume it from its experiments' latest records."""
+        try:
+            return await self._run(round_no, resume)
+        finally:
+            pending = list(self._evaluations.values())
+            self._evaluations.clear()
+            for evaluation in pending:
+                evaluation.cancel()  # Nothing keeps evaluating after the round, as at a deadline.
+            await asyncio.gather(*pending, return_exceptions=True)
+
+    async def _run(self, round_no: int, resume: Sequence[ExperimentRecord]) -> RoundOutcome:
         best = await asyncio.to_thread(self._best)
         records = list(resume)
         if not records:
@@ -306,12 +370,12 @@ class RoundRunner:
         analyst_usage = Usage()
         if len(await asyncio.to_thread(queue.pending)) < k:
             analysis = await self._analyze(round_no, best)
-            if isinstance(analysis, str):
+            analyst_usage = analysis.usage  # Charged to this round's experiments, if any.
+            if isinstance(analysis, AnalysisSkipped):
                 if not await asyncio.to_thread(queue.pending):
-                    return [], analysis
+                    return [], analysis.reason
             else:
-                analyst_usage = analysis.usage
-                await asyncio.to_thread(queue.push, analysis.hypotheses)
+                await finish(functools.partial(queue.push, analysis.hypotheses))
         chosen = (await asyncio.to_thread(queue.pending))[:k]
         shares = _split_usage(analyst_usage, len(chosen))
         records = []
@@ -332,11 +396,11 @@ class RoundRunner:
                 )
             await self._save(record)
             records.append(record)
-        await asyncio.to_thread(queue.remove, [h.hypothesis_id for h in chosen])
+        await finish(functools.partial(queue.remove, [h.hypothesis_id for h in chosen]))
         return records, ""
 
-    async def _analyze(self, round_no: int, best: str) -> Analysis | str:
-        """The round's analysis, or why it was skipped. An LlmError aborts the round."""
+    async def _analyze(self, round_no: int, best: str) -> Analysis | AnalysisSkipped:
+        """The round's analysis, or its skip. An LlmError aborts the round."""
         results, trajectories = await asyncio.to_thread(self._train_history, best)
         queued = await asyncio.to_thread(self._deps.queue.pending)
         analyst_input = self._deps.analyst_input(results, trajectories, queued)
@@ -345,7 +409,7 @@ class RoundRunner:
             analysis = await analyze(self._deps.llm, analyst_input, round_id=round_id)
         except LlmError as error:
             raise _RoundAbortedError(f"the analyst's call failed: {error}") from error
-        return analysis if isinstance(analysis, Analysis) else analysis.reason
+        return analysis
 
     # Steps 2-5, for one experiment.
 
@@ -364,7 +428,7 @@ class RoundRunner:
             await self._abort(record, str(error))
         except Exception as error:  # Docker, git or the evaluator: infrastructure.
             _logger.exception("experiment %s failed", record.experiment_id)
-            await self._abort(record, f"infrastructure failure: {type(error).__name__}: {error}")
+            await self._abort(record, _infrastructure(error))
 
     async def _implement(self, record: ExperimentRecord) -> None:
         if record.candidate_commit:
@@ -406,13 +470,10 @@ class RoundRunner:
 
     async def _screen(self, record: ExperimentRecord, best: str) -> None:
         tasks = await asyncio.to_thread(self._screen_tasks, record, best)
-        if not tasks:
-            await self._reject(
-                record, [REJECTION_REASON_NO_SCREEN_GAIN], "screen: no train task to screen on"
-            )
-            return
+        if not tasks:  # Setup or infrastructure: v0's train results are missing.
+            raise _AbortedError("no train results to screen on")
         seeds = (self._config.screen_seed,)
-        theirs, ours = await asyncio.gather(
+        theirs, v0, ours = await asyncio.gather(
             self._measure(
                 EvalPhase.REFERENCE,
                 best,
@@ -420,6 +481,14 @@ class RoundRunner:
                 tasks,
                 seeds,
                 f"{record.experiment_id}-screen-best",
+            ),
+            self._measure(
+                EvalPhase.REFERENCE,
+                self._deps.v0_commit,
+                SPLIT_TRAIN,
+                tasks,
+                seeds,
+                f"{record.experiment_id}-screen-v0",
             ),
             self._measure(
                 EvalPhase.SCREEN,
@@ -430,16 +499,24 @@ class RoundRunner:
                 f"{record.experiment_id}-screen",
             ),
         )
-        await self._apply(record, "screening", decision.screen(SPLIT_TRAIN, theirs, ours))
+        (theirs_m, v0_m, ours_m), dropped = self._comparable(
+            "screen", tasks, [theirs], [v0], [ours]
+        )
+        config = _config_of(record)
+        verdict = decision.screen(SPLIT_TRAIN, theirs_m, ours_m, v0=v0_m, config=config)
+        await self._apply(record, "screening", verdict, dropped)
 
     async def _validate(self, record: ExperimentRecord, best: str) -> None:
         theirs, v0, ours = await asyncio.gather(
             self._reference_val(best, record.experiment_id, "best"),
             self._reference_val(self._deps.v0_commit, record.experiment_id, "v0"),
-            self._candidate_val(record, self._config.validation_seed, EvalPhase.VALIDATION),
+            self._candidate_results(record, self._config.validation_seed, EvalPhase.VALIDATION),
         )
-        verdict = decision.validate(SPLIT_VAL, theirs, ours, v0=v0, config=self._config.decision)
-        await self._apply(record, "validation", verdict)
+        (theirs_m, v0_m, ours_m), dropped = self._comparable(
+            "validation", self._deps.val_ids, [theirs], [v0], [ours]
+        )
+        verdict = decision.validate(SPLIT_VAL, theirs_m, ours_m, v0=v0_m, config=_config_of(record))
+        await self._apply(record, "validation", verdict, dropped)
 
     # Steps 6-7.
 
@@ -456,21 +533,28 @@ class RoundRunner:
         )
         for name in outranked:
             loser = passing[name]
+            # Queued first, so a crash before the rejection is saved loses no hypothesis.
+            push = functools.partial(self._deps.queue.push, [loser.hypothesis])
+            await finish(push)
             await self._reject(
                 loser,
                 [REJECTION_REASON_OUTRANKED],
                 f"outranked by {winner}, whose validation gain is larger",
             )
-            await asyncio.to_thread(self._deps.queue.push, [loser.hypothesis])
+        record = passing[winner]
         try:
-            await self._confirm(passing[winner])
-        except _AbortedError as error:
-            await self._abort(passing[winner], str(error))
-        except Exception as error:  # Infrastructure, as in _through_validation.
-            _logger.exception("experiment %s failed", winner)
-            await self._abort(
-                passing[winner], f"infrastructure failure: {type(error).__name__}: {error}"
-            )
+            await self._confirm(record)
+        except Exception as error:
+            tag = await asyncio.to_thread(self._deps.workspace.best_commit, self._deps.lane)
+            if tag == record.candidate_commit:
+                # The tag moved, so the candidate is the best: never abort it. The lane fails,
+                # and its restart records the acceptance (goaly.rsi.resume.reconcile_best).
+                raise
+            if isinstance(error, _AbortedError):
+                await self._abort(record, str(error))
+            else:  # Infrastructure, as in _through_validation.
+                _logger.exception("experiment %s failed", winner)
+                await self._abort(record, _infrastructure(error))
 
     async def _confirm(self, record: ExperimentRecord) -> None:
         best = record.parent_version
@@ -482,19 +566,24 @@ class RoundRunner:
                 self._candidate_results(record, seeds[0], EvalPhase.VALIDATION),
                 self._candidate_results(record, seeds[1], EvalPhase.CONFIRMATION),
             )
-            ours = Measured.from_results(
-                [*first.results, *second.results], CostStats.combine([first.stats, second.stats])
+            (theirs_m, v0_m, ours_m), dropped = self._comparable(
+                "confirmation", self._deps.val_ids, [theirs], [v0], [first, second]
             )
-            guardrail = record.validation.effective_min_delta > self._config.decision.min_delta
             verdict = decision.confirm(
-                SPLIT_VAL, theirs, ours, v0=v0, config=self._config.decision, guardrail=guardrail
+                SPLIT_VAL,
+                theirs_m,
+                ours_m,
+                v0=v0_m,
+                config=_config_of(record),  # The thresholds recorded when the round began.
+                validation=record.validation,
             )
-            await self._apply(record, "confirmation", verdict)
+            await self._apply(record, "confirmation", verdict, dropped)
             if record.decision != DECISION_PENDING:
                 return
         # A pending record whose confirmation passed: the tag moves first, so after a crash the
         # lane finds the tag on this commit and records the acceptance (goaly.rsi.resume).
-        await asyncio.to_thread(shielded_accept, self._deps, record)
+        # Run to the end even if the round is cancelled meanwhile, as at the deadline.
+        await finish(lambda: _accept(self._deps, record))
 
     # Step 8.
 
@@ -509,12 +598,14 @@ class RoundRunner:
         except (LlmError, StructuredOutputError) as error:
             _logger.warning("no lesson for %s: %s", record.experiment_id, error)
             return
-        await asyncio.to_thread(
-            self._deps.lessons.add,
-            name,
-            self._deps.lane,
-            reply.value.lesson,
-            [record.experiment_id],
+        await finish(
+            functools.partial(
+                self._deps.lessons.add,
+                name,
+                self._deps.lane,
+                reply.value.lesson,
+                [record.experiment_id],
+            )
         )
         self._add_usage(record)
         await self._save(record)
@@ -564,7 +655,13 @@ class RoundRunner:
             for task in dict.fromkeys(record.hypothesis.target_instance_ids)
             if task in credits and task not in solved_tasks
         ][: self._config.screen_failures]
-        # The solved tasks are drawn by a hash of the experiment, so a resume draws the same.
+        # The solved tasks are the best's own when it has run enough of them; otherwise its
+        # ancestors' (the train history's fallback), which is harmless for scoring, since the
+        # best is measured again on them as the reference. They are drawn by a hash of the
+        # experiment, so a resume draws the same.
+        own = {r.instance_id for r in self._deps.evaluator.known_train(best)[0]}
+        if len(own & solved_tasks) >= self._config.screen_solved:
+            solved_tasks = frozenset(own & solved_tasks)
         draw = sorted(solved_tasks, key=lambda task: _hash(record.experiment_id, task))
         return (*targets, *draw[: self._config.screen_solved])
 
@@ -576,9 +673,27 @@ class RoundRunner:
         tasks: Sequence[str],
         seeds: Sequence[int],
         run_id: str,
-    ) -> Measured:
-        evaluation = await self._evaluate(phase, commit, split, tasks, seeds, run_id)
-        return Measured.from_results(evaluation.results, evaluation.stats)
+    ) -> Evaluation:
+        return await self._evaluate(phase, commit, split, tasks, seeds, run_id)
+
+    def _comparable(
+        self, name: str, tasks: Sequence[str], *versions: Sequence[Evaluation]
+    ) -> tuple[list[Measured], int]:
+        """Measure each version, given as its evaluations, on the tasks the infrastructure
+        failed in none of them, and return how many tasks were dropped. Beyond
+        ``max_infra_share`` of the tasks, the experiment aborts.
+        """
+        failed = {task for version in versions for part in version for task in _failed(part)}
+        if failed and len(failed) > self._config.max_infra_share * len(tasks):
+            raise _AbortedError(
+                f"the {name}: the infrastructure failed {len(failed)} of {len(tasks)} tasks"
+            )
+        measured = []
+        for version in versions:
+            results = [r for part in version for r in part.results if r.instance_id not in failed]
+            stats = CostStats.combine([part.stats for part in version])
+            measured.append(Measured.from_results(results, stats))
+        return measured, len(failed)
 
     async def _evaluate(
         self,
@@ -589,15 +704,21 @@ class RoundRunner:
         seeds: Sequence[int],
         run_id: str,
     ) -> Evaluation:
-        tree = await asyncio.to_thread(self._tree, commit)
-        request = EvaluationRequest(phase, commit, tree, split, tuple(tasks), tuple(seeds), run_id)
-        evaluation = await self._deps.evaluator.evaluate(request)
+        key: _Key = (commit, split, tuple(tasks), tuple(seeds))
+        shared = self._evaluations.get(key)
+        if shared is None or (shared.done() and (shared.cancelled() or shared.exception())):
+            # Kept before its first await, so a concurrent request for the same key shares it.
+            shared = asyncio.ensure_future(self._request(phase, key, run_id))
+            self._evaluations[key] = shared
+        evaluation = await asyncio.shield(shared)  # One waiter's cancellation spares the rest.
         results = list(evaluation.results)
-        got = {(result.instance_id, result.seed) for result in results}
-        missing = {(task, seed) for task in tasks for seed in seeds} - got
-        if missing:
+        expected = {(task, seed) for task in tasks for seed in seeds}
+        got = [(result.instance_id, result.seed) for result in results]
+        if len(got) != len(set(got)) or set(got) != expected:
+            missing, extra = len(expected - set(got)), len(set(got) - expected)
             raise _AbortedError(
-                f"the {phase} evaluation {run_id} lacks {len(missing)} task results"
+                f"the {phase} evaluation {run_id} returned the wrong results: {missing} missing,"
+                f" {extra} unexpected, {len(got) - len(set(got))} repeated"
             )
         try:
             GradeTable.from_results(results)  # Every result graded and scored, once.
@@ -607,7 +728,7 @@ class RoundRunner:
             ) from error
         return evaluation
 
-    async def _reference_val(self, commit: str, experiment_id: str, who: str) -> Measured:
+    async def _reference_val(self, commit: str, experiment_id: str, who: str) -> Evaluation:
         run_id = f"{experiment_id}-val-{who}"
         return await self._measure(
             EvalPhase.REFERENCE,
@@ -626,15 +747,13 @@ class RoundRunner:
             phase, record.candidate_commit, SPLIT_VAL, self._deps.val_ids, (seed,), run_id
         )
 
-    async def _candidate_val(
-        self, record: ExperimentRecord, seed: int, phase: EvalPhase
-    ) -> Measured:
-        evaluation = await self._candidate_results(record, seed, phase)
-        return Measured.from_results(evaluation.results, evaluation.stats)
-
-    async def _apply(self, record: ExperimentRecord, phase_field: str, verdict: Verdict) -> None:
+    async def _apply(
+        self, record: ExperimentRecord, phase_field: str, verdict: Verdict, dropped: int = 0
+    ) -> None:
         getattr(record, phase_field).CopyFrom(verdict.phase)
         text = decision.describe(phase_field, verdict)
+        if dropped:
+            text += f"; {dropped} tasks left out: the infrastructure failed them"
         record.decision_reason = "; ".join(filter(None, [record.decision_reason, text]))
         if verdict.passed:
             await self._save(record)
@@ -655,8 +774,16 @@ class RoundRunner:
     async def _abort(self, record: ExperimentRecord, reason: str) -> None:
         deps = self._deps
         usage = deps.usage(record.experiment_id)
-        await asyncio.to_thread(
-            abort_record, deps.ledger, deps.queue, record, reason, now=deps.clock(), usage=usage
+        await finish(
+            lambda: abort_record(
+                deps.ledger,
+                deps.queue,
+                record,
+                reason,
+                now=deps.clock(),
+                usage=usage,
+                max_requeues=self._config.max_requeues,
+            )
         )
 
     def _add_usage(self, record: ExperimentRecord) -> None:
@@ -675,29 +802,63 @@ class RoundRunner:
             stats.deletions += int(removed) if removed.isdigit() else 0
         return stats
 
-    def _tree(self, commit: str) -> str:
-        return run_git(["rev-parse", f"{commit}^{{tree}}"], cwd=self._deps.workspace.repo).strip()
+    async def _request(self, phase: EvalPhase, key: _Key, run_id: str) -> Evaluation:
+        commit, split, tasks, seeds = key
+        tree, pack_tree = await asyncio.to_thread(self._trees, commit)
+        request = EvaluationRequest(
+            phase,
+            commit,
+            tree,
+            split,
+            tasks,
+            seeds,
+            run_id,
+            pack_tree=pack_tree,
+            tasks_digest=tasks_digest(split, tasks, seeds),
+        )
+        return await self._deps.evaluator.evaluate(request)
+
+    def _trees(self, commit: str) -> tuple[str, str]:
+        """The commit's tree and its pack directory's tree."""
+        pack = self._info.pack_dirs[0]
+        trees = run_git(
+            ["rev-parse", f"{commit}^{{tree}}", f"{commit}:{pack}"], cwd=self._deps.workspace.repo
+        ).split()
+        return trees[0], trees[1]
 
     async def _save(self, record: ExperimentRecord) -> None:
-        await asyncio.to_thread(self._deps.ledger.record_experiment, record)
+        # Every ledger write runs to its end, even if the round is cancelled meanwhile.
+        await finish(lambda: self._deps.ledger.record_experiment(record))
 
     def _now(self) -> Timestamp:
-        return _timestamp(self._deps.clock())
+        return timestamp(self._deps.clock())
 
 
-class _RoundAbortedError(Exception):
-    """The round could not start for a reason that says nothing about any hypothesis."""
-
-
-def shielded_accept(deps: RoundDeps, record: ExperimentRecord) -> None:
+def _accept(deps: RoundDeps, record: ExperimentRecord) -> None:
     """Move the best tag to the record's commit, then record it accepted; in one thread, so a
     cancelled round cannot stop it between the two.
     """
     deps.workspace.set_best(deps.lane, record.candidate_commit, expected=record.parent_version)
     record.decision = DECISION_ACCEPTED
-    record.finished_at.CopyFrom(_timestamp(deps.clock()))
+    record.finished_at.CopyFrom(timestamp(deps.clock()))
     merge_usage(record, deps.usage(record.experiment_id))
-    deps.ledger.record_experiment(record)
+    # The tag has moved: the candidate is the best, so the record must say so. A failed write is
+    # retried with backoff; one still failing propagates, and reconcile_best records it later.
+    for pause in (*_ACCEPT_RETRIES_S, None):
+        try:
+            deps.ledger.record_experiment(record)
+            return
+        except Exception:
+            if pause is None:
+                raise
+            _logger.warning("retrying the acceptance of %s", record.experiment_id, exc_info=True)
+            time.sleep(pause)
+
+
+def tasks_digest(split: Split.ValueType, tasks: Sequence[str], seeds: Sequence[int]) -> str:
+    """sha256 of the split, the tasks and the seeds an evaluation expects, as the request says."""
+    text = json.dumps([Split.Name(split), sorted(tasks), sorted(seeds)], separators=(",", ":"))
+    return hashlib.sha256(text.encode()).hexdigest()
 
 
 def _split_usage(usage: Usage, parts: int) -> list[Usage]:
@@ -725,9 +886,28 @@ def _first_seed(results: Sequence[TaskResult]) -> list[TaskResult]:
     """
     chosen: dict[str, TaskResult] = {}
     for result in sorted(results, key=lambda r: r.seed):
-        if result.grade.status in _SCORED:
+        if result.grade.status in SCORED_STATUSES:  # T07's: the statuses its tables score.
             chosen.setdefault(result.instance_id, result)
     return list(chosen.values())
+
+
+def _failed(evaluation: Evaluation) -> set[str]:
+    """The tasks the infrastructure failed: the host's account, or the results' own until then."""
+    if evaluation.infra_failed is not None:
+        return {task for task, _ in evaluation.infra_failed}
+    return {r.instance_id for r in evaluation.results if r.error_type in _INFRA_ERRORS}
+
+
+def _config_of(record: ExperimentRecord) -> DecisionConfig:
+    """The decision thresholds the record carries, set when its round began."""
+    return DecisionConfig.from_thresholds(record.thresholds)
+
+
+def _infrastructure(error: BaseException) -> str:
+    """An abort reason: the error's type and the start of its first line, never raw output."""
+    text = str(error).strip()
+    first = text.splitlines()[0] if text else ""
+    return f"infrastructure failure: {type(error).__name__}: {first[:_REASON_CHARS]}"
 
 
 def _hash(experiment_id: str, task: str) -> str:
@@ -736,9 +916,3 @@ def _hash(experiment_id: str, task: str) -> str:
 
 def _exit_name(exit_: ImplementerExit.ValueType) -> str:
     return ImplementerExit.Name(exit_)
-
-
-def _timestamp(moment: datetime) -> Timestamp:
-    stamp = Timestamp()
-    stamp.FromDatetime(moment)
-    return stamp

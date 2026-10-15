@@ -29,10 +29,18 @@ from goaly.harness.core.llm import CallTags, LlmClient
 from goaly.harness.core.llm_models import IMPROVEMENT_MODEL, ModelParams
 from goaly.rsi.structured import StructuredReply, complete_structured
 
-__all__ = ["LESSON_MAX_TOKENS", "LessonAnswer", "lesson_prompt", "write_lesson"]
+__all__ = [
+    "LESSON_ATTEMPT_TIMEOUT_S",
+    "LESSON_MAX_TOKENS",
+    "LessonAnswer",
+    "lesson_prompt",
+    "write_lesson",
+]
 
 # GLM can reason past 12K tokens before it answers (T19), so a lesson call may use 24K.
 LESSON_MAX_TOKENS: Final = 24_000
+# Each attempt's limit, as the analyst's: 24K tokens outlast the client's default 300 s under load.
+LESSON_ATTEMPT_TIMEOUT_S: Final = 900.0
 _SUMMARY_CHARS: Final = 600
 
 _SYSTEM: Final = """\
@@ -107,6 +115,7 @@ async def write_lesson(
         lesson_prompt(record),
         LessonAnswer,
         params=ModelParams(max_tokens=LESSON_MAX_TOKENS),
+        attempt_timeout_s=LESSON_ATTEMPT_TIMEOUT_S,
     )
 
 

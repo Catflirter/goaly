@@ -26,6 +26,7 @@ from goaly.bench.effisql.grader import (
     Psycopg2Timestamptz,
     QueryError,
     QueryTimeoutError,
+    ResourceError,
     ResultDigest,
     TimingError,
     Watchdog,
@@ -391,6 +392,13 @@ class FakeCursor:
     def fetchone(self) -> Row | None:
         return self._row
 
+    @property
+    def description(self) -> list[Any] | None:
+        if self._row is None:
+            return None
+        oids = [psycopg.adapters.types[name].oid for name in self._row]
+        return [type("Column", (), {"type_code": oid})() for oid in [*oids, 1]]
+
 
 class FakeConn:
     """Enough of psycopg.Connection for PgSession: canned results and errors per query."""
@@ -533,6 +541,16 @@ class TestPgSession:
                 session.digest("SELECT 1")
             assert conn.statements[-2:] == RESET
             assert isinstance(expected("x"), GradingFailure)
+
+    def test_running_out_of_resources_is_the_graders(self) -> None:
+        error = psycopg.errors.OutOfMemory("could not resize shared memory segment")
+        conn = FakeConn(rows=raising(error))
+        with (
+            session_on(conn) as session,
+            pytest.raises(ResourceError, match="ran out of resources"),
+        ):
+            session.digest("SELECT 1")
+        assert issubclass(ResourceError, GraderError)
 
     def test_a_dead_connection_is_a_grader_error_every_time(self) -> None:
         conn = FakeConn()
@@ -697,3 +715,11 @@ def test_timing_needs_a_run(runs: int) -> None:
         time_prediction(lambda: 1.0, base_ms=1.0, runs=runs)
     with pytest.raises(ValueError, match="at least 1 run"):
         time_base(lambda: 1.0, runs=runs)
+
+
+def test_column_types_names_each_column_without_fetching() -> None:
+    conn = FakeConn(explain=lambda _: ("numeric", "date", "bpchar"))
+    with session_on(conn) as session:
+        types = session.column_types("SELECT 1;")
+    assert types == ["numeric", "date", "bpchar", "unknown"]
+    assert conn.statements[1] == "SELECT * FROM (SELECT 1) AS q LIMIT 0"
