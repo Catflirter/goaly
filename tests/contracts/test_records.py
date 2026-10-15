@@ -2,8 +2,11 @@
 
 import json
 from collections.abc import Sequence
+from datetime import UTC, datetime
+from pathlib import Path
 
 from google.protobuf.message import Message
+from google.protobuf.timestamp_pb2 import Timestamp
 
 from goaly.contracts.gen.experiment_pb2 import (
     Decision,
@@ -14,6 +17,8 @@ from goaly.contracts.gen.experiment_pb2 import (
     ImplementerExit,
     ImplementerRun,
     Lane,
+    LaneEvent,
+    LaneEventKind,
     PhaseResult,
     RejectionReason,
     SmokeTest,
@@ -30,7 +35,7 @@ from goaly.contracts.gen.trajectory_pb2 import (
     ToolResult,
     Trajectory,
 )
-from goaly.contracts.jsonl import from_json_line, to_json_line
+from goaly.contracts.jsonl import append_jsonl, from_json_line, read_jsonl, to_json_line
 
 # Rebuilding the prompt a step's model call was sent, by the rule in Step's comment
 # (proto/goaly/v1/trajectory.proto). These helpers are that rule's reference implementation.
@@ -314,3 +319,61 @@ def test_a_smoke_test_that_never_ran_the_candidate_has_no_score() -> None:
     assert json.loads(scored_zero)["score"] == 0.0
     assert not from_json_line(refused, SmokeTest).HasField("score")
     assert from_json_line(scored_zero, SmokeTest).HasField("score")
+
+
+def at(hour: int, minute: int) -> Timestamp:
+    """A point in time on 2026-10-15, in UTC."""
+    timestamp = Timestamp()
+    timestamp.FromDatetime(datetime(2026, 10, 15, hour, minute, tzinfo=UTC))
+    return timestamp
+
+
+def test_lane_events_are_appended_to_lane_events_jsonl_and_read_back(tmp_path: Path) -> None:
+    lane, kind = Lane.LANE_EFFISQL, LaneEventKind
+    pr_opened = "effisql: results PR #12 is open"
+    events = [
+        LaneEvent(lane=lane, occurred_at=at(16, 0), kind=kind.LANE_EVENT_KIND_STARTED),
+        LaneEvent(
+            lane=lane,
+            occurred_at=at(17, 31),
+            kind=kind.LANE_EVENT_KIND_RESTARTED,
+            detail="killed after 10 minutes without a heartbeat; restarted after 30 s",
+        ),
+        LaneEvent(
+            lane=lane,
+            occurred_at=at(19, 0),
+            kind=kind.LANE_EVENT_KIND_RESULTS_PR,
+            detail="3 accepted changes since the last results PR",
+            pr_number=12,
+            pr_url="https://github.com/Catflirter/goaly/pull/12",
+            head_commit="4f2c0de1b6a8e3f9c7d5b1a2e4f6c8d0a9b7e5f3",
+            experiment_ids=["exp-3", "exp-7", "exp-8"],
+        ),
+        LaneEvent(
+            lane=lane,
+            occurred_at=at(19, 1),
+            kind=kind.LANE_EVENT_KIND_NOTIFY_FAILED,
+            detail="HTTP 502 from ntfy.sh",
+            notification=pr_opened,
+        ),
+        LaneEvent(
+            lane=lane,
+            occurred_at=at(19, 2),
+            kind=kind.LANE_EVENT_KIND_NOTIFIED,
+            notification=pr_opened,
+        ),
+        LaneEvent(
+            lane=lane,
+            occurred_at=at(23, 40),
+            kind=kind.LANE_EVENT_KIND_STOPPED,
+            detail="4 rounds in a row with no accepted change",
+        ),
+    ]
+    path = tmp_path / "lane_events.jsonl"
+
+    for event in events:
+        append_jsonl(path, event)
+
+    assert path.read_bytes().count(b"\n") == len(events)
+    assert list(read_jsonl(path, LaneEvent)) == events
+    assert set_fields(*events) == set(LaneEvent.DESCRIPTOR.fields_by_name)

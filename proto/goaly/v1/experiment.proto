@@ -1,5 +1,5 @@
-// The RSI ledger contracts (spec §3.3, §8.2, §8.3, §8.6, §8.8): the experiments with their
-// implementer runs, and the lessons learned from them.
+// The RSI ledger contracts (spec §3.3, §8.2, §8.3, §8.6-§8.8): the experiments with their
+// implementer runs, the lessons learned from them, and the lanes' events.
 syntax = "proto3";
 
 package goaly.v1;
@@ -414,4 +414,57 @@ message Lesson {
   google.protobuf.Timestamp created_at = 7;
   // When it last changed, as when an experiment was added to helped_by or hurt_by.
   google.protobuf.Timestamp updated_at = 8;
+}
+
+// Something that happened to a lane outside any one experiment (spec §8.6, §8.7): one line of
+// lane_events.jsonl. The supervisor and the lanes append these; a restarted lane and the report
+// read them back.
+message LaneEvent {
+  // The lane.
+  Lane lane = 1;
+  // When it happened.
+  google.protobuf.Timestamp occurred_at = 2;
+  // What happened.
+  LaneEventKind kind = 3;
+  // Details in words, such as how the lane crashed, the rule that stopped it, or why a
+  // notification could not be delivered; may be empty.
+  string detail = 4;
+  // For LANE_EVENT_KIND_RESULTS_PR: the PR's number, which the ledger keeps so that a restarted
+  // lane never opens a duplicate (spec §8.7); 0 for other kinds.
+  int32 pr_number = 5;
+  // For LANE_EVENT_KIND_RESULTS_PR: the PR's URL; empty for other kinds.
+  string pr_url = 6;
+  // For LANE_EVENT_KIND_RESULTS_PR: the commit at the head of the PR's rsi/<lane>/results-<n>
+  // branch; empty for other kinds.
+  string head_commit = 7;
+  // For LANE_EVENT_KIND_RESULTS_PR: the accepted experiments whose changes the PR carries;
+  // empty for other kinds.
+  repeated string experiment_ids = 8;
+  // For LANE_EVENT_KIND_NOTIFIED and LANE_EVENT_KIND_NOTIFY_FAILED: the text of the
+  // notification, which never carries a secret or task data; empty for other kinds. It is kept
+  // apart from detail, which holds a failed delivery's error, because the next results PR lists
+  // every notification, delivered or not (spec §8.7).
+  string notification = 9;
+}
+
+// What happened to a lane (spec §8.4, §8.7).
+enum LaneEventKind {
+  // Not set.
+  LANE_EVENT_KIND_UNSPECIFIED = 0;
+  // The lane started: the first time, or when a new goaly rsi run resumed it from the ledger,
+  // as after the workspace stopped. The lane's time budget counts from its first start.
+  LANE_EVENT_KIND_STARTED = 1;
+  // The supervisor restarted the lane after it crashed; detail says how it crashed.
+  LANE_EVENT_KIND_RESTARTED = 2;
+  // The lane crashed too often for automatic recovery, so the supervisor stopped it and notified
+  // the project lead.
+  LANE_EVENT_KIND_RECOVERY_FAILED = 3;
+  // The lane stopped by a stopping rule (spec §8.4); detail names the rule.
+  LANE_EVENT_KIND_STOPPED = 4;
+  // The lane opened a results PR.
+  LANE_EVENT_KIND_RESULTS_PR = 5;
+  // A notification was delivered to the ntfy topic.
+  LANE_EVENT_KIND_NOTIFIED = 6;
+  // A notification could not be delivered; it is retried.
+  LANE_EVENT_KIND_NOTIFY_FAILED = 7;
 }
