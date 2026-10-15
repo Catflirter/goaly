@@ -18,9 +18,10 @@ A task's credit is its mean over the version's seeds, so the best's table holds 
 seeds, and the confirmation's candidate table both of the candidate's. The numbers are the ones
 config sets (:class:`DecisionConfig`), and every PhaseResult records the threshold it applied.
 
-Tokens and cost per task come from TaskResult.usage, which the evaluator fills from the LLM
-proxy's records, since files written in the solve container are untrusted (spec §6.1, §9). A
-ratio whose basis is 0 or unknown is left unset, and its rule then does not apply.
+Tokens, cost and wall time per task are :class:`CostStats`, which the evaluator reports from the
+LLM proxy's records and the host's clock: files written in the solve container are untrusted
+(spec §6.1, §9; ruling V27). A ratio whose basis is 0 or unknown is left unset, and its rule then
+does not apply.
 
 :func:`describe` puts a verdict into words with aggregates only, never a task ID, so the
 decision_reason and the lessons drawn from it stay clean of per-task val data (spec §7).
@@ -110,16 +111,21 @@ class DecisionConfig(BaseModel):
 @dataclass(frozen=True, slots=True)
 class CostStats:
     """A version's means per task and seed: tokens (input plus output, reasoning included), cost
-    in USD, None unless every result has it, and wall time in seconds.
+    in USD, None if unknown, and wall time in seconds; over ``count`` tasks and seeds.
+
+    The evaluator reports them from the proxy's records and the host's clock (V27).
     """
 
     mean_tokens: float
     mean_cost_usd: float | None
     mean_wall_time_s: float
+    count: int = 1
 
     @classmethod
     def from_results(cls, results: Iterable[TaskResult]) -> "CostStats":
-        """Average ``results``, whose usage the evaluator took from the proxy's records."""
+        """Average ``results``' usage and wall time, for results whose numbers the host itself
+        measured, as in the one-process mode and the tests; never for a solve container's.
+        """
         listed = list(results)
         if not listed:
             raise ValueError("cost statistics need at least one result")
@@ -129,6 +135,23 @@ class CostStats:
             / len(listed),
             mean_cost_usd=math.fsum(costs) / len(listed) if len(costs) == len(listed) else None,
             mean_wall_time_s=math.fsum(r.wall_time_s for r in listed) / len(listed),
+            count=len(listed),
+        )
+
+    @classmethod
+    def combine(cls, parts: Sequence["CostStats"]) -> "CostStats":
+        """Average ``parts``, each weighted by its count, as over a version's two val seeds."""
+        if not parts:
+            raise ValueError("cost statistics need at least one part")
+        count = sum(part.count for part in parts)
+        costs = [part.mean_cost_usd for part in parts]
+        return cls(
+            mean_tokens=math.fsum(p.mean_tokens * p.count for p in parts) / count,
+            mean_cost_usd=None
+            if None in costs
+            else math.fsum(p.count * (p.mean_cost_usd or 0.0) for p in parts) / count,
+            mean_wall_time_s=math.fsum(p.mean_wall_time_s * p.count for p in parts) / count,
+            count=count,
         )
 
 
@@ -141,11 +164,15 @@ class Measured:
     run_ids: tuple[str, ...]
 
     @classmethod
-    def from_results(cls, results: Sequence[TaskResult]) -> "Measured":
-        """Measure a version from its graded results, which name their runs."""
+    def from_results(
+        cls, results: Sequence[TaskResult], stats: CostStats | None = None
+    ) -> "Measured":
+        """Measure a version from its graded results, which name their runs, and the evaluator's
+        ``stats``; without them, from the results' own numbers (CostStats.from_results).
+        """
         return cls(
             table=GradeTable.from_results(results),
-            stats=CostStats.from_results(results),
+            stats=CostStats.from_results(results) if stats is None else stats,
             run_ids=tuple(dict.fromkeys(result.run_id for result in results)),
         )
 

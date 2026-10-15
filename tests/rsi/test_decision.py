@@ -355,6 +355,26 @@ def test_a_ratio_without_a_basis_is_left_unset() -> None:
     assert verdict.reasons == (REJECTION_REASON_EFFICIENCY_CAP,)
 
 
+def test_cost_stats_combine_weighted_by_count() -> None:
+    first = CostStats(1000.0, 0.01, 10.0, count=30)
+    second = CostStats(4000.0, 0.04, 40.0, count=10)
+    both = CostStats.combine([first, second])
+    assert both.count == 40
+    assert both.mean_tokens == pytest.approx(1750.0)
+    assert both.mean_cost_usd == pytest.approx(0.0175)
+    assert both.mean_wall_time_s == pytest.approx(17.5)
+    assert CostStats.combine([first, CostStats(1.0, None, 1.0)]).mean_cost_usd is None
+    with pytest.raises(ValueError, match="at least one"):
+        CostStats.combine([])
+
+
+def test_measured_takes_the_evaluators_stats_over_the_results_own() -> None:
+    results = [result("1", 0, 1.0, run_id="r", tokens=999, wall=99.0)]
+    stats = CostStats(10.0, 0.5, 1.0)
+    assert Measured.from_results(results, stats).stats is stats
+    assert Measured.from_results(results).stats.mean_tokens == 999.0
+
+
 def test_measured_names_each_run_once_in_order() -> None:
     results = [
         result("1", 0, 1.0, run_id="b"),
