@@ -30,7 +30,9 @@ first aborts the pending experiments that had no commit yet (goaly.rsi.resume).
 
 import asyncio
 import enum
+import functools
 import hashlib
+import json
 import logging
 import secrets
 from collections.abc import Callable, Sequence
@@ -66,7 +68,11 @@ from goaly.contracts.gen.experiment_pb2 import (
     RejectionReason,
 )
 from goaly.contracts.gen.llm_call_pb2 import CallPurpose, Usage
-from goaly.contracts.gen.result_pb2 import TaskResult
+from goaly.contracts.gen.result_pb2 import (
+    TASK_ERROR_TYPE_ENVIRONMENT,
+    TASK_ERROR_TYPE_LLM,
+    TaskResult,
+)
 from goaly.contracts.gen.task_pb2 import (
     GRADE_STATUS_GRADED,
     GRADE_STATUS_PREDICTION_FAILED,
@@ -87,7 +93,15 @@ from goaly.rsi.lanes import lane_info
 from goaly.rsi.ledger import Ledger
 from goaly.rsi.lesson_writer import write_lesson
 from goaly.rsi.lessons import LessonStore
-from goaly.rsi.resume import UsageSource, abort_record, merge_usage
+from goaly.rsi.resume import (
+    MAX_REQUEUES,
+    UsageSource,
+    abort_record,
+    finish,
+    merge_usage,
+    requeue,
+    timestamp,
+)
 from goaly.rsi.structured import StructuredOutputError
 from goaly.rsi.workspace import Workspace, Worktree
 
@@ -105,11 +119,16 @@ __all__ = [
     "RoundOutcome",
     "RoundRunner",
     "lesson_id",
+    "tasks_digest",
 ]
 
 _logger = logging.getLogger(__name__)
 
 _SCORED = frozenset({GRADE_STATUS_GRADED, GRADE_STATUS_PREDICTION_FAILED, GRADE_STATUS_TIMEOUT})
+# A task the infrastructure failed, by the container's own word, until the host counts them.
+_INFRA_ERRORS = frozenset({TASK_ERROR_TYPE_LLM, TASK_ERROR_TYPE_ENVIRONMENT})
+
+type _Key = tuple[str, Split.ValueType, tuple[str, ...], tuple[int, ...]]
 
 
 class EvalPhase(enum.StrEnum):
@@ -145,6 +164,13 @@ class EvaluationRequest:
     seeds: tuple[int, ...]
     run_id: str
     mode: Mode = Mode.DEV  # RSI grades in dev mode; official mode is for the final runs.
+    # The pack's tree at ``commit``: the harness identity, which the host run's harness hash
+    # must match, as T06's planner computes it from the snapshot's pack directory.
+    pack_tree: str = ""
+    # sha256 of the split, the task IDs and the seeds: the expected set, which the host run's
+    # plan must match exactly. The run's config hash and the dataset's task digests are the
+    # host planner's, computed from the snapshot and the dataset, never from solve/ (V27).
+    tasks_digest: str = ""
 
     @property
     def priority(self) -> Priority:
@@ -161,10 +187,15 @@ class Evaluation:
     time, so a cached task brings its original numbers. The tags are the container's, but the
     run total is the proxy's own: the evaluator flags a sum that differs from it by over 1%.
     Numbers it cannot give are left out, and the rules that need them are skipped (decision).
+
+    ``infra_failures`` counts the tasks the infrastructure failed, as the host saw it: proxy
+    records whose retries ran out, and environment failures. None until the host can count
+    them; the round then counts the results' LLM and environment errors instead.
     """
 
     results: Sequence[TaskResult]
     stats: CostStats
+    infra_failures: int | None = None
 
 
 class Evaluator(Protocol):
@@ -215,6 +246,9 @@ class RoundConfig(BaseModel):
     validation_seed: int = 0
     confirmation_seed: int = 1
     decision: DecisionConfig = DecisionConfig()
+    # Above this share of tasks failed by the infrastructure, an evaluation aborts its experiment.
+    max_infra_share: float = Field(default=0.2, ge=0, le=1)
+    max_requeues: int = Field(default=MAX_REQUEUES, ge=0)
 
     @model_validator(mode="after")
     def _check_seeds(self) -> "RoundConfig":
@@ -274,6 +308,10 @@ class _AbortedError(Exception):
     """An experiment cannot go on for a reason that says nothing about its hypothesis."""
 
 
+class _RoundAbortedError(Exception):
+    """The round could not start for a reason that says nothing about any hypothesis."""
+
+
 class RoundRunner:
     """Runs a lane's rounds, one :meth:`run` at a time."""
 
@@ -281,9 +319,20 @@ class RoundRunner:
         self._deps = deps
         self._config = config
         self._info = lane_info(deps.lane)
+        # The round's evaluations, by what they evaluate: the k candidates share the best's and
+        # v0's references, and the confirmation reuses the validation's.
+        self._evaluations: dict[_Key, asyncio.Future[Evaluation]] = {}
 
     async def run(self, round_no: int, *, resume: Sequence[ExperimentRecord] = ()) -> RoundOutcome:
         """Run round ``round_no``, or resume it from its experiments' latest records."""
+        try:
+            return await self._run(round_no, resume)
+        finally:
+            for evaluation in self._evaluations.values():
+                evaluation.cancel()  # Nothing keeps evaluating after the round, as at a deadline.
+            self._evaluations.clear()
+
+    async def _run(self, round_no: int, resume: Sequence[ExperimentRecord]) -> RoundOutcome:
         best = await asyncio.to_thread(self._best)
         records = list(resume)
         if not records:
@@ -418,7 +467,7 @@ class RoundRunner:
             )
             return
         seeds = (self._config.screen_seed,)
-        theirs, ours = await asyncio.gather(
+        theirs, v0, ours = await asyncio.gather(
             self._measure(
                 EvalPhase.REFERENCE,
                 best,
@@ -426,6 +475,14 @@ class RoundRunner:
                 tasks,
                 seeds,
                 f"{record.experiment_id}-screen-best",
+            ),
+            self._measure(
+                EvalPhase.REFERENCE,
+                self._deps.v0_commit,
+                SPLIT_TRAIN,
+                tasks,
+                seeds,
+                f"{record.experiment_id}-screen-v0",
             ),
             self._measure(
                 EvalPhase.SCREEN,
@@ -436,7 +493,8 @@ class RoundRunner:
                 f"{record.experiment_id}-screen",
             ),
         )
-        await self._apply(record, "screening", decision.screen(SPLIT_TRAIN, theirs, ours))
+        verdict = decision.screen(SPLIT_TRAIN, theirs, ours, v0=v0, config=self._config.decision)
+        await self._apply(record, "screening", verdict)
 
     async def _validate(self, record: ExperimentRecord, best: str) -> None:
         theirs, v0, ours = await asyncio.gather(
@@ -462,12 +520,20 @@ class RoundRunner:
         )
         for name in outranked:
             loser = passing[name]
+            # Queued first, so a crash before the rejection is saved loses no hypothesis.
+            push = functools.partial(
+                requeue,
+                self._deps.ledger,
+                self._deps.queue,
+                loser,
+                max_requeues=self._config.max_requeues,
+            )
+            await finish(push)
             await self._reject(
                 loser,
                 [REJECTION_REASON_OUTRANKED],
                 f"outranked by {winner}, whose validation gain is larger",
             )
-            await asyncio.to_thread(self._deps.queue.push, [loser.hypothesis])
         try:
             await self._confirm(passing[winner])
         except _AbortedError as error:
@@ -491,16 +557,21 @@ class RoundRunner:
             ours = Measured.from_results(
                 [*first.results, *second.results], CostStats.combine([first.stats, second.stats])
             )
-            guardrail = record.validation.effective_min_delta > self._config.decision.min_delta
             verdict = decision.confirm(
-                SPLIT_VAL, theirs, ours, v0=v0, config=self._config.decision, guardrail=guardrail
+                SPLIT_VAL,
+                theirs,
+                ours,
+                v0=v0,
+                config=self._config.decision,
+                validation=record.validation,
             )
             await self._apply(record, "confirmation", verdict)
             if record.decision != DECISION_PENDING:
                 return
         # A pending record whose confirmation passed: the tag moves first, so after a crash the
         # lane finds the tag on this commit and records the acceptance (goaly.rsi.resume).
-        await asyncio.to_thread(shielded_accept, self._deps, record)
+        # Run to the end even if the round is cancelled meanwhile, as at the deadline.
+        await finish(lambda: _accept(self._deps, record))
 
     # Step 8.
 
@@ -595,15 +666,29 @@ class RoundRunner:
         seeds: Sequence[int],
         run_id: str,
     ) -> Evaluation:
-        tree = await asyncio.to_thread(self._tree, commit)
-        request = EvaluationRequest(phase, commit, tree, split, tuple(tasks), tuple(seeds), run_id)
-        evaluation = await self._deps.evaluator.evaluate(request)
+        key: _Key = (commit, split, tuple(tasks), tuple(seeds))
+        shared = self._evaluations.get(key)
+        if shared is None or (shared.done() and (shared.cancelled() or shared.exception())):
+            # Kept before its first await, so a concurrent request for the same key shares it.
+            shared = asyncio.ensure_future(self._request(phase, key, run_id))
+            self._evaluations[key] = shared
+        evaluation = await asyncio.shield(shared)  # One waiter's cancellation spares the rest.
         results = list(evaluation.results)
-        got = {(result.instance_id, result.seed) for result in results}
-        missing = {(task, seed) for task in tasks for seed in seeds} - got
-        if missing:
+        expected = {(task, seed) for task in tasks for seed in seeds}
+        got = [(result.instance_id, result.seed) for result in results]
+        if len(got) != len(set(got)) or set(got) != expected:
+            missing, extra = len(expected - set(got)), len(set(got) - expected)
             raise _AbortedError(
-                f"the {phase} evaluation {run_id} lacks {len(missing)} task results"
+                f"the {phase} evaluation {run_id} returned the wrong results: {missing} missing,"
+                f" {extra} unexpected, {len(got) - len(set(got))} repeated"
+            )
+        failed = evaluation.infra_failures
+        if failed is None:  # Until the host counts them (V27): the results' own error types.
+            failed = sum(result.error_type in _INFRA_ERRORS for result in results)
+        if failed > self._config.max_infra_share * len(expected):
+            raise _AbortedError(
+                f"the {phase} evaluation {run_id}: the infrastructure failed {failed} of"
+                f" {len(expected)} tasks"
             )
         try:
             GradeTable.from_results(results)  # Every result graded and scored, once.
@@ -661,8 +746,16 @@ class RoundRunner:
     async def _abort(self, record: ExperimentRecord, reason: str) -> None:
         deps = self._deps
         usage = deps.usage(record.experiment_id)
-        await asyncio.to_thread(
-            abort_record, deps.ledger, deps.queue, record, reason, now=deps.clock(), usage=usage
+        await finish(
+            lambda: abort_record(
+                deps.ledger,
+                deps.queue,
+                record,
+                reason,
+                now=deps.clock(),
+                usage=usage,
+                max_requeues=self._config.max_requeues,
+            )
         )
 
     def _add_usage(self, record: ExperimentRecord) -> None:
@@ -681,29 +774,53 @@ class RoundRunner:
             stats.deletions += int(removed) if removed.isdigit() else 0
         return stats
 
-    def _tree(self, commit: str) -> str:
-        return run_git(["rev-parse", f"{commit}^{{tree}}"], cwd=self._deps.workspace.repo).strip()
+    async def _request(self, phase: EvalPhase, key: _Key, run_id: str) -> Evaluation:
+        commit, split, tasks, seeds = key
+        tree, pack_tree = await asyncio.to_thread(self._trees, commit)
+        request = EvaluationRequest(
+            phase,
+            commit,
+            tree,
+            split,
+            tasks,
+            seeds,
+            run_id,
+            pack_tree=pack_tree,
+            tasks_digest=tasks_digest(split, tasks, seeds),
+        )
+        return await self._deps.evaluator.evaluate(request)
+
+    def _trees(self, commit: str) -> tuple[str, str]:
+        """The commit's tree and its pack directory's tree."""
+        pack = self._info.pack_dirs[0]
+        trees = run_git(
+            ["rev-parse", f"{commit}^{{tree}}", f"{commit}:{pack}"], cwd=self._deps.workspace.repo
+        ).split()
+        return trees[0], trees[1]
 
     async def _save(self, record: ExperimentRecord) -> None:
-        await asyncio.to_thread(self._deps.ledger.record_experiment, record)
+        # Every ledger write runs to its end, even if the round is cancelled meanwhile.
+        await finish(lambda: self._deps.ledger.record_experiment(record))
 
     def _now(self) -> Timestamp:
-        return _timestamp(self._deps.clock())
+        return timestamp(self._deps.clock())
 
 
-class _RoundAbortedError(Exception):
-    """The round could not start for a reason that says nothing about any hypothesis."""
-
-
-def shielded_accept(deps: RoundDeps, record: ExperimentRecord) -> None:
+def _accept(deps: RoundDeps, record: ExperimentRecord) -> None:
     """Move the best tag to the record's commit, then record it accepted; in one thread, so a
     cancelled round cannot stop it between the two.
     """
     deps.workspace.set_best(deps.lane, record.candidate_commit, expected=record.parent_version)
     record.decision = DECISION_ACCEPTED
-    record.finished_at.CopyFrom(_timestamp(deps.clock()))
+    record.finished_at.CopyFrom(timestamp(deps.clock()))
     merge_usage(record, deps.usage(record.experiment_id))
     deps.ledger.record_experiment(record)
+
+
+def tasks_digest(split: Split.ValueType, tasks: Sequence[str], seeds: Sequence[int]) -> str:
+    """sha256 of the split, the tasks and the seeds an evaluation expects, as the request says."""
+    text = json.dumps([Split.Name(split), sorted(tasks), sorted(seeds)], separators=(",", ":"))
+    return hashlib.sha256(text.encode()).hexdigest()
 
 
 def _split_usage(usage: Usage, parts: int) -> list[Usage]:
@@ -742,9 +859,3 @@ def _hash(experiment_id: str, task: str) -> str:
 
 def _exit_name(exit_: ImplementerExit.ValueType) -> str:
     return ImplementerExit.Name(exit_)
-
-
-def _timestamp(moment: datetime) -> Timestamp:
-    stamp = Timestamp()
-    stamp.FromDatetime(moment)
-    return stamp
