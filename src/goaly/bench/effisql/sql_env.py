@@ -108,6 +108,7 @@ __all__ = [
     "ResultBuilder",
     "SolvingPool",
     "SqlEnvOptions",
+    "capped_error",
     "connection_lost",
     "encode_value",
     "refuse_copy_data",
@@ -137,6 +138,7 @@ _LOST = frozenset({"57P01", "57P02", "57P03", "57P04", "57P05", "25P03"})
 # How long psycopg may take to let go of a session whose runner was cancelled: one more
 # cancel request and a wait for the statement, up to 5 s each.
 _CLOSE_WAIT_S = 15.0
+_ERROR_BYTES = 8192  # The most of an error message the agent sees; the rest is cut, with a note.
 _NO_COPY_OUT = "COPY to the client is not supported here; run a SELECT instead"
 _NO_COPY_IN = b"COPY from the client is not supported here"
 
@@ -191,6 +193,19 @@ def encode_value(raw: bytes | None, type_oid: int, *, max_bytes: int = _VALUE_BY
     if type_oid in _FLOATS and text not in _NON_FINITE:
         return Value(number_value=float(text))
     return Value(string_value=text)
+
+
+def capped_error(message: str | bytes, *, max_bytes: int = _ERROR_BYTES) -> str:
+    """An error message as the agent sees it: stripped, and at most ``max_bytes`` long, a cut
+    one ending with a note of how many bytes were left out. A server error can quote a value
+    whole, up to its 1 GB. A message already cut comes back unchanged."""
+    raw = message if isinstance(message, bytes) else message.encode("utf-8", errors="replace")
+    raw = raw.strip()
+    if len(raw) <= max_bytes:
+        return raw.decode("utf-8", errors="replace")
+    room = max(max_bytes - len(f"[truncated {len(raw)} bytes]"), 0)  # The note fits too.
+    head = raw[:room].decode("utf-8", errors="ignore")  # No half character at the cut.
+    return f"{head}[truncated {len(raw) - len(head.encode())} bytes]"
 
 
 def connection_lost(sqlstate: str | None) -> bool:
@@ -289,12 +304,12 @@ class ResultBuilder:
         else:  # FATAL_ERROR, or a result this environment does not support.
             sqlstate = res.error_field(DiagnosticField.SQLSTATE)
             self.sqlstate = sqlstate.decode() if sqlstate else None
-            message = res.error_message.decode("utf-8", errors="replace").strip()
+            message = capped_error(res.error_message)  # It can quote a huge value whole.
             self.fail(message or f"unsupported result: {ExecStatus(status).name}")
 
     def fail(self, message: str) -> None:
         """End the string's result with an error, as when a statement fails."""
-        self._finish(SqlResult(error=message))
+        self._finish(SqlResult(error=capped_error(message)))
 
     def result(self) -> SqlResult:
         result = SqlResult()
@@ -397,7 +412,7 @@ async def _control(conn: psycopg.AsyncConnection[Any], command: bytes) -> None:
     await conn.wait(generators.send(pgconn))
     while (res := await conn.wait(generators.fetch(pgconn))) is not None:
         if res.status == ExecStatus.FATAL_ERROR:
-            message = res.error_message.decode("utf-8", errors="replace").strip()
+            message = capped_error(res.error_message)
             raise psycopg.OperationalError(f"{command.decode()} failed: {message}")
 
 
@@ -465,6 +480,9 @@ class PgSqlEnvironment:
         self._closed = True
         await asyncio.shield(self._shut_down())
 
+    def _was_closed(self) -> bool:
+        return self._closed  # A call, so a type checker does not assume it unchanged by an await.
+
     def _timeout(self, timeout_s: float | None) -> float:
         cap = self._options.timeout_s
         if timeout_s is None:
@@ -491,8 +509,12 @@ class PgSqlEnvironment:
         if self._conn is not None:
             await _close_quietly(self._conn)
             self._conn = None
-        self._conn = await self._open()
-        return self._conn
+        conn = await self._open()
+        if self._was_closed():  # close() ran while the session opened: it must not outlive it.
+            await asyncio.shield(_close_quietly(conn))
+            raise RuntimeError("the SQL environment was closed while its session opened")
+        self._conn = conn
+        return conn
 
     async def _run(self, conn: _Conn, sql: str, timeout_s: float, queue_wait_s: float) -> SqlResult:
         builder = ResultBuilder(self._options.row_limit)
@@ -515,11 +537,13 @@ class PgSqlEnvironment:
             self._running = None
         failure = _failure(task)
         if failure is not None or conn.closed or connection_lost(builder.sqlstate):
-            reason = str(failure) if failure is not None else builder.result().error
+            reason = capped_error(str(failure)) if failure is not None else builder.result().error
             await self._drop(conn, failure)
             return SqlResult(
-                error=f"the session ended: {reason or 'its connection closed'}; the next "
-                "statement opens a new one",
+                error=capped_error(
+                    f"the session ended: {reason or 'its connection closed'}; the next "
+                    "statement opens a new one"
+                ),
                 elapsed_s=elapsed_s,
                 queue_wait_s=queue_wait_s,
             )
