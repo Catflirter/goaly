@@ -116,13 +116,13 @@ def test_a_process_alone_may_use_each_models_whole_budget() -> None:
 @pytest.mark.parametrize(
     "policy",
     [
-        {"successes_to_grow": 0},
-        {"breaker_window_s": 0.0},
-        {"breaker_open_s": -1.0},
-        {"breaker_min_attempts": 0},
-        {"breaker_failure_ratio": 1.0},
-        {"breaker_failure_ratio": 0.0},
-        {"breaker_open_s": float("nan")},
+        pytest.param({"successes_to_grow": 0}, id="no-successes-to-grow"),
+        pytest.param({"breaker_window_s": 0.0}, id="no-window"),
+        pytest.param({"breaker_open_s": -1.0}, id="negative-open-time"),
+        pytest.param({"breaker_min_attempts": 0}, id="no-min-attempts"),
+        pytest.param({"breaker_failure_ratio": 1.0}, id="ratio-of-one"),
+        pytest.param({"breaker_failure_ratio": 0.0}, id="ratio-of-zero"),
+        pytest.param({"breaker_open_s": float("nan")}, id="nan-open-time"),
     ],
 )
 def test_the_policy_rejects_values_out_of_range(policy: dict[str, Any]) -> None:
@@ -482,7 +482,15 @@ async def test_needs_enough_attempts_before_it_opens() -> None:
         assert clock.sleeps == [60.0]
 
 
-@pytest.mark.parametrize("status", [RATE_LIMITED, SERVER_ERROR, TIMEOUT, CONNECTION_ERROR])
+@pytest.mark.parametrize(
+    "status",
+    [
+        pytest.param(RATE_LIMITED, id="rate-limited"),
+        pytest.param(SERVER_ERROR, id="server-error"),
+        pytest.param(TIMEOUT, id="timeout"),
+        pytest.param(CONNECTION_ERROR, id="connection-error"),
+    ],
+)
 async def test_counts_each_transient_failure(status: LlmCallStatus.ValueType) -> None:
     clock = FakeClock()
     limiter = new_throttle(clock=clock)
@@ -492,7 +500,14 @@ async def test_counts_each_transient_failure(status: LlmCallStatus.ValueType) ->
         assert clock.sleeps == [60.0]
 
 
-@pytest.mark.parametrize("status", [CLIENT_ERROR, CONTEXT_OVERFLOW, INVALID_RESPONSE])
+@pytest.mark.parametrize(
+    "status",
+    [
+        pytest.param(CLIENT_ERROR, id="client-error"),
+        pytest.param(CONTEXT_OVERFLOW, id="context-overflow"),
+        pytest.param(INVALID_RESPONSE, id="invalid-response"),
+    ],
+)
 async def test_a_refused_request_is_no_failure_of_the_gateway(
     status: LlmCallStatus.ValueType,
 ) -> None:
