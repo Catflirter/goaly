@@ -5,8 +5,9 @@ Every metric comes in two scorings (:class:`Scoring`):
 
 - official, as the official evaluator computes it, ignoring the hard-coding flags: a matched
   task's credit is g(τ) of its capped speedup, and any other task's is 0;
-- checked, which RSI decides on: the grader's credit, as given, and a flagged task counts as
-  unmatched, so it gets credit 0, is not covered and is left out of GMS.
+- checked, which RSI decides on: the grader's credit, as given, and a flagged task, hard_coded
+  or literal_result, counts as unmatched, so it gets credit 0, is not covered and is left out
+  of GMS.
 
 R-VES and Coverage@2x always divide by every task. :func:`tier_credit` is g(τ), the one function
 the grader and the official numbers share.
@@ -191,8 +192,12 @@ def tier_credit(speedup: float) -> float:
 
 
 def is_flagged(grade: EffiSqlGrade) -> bool:
-    """Return whether a hard-coding check flagged the prediction (hard_coded)."""
-    return grade.HasField("alt_matched") and not grade.alt_matched
+    """Return whether a hard-coding check flagged the prediction (spec §4.1).
+
+    The flags are hard_coded, which is alt_matched false, and literal_result true. A check that
+    did not run leaves its field unset, which flags nothing.
+    """
+    return (grade.HasField("alt_matched") and not grade.alt_matched) or grade.literal_result
 
 
 def seed_metrics(table: GradeTable, *, scoring: Scoring) -> dict[int, Metrics]:

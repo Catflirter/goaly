@@ -53,6 +53,7 @@ def grade(
     speedup: float | None = None,
     matched: bool | None = None,
     alt_matched: bool | None = None,
+    literal_result: bool | None = None,
 ) -> EffiSqlGrade:
     """An Effi-SQL grade. It is matched if it has a speedup, unless ``matched`` says otherwise."""
     graded = EffiSqlGrade(
@@ -62,18 +63,38 @@ def grade(
         graded.speedup = speedup
     if alt_matched is not None:
         graded.alt_matched = alt_matched
+    if literal_result is not None:
+        graded.literal_result = literal_result
     return graded
 
 
-def timed(speedup: float, *, alt_matched: bool | None = None) -> EffiSqlGrade:
+def timed(
+    speedup: float, *, alt_matched: bool | None = None, literal_result: bool | None = None
+) -> EffiSqlGrade:
     """A matched, timed grade with g(τ) as its credit, as the official evaluator scores it."""
-    return grade(tier_credit(speedup), speedup=speedup, alt_matched=alt_matched)
+    return grade(
+        tier_credit(speedup),
+        speedup=speedup,
+        alt_matched=alt_matched,
+        literal_result=literal_result,
+    )
 
 
 def hard_coded() -> EffiSqlGrade:
-    """A constant answer: matched at the speedup cap, flagged by the robustness check, so the
-    grader's credit is 0. The official evaluator would give it g(1000) = 1."""
+    """A constant answer, matched at the speedup cap and flagged by the robustness check.
+
+    The grader's credit is then 0. The official evaluator would give it g(1000) = 1.
+    """
     return grade(0.0, speedup=SPEEDUP_CAP, alt_matched=False)
+
+
+def literal() -> EffiSqlGrade:
+    """A constant answer over region or nation, which have the same rows at every scale.
+
+    It passes the robustness check, but the plan check flags it as a literal result, so the
+    grader's credit is 0. The official evaluator would give it g(1000) = 1.
+    """
+    return grade(0.0, speedup=SPEEDUP_CAP, alt_matched=True, literal_result=True)
 
 
 def unmatched() -> EffiSqlGrade:
@@ -163,9 +184,13 @@ def test_tier_credit_rejects_a_speedup_that_cannot_be(speedup: float) -> None:
 @pytest.mark.parametrize(
     ("graded", "flagged"),
     [
-        (timed(4.0), False),  # The checks did not run, as in the official protocol.
-        (timed(4.0, alt_matched=True), False),
-        (timed(4.0, alt_matched=False), True),  # hard_coded.
+        pytest.param(timed(4.0), False, id="no check ran"),
+        pytest.param(timed(4.0, alt_matched=True), False, id="robust"),
+        pytest.param(timed(4.0, alt_matched=False), True, id="hard_coded"),
+        pytest.param(timed(4.0, alt_matched=True, literal_result=False), False, id="both passed"),
+        pytest.param(timed(4.0, literal_result=True), True, id="literal_result"),
+        pytest.param(timed(4.0, alt_matched=True, literal_result=True), True, id="robust literal"),
+        pytest.param(timed(4.0, alt_matched=False, literal_result=True), True, id="both flags"),
     ],
 )
 def test_is_flagged(graded: EffiSqlGrade, flagged: bool) -> None:
@@ -340,9 +365,10 @@ def test_gms_is_none_without_a_matched_task_with_a_speedup() -> None:
 # Official and checked numbers.
 
 
-def test_checked_numbers_count_a_flagged_task_as_unmatched() -> None:
+@pytest.mark.parametrize("flagged", [hard_coded(), literal()], ids=["hard_coded", "literal"])
+def test_checked_numbers_count_a_flagged_task_as_unmatched(flagged: EffiSqlGrade) -> None:
     # Officially the constant answer is a match at τ = 1000; checked, it is no match at all.
-    table = one_seed(hard_coded(), timed(4.0))
+    table = one_seed(flagged, timed(4.0))
 
     official = only_seed(table, scoring=OFFICIAL)
     checked = only_seed(table, scoring=CHECKED)
@@ -353,8 +379,14 @@ def test_checked_numbers_count_a_flagged_task_as_unmatched() -> None:
     assert checked.gms == pytest.approx(4.0)
 
 
-def test_checked_numbers_keep_a_task_that_passed_the_check() -> None:
-    table = one_seed(timed(4.0, alt_matched=True), timed(1.0))
+def test_checked_numbers_give_a_flagged_task_no_credit_even_if_its_grade_has_some() -> None:
+    table = one_seed(timed(SPEEDUP_CAP, alt_matched=False), timed(4.0, literal_result=True))
+
+    assert only_seed(table, scoring=CHECKED).rves == 0.0
+
+
+def test_checked_numbers_keep_a_task_that_passed_both_checks() -> None:
+    table = one_seed(timed(4.0, alt_matched=True, literal_result=False), timed(1.0))
 
     assert only_seed(table, scoring=CHECKED) == only_seed(table, scoring=OFFICIAL)
 
@@ -363,11 +395,12 @@ def test_flagged_tasks_are_those_flagged_in_any_seed() -> None:
     table = GradeTable(
         {
             "a": {0: timed(4.0), 1: hard_coded()},
-            "b": {0: timed(4.0, alt_matched=True), 1: timed(1.0)},
+            "b": {0: timed(4.0, alt_matched=True, literal_result=False), 1: timed(1.0)},
+            "c": {0: literal(), 1: timed(4.0)},
         }
     )
 
-    assert flagged_tasks(table) == {"a"}
+    assert flagged_tasks(table) == {"a", "c"}
 
 
 # Seeds (spec §6.3, §8.3).
@@ -395,8 +428,9 @@ def test_solved_uses_the_seed_mean_and_stably_solved_every_seed() -> None:
     assert stably_solved(table, scoring=OFFICIAL) == {"b", "d"}
 
 
-def test_a_flagged_task_is_not_solved_under_the_checked_scoring() -> None:
-    table = GradeTable({"a": {0: hard_coded()}, "b": {0: timed(4.0)}})
+@pytest.mark.parametrize("flagged", [hard_coded(), literal()], ids=["hard_coded", "literal"])
+def test_a_flagged_task_is_not_solved_under_the_checked_scoring(flagged: EffiSqlGrade) -> None:
+    table = GradeTable({"a": {0: flagged}, "b": {0: timed(4.0)}})
 
     assert solved(table, scoring=OFFICIAL) == stably_solved(table, scoring=OFFICIAL) == {"a", "b"}
     assert solved(table, scoring=CHECKED) == stably_solved(table, scoring=CHECKED) == {"b"}
@@ -493,9 +527,10 @@ def test_compare_delta_is_exact_at_a_decision_threshold() -> None:
     assert comparison.delta == 0.05
 
 
-def test_compare_checked_gives_a_flagged_task_no_credit() -> None:
+@pytest.mark.parametrize("flagged", [hard_coded(), literal()], ids=["hard_coded", "literal"])
+def test_compare_checked_gives_a_flagged_task_no_credit(flagged: EffiSqlGrade) -> None:
     best = GradeTable({"a": {0: timed(1.0)}, "b": {0: timed(1.0)}})
-    candidate = GradeTable({"a": {0: hard_coded()}, "b": {0: timed(1.0)}})
+    candidate = GradeTable({"a": {0: flagged}, "b": {0: timed(1.0)}})
 
     assert compare(best, candidate, scoring=OFFICIAL).sign.wins == 1
     checked = compare(best, candidate, scoring=CHECKED)
