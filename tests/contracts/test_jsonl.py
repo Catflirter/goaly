@@ -323,7 +323,7 @@ def test_ignores_unknown_fields_at_any_depth() -> None:
     [
         # protobuf alone reads these three as an empty message: no item is a field name.
         '"instance_id"',
-        '["db_id"]',
+        '["base_sql"]',
         "[]",
         "7",
         "null",
