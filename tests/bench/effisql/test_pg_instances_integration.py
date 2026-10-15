@@ -147,7 +147,7 @@ def test_the_agent_reaches_tpch_on_solving_instances_and_nothing_on_grading_ones
 ) -> None:
     for instance in pg_env.instances:
         allowed = ("tpch",) if instance.kind == "solving" else ()
-        for db in ("tpch", "tpch_alt", "postgres"):
+        for db in ("tpch", "tpch_alt", "postgres", "template1"):
             if db in allowed:
                 with pg_env.connect(instance, AGENT_ROLE, db) as conn:
                     assert conn.execute("SELECT count(*) FROM region").fetchone() == (5,)
