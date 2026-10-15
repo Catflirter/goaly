@@ -31,7 +31,14 @@ from pydantic import BaseModel, ConfigDict, SecretStr, ValidationError
 
 from goaly.bench.effisql import pg_containers
 from goaly.bench.effisql.pg_containers import ContainerSpec, Mount
-from goaly.bench.effisql.pg_settings import ADMIN_ROLE, ALT_DB, MAIN_DB, PgEnvConfig, write_private
+from goaly.bench.effisql.pg_settings import (
+    ADMIN_ROLE,
+    ALT_DB,
+    MAIN_DB,
+    PgEnvConfig,
+    connection_kwargs,
+    write_private,
+)
 
 __all__ = [
     "DATASETS",
@@ -60,6 +67,7 @@ __all__ = [
     "read_golden_record",
     "run_command",
     "tpch_ddl",
+    "wait_until_ready",
     "without_trailing_delimiter",
 ]
 
@@ -73,6 +81,7 @@ _DBGEN_CC = "gcc -std=gnu89 -fcommon"
 
 _SECRETS_TARGET = "/run/goaly"
 _READY_TIMEOUT_S = 300.0
+_STARTING = frozenset({"created", "running", "restarting"})  # Container states still starting.
 _STOP_TIMEOUT_S = 600
 
 _log = logging.getLogger(__name__)
@@ -483,7 +492,7 @@ def _build_server(config: PgEnvConfig, password: SecretStr, pgdata: Path) -> Ite
         pg_containers.start(spec)
         try:
             connect = connector(config.host, config.build_port, password)
-            _wait_until_ready(connect, name)
+            wait_until_ready(connect, name)
             problems = hba_problems((pgdata / "pg_hba.conf").read_text(encoding="utf-8"))
             if problems:
                 raise BuildError(f"{pgdata}/pg_hba.conf lets in without a password: {problems}")
@@ -531,30 +540,31 @@ def connector(host: str, port: int, password: SecretStr, *, user: str = ADMIN_RO
     """Return a Connect that opens autocommit connections as ``user`` to the server at ``port``."""
 
     def connect(dbname: str) -> psycopg.Connection[Any]:
-        return psycopg.connect(
-            host=host,
-            port=port,
-            user=user,
-            password=password.get_secret_value(),
-            dbname=dbname,
-            autocommit=True,
-            connect_timeout=10,
-        )
+        return psycopg.connect(**connection_kwargs(host, port, user, password, dbname))
 
     return connect
 
 
-def _wait_until_ready(connect: Connect, container: str) -> None:
+def wait_until_ready(connect: Connect, container: str) -> None:
+    """Wait until the server in ``container`` accepts connections; fail if the container stops.
+
+    A container that Docker is restarting is still starting. Our ports lie in Linux's ephemeral
+    range (32768-60999), so a client socket can briefly hold a server's port: the server then
+    exits, and the restart policy retries until the port is free.
+    """
     deadline = time.monotonic() + _READY_TIMEOUT_S
     while True:
         try:
             with connect("postgres"):
                 return
         except psycopg.OperationalError:
-            if pg_containers.state(container) != "running":
+            if pg_containers.state(container) not in _STARTING:
                 raise BuildError(
                     f"{container} stopped while starting:\n{pg_containers.logs(container)}"
                 ) from None
             if time.monotonic() > deadline:
-                raise BuildError(f"{container} did not accept connections in time") from None
+                raise BuildError(
+                    f"{container} did not accept connections in time:\n"
+                    f"{pg_containers.logs(container)}"
+                ) from None
             time.sleep(0.5)
