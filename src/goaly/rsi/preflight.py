@@ -115,7 +115,9 @@ def check_postgres(timeout_s: float = 60.0) -> str | None:
     try:
         sql_env = importlib.import_module("goaly.bench.effisql.sql_env")
         pg_settings = importlib.import_module("goaly.bench.effisql.pg_settings")
-        pool = sql_env.SolvingPool(pg_settings.PgEnvConfig(), pg_settings.load_credentials())
+        pool = sql_env.SolvingPool(
+            pg_settings.PgEnvConfig(), pg_settings.load_credentials().agent_only()
+        )
         asyncio.run(asyncio.wait_for(pool.preflight(), timeout_s))
     except Exception as error:  # noqa: BLE001  (any failure is a failed start)
         # T09's messages name instances and roles, never a password.

@@ -118,11 +118,16 @@ def test_postgres_runs_the_solving_pools_preflight(monkeypatch: pytest.MonkeyPat
 
         @staticmethod
         def load_credentials() -> object:
-            return object()
+            class Credentials:
+                def agent_only(self) -> object:
+                    calls.append("agent_only")
+                    return object()
+
+            return Credentials()
 
     monkeypatch.setattr("importlib.import_module", lambda name: Module)
     assert check_postgres() is None
-    assert calls == ["init", "preflight"]
+    assert calls == ["agent_only", "init", "preflight"]
 
     async def broken(self: Pool) -> None:
         raise OSError("instance solve-1 (port 55433): the agent role cannot log in")
