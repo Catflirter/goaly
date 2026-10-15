@@ -73,6 +73,7 @@ def reconcile_best(
     *,
     v0_commit: str,
     now: datetime,
+    usage: UsageSource = lambda _: {},
 ) -> str:
     """Make ``best/<lane>`` and the ledger agree, and return the best commit.
 
@@ -95,13 +96,16 @@ def reconcile_best(
     confirmed = [
         record
         for record in ledger.pending_experiments(lane)
-        if record.candidate_commit == tag and record.HasField("confirmation")
+        if record.candidate_commit == tag
+        and record.HasField("confirmation")
+        and record.parent_version == recorded  # It was built on the best the ledger holds.
     ]
     if confirmed:
         record = confirmed[-1]
         record.decision = DECISION_ACCEPTED
         del record.rejection_reasons[:]
         record.finished_at.CopyFrom(timestamp(now))
+        merge_usage(record, usage(record.experiment_id))
         ledger.record_experiment(record)
         _logger.warning("recorded %s as accepted: the best tag was on it", record.experiment_id)
         return tag

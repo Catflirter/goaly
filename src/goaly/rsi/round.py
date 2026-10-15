@@ -22,6 +22,10 @@ commit's snapshot. Rules come from goaly.rsi.decision.
 the gateway, git or an evaluation that failed or came back incomplete, aborts the experiment
 (DECISION_ABORTED) and queues its hypothesis again.
 
+A winner that fails its confirmation leaves the best as it was. The candidates it outranked
+were already queued again, and are rebuilt on the unchanged best next round, rather than
+confirmed in turn: a design choice, since the spec is silent and a rebuild costs no val run.
+
 **Resuming** (spec §8.7). The ledger holds each experiment's latest state, and a pending record's
 steps so far all passed. Given the round's records, :meth:`RoundRunner.run` resumes each pending
 experiment at its next step, and starts no new one, so no experiment is duplicated. The lane
@@ -46,7 +50,13 @@ from pydantic import BaseModel, ConfigDict, Field, model_validator
 
 from goaly.bench.effisql.grading import Mode
 from goaly.bench.effisql.grading_pool import Priority
-from goaly.bench.effisql.metrics import GradeTable, Scoring, solved, task_credits
+from goaly.bench.effisql.metrics import (
+    SCORED_STATUSES,
+    GradeTable,
+    Scoring,
+    solved,
+    task_credits,
+)
 from goaly.contracts.gen.experiment_pb2 import (
     DECISION_ABORTED,
     DECISION_ACCEPTED,
@@ -74,9 +84,6 @@ from goaly.contracts.gen.result_pb2 import (
     TaskResult,
 )
 from goaly.contracts.gen.task_pb2 import (
-    GRADE_STATUS_GRADED,
-    GRADE_STATUS_PREDICTION_FAILED,
-    GRADE_STATUS_TIMEOUT,
     SPLIT_TRAIN,
     SPLIT_VAL,
     Split,
@@ -85,7 +92,7 @@ from goaly.contracts.gen.trajectory_pb2 import Trajectory
 from goaly.harness.core.llm import LlmClient
 from goaly.harness.core.llm_errors import LlmError
 from goaly.rsi import decision
-from goaly.rsi.analyst import Analysis, AnalystInput, analyze
+from goaly.rsi.analyst import Analysis, AnalysisSkipped, AnalystInput, analyze
 from goaly.rsi.decision import CostStats, DecisionConfig, Measured, Verdict
 from goaly.rsi.git import run_git
 from goaly.rsi.hypothesis_queue import HypothesisQueue
@@ -123,7 +130,6 @@ __all__ = [
 
 _logger = logging.getLogger(__name__)
 
-_SCORED = frozenset({GRADE_STATUS_GRADED, GRADE_STATUS_PREDICTION_FAILED, GRADE_STATUS_TIMEOUT})
 # A task the infrastructure failed, by the container's own word, until the host counts them.
 _INFRA_ERRORS = frozenset({TASK_ERROR_TYPE_LLM, TASK_ERROR_TYPE_ENVIRONMENT})
 
@@ -364,11 +370,11 @@ class RoundRunner:
         analyst_usage = Usage()
         if len(await asyncio.to_thread(queue.pending)) < k:
             analysis = await self._analyze(round_no, best)
-            if isinstance(analysis, str):
+            analyst_usage = analysis.usage  # Charged to this round's experiments, if any.
+            if isinstance(analysis, AnalysisSkipped):
                 if not await asyncio.to_thread(queue.pending):
-                    return [], analysis
+                    return [], analysis.reason
             else:
-                analyst_usage = analysis.usage
                 await finish(functools.partial(queue.push, analysis.hypotheses))
         chosen = (await asyncio.to_thread(queue.pending))[:k]
         shares = _split_usage(analyst_usage, len(chosen))
@@ -393,8 +399,8 @@ class RoundRunner:
         await finish(functools.partial(queue.remove, [h.hypothesis_id for h in chosen]))
         return records, ""
 
-    async def _analyze(self, round_no: int, best: str) -> Analysis | str:
-        """The round's analysis, or why it was skipped. An LlmError aborts the round."""
+    async def _analyze(self, round_no: int, best: str) -> Analysis | AnalysisSkipped:
+        """The round's analysis, or its skip. An LlmError aborts the round."""
         results, trajectories = await asyncio.to_thread(self._train_history, best)
         queued = await asyncio.to_thread(self._deps.queue.pending)
         analyst_input = self._deps.analyst_input(results, trajectories, queued)
@@ -403,7 +409,7 @@ class RoundRunner:
             analysis = await analyze(self._deps.llm, analyst_input, round_id=round_id)
         except LlmError as error:
             raise _RoundAbortedError(f"the analyst's call failed: {error}") from error
-        return analysis if isinstance(analysis, Analysis) else analysis.reason
+        return analysis
 
     # Steps 2-5, for one experiment.
 
@@ -649,7 +655,13 @@ class RoundRunner:
             for task in dict.fromkeys(record.hypothesis.target_instance_ids)
             if task in credits and task not in solved_tasks
         ][: self._config.screen_failures]
-        # The solved tasks are drawn by a hash of the experiment, so a resume draws the same.
+        # The solved tasks are the best's own when it has run enough of them; otherwise its
+        # ancestors' (the train history's fallback), which is harmless for scoring, since the
+        # best is measured again on them as the reference. They are drawn by a hash of the
+        # experiment, so a resume draws the same.
+        own = {r.instance_id for r in self._deps.evaluator.known_train(best)[0]}
+        if len(own & solved_tasks) >= self._config.screen_solved:
+            solved_tasks = frozenset(own & solved_tasks)
         draw = sorted(solved_tasks, key=lambda task: _hash(record.experiment_id, task))
         return (*targets, *draw[: self._config.screen_solved])
 
@@ -874,7 +886,7 @@ def _first_seed(results: Sequence[TaskResult]) -> list[TaskResult]:
     """
     chosen: dict[str, TaskResult] = {}
     for result in sorted(results, key=lambda r: r.seed):
-        if result.grade.status in _SCORED:
+        if result.grade.status in SCORED_STATUSES:  # T07's: the statuses its tables score.
             chosen.setdefault(result.instance_id, result)
     return list(chosen.values())
 

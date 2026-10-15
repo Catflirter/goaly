@@ -19,7 +19,14 @@ from goaly.contracts.gen.experiment_pb2 import (
     PhaseResult,
 )
 from goaly.contracts.gen.llm_call_pb2 import CallPurpose
-from goaly.rsi.lesson_writer import LESSON_MAX_TOKENS, lesson_prompt, write_lesson
+from goaly.rsi import lesson_writer, structured
+from goaly.rsi.analyst import ANALYST_ATTEMPT_TIMEOUT_S
+from goaly.rsi.lesson_writer import (
+    LESSON_ATTEMPT_TIMEOUT_S,
+    LESSON_MAX_TOKENS,
+    lesson_prompt,
+    write_lesson,
+)
 from tests.rsi.fake_llm import FakeGlm
 from tests.rsi.round_world import hypothesis
 
@@ -93,3 +100,20 @@ async def test_write_lesson_makes_one_rsi_lesson_call() -> None:
     assert record.purpose == CallPurpose.CALL_PURPOSE_RSI_LESSON
     assert record.run_id == "effisql-r2-1-abc123"
     assert gateway.bodies[0]["max_tokens"] == LESSON_MAX_TOKENS == 24000
+
+
+async def test_each_lesson_attempt_may_take_as_long_as_the_analysts(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    seen: dict[str, object] = {}
+    original = structured.complete_structured
+
+    async def spy(*args: object, **kwargs: object) -> object:
+        seen.update(kwargs)
+        return await original(*args, **kwargs)  # type: ignore[arg-type]  # Passed through.
+
+    monkeypatch.setattr(lesson_writer, "complete_structured", spy)
+    gateway = FakeGlm(json.dumps({"lesson": "Flagged: embedding result rows fails the check."}))
+    async with gateway.client() as client:
+        await write_lesson(client, flagged_record())
+    assert seen["attempt_timeout_s"] == LESSON_ATTEMPT_TIMEOUT_S == ANALYST_ATTEMPT_TIMEOUT_S
