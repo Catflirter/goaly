@@ -13,6 +13,7 @@ import stat
 import tempfile
 from pathlib import Path
 
+from dotenv import dotenv_values
 from pydantic import BaseModel, ConfigDict, Field, SecretStr, ValidationError
 from pydantic_settings import BaseSettings, PydanticBaseSettingsSource, SettingsConfigDict
 
@@ -99,8 +100,8 @@ class PgEnvConfig(BaseModel):
 class PgCredentials(BaseSettings):
     """The passwords of the admin, agent and grader roles. Build it with :func:`load_credentials`.
 
-    Each comes from the first of: an explicit argument, a ``GOALY_PG_*`` environment variable,
-    the credentials file.
+    Each comes from an explicit argument or else from the credentials file: never from an
+    environment variable, so no child process can inherit one.
     """
 
     model_config = SettingsConfigDict(
@@ -108,6 +109,7 @@ class PgCredentials(BaseSettings):
         env_file_encoding="utf-8",
         extra="ignore",
         frozen=True,
+        hide_input_in_errors=True,
     )
 
     admin_password: SecretStr = Field(min_length=1)
@@ -123,8 +125,9 @@ class PgCredentials(BaseSettings):
         dotenv_settings: PydanticBaseSettingsSource,
         file_secret_settings: PydanticBaseSettingsSource,
     ) -> tuple[PydanticBaseSettingsSource, ...]:
-        # Only the file load_credentials passes in: no secrets directory, no .env in the cwd.
-        return init_settings, env_settings, dotenv_settings
+        # Only the file load_credentials passes in: no environment variables, no secrets
+        # directory and no .env in the working directory.
+        return init_settings, dotenv_settings
 
 
 def default_credentials_file() -> Path:
@@ -132,17 +135,25 @@ def default_credentials_file() -> Path:
     return Path.home() / ".config" / "goaly" / "pg.env"
 
 
-def ensure_credentials(path: Path | None = None) -> None:
+def ensure_credentials(path: Path | None = None, *, golden_pgdata: Path | None = None) -> None:
     """Give each role a random password in the credentials file, keeping those it already has.
 
     Creates the file, mode 0600, and its directory, mode 0700, if they are missing. A file that
-    other users could read is refused rather than used.
+    other users could read is refused rather than used. If the data directory ``golden_pgdata``
+    already exists, it was built with an admin password, so a missing one is an error rather
+    than a reason to make up a new one that the servers would refuse.
     """
     path = default_credentials_file() if path is None else path
     values = _read_values(path) if path.exists() else {}
     missing = [name for name in _PASSWORD_FIELDS if not values.get(_variable(name))]
     if not missing:
         return
+    if "admin_password" in missing and golden_pgdata is not None and golden_pgdata.exists():
+        raise PgSettingsError(
+            f"{path} has lost the admin password that the data directory {golden_pgdata} was "
+            "built with: restore the file, or delete the golden build and the instances to "
+            "rebuild them."
+        )
     for name in missing:
         values[_variable(name)] = secrets.token_urlsafe(_PASSWORD_BYTES)
     path.parent.mkdir(mode=0o700, parents=True, exist_ok=True)
@@ -156,14 +167,21 @@ def write_private(path: Path, text: str) -> None:
     try:
         with os.fdopen(descriptor, "w", encoding="utf-8") as handle:
             handle.write(text)
+            handle.flush()
+            os.fsync(handle.fileno())
         Path(temporary).replace(path)
     except BaseException:
         Path(temporary).unlink(missing_ok=True)
         raise
+    directory = os.open(path.parent, os.O_RDONLY)
+    try:
+        os.fsync(directory)  # Make the rename itself durable.
+    finally:
+        os.close(directory)
 
 
 def load_credentials(path: Path | None = None) -> PgCredentials:
-    """Read the credentials from the environment and ``path`` (default: the pg.env file).
+    """Read the credentials from ``path`` (default: the pg.env file).
 
     Raise :class:`PgSettingsError` if a password is missing, or if the file is unsafe or cannot
     be read. The message names the variable but never echoes a value.
@@ -179,7 +197,7 @@ def load_credentials(path: Path | None = None) -> PgCredentials:
         reason = error.strerror if isinstance(error, OSError) else "not valid UTF-8"
         raise PgSettingsError(f"Cannot read {path}: {reason}.") from None
     problems = [f"{_variable(str(detail['loc'][0]))} is missing or empty." for detail in details]
-    hint = f" Run the environment setup, which writes {path}, or set the variables."
+    hint = f" Run the environment setup, which writes {path}."
     raise PgSettingsError(" ".join(problems) + hint) from None
 
 
@@ -196,10 +214,6 @@ def _check_private(path: Path) -> None:
 
 
 def _read_values(path: Path) -> dict[str, str]:
+    """Read the credentials file with python-dotenv, the parser pydantic-settings reads it with."""
     _check_private(path)
-    values: dict[str, str] = {}
-    for line in path.read_text(encoding="utf-8").splitlines():
-        key, separator, value = line.partition("=")
-        if separator and not line.lstrip().startswith("#"):
-            values[key.strip()] = value.strip()
-    return values
+    return {key: value for key, value in dotenv_values(path, encoding="utf-8").items() if value}
