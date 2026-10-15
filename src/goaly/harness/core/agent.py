@@ -63,8 +63,6 @@ __all__ = ["AgentContext", "AgentHooks", "run_agent"]
 # The finish_reason of a reply that max_tokens cut off.
 _CUT_OFF: Final = "length"
 _REASONING_XML: Final = ToolCallSource.TOOL_CALL_SOURCE_REASONING_XML
-# Where the parser finds calls written as Qwen3-Coder XML.
-_XML_SOURCES: Final = frozenset({ToolCallSource.TOOL_CALL_SOURCE_CONTENT_XML, _REASONING_XML})
 
 # What the loop tells the model. {tools} lists the tools' names.
 _CUT_OFF_CALL: Final = (
@@ -78,10 +76,11 @@ _CUT_OFF_NO_CALL: Final = (
 _NO_CALL: Final = (
     "Error: your reply called no tool. Each reply must call one of the tools: {tools}."
 )
+# The tool runs again, so the result may differ in timing, e.g. a statement's elapsed time.
 _REPEATED: Final = (
     "Note: this call repeats your previous one, the same tool with the same arguments, so its "
-    "result is unchanged. Repeating a call does not help: change the arguments or try another "
-    "approach."
+    "result is unchanged, apart from timing. Repeating a call does not help: change the "
+    "arguments or try another approach."
 )
 _OVER_CAP: Final = (
     f"Error: a reply may make at most {CALLS_PER_REPLY} tool calls, so this call was not run. "
@@ -186,7 +185,8 @@ async def run_agent[E: Environment](
     The chat goes into ``ctx``'s trajectory under ``label``, which no other chat of the task may
     have, with why it stopped. What may raise is as the module docstring says, and a label
     already taken raises ValueError; the trajectory then records STOP_REASON_CANCELLED, or
-    STOP_REASON_CRASHED and the error.
+    STOP_REASON_CRASHED and the error. The stop reason is the task's, so the last loop sets it:
+    a loop that raises marks the trajectory crashed even after an earlier chat submitted.
     """
     return await _Chat(env, ctx, hooks, label).run()
 
@@ -200,7 +200,8 @@ class _Outcome(NamedTuple):
 
 
 class _Sent(NamedTuple):
-    """A model call that got a reply: the reply, and the prompt it was sent, as folded."""
+    """A model call that got a reply: the reply, the folds made for it, and the estimate that
+    the folding threshold compared, before any fold (Step.estimated_prompt_tokens)."""
 
     reply: LlmReply
     folds: list[ContextFold]
@@ -233,7 +234,9 @@ class _Chat[E: Environment]:
     async def run(self) -> Prediction:
         """Open the chat and converse; every exit, an exception's included, sets a stop reason."""
         try:
-            self._chat = self._recorder.start_chat(self._label, self._opening)
+            self._chat = self._recorder.start_chat(
+                self._label, self._opening, keep_turns=self._ctx._window.keep_turns
+            )
             outcome = await self._converse_in_time()
             prediction = outcome.submission
             if prediction is None:
@@ -302,8 +305,8 @@ class _Chat[E: Environment]:
         A prompt that the gateway says does not fit folds every older output it may and goes
         once more. With nothing more to fold, or a second overflow, ContextOverflow propagates.
         """
+        estimate = self._prompt.estimated_tokens  # What the threshold compares.
         folds = self._prompt.fold()
-        estimate = self._prompt.estimated_tokens
         try:
             reply = await self._complete()
         except ContextOverflow:
@@ -311,7 +314,6 @@ class _Chat[E: Environment]:
             if not more:
                 raise
             folds += more
-            estimate = self._prompt.estimated_tokens
             reply = await self._complete()
         self._prompt.sent(reply.usage.input_tokens)
         return _Sent(reply, folds, estimate)
@@ -338,7 +340,9 @@ class _Chat[E: Environment]:
         step.estimated_prompt_tokens = sent.estimated_tokens
         step.folds.extend(sent.folds)
         self._last = step
-        self._prompt.add_turn(step.index, _replayed(assistant))
+        # A window of 0 marks a chat whose replies replay unchanged (Chat.keep_turns).
+        replay = _replayed(assistant) if self._ctx._window.keep_turns > 0 else assistant
+        self._prompt.add_turn(step.index, replay)
         if reply.finish_reason == _CUT_OFF:
             for call in calls:  # A cut-off call may be a wrong submit: none runs.
                 self._answer(step, _not_run(call, _CUT_OFF_CALL))
@@ -353,9 +357,10 @@ class _Chat[E: Environment]:
         worked = False  # Whether a call gave a result that is no error.
         for call in calls[:CALLS_PER_REPLY]:
             result = await self._hooks.tools.execute(call, self._env)
-            if result.HasField("submission") and call.source == _REASONING_XML:
+            drafted = result.HasField("submission") and call.source == _REASONING_XML
+            if drafted:  # A call drafted in the reasoning is no call of the model's to repeat.
                 result = _drafted(call, result)
-            repeated = self._repeats(call)
+            repeated = not drafted and self._repeats(call)
             if repeated:
                 result.content = _appended(result.content, _REPEATED)
             worked = worked or not (result.is_error or repeated)
@@ -372,7 +377,9 @@ class _Chat[E: Environment]:
         """Whether ``call``, which ran, repeats the call that ran before it in this chat.
 
         Calls are compared by tool and normalized arguments, never by ID: an XML call's ID is
-        only unique within its reply.
+        only unique within its reply. A repeat counts toward the error streak, but its result
+        keeps ``is_error`` as the tool gave it, since the call itself did not fail: the note in
+        its content marks it, in the trajectory as for the model.
         """
         key = (call.name, _normalized_arguments(call))
         repeated = key == self._previous
@@ -439,22 +446,33 @@ def _with_calls(message: ChatMessage, calls: Sequence[ToolCall]) -> ChatMessage:
 
 
 def _replayed(assistant: ChatMessage) -> ChatMessage:
-    """``assistant`` as later prompts carry it: each call only once, as a structured call.
+    """``assistant`` as later prompts carry it: no call markup, its calls only as structured calls.
 
-    When its calls were parsed from XML, the call markup is taken out of both the content and
-    the reasoning. A call drafted in one and written again in the other then reaches the model
-    once, and a drafted call that never ran cannot look as if it ran. The trajectory keeps the
-    reply as it came.
+    An executor chat, one with a replay window, replays no Qwen3-Coder XML call markup (spec
+    §5.1, and Step's rebuild rule in trajectory.proto). Its content and its reasoning both lose
+    it, whichever field its calls came from, the standard one included. A call drafted in one
+    field and written again in the other then reaches the model once; a drafted call that never
+    ran cannot look as if it ran; and markup the parser took for no call never reaches the model
+    either. The trajectory keeps every reply as it came.
     """
     message = _copy(assistant)
-    if any(call.source in _XML_SOURCES for call in assistant.tool_calls):
-        message.content = strip_tool_call_markup(message.content)
-        message.reasoning_content = strip_tool_call_markup(message.reasoning_content)
+    message.content = _without_markup(message.content)
+    message.reasoning_content = _without_markup(message.reasoning_content)
     return message
 
 
+def _without_markup(text: str) -> str:
+    """``text`` without its <tool_call> blocks, and then without its bare <function=...> ones."""
+    # strip_tool_call_markup takes the <tool_call> blocks of a text that has some, or else its
+    # bare blocks: a second pass takes the bare blocks left beside <tool_call> ones.
+    return strip_tool_call_markup(strip_tool_call_markup(text))
+
+
 def _drafted(call: ToolCall, result: ToolResult) -> ToolResult:
-    """The error result of a call from the reasoning that would have submitted: it does not."""
+    """The error result of a call from the reasoning that would have submitted: it does not.
+
+    The tool has run, since only its result shows that it submits; its submission is dropped.
+    """
     return ToolResult(
         tool_call_id=call.id,
         name=call.name,
