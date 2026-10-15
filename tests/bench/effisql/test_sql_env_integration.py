@@ -177,6 +177,7 @@ ATTEMPTS = [
     ),
     ("SET work_mem = '64MB'", "SHOW work_mem", [["4MB"]]),
     ("SET temp_file_limit = -1", "SHOW temp_file_limit", [["5GB"]]),
+    ("SET statement_timeout = 0", "SHOW statement_timeout", [["130s"]]),  # The backstop holds.
     (
         "CREATE TEMP TABLE itest_tmp (x int)",
         "SELECT to_regclass('pg_temp.itest_tmp')::text",
@@ -261,7 +262,7 @@ async def test_preflight_names_an_agent_role_that_is_not_read_only(writable_env:
         apply_roles(admin, writable_env.credentials, instance.kind)
 
     message = str(caught.value)
-    assert "not read-only by default" in message
+    assert "default_transaction_read_only is off, not on" in message
     assert "temp_file_limit is -1, not 5GB" in message
     assert "cannot end its own sessions" in message
 

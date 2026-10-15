@@ -264,10 +264,14 @@ def test_statement_text_postgresql_cannot_take_is_named(sql: str, problem: str |
         assert problem in found
 
 
-GOOD_DEFAULTS: list[tuple[Any, ...]] = [
-    (None, ["temp_file_limit=5GB", "default_transaction_read_only=on"])
+ROLE_WIDE = [
+    "client_connection_check_interval=5s",
+    "default_transaction_read_only=on",
+    "statement_timeout=130s",
+    "temp_file_limit=5GB",
 ]
-EXPECTED_DEFAULTS = "['default_transaction_read_only=on', 'temp_file_limit=5GB']"
+GOOD_DEFAULTS: list[tuple[Any, ...]] = [(None, list(reversed(ROLE_WIDE)))]  # In any order.
+EXPECTED_DEFAULTS = str(ROLE_WIDE)
 
 
 @pytest.mark.parametrize(
@@ -277,8 +281,8 @@ EXPECTED_DEFAULTS = "['default_transaction_read_only=on', 'temp_file_limit=5GB']
         # The role's own RESET ALL removed the row: its sessions would start read-write.
         ([], [f"role-wide defaults [], not {EXPECTED_DEFAULTS}"]),
         (
-            [(None, ["default_transaction_read_only=on"])],
-            [f"role-wide defaults ['default_transaction_read_only=on'], not {EXPECTED_DEFAULTS}"],
+            [(None, ROLE_WIDE[:3])],  # The temp-file cap is gone.
+            [f"role-wide defaults {ROLE_WIDE[:3]}, not {EXPECTED_DEFAULTS}"],
         ),
         (
             [*GOOD_DEFAULTS, ("template1", ["work_mem=1GB"])],
@@ -780,7 +784,7 @@ async def test_role_defaults_an_earlier_session_changed_are_restored_first(
     changed: list[tuple[Any, ...]] = [
         (None, ["default_transaction_read_only=off", "temp_file_limit=5GB"]),
         ("template1", ["work_mem=1GB"]),
-    ]
+    ]  # The session lifted read-only and both timeouts, and set work_mem for template1.
     first, second = FakeConn(defaults=changed), FakeConn()
     connections = [first, second]
 
@@ -798,8 +802,10 @@ async def test_role_defaults_an_earlier_session_changed_are_restored_first(
         "BEGIN",
         "SET TRANSACTION READ WRITE",
         'ALTER ROLE CURRENT_USER IN DATABASE "template1" RESET ALL',
-        "ALTER ROLE CURRENT_USER RESET ALL",
+        "ALTER ROLE CURRENT_USER RESET ALL",  # It leaves the superuser-only temp_file_limit.
         "ALTER ROLE CURRENT_USER SET \"default_transaction_read_only\" = 'on'",
+        "ALTER ROLE CURRENT_USER SET \"statement_timeout\" = '130s'",
+        "ALTER ROLE CURRENT_USER SET \"client_connection_check_interval\" = '5s'",
         "COMMIT",
     ]
     assert connections == []  # The second, clean session is the one in use.
@@ -809,7 +815,7 @@ async def test_role_defaults_an_earlier_session_changed_are_restored_first(
 
 @pytest.mark.anyio
 async def test_defaults_the_agent_role_cannot_restore_fail_the_session() -> None:
-    lost_cap: list[tuple[Any, ...]] = [(None, ["default_transaction_read_only=on"])]
+    lost_cap: list[tuple[Any, ...]] = [(None, ROLE_WIDE[:3])]  # temp_file_limit is gone.
     first, second = FakeConn(defaults=lost_cap), FakeConn(defaults=lost_cap)
     connections = [first, second]
 
@@ -839,6 +845,32 @@ async def test_close_stops_a_statement_still_in_flight() -> None:
     assert scenario.connections[0].cancelled.is_set()  # Its backend does not run on,
     assert scenario.connections[0].closed
     assert "canceling statement" in (await running).error  # and its caller gets a result.
+
+
+@pytest.mark.anyio
+async def test_close_stops_even_a_statement_nothing_stops_within_its_bound() -> None:
+    scenario = Scenario("stubborn")
+
+    async def hang(pid: int, started: datetime) -> None:
+        await asyncio.sleep(60)
+
+    env = _environment(scenario, grace=0.05, terminate=hang)
+    await env.open()
+    running = asyncio.create_task(env.execute("SELECT stuck()", timeout_s=60))  # Left behind.
+    await asyncio.sleep(0.05)
+
+    async with asyncio.timeout(1):  # The grace periods, not the statement's 60 s.
+        await env.close()
+
+    assert scenario.connections[0].cancelled.is_set()  # The cancel key came first,
+    assert scenario.connections[0].closed  # and the socket closed at the end.
+    assert (await running).error.startswith("the session ended")
+
+
+def test_the_trusted_timeout_stays_below_the_servers_backstop() -> None:
+    assert SqlEnvOptions(timeout_s=129).timeout_s == 129
+    with pytest.raises(ValueError, match="less than 130"):
+        SqlEnvOptions(timeout_s=130)
 
 
 @pytest.mark.anyio
@@ -1017,7 +1049,7 @@ class PreflightConn(FakeConn):
         return FakeCursor([self.row])
 
 
-READY = ("on", "5GB", True, True)
+READY = (True, True, ["on", "5GB", "130s", "5s"])
 
 
 @pytest.mark.anyio
@@ -1038,7 +1070,7 @@ async def test_preflight_fails_fast_naming_every_problem(monkeypatch: pytest.Mon
         monkeypatch,
         {
             55432: psycopg.OperationalError("password authentication failed"),
-            55433: PreflightConn(("off", "-1", False, False)),
+            55433: PreflightConn((False, False, ["off", "-1", "0", "5s"])),
         },
     )
 
@@ -1047,8 +1079,12 @@ async def test_preflight_fails_fast_naming_every_problem(monkeypatch: pytest.Mon
 
     message = str(caught.value)
     assert "solve-1 (port 55432): the agent role cannot log in: password" in message
-    assert "solve-2 (port 55433): the agent's transactions are not read-only by default" in message
+    assert "solve-2 (port 55433): the agent's default_transaction_read_only is off, not on" in (
+        message
+    )
     assert "solve-2 (port 55433): the agent's temp_file_limit is -1, not 5GB" in message
+    assert "solve-2 (port 55433): the agent's statement_timeout is 0, not 130s" in message
+    assert "client_connection_check_interval" not in message  # That one is right.
     assert "solve-2 (port 55433): the agent role cannot read the TPC-H tables" in message
     assert "solve-2 (port 55433): the agent role cannot end its own sessions" in message
     assert "pgenv.py start" in message
