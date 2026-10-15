@@ -29,7 +29,10 @@ and the role defaults only add defense in depth:
 - the grader role connects to both databases on every instance, with SELECT on their tables;
 - both default to read-only transactions;
 - PUBLIC loses CONNECT and TEMPORARY on every database and CREATE on the public schema. It
-  also loses the functions that let one session stop another or write large objects.
+  also loses pg_stat_activity, the functions that let one session stop another, read
+  another's query text or write large objects, and PL/pgSQL, so no statement is a DO block
+  that runs many. No role here may cancel or end another session, so no task can stop
+  another task's or another run's statements.
 
 Each server also listens on a Unix socket, in a directory bind-mounted from the host
 (``~/data/effisql/sockets/<instance>/``; see :func:`socket_dirs`). A sandbox that may not use
@@ -217,16 +220,20 @@ ROLE_DEFAULTS: Mapping[str, Mapping[str, str]] = {
     GRADER_ROLE: {"default_transaction_read_only": "on"},
 }
 _CONNECTION_LIMITS = {AGENT_ROLE: 64, GRADER_ROLE: -1}  # Per instance; -1 means no limit.
-# Functions PUBLIC may call by default that let a session stop another one or write data.
+# Functions PUBLIC may call by default that let a session stop another one, read the text of
+# another session's query, or write data.
 _REVOKED_FUNCTIONS = (
     "pg_catalog.pg_cancel_backend(integer)",
     "pg_catalog.pg_terminate_backend(integer, bigint)",
+    "pg_catalog.pg_stat_get_activity(integer)",
+    "pg_catalog.pg_stat_get_backend_activity(integer)",
     "pg_catalog.lo_creat(integer)",
     "pg_catalog.lo_create(oid)",
     "pg_catalog.lo_from_bytea(oid, bytea)",
     "pg_catalog.lo_import(text)",
     "pg_catalog.lo_import(text, oid)",
 )
+_STAT_ACTIVITY = sql.Identifier("pg_catalog", "pg_stat_activity")
 
 
 def readers(kind: Kind, db: str) -> tuple[str, ...]:
@@ -300,7 +307,13 @@ def database_statements(db: str, kind: Kind) -> list[sql.Composed]:
             sql.SQL("GRANT USAGE ON SCHEMA {} TO {}").format(public, _names(roles)),
             sql.SQL("GRANT SELECT ON ALL TABLES IN SCHEMA {} TO {}").format(public, _names(roles)),
         ]
-    statements.append(sql.SQL("REVOKE EXECUTE ON FUNCTION {} FROM PUBLIC").format(functions))
+    statements += [
+        sql.SQL("REVOKE EXECUTE ON FUNCTION {} FROM PUBLIC, {}").format(functions, _names(_ROLES)),
+        # Every task shares the agent role, which would see its own sessions' query text here.
+        sql.SQL("REVOKE ALL ON {} FROM PUBLIC, {}").format(_STAT_ACTIVITY, _names(_ROLES)),
+        # A DO block could run many queries in one statement, after raising work_mem for them.
+        sql.SQL("REVOKE USAGE ON LANGUAGE plpgsql FROM PUBLIC, {}").format(_names(_ROLES)),
+    ]
     return statements
 
 

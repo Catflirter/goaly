@@ -5,6 +5,11 @@ secret. :class:`PgCredentials` holds the passwords of its three roles, which liv
 ``~/.config/goaly/pg.env`` (mode 0600), outside the repository: :func:`ensure_credentials`
 creates that file with random passwords, and :func:`load_credentials` reads it. Neither ever
 prints a password, and no error message quotes one.
+
+The solving side holds the agent role's password and nothing else (spec §6.1, §8.5):
+:class:`AgentCredentials`, read by :func:`load_agent_credentials` from a file it must be given,
+normally the agent-only file :func:`write_agent_credentials` writes for a solve container to
+mount; it keeps the agent's password and no other.
 """
 
 import os
@@ -12,6 +17,7 @@ import secrets
 import stat
 import tempfile
 from pathlib import Path
+from typing import Any
 
 from dotenv import dotenv_values
 from pydantic import BaseModel, ConfigDict, Field, SecretStr, ValidationError
@@ -21,15 +27,20 @@ __all__ = [
     "ADMIN_ROLE",
     "AGENT_ROLE",
     "ALT_DB",
+    "CONNECT_TIMEOUT_S",
     "GRADER_ROLE",
     "MAIN_DB",
     "POSTGRES_IMAGE",
+    "AgentCredentials",
     "PgCredentials",
     "PgEnvConfig",
     "PgSettingsError",
+    "connection_kwargs",
     "default_credentials_file",
     "ensure_credentials",
+    "load_agent_credentials",
     "load_credentials",
+    "write_agent_credentials",
     "write_private",
 ]
 
@@ -43,6 +54,8 @@ ALT_DB = "tpch_alt"  # TPC-H at scale factor 0.3: the grader's robustness check 
 ADMIN_ROLE = "postgres"  # The bootstrap superuser; only setup uses it.
 AGENT_ROLE = "effisql_agent"  # The agent's read-only role, on the solving instances.
 GRADER_ROLE = "effisql_grader"  # The grader's role: SELECT on both databases.
+
+CONNECT_TIMEOUT_S = 10  # How long opening a connection to one of the servers may take.
 
 _ENV_PREFIX = "GOALY_PG_"
 _PASSWORD_FIELDS = ("admin_password", "agent_password", "grader_password")
@@ -141,6 +154,58 @@ class PgCredentials(BaseSettings):
         # directory and no .env in the working directory.
         return init_settings, dotenv_settings
 
+    def agent_only(self) -> "AgentCredentials":
+        """The agent role's password alone, for code on the solving side."""
+        return AgentCredentials(agent_password=self.agent_password, _env_file=None)
+
+
+class AgentCredentials(BaseSettings):
+    """The agent role's password, all the solving side may hold. Build it with
+    :func:`load_agent_credentials` or :meth:`PgCredentials.agent_only`.
+
+    Like :class:`PgCredentials`, it reads only an explicit argument or the credentials file,
+    never an environment variable, and it ignores the file's other passwords.
+    """
+
+    model_config = SettingsConfigDict(
+        env_prefix=_ENV_PREFIX,
+        env_file_encoding="utf-8",
+        extra="ignore",
+        frozen=True,
+        hide_input_in_errors=True,
+    )
+
+    agent_password: SecretStr = Field(min_length=1)
+
+    @classmethod
+    def settings_customise_sources(
+        cls,
+        settings_cls: type[BaseSettings],
+        init_settings: PydanticBaseSettingsSource,
+        env_settings: PydanticBaseSettingsSource,
+        dotenv_settings: PydanticBaseSettingsSource,
+        file_secret_settings: PydanticBaseSettingsSource,
+    ) -> tuple[PydanticBaseSettingsSource, ...]:
+        return init_settings, dotenv_settings
+
+
+def connection_kwargs(
+    host: str, port: int, user: str, password: SecretStr, dbname: str
+) -> dict[str, Any]:
+    """The arguments of an autocommit psycopg connection to one of the environment's servers.
+
+    A ``host`` that is a directory means the server's Unix socket there (spec §6.1, V28).
+    """
+    return {
+        "host": host,
+        "port": port,
+        "user": user,
+        "password": password.get_secret_value(),
+        "dbname": dbname,
+        "autocommit": True,
+        "connect_timeout": CONNECT_TIMEOUT_S,
+    }
+
 
 def default_credentials_file() -> Path:
     """Return ``~/.config/goaly/pg.env`` for the current ``HOME``."""
@@ -198,11 +263,33 @@ def load_credentials(path: Path | None = None) -> PgCredentials:
     Raise :class:`PgSettingsError` if a password is missing, or if the file is unsafe or cannot
     be read. The message names the variable but never echoes a value.
     """
+    return _load(PgCredentials, path)
+
+
+def load_agent_credentials(path: Path) -> AgentCredentials:
+    """Read the agent role's password from ``path``, the agent-only file a solve container
+    mounts (see :func:`write_agent_credentials`).
+
+    There is no default: the host's pg.env holds every password, so the solving side must name
+    the file it reads. Any other password in the file is ignored. It fails as
+    :func:`load_credentials` does. Host code takes ``load_credentials().agent_only()``.
+    """
+    return _load(AgentCredentials, path)
+
+
+def write_agent_credentials(path: Path, credentials: AgentCredentials | PgCredentials) -> None:
+    """Write a credentials file, mode 0600, that holds the agent role's password and nothing
+    else: the file a solve container mounts and reads with :func:`load_agent_credentials`."""
+    password = credentials.agent_password.get_secret_value()
+    write_private(path, f"{_variable('agent_password')}={password}\n")
+
+
+def _load[C: PgCredentials | AgentCredentials](cls: type[C], path: Path | None) -> C:
     path = default_credentials_file() if path is None else path
     if path.exists():
         _check_private(path)
     try:
-        return PgCredentials(_env_file=path)
+        return cls(_env_file=path)
     except ValidationError as error:
         details = error.errors(include_input=False)
     except (OSError, UnicodeDecodeError) as error:

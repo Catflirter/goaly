@@ -39,7 +39,9 @@ WRITES = [
     "CREATE TABLE itest_t (x int)",
     "CREATE TEMP TABLE itest_tmp (x int)",
     "SELECT lo_create(0)",
+    "SELECT pg_cancel_backend(pg_backend_pid())",
     "SELECT pg_terminate_backend(pg_backend_pid())",
+    "DO $$ BEGIN PERFORM 1; END $$",
 ]
 
 
@@ -154,6 +156,22 @@ def test_the_agent_reaches_tpch_on_solving_instances_and_nothing_on_grading_ones
                 continue
             with pytest.raises(psycopg.OperationalError, match="permission denied for database"):
                 pg_env.connect(instance, AGENT_ROLE, db)
+
+
+def test_no_role_may_cancel_or_end_another_session(pg_env: PgEnv) -> None:
+    solving = pg_env.instance("solving")
+    with (
+        pg_env.connect(solving, AGENT_ROLE, "tpch", autocommit=True) as agent,
+        pg_env.connect(solving, AGENT_ROLE, "tpch", autocommit=True) as other,
+        pg_env.connect(solving, GRADER_ROLE, "tpch", autocommit=True) as grader,
+    ):
+        # Not even a session of the same role: one task never stops another task's statement.
+        for conn, target in ((agent, other), (agent, grader), (grader, agent)):
+            for function in ("pg_cancel_backend", "pg_terminate_backend"):
+                with pytest.raises(errors.InsufficientPrivilege, match="permission denied"):
+                    conn.execute(f"SELECT {function}(%s)", [target.info.backend_pid])
+        assert other.execute("SELECT 1").fetchone() == (1,)
+        assert grader.execute("SELECT 1").fetchone() == (1,)
 
 
 def test_agent_sessions_start_with_the_server_side_backstops(pg_env: PgEnv) -> None:

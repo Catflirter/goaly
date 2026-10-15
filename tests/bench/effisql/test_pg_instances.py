@@ -181,10 +181,16 @@ def test_on_a_grading_instance_the_agent_may_connect_to_nothing() -> None:
 
 
 REVOKED_FUNCTIONS = (
-    "REVOKE EXECUTE ON FUNCTION pg_catalog.pg_cancel_backend(integer), "
-    "pg_catalog.pg_terminate_backend(integer, bigint), pg_catalog.lo_creat(integer), "
-    "pg_catalog.lo_create(oid), pg_catalog.lo_from_bytea(oid, bytea), "
-    "pg_catalog.lo_import(text), pg_catalog.lo_import(text, oid) FROM PUBLIC"
+    "REVOKE EXECUTE ON FUNCTION pg_catalog.pg_cancel_backend(integer), "  # One session may not
+    "pg_catalog.pg_terminate_backend(integer, bigint), "  # stop another,
+    "pg_catalog.pg_stat_get_activity(integer), "  # read the text of another's query,
+    "pg_catalog.pg_stat_get_backend_activity(integer), "
+    "pg_catalog.lo_creat(integer), pg_catalog.lo_create(oid), "  # or write large objects.
+    "pg_catalog.lo_from_bytea(oid, bytea), pg_catalog.lo_import(text), "
+    'pg_catalog.lo_import(text, oid) FROM PUBLIC, "effisql_agent", "effisql_grader"'
+)
+REVOKE_STAT_ACTIVITY = (
+    'REVOKE ALL ON "pg_catalog"."pg_stat_activity" FROM PUBLIC, "effisql_agent", "effisql_grader"'
 )
 
 
@@ -206,6 +212,8 @@ def test_each_database_grants_select_to_its_readers_and_revokes_the_rest(
         f'GRANT USAGE ON SCHEMA "public" TO {readers}',
         f'GRANT SELECT ON ALL TABLES IN SCHEMA "public" TO {readers}',
         REVOKED_FUNCTIONS,
+        REVOKE_STAT_ACTIVITY,
+        'REVOKE USAGE ON LANGUAGE plpgsql FROM PUBLIC, "effisql_agent", "effisql_grader"',
     ]
 
 
