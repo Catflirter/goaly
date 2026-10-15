@@ -1,4 +1,5 @@
-"""Process settings: the model gateway's key, URL and socket, and the RSI lane's secrets.
+"""Process settings: the model gateway's API key, base URL and socket, and the RSI lane's
+secrets.
 
 Each value comes from the first of these that provides it: explicit arguments, ``GOALY_*``
 environment variables, the env file (``~/.config/goaly/.env`` by default), the field default.
@@ -40,15 +41,15 @@ class Settings(BaseSettings):
 
     api_key: SecretStr
     base_url: str = "https://api.goaly.ai/inference/v1"
-    # A Unix socket to reach the gateway through instead of TCP, as the solve container reaches
-    # the host's LLM proxy (spec §6.1). The base URL then only names the host in each request.
-    llm_uds: Path | None = None
     # The ntfy.sh topic the RSI lane notifies the project lead on (spec §8.7). Anyone who knows
     # it can read and post, so it is a secret; None turns notifications off.
     ntfy_topic: SecretStr | None = None
     # The GitHub token for results PRs (spec §8.7), read at run time: goaly.rsi reloads the
     # settings for each use, and falls back to the Coder workspace's token when this is unset.
     github_token: SecretStr | None = None
+    # A Unix socket to reach the gateway through instead of TCP, as the solve container reaches
+    # the host's LLM proxy (spec §6.1). The base URL then only names the host in each request.
+    llm_uds: Path | None = None
 
     @classmethod
     def settings_customise_sources(

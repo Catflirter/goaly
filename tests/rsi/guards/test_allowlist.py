@@ -143,7 +143,13 @@ def test_ordinary_pack_code_passes() -> None:
         "class A:\n    def f(self):\n        return self.__x\n",
         "from goaly.harness.packs import effisql\n",
         "import json\njson.not_there\n",  # An AttributeError when it runs, not a way out.
-        "f(**options)\n",
+        "f(*options)\n",
+        "from pydantic import BaseModel, ConfigDict\n"
+        "class M(BaseModel):\n    model_config = ConfigDict(frozen=True, extra='forbid')\n",
+        "from pydantic import BaseModel, ConfigDict\n"
+        "class M(BaseModel):\n    model_config: ConfigDict = ConfigDict(title='m')\n",
+        "from pydantic import BaseModel, ConfigDict\nclass M(BaseModel):\n"
+        "    model_config = ConfigDict(json_schema_extra={'examples': [1, (2, 3)]})\n",
         "try:\n    pass\nexcept ValueError:\n    pass\n",
         "TEXT = 'call __init__ first, then len(x)'\n",
         "match p:\n    case [first, *rest]:\n        pass\n    case {'k': v, **others}:\n"
@@ -744,3 +750,41 @@ def test_a_submodule_another_pack_file_imported_is_bound_as_a_module(tmp_path: P
         "src/goaly/harness/packs/effisql/policy.py:3: the module abc used as a value; "
         "only its attributes may be read"
     ]
+
+
+# P9, from the final review: a pydantic config built at run time.
+@pytest.mark.parametrize(
+    ("source", "problem"),
+    [
+        (
+            "import typing\nimport pydantic\ndef hidden(name: str) -> str:\n"
+            "    return 'x' + name\nclass M(pydantic.BaseModel):\n"
+            "    model_config = {'from_' + 'attributes': True, 'alias_generator': hidden}\n"
+            "    client: typing.Any = None\nM.model_validate(obj).client\n",
+            "policy.py:6: model_config must be a ConfigDict(...) of literals",
+        ),
+        (
+            "from pydantic import BaseModel, ConfigDict, Field\nclass M(BaseModel):\n"
+            "    model_config = ConfigDict(**{'from_' + 'attributes': True})\n"
+            "    client: int = Field(**{'validation_' + 'alias': 'cl' + 'ient'})\n",
+            "keyword arguments unpacked with **",
+        ),
+        ("f(**options)\n", "policy.py:1: keyword arguments unpacked with **"),
+        (
+            "from pydantic import BaseModel, ConfigDict\nclass M(BaseModel):\n"
+            "    model_config = ConfigDict(frozen=flag)\n",
+            "model_config must be a ConfigDict(...) of literals",
+        ),
+        (
+            "from pydantic import BaseModel, ConfigDict\nclass M(BaseModel):\n"
+            "    model_config = make_config()\n",
+            "model_config must be a ConfigDict(...) of literals",
+        ),
+        ("from pydantic import AliasGenerator\n", "banned name AliasGenerator"),
+        ("from pydantic import ConfigDict\nConfigDict(alias_generator=f)\n", "alias_generator"),
+    ],
+)
+def test_a_pydantic_config_built_at_run_time_is_refused(source: str, problem: str) -> None:
+    found = check(source)
+
+    assert any(problem in line for line in found), found

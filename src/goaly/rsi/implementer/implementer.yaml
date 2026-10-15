@@ -5,7 +5,9 @@
 # the sandbox stops each command after its timeout; goaly-smoke refuses calls after its limit.
 limits:
   step_limit: 60
-  cost_limit_usd: 3.0
+  # $10, not the spec's first $3 (2026-10-15, approved by the project lead): each GLM call
+  # resends the whole history, and round-1 runs hit $3 after about 40 steps without finishing.
+  cost_limit_usd: 10.0
   wall_time_limit_s: 1800
   max_consecutive_format_errors: 3
   command_timeout_s: 120

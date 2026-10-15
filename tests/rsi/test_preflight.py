@@ -12,10 +12,12 @@ from pydantic import SecretStr
 from goaly.contracts.gen.experiment_pb2 import LANE_EFFISQL
 from goaly.harness.core.settings import Settings
 from goaly.rsi import preflight
+from goaly.rsi.guards.gold_windows import WINDOW, GoldWindows
 from goaly.rsi.preflight import (
     check_disk,
     check_docker,
     check_gateway,
+    check_gold_windows,
     check_image,
     check_lane,
     check_postgres,
@@ -118,11 +120,16 @@ def test_postgres_runs_the_solving_pools_preflight(monkeypatch: pytest.MonkeyPat
 
         @staticmethod
         def load_credentials() -> object:
-            return object()
+            class Credentials:
+                def agent_only(self) -> object:
+                    calls.append("agent_only")
+                    return object()
+
+            return Credentials()
 
     monkeypatch.setattr("importlib.import_module", lambda name: Module)
     assert check_postgres() is None
-    assert calls == ["init", "preflight"]
+    assert calls == ["agent_only", "init", "preflight"]
 
     async def broken(self: Pool) -> None:
         raise OSError("instance solve-1 (port 55433): the agent role cannot log in")
@@ -187,10 +194,26 @@ def test_check_lane_runs_cleanup_first_and_every_check(
     monkeypatch.setattr(preflight, "cleanup", lambda *a: order.append("cleanup"))
     monkeypatch.setattr(preflight, "check_docker", lambda **kw: order.append("docker"))
     monkeypatch.setattr(preflight, "check_image", lambda repo: order.append("image"))
+    monkeypatch.setattr(preflight, "check_gold_windows", lambda: order.append("gold"))
     monkeypatch.setattr(preflight, "load_settings", settings)
     monkeypatch.setattr(preflight, "check_gateway", lambda s, t: order.append("gateway"))
     monkeypatch.setattr(preflight, "check_postgres", lambda t: order.append("postgres"))
     monkeypatch.setattr(preflight, "check_disk", lambda p, g: "disk is full")
     assert check_lane(LANE_EFFISQL, tmp_path, None) == ["disk is full"]
-    assert order == ["cleanup", "docker", "image", "gateway", "postgres"]
+    assert order == ["cleanup", "docker", "image", "gold", "gateway", "postgres"]
     assert os.environ.get("GOALY_API_KEY") is None  # Nothing leaked into the environment.
+
+
+def test_gold_windows_store_must_exist_and_load(tmp_path: Path) -> None:
+    missing = tmp_path / "gold_windows.json"
+    problem = check_gold_windows(missing)
+    assert problem is not None
+    assert problem.startswith(f"the gold windows store {missing} is missing: build it with ")
+    assert "python -m goaly.rsi.guards.gold_windows --dataset" in problem
+    missing.write_text("{}", encoding="utf-8")
+    problem = check_gold_windows(missing)
+    assert problem is not None
+    assert problem.startswith("the gold windows store is not usable (")
+    assert "rebuild it with" in problem
+    GoldWindows(frozenset({"a" * 64}), WINDOW, "0" * 64).save(missing)
+    assert check_gold_windows(missing) is None

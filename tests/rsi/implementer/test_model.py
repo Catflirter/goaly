@@ -169,7 +169,7 @@ async def test_each_call_is_recorded_with_its_purpose_and_the_gateways_cost() ->
 async def test_the_run_stops_at_the_cost_limit() -> None:
     run = Run(Gateway(*(reply("ls", cost="1.25") for _ in range(5))))
 
-    await run.go()
+    await run.go(run_limits=limits(cost_limit_usd=3.0))
 
     # $1.25, $2.50, then $3.75: the limit of $3 is reached after the third call.
     assert run.result == {"exit_status": EXIT_COST_LIMIT, "submission": ""}
@@ -180,7 +180,7 @@ async def test_the_run_stops_at_the_cost_limit() -> None:
 async def test_the_run_stops_as_soon_as_the_cost_reaches_the_limit_exactly() -> None:
     run = Run(Gateway(*(reply("ls", cost="1.5") for _ in range(3))))
 
-    await run.go()
+    await run.go(run_limits=limits(cost_limit_usd=3.0))
 
     assert run.result == {"exit_status": EXIT_COST_LIMIT, "submission": ""}
     assert len(run.gateway.requests) == 2  # $1.50 and $1.50 make $3.00, the limit.

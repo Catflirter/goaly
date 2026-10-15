@@ -81,6 +81,7 @@ def _run(phase: Phase, args: argparse.Namespace, val: Sequence[str]) -> int:
                 RecordStore(args.records),
                 BaseCache(args.cache_root / Mode.DEV.value),
                 val=val,
+                manual=[e.instance_id for e in load_manual_exclusions(args.manual_exclusions)],
             )
         )
     finally:
