@@ -240,7 +240,9 @@ Global___LlmCallAttempt: _TypeAlias = LlmCallAttempt  # noqa: Y015
 
 @_typing.final
 class Usage(_message.Message):
-    """Tokens and cost, of one call or summed over many."""
+    """Tokens and cost, of one call or summed over many. output_tokens includes the reasoning tokens,
+    so "tokens per task" in the decision rules (spec §8.3) means input_tokens + output_tokens.
+    """
 
     DESCRIPTOR: _descriptor.Descriptor
 

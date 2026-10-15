@@ -94,7 +94,8 @@ enum LlmCallStatus {
   LLM_CALL_STATUS_CANCELLED = 9;
 }
 
-// Tokens and cost, of one call or summed over many.
+// Tokens and cost, of one call or summed over many. output_tokens includes the reasoning tokens,
+// so "tokens per task" in the decision rules (spec §8.3) means input_tokens + output_tokens.
 message Usage {
   // Prompt tokens.
   int64 input_tokens = 1;
