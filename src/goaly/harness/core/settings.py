@@ -16,6 +16,7 @@ from pydantic_settings import BaseSettings, PydanticBaseSettingsSource, Settings
 __all__ = ["Settings", "SettingsError", "default_env_file", "load_settings"]
 
 _ENV_PREFIX = "GOALY_"
+_NOT_AN_HTTP_URL = "must be an absolute http or https URL with a host"
 
 
 class SettingsError(Exception):
@@ -63,11 +64,11 @@ class Settings(BaseSettings):
     @field_validator("base_url")
     @classmethod
     def _check_base_url(cls, value: str) -> str:
-        if not _is_absolute_http_url(value):
-            raise PydanticCustomError(
-                "invalid_url", "must be an absolute http or https URL with a host"
-            )
-        return value.rstrip("/")
+        url = value.strip()
+        problem = _base_url_problem(url)
+        if problem is not None:
+            raise PydanticCustomError("invalid_url", problem)
+        return url.rstrip("/")
 
 
 def default_env_file() -> Path:
@@ -119,13 +120,26 @@ def _is_blank(value: object) -> bool:
     return isinstance(value, str) and not value.strip()
 
 
-def _is_absolute_http_url(value: str) -> bool:
+def _base_url_problem(url: str) -> str | None:
+    """Say why ``url`` cannot be the base URL, or return None. The reason never quotes ``url``."""
+    # urlsplit silently drops some of these characters, so it must never see them.
+    if any(char.isspace() or not char.isprintable() for char in url):
+        return "must not contain whitespace or control characters"
     try:
-        url = urlsplit(value)
-        _ = url.port  # Raises ValueError for a malformed port.
+        parts = urlsplit(url)
+    except ValueError:  # For example, an unclosed "[" around an IPv6 host.
+        return _NOT_AN_HTTP_URL
+    if "@" in parts.netloc:
+        return "must not contain credentials"
+    if "?" in url or "#" in url:
+        return "must not have a query or a fragment"
+    try:
+        _ = parts.port  # Raises ValueError for a malformed port.
     except ValueError:
-        return False
-    return url.scheme in {"http", "https"} and bool(url.hostname)
+        return _NOT_AN_HTTP_URL
+    if parts.scheme not in {"http", "https"} or not parts.hostname:
+        return _NOT_AN_HTTP_URL
+    return None
 
 
 def _describe(detail: ErrorDetails, env_file: Path) -> str:

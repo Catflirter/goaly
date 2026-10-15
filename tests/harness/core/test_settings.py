@@ -19,6 +19,7 @@ from goaly.harness.core.settings import (
 )
 
 DEFAULT_BASE_URL = "https://api.goaly.ai/inference/v1"
+NOT_AN_HTTP_URL = "must be an absolute http or https URL with a host"
 
 
 def write_env_file(path: Path, *lines: str) -> Path:
@@ -271,9 +272,12 @@ def test_strips_whitespace_around_the_key(monkeypatch: pytest.MonkeyPatch) -> No
         ("https://example.test/v1/", "https://example.test/v1"),
         ("https://example.test/", "https://example.test"),
         ("http://localhost:8080/v1", "http://localhost:8080/v1"),
+        (" https://example.test/v1", "https://example.test/v1"),
+        ("https://example.test/v1/ ", "https://example.test/v1"),
+        ("https://example.test/v1\n", "https://example.test/v1"),
     ],
 )
-def test_accepts_http_base_urls_without_a_trailing_slash(
+def test_stores_the_base_url_trimmed_and_without_a_trailing_slash(
     base_url: str, expected: str, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     monkeypatch.setenv("GOALY_API_KEY", "env-key")
@@ -283,27 +287,45 @@ def test_accepts_http_base_urls_without_a_trailing_slash(
 
 
 @pytest.mark.parametrize(
-    "base_url",
+    ("base_url", "reason"),
     [
-        "ftp://example.test/v1",
-        "example.test/v1",
-        "/inference/v1",
-        "https://",
-        "https:///v1",
-        "https://example.test:port/v1",
-        "https://example.test:99999/v1",
+        ("ftp://example.test/v1", NOT_AN_HTTP_URL),
+        ("example.test/v1", NOT_AN_HTTP_URL),
+        ("/inference/v1", NOT_AN_HTTP_URL),
+        ("https://", NOT_AN_HTTP_URL),
+        ("https:///v1", NOT_AN_HTTP_URL),
+        ("https://example.test:port/v1", NOT_AN_HTTP_URL),
+        ("https://example.test:99999/v1", NOT_AN_HTTP_URL),
+        ("https://[::1/v1", NOT_AN_HTTP_URL),
+        ("https://exa\tmple.test/v1", "must not contain whitespace or control characters"),
+        ("https://exa mple.test/v1", "must not contain whitespace or control characters"),
+        ("https://example.test/\x7fv1", "must not contain whitespace or control characters"),
+        ("https://user:pw@example.test/v1", "must not contain credentials"),
+        ("https://example.test/v1?q=1", "must not have a query or a fragment"),
+        ("https://example.test/v1#frag", "must not have a query or a fragment"),
     ],
 )
-def test_rejects_an_invalid_base_url(base_url: str, monkeypatch: pytest.MonkeyPatch) -> None:
+def test_rejects_an_invalid_base_url(
+    base_url: str, reason: str, monkeypatch: pytest.MonkeyPatch
+) -> None:
     monkeypatch.setenv("GOALY_API_KEY", "env-key")
     monkeypatch.setenv("GOALY_BASE_URL", base_url)
 
     with pytest.raises(SettingsError) as raised:
         load_settings()
 
-    assert str(raised.value) == (
-        "GOALY_BASE_URL is invalid: must be an absolute http or https URL with a host."
-    )
+    assert str(raised.value) == f"GOALY_BASE_URL is invalid: {reason}."
+
+
+def test_never_echoes_credentials_in_a_base_url(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setenv("GOALY_API_KEY", "env-key")
+    monkeypatch.setenv("GOALY_BASE_URL", "https://user:pw@example.test/v1")
+
+    with pytest.raises(SettingsError) as raised:
+        load_settings()
+
+    assert "GOALY_BASE_URL" in str(raised.value)
+    assert "pw" not in str(raised.value)
 
 
 def test_reports_every_problem(monkeypatch: pytest.MonkeyPatch) -> None:
