@@ -136,8 +136,10 @@ class TaskResult(_message.Message):
         speedup with the expert patch's. A task with no prediction, after a crash or an error, is
         graded as the benchmark's empty answer, the same one Benchmark.to_official writes:
         Effi-SQL's base_sql unchanged, with the identity credit, and SWE an empty patch, which scores
-        1/gold speedup without an evaluation run (spec §4.2). Absent only in a run that is not
-        graded, such as an organizers' run on SPLIT_EXTERNAL.
+        1/gold speedup without an evaluation run (spec §4.2). Unset in the line the solve phase
+        writes; the grade phase, on the host, appends the graded copy, which wins as the last line
+        (spec §6.1). It stays unset in a run that is not graded, such as an organizers' run on
+        SPLIT_EXTERNAL.
         """
 
     @_builtins.property

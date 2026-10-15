@@ -154,7 +154,8 @@ class ImplementerExit(_ImplementerExit, metaclass=_ImplementerExitEnumTypeWrappe
     aborted instead. A model call that fails ends the run as follows. IMPLEMENTER_EXIT_INFRASTRUCTURE
     is a gateway outage that outlasted its retries (LLM_CALL_STATUS_RATE_LIMITED, SERVER_ERROR,
     TIMEOUT or CONNECTION_ERROR) or an open breaker. IMPLEMENTER_EXIT_CRASHED is
-    LLM_CALL_STATUS_CONTEXT_OVERFLOW, INVALID_RESPONSE or CLIENT_ERROR.
+    LLM_CALL_STATUS_CONTEXT_OVERFLOW, INVALID_RESPONSE or CLIENT_ERROR. IMPLEMENTER_EXIT_INTERRUPTED
+    is LLM_CALL_STATUS_CANCELLED: our code cancelled the call.
     """
 
 IMPLEMENTER_EXIT_UNSPECIFIED: ImplementerExit.ValueType  # 0
@@ -207,18 +208,10 @@ class _GuardEnumTypeWrapper(_enum_type_wrapper._EnumTypeWrapper[_Guard.ValueType
     GUARD_UNIT_TESTS: _Guard.ValueType  # 4
     """The pack's unit tests pass."""
     GUARD_PACK_CODE_ALLOWLIST: _Guard.ValueType  # 5
-    """The static AST allowlist passes on the candidate's pack code, which runs on the host during
-    smoke tests, screening and validation (spec §8.5). It is a static defense in depth, not a
-    sandbox. Imports may come only from: an explicit list of goaly.harness.core modules, which
-    leaves out settings and every llm* module; goaly.contracts; pydantic; relative imports and
-    goaly.harness.packs.<lane>, the lane's own pack; a closed list of pure stdlib modules, such
-    as json, re and typing; and asyncio, for concurrency only. Banned: the builtins open, eval,
-    exec, compile, __import__, getattr, setattr, delattr, vars, globals, locals, dir, type,
-    breakpoint, input and memoryview; any attribute name that starts with _, except on self or
-    cls; calls to .format and .format_map; the frame and coroutine attributes f_*, gi_*, cr_*,
-    ag_* and tb_*; any attribute of an imported module that is itself a module; and the attribute
-    names sys, os, modules, builtins and subprocess, and asyncio's process, socket and pipe
-    functions.
+    """The static AST allowlist passes on the candidate's pack code. Spec §8.5 is the authority on
+    its rules: the imports it allows and the names, attributes and calls it bans. It is a static
+    defense in depth; the candidate's code itself is isolated in the keyless solve container
+    (spec §6.1).
     """
 
 class Guard(_Guard, metaclass=_GuardEnumTypeWrapper):
@@ -245,18 +238,10 @@ from any split.
 GUARD_UNIT_TESTS: Guard.ValueType  # 4
 """The pack's unit tests pass."""
 GUARD_PACK_CODE_ALLOWLIST: Guard.ValueType  # 5
-"""The static AST allowlist passes on the candidate's pack code, which runs on the host during
-smoke tests, screening and validation (spec §8.5). It is a static defense in depth, not a
-sandbox. Imports may come only from: an explicit list of goaly.harness.core modules, which
-leaves out settings and every llm* module; goaly.contracts; pydantic; relative imports and
-goaly.harness.packs.<lane>, the lane's own pack; a closed list of pure stdlib modules, such
-as json, re and typing; and asyncio, for concurrency only. Banned: the builtins open, eval,
-exec, compile, __import__, getattr, setattr, delattr, vars, globals, locals, dir, type,
-breakpoint, input and memoryview; any attribute name that starts with _, except on self or
-cls; calls to .format and .format_map; the frame and coroutine attributes f_*, gi_*, cr_*,
-ag_* and tb_*; any attribute of an imported module that is itself a module; and the attribute
-names sys, os, modules, builtins and subprocess, and asyncio's process, socket and pipe
-functions.
+"""The static AST allowlist passes on the candidate's pack code. Spec §8.5 is the authority on
+its rules: the imports it allows and the names, attributes and calls it bans. It is a static
+defense in depth; the candidate's code itself is isolated in the keyless solve container
+(spec §6.1).
 """
 Global___Guard: _TypeAlias = Guard  # noqa: Y015
 
@@ -341,9 +326,10 @@ class _RejectionReasonEnumTypeWrapper(_enum_type_wrapper._EnumTypeWrapper[_Rejec
 
 class RejectionReason(_RejectionReason, metaclass=_RejectionReasonEnumTypeWrapper):
     """A rule that rejects a candidate: one value for each way spec §8.2 and §8.3 reject one. The
-    values are declared by number. The decision code checks them in the order of the round's
-    steps: IMPLEMENTATION_FAILED, GUARD_FAILED, HARD_CODED, NO_SCREEN_GAIN, EFFICIENCY_CAP,
-    INSUFFICIENT_GAIN, COST_GUARDRAIL, NOT_SIGNIFICANT, REGRESSION, OUTRANKED, then NOT_CONFIRMED.
+    values are declared by number. Roughly in evaluation order, they are: IMPLEMENTATION_FAILED,
+    GUARD_FAILED, HARD_CODED, NO_SCREEN_GAIN, EFFICIENCY_CAP, INSUFFICIENT_GAIN, COST_GUARDRAIL,
+    NOT_SIGNIFICANT, REGRESSION, OUTRANKED and NOT_CONFIRMED. HARD_CODED can also come up in the
+    validation or the confirmation. The decision code (T21) owns the exact order.
     """
 
 REJECTION_REASON_UNSPECIFIED: RejectionReason.ValueType  # 0
@@ -700,8 +686,9 @@ Global___ImplementerRun: _TypeAlias = ImplementerRun  # noqa: Y015
 class SmokeTest(_message.Message):
     """One goaly-smoke call by the implementer agent (spec §8.8). The host refuses any task that is
     not in train, and any call after the second; otherwise it runs the step-3 guards on the
-    worktree as it stands, then the candidate on the task with the bench runner and one seed. The
-    smoke run's model calls count toward the experiment's usage_by_purpose (spec §9).
+    worktree as it stands, then the candidate on the task through the isolated two-phase path
+    (spec §6.1), with one seed. The smoke run's model calls count toward the experiment's
+    usage_by_purpose (spec §9).
     """
 
     DESCRIPTOR: _descriptor.Descriptor
