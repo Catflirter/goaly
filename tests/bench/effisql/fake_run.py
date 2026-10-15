@@ -155,6 +155,6 @@ def fake_wiring(root: Path) -> FakeWiring:
         paths=lambda: paths,
         llm=llm,
         solving=open_solving,
-        grader=lambda _root, _check: grader,
+        grader=lambda _root, _check, _instances: grader,
     )
     return FakeWiring(wiring, client, solving, grader, shares)

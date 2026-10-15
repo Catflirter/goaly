@@ -21,7 +21,6 @@ import logging
 import threading
 from collections.abc import AsyncIterator, Awaitable, Callable, Mapping
 from contextlib import AbstractAsyncContextManager, AsyncExitStack, asynccontextmanager
-from contextvars import ContextVar
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Protocol, Self
@@ -48,7 +47,12 @@ from goaly.bench.effisql.data import (
     write_runtime_file,
 )
 from goaly.bench.effisql.grading import InstanceCheck, Mode
-from goaly.bench.effisql.grading_pool import GRADING_INSTANCES, Priority
+from goaly.bench.effisql.grading_pool import (
+    GRADING_INSTANCES,
+    SETUP_INSTANCES,
+    GradingInstance,
+    Priority,
+)
 from goaly.bench.effisql.grading_service import EffiSqlGrader
 from goaly.bench.effisql.inputs import load_plans, load_schema_snapshot
 from goaly.bench.effisql.pg_settings import MAIN_DB, PgEnvConfig, load_agent_credentials
@@ -62,6 +66,7 @@ from goaly.contracts.interfaces import JsonValue, SqlEnvironment
 from goaly.harness.core.agent import AgentContext
 from goaly.harness.core.budgets import Budgets
 from goaly.harness.core.context_window import ContextWindow
+from goaly.harness.core.grading import GRADING_TASK
 from goaly.harness.core.jsonl_writer import JsonlWriter
 from goaly.harness.core.llm import BoundLlm, CallRecorder, CallTags, LlmClient
 from goaly.harness.core.llm_errors import ConnectionFailed, RateLimited, ServerError, TimedOut
@@ -84,7 +89,7 @@ from goaly.harness.core.runner import ContextFactory, RunIdentity, error_classif
 from goaly.harness.core.settings import load_settings
 
 __all__ = [
-    "GRADING_TASK",
+    "GRADING_INSTANCE_SETS",
     "PACK_DIR",
     "RUNTIME_SHA256",
     "SOLVING_STATEMENT_TIMEOUT_S",
@@ -103,6 +108,7 @@ __all__ = [
     "load_pack",
     "load_tasks",
     "model_settings",
+    "named_priority",
     "open_harness",
     "open_host",
     "pack_models",
@@ -214,14 +220,6 @@ class GradesPredictions(Protocol):
     def close(self) -> None: ...
 
 
-# The task a host grade is grading, (instance ID, seed), which Benchmark.grade does not get;
-# whoever grades sets it around each grading (the interim driver does).
-# TODO(T06): read core's own, once its host grade sets one.
-GRADING_TASK: ContextVar[tuple[str, int] | None] = ContextVar(
-    "goaly_effisql_grading_task", default=None
-)
-
-
 class PlanLog:
     """The host-only audit of every graded prediction's EXPLAIN (FORMAT JSON) plan, for T23.
 
@@ -234,7 +232,8 @@ class PlanLog:
         self._lock = threading.Lock()
 
     def record(self, instance_id: str, plan: JsonValue) -> None:
-        """Write ``plan``, under the seed GRADING_TASK names; a plan of no known task is logged."""
+        """Write ``plan``, under the seed core's GRADING_TASK names, the task being graded; a
+        plan of no known task is logged."""
         task = GRADING_TASK.get()
         if task is None or task[0] != instance_id:
             _logger.warning("a graded plan of no known task", extra={"instance_id": instance_id})
@@ -273,8 +272,20 @@ async def _real_solving() -> SolvingPool:
     )
 
 
-def _real_grader(cache_root: Path, check: InstanceCheck | None) -> EffiSqlGrader:
-    return EffiSqlGrader.on_instances(GRADING_INSTANCES, cache_root=cache_root, check=check)
+# Which instances a run grades on (--grading-instances): the 3 grading instances, or all 5 for
+# T23's final runs, which T10's per-instance locks keep apart from any solve phase.
+GRADING_INSTANCE_SETS: Mapping[str, tuple[GradingInstance, ...]] = {
+    "grading": GRADING_INSTANCES,
+    "all": SETUP_INSTANCES,
+}
+
+
+def _real_grader(
+    cache_root: Path, check: InstanceCheck | None, instances: str = "grading"
+) -> EffiSqlGrader:
+    return EffiSqlGrader.on_instances(
+        GRADING_INSTANCE_SETS[instances], cache_root=cache_root, check=check
+    )
 
 
 @dataclass(frozen=True)
@@ -288,8 +299,9 @@ class EffiSqlWiring:
         Awaitable[AbstractAsyncContextManager[BindsLlm]],
     ] = _real_llm
     solving: Callable[[], Awaitable[SolvesTasks]] = _real_solving
-    # Starts the grader, given the cache root and the check each grading instance passes first.
-    grader: Callable[[Path, InstanceCheck | None], GradesPredictions] = _real_grader
+    # Starts the grader, given the cache root, the check each grading instance passes first and
+    # the set of instances it grades on (GRADING_INSTANCE_SETS).
+    grader: Callable[[Path, InstanceCheck | None, str], GradesPredictions] = _real_grader
     # The check of a grading instance before each evaluation: T09's catalog fingerprint (spec
     # §8.5), once it is an InstanceCheck; until then None, and no instance is checked.
     instance_check: InstanceCheck | None = None
@@ -462,7 +474,11 @@ async def open_harness(
     policy = build_policy(config.pack, prompt)
     split = options.split
     mode = grading_mode(split)
-    priority = grading_priority(split, options.budget_phase)
+    priority = (
+        named_priority(options.grading_priority)
+        if options.grading_priority is not None
+        else grading_priority(split, options.budget_phase)
+    )
     paths = wiring.paths()
     settings = {"grading_priority": priority.name.lower()}
     loaded = await asyncio.to_thread(load_tasks, paths, options.instances_file, mode, settings)
@@ -471,10 +487,12 @@ async def open_harness(
     async with AsyncExitStack() as stack:
         grader = None
         if mode is not None:
+            instances = _grading_instances(options.grading_instances)
             grader = LazyGrader(
-                lambda: wiring.grader(paths.grading_cache_root, wiring.instance_check),
+                lambda: wiring.grader(paths.grading_cache_root, wiring.instance_check, instances),
                 mode,
                 priority,
+                PlanLog(options.files.root),
             )
             stack.push_async_callback(grader.close)
         calls = await stack.enter_async_context(JsonlWriter[LlmCallRecord](options.files.llm_calls))
@@ -515,17 +533,20 @@ async def open_host(
             f"the run's manifest names grading mode {recorded!r}, but its split grades in"
             f" {_mode_name(mode)!r} mode"
         )
-    if options.budget_phase is None and manifest is not None:
+    if options.grading_priority is not None:
+        priority = named_priority(options.grading_priority)
+    elif options.budget_phase is None and manifest is not None:
         priority = recorded_priority(manifest)
     else:
         priority = grading_priority(options.split, options.budget_phase)
+    instances = _grading_instances(options.grading_instances)
     paths = wiring.paths()
     settings = {"grading_priority": priority.name.lower()}
     loaded = await asyncio.to_thread(load_tasks, paths, options.instances_file, mode, settings)
     grader = None
     if mode is not None:
         grader = LazyGrader(
-            lambda: wiring.grader(paths.grading_cache_root, wiring.instance_check),
+            lambda: wiring.grader(paths.grading_cache_root, wiring.instance_check, instances),
             mode,
             priority,
             PlanLog(options.files.root),
@@ -541,6 +562,21 @@ async def open_host(
 
 def _mode_name(mode: Mode | None) -> str:
     return "none" if mode is None else mode.value
+
+
+def named_priority(name: str) -> Priority:
+    """The priority --grading-priority names: smoke, baseline, baseline_heldout, rsi or final."""
+    member = name.upper()
+    if member not in Priority.__members__ or Priority[member] is Priority.SETUP:
+        allowed = ", ".join(p.name.lower() for p in Priority if p is not Priority.SETUP)
+        raise ValueError(f"no grading priority {name!r}; the priorities are: {allowed}")
+    return Priority[member]
+
+
+def _grading_instances(name: str) -> str:
+    if name not in GRADING_INSTANCE_SETS:
+        raise ValueError(f"--grading-instances is one of {', '.join(GRADING_INSTANCE_SETS)}")
+    return name
 
 
 def recorded_priority(manifest: RunManifest) -> Priority:

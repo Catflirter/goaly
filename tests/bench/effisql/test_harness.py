@@ -30,7 +30,7 @@ from goaly.bench.effisql.data import (
 from goaly.bench.effisql.grading import Mode
 from goaly.bench.effisql.grading_pool import Priority
 from goaly.bench.effisql.harness import (
-    GRADING_TASK,
+    GRADING_INSTANCE_SETS,
     PACK_DIR,
     SOLVING_STATEMENT_TIMEOUT_S,
     EffiSqlPaths,
@@ -46,6 +46,7 @@ from goaly.bench.effisql.harness import (
     load_pack,
     load_tasks,
     model_settings,
+    named_priority,
     open_harness,
     open_host,
     pack_models,
@@ -75,6 +76,7 @@ from goaly.contracts.gen.task_pb2 import (
 from goaly.contracts.jsonl import read_jsonl
 from goaly.harness.core import cli
 from goaly.harness.core.budgets import Budgets
+from goaly.harness.core.grading import GRADING_TASK
 from goaly.harness.core.jsonl_writer import JsonlWriter
 from goaly.harness.core.llm import BoundLlmClient, CallTags, LlmClient
 from goaly.harness.core.llm_errors import (
@@ -96,6 +98,7 @@ from goaly.harness.packs.effisql.tools import ExecuteSql, ExecuteSqlConfig
 from tests.bench.effisql.fake_run import (
     OFFICIAL_FORM,
     FakeClient,
+    FakeGrader,
     FakeWiring,
     fake_wiring,
     write_inputs,
@@ -135,6 +138,9 @@ def registry(fakes: FakeWiring) -> Registry:
 
 
 def goaly_run(fakes: FakeWiring, *args: str) -> int:
+    # Part (c)'s host side has no launcher yet: one process, with the fakes (part (d) isolates).
+    if "--phase" not in args or args[args.index("--phase") + 1] != "grade":
+        args = (*args, "--in-process")
     return cli.main(
         ["run", "--bench", "effisql", *args], registry(fakes), budgets_file=goaly_cli.BUDGETS_FILE
     )
@@ -284,26 +290,21 @@ class TestDryRun:
         assert fakes.shares == [{EXECUTOR_MODEL: 40}]
         assert fakes.grader.closed
 
-    def test_two_phases_grade_with_no_pack_code_loaded(
-        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+    async def test_the_host_side_grades_with_no_pack_code_loaded(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
     ) -> None:
         fakes = fake_wiring(tmp_path)
-        run = tmp_path / "run"
-        solved = goaly_run(
-            fakes, "--phase", "solve", "--split", "val", "--only", VAL_ID, "--budget-phase", "rsi",
-            "--out", str(run),
-        )  # fmt: skip
-        assert solved == 0, capsys.readouterr().err
-        assert [r.HasField("grade") for r in results(run)] == [False]
-        assert fakes.grader.graded == []
         for name in [m for m in sys.modules if m.startswith(_PACK_MODULES)]:
             monkeypatch.delitem(sys.modules, name)
+        options = HostOptions(RunFiles(tmp_path / "run"), None, SPLIT_VAL, "rsi")
+        inst = EffiSqlInstance.model_validate(task(id=int(VAL_ID)))
+        prediction = Prediction(instance_id=VAL_ID, effisql=EffiSqlPrediction(sql=OFFICIAL_FORM))
 
-        graded = goaly_run(fakes, "--phase", "grade", "--out", str(run))
+        async with open_host(options, fakes.wiring) as host:
+            grade = await host.benchmark.grade(inst, prediction)  # type: ignore[attr-defined]
 
-        assert graded == 0, capsys.readouterr().err
+        assert grade.score == 0.5
         assert not [m for m in sys.modules if m.startswith(_PACK_MODULES)]
-        assert [r.HasField("grade") for r in results(run)] == [False, True]
         assert fakes.grader.graded == [(VAL_ID, OFFICIAL_FORM, False, Mode.DEV, Priority.RSI)]
 
     def test_a_held_out_run_grades_in_official_mode(
@@ -321,23 +322,18 @@ class TestDryRun:
         assert status == 0, capsys.readouterr().err
         assert fakes.grader.graded[0][3:] == (Mode.OFFICIAL, Priority.BASELINE_HELDOUT)
 
-    def test_the_grade_phase_refuses_a_manifest_that_names_another_mode(
-        self, tmp_path: Path, capsys: pytest.CaptureFixture[str]
+    async def test_the_host_side_refuses_a_manifest_that_names_another_mode(
+        self, tmp_path: Path
     ) -> None:
         fakes = fake_wiring(tmp_path)
-        run = tmp_path / "run"
-        goaly_run(
-            fakes, "--phase", "solve", "--split", "val", "--only", VAL_ID, "--budget-phase", "rsi",
-            "--out", str(run),
-        )  # fmt: skip
-        manifest = run / "manifest.json"
-        text = manifest.read_text().replace('"grading_mode": "dev"', '"grading_mode": "official"')
-        manifest.write_text(text)
+        files = RunFiles(tmp_path / "run")
+        files.root.mkdir()
+        settings = {"grading_mode": "official"}
+        write_manifest(files.manifest, RunManifest(split=SPLIT_VAL, environment_settings=settings))
 
-        status = goaly_run(fakes, "--phase", "grade", "--out", str(run))
-
-        assert status == 1  # The host side refuses it as it opens: the run fails.
-        assert "grading mode 'official'" in capsys.readouterr().err
+        with pytest.raises(ValueError, match="grading mode 'official'"):
+            async with open_host(HostOptions(files, None, SPLIT_VAL, None), fakes.wiring):
+                pass
         assert fakes.grader.graded == []
 
     def test_an_organizers_file_is_solved_but_not_graded(
@@ -349,7 +345,7 @@ class TestDryRun:
         organizers.write_text(json.dumps(task(id=901)) + "\n")
 
         status = goaly_run(
-            fakes, "--instances", str(organizers), "--phase", "solve", "--budget-phase", "final",
+            fakes, "--instances", str(organizers), "--budget-phase", "final",
             "--out", str(run),
         )  # fmt: skip
 
@@ -591,3 +587,47 @@ class TestPlanAudit:
             {"instance_id": "5", "plan": {"Node Type": "Aggregate"}}
         ]
         assert sorted(p.name for p in (tmp_path / "run" / "plans").iterdir()) == ["seed-2.jsonl"]
+
+
+class TestGradingOptions:
+    @pytest.mark.parametrize("name", ["smoke", "rsi", "baseline_heldout", "final"])
+    def test_a_named_priority(self, name: str) -> None:
+        assert named_priority(name).name.lower() == name
+
+    @pytest.mark.parametrize("name", ["setup", "urgent"])
+    def test_an_unknown_or_setup_priority_is_refused(self, name: str) -> None:
+        with pytest.raises(ValueError, match="no grading priority"):
+            named_priority(name)
+
+    async def test_all_instances_grade_on_the_five(self, tmp_path: Path) -> None:
+        fakes = fake_wiring(tmp_path)
+        chosen: list[str] = []
+        wiring = dataclasses.replace(
+            fakes.wiring,
+            grader=lambda _root, _check, instances: _chosen(chosen, instances, fakes.grader),
+        )
+        files = RunFiles(tmp_path / "run")
+        options = HostOptions(
+            files, None, SPLIT_VAL, "final", grading_priority="smoke", grading_instances="all"
+        )
+        inst = EffiSqlInstance.model_validate(task(id=int(VAL_ID)))
+        prediction = Prediction(instance_id=VAL_ID, effisql=EffiSqlPrediction(sql="SELECT 1"))
+
+        async with open_host(options, wiring) as host:
+            await host.benchmark.grade(inst, prediction)  # type: ignore[attr-defined]
+
+        assert chosen == ["all"]
+        assert [len(GRADING_INSTANCE_SETS[k]) for k in ("grading", "all")] == [3, 5]
+        assert fakes.grader.graded[0][4] is Priority.SMOKE
+
+    async def test_an_unknown_instance_set_is_refused(self, tmp_path: Path) -> None:
+        options = HostOptions(RunFiles(tmp_path), None, SPLIT_VAL, None, grading_instances="x")
+
+        with pytest.raises(ValueError, match="--grading-instances"):
+            async with open_host(options, fake_wiring(tmp_path).wiring):
+                pass
+
+
+def _chosen(chosen: list[str], instances: str, grader: FakeGrader) -> FakeGrader:
+    chosen.append(instances)
+    return grader
