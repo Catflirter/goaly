@@ -24,6 +24,7 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Protocol, Self
 
+import httpx
 import yaml
 from pydantic import BaseModel, ConfigDict, SecretStr
 
@@ -188,7 +189,12 @@ class GradesPredictions(Protocol):
 async def _real_llm(recorder: CallRecorder, shares: Mapping[str, int]) -> LlmClient:
     settings = await asyncio.to_thread(load_settings)
     profile = QWEN_PROFILE.model_copy()  # The pack's model params override it per call.
-    return LlmClient(settings, recorder, profiles=[profile], shares=_full_shares(shares))
+    # In the solve container no IP socket opens (V28): the proxy is on a Unix socket.
+    uds = os.environ.get("GOALY_LLM_UDS")
+    transport = None if not uds else httpx.AsyncHTTPTransport(uds=uds)
+    return LlmClient(
+        settings, recorder, profiles=[profile], shares=_full_shares(shares), transport=transport
+    )
 
 
 def _full_shares(shares: Mapping[str, int]) -> dict[str, int]:

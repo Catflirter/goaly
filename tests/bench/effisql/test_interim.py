@@ -8,7 +8,7 @@ database or the gateway.
 
 import asyncio
 import json
-import shlex
+import os
 from collections.abc import AsyncIterator
 from contextlib import AbstractAsyncContextManager, asynccontextmanager
 from pathlib import Path
@@ -23,6 +23,7 @@ from goaly.bench.effisql.interim import (
     InterimRequest,
     RecordingTransport,
     SolveRequest,
+    _lines,  # The reader of the container's untrusted files, tested directly.
     run_interim,
 )
 from goaly.bench.effisql.launcher import EffiSqlLauncher, SolveRequestLike
@@ -58,11 +59,11 @@ class FakeContainer:
         self,
         checkout: Path,
         request: SolveRequestLike,
-        command: str,
+        argv: list[str],
+        staged_instances: Path | None,
         environment: SolveEnvironment,
         timeout_s: float,
     ) -> SandboxResult:
-        argv = shlex.split(command)
         assert argv[:3] == ["python", "-m", "goaly"]
         self.commands.append(argv[3:])
         if not self.solve:
@@ -83,15 +84,17 @@ class FakeContainer:
         )
         return open_harness(options, wiring)
 
-    async def remove(self, run_id: str) -> None:
+    async def stop(self, run_id: str) -> None:
         pass
 
 
 class FakeProxy:
-    base_url = "http://127.0.0.1:41234"
-
     def container_env(self) -> dict[str, str]:
-        return {"GOALY_API_KEY": "token", "GOALY_BASE_URL": self.base_url}
+        return {
+            "GOALY_API_KEY": "token",
+            "GOALY_BASE_URL": "http://localhost",
+            "GOALY_LLM_UDS": "/run/goaly/proxy/llm.sock",
+        }
 
 
 @asynccontextmanager
@@ -108,6 +111,7 @@ def launcher(fakes: FakeWiring, container: FakeContainer) -> EffiSqlLauncher:
         credentials=lambda: PgCredentials(
             admin_password=secret, agent_password=secret, grader_password=secret
         ),
+        socket_dirs=lambda: (Path("/sock/solve-1"), Path("/sock/solve-2")),
     )
 
 
@@ -214,3 +218,16 @@ async def test_the_recording_transport_records_each_forwarded_call(tmp_path: Pat
     assert (record.usage.input_tokens, record.usage.output_tokens) == (10, 4)
     assert record.usage.reasoning_tokens == 3
     assert record.usage.cost_usd == pytest.approx(0.002)
+
+
+def test_a_planted_symlink_in_solve_is_refused(tmp_path: Path) -> None:
+    secret = tmp_path / "secret.jsonl"
+    secret.write_text("{}\n")
+    planted = tmp_path / "results.jsonl"
+    planted.symlink_to(secret)
+
+    assert _lines(planted, TaskResult) == [None]
+    assert _lines(tmp_path / "absent.jsonl", TaskResult) == []
+    fifo = tmp_path / "fifo.jsonl"
+    os.mkfifo(fifo)
+    assert _lines(fifo, TaskResult) == [None]

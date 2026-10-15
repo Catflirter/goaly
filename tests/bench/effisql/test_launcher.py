@@ -6,7 +6,7 @@ reaches the gateway.
 
 import asyncio
 import json
-import shlex
+import subprocess
 from collections.abc import AsyncIterator
 from contextlib import asynccontextmanager
 from dataclasses import dataclass, field
@@ -22,6 +22,7 @@ from goaly.bench.effisql.launcher import (
     SolveContainerError,
     SolveRequestLike,
     checkout_of,
+    snapshot_checkout,
     stage_inputs,
 )
 from goaly.bench.effisql.layout import SolveInputs
@@ -38,8 +39,7 @@ from tests.bench.effisql.synthetic import GOLD_SQL, task
 
 pytestmark = pytest.mark.anyio
 
-CHECKOUT = Path(__file__).resolve().parents[3]
-PACK = CHECKOUT / "src" / "goaly" / "harness" / "packs" / "effisql"
+REPO = Path(__file__).resolve().parents[3]
 TOKEN = "per-run-token"  # noqa: S105 - a fake dummy token.
 
 
@@ -52,7 +52,7 @@ class Request:
     inputs_dir: Path
     llm_calls: Path
     tasks: tuple[tuple[str, int], ...]
-    pack_dir: Path | None = PACK
+    pack_dir: Path | None
     instances_file: Path | None = None
     max_tasks: int = 2
     task_timeout_s: float | None = None
@@ -78,7 +78,7 @@ class FakeSandbox:
     exit_code: int = 0
     hang: bool = False
     prepared: list[Path] = field(default_factory=list)
-    runs: list[tuple[str, SolveEnvironment, float]] = field(default_factory=list)
+    runs: list[tuple[list[str], Path | None, SolveEnvironment, float]] = field(default_factory=list)
     removed: list[str] = field(default_factory=list)
     started: asyncio.Event = field(default_factory=asyncio.Event)
 
@@ -89,17 +89,18 @@ class FakeSandbox:
         self,
         checkout: Path,
         request: SolveRequestLike,
-        command: str,
+        argv: list[str],
+        staged_instances: Path | None,
         environment: SolveEnvironment,
         timeout_s: float,
     ) -> SandboxResult:
-        self.runs.append((command, environment, timeout_s))
+        self.runs.append((argv, staged_instances, environment, timeout_s))
         self.started.set()
         if self.hang:
             await asyncio.Event().wait()
         return SandboxResult(self.exit_code, "container output", timed_out=False)
 
-    async def remove(self, run_id: str) -> None:
+    async def stop(self, run_id: str) -> None:
         self.removed.append(run_id)
 
 
@@ -108,10 +109,14 @@ class FakeProxy:
     recorders: list[CallRecorder] = field(default_factory=list)
     stopped: bool = False
 
-    base_url = "http://127.0.0.1:41234"
+    uds: Path = Path("/run/goaly/proxy/llm.sock")
 
     def container_env(self) -> dict[str, str]:
-        return {"GOALY_API_KEY": TOKEN, "GOALY_BASE_URL": self.base_url}
+        return {
+            "GOALY_API_KEY": TOKEN,
+            "GOALY_BASE_URL": "http://localhost",
+            "GOALY_LLM_UDS": str(self.uds),
+        }
 
 
 def credentials() -> PgCredentials:
@@ -119,10 +124,19 @@ def credentials() -> PgCredentials:
     return PgCredentials(admin_password=secret, agent_password=secret, grader_password=secret)
 
 
+def fake_checkout(root: Path) -> Path:
+    """A checkout without .git, as an RSI snapshot is: used as it is."""
+    pack = root / "src" / "goaly" / "harness" / "packs" / "effisql"
+    pack.mkdir(parents=True)
+    (pack / "policy.py").write_text("x = 1\n")
+    return pack
+
+
 def setup(
     tmp_path: Path, sandbox: FakeSandbox
 ) -> tuple[EffiSqlLauncher, FakeProxy, Request, EffiSqlPaths]:
     paths = write_inputs(tmp_path)
+    pack = fake_checkout(tmp_path / "checkout")
     proxy = FakeProxy()
 
     @asynccontextmanager
@@ -139,7 +153,7 @@ def setup(
         sandbox=lambda: sandbox,
         proxy=open_proxy,
         credentials=credentials,
-        solving_ports=(55432, 55433),
+        socket_dirs=lambda: (Path("/sock/solve-1"), Path("/sock/solve-2")),
     )
     run = tmp_path / "run"
     request = Request(
@@ -148,6 +162,7 @@ def setup(
         inputs_dir=run / "inputs",
         llm_calls=run / "llm_calls.jsonl",
         tasks=(("1", 0), ("3", 0), ("1", 1)),
+        pack_dir=pack,
     )
     return launcher, proxy, request, paths
 
@@ -158,20 +173,19 @@ async def test_it_stages_the_inputs_and_runs_the_container(tmp_path: Path) -> No
 
     await launcher(request)
 
-    assert sandbox.prepared == [CHECKOUT]
-    ((command, environment, timeout_s),) = sandbox.runs
-    assert shlex.split(command) == [
+    assert sandbox.prepared == [(tmp_path / "checkout").resolve()]
+    ((argv, staged, environment, timeout_s),) = sandbox.runs
+    assert staged is None
+    assert argv == [
         "python", "-m", "goaly", "run", "--bench", "effisql", "--out", str(request.solve_dir),
         "--inputs", str(request.inputs_dir), "--split", "val",
     ]  # fmt: skip
     assert environment.variables() == {
-        "GOALY_BASE_URL": "http://127.0.0.1:41234",
+        "GOALY_BASE_URL": "http://localhost",
         "GOALY_API_KEY": TOKEN,
-        "GOALY_PG_HOST": "127.0.0.1",
-        "GOALY_PG_PORTS": "55432,55433",
+        "GOALY_LLM_UDS": "/run/goaly/proxy/llm.sock",
+        "GOALY_PG_SOCKET_DIRS": "/sock/solve-1,/sock/solve-2",
         "GOALY_PG_AGENT_PASSWORD": "agent-secret",
-        "GOALY_RUN_ID": "run-1",
-        "GOALY_SEED": "0",
     }
     assert timeout_s == 2 * 600 * 1.5 + 600  # 3 tasks, 2 at a time.
     inputs = SolveInputs(request.inputs_dir)
@@ -196,7 +210,8 @@ async def test_an_organizers_file_is_staged_without_its_gold(tmp_path: Path) -> 
     await launcher(external)
 
     staged = SolveInputs(request.inputs_dir).tasks
-    assert shlex.split(sandbox.runs[0][0])[-2:] == ["--instances", str(staged)]
+    assert sandbox.runs[0][0][-2:] == ["--instances", str(staged)]
+    assert sandbox.runs[0][1] == staged
     record = json.loads(staged.read_text())
     assert record["id"] == 901
     assert GOLD_SQL not in staged.read_text()
@@ -236,6 +251,25 @@ async def test_a_request_needs_tasks_and_a_pack(tmp_path: Path) -> None:
         checkout_of(None)
     with pytest.raises(ValueError, match="not a pack"):
         checkout_of(tmp_path / "a" / "b" / "c" / "d" / "e")
+
+
+def test_a_git_checkout_is_snapshotted_without_git_with_its_changes(tmp_path: Path) -> None:
+    repo = tmp_path / "repo"
+    pack = fake_checkout(repo)
+    run = ["git", "-C", str(repo), "-c", "user.email=t@e", "-c", "user.name=t"]
+    subprocess.run([*run, "init", "-q"], check=True)  # noqa: S603
+    subprocess.run([*run, "add", "."], check=True)  # noqa: S603
+    subprocess.run([*run, "commit", "-q", "-m", "c"], check=True)  # noqa: S603
+    (pack / "policy.py").write_text("x = 2\n")  # An uncommitted change the host hashed.
+    (repo / "untracked.txt").write_text("not tracked")
+
+    snapshot = snapshot_checkout(repo, tmp_path / "run" / "checkout")
+
+    copied = snapshot / "src" / "goaly" / "harness" / "packs" / "effisql" / "policy.py"
+    assert copied.read_text() == "x = 2\n"
+    assert not (snapshot / ".git").exists()
+    assert not (snapshot / "untracked.txt").exists()
+    assert snapshot_checkout(snapshot, tmp_path / "unused") == snapshot
 
 
 def test_staging_twice_replaces_the_inputs(tmp_path: Path) -> None:

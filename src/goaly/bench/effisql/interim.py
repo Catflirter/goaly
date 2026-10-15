@@ -20,6 +20,8 @@ import asyncio
 import contextlib
 import json
 import logging
+import os
+import stat
 import sys
 import threading
 import time
@@ -315,13 +317,36 @@ def _write_manifest(
     write_manifest(files.manifest, manifest)
 
 
+def _read_untrusted(path: Path) -> bytes | None:
+    """``path``'s bytes, a file the container wrote: None if it is absent.
+
+    The container may have planted a symlink or a special file, so the file is opened with
+    O_NOFOLLOW and must be a regular file no larger than the records limit (T18's #48 M8);
+    otherwise this raises ValueError, which fails every task the file was to answer.
+    """
+    try:
+        fd = os.open(path, os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK)
+    except FileNotFoundError:
+        return None
+    except OSError as error:  # ELOOP: a symlink.
+        raise ValueError(f"{path} is not a file the host reads: {error.strerror}") from None
+    with os.fdopen(fd, "rb") as file:
+        info = os.fstat(file.fileno())
+        if not stat.S_ISREG(info.st_mode) or info.st_size > _RECORDS_LIMIT:
+            raise ValueError(f"{path} is not a regular records file within the limit")
+        return file.read(_RECORDS_LIMIT + 1)
+
+
 def _lines[M: (Trajectory, TaskResult)](path: Path, kind: type[M]) -> list[M | None]:
-    if not path.exists():
-        return []
-    if path.stat().st_size > _RECORDS_LIMIT:
+    try:
+        raw = _read_untrusted(path)
+    except ValueError:
+        _logger.exception("an untrusted records file was refused")
         return [None]
+    if raw is None:
+        return []
     parsed: list[M | None] = []
-    for line in path.read_bytes().split(b"\n"):
+    for line in raw.split(b"\n"):
         if line.strip():
             try:
                 parsed.append(from_json_line(line.decode("utf-8"), kind))
