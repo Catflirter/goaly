@@ -5,8 +5,8 @@
 - Every other test runs with a fresh, empty ``HOME`` and no ``GOALY_*`` environment variables
   (in any case, as pydantic-settings matches names case-insensitively), so it can never read
   ``~/.config/goaly/.env`` or a real API key.
-- Async tests are marked ``anyio``, and anyio's pytest plugin runs them on asyncio, the event
-  loop goaly runs on.
+- Async tests run through anyio's pytest plugin, on asyncio only. Mark them ``anyio``, for example
+  with ``pytestmark = pytest.mark.anyio`` at the top of the module.
 """
 
 import os
@@ -26,12 +26,6 @@ def pytest_addoption(parser: pytest.Parser) -> None:
     )
 
 
-@pytest.fixture(scope="session")
-def anyio_backend() -> str:
-    # The plugin's default runs each test once on every installed backend.
-    return "asyncio"
-
-
 def pytest_collection_modifyitems(config: pytest.Config, items: list[pytest.Item]) -> None:
     if config.getoption("--integration"):
         return
@@ -39,6 +33,12 @@ def pytest_collection_modifyitems(config: pytest.Config, items: list[pytest.Item
     for item in items:
         if item.get_closest_marker("integration") is not None:
             item.add_marker(skip_integration)
+
+
+@pytest.fixture(scope="session")
+def anyio_backend() -> str:
+    """Run every test marked ``anyio`` once, on asyncio: each process runs one asyncio loop."""
+    return "asyncio"
 
 
 @pytest.fixture(autouse=True)
