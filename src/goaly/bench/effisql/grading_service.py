@@ -6,35 +6,45 @@ Each grading instance gets a :class:`SlotRunner` that runs its evaluations one a
   and hashing a result is Python work. Measured on 2M lineitem rows, three threads in one
   process each took 4 times as long as one thread alone, and five threads 7 times, since they
   share one interpreter lock. Results reach 18-20M rows, so threads would push the largest
-  tasks past the fetch's time limit.
+  tasks past the fetch's time limit. A worker that dies is replaced, and the instance is held
+  back with a growing pause after repeated deaths, so a broken worker cannot drain the queue.
+  A file lock keeps a second grader process off the same instance.
 - :class:`ThreadRunner` runs them in a thread of this process: for tests, and for one instance.
 
-:class:`EffiSqlGrader` leases a runner from the pool by priority (goaly.bench.effisql.
-grading_pool), runs the evaluation on it, and never raises for grading trouble: the Grade's
-status says what went wrong. A cancelled grading stops its statements before it frees the
-instance, so no orphaned statement can disturb the next evaluation's timing.
+Every call gets a token, and a cancel stops only the call with that token
+(goaly.bench.effisql.grading.GradingSlot), so a late cancel never reaches the next evaluation.
+:class:`EffiSqlGrader` grades what needs no database at once, leases a runner from the pool by
+priority (goaly.bench.effisql.grading_pool, the one scheduler of the grading instances, with
+``goaly-smoke`` first) for the rest, and never raises for grading trouble: the Grade's status
+says what went wrong. A cancelled grading stops its statements before it frees the instance.
 """
 
 import asyncio
+import contextlib
+import fcntl
+import itertools
 import logging
 import multiprocessing
+import multiprocessing.synchronize
+import os
 import threading
-import time
 from collections.abc import Awaitable, Callable, Sequence
-from concurrent.futures import Executor, ProcessPoolExecutor, ThreadPoolExecutor
+from concurrent.futures import ProcessPoolExecutor, ThreadPoolExecutor
+from concurrent.futures.process import BrokenProcessPool
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Any, Protocol, Self
+from typing import IO, TYPE_CHECKING, Any, Protocol, Self
 
 from goaly.bench.effisql.data import EffiSqlInstance
+from goaly.bench.effisql.grader import GraderError
 from goaly.bench.effisql.grading import (
-    AbortFlag,
     BaseCache,
     GradingSlot,
     InstanceCheck,
     Mode,
     grader_error,
     prediction_sql,
+    quick_grade,
 )
 from goaly.bench.effisql.grading_pool import GradingInstance, GradingPool, Priority
 from goaly.bench.effisql.pg_build import Connect, connector
@@ -47,12 +57,19 @@ __all__ = [
     "SlotRunner",
     "ThreadRunner",
     "WorkerSpec",
+    "default_lock_dir",
     "grade_on_slot",
 ]
 
+if TYPE_CHECKING:  # Generic only to type checkers; a plain class at run time.
+    from multiprocessing.sharedctypes import Synchronized
+
 _log = logging.getLogger(__name__)
 
-_ABORT_POLL_S = 0.2  # How often a worker's abort watcher checks that an abort is over.
+_BACKOFF_AFTER = 2  # A worker's deaths in a row before its instance is held back.
+_BACKOFF_STEP_S = 30.0  # Each further death in a row holds the instance back this much more.
+_BACKOFF_MAX_S = 600.0
+_CLOSE_JOIN_S = 30.0  # How long close() waits for a worker before it terminates it.
 
 
 class SlotRunner(Protocol):
@@ -77,24 +94,27 @@ class ThreadRunner:
     def __init__(self, slot: GradingSlot) -> None:
         self.slot = slot
         self._executor = ThreadPoolExecutor(1, thread_name_prefix=f"grade-{slot.instance.name}")
+        self._tokens = itertools.count()
 
     @property
     def instance(self) -> GradingInstance:
         return self.slot.instance
 
     async def call[T](self, work: Callable[..., T], *args: Any) -> T:
-        loop = asyncio.get_running_loop()
-        future = loop.run_in_executor(self._executor, work, self.slot, *args)
-        return await _shielded(future, self._abort)
-
-    def _abort(self) -> None:
-        sessions = self.slot.open_sessions
-        if sessions is not None:
-            sessions.abort()
+        token = next(self._tokens)
+        future = asyncio.get_running_loop().run_in_executor(
+            self._executor, self.slot.run, token, lambda slot: work(slot, *args)
+        )
+        return await _shielded(future, lambda: self.slot.abort(token), inline=False)
 
     def close(self) -> None:
         self._executor.shutdown(wait=True)
         self.slot.reset()
+
+
+def default_lock_dir() -> Path:
+    """Where grader processes take their per-instance locks: ``~/.cache/goaly/grading``."""
+    return Path.home() / ".cache" / "goaly" / "grading"
 
 
 @dataclass(frozen=True, slots=True)
@@ -114,44 +134,64 @@ class WorkerSpec:
 _worker_slot: GradingSlot | None = None
 
 
-def _start_worker(spec: WorkerSpec, aborted: AbortFlag) -> None:
+def _start_worker(
+    spec: WorkerSpec, cancel: "Synchronized[int]", poke: multiprocessing.synchronize.Event
+) -> None:
     global _worker_slot  # The worker process's one slot.
-    connect = spec.connect()
-    slot = GradingSlot(spec.instance, lambda _: connect, check=spec.check, aborted=aborted)
+    slot = GradingSlot(
+        spec.instance, lambda _: spec.connect(), check=spec.check, cancelled=lambda: cancel.value
+    )
     _worker_slot = slot
-    threading.Thread(target=_watch_aborts, args=(slot, aborted), daemon=True).start()
+    threading.Thread(target=_watch_aborts, args=(slot, cancel, poke), daemon=True).start()
 
 
-def _watch_aborts(slot: GradingSlot, aborted: AbortFlag) -> None:
-    """Cancel the slot's statements whenever the parent sets ``aborted``.
+def _watch_aborts(
+    slot: GradingSlot,
+    cancel: "Synchronized[int]",
+    poke: multiprocessing.synchronize.Event,
+    stop: threading.Event | None = None,
+) -> None:
+    """Abort the call whose token the parent wrote to ``cancel``, each time it pokes.
 
     Only the connection that runs a statement holds its cancel key, and the grader's role may
     not cancel other sessions, so the cancel comes from inside the worker.
     """
-    while True:
-        aborted.wait()
-        sessions = slot.open_sessions
-        if sessions is not None:
-            sessions.abort()
-        while aborted.is_set():  # The next evaluation clears it.
-            time.sleep(_ABORT_POLL_S)
+    while stop is None or not stop.is_set():
+        if not poke.wait(0.5):
+            continue
+        poke.clear()
+        slot.abort(cancel.value)
 
 
-def _run_in_worker[T](work: Callable[..., T], args: tuple[Any, ...]) -> T:
+def _run_in_worker[T](token: int, work: Callable[..., T], args: tuple[Any, ...]) -> T:
     if _worker_slot is None:
         raise RuntimeError("the grading worker was not started")
-    return work(_worker_slot, *args)
+    return _worker_slot.run(token, lambda slot: work(slot, *args))
 
 
 class ProcessRunner:
-    """Runs a slot's work in a worker process of its own, started with spawn."""
+    """Runs a slot's work in a worker process of its own, started with spawn.
 
-    def __init__(self, spec: WorkerSpec) -> None:
+    It takes the instance's lock under ``lock_dir`` for its lifetime, so no other grader process
+    can grade on the same instance, and raises GraderError if another holds it.
+    """
+
+    def __init__(self, spec: WorkerSpec, *, lock_dir: Path | None = None) -> None:
         self.spec = spec
-        context = multiprocessing.get_context("spawn")  # Never fork a process with threads.
-        self._aborted = context.Event()
-        self._executor: Executor = ProcessPoolExecutor(
-            1, mp_context=context, initializer=_start_worker, initargs=(spec, self._aborted)
+        self._lock_file = _lock_instance(lock_dir or default_lock_dir(), spec.instance)
+        self._context = multiprocessing.get_context("spawn")  # Never fork with threads around.
+        self._tokens = itertools.count()
+        self._deaths = 0
+        self._start()
+
+    def _start(self) -> None:
+        self._cancel: Synchronized[int] = self._context.Value("q", -1)
+        self._poke = self._context.Event()
+        self._executor = ProcessPoolExecutor(
+            1,
+            mp_context=self._context,
+            initializer=_start_worker,
+            initargs=(self.spec, self._cancel, self._poke),
         )
 
     @property
@@ -159,23 +199,75 @@ class ProcessRunner:
         return self.spec.instance
 
     async def call[T](self, work: Callable[..., T], *args: Any) -> T:
-        loop = asyncio.get_running_loop()
-        future = loop.run_in_executor(self._executor, _run_in_worker, work, args)
-        return await _shielded(future, self._abort)
+        token = next(self._tokens)
+        future = asyncio.get_running_loop().run_in_executor(
+            self._executor, _run_in_worker, token, work, args
+        )
+        try:
+            result = await _shielded(future, lambda: self._abort(token), inline=True)
+        except BrokenProcessPool:
+            await self._replace_dead_worker()
+            raise GraderError(
+                f"the grading worker for {self.instance.name} died; it was replaced"
+            ) from None
+        self._deaths = 0
+        return result
 
-    def _abort(self) -> None:
-        self._aborted.set()  # The worker's watcher cancels the statements.
+    def _abort(self, token: int) -> None:
+        self._cancel.value = token
+        self._poke.set()  # The worker's watcher cancels the statements.
+
+    async def _replace_dead_worker(self) -> None:
+        self._deaths += 1
+        _log.error("grading worker died", extra={"instance": self.instance.name})
+        self._executor.shutdown(wait=False, cancel_futures=True)
+        self._start()
+        # The dead worker's statement ends by the server's statement_timeout. Hold the instance
+        # back after repeated deaths, so this runner does not win every lease and fail it.
+        if self._deaths >= _BACKOFF_AFTER:
+            pause = min(_BACKOFF_STEP_S * (self._deaths - _BACKOFF_AFTER + 1), _BACKOFF_MAX_S)
+            await asyncio.sleep(pause)
 
     def close(self) -> None:
-        self._executor.shutdown(wait=True, cancel_futures=True)
+        """Stop the worker, waiting a bounded time for it, then release the instance's lock.
+
+        It blocks: call it once no grading runs, outside the event loop or at its end.
+        """
+        processes = list(getattr(self._executor, "_processes", {}).values())
+        self._executor.shutdown(wait=False, cancel_futures=False)
+        for process in processes:
+            process.join(_CLOSE_JOIN_S)
+            if process.is_alive():
+                _log.warning("terminating a hung grading worker", extra={"pid": process.pid})
+                process.terminate()
+        self._lock_file.close()
 
 
-async def _shielded[T](future: asyncio.Future[T], abort: Callable[[], None]) -> T:
-    """Await ``future``; if cancelled, run ``abort`` and wait for ``future`` before re-raising."""
+def _lock_instance(lock_dir: Path, instance: GradingInstance) -> IO[str]:
+    lock_dir.mkdir(parents=True, exist_ok=True)
+    handle = (lock_dir / f"{instance.name}.lock").open("w", encoding="utf-8")
+    try:
+        fcntl.flock(handle, fcntl.LOCK_EX | fcntl.LOCK_NB)
+    except BlockingIOError:
+        handle.close()
+        raise GraderError(f"another grader process is grading on {instance.name}") from None
+    handle.write(f"{os.getpid()}\n")
+    handle.flush()
+    return handle
+
+
+async def _shielded[T](future: asyncio.Future[T], abort: Callable[[], None], *, inline: bool) -> T:
+    """Await ``future``; if cancelled, run ``abort`` and wait for ``future`` before re-raising.
+
+    ``abort`` runs inline when it cannot block, else on the loop's default executor.
+    """
     try:
         return await asyncio.shield(future)
     except asyncio.CancelledError:
-        await _finish(asyncio.get_running_loop().run_in_executor(None, abort))
+        if inline:
+            abort()
+        else:
+            await _finish(asyncio.get_running_loop().run_in_executor(None, abort))
         await _finish(future)
         raise
 
@@ -201,13 +293,13 @@ def grade_on_slot(
 class EffiSqlGrader:
     """Grades predictions on a pool of grading instances, in dev or official mode.
 
-    Each mode has its own directory under ``cache_root``: dev mode's holds the base cache it
-    reads, and official mode reads and writes none.
+    Dev mode reads the base cache under ``cache_root / "dev"``; official mode reads and writes
+    no cache.
     """
 
     def __init__(self, pool: GradingPool[SlotRunner], *, cache_root: Path) -> None:
         self._pool = pool
-        self._caches = {mode: BaseCache(cache_root / mode.value) for mode in Mode}
+        self._dev_cache = BaseCache(cache_root / Mode.DEV.value)
 
     @classmethod
     def on_instances(
@@ -216,13 +308,22 @@ class EffiSqlGrader:
         *,
         cache_root: Path,
         check: InstanceCheck | None = None,
+        lock_dir: Path | None = None,
     ) -> Self:
         """A grader with a worker process per instance; :meth:`close` stops them."""
-        runners: list[SlotRunner] = [ProcessRunner(WorkerSpec(i, check=check)) for i in instances]
+        runners: list[SlotRunner] = []
+        try:
+            for instance in instances:
+                runners.append(ProcessRunner(WorkerSpec(instance, check=check), lock_dir=lock_dir))
+        except GraderError:
+            for runner in runners:
+                runner.close()
+            raise
         return cls(GradingPool(runners), cache_root=cache_root)
 
-    def cache(self, mode: Mode) -> BaseCache:
-        return self._caches[mode]
+    @property
+    def dev_cache(self) -> BaseCache:
+        return self._dev_cache
 
     @property
     def pool(self) -> GradingPool[SlotRunner]:
@@ -238,12 +339,13 @@ class EffiSqlGrader:
     ) -> Grade:
         """Grade ``prediction`` for ``inst``. Grading trouble sets the status; it never raises."""
         sql = prediction_sql(inst, prediction)
-        cache = self._caches[Mode.DEV] if mode is Mode.DEV else None
+        cache = self._dev_cache if mode is Mode.DEV else None
         try:
+            quick = quick_grade(inst, sql, mode, cache)
+            if quick is not None:
+                return quick
             async with self._pool.lease(priority) as runner:
                 return await runner.call(grade_on_slot, inst, sql, mode, cache)
-        except asyncio.CancelledError:
-            raise
         except Exception as error:  # noqa: BLE001  # Never raise for grading trouble.
             _log.exception("grading failed", extra={"instance_id": inst.instance_id})
             return grader_error(inst, f"grader: {type(error).__name__}: {error}")
@@ -261,4 +363,5 @@ class EffiSqlGrader:
     def close(self) -> None:
         """Stop every runner; call it once no grading is running."""
         for runner in self._pool.resources:
-            runner.close()
+            with contextlib.suppress(Exception):
+                runner.close()
