@@ -169,3 +169,15 @@ def test_load_yaml_reads_a_document(tmp_path: Path) -> None:
     path.write_text("limits:\n  step_limit: 60\n", encoding="utf-8")
 
     assert msa.load_yaml(path) == {"limits": {"step_limit": 60}}
+
+
+@pytest.mark.parametrize("name", ["mini.yaml", "default.yaml", "config.yml"])
+def test_load_yaml_reads_only_the_path_it_is_given(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, name: str
+) -> None:
+    # mini-swe-agent ships mini.yaml and default.yaml, and its lookup would read config.yaml.
+    (tmp_path / "config.yaml").write_text("a: 1\n", encoding="utf-8")
+    monkeypatch.chdir(tmp_path)
+
+    with pytest.raises(FileNotFoundError):
+        msa.load_yaml(Path(name))
