@@ -1,0 +1,76 @@
+{
+  "tpch": {
+    "scale": "3",
+    "files": {
+      "region": {
+        "sha256": "5a7c2fe9718db00ff5e5bc82a9ebfa8abc492cc75260d3c0ffb411974f235ab0",
+        "rows": 5
+      },
+      "nation": {
+        "sha256": "7d47bc9397da331054fa92b8fb92e4c074004bad72dcbb893012093218dccf6c",
+        "rows": 25
+      },
+      "supplier": {
+        "sha256": "73072c20eb0ccd43b1cca81b5f6bc71a729d5991b933975ce46c2e39170019d3",
+        "rows": 30000
+      },
+      "customer": {
+        "sha256": "de9bee0c8bb678e86c74b8d3a78ba8443361f2f3a43fcdcaee0062406d5e1c0e",
+        "rows": 450000
+      },
+      "part": {
+        "sha256": "649930db32b160ffa3aee458c8cc3bca6dcf1ac7d3cced8270f704df3aca3dba",
+        "rows": 600000
+      },
+      "partsupp": {
+        "sha256": "4c1c73f9c674c0c45d637ca4b1c55c8f5b09ba951cbefc94fa6bcda1b0260cee",
+        "rows": 2400000
+      },
+      "orders": {
+        "sha256": "ce9115cda86b710ac82b8809e89e3dbf8b82bbaed8966e887114443931bf5a6b",
+        "rows": 4500000
+      },
+      "lineitem": {
+        "sha256": "4a98a91090be0a074e1826a8e44a3ae1bb166bdc5b2b5bbaffcb27ce26087dce",
+        "rows": 17996609
+      }
+    }
+  },
+  "tpch_alt": {
+    "scale": "0.3",
+    "files": {
+      "region": {
+        "sha256": "5a7c2fe9718db00ff5e5bc82a9ebfa8abc492cc75260d3c0ffb411974f235ab0",
+        "rows": 5
+      },
+      "nation": {
+        "sha256": "7d47bc9397da331054fa92b8fb92e4c074004bad72dcbb893012093218dccf6c",
+        "rows": 25
+      },
+      "supplier": {
+        "sha256": "09719bc81b613e029ae0712c975c0a7a38404e1892a1a3051cb7488530fc1e73",
+        "rows": 3000
+      },
+      "customer": {
+        "sha256": "89b333f07c90120ec92674ce10d76b273da3cb1c38c85a364400a4d3cbad183e",
+        "rows": 45000
+      },
+      "part": {
+        "sha256": "98a14c894b5d98ce138f30a7d2fc6259240d0eccd1f367818fddece9ae97a80d",
+        "rows": 60000
+      },
+      "partsupp": {
+        "sha256": "edf57b3c94e3c56cff947905ceb06a4fc16f519677745f1fb6e245c9ba27c231",
+        "rows": 240000
+      },
+      "orders": {
+        "sha256": "62e94093dca776171008ef14232dc77b3bb04bf8c50fe26a0bf794cd68462a4f",
+        "rows": 450000
+      },
+      "lineitem": {
+        "sha256": "5d401279c7ca46795b59e750b4eed21ab43ea15067804046c6f215e362b77343",
+        "rows": 1800093
+      }
+    }
+  }
+}

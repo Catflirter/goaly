@@ -1,5 +1,6 @@
 """Tests for goaly.harness.core.logs."""
 
+import asyncio
 import io
 import json
 import logging
@@ -13,7 +14,7 @@ from typing import Any
 
 import pytest
 
-from goaly.harness.core.logs import JsonFormatter, configure_logging
+from goaly.harness.core.logs import JsonFormatter, configure_logging, log_context
 
 CORE_KEYS = ["timestamp", "level", "logger", "message"]
 
@@ -274,3 +275,48 @@ def test_configure_logging_leaves_other_handlers_alone(root: logging.Logger) -> 
 
     assert other in root.handlers
     assert len(json_handlers(root)) == 1
+
+
+# The log context.
+
+
+def test_a_log_context_adds_its_fields_to_every_record_inside_it(root: logging.Logger) -> None:
+    stream = io.StringIO()
+    configure_logging(stream=stream)
+    logger = logging.getLogger("goaly.harness.core.runner")
+
+    with log_context(run_id="r1", instance_id="t1", seed=0):
+        logger.warning("task failed")
+        with log_context(seed=1, step=3):  # Nested: it adds to the outer fields, and wins.
+            logger.info("inner", extra={"step": 4})  # An explicit extra wins over the context.
+    logger.info("outside")
+
+    first, inner, outside = map(parse_line, stream.getvalue().splitlines(keepends=True))
+    assert (first["run_id"], first["instance_id"], first["seed"]) == ("r1", "t1", 0)
+    assert (inner["run_id"], inner["seed"], inner["step"]) == ("r1", 1, 4)
+    assert "run_id" not in outside
+
+
+@pytest.mark.anyio
+async def test_a_log_context_reaches_the_tasks_and_threads_started_inside_it(
+    root: logging.Logger,
+) -> None:
+    stream = io.StringIO()
+    configure_logging(stream=stream)
+    logger = logging.getLogger("goaly.tests.logs")
+
+    async def logs(message: str) -> None:
+        logger.info(message)
+
+    with log_context(instance_id="t1"):
+        inside = asyncio.create_task(logs("task"))
+        await asyncio.to_thread(logger.info, "thread")
+    outside = asyncio.create_task(logs("later"))
+    await asyncio.gather(inside, outside)
+
+    found = {
+        entry["message"]: entry for entry in map(parse_line, stream.getvalue().splitlines(True))
+    }
+    assert found["task"]["instance_id"] == "t1"
+    assert found["thread"]["instance_id"] == "t1"
+    assert "instance_id" not in found["later"]

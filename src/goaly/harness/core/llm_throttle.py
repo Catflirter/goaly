@@ -22,6 +22,7 @@ after it, or the first outcome judged after it.
 """
 
 import asyncio
+import itertools
 import logging
 import math
 import time
@@ -117,7 +118,9 @@ class ModelThrottle:
         self._clock = clock
         self._limit = share
         self._in_flight = 0
-        self._waiters: deque[tuple[asyncio.Future[None], LlmCallRecord]] = deque()
+        # Waiting calls, in the order they came: each call's turn, its future and its record.
+        self._waiters: deque[tuple[int, asyncio.Future[None], LlmCallRecord]] = deque()
+        self._turns = itertools.count()
         self._closer: asyncio.Task[None] | None = None  # Wakes the queue when the pause ends.
         self._successes = 0  # In a row.
         self._halved_at = -math.inf
@@ -177,13 +180,10 @@ class ModelThrottle:
                     self._grow(record)
 
     async def _acquire(self, record: LlmCallRecord) -> None:
-        first_in_line = False
+        turn = next(self._turns)
         while True:
             waiter = asyncio.get_running_loop().create_future()
-            if first_in_line:
-                self._waiters.appendleft((waiter, record))
-            else:
-                self._waiters.append((waiter, record))
+            self._queue(turn, waiter, record)
             self._wake()
             try:
                 await waiter
@@ -195,7 +195,13 @@ class ModelThrottle:
             if self._in_flight <= self._limit and not self._is_open(self._clock.monotonic()):
                 return
             self._in_flight -= 1  # Give it back, and wait again, keeping this call's turn.
-            first_in_line = True
+
+    def _queue(self, turn: int, waiter: asyncio.Future[None], record: LlmCallRecord) -> None:
+        """Queue a call by its turn: a new one at the back, one that gave its slot back in place."""
+        place = len(self._waiters)
+        while place > 0 and self._waiters[place - 1][0] > turn:
+            place -= 1
+        self._waiters.insert(place, (turn, waiter, record))
 
     def _release(self) -> None:
         self._in_flight -= 1
@@ -212,7 +218,7 @@ class ModelThrottle:
                 self._closer = asyncio.get_running_loop().create_task(self._wake_when_closed())
             return
         while self._waiters and self._in_flight < self._limit:
-            waiter, record = self._waiters.popleft()
+            _, waiter, record = self._waiters.popleft()
             if not waiter.done():
                 self._close_if_due(now, record)
                 self._in_flight += 1

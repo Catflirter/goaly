@@ -1,0 +1,146 @@
+[
+  {
+    "instance_id": "29",
+    "reason": "gold optimized_sql is only 0.74x faster than base_sql (under 1.2x)"
+  },
+  {
+    "instance_id": "31",
+    "reason": "gold optimized_sql is only 1.01x faster than base_sql (under 1.2x)"
+  },
+  {
+    "instance_id": "32",
+    "reason": "gold optimized_sql is only 0.99x faster than base_sql (under 1.2x)"
+  },
+  {
+    "instance_id": "33",
+    "reason": "gold optimized_sql is only 0.96x faster than base_sql (under 1.2x)"
+  },
+  {
+    "instance_id": "39",
+    "reason": "gold optimized_sql is only 1.02x faster than base_sql (under 1.2x)"
+  },
+  {
+    "instance_id": "51",
+    "reason": "gold optimized_sql is only 1.05x faster than base_sql (under 1.2x)"
+  },
+  {
+    "instance_id": "55",
+    "reason": "gold optimized_sql is only 1.00x faster than base_sql (under 1.2x)"
+  },
+  {
+    "instance_id": "73",
+    "reason": "gold optimized_sql is only 0.98x faster than base_sql (under 1.2x)"
+  },
+  {
+    "instance_id": "74",
+    "reason": "gold optimized_sql is only 1.14x faster than base_sql (under 1.2x)"
+  },
+  {
+    "instance_id": "81",
+    "reason": "gold optimized_sql is only 1.01x faster than base_sql (under 1.2x)"
+  },
+  {
+    "instance_id": "86",
+    "reason": "gold optimized_sql is only 1.10x faster than base_sql (under 1.2x)"
+  },
+  {
+    "instance_id": "90",
+    "reason": "gold optimized_sql is only 1.13x faster than base_sql (under 1.2x)"
+  },
+  {
+    "instance_id": "98",
+    "reason": "gold optimized_sql is only 0.97x faster than base_sql (under 1.2x)"
+  },
+  {
+    "instance_id": "122",
+    "reason": "gold optimized_sql is only 1.15x faster than base_sql (under 1.2x)"
+  },
+  {
+    "instance_id": "124",
+    "reason": "gold optimized_sql is only 1.00x faster than base_sql (under 1.2x)"
+  },
+  {
+    "instance_id": "134",
+    "reason": "gold optimized_sql is only 1.19x faster than base_sql (under 1.2x)"
+  },
+  {
+    "instance_id": "135",
+    "reason": "gold optimized_sql is only 0.57x faster than base_sql (under 1.2x)"
+  },
+  {
+    "instance_id": "139",
+    "reason": "gold optimized_sql is only 1.15x faster than base_sql (under 1.2x)"
+  },
+  {
+    "instance_id": "141",
+    "reason": "gold optimized_sql is only 0.99x faster than base_sql (under 1.2x)"
+  },
+  {
+    "instance_id": "143",
+    "reason": "gold optimized_sql is only 1.02x faster than base_sql (under 1.2x)"
+  },
+  {
+    "instance_id": "149",
+    "reason": "gold optimized_sql is only 1.02x faster than base_sql (under 1.2x)"
+  },
+  {
+    "instance_id": "152",
+    "reason": "gold optimized_sql is only 0.97x faster than base_sql (under 1.2x)"
+  },
+  {
+    "instance_id": "155",
+    "reason": "gold optimized_sql is only 1.19x faster than base_sql (under 1.2x)"
+  },
+  {
+    "instance_id": "162",
+    "reason": "gold optimized_sql is only 0.98x faster than base_sql (under 1.2x)"
+  },
+  {
+    "instance_id": "163",
+    "reason": "gold optimized_sql is only 1.10x faster than base_sql (under 1.2x)"
+  },
+  {
+    "instance_id": "170",
+    "reason": "gold optimized_sql is only 0.62x faster than base_sql (under 1.2x)"
+  },
+  {
+    "instance_id": "182",
+    "reason": "gold optimized_sql is only 1.03x faster than base_sql (under 1.2x)"
+  },
+  {
+    "instance_id": "183",
+    "reason": "gold optimized_sql is only 1.11x faster than base_sql (under 1.2x)"
+  },
+  {
+    "instance_id": "197",
+    "reason": "gold optimized_sql is only 1.14x faster than base_sql (under 1.2x)"
+  },
+  {
+    "instance_id": "202",
+    "reason": "gold optimized_sql is only 1.00x faster than base_sql (under 1.2x)"
+  },
+  {
+    "instance_id": "204",
+    "reason": "gold optimized_sql is only 1.18x faster than base_sql (under 1.2x)"
+  },
+  {
+    "instance_id": "205",
+    "reason": "gold optimized_sql is only 1.14x faster than base_sql (under 1.2x)"
+  },
+  {
+    "instance_id": "226",
+    "reason": "gold optimized_sql is only 1.14x faster than base_sql (under 1.2x)"
+  },
+  {
+    "instance_id": "228",
+    "reason": "gold optimized_sql is only 1.01x faster than base_sql (under 1.2x)"
+  },
+  {
+    "instance_id": "93",
+    "reason": "review: the gold fails the robustness check and is at fault: it subtracts only prices strictly below the maximum, while the base subtracts every other row's price, ties at the maximum included; tpch_alt has such a tie"
+  },
+  {
+    "instance_id": "94",
+    "reason": "review: the identity \u03c4 is unstable on this machine: 1.23 measured idle, 0.60 under load, outside the \u00b110% tolerance"
+  }
+]
