@@ -55,9 +55,10 @@ def result(
     seed: int,
     graded: EffiSqlGrade | None,
     status: GradeStatus.ValueType = GRADE_STATUS_GRADED,
+    wall_time_s: float = 0.0,
 ) -> TaskResult:
     """A result line: graded, or the solve phase's ungraded line for None."""
-    line = TaskResult(run_id=run_id, instance_id=task, seed=seed)
+    line = TaskResult(run_id=run_id, instance_id=task, seed=seed, wall_time_s=wall_time_s)
     if graded is not None:
         line.grade.CopyFrom(
             Grade(instance_id=task, score=graded.credit, status=status, effisql=graded)
@@ -80,6 +81,7 @@ def write_run(
 ) -> Path:
     """A graded run of ``speedups[task][seed]``, each line after an ungraded solve line.
 
+    Each graded line has a host-attributed wall_time_s of 30 s.
     The call log has ``calls`` calls, each of 100 input and 10 output tokens and ``cost``
     dollars, 60 s apart and 30 s long.
     """
@@ -106,7 +108,7 @@ def write_run(
         for seed, speedup in enumerate(values):
             lines += [
                 result(run_id, task, seed, None),
-                result(run_id, task, seed, effisql_grade(speedup)),
+                result(run_id, task, seed, effisql_grade(speedup), wall_time_s=30.0),
             ]
     write_jsonl(path / "results.jsonl", [*lines, *extra])
     records = []
@@ -176,3 +178,25 @@ def write_ledger(
     write_jsonl(path / "experiments.jsonl", experiments)
     write_jsonl(path / "lessons.jsonl", lessons)
     return path
+
+
+def write_stages(root: Path, run: Path, *durations: float) -> None:
+    """Append a solve segment of each duration for ``run`` to ``root``'s stages.jsonl."""
+    with (root / "stages.jsonl").open("a", encoding="utf-8") as file:
+        for duration in durations:
+            argv = ["goaly", "run", "--phase", "solve", "--out", str(run)]
+            record: dict[str, object] = {"run": run.name, "phase": "solve", "argv": argv}
+            record |= {"started_at": START, "finished_at": START + duration, "exit_status": 0}
+            file.write(json.dumps(record) + "\n")
+
+
+def write_plans(run: Path, plans: Mapping[tuple[str, int], object]) -> None:
+    """Write the grade phase's stored plans, ``plans[(task, seed)]``."""
+    (run / "plans").mkdir(exist_ok=True)
+    for seed in sorted({seed for _, seed in plans}):
+        lines = [
+            json.dumps({"instance_id": task, "plan": plan}) + "\n"
+            for (task, at), plan in plans.items()
+            if at == seed
+        ]
+        (run / "plans" / f"seed-{seed}.jsonl").write_text("".join(lines), encoding="utf-8")

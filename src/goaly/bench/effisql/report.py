@@ -12,10 +12,11 @@ matched predictions a person must read before publishing (goaly.bench.effisql.au
 section NAME, and the template must place every section exactly once.
 """
 
+import dataclasses
 import re
 import statistics
 from collections.abc import Callable, Mapping, Sequence
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 
 from goaly.bench.effisql.audit import AUDIT_SPEEDUP, audit_reasons
 from goaly.bench.effisql.metrics import (
@@ -28,10 +29,11 @@ from goaly.bench.effisql.metrics import (
     markdown_table,
     seed_metrics,
 )
-from goaly.bench.effisql.report_inputs import RunRecord
+from goaly.bench.effisql.report_inputs import RunRecord, Verdict, VerdictKey
 from goaly.contracts.gen.experiment_pb2 import (
     DECISION_ACCEPTED,
-    DECISION_REJECTED,
+    DECISION_PENDING,
+    DECISION_UNSPECIFIED,
     REJECTION_REASON_REGRESSION,
     ChangeKind,
     Decision,
@@ -42,35 +44,85 @@ from goaly.contracts.gen.experiment_pb2 import (
     PhaseResult,
 )
 from goaly.contracts.gen.llm_call_pb2 import CallPurpose
-from goaly.contracts.gen.task_pb2 import Split
+from goaly.contracts.gen.task_pb2 import EffiSqlGrade, Split
 
-__all__ = ["BOOTSTRAP_SEED", "EFFICIENCY_CAP", "ROLES", "ReportInputs", "render", "sections"]
+__all__ = [
+    "BOOTSTRAP_SEED",
+    "EFFICIENCY_CAP",
+    "ROLES",
+    "ReportInputs",
+    "render",
+    "sections",
+]
 
 BOOTSTRAP_SEED = 20261014  # The split's seed (spec §7), so the intervals are reproducible.
 EFFICIENCY_CAP = 3.0  # The final harness's cost and wall time per task, at most 3x v0's (§8.3).
 ROLES = ("v0-heldout", "final-heldout", "v0-val", "final-val")
-_DECIDED = (DECISION_ACCEPTED, DECISION_REJECTED)
+# A round has reached its decision once no experiment in it is still pending (spec §8.2): an
+# aborted experiment, from an infrastructure failure or the lane's budget, is settled too.
+_UNSETTLED = (DECISION_UNSPECIFIED, DECISION_PENDING)
 _AT_RISK = "**at risk**: Effi-SQL only, as SWE is on hold"
 _MARKER = re.compile(r"<!-- report:([a-z]+) -->")
 
 
 @dataclass(frozen=True)
 class ReportInputs:
-    """Everything the report reads: runs by role, task difficulties and the ledger."""
+    """Everything the report reads: runs by role, task difficulties, the ledger and verdicts.
+
+    Outside ``allow_partial``, v0's and the final's runs on a split must name the same tasks, so
+    every section describes one task set. A verdict that a prediction is a constant branch flags
+    it as literal_result: the official numbers keep it, the checked ones give it 0.
+    """
 
     runs: Mapping[str, RunRecord]
     difficulty: Mapping[str, str]
     experiments: Sequence[ExperimentRecord] = ()
     lessons: Sequence[Lesson] = ()
     bootstrap_seed: int = BOOTSTRAP_SEED
+    allow_partial: bool = False
+    verdicts: Mapping[VerdictKey, Verdict] = field(default_factory=dict)
 
     def __post_init__(self) -> None:
         if unknown := self.runs.keys() - set(ROLES):
             raise ValueError(f"unknown run roles {sorted(unknown)}; the roles are {ROLES}")
+        for split in ("heldout", "val"):
+            v0, final = (self.runs.get(f"{version}-{split}") for version in ("v0", "final"))
+            if self.allow_partial or v0 is None or final is None:
+                continue
+            if set(v0.manifest.instance_ids) != set(final.manifest.instance_ids):
+                raise ValueError(
+                    f"v0-{split} and final-{split} name different tasks; compare them with"
+                    " --allow-partial, which reports the tasks both graded"
+                )
+        if stray := sorted(key for key in self.verdicts if key[0] not in self.runs):
+            raise ValueError(f"verdicts name runs the report lacks: {stray}")
+        runs = {role: _with_verdicts(role, run, self.verdicts) for role, run in self.runs.items()}
+        object.__setattr__(self, "runs", runs)
 
     def table(self, role: str) -> GradeTable | None:
         run = self.runs.get(role)
         return None if run is None else run.table
+
+
+def _with_verdicts(role: str, run: RunRecord, verdicts: Mapping[VerdictKey, Verdict]) -> RunRecord:
+    """``run``, with every prediction judged a constant branch flagged literal_result."""
+    flagged = {
+        (task, seed)
+        for (who, task, seed), verdict in verdicts.items()
+        if who == role and verdict.constant_branch
+    }
+    if not flagged or run.table is None:
+        return run
+    grades: dict[str, dict[int, EffiSqlGrade]] = {}
+    for task, seeds in run.table.grades.items():
+        grades[task] = {}
+        for seed, grade in seeds.items():
+            judged = EffiSqlGrade()
+            judged.CopyFrom(grade)
+            if (task, seed) in flagged:
+                judged.literal_result, judged.credit = True, 0.0
+            grades[task][seed] = judged
+    return dataclasses.replace(run, table=GradeTable(grades))
 
 
 def sections(inputs: ReportInputs) -> dict[str, str]:
@@ -200,14 +252,16 @@ def _efficiency(inputs: ReportInputs) -> str:
     lines = [
         "## Time, tokens and cost",
         "",
-        "Tokens and cost come from the host-side proxy's call log. The solve span runs from the"
-        " first LLM call to the last; wall time per task spreads it over the tasks and multiplies"
-        " by the run's task concurrency (spec §8.3). The run span, from the manifest, includes"
-        " grading.",
+        "Tokens and cost come from the host-side proxy's call log. Wall time per task is spec"
+        " §8.3's, from the source named: *solve phase* is the host clock around the run's solve"
+        " segments (stages.jsonl), downtime between resumed segments left out, spread over the"
+        " tasks and times the run's task concurrency; *results* is the mean host-attributed"
+        " wall_time_s of the graded results, as T21's cap check takes it, for runs without"
+        " stages.jsonl. The run span, from the manifest, includes grading.",
         "",
         "| Run | Tasks x seeds | LLM calls | Unpriced | Input tokens | Output tokens | Cost (USD)"
-        " | Cost per task | Solve span (min) | Wall per task (s) | Run span (min) |",
-        "|---|--:|--:|--:|--:|--:|--:|--:|--:|--:|--:|",
+        " | Cost per task | Solve phase (min) | Wall per task (s) | Wall source | Run span (min) |",
+        "|---|--:|--:|--:|--:|--:|--:|--:|--:|--:|---|--:|",
     ]
     for role in ROLES:
         if (run := inputs.runs.get(role)) is None:
@@ -219,18 +273,20 @@ def _efficiency(inputs: ReportInputs) -> str:
         else:
             cells += [usage.calls, usage.unpriced_calls, usage.input_tokens, usage.output_tokens]
             cells += [f"{usage.cost_usd:.2f}", _num(run.cost_per_task_usd(), 4)]
-        cells += [_num(_minutes(None if usage is None else usage.solve_span_s))]
-        lines.append(_row([*cells, _num(run.wall_per_task_s()), _num(_minutes(run.run_span_s))]))
+        cells += [_num(_minutes(run.solve_wall_s)), _num(run.wall_per_task_s()), run.wall_source]
+        lines.append(_row([*cells, _num(_minutes(run.run_span_s))]))
     lines += ["", f"Against the efficiency cap, {EFFICIENCY_CAP:g}x v0 per task (spec §8.3):", ""]
     for split in ("heldout", "val"):
         v0, final = inputs.runs.get(f"v0-{split}"), inputs.runs.get(f"final-{split}")
         if v0 is None or final is None:
             lines.append(f"- {split}: {_pending(f'v0-{split} and final-{split}')}")
             continue
-        cost = _ratio(final.cost_per_task_usd(), v0.cost_per_task_usd())
-        wall = _ratio(final.wall_per_task_s(), v0.wall_per_task_s())
+        cost, wall = _cap_ratios(final, v0)
         verdict = _cap_verdict(cost, wall)
-        lines.append(f"- {split}: cost {_times(cost)} and wall time {_times(wall)}: {verdict}.")
+        sources = f"wall time from {final.wall_source} and {v0.wall_source}"
+        lines.append(
+            f"- {split}: cost {_times(cost)} and wall time {_times(wall)} ({sources}): {verdict}."
+        )
     return _text([*lines, "", *_experiment_cost(inputs.experiments)])
 
 
@@ -271,7 +327,7 @@ def _flags(inputs: ReportInputs) -> str:
         for task, seeds in table.grades.items():
             for seed, grade in seeds.items():
                 if is_flagged(grade):
-                    alt = grade.HasField("alt_matched") and not grade.alt_matched
+                    alt = grade.matched and grade.HasField("alt_matched") and not grade.alt_matched
                     checks = ["hard_coded"] * alt + ["literal_result"] * grade.literal_result
                     found.append(f"task {task} seed {seed} ({', '.join(checks)})")
         lines.append(f"- {role}: {'; '.join(found) if found else 'none'}")
@@ -283,35 +339,72 @@ def _audit(inputs: ReportInputs) -> str:
         "## Constant-branch audit",
         "",
         "The grader's checks cannot flag a single-row constant gated on the data, a residual risk"
-        " the project lead accepted (spec §12). A matched prediction is listed here if it adds a"
-        f" pattern of such a branch to its base query, or ran at least {AUDIT_SPEEDUP:g}x faster:"
-        " read each one before the numbers are published, and record the verdict.",
+        " the project lead accepted (spec §12). A matched prediction is listed here if its stored"
+        " plan has a constant output branch, if it adds a literal its base query lacks, if it"
+        f" adds a branch pattern, or if it ran at least {AUDIT_SPEEDUP:g}x faster"
+        " (goaly.bench.effisql.audit). Read each one before the numbers are published, and record"
+        " the verdict in the verdicts file: a constant branch then gets no credit in every"
+        " checked number.",
         "",
         "| Run | Task | Seed | τ | Checked credit | Why | Official record | Verdict |",
         "|---|--:|--:|--:|--:|---|---|---|",
     ]
-    listed, unread = 0, []
+    listed, coverage = 0, []
     for role in ROLES:
         run = inputs.runs.get(role)
         if run is None or run.table is None:
             continue
-        if not run.queries:
-            unread.append(role)
+        planned = 0
         for task, seeds in run.table.grades.items():
             for seed, grade in seeds.items():
-                sql, base = run.queries.get((task, seed), ("", ""))
-                reasons = audit_reasons(sql, base, grade.speedup) if grade.matched else []
+                if not grade.matched:
+                    continue
+                plan = run.plans.get((task, seed))
+                planned += plan is not None
+                reasons = _audit_reasons(run, task, seed, grade.speedup, plan)
                 if not reasons:
                     continue
                 listed += 1
                 where = f"`{run.path / 'official' / f'seed-{seed}.jsonl'}`"
-                cells = [role, task, seed, _num(grade.speedup, 2), grade.credit]
-                lines.append(_row([*cells, "; ".join(reasons), where, "TODO"]))
+                cells = [role, task, seed, _num(grade.speedup, 2), grade.credit, "; ".join(reasons)]
+                lines.append(
+                    _row([*cells, where, _verdict(inputs.verdicts.get((role, task, seed)))])
+                )
+        coverage.append(_audit_coverage(role, run, planned))
     if not listed:
-        lines[-2:] = ["No matched prediction needs a review."]
-    if unread:
-        lines += ["", f"No official records in {', '.join(unread)}: listed by speedup alone."]
-    return _text(lines)
+        lines[-2:] = ["No matched prediction is listed."]
+    return _text([*lines, "", "What the audit read:", "", *coverage])
+
+
+def _audit_reasons(run: RunRecord, task: str, seed: int, speedup: float, plan: object) -> list[str]:
+    official = run.queries.get((task, seed))
+    if official is None:  # No official record: only the speedup can say anything.
+        return audit_reasons("", "", speedup)
+    try:
+        return audit_reasons(
+            official.sql, official.base_sql, speedup, plan=plan, base_plan=official.base_plan
+        )
+    except ValueError:
+        reasons = audit_reasons(official.sql, official.base_sql, speedup)
+        return ["plan: unreadable, so read the query", *reasons]
+
+
+def _audit_coverage(role: str, run: RunRecord, planned: int) -> str:
+    assert run.table is not None  # noqa: S101 - _audit skips runs without one.
+    matched = sum(g.matched for seeds in run.table.grades.values() for g in seeds.values())
+    text = f"- {role}: stored plans for {planned} of {matched} matched predictions"
+    text += "; the literal and pattern rules for the rest" if planned < matched else ""
+    if run.unread_seeds:
+        seeds = ", ".join(map(str, run.unread_seeds))
+        text += f". **No official records for seed {seeds}**: those are listed by τ alone"
+    return text + "."
+
+
+def _verdict(verdict: Verdict | None) -> str:
+    if verdict is None:
+        return "TODO"
+    judged = "constant branch: no credit" if verdict.constant_branch else "clean"
+    return f"{judged}{f' ({verdict.note})' if verdict.note else ''}"
 
 
 def _rsi(inputs: ReportInputs) -> str:
@@ -320,11 +413,12 @@ def _rsi(inputs: ReportInputs) -> str:
     if not rounds:
         return _text([*lines, "No RSI experiment is in the ledger, so no round finished."])
     finished = sum(done for _, _, done in rounds)
-    if not finished:
-        lines += ["**No round finished**, so the final harness is v0.", ""]
+    if not any(r.decision == DECISION_ACCEPTED for r in inputs.experiments):
+        lines += ["**No experiment was accepted**, so the final harness is v0.", ""]
     lines += [
-        f"{finished} of {len(rounds)} rounds finished: every experiment in a finished round was"
-        " accepted or rejected. An incomplete round's work stays in the tables below.",
+        f"{finished} of {len(rounds)} rounds finished: a finished round reached its decision, with"
+        " no experiment still pending; an aborted experiment does not hold it open. An"
+        " incomplete round's work stays in the tables below.",
         "",
         "| Round | Status | Experiments | Accepted | Best val R-VES after it |",
         "|--:|---|--:|--:|--:|",
@@ -351,12 +445,12 @@ def _rsi(inputs: ReportInputs) -> str:
 def _rounds(
     experiments: Sequence[ExperimentRecord],
 ) -> list[tuple[int, list[ExperimentRecord], bool]]:
-    """Each round's experiments, and whether it finished: all of them accepted or rejected."""
+    """Each round's experiments, and whether it finished: none of them is still pending."""
     rounds: dict[int, list[ExperimentRecord]] = {}
     for record in experiments:
         rounds.setdefault(record.round, []).append(record)
     return [
-        (number, records, all(r.decision in _DECIDED for r in records))
+        (number, records, all(r.decision not in _UNSETTLED for r in records))
         for number, records in sorted(rounds.items())
     ]
 
@@ -430,12 +524,17 @@ def _criteria(inputs: ReportInputs) -> str:
         ci = delta_rves_ci(*pair, scoring=Scoring.CHECKED, bootstrap_seed=inputs.bootstrap_seed)
         gain = f"{100 * delta:+.1f} [{ci.low:+.1f}, {ci.high:+.1f}]"
     lessons = len(inputs.lessons)
+    heldout = inputs.runs.get("v0-heldout"), inputs.runs.get("final-heldout")
+    efficiency = "**pending**"
+    if heldout[0] is not None and heldout[1] is not None:
+        verdict = _cap_verdict(*_cap_ratios(heldout[1], heldout[0]))
+        efficiency = "met" if verdict == "within the cap" else verdict
     rows = [  # The PDF's criteria (spec §2): each with its status and where the report shows it.
         ("Score: start, final, gain on every benchmark", _AT_RISK, f"checked ΔR-VES {gain}"),
         ("Robustness: 3 or more runs", "met" if seeds >= 3 else "**pending**", f"{seeds} runs"),
         ("Generalization", "**not met**: one benchmark", "Committed splits; flags section"),
         ("Lessons from experiments", "met" if lessons else "**pending**", f"{lessons} lessons"),
-        ("Efficiency: time, tokens and cost", "met", "Time, tokens and cost section"),
+        ("Efficiency: time, tokens and cost, 3x cap", efficiency, "Time, tokens and cost section"),
         ("Reproducibility: one command", "met", "`make final`; run manifests; uv.lock"),
         ("Automation: several rounds", automation, f"{finished} rounds finished"),
         ("Regression check", "met", f"best/effisql; {regressions} rejected for a regression"),
@@ -505,6 +604,12 @@ def _ratio(value: float | None, base: float | None) -> float | None:
 
 def _times(ratio: float | None) -> str:
     return "n/a" if ratio is None else f"{ratio:.2f}x v0's"
+
+
+def _cap_ratios(final: RunRecord, v0: RunRecord) -> tuple[float | None, float | None]:
+    """The final's cost and wall time per task over v0's."""
+    cost = _ratio(final.cost_per_task_usd(), v0.cost_per_task_usd())
+    return cost, _ratio(final.wall_per_task_s(), v0.wall_per_task_s())
 
 
 def _cap_verdict(cost: float | None, wall: float | None) -> str:

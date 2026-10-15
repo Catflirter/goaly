@@ -6,15 +6,16 @@ import pytest
 
 from goaly.bench.effisql.metrics import GradeTable, Scoring, compare
 from goaly.bench.effisql.report import ROLES, ReportInputs, render, sections
-from goaly.bench.effisql.report_inputs import RunRecord, load_run
+from goaly.bench.effisql.report_inputs import RunRecord, Verdict, load_run
 from goaly.contracts.gen.experiment_pb2 import (
     DECISION_ABORTED,
+    DECISION_PENDING,
     DECISION_REJECTED,
     REJECTION_REASON_REGRESSION,
     Lesson,
 )
-from goaly.contracts.gen.task_pb2 import SPLIT_HELDOUT, SPLIT_VAL
-from tests.bench.effisql.rundirs import experiment, write_run
+from goaly.contracts.gen.task_pb2 import SPLIT_HELDOUT, SPLIT_VAL, EffiSqlGrade
+from tests.bench.effisql.rundirs import experiment, write_plans, write_run, write_stages
 
 TEMPLATE = Path(__file__).resolve().parents[3] / "docs" / "results" / "final-report-template.md"
 DIFFICULTY = {"1": "easy", "2": "hard", "3": "hard"}
@@ -78,12 +79,14 @@ def test_a_role_without_a_run_renders_as_pending(tmp_path: Path) -> None:
     assert "| final-heldout | 2 | checked |" in built["variation"]
 
 
-def test_compares_only_the_tasks_both_runs_graded(tmp_path: Path) -> None:
+def test_refuses_runs_on_different_tasks_unless_partial(tmp_path: Path) -> None:
     loaded = runs(tmp_path, "v0-heldout")
     write_run(tmp_path / "f", {"1": [2.0], "2": [1.0]}, run_id="f")
     loaded["final-heldout"] = load_run(tmp_path / "f")
 
-    headline = sections(ReportInputs(loaded, DIFFICULTY))["headline"]
+    with pytest.raises(ValueError, match="v0-heldout and final-heldout name different tasks"):
+        ReportInputs(loaded, DIFFICULTY)
+    headline = sections(ReportInputs(loaded, DIFFICULTY, allow_partial=True))["headline"]
 
     assert "Compared on the 2 tasks both runs graded." in headline
 
@@ -100,10 +103,29 @@ def test_reports_cost_per_task_against_the_efficiency_cap(tmp_path: Path) -> Non
     write_run(tmp_path / "f", {"1": [2.0], "2": [1.0], "3": [1.0]}, run_id="f", cost=1.0)
     loaded["final-heldout"] = load_run(tmp_path / "f")
 
-    text = sections(ReportInputs(loaded, DIFFICULTY))["efficiency"]
+    built = sections(ReportInputs(loaded, DIFFICULTY))
 
-    assert "| final-heldout | 3 | 4 | 0 | 400 | 40 | 4.00 | 1.3333 | 3.5 | 140.0 | 60.0 |" in text
-    assert "- heldout: cost 4.00x v0's and wall time 1.00x v0's: **over the cap**." in text
+    text = built["efficiency"]
+    row = "| final-heldout | 3 | 4 | 0 | 400 | 40 | 4.00 | 1.3333 | n/a | 30.0 | results | 60.0 |"
+    assert row in text
+    assert (
+        "- heldout: cost 4.00x v0's and wall time 1.00x v0's (wall time from results and"
+        " results): **over the cap**." in text
+    )
+    assert "| Efficiency: time, tokens and cost, 3x cap | **over the cap** |" in built["criteria"]
+
+
+def test_takes_wall_time_from_the_host_clock_around_the_solve_segments(tmp_path: Path) -> None:
+    loaded = runs(tmp_path, "v0-heldout")
+    final = write_run(tmp_path / "final" / "heldout", {"1": [2.0], "2": [1.0], "3": [1.0]})
+    write_stages(tmp_path / "final", final, 100.0, 50.0)  # A solve, resumed after a crash.
+    loaded["final-heldout"] = load_run(final)
+
+    built = sections(ReportInputs(loaded, DIFFICULTY))
+
+    # 150 s of solving, times the concurrency of 2, over the 3 tasks.
+    assert "| 0.3333 | 2.5 | 100.0 | solve phase | 60.0 |" in built["efficiency"]
+    assert "wall time 3.33x v0's (wall time from solve phase and results)" in built["efficiency"]
 
 
 def test_lists_flagged_predictions_with_their_checks(tmp_path: Path) -> None:
@@ -124,6 +146,7 @@ def test_counts_finished_rounds_and_plots_the_best_by_round(tmp_path: Path) -> N
         experiment("e1", 1, val_score=0.6),
         experiment("e2", 1, DECISION_REJECTED),
         experiment("e3", 2, DECISION_ABORTED),
+        experiment("e4", 3, DECISION_PENDING),
     ]
     experiments[1].rejection_reasons.append(REJECTION_REASON_REGRESSION)
     inputs = ReportInputs(runs(tmp_path, "v0-val"), DIFFICULTY, experiments=experiments)
@@ -131,16 +154,29 @@ def test_counts_finished_rounds_and_plots_the_best_by_round(tmp_path: Path) -> N
     built = sections(inputs)
 
     rsi = built["rsi"]
-    assert "1 of 2 rounds finished" in rsi
+    assert "2 of 3 rounds finished" in rsi
     assert "| 1 | finished | 2 | 1 | 60.0 |" in rsi
-    assert "| 2 | incomplete | 1 | 0 | 60.0 |" in rsi
-    assert '    x-axis ["v0", "1", "2"]' in rsi
-    assert "    line [43.8, 60.0, 60.0]" in rsi  # v0's val R-VES is (0.5 + 0.25 + 0.5 + 0.5) / 4.
+    assert "| 2 | finished | 1 | 0 | 60.0 |" in rsi  # An aborted experiment is settled.
+    assert "| 3 | incomplete | 1 | 0 | 60.0 |" in rsi
+    assert '    x-axis ["v0", "1", "2", "3"]' in rsi
+    # v0's val R-VES is (0.5 + 0.25 + 0.5 + 0.5) / 4.
+    assert "    line [43.8, 60.0, 60.0, 60.0]" in rsi
+    assert "No experiment was accepted" not in rsi
     assert r"prompt: Ask for a plan \| then rewrite" in rsi
     assert "Accepted changes by source: 1 from idea_bank." in rsi
-    assert "| effisql | exec | 3000 | 300 | 4.50 |" in built["efficiency"]
+    assert "| effisql | exec | 4000 | 400 | 6.00 |" in built["efficiency"]
     assert "best/effisql; 1 rejected for a regression" in built["criteria"]
-    assert "| Automation: several rounds | **at risk** |" in built["criteria"]
+    assert "| Automation: several rounds | met | 2 rounds finished |" in built["criteria"]
+
+
+def test_a_round_with_an_aborted_straggler_still_finished(tmp_path: Path) -> None:
+    experiments = [experiment("e1", 1), experiment("e2", 1, DECISION_ABORTED)]
+
+    built = sections(ReportInputs({}, DIFFICULTY, experiments=experiments))
+
+    assert "1 of 1 rounds finished" in built["rsi"]
+    assert "final harness is v0" not in built["rsi"]
+    assert "| Automation: several rounds | **at risk** | 1 rounds finished |" in built["criteria"]
 
 
 def test_says_plainly_when_no_round_ran(tmp_path: Path) -> None:
@@ -193,12 +229,13 @@ def test_refuses_an_unknown_role() -> None:
         ReportInputs({"v1-heldout": None}, DIFFICULTY)  # type: ignore[dict-item]  # The wrong role.
 
 
-def test_says_plainly_when_the_rounds_ran_but_none_finished() -> None:
-    inputs = ReportInputs({}, DIFFICULTY, experiments=[experiment("e1", 1, DECISION_ABORTED)])
+def test_says_plainly_when_no_experiment_was_accepted() -> None:
+    inputs = ReportInputs({}, DIFFICULTY, experiments=[experiment("e1", 1, DECISION_PENDING)])
 
     rsi = sections(inputs)["rsi"]
 
-    assert "**No round finished**, so the final harness is v0." in rsi
+    assert "**No experiment was accepted**, so the final harness is v0." in rsi
+    assert "0 of 1 rounds finished" in rsi
     assert "(No val score to plot yet.)" in rsi
 
 
@@ -210,7 +247,8 @@ def test_the_cap_cannot_be_checked_without_a_call_log(tmp_path: Path) -> None:
     text = sections(ReportInputs(loaded, DIFFICULTY))["efficiency"]
 
     assert "| v0-heldout | 3 | no call log |" in text
-    assert "- heldout: cost n/a and wall time n/a: cannot be checked." in text
+    assert "- heldout: cost n/a and wall time 1.00x v0's" in text
+    assert "cannot be checked." in text
 
 
 def test_lists_matched_predictions_for_the_constant_branch_audit(tmp_path: Path) -> None:
@@ -232,14 +270,96 @@ def test_lists_matched_predictions_for_the_constant_branch_audit(tmp_path: Path)
     assert "| final-heldout | 3 |" not in text  # Unmatched, so it scores nothing anyway.
 
 
-def test_the_audit_says_when_nothing_needs_a_review(tmp_path: Path) -> None:
+def test_the_audit_names_every_seed_it_could_not_read(tmp_path: Path) -> None:
     loaded = runs(tmp_path, "final-heldout")
     (tmp_path / "final-heldout" / "official" / "seed-0.jsonl").unlink()
-    (tmp_path / "final-heldout" / "official" / "seed-1.jsonl").unlink()
     (tmp_path / "final-heldout" / "official" / "seed-2.jsonl").unlink()
     loaded["final-heldout"] = load_run(tmp_path / "final-heldout")
 
     text = sections(ReportInputs(loaded, DIFFICULTY))["audit"]
 
-    assert "No matched prediction needs a review." in text
-    assert "No official records in final-heldout: listed by speedup alone." in text
+    assert "No matched prediction is listed." in text
+    assert (
+        "- final-heldout: stored plans for 0 of 9 matched predictions; the literal and pattern"
+        " rules for the rest. **No official records for seed 0, 2**: those are listed by τ"
+        " alone." in text
+    )
+
+
+# A stored plan of the r5 CASE: a Result over two InitPlans, reading no table itself.
+CASE_PLAN = [
+    {
+        "Plan": {
+            "Node Type": "Result",
+            "Plans": [
+                {
+                    "Node Type": "Aggregate",
+                    "Parent Relationship": "InitPlan",
+                    "Plans": [{"Node Type": "Seq Scan", "Relation Name": "orders"}],
+                },
+                {
+                    "Node Type": "Aggregate",
+                    "Parent Relationship": "InitPlan",
+                    "Plans": [{"Node Type": "Seq Scan", "Relation Name": "lineitem"}],
+                },
+            ],
+        }
+    }
+]
+
+
+def test_reads_the_stored_plans_where_there_are_any(tmp_path: Path) -> None:
+    path = write_run(tmp_path / "f", {"1": [2.0], "2": [1.0]}, run_id="f")
+    write_plans(path, {("1", 0): CASE_PLAN, ("2", 0): "not json"})
+
+    text = sections(ReportInputs({"final-heldout": load_run(path)}, DIFFICULTY))["audit"]
+
+    assert (
+        "| final-heldout | 1 | 0 | 2.00 | 1.0 | plan: a Result that reads no table, from 2" in text
+    )
+    assert "| final-heldout | 2 | 0 | 1.00 | 0.5 | plan: unreadable, so read the query |" in text
+    assert "- final-heldout: stored plans for 2 of 2 matched predictions." in text
+
+
+def test_a_verdict_of_constant_branch_takes_the_checked_credit(tmp_path: Path) -> None:
+    loaded = runs(tmp_path, "final-heldout")
+    verdicts = {
+        ("final-heldout", "1", 0): Verdict(constant_branch=True, note="gated on count(orders)"),
+        ("final-heldout", "2", 0): Verdict(constant_branch=False),
+    }
+    gated = "SELECT 12345.67"
+    path = write_run(tmp_path / "f", {"1": [2.0, 2.0, 2.0], "2": [1.0] * 3, "3": [1.0] * 3},
+                     run_id="f", queries={("1", 0): gated, ("2", 0): gated})  # fmt: skip
+    loaded["final-heldout"] = load_run(path)
+    plain = ReportInputs(loaded, DIFFICULTY)
+    judged = ReportInputs(loaded, DIFFICULTY, verdicts=verdicts)
+
+    audit, flags = sections(judged)["audit"], sections(judged)["flags"]
+
+    assert "| constant branch: no credit (gated on count(orders)) |" in audit
+    assert "| clean |" in audit
+    assert "task 1 seed 0 (literal_result)" in flags
+    before, after = plain.table("final-heldout"), judged.table("final-heldout")
+    assert before is not None
+    assert after is not None
+    assert after.grades["1"][0].credit == 0.0
+    assert before.grades["1"][0].credit == 1.0
+    assert after.grades["1"][1].credit == 1.0  # Only the judged seed.
+
+
+def test_refuses_a_verdict_on_a_run_the_report_lacks() -> None:
+    with pytest.raises(ValueError, match="verdicts name runs the report lacks"):
+        ReportInputs({}, DIFFICULTY, verdicts={("final-heldout", "1", 0): Verdict(True)})
+
+
+def test_labels_an_unmatched_flag_by_the_check_that_set_it(tmp_path: Path) -> None:
+    loaded = runs(tmp_path, "final-heldout")
+    final = loaded["final-heldout"]
+    assert final.table is not None
+    grades = {task: dict(seeds) for task, seeds in final.table.grades.items()}
+    grades["3"][2] = EffiSqlGrade(matched=False, alt_matched=False, literal_result=True)
+    loaded["final-heldout"] = RunRecord(final.path, final.manifest, GradeTable(grades), (), None)
+
+    text = sections(ReportInputs(loaded, DIFFICULTY))["flags"]
+
+    assert "- final-heldout: task 3 seed 2 (literal_result)" in text

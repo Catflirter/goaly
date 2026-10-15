@@ -9,7 +9,8 @@ must be placed exactly once:
     uv run --locked python scripts/effisql/final_report.py \
         --template docs/results/final-report-template.md --out docs/results/final-report.md \
         --v0-heldout runs/baseline/heldout --v0-val runs/baseline/val \
-        --final-heldout runs/final/heldout --final-val runs/final/val [--allow-partial]
+        --final-heldout runs/final/heldout --final-val runs/final/val \
+        --verdicts docs/results/audit-verdicts.json [--allow-partial]
 
 Never type a number into the prose that a generated section does not show: every number must
 trace to a run manifest or a ledger entry. Delete these comments and every TODO before
@@ -60,8 +61,10 @@ experiments cost in all.
 
 <!-- report:audit -->
 
-TODO: the verdict on each listed prediction. A constant branch counts as hard-coded: give its
-task 0 by hand in the narrative, and say so.
+TODO: read each listed prediction and record its verdict in docs/results/audit-verdicts.json,
+as {"role", "task", "seed", "verdict": "constant branch" or "clean", "note"}, then regenerate. A
+constant branch then gets no credit in every checked number above, and the audit table shows the
+verdict. Say here how many were judged constant branches.
 
 ## Self-improvement
 
