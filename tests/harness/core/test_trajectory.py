@@ -67,19 +67,20 @@ def test_a_zero_optional_still_counts_as_reported() -> None:
 def test_chats_are_recorded_in_the_order_they_start() -> None:
     record = TrajectoryRecorder()
 
-    first = record.start_chat("main", [system("Be fast."), user("Rewrite it.")])
-    second = record.start_chat("verify", [])
+    first = record.start_chat("main", [system("Be fast."), user("Rewrite it.")], keep_turns=8)
+    second = record.start_chat("verify", [], keep_turns=8)
 
     trajectory = record.trajectory()
     assert (first, second) == (0, 1)
     assert [chat.label for chat in trajectory.chats] == ["main", "verify"]
+    assert [chat.keep_turns for chat in trajectory.chats] == [8, 8]  # Executor chats both.
     assert list(trajectory.chats[0].initial_messages) == [system("Be fast."), user("Rewrite it.")]
     assert not trajectory.chats[0].HasField("forked_from_step")
 
 
 def test_a_step_takes_its_call_record_and_its_usage_joins_the_total() -> None:
     record = TrajectoryRecorder()
-    record.start_chat("main", [])
+    record.start_chat("main", [], keep_turns=8)
     usage = Usage(input_tokens=1200, output_tokens=300, reasoning_tokens=250, cost_usd=0.002)
     message = assistant(ToolCall(id="c1", name="submit", arguments_json="{}"))
 
@@ -113,7 +114,7 @@ def test_a_failed_calls_usage_joins_the_total_without_a_step() -> None:
 
 def test_the_usage_and_the_trajectory_are_copies() -> None:
     record = TrajectoryRecorder()
-    record.start_chat("main", [])
+    record.start_chat("main", [], keep_turns=8)
 
     record.usage.input_tokens = 99
     record.trajectory().chats.add(label="extra")
@@ -137,7 +138,7 @@ def test_stop_records_why_the_agent_stopped() -> None:
 
 def test_the_recorder_leaves_the_runners_fields_unset() -> None:
     record = TrajectoryRecorder()
-    record.start_chat("main", [user("Rewrite it.")])
+    record.start_chat("main", [user("Rewrite it.")], keep_turns=8)
     record.stop(SUBMITTED)
 
     trajectory = record.trajectory()
@@ -152,7 +153,7 @@ def test_the_recorder_leaves_the_runners_fields_unset() -> None:
 def full_trajectory() -> Trajectory:
     """A trajectory with every field set, as the loop and then the runner fill them."""
     record = TrajectoryRecorder()
-    record.start_chat("main", [system("Be fast."), user("Rewrite it.")])
+    record.start_chat("main", [system("Be fast."), user("Rewrite it.")], keep_turns=8)
     usage = Usage(input_tokens=1200, output_tokens=300, reasoning_tokens=0, cost_usd=0.0)
     call = ToolCall(
         id="call_abc",
@@ -199,10 +200,10 @@ def test_a_trajectory_survives_a_jsonl_round_trip(tmp_path: Path) -> None:
 
 def test_a_label_names_one_chat() -> None:
     record = TrajectoryRecorder()
-    record.start_chat("main", [])
+    record.start_chat("main", [], keep_turns=8)
 
     with pytest.raises(ValueError, match="already has a chat named 'main'"):
-        record.start_chat("main", [])
+        record.start_chat("main", [], keep_turns=8)
 
     assert len(record.trajectory().chats) == 1
 
@@ -210,12 +211,19 @@ def test_a_label_names_one_chat() -> None:
 @pytest.mark.parametrize("label", ["", " "])
 def test_a_chat_needs_a_label(label: str) -> None:
     with pytest.raises(ValueError, match="label"):
-        TrajectoryRecorder().start_chat(label, [])
+        TrajectoryRecorder().start_chat(label, [], keep_turns=8)
 
 
 def test_a_step_needs_a_chat() -> None:
     record = TrajectoryRecorder()
-    record.start_chat("main", [])
+    record.start_chat("main", [], keep_turns=8)
 
     with pytest.raises(ValueError, match="no chat 1"):
         record.add_step(1, call_record("llm-1", Usage()), assistant())
+
+
+@pytest.mark.parametrize("keep_turns", [0, -1])
+def test_an_executor_chat_keeps_at_least_one_turn(keep_turns: int) -> None:
+    # 0 or unset would mark a chat whose replies replay unchanged, as GLM's do (trajectory.proto).
+    with pytest.raises(ValueError, match="keep_turns"):
+        TrajectoryRecorder().start_chat("main", [], keep_turns=keep_turns)

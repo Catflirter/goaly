@@ -317,7 +317,8 @@ WRAPPED_CALL = tool_call_block("execute_sql", "SELECT 1")
 
 
 def markup_script() -> list[LlmReply]:
-    """Replies with both kinds of call markup, in content and in reasoning, from each source."""
+    """Replies with both kinds of call markup, in content and reasoning, with calls from each
+    source; then six plain replies, which push the first two out of the 8-turn replay window."""
     return [
         # Calls from the content's <tool_call> block; the reasoning drafts it too.
         reply(
@@ -332,33 +333,47 @@ def markup_script() -> list[LlmReply]:
         reply(
             execute_sql("SELECT 5"), content=f"Also {WRAPPED_CALL}", reasoning=f"Also {BARE_CALL}"
         ),
+        *(reply(execute_sql(f"SELECT {n}"), reasoning=f"Plain {n}.") for n in range(6, 12)),
         reply(submit()),
     ]
 
 
-async def test_replies_go_out_without_call_markup_whatever_their_calls_source() -> None:
-    """Spec §5.1: an executor chat replays no XML call markup, in content or reasoning."""
+def replies_sent(llm: FakeLLM, call: int) -> list[tuple[str, str]]:
+    """The content and reasoning of each reply that call number ``call`` was sent."""
+    return [(m.content, m.reasoning_content) for m in sent(llm)[call] if m.role == ASSISTANT]
+
+
+async def test_replies_go_out_without_call_markup_and_older_ones_without_reasoning() -> None:
+    """Spec §5.1: an executor chat replays no call markup, and reasoning only in its window."""
     llm = FakeLLM(markup_script())
     ctx = context(llm)
 
     await run_agent(environment(), ctx, hooks())
 
     trajectory = ctx.trajectory()
-    assert [len(step.assistant.tool_calls) for step in trajectory.steps] == [1] * 5
-    replies = [(m.content, m.reasoning_content) for m in sent(llm)[4] if m.role == ASSISTANT]
-    assert replies == [
-        # A text with a <tool_call> block loses those blocks (strip_tool_call_markup).
-        (f"Run it.\n\nNot this: {BARE_CALL}", f"Draft: \n{BARE_CALL}"),
-        ("Then: ", ""),  # One with none loses its bare blocks, in content and reasoning alike.
+    assert [len(step.assistant.tool_calls) for step in trajectory.steps] == [1] * 11
+    assert [chat.keep_turns for chat in trajectory.chats] == [8]
+    stripped = [
+        # Every <tool_call> block goes, then every bare <function=...> block, in either field,
+        # whatever field the calls came from: a standard call's reply loses its markup too.
+        ("Run it.\n\nNot this: ", "Draft: \n"),
+        ("Then: ", ""),
         ("", "Thinking.\n"),
-        ("Also ", "Also "),  # The standard call's reply loses its markup too.
+        ("Also ", "Also "),
     ]
+    assert replies_sent(llm, 4) == stripped  # All four within the window.
+    assert (
+        replies_sent(llm, 10)
+        == [
+            ("Run it.\n\nNot this: ", ""),  # Out of the window: no reasoning at all.
+            ("Then: ", ""),
+            *stripped[2:],
+            *(("", f"Plain {n}.") for n in range(6, 12)),
+        ]
+    )
     assert trajectory.steps[3].assistant.content == f"Also {WRAPPED_CALL}"  # Kept as it came.
 
 
-@pytest.mark.xfail(
-    strict=True, reason="#29's round 3 gives the reference rebuild the same unconditional strip"
-)
 async def test_the_loop_sends_the_prompts_the_contracts_reference_rebuilds() -> None:
     llm = FakeLLM(markup_script())
     ctx = context(llm)
