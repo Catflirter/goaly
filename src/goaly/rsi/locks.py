@@ -30,13 +30,17 @@ def file_lock(path: Path, *, shared: bool = False, timeout_s: float = 60.0) -> I
     """Hold the lock on ``path`` while the block runs: exclusive, or ``shared`` with other readers.
 
     The lock file is created if needed, but not its directory, and it is never removed, since
-    removing it would let two processes lock two different files. It is opened read-only, which
-    is all flock needs, so a reader can lock it without write access. The lock belongs to this
-    open file, so two blocks in one process exclude each other too, and child processes do not
-    inherit it. Waiting longer than ``timeout_s`` raises :class:`LockTimeoutError`; 0 tries once.
-    Raises PermissionError if the file is missing and cannot be created.
+    removing it would let two processes lock two different files. A shared lock opens it
+    read-only, which is all flock needs, so a reader can lock it without write access. An
+    exclusive lock opens it read-write, since NFS emulates flock with POSIX locks, and an
+    exclusive one of those needs a writable descriptor. The lock belongs to this open file, so two
+    blocks in one process exclude each other too, and child processes do not inherit it. Waiting
+    longer than ``timeout_s`` raises :class:`LockTimeoutError`; 0 tries once. Raises OSError if
+    the file cannot be opened, such as PermissionError, or EROFS on a read-only file system, when
+    it is missing and cannot be created.
     """
-    descriptor = os.open(path, os.O_RDONLY | os.O_CREAT | os.O_CLOEXEC, 0o644)
+    access = os.O_RDONLY if shared else os.O_RDWR
+    descriptor = os.open(path, access | os.O_CREAT | os.O_CLOEXEC, 0o644)
     try:
         _acquire(descriptor, fcntl.LOCK_SH if shared else fcntl.LOCK_EX, path, timeout_s)
         yield
