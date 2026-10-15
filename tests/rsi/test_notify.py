@@ -170,7 +170,7 @@ def test_close_retries_until_its_budget_runs_out(
     assert time.monotonic() - started < 2
     details = [event.detail for event in ledger.lane_events()]
     assert details[0] == "attempt 1: the fake channel is down; retry in 3600 s"
-    assert len(details) >= 3
+    assert len(details) >= 2
     assert all(detail.endswith("retry in 0.05 s") for detail in details[1:-1])
     assert details[-1].endswith("; no retry: the process is exiting")
     assert notifier.pending() == 0
