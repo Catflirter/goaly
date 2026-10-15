@@ -11,8 +11,8 @@ A call can be in three places. :func:`parse_tool_calls` takes the first that has
 
 Only a terminated XML call counts: markup cut off before its closing tag is never a call, so a
 draft at the end of a reply cannot become its answer. :func:`strip_tool_call_markup` removes the
-XML markup from a text, unterminated markup included, so that a reply whose calls were parsed
-from it can be replayed with them as structured calls only.
+XML markup from a text, unterminated markup included, for the executor's replay: there a reply
+carries its calls as structured calls only, and no markup.
 """
 
 import hashlib
@@ -99,10 +99,13 @@ def strip_tool_call_markup(text: str, *, reasoning: bool = False) -> str:
     which the parser never takes as a call, is removed all the same, so that none reaches the
     model. Everything else stays as it was, whitespace included.
 
-    When a reply's calls came from XML, its replay strips both its content and its reasoning,
-    ``strip_tool_call_markup(content)`` and ``strip_tool_call_markup(reasoning_content,
-    reasoning=True)``, and carries the calls as structured calls only. Otherwise the model sees
-    each call twice.
+    The executor's replay (spec §5.1) strips all Qwen3-Coder tool-call markup from every
+    replayed assistant message, unconditionally: from its content and its reasoning alike,
+    wrapped and bare, terminated or not, whether or not a call was parsed from it. One call
+    takes the ``<tool_call>`` blocks of a text that has some, or else its bare blocks, so the
+    replay calls it twice: ``strip_tool_call_markup(strip_tool_call_markup(text))``. Whether a
+    message's reasoning is replayed at all is Chat.keep_turns's to decide. A chat that is not
+    the executor's, such as GLM's, replays its messages unchanged.
     """
     markup = _TOOL_CALL if reasoning or _TOOL_CALL.search(text) else _FUNCTION
     return markup.sub("", text)
