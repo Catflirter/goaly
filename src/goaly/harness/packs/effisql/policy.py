@@ -71,6 +71,19 @@ def fallback(task: EffiSqlTaskInput) -> Prediction:
     return Prediction(effisql=EffiSqlPrediction(sql=task.base_sql))
 
 
+# Appended to every task prompt: hygiene that costs nothing to obey and recovers the steps a
+# task lost to mechanical errors (a batch of statements in one call, an exploratory EXPLAIN
+# ANALYZE, a statement whose result the model already had) and to a rewrite that was found but
+# never submitted before the clock ran out.
+HYGIENE = (
+    "Execution hygiene: Send exactly one SQL statement per execute_sql call — batches always "
+    "error. Use plain EXPLAIN when you only need the plan; reserve EXPLAIN ANALYZE for timing a "
+    "rewrite candidate. Never execute a statement whose result or plan you already have. As "
+    "soon as a rewrite is correct and timed faster than the base, submit it — do not keep "
+    "exploring."
+)
+
+
 def task_prompt(task: EffiSqlTaskInput, config: PackConfig, budgets: Budgets) -> str:
     """The first user message: the query to rewrite, its database and plan, and the limits."""
     minutes = budgets.wall_clock_s / 60
@@ -85,6 +98,7 @@ def task_prompt(task: EffiSqlTaskInput, config: PackConfig, budgets: Budgets) ->
             f"Limits: execute_sql stops a query after {timeout:g} s. You have {budgets.steps}"
             f" steps and {minutes:g} minutes; if they run out before you submit, the query above"
             " is submitted unchanged.",
+            HYGIENE,
         ]
     )
 

@@ -18,6 +18,7 @@ from goaly.harness.core.context_window import ContextWindow
 from goaly.harness.core.llm_models import ModelParams
 from goaly.harness.packs import effisql
 from goaly.harness.packs.effisql.policy import (
+    HYGIENE,
     EffiSqlPolicy,
     PackConfig,
     build_policy,
@@ -158,6 +159,19 @@ class TestPrompt:
         assert "after 120 s" in text
         assert "30 steps and 10 minutes" in text
         assert "submitted unchanged" in text
+
+    def test_the_task_prompt_carries_the_hygiene_paragraph(self) -> None:
+        paragraph = (
+            "Execution hygiene: Send exactly one SQL statement per execute_sql call — batches "
+            "always error. Use plain EXPLAIN when you only need the plan; reserve EXPLAIN "
+            "ANALYZE for timing a rewrite candidate. Never execute a statement whose result or "
+            "plan you already have. As soon as a rewrite is correct and timed faster than the "
+            "base, submit it — do not keep exploring."
+        )
+        text = task_prompt(TASK.effisql, PackConfig(), Budgets(steps=30, wall_clock_s=600))
+
+        assert paragraph == HYGIENE
+        assert text.endswith(paragraph)  # One paragraph, carried whole, at the prompt's end.
 
     def test_a_missing_difficulty_reads_unknown(self) -> None:
         task = EffiSqlTaskInput(db="tpch", base_sql=BASE_SQL)
