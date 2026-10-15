@@ -20,6 +20,7 @@ from typing import Protocol
 from pydantic import BaseModel
 
 from goaly.contracts.gen.environment_pb2 import ShellResult, SqlResult
+from goaly.contracts.gen.manifest_pb2 import RunManifest
 from goaly.contracts.gen.task_pb2 import Grade, Prediction, Split, TaskInput
 from goaly.contracts.gen.trajectory_pb2 import ToolResult
 
@@ -76,6 +77,10 @@ class SqlEnvironment(Environment, Protocol):
         ``sql`` holds one statement or more; the result is the last statement's. A statement
         that fails or times out gives a result with ``error`` set, not an exception. Only a
         failure of the environment itself raises EnvironmentFailure.
+
+        ``timeout_s`` bounds the execution only, not the wait for a statement slot (spec §6.2).
+        The result reports that wait as ``queue_wait_s``, apart from ``elapsed_s``, and the
+        task's wall budget is what bounds it.
         """
 
 
@@ -241,6 +246,15 @@ class Benchmark[InstanceT: Instance, EnvT: Environment](Protocol):
         benchmark's empty answer, the one :meth:`to_official` writes for it: Effi-SQL's
         ``base_sql`` unchanged, which gets the credit of its measured identity τ, or an empty SWE
         patch, scored 1/gold.
+        """
+
+    def manifest_fields(self) -> RunManifest:
+        """Return the run manifest's fields that only the adapter knows, for the runner to merge.
+
+        The partial manifest sets at most ``dataset_revision``, ``dataset_notes``,
+        ``environment_settings`` and ``dataset_sha256``; the runner fills every other field and
+        merges this one in. ``environment_settings["grading_mode"]`` names the grader's mode, such
+        as Effi-SQL's "dev" or "official".
         """
 
     def to_official(self, inst: InstanceT, prediction: Prediction) -> dict[str, JsonValue]:

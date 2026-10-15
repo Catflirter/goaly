@@ -32,6 +32,9 @@ message RunManifest {
   // How the loader changed the dataset, such as rewriting the SWE image registry (spec §4.2);
   // empty if it changed nothing.
   repeated string dataset_notes = 9;
+  // The SHA-256 of the dataset file the tasks came from, in hex, such as Effi-SQL's
+  // effi-sql-pg.jsonl or the organizers' --instances file.
+  string dataset_sha256 = 20;
   // The SHA-256 of the gold-answer files the grader used that are not part of the dataset, in
   // hex; empty if there were none, as when the gold answers ship with the dataset.
   string gold_sha256 = 10;
@@ -55,7 +58,9 @@ message RunManifest {
   // adapter's name for each setting; empty if the benchmark has none. For Effi-SQL: the
   // PostgreSQL image digest; the server settings shared_buffers, work_mem, jit and the
   // parallel-worker settings; the dbgen build; the generated data's checksums; and each
-  // instance's cpuset. The benchmark's adapter fills it, and the runner writes it.
+  // instance's cpuset. Its key "grading_mode" names the grader's mode, such as Effi-SQL's "dev"
+  // or "official". The benchmark's adapter fills it, through Benchmark.manifest_fields, and the
+  // runner writes it.
   map<string, string> environment_settings = 19;
   // The SHA-256 of uv.lock, in hex. The lock file pins every dependency's version (spec §10).
   string uv_lock_sha256 = 18;

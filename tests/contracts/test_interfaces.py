@@ -35,6 +35,7 @@ from pydantic import BaseModel
 from goaly.contracts import interfaces
 from goaly.contracts.errors import EnvironmentFailure
 from goaly.contracts.gen.environment_pb2 import ShellResult, SqlResult
+from goaly.contracts.gen.manifest_pb2 import RunManifest
 from goaly.contracts.gen.task_pb2 import (
     GRADE_STATUS_GRADED,
     SPLIT_EXTERNAL,
@@ -717,6 +718,21 @@ def test_toy_benchmark_writes_its_official_record() -> None:
     record = benchmark.to_official(TOY_INSTANCES[0], prediction)
 
     assert json.loads(json.dumps(record)) == {"instance_id": "toy-1", "sql": "SELECT 1"}
+
+
+def test_toy_benchmark_hands_the_runner_its_manifest_fields() -> None:
+    benchmark: Benchmark[ToyInstance, SqlEnvironment] = ToyBenchmark()
+    manifest = RunManifest(run_id="run-1", benchmark=benchmark.name)
+
+    fields = benchmark.manifest_fields()
+    manifest.MergeFrom(fields)  # As the runner merges them in.
+
+    assert {field.name for field, _ in fields.ListFields()} <= {
+        *("dataset_revision", "dataset_notes", "environment_settings", "dataset_sha256"),
+    }
+    assert fields.environment_settings["grading_mode"] == "dev"
+    assert (manifest.run_id, manifest.dataset_revision) == ("run-1", fields.dataset_revision)
+    assert len(manifest.dataset_sha256) == 64
 
 
 def test_toy_benchmark_writes_the_empty_answer_for_a_prediction_with_no_branch() -> None:
