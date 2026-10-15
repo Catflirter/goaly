@@ -34,6 +34,7 @@ record holds it, and the client removes it from any text it quotes from the gate
 """
 
 import asyncio
+import contextlib
 import json
 import logging
 import math
@@ -70,6 +71,7 @@ from goaly.harness.core.llm_models import (
 )
 from goaly.harness.core.llm_throttle import (
     DEFAULT_SHARES,
+    TRANSIENT_FAILURES,
     Clock,
     ModelThrottle,
     SystemClock,
@@ -92,14 +94,6 @@ __all__ = [
 _logger = logging.getLogger(__name__)
 
 _S = LlmCallStatus
-_RETRYABLE: Final = frozenset(
-    {
-        _S.LLM_CALL_STATUS_RATE_LIMITED,
-        _S.LLM_CALL_STATUS_SERVER_ERROR,
-        _S.LLM_CALL_STATUS_TIMEOUT,
-        _S.LLM_CALL_STATUS_CONNECTION_ERROR,
-    }
-)
 # How a 400 says the request does not fit in the context, in both forms seen on 2026-10-15:
 # LiteLLM marks a prompt too long by itself, but passes SGLang's message on as a plain
 # BadRequestError when the prompt fits and max_tokens does not.
@@ -271,8 +265,10 @@ class BoundLlm(Protocol):
 class LlmClient:
     """An async client of the OpenAI-compatible model gateway; the module docstring has more.
 
-    ``profiles`` replace the default profiles of their models (llm_models.DEFAULT_PROFILES),
-    and ``shares`` the default shares, each model's whole budget (llm_throttle.DEFAULT_SHARES).
+    ``profiles`` replace the default profiles of their models (llm_models.DEFAULT_PROFILES).
+    ``shares`` gives every model this process's share of its budget, a positive int each (spec
+    §6.2). The runner passes the shares of the phase it runs in. Without them each model gets its
+    whole budget (llm_throttle.DEFAULT_SHARES), right only for a process that runs alone.
     ``transport``, ``clock`` and ``rng`` are for tests: a mock transport, a clock that skips
     waits, and a seeded source of jitter.
     """
@@ -295,10 +291,15 @@ class LlmClient:
             if profile.model not in self._profiles:
                 raise ValueError(f"no call purpose may use {profile.model}, so it has no profile")
             self._profiles[profile.model] = profile
-        shares = {**DEFAULT_SHARES, **(shares or {})}
-        for model in shares:
-            if model not in self._profiles:
-                raise ValueError(f"no call purpose may use {model}, so it has no share")
+        shares = DEFAULT_SHARES if shares is None else shares
+        if set(shares) != set(self._profiles):
+            raise ValueError(f"the shares must name every model, {sorted(self._profiles)}, only")
+        for model, share in shares.items():
+            if isinstance(share, bool) or not isinstance(share, int) or share < 1:
+                raise ValueError(f"{model}: a share must be a positive int, not {share!r}")
+        _logger.info(
+            "LLM concurrency shares", extra={"event": "llm_shares", "shares": dict(shares)}
+        )
         self._recorder = recorder
         self._retry = RetryPolicy() if retry is None else retry
         self._clock: Clock = SystemClock() if clock is None else clock
@@ -335,9 +336,13 @@ class LlmClient:
         await self.aclose()
 
     async def aclose(self) -> None:
-        """Close the client's connections; it cannot make calls after."""
-        for http in self._http.values():
-            await http.aclose()
+        """Close the client's connections; it cannot make calls after.
+
+        Every model's pool is closed, even when closing another fails.
+        """
+        async with contextlib.AsyncExitStack() as pools:
+            for http in self._http.values():
+                pools.push_async_callback(http.aclose)
 
     async def complete(
         self,
@@ -466,7 +471,7 @@ class LlmClient:
             if outcome.response is not None:
                 return outcome.response
             retries = len(record.attempts) - 1
-            if outcome.status not in _RETRYABLE or retries >= self._retry.max_retries:
+            if outcome.status not in TRANSIENT_FAILURES or retries >= self._retry.max_retries:
                 count = f"{retries + 1} attempt{'s' if retries else ''}"
                 message = f"{record.model}: {outcome.detail} ({count})"
                 raise error_type(outcome.status)(message, record=record)

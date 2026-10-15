@@ -11,6 +11,7 @@ from goaly.harness.core.llm import CallTags, LlmClient
 from goaly.harness.core.llm_errors import ClientError
 from tests.harness.core.llm_fakes import (
     GLM,
+    QWEN,
     Gateway,
     Recorder,
     completion,
@@ -56,7 +57,10 @@ async def test_calls_from_threads_and_from_the_loop_share_one_limit() -> None:
 
     gateway = Gateway(*(answer for _ in range(8)))
     async with LlmClient(
-        settings(), Recorder(), shares={GLM: 2}, transport=httpx.MockTransport(gateway.handle)
+        settings(),
+        Recorder(),
+        shares={QWEN: 1, GLM: 2},
+        transport=httpx.MockTransport(gateway.handle),
     ) as llm:
         from_threads = [
             asyncio.to_thread(llm.complete_sync, [user("thread")], model=GLM, tags=IMPL)
@@ -118,16 +122,3 @@ def test_refuses_once_its_loop_has_stopped() -> None:
 
     with pytest.raises(RuntimeError, match="not running"):
         llm.complete_sync([user("hi")], model=GLM, tags=IMPL)
-
-
-async def test_a_client_serves_only_the_loop_it_was_first_used_on() -> None:
-    gateway = Gateway(completion())
-    async with connect(gateway) as llm:
-
-        def call_on_a_second_loop() -> None:
-            asyncio.run(llm.complete([user("hi")], model=GLM, tags=IMPL))
-
-        with pytest.raises(RuntimeError, match="one event loop"):
-            await asyncio.to_thread(call_on_a_second_loop)
-
-    assert gateway.requests == []

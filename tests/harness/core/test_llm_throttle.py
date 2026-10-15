@@ -7,6 +7,9 @@ against a FakeLLM that injects 429s, latency and timeouts.
 
 import asyncio
 import logging
+import random
+from collections import Counter
+from collections.abc import Callable, Coroutine
 from contextlib import AsyncExitStack
 from typing import Any
 
@@ -26,6 +29,7 @@ from tests.harness.core.llm_fakes import (
     FakeClock,
     FakeLLM,
     Gateway,
+    Phase,
     Recorder,
     TopOfRange,
     completion,
@@ -115,13 +119,13 @@ def test_a_process_alone_may_use_each_models_whole_budget() -> None:
 @pytest.mark.parametrize(
     "policy",
     [
-        {"successes_to_grow": 0},
-        {"breaker_window_s": 0.0},
-        {"breaker_open_s": -1.0},
-        {"breaker_min_attempts": 0},
-        {"breaker_failure_ratio": 1.0},
-        {"breaker_failure_ratio": 0.0},
-        {"breaker_open_s": float("nan")},
+        pytest.param({"successes_to_grow": 0}, id="no-successes-to-grow"),
+        pytest.param({"breaker_window_s": 0.0}, id="no-window"),
+        pytest.param({"breaker_open_s": -1.0}, id="negative-open-time"),
+        pytest.param({"breaker_min_attempts": 0}, id="no-min-attempts"),
+        pytest.param({"breaker_failure_ratio": 1.0}, id="ratio-of-one"),
+        pytest.param({"breaker_failure_ratio": 0.0}, id="ratio-of-zero"),
+        pytest.param({"breaker_open_s": float("nan")}, id="nan-open-time"),
     ],
 )
 def test_the_policy_rejects_values_out_of_range(policy: dict[str, Any]) -> None:
@@ -206,12 +210,16 @@ async def test_a_call_that_raises_gives_its_slot_back() -> None:
 
 @pytest.mark.parametrize(
     ("status", "http_status"),
-    [(RATE_LIMITED, 429), (SERVER_ERROR, 503), (TIMEOUT, 0)],
-    ids=["429", "503", "timeout"],
+    [
+        pytest.param(RATE_LIMITED, 429, id="429"),
+        pytest.param(SERVER_ERROR, 502, id="502"),
+        pytest.param(SERVER_ERROR, 503, id="503"),
+        pytest.param(SERVER_ERROR, 504, id="504"),
+        pytest.param(TIMEOUT, 0, id="timeout"),
+        pytest.param(TIMEOUT, 408, id="408"),
+    ],
 )
-def test_halves_the_limit_after_a_429_a_503_or_a_timeout(
-    status: LlmCallStatus.ValueType, http_status: int
-) -> None:
+def test_halves_the_limit_on_congestion(status: LlmCallStatus.ValueType, http_status: int) -> None:
     clock = FakeClock()
     limiter = new_throttle(share=8, clock=clock)
 
@@ -223,12 +231,12 @@ def test_halves_the_limit_after_a_429_a_503_or_a_timeout(
 @pytest.mark.parametrize(
     ("status", "http_status"),
     [
-        (OK, 200),
-        (SERVER_ERROR, 500),
-        (SERVER_ERROR, 502),
-        (CONNECTION_ERROR, 0),
-        (CLIENT_ERROR, 400),
-        (CONTEXT_OVERFLOW, 400),
+        pytest.param(OK, 200, id="ok"),
+        pytest.param(SERVER_ERROR, 500, id="500"),
+        pytest.param(CONNECTION_ERROR, 0, id="connection-error"),
+        pytest.param(CLIENT_ERROR, 400, id="400"),
+        pytest.param(CONTEXT_OVERFLOW, 400, id="context-overflow"),
+        pytest.param(INVALID_RESPONSE, 200, id="invalid-response"),
     ],
 )
 def test_other_outcomes_do_not_lower_the_limit(
@@ -260,6 +268,19 @@ def test_halves_once_per_burst() -> None:
     assert limiter.limit == 2
 
 
+def test_a_burst_spread_over_time_still_halves_once() -> None:
+    clock = FakeClock()
+    limiter = new_throttle(share=8, clock=clock)
+    first_sent, second_sent = clock.now, clock.now + 0.5
+    clock.now += 1.0  # The first congested reply comes back, after both were sent.
+
+    observe(limiter, RATE_LIMITED, 429, first_sent)
+    clock.now += 0.2
+    observe(limiter, SERVER_ERROR, 503, second_sent)  # Sent before the halving: same burst.
+
+    assert limiter.limit == 4
+
+
 def test_never_halves_below_one() -> None:
     clock = FakeClock()
     limiter = new_throttle(share=3, clock=clock)
@@ -274,6 +295,7 @@ def test_grows_by_one_after_every_20_consecutive_successes() -> None:
     clock = FakeClock()
     limiter = new_throttle(share=8, clock=clock)
     observe(limiter, RATE_LIMITED, 429, clock.now)
+    clock.now += 1.0  # The successes below are of requests sent after the halving.
 
     succeed(limiter, clock, 19)
     assert limiter.limit == 4
@@ -283,19 +305,66 @@ def test_grows_by_one_after_every_20_consecutive_successes() -> None:
     assert limiter.limit == 6
 
 
-def test_congestion_restarts_the_count_of_successes() -> None:
+@pytest.mark.parametrize(
+    ("status", "http_status"),
+    [
+        pytest.param(RATE_LIMITED, 429, id="old-burst-429"),
+        pytest.param(SERVER_ERROR, 500, id="500"),
+        pytest.param(CONNECTION_ERROR, 0, id="connection-error"),
+    ],
+)
+def test_any_failure_restarts_the_run_of_successes(
+    status: LlmCallStatus.ValueType, http_status: int
+) -> None:
+    clock = FakeClock()
+    limiter = new_throttle(share=8, clock=clock)
+    sent = clock.now
+    clock.now += 1.0
+    observe(limiter, RATE_LIMITED, 429, sent)
+    clock.now += 1.0
+
+    succeed(limiter, clock, 19)
+    observe(limiter, status, http_status, sent)  # No halving: a 500, or the old burst's 429.
+    succeed(limiter, clock, 19)
+    assert limiter.limit == 4
+    succeed(limiter, clock, 1)
+    assert limiter.limit == 5
+
+
+@pytest.mark.parametrize(
+    ("status", "http_status"),
+    [
+        pytest.param(CLIENT_ERROR, 400, id="400"),
+        pytest.param(CONTEXT_OVERFLOW, 400, id="context-overflow"),
+        pytest.param(INVALID_RESPONSE, 200, id="invalid-response"),
+    ],
+)
+def test_a_refused_request_leaves_the_run_of_successes_alone(
+    status: LlmCallStatus.ValueType, http_status: int
+) -> None:
+    clock = FakeClock()
+    limiter = new_throttle(share=8, clock=clock)
+    observe(limiter, RATE_LIMITED, 429, clock.now)
+    clock.now += 1.0
+
+    succeed(limiter, clock, 19)
+    observe(limiter, status, http_status, clock.now)
+    succeed(limiter, clock, 1)
+
+    assert limiter.limit == 5
+
+
+def test_successes_sent_before_the_last_halving_do_not_count() -> None:
     clock = FakeClock()
     limiter = new_throttle(share=8, clock=clock)
     sent = clock.now
     clock.now += 1.0
     observe(limiter, RATE_LIMITED, 429, sent)
 
-    succeed(limiter, clock, 19)
-    observe(limiter, RATE_LIMITED, 429, sent)  # Part of the old burst: no halving, but a reset.
-    succeed(limiter, clock, 19)
+    for _ in range(40):  # They ran under the old limit, so they say nothing of the new one.
+        observe(limiter, OK, 200, sent)
+
     assert limiter.limit == 4
-    succeed(limiter, clock, 1)
-    assert limiter.limit == 5
 
 
 def test_never_grows_above_the_share() -> None:
@@ -331,6 +400,7 @@ async def test_a_higher_limit_lets_a_waiting_call_start() -> None:
     clock = FakeClock()
     limiter = new_throttle(share=2, clock=clock)
     observe(limiter, RATE_LIMITED, 429, clock.now)
+    clock.now += 1.0
     done, entered = asyncio.Event(), list[int]()
     tasks = [asyncio.create_task(hold(limiter, done, entered, n)) for n in range(2)]
     await settle()
@@ -352,14 +422,15 @@ def test_logs_each_change_of_the_limit_with_the_purpose_and_model(
     limiter = new_throttle(share=8, clock=clock)
 
     observe(limiter, RATE_LIMITED, 429, clock.now)
+    clock.now += 1.0
     succeed(limiter, clock, 20)
 
     (down,) = events(caplog, "llm_limit_down")
     (up,) = events(caplog, "llm_limit_up")
     assert down.levelno == logging.WARNING
     assert up.levelno == logging.INFO
-    fields = ["model", "purpose", "call_id", "limit", "previous_limit", "share"]
-    assert {key: getattr(down, key) for key in [*fields, "after", "http_status"]} == {
+    keys = ["model", "purpose", "call_id", "limit", "previous_limit", "share"]
+    assert {key: getattr(down, key) for key in [*keys, "after", "http_status"]} == {
         "model": QWEN,
         "purpose": "CALL_PURPOSE_EXEC",
         "call_id": "c-1",
@@ -369,7 +440,7 @@ def test_logs_each_change_of_the_limit_with_the_purpose_and_model(
         "after": "LLM_CALL_STATUS_RATE_LIMITED",
         "http_status": 429,
     }
-    assert {key: getattr(up, key) for key in fields} == {
+    assert {key: getattr(up, key) for key in keys} == {
         "model": QWEN,
         "purpose": "CALL_PURPOSE_EXEC",
         "call_id": "c-1",
@@ -414,7 +485,15 @@ async def test_needs_enough_attempts_before_it_opens() -> None:
         assert clock.sleeps == [60.0]
 
 
-@pytest.mark.parametrize("status", [RATE_LIMITED, SERVER_ERROR, TIMEOUT, CONNECTION_ERROR])
+@pytest.mark.parametrize(
+    "status",
+    [
+        pytest.param(RATE_LIMITED, id="rate-limited"),
+        pytest.param(SERVER_ERROR, id="server-error"),
+        pytest.param(TIMEOUT, id="timeout"),
+        pytest.param(CONNECTION_ERROR, id="connection-error"),
+    ],
+)
 async def test_counts_each_transient_failure(status: LlmCallStatus.ValueType) -> None:
     clock = FakeClock()
     limiter = new_throttle(clock=clock)
@@ -424,7 +503,14 @@ async def test_counts_each_transient_failure(status: LlmCallStatus.ValueType) ->
         assert clock.sleeps == [60.0]
 
 
-@pytest.mark.parametrize("status", [CLIENT_ERROR, CONTEXT_OVERFLOW, INVALID_RESPONSE])
+@pytest.mark.parametrize(
+    "status",
+    [
+        pytest.param(CLIENT_ERROR, id="client-error"),
+        pytest.param(CONTEXT_OVERFLOW, id="context-overflow"),
+        pytest.param(INVALID_RESPONSE, id="invalid-response"),
+    ],
+)
 async def test_a_refused_request_is_no_failure_of_the_gateway(
     status: LlmCallStatus.ValueType,
 ) -> None:
@@ -462,6 +548,48 @@ async def test_closes_after_its_open_period_and_judges_afresh() -> None:
     fail(limiter, clock, 1)
     async with limiter.slot(RECORD):
         assert clock.sleeps == [60.0, 60.0]
+
+
+async def test_attempts_sent_before_it_opened_do_not_count_toward_its_next_judgement(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    clock = FakeClock()
+    limiter = new_throttle(share=20, clock=clock)
+    done, entered = asyncio.Event(), list[int]()
+    held = [asyncio.create_task(hold(limiter, done, entered, n)) for n in range(10)]
+    await settle()
+    held_sent = clock.now  # Ten attempts in flight, sent at t=100.
+    clock.now += 1.0
+    fail(limiter, clock, 10)  # Ten others, sent at t=101, open the breaker.
+
+    for _ in range(10):  # The held ones fail too, while it is open.
+        observe(limiter, SERVER_ERROR, 500, held_sent)
+    done.set()
+    await asyncio.gather(*held)
+    async with limiter.slot(RECORD):  # Waits out the 60 s.
+        pass
+    succeed(limiter, clock, 1)  # A fresh success, judged on its own.
+    async with limiter.slot(RECORD):
+        pass
+
+    assert clock.sleeps == [60.0]
+    assert len(events(caplog, "llm_breaker_open")) == 1
+
+
+async def test_failures_reported_while_it_is_open_extend_nothing(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    clock = FakeClock()
+    limiter = new_throttle(clock=clock)
+    fail(limiter, clock, 10)  # Opens at t=100, until t=160.
+    clock.now += 0.5
+    fail(limiter, clock, 10)  # Enough to open it again, but it is open already.
+
+    async with limiter.slot(RECORD):
+        pass
+
+    assert clock.sleeps == [59.5]  # Until t=160, not t=160.5.
+    assert len(events(caplog, "llm_breaker_open")) == 1
 
 
 async def test_calls_in_flight_finish_while_it_is_open() -> None:
@@ -516,7 +644,92 @@ async def test_logs_opening_and_closing_with_the_purpose_and_model(
         "attempts": 10,
         "open_s": 60.0,
     }
-    assert {key: getattr(closed, key) for key in base} == base
+    assert {key: getattr(closed, key) for key in [*base, "open_s"]} == {**base, "open_s": 60.0}
+
+
+class PausingClock(FakeClock):
+    """A FakeClock whose sleeps hold until ``resume`` is set, so a test sees the pause."""
+
+    def __init__(self) -> None:
+        super().__init__()
+        self.resume = asyncio.Event()
+
+    async def sleep(self, seconds: float) -> None:
+        self.sleeps.append(seconds)
+        await self.resume.wait()
+        self.now += seconds
+
+
+async def test_calls_keep_their_order_across_a_pause_and_wake_once_it_ends() -> None:
+    clock = PausingClock()
+    limiter = new_throttle(share=2, clock=clock)
+    dones = {name: asyncio.Event() for name in "ABCDE"}
+    entered: list[int] = []
+    tasks = [
+        asyncio.create_task(hold(limiter, dones[name], entered, n))
+        for n, name in enumerate("ABCDE")
+    ]
+    await settle()
+    assert entered == [0, 1]  # C, D and E wait, in that order.
+
+    fail(limiter, clock, 10)  # The breaker opens.
+    dones["A"].set()
+    dones["B"].set()
+    await settle()
+    assert (entered, limiter.in_flight) == ([0, 1], 0)  # No slot goes out while it is open.
+    assert clock.sleeps == [60.0]  # One wait for the whole queue.
+
+    clock.resume.set()
+    await settle()
+    assert entered == [0, 1, 2, 3]  # The queue wakes once, in order.
+    dones["C"].set()
+    await settle()
+    assert entered == [0, 1, 2, 3, 4]
+    for done in dones.values():
+        done.set()
+    await asyncio.gather(*tasks)
+    assert clock.sleeps == [60.0]
+
+
+async def test_a_call_whose_slot_came_just_before_a_halving_waits_again_first_in_line() -> None:
+    clock = FakeClock()
+    limiter = new_throttle(share=2, clock=clock)
+    first = AsyncExitStack()
+    await first.enter_async_context(limiter.slot(RECORD))
+    dones = [asyncio.Event() for _ in range(3)]
+    entered: list[int] = []
+    tasks = [asyncio.create_task(hold(limiter, dones[n], entered, n)) for n in range(3)]
+    await settle()
+    assert entered == [0]  # 1 and 2 wait, in that order.
+
+    await first.aclose()  # Its slot goes to 1, which has not resumed yet...
+    observe(limiter, RATE_LIMITED, 429, clock.now)  # ...when the limit halves to 1.
+    await settle()
+    assert (entered, limiter.in_flight, limiter.limit) == ([0], 1, 1)  # 1 gave the slot back.
+
+    dones[0].set()
+    await settle()
+    assert entered == [0, 1]  # 1 kept its turn, ahead of 2.
+    for done in dones:
+        done.set()
+    await asyncio.gather(*tasks)
+
+
+async def test_a_call_whose_slot_came_just_before_the_breaker_opened_waits_it_out() -> None:
+    clock = FakeClock()
+    limiter = new_throttle(share=1, clock=clock)
+    first = AsyncExitStack()
+    await first.enter_async_context(limiter.slot(RECORD))
+    done, entered = asyncio.Event(), list[int]()
+    task = asyncio.create_task(hold(limiter, done, entered, 1))
+    await settle()
+
+    await first.aclose()  # Its slot goes to 1, which has not resumed yet...
+    fail(limiter, clock, 10)  # ...when the breaker opens.
+    await settle()
+    assert (entered, clock.sleeps) == ([1], [60.0])  # 1 started only after the pause.
+    done.set()
+    await task
 
 
 # Through the client.
@@ -534,7 +747,7 @@ async def test_slot_waits_count_into_the_attempts_wait() -> None:
     async with LlmClient(
         settings(),
         Recorder(),
-        shares={QWEN: 1},
+        shares={QWEN: 1, GLM: 1},
         transport=httpx.MockTransport(gateway.handle),
         clock=clock,
     ) as llm:
@@ -584,7 +797,10 @@ async def test_bound_clients_share_the_limit_of_the_client_that_bound_them() -> 
 
     gateway = Gateway(*(answer for _ in range(6)))
     async with LlmClient(
-        settings(), Recorder(), shares={QWEN: 2}, transport=httpx.MockTransport(gateway.handle)
+        settings(),
+        Recorder(),
+        shares={QWEN: 2, GLM: 1},
+        transport=httpx.MockTransport(gateway.handle),
     ) as llm:
         tasks = [
             llm.bind(model=QWEN, tags=CallTags(CallPurpose.CALL_PURPOSE_EXEC, instance_id=f"t{n}"))
@@ -596,6 +812,47 @@ async def test_bound_clients_share_the_limit_of_the_client_that_bound_them() -> 
 
     assert len(replies) == 6
     assert peak == 2  # Three tasks under one limit of 2: not 2 each.
+
+
+async def test_a_client_serves_only_the_loop_it_was_first_used_on() -> None:
+    # Its limits wait on futures of that loop: a call from another loop must not join them.
+    gateway = Gateway(completion())
+    async with LlmClient(
+        settings(), Recorder(), transport=httpx.MockTransport(gateway.handle)
+    ) as llm:
+
+        def call_on_a_second_loop() -> None:
+            asyncio.run(llm.complete([user("hi")], model=QWEN, tags=EXEC))
+
+        with pytest.raises(RuntimeError, match="one event loop"):
+            await asyncio.to_thread(call_on_a_second_loop)
+
+    assert gateway.requests == []
+
+
+class CloseFailsOnce(httpx.MockTransport):
+    """A transport whose first close fails; every model's pool shares it in these tests."""
+
+    def __init__(
+        self, handler: Callable[[httpx.Request], Coroutine[None, None, httpx.Response]]
+    ) -> None:
+        super().__init__(handler)
+        self.closes = 0
+
+    async def aclose(self) -> None:
+        self.closes += 1
+        if self.closes == 1:
+            raise OSError("close failed")
+
+
+async def test_closing_closes_every_pool_even_when_one_fails() -> None:
+    transport = CloseFailsOnce(Gateway().handle)
+    llm = LlmClient(settings(), Recorder(), transport=transport)
+
+    with pytest.raises(OSError, match="close failed"):
+        await llm.aclose()
+
+    assert transport.closes == 2  # Qwen's pool and GLM's.
 
 
 async def test_each_model_has_its_own_limit(caplog: pytest.LogCaptureFixture) -> None:
@@ -617,35 +874,58 @@ async def test_each_model_has_its_own_limit(caplog: pytest.LogCaptureFixture) ->
 
 @pytest.mark.parametrize(
     ("shares", "message"),
-    [({"gpt-4o": 4}, "gpt-4o"), ({QWEN: 0}, "share")],
+    [
+        pytest.param({QWEN: 4}, "every model", id="a-model-missing"),
+        pytest.param({QWEN: 4, GLM: 2, "gpt-4o": 1}, "every model", id="an-unknown-model"),
+        pytest.param({QWEN: 0, GLM: 2}, "positive int", id="zero"),
+        pytest.param({QWEN: True, GLM: 2}, "positive int", id="a-bool"),
+        pytest.param({QWEN: 2.0, GLM: 2}, "positive int", id="a-float"),
+    ],
 )
-def test_the_client_refuses_a_share_it_cannot_use(shares: dict[str, int], message: str) -> None:
+def test_the_client_refuses_shares_it_cannot_use(shares: dict[str, Any], message: str) -> None:
     with pytest.raises(ValueError, match=message):
         LlmClient(settings(), Recorder(), shares=shares)
 
 
-# The stress test (spec §6.2): faults, latency and timeouts, 500 calls at once.
+@pytest.mark.parametrize(
+    ("shares", "logged"),
+    [
+        pytest.param(None, {QWEN: 48, GLM: 16}, id="the-whole-budgets"),
+        pytest.param({QWEN: 4, GLM: 2}, {QWEN: 4, GLM: 2}, id="given"),
+    ],
+)
+async def test_logs_the_shares_it_runs_with(
+    shares: dict[str, int] | None, logged: dict[str, int], caplog: pytest.LogCaptureFixture
+) -> None:
+    caplog.set_level(logging.INFO, logger="goaly.harness.core.llm")
+    async with LlmClient(settings(), Recorder(), shares=shares):
+        pass
+
+    (entry,) = events(caplog, "llm_shares")
+    assert entry.levelno == logging.INFO
+    assert getattr(entry, "shares", None) == logged
+
+
+# The stress test (spec §6.2): faults, latency, timeouts and cancellations, 500 calls at once.
 
 STRESS_SHARES = {QWEN: 8, GLM: 3}
+STRESS_PHASES = [
+    # A storm of 429s and timeouts, which drives both limits down to 1.
+    Phase(until=100, rate_limited=0.25, timeouts=0.05),
+    # Then nearly every request fails with a 500, which opens the breaker under load.
+    Phase(until=200, server_errors=0.9),
+]  # The calm after that is long enough for both limits to grow back to the share.
 
 
-async def test_500_faulty_calls_stay_within_the_share_and_are_each_recorded_once(
+async def test_500_faulty_calls_hold_every_limit_and_are_each_recorded_once(
     caplog: pytest.LogCaptureFixture,
 ) -> None:
     caplog.set_level(logging.INFO, logger="goaly.harness.core.llm_throttle")
-    # A storm of 429s and timeouts over the first 100 requests drives both limits down to 1;
-    # the calm after it is long enough for them to grow back, with room to spare.
-    gateway = FakeLLM(
-        seed=20261015,
-        latency_s=0.005,
-        hang_s=1.0,
-        rate_limited=0.25,
-        timeouts=0.05,
-        storm_requests=100,
-    )
+    gateway = FakeLLM(seed=20261015, latency_s=0.005, hang_s=1.0, phases=STRESS_PHASES)
     recorder = Recorder()
     retry = RetryPolicy(timeout_s=0.2, backoff_base_s=0.001, backoff_cap_s=0.01)
     policy = ThrottlePolicy(breaker_window_s=1.0, breaker_open_s=0.05)
+    cancelling = random.Random(7)  # noqa: S311 - which calls to cancel, and when.
     async with LlmClient(
         settings(),
         recorder,
@@ -654,31 +934,57 @@ async def test_500_faulty_calls_stay_within_the_share_and_are_each_recorded_once
         throttle=policy,
         transport=httpx.MockTransport(gateway.handle),
     ) as llm:
+        throttles = llm._throttles  # The test reads the throttles' own counters.
+        gateway.probe = lambda model: (throttles[model].in_flight, throttles[model].limit)
 
         async def one(n: int) -> LlmReply | LlmError:
             model, tags = (GLM, ANALYST) if n % 4 == 0 else (QWEN, EXEC)
             try:
                 return await llm.complete([user(f"task {n}")], model=model, tags=tags)
-            except LlmError as error:  # Retries can run out during the storm.
+            except LlmError as error:  # Retries can run out in the storm.
                 return error
 
+        tasks = [asyncio.create_task(one(n)) for n in range(500)]
+        loop = asyncio.get_running_loop()
+        for task in tasks:  # One call in ten is cancelled midway, as a task budget would.
+            if cancelling.random() < 0.1:
+                loop.call_later(cancelling.uniform(0.001, 0.5), task.cancel)
         async with asyncio.timeout(60):  # Nothing deadlocks.
-            results = await asyncio.gather(*(one(n) for n in range(500)))
+            results = await asyncio.gather(*tasks, return_exceptions=True)
+        held = {model: throttle.in_flight for model, throttle in throttles.items()}
 
+    # No model went over its share, no request started above its model's limit, and every slot
+    # came back, cancelled calls' too.
     assert gateway.max_in_flight == STRESS_SHARES
-    records = [result.record for result in results]
-    assert all(record is not None for record in records)
-    call_ids = [record.call_id for record in records if record is not None]
-    assert len(set(call_ids)) == 500
-    assert sorted(record.call_id for record in recorder.records) == sorted(call_ids)
-    assert sum(len(record.attempts) for record in recorder.records) == gateway.requests
-    # The limits backed off in the storm and grew back to the share in the calm.
+    assert gateway.over_limit == []
+    assert held == {QWEN: 0, GLM: 0}
+    # Every call, cancelled ones too, was recorded exactly once.
+    cancelled = [result for result in results if isinstance(result, asyncio.CancelledError)]
+    finished = [result for result in results if isinstance(result, LlmReply | LlmError)]
+    assert cancelled
+    assert len(cancelled) + len(finished) == 500
+    assert len({record.call_id for record in recorder.records}) == len(recorder.records) == 500
+    statuses = Counter(record.status for record in recorder.records)
+    assert statuses[S.LLM_CALL_STATUS_CANCELLED] == len(cancelled)
+    finished_ids = {result.record.call_id for result in finished if result.record is not None}
+    assert len(finished_ids) == len(finished)
+    assert finished_ids <= {record.call_id for record in recorder.records}
+    # Every attempt reached the gateway, but for some of the cancelled ones.
+    attempts = [attempt for record in recorder.records for attempt in record.attempts]
+    sent = sum(1 for attempt in attempts if attempt.status != S.LLM_CALL_STATUS_CANCELLED)
+    assert sent <= gateway.requests <= len(attempts)
+    # The storm took both limits down to 1, and the calm grew them back to the share.
     for model, share in STRESS_SHARES.items():
-        downs = [entry for entry in events(caplog, "llm_limit_down") if fields(entry)[0] == model]
-        changes = [
+        limits = [
             fields(entry)[1]
             for entry in caplog.records
             if getattr(entry, "event", "").startswith("llm_limit") and fields(entry)[0] == model
         ]
-        assert downs, model
-        assert changes[-1] == share, model
+        downs = [fields(entry)[1] for entry in events(caplog, "llm_limit_down")]
+        assert min(downs) == 1, model
+        assert limits[-1] == share, model
+    # The 500s opened each model's breaker under load, and each closed again.
+    for model in STRESS_SHARES:
+        assert [entry for entry in events(caplog, "llm_breaker_open") if fields(entry)[0] == model]
+        closed = events(caplog, "llm_breaker_closed")
+        assert [entry for entry in closed if fields(entry)[0] == model], model
