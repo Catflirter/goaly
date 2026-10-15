@@ -7,7 +7,14 @@ from pydantic import BaseModel, ConfigDict, PositiveFloat, PositiveInt
 
 from goaly.rsi.implementer.msa import load_yaml
 
-__all__ = ["DEFAULT_CONFIG", "ImplementerConfig", "Limits", "ModelTemplates", "load_config"]
+__all__ = [
+    "DEFAULT_CONFIG",
+    "AgentTemplates",
+    "ImplementerConfig",
+    "Limits",
+    "ModelTemplates",
+    "load_config",
+]
 
 DEFAULT_CONFIG: Final = Path(__file__).with_name("implementer.yaml")
 
@@ -40,6 +47,16 @@ class ModelTemplates(BaseModel):
     format_error_template: str
 
 
+class AgentTemplates(BaseModel):
+    """The prompt: the Jinja templates of the agent's first two messages."""
+
+    model_config = ConfigDict(frozen=True, extra="forbid")
+
+    system_template: str
+    # The hypothesis, the allowed paths, the pack's layout and rules, and how to finish.
+    instance_template: str
+
+
 class ImplementerConfig(BaseModel):
     """``implementer.yaml``."""
 
@@ -47,6 +64,7 @@ class ImplementerConfig(BaseModel):
 
     limits: Limits
     model: ModelTemplates
+    agent: AgentTemplates
 
 
 def load_config(path: Path = DEFAULT_CONFIG) -> ImplementerConfig:
