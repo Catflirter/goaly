@@ -57,7 +57,13 @@ from goaly.contracts.gen.trajectory_pb2 import StopReason, Trajectory
 from goaly.contracts.jsonl import from_json_line, to_json_line
 from goaly.harness.core.atomic import write_text_atomically
 from goaly.harness.core.logs import configure_logging
-from goaly.harness.core.manifest import harness_hash, new_run_id, provenance, write_manifest
+from goaly.harness.core.manifest import (
+    harness_hash,
+    new_run_id,
+    provenance,
+    read_manifest,
+    write_manifest,
+)
 from goaly.harness.core.registry import HostBenchmark, HostOptions
 from goaly.harness.core.runner import RunFiles, lock_run_dir
 
@@ -126,6 +132,8 @@ class InterimRequest:
     max_tasks: int = 16
     harness_dir: Path = field(default_factory=lambda: Path(__file__).resolve().parents[4])
     run_id: str | None = None
+    # Grade a run this driver solved before, without solving it again.
+    grade_only: bool = False
 
 
 @dataclass(frozen=True)
@@ -158,7 +166,11 @@ async def run_interim(
     started = time.monotonic()
     llm_calls = request.out / "llm_calls.jsonl"
     with await asyncio.to_thread(lock_run_dir, files):
-        if files.manifest.exists():
+        if request.grade_only:  # Grade a run solved before, as its host manifest names it.
+            if not files.manifest.exists() or files.results.exists():
+                raise RuntimeError(f"{request.out} holds no solved run left to grade")
+            run_id = read_manifest(files.manifest).run_id
+        elif files.manifest.exists():
             raise RuntimeError(f"{request.out} holds a run already")
         options = HostOptions(files, None, request.split, request.budget_phase)
         if launcher is None:
@@ -176,9 +188,10 @@ async def run_interim(
             if len(instances) != len(wanted):
                 raise ValueError(f"not all of {sorted(wanted)} are in the split")
             pack_dir = request.harness_dir / _PACK
-            await asyncio.to_thread(
-                _write_manifest, files, run_id, request, benchmark, instances, pack_dir
-            )
+            if not request.grade_only:
+                await asyncio.to_thread(
+                    _write_manifest, files, run_id, request, benchmark, instances, pack_dir
+                )
             tasks = tuple((i.instance_id, seed) for seed in request.seeds for i in instances)
             solve = SolveRequest(
                 run_id=run_id,
@@ -192,13 +205,14 @@ async def run_interim(
                 budget_share=request.budget_share,
                 max_tasks=request.max_tasks,
             )
-            solve.solve_dir.mkdir(parents=True, exist_ok=True)
             failure: SolveContainerError | None = None
-            try:
-                await launcher(solve)
-            except SolveContainerError as error:
-                failure = error
-                _logger.exception("the solve container failed; grading what it left")
+            if not request.grade_only:
+                solve.solve_dir.mkdir(parents=True, exist_ok=True)
+                try:
+                    await launcher(solve)
+                except SolveContainerError as error:
+                    failure = error
+                    _logger.exception("the solve container failed; grading what it left")
             summaries = await _grade(request, benchmark, instances, run_id)
     proxy = _proxy_totals(llm_calls)
     summary = {
@@ -426,6 +440,7 @@ def main(argv: Sequence[str] | None = None) -> int:
     parser.add_argument("--seeds", type=int, nargs="+", default=[0])
     parser.add_argument("--budget-phase", default="baseline")
     parser.add_argument("--out", type=Path, required=True)
+    parser.add_argument("--grade-only", action="store_true", help="grade a solved run in --out")
     args = parser.parse_args(argv)
     configure_logging("INFO")
     confine_to_python_cpus()
@@ -435,6 +450,7 @@ def main(argv: Sequence[str] | None = None) -> int:
         only=args.only,
         seeds=args.seeds,
         budget_phase=args.budget_phase,
+        grade_only=args.grade_only,
     )
     summary = asyncio.run(run_interim(request))
     sys.stdout.write(json.dumps(summary, indent=2) + "\n")

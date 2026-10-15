@@ -7,6 +7,7 @@ database or the gateway.
 """
 
 import asyncio
+import dataclasses
 import json
 import os
 from collections.abc import AsyncIterator
@@ -18,7 +19,8 @@ import pytest
 from pydantic import SecretStr
 
 from goaly import cli as goaly_cli
-from goaly.bench.effisql.harness import EffiSqlWiring, open_harness
+from goaly.bench.effisql.grading import InstanceCheck
+from goaly.bench.effisql.harness import EffiSqlWiring, GradesPredictions, open_harness
 from goaly.bench.effisql.interim import (
     InterimRequest,
     SolveRequest,
@@ -219,3 +221,30 @@ def test_a_planted_symlink_in_solve_is_refused(tmp_path: Path) -> None:
     fifo = tmp_path / "fifo.jsonl"
     os.mkfifo(fifo)
     assert _lines(fifo, TaskResult) == [None]
+
+
+async def test_a_solved_run_is_graded_later_without_solving_again(tmp_path: Path) -> None:
+    fakes = fake_wiring(tmp_path)
+    container = FakeContainer(fakes)
+    solved = request(tmp_path)
+    blocked = dataclasses.replace(fakes.wiring, grader=_refusing_grader)
+    with pytest.raises(ExceptionGroup):
+        await run_interim(solved, blocked, launcher(fakes, container, tmp_path / "locks"))
+    assert len(container.commands) == 1
+
+    summary = await run_interim(
+        dataclasses.replace(solved, grade_only=True),
+        fakes.wiring,
+        launcher(fakes, container, tmp_path / "locks"),
+    )
+
+    assert len(container.commands) == 1  # Not solved again.
+    tasks = summary["tasks"]
+    assert isinstance(tasks, list)
+    assert [t["credit"] for t in tasks] == [0.5, 0.5]
+    with pytest.raises(RuntimeError, match="no solved run left"):
+        await run_interim(dataclasses.replace(solved, grade_only=True), fakes.wiring)
+
+
+def _refusing_grader(cache_root: Path, check: InstanceCheck | None) -> GradesPredictions:
+    raise RuntimeError("another grader process is grading on grade-1")
