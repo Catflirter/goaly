@@ -284,10 +284,11 @@ def test_an_unreadable_exit_status_is_a_sandbox_error(
 
 def test_a_container_that_outlives_its_timeout_is_removed(docker: FakeDocker) -> None:
     # docker wait gets the command's timeout plus a margin; past that, docker itself is stuck.
-    config = SandboxConfig(docker=str(docker.path), docker_timeout_s=0.5, kill_after_s=0)
-    docker.script({"wait": {"sleep": 5}})
+    # The margin leaves the fake docker time to start even on a loaded machine.
+    config = SandboxConfig(docker=str(docker.path), docker_timeout_s=3, kill_after_s=0)
+    docker.script({"wait": {"sleep": 30}})
 
-    with pytest.raises(SandboxError, match="timed out"):
+    with pytest.raises(SandboxError, match="docker wait timed out"):
         run(config, timeout_s=0.5)
 
     assert docker.commands() == ["run", "wait", "rm"]
