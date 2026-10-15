@@ -21,7 +21,7 @@ The best (v0) fails train tasks 1 to 5, solves 6 to 10, and scores 0.5 on every 
 
 import asyncio
 import json
-from collections.abc import Sequence
+from collections.abc import Callable, Sequence
 from dataclasses import dataclass, field
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
@@ -137,13 +137,14 @@ class ToyEvaluator:
     most_in_flight: int = 0
     gate: asyncio.Event | None = None  # When set, validations wait for it.
     train_known: bool = True  # Whether v0's train results exist.
+    kind_of: Callable[[str], str] | None = None  # The behavior of a commit not in ``kinds``.
 
     def __post_init__(self) -> None:
         self._limit = asyncio.Semaphore(self.concurrency)
 
     async def evaluate(self, request: EvaluationRequest) -> Evaluation:
         self.requests.append(request)
-        kind = self.kinds.get(request.commit, "base")
+        kind = self._kind(request.commit)
         if kind == "broken" or (kind == "late" and request.phase == "confirmation"):
             raise RuntimeError("the solve container exited with 137")
         if self.gate is not None and request.phase == "validation":
@@ -167,8 +168,13 @@ class ToyEvaluator:
         stats = CostStats(1000.0, 0.01, 10.0, count=count)
         return Evaluation(results, stats)
 
+    def _kind(self, commit: str) -> str:
+        if commit in self.kinds:
+            return self.kinds[commit]
+        return "base" if self.kind_of is None else self.kind_of(commit)
+
     def known_train(self, commit: str) -> tuple[Sequence[TaskResult], Sequence[Trajectory]]:
-        kind = self.kinds.get(commit, "base")
+        kind = self._kind(commit)
         if kind != "base" or not self.train_known:
             return [], []
         results = [
