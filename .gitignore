@@ -1,0 +1,26 @@
+# Secrets: they live in the environment or ~/.config/goaly/.env, never in the repository.
+.env
+.env.*
+*.env
+.envrc
+
+# Run artifacts, at the top level only.
+/runs/
+
+# Python and packaging.
+.venv/
+__pycache__/
+*.py[cod]
+build/
+dist/
+*.egg-info/
+
+# Tool caches and coverage reports.
+.mypy_cache/
+.ruff_cache/
+.pytest_cache/
+.import_linter_cache/
+.coverage
+.coverage.*
+htmlcov/
+coverage.xml
