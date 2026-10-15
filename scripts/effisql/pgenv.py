@@ -54,11 +54,11 @@ def main(argv: Sequence[str] | None = None) -> int:
     plans.add_argument("--out", type=Path, help="default: ~/data/effisql/plans.json")
     args = parser.parse_args(argv)
 
-    configure_logging()
-    config = PgEnvConfig()
     try:
+        configure_logging()
+        config = PgEnvConfig()
         if args.command == "build":
-            ensure_credentials()
+            ensure_credentials(golden_pgdata=config.golden_pgdata)
             password = load_credentials().admin_password
             dbs = [dataset.db for dataset in DATASETS]
             record = build_golden(
@@ -85,15 +85,25 @@ def _plans(config: PgEnvConfig, tasks: Path, port: int, out: Path) -> int:
     password = load_credentials().admin_password
     with connector(config.host, port, password)(MAIN_DB) as conn:
         plans, errors = explain_plans(conn, requests)
-    write_json(out, dict(plans))
     by_reason = {
         reason: sum(1 for request in requests if request.reason == reason)
         for reason in ("no plan", "foreign scale")
     }
+    if errors:
+        # A partial cache would leave tasks on a plan from another scale: keep the old one.
+        for request in requests:
+            if request.instance_id in errors:
+                _log.error(
+                    "task %s (%s) has no plan: EXPLAIN failed: %s",
+                    request.instance_id,
+                    request.reason,
+                    errors[request.instance_id],
+                )
+        sys.stderr.write(f"{len(errors)} of {len(requests)} EXPLAINs failed; {out} is unchanged\n")
+        return 1
+    write_json(out, dict(plans))
     sys.stdout.write(f"{len(plans)} plans written to {out}: {by_reason}\n")
-    for instance_id, message in sorted(errors.items()):
-        sys.stderr.write(f"task {instance_id}: EXPLAIN failed: {message}\n")
-    return 1 if errors else 0
+    return 0
 
 
 if __name__ == "__main__":

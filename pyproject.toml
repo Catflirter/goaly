@@ -12,6 +12,7 @@ dependencies = [
     "psycopg[binary]>=3.2", # 3.2 added cancel_safe() and chunked-rows streaming
     "pydantic>=2.4", # 2.4 added ValidationError.errors(include_input=...)
     "pydantic-settings>=2",
+    "python-dotenv>=1", # Parses ~/.config/goaly/pg.env, as pydantic-settings does
 ]
 
 [dependency-groups]

@@ -115,7 +115,7 @@ def stop(name: str, *, timeout_s: int) -> int:
     writes a shutdown checkpoint. Only after ``timeout_s`` seconds does Docker kill it.
     """
     _check_name(name)
-    _docker(["stop", "--time", str(timeout_s), name])
+    _docker(["stop", "--timeout", str(timeout_s), name])
     inspected = _docker(["container", "inspect", "--format", "{{.State.ExitCode}}", name])
     return int(inspected.stdout.strip())
 
@@ -128,7 +128,11 @@ def remove(name: str, *, force: bool = False) -> None:
 
 
 def logs(name: str, *, lines: int = 30) -> str:
-    """Return the last ``lines`` lines of the container's log, which never holds a password."""
+    """Return the last ``lines`` lines of the container's log.
+
+    That is PostgreSQL's own output. Passwords reach the servers only as files or verifiers,
+    so none should appear in it, but a statement the server logs is quoted as it came.
+    """
     _check_name(name)
     completed = _docker(["logs", "--tail", str(lines), name], check=False)
     return (completed.stdout + completed.stderr).strip()

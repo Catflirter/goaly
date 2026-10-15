@@ -8,6 +8,7 @@ from the same settled state. Each step is idempotent, and a finished build leave
 which names the dbgen build and every generated file's checksum, so a rebuild can be verified.
 """
 
+import fcntl
 import hashlib
 import json
 import logging
@@ -156,6 +157,10 @@ class GoldenRecord(BaseModel):
     dbgen: DbgenBuild
     databases: dict[str, DatabaseBuild]
     built_at: datetime
+    # What initdb and the image made of the cluster. None in a record from before they were kept.
+    server_version: str | None = None
+    encoding: str | None = None
+    collation: str | None = None
 
 
 class Runner(Protocol):
@@ -187,10 +192,18 @@ def run_command(
     )
     if completed.returncode != 0:
         detail = completed.stderr.strip()[-800:]
-        raise BuildError(
-            f"{' '.join(args[:2])} failed with exit code {completed.returncode}: {detail}"
-        )
+        raise BuildError(f"{_command(args)} failed with exit code {completed.returncode}: {detail}")
     return completed.stdout
+
+
+def _command(args: Sequence[str]) -> str:
+    """Name a command by its program and subcommand, such as ``git fetch``; paths are omitted."""
+    words = [Path(args[0]).name]
+    rest = list(args[1:])
+    if words[0] == "git" and rest[:1] == ["-C"]:
+        rest = rest[2:]  # git -C <checkout> <subcommand> ...
+    words += [arg for arg in rest[:1] if not arg.startswith("-")]
+    return " ".join(words)
 
 
 def dbgen_binary(dbgen_dir: Path) -> Path:
@@ -201,13 +214,15 @@ def ensure_dbgen(dbgen_dir: Path, *, run: Runner = run_command) -> DbgenBuild:
     """Check out the pinned tpch-kit commit under ``dbgen_dir`` and build dbgen, unless done."""
     source = dbgen_dir / "tpch-kit"
     git = ["git", "-C", str(source)]
-    if not (source / ".git").is_dir():
+    if not (source / ".git").is_dir() or _head(run, git) != DBGEN_COMMIT:
+        # Missing, or left at another commit or half-fetched by an interrupted build: the
+        # checkout is ours, under the data root, so start it over.
         if source.exists():
-            raise BuildError(f"{source} exists but is not a git checkout; remove it")
+            shutil.rmtree(source)
         run(["git", "init", "-q", str(source)])
         run([*git, "fetch", "-q", "--depth", "1", DBGEN_REPOSITORY, DBGEN_COMMIT])
         run([*git, "checkout", "-q", "--detach", "FETCH_HEAD"])
-    head = run([*git, "rev-parse", "HEAD"]).strip()
+    head = _head(run, git)
     if head != DBGEN_COMMIT:
         raise BuildError(f"{source} is at {head}, not the pinned commit {DBGEN_COMMIT}")
     try:
@@ -224,6 +239,14 @@ def ensure_dbgen(dbgen_dir: Path, *, run: Runner = run_command) -> DbgenBuild:
         version=DBGEN_VERSION,
         binary_sha256=inspect_table_file(binary).sha256,
     )
+
+
+def _head(run: Runner, git: Sequence[str]) -> str | None:
+    """The commit the checkout is at, or None if it has none yet."""
+    try:
+        return run([*git, "rev-parse", "--verify", "--quiet", "HEAD^{commit}"]).strip() or None
+    except BuildError:
+        return None
 
 
 def inspect_table_file(path: Path) -> TableFile:
@@ -300,6 +323,9 @@ def load_dataset(connect: Connect, dataset: Dataset, raw_dir: Path) -> None:
                 for block in without_trailing_delimiter(source):
                     copy.write(block)
         conn.execute("ANALYZE")
+        # Not in the official load: an approved deviation from the spec. Autovacuum would run it
+        # soon after the bulk load anyway; running it here gives all 5 copies the same
+        # visibility map and hint bits from the start.
         conn.execute("VACUUM")
         for table in TPCH_TABLES:
             count_sql = sql.SQL("SELECT count(*) FROM {}").format(sql.Identifier(table))
@@ -337,33 +363,98 @@ def build_golden(
     An unfinished build is discarded and started over. ``after_load`` runs while the build
     server still holds the loaded databases, before its clean shutdown.
     """
-    existing = read_golden_record(config.golden_record)
-    if existing is not None:
-        return existing
-    dbgen = ensure_dbgen(config.dbgen_dir, run=run)
-    binary = dbgen_binary(config.dbgen_dir)
-    for dataset in datasets:
-        ensure_generated(dataset, binary, config.raw_dir(dataset.scale), run=run)
-    # A build container left over from a failed build may still hold the data directory.
-    pg_containers.remove(config.build_container, force=True)
-    pgdata = config.golden_pgdata
-    if pgdata.exists():
-        shutil.rmtree(pgdata)
-    pgdata.mkdir(mode=0o700, parents=True)
-    with _build_server(config, admin_password, pgdata) as connect:
-        for dataset in datasets:
-            load_dataset(connect, dataset, config.raw_dir(dataset.scale))
-        if after_load is not None:
-            after_load(connect)
-    record = GoldenRecord(
-        image=config.image,
-        dbgen=dbgen,
-        databases={dataset.db: dataset.record() for dataset in datasets},
-        built_at=datetime.now(UTC),
-    )
-    write_private(config.golden_record, record.model_dump_json(indent=2) + "\n")
-    _log.info("golden build complete", extra={"pgdata": str(pgdata)})
-    return record
+    with _build_lock(config.golden_record.parent / ".lock"):
+        existing = read_golden_record(config.golden_record)
+        if existing is not None:
+            _check_record(existing, config, datasets)
+            return existing
+        dbgen = ensure_dbgen(config.dbgen_dir, run=run)
+        binary = dbgen_binary(config.dbgen_dir)
+        databases = {
+            dataset.db: DatabaseBuild(
+                scale_factor=dataset.scale,
+                tables=ensure_generated(dataset, binary, config.raw_dir(dataset.scale), run=run),
+            )
+            for dataset in datasets
+        }
+        # A build container left over from a failed build may still hold the data directory.
+        pg_containers.remove(config.build_container, force=True)
+        pgdata = config.golden_pgdata
+        if pgdata.exists():
+            shutil.rmtree(pgdata)
+        pgdata.mkdir(mode=0o700, parents=True)
+        with _build_server(config, admin_password, pgdata) as connect:
+            for dataset in datasets:
+                load_dataset(connect, dataset, config.raw_dir(dataset.scale))
+            cluster = _cluster_facts(connect, datasets[0].db)
+            if after_load is not None:
+                after_load(connect)
+        record = GoldenRecord(
+            image=config.image,
+            dbgen=dbgen,
+            databases=databases,
+            built_at=datetime.now(UTC),
+            **cluster,
+        )
+        write_private(config.golden_record, record.model_dump_json(indent=2) + "\n")
+        _log.info("golden build complete", extra={"pgdata": str(pgdata)})
+        return record
+
+
+@contextmanager
+def _build_lock(path: Path) -> Iterator[None]:
+    """Hold an exclusive lock for the whole build, so two setups never build at once."""
+    path.parent.mkdir(parents=True, exist_ok=True)
+    with path.open("a") as handle:
+        try:
+            fcntl.flock(handle, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        except BlockingIOError:
+            raise BuildError(f"another golden build holds {path}; wait for it to finish") from None
+        try:
+            yield
+        finally:
+            fcntl.flock(handle, fcntl.LOCK_UN)
+
+
+def _cluster_facts(connect: Connect, db: str) -> dict[str, str]:
+    with connect(db) as conn:
+        row = conn.execute(
+            "SELECT current_setting('server_version'), pg_encoding_to_char(encoding), datcollate"
+            " FROM pg_database WHERE datname = current_database()"
+        ).fetchone()
+    if row is None:
+        raise BuildError(f"{db} is missing from pg_database")
+    return {"server_version": row[0], "encoding": row[1], "collation": row[2]}
+
+
+def _check_record(record: GoldenRecord, config: PgEnvConfig, datasets: Sequence[Dataset]) -> None:
+    """Fail unless the finished build ``record`` describes is the one this setup asks for."""
+    problems = []
+    if record.image != config.image:
+        problems.append(f"it used the image {record.image}, not {config.image}")
+    if record.dbgen.commit != DBGEN_COMMIT:
+        problems.append(f"it used dbgen {record.dbgen.commit}, not {DBGEN_COMMIT}")
+    expected = {dataset.db: dataset.record() for dataset in datasets}
+    for db in sorted(record.databases.keys() | expected.keys()):
+        built, wanted = record.databases.get(db), expected.get(db)
+        if built is None or wanted is None:
+            problems.append(f"it {'lacks' if built is None else 'has an extra'} database {db}")
+        elif built != wanted:
+            tables = sorted(
+                t
+                for t in built.tables.keys() | wanted.tables.keys()
+                if built.tables.get(t) != wanted.tables.get(t)
+            )
+            problems.append(
+                f"its {db} (SF {built.scale_factor}) differs in {', '.join(tables) or 'scale'}"
+            )
+    if not config.golden_pgdata.is_dir():
+        problems.append(f"its data directory {config.golden_pgdata} is missing")
+    if problems:
+        raise BuildError(
+            f"the golden build recorded in {config.golden_record} does not match this setup: "
+            f"{'; '.join(problems)}. Delete {config.golden_record.parent} to rebuild it."
+        )
 
 
 @contextmanager
