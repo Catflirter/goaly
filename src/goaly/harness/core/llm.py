@@ -30,7 +30,9 @@ Synchronous code in a worker thread, such as the mini-swe-agent that RSI's imple
 (T20), calls ``complete_sync``, which runs the call on the client's own loop.
 
 The API key goes in the Authorization header and nowhere else: no message, log line, repr or
-record holds it, and the client removes it from any text it quotes from the gateway.
+record holds it, and the client removes it from any text it quotes from the gateway. Each request
+also carries the call's tags in an ``X-Goaly-Call-Tags`` header, for the host's proxy, which
+records every call from the solve container (``llm_proxy``, spec §6.1).
 """
 
 import asyncio
@@ -81,6 +83,9 @@ from goaly.harness.core.llm_throttle import (
 from goaly.harness.core.settings import Settings
 
 __all__ = [
+    "CALL_TAGS_HEADER",
+    "REQUEST_KEYS",
+    "THINKING_SWITCHES",
     "BoundLlm",
     "BoundLlmClient",
     "CallRecorder",
@@ -91,6 +96,7 @@ __all__ = [
     "LlmReply",
     "MemoryCallRecorder",
     "RetryPolicy",
+    "judge_response",
 ]
 
 _logger = logging.getLogger(__name__)
@@ -100,7 +106,6 @@ _S = LlmCallStatus
 # LiteLLM marks a prompt too long by itself, but passes SGLang's message on as a plain
 # BadRequestError when the prompt fits and max_tokens does not.
 _CONTEXT_OVERFLOW_MARKS: Final = ("contextwindowexceedederror", "maximum context length")
-_THINKING_SWITCHES: Final = ("enable_thinking", "preserve_thinking")
 _ROLES: Final = {
     ChatRole.CHAT_ROLE_SYSTEM: "system",
     ChatRole.CHAT_ROLE_USER: "user",
@@ -281,8 +286,9 @@ class LlmClient:
     ``shares`` gives every model this process's share of its budget, a positive int each (spec
     §6.2). The runner passes the shares of the phase it runs in. Without them each model gets its
     whole budget (llm_throttle.DEFAULT_SHARES), right only for a process that runs alone.
-    ``transport``, ``clock`` and ``rng`` are for tests: a mock transport, a clock that skips
-    waits, and a seeded source of jitter.
+    With ``settings.llm_uds`` set, the client connects through that Unix socket, as the solve
+    container reaches the host's proxy (spec §6.1). ``transport``, ``clock`` and ``rng`` are for
+    tests: a mock transport, a clock that skips waits, and a seeded source of jitter.
     """
 
     def __init__(
@@ -326,13 +332,7 @@ class LlmClient:
         self._api_key = settings.api_key
         headers = {"Authorization": f"Bearer {settings.api_key.get_secret_value()}"}
         self._http = {  # One connection pool per model, as large as its share.
-            model: httpx.AsyncClient(
-                base_url=settings.base_url,
-                headers=headers,
-                timeout=self._retry.timeout_s,
-                limits=httpx.Limits(max_connections=share, max_keepalive_connections=share),
-                transport=transport,
-            )
+            model: _http_client(settings, share, self._retry.timeout_s, headers, transport)
             for model, share in shares.items()
         }
 
@@ -395,7 +395,7 @@ class LlmClient:
         start = self._clock.monotonic()
         try:
             response = await self._send(body, record)
-            self._read_usage(response, record)
+            _read_usage(response, record)
         finally:
             self._finish(record, start)
         choice = response.choices[0]
@@ -558,7 +558,9 @@ class LlmClient:
             return _Outcome(_S.LLM_CALL_STATUS_CANCELLED)
         try:
             async with asyncio.timeout(self._retry.timeout_s):
-                response = await http.post("/chat/completions", content=body, headers=_JSON_HEADERS)
+                response = await http.post(
+                    "/chat/completions", content=body, headers=_call_headers(record)
+                )
         except (TimeoutError, httpx.TimeoutException):
             detail = f"no response within {self._retry.timeout_s:g} s"
             return _Outcome(_S.LLM_CALL_STATUS_TIMEOUT, detail=detail)
@@ -573,76 +575,7 @@ class LlmClient:
         except httpx.RequestError as error:  # For example, a body that cannot be decoded.
             detail = self._quote(f"unreadable response: {type(error).__name__}: {error}")
             return _Outcome(_S.LLM_CALL_STATUS_INVALID_RESPONSE, detail=detail)
-        return self._outcome(response, record)
-
-    def _outcome(self, response: httpx.Response, record: LlmCallRecord) -> _Outcome:
-        """Say how an attempt that got ``response`` ended (spec §5.1)."""
-        code = response.status_code
-        retry_after = _retry_after_s(response.headers)
-        cost = self._cost_usd(response.headers, record)
-        if response.is_success:
-            try:
-                parsed = _WireResponse.model_validate_json(response.content)
-            except ValidationError as error:
-                detail = f"HTTP {code}, but no chat completion: {_problems(error)}"
-                return _Outcome(
-                    _S.LLM_CALL_STATUS_INVALID_RESPONSE, code, detail, retry_after, cost
-                )
-            return _Outcome(_S.LLM_CALL_STATUS_OK, code, "", retry_after, cost, parsed)
-        said = self._redact(_error_message(response))
-        if code == httpx.codes.TOO_MANY_REQUESTS:
-            status = _S.LLM_CALL_STATUS_RATE_LIMITED
-        elif code == httpx.codes.REQUEST_TIMEOUT:  # LiteLLM's own upstream request timed out.
-            status = _S.LLM_CALL_STATUS_TIMEOUT
-        elif code >= httpx.codes.INTERNAL_SERVER_ERROR:
-            status = _S.LLM_CALL_STATUS_SERVER_ERROR
-        elif code == httpx.codes.BAD_REQUEST and any(
-            mark in said.lower() for mark in _CONTEXT_OVERFLOW_MARKS
-        ):
-            status = _S.LLM_CALL_STATUS_CONTEXT_OVERFLOW
-        elif code >= httpx.codes.BAD_REQUEST:
-            status = _S.LLM_CALL_STATUS_CLIENT_ERROR
-        else:  # 1xx or 3xx: no chat completion comes that way.
-            status = _S.LLM_CALL_STATUS_INVALID_RESPONSE
-        detail = f"HTTP {code}: {_cut(said)}" if said else f"HTTP {code}"
-        return _Outcome(status, code, detail, retry_after, cost)
-
-    def _cost_usd(self, headers: httpx.Headers, record: LlmCallRecord) -> float | None:
-        """Return the cost the gateway reported in x-litellm-response-cost, or None for none."""
-        value = headers.get("x-litellm-response-cost")
-        if value is None:
-            return None
-        try:
-            cost = float(value)
-        except ValueError:
-            cost = math.nan
-        if math.isfinite(cost) and cost >= 0:
-            return cost
-        _logger.warning(
-            "ignored a malformed cost header",
-            extra={
-                "event": "llm_bad_cost",
-                "model": record.model,
-                "call_id": record.call_id,
-                "value": self._redact(value)[:40],  # Redacted first: a cut could split the key.
-            },
-        )
-        return None
-
-    def _read_usage(self, response: _WireResponse, record: LlmCallRecord) -> None:
-        """Copy the tokens the gateway reported into ``record``, whose cost is already in."""
-        usage = response.usage
-        if usage is None:
-            _logger.warning(
-                "the gateway reported no usage, so the call counts no tokens",
-                extra={"event": "llm_no_usage", "model": record.model, "call_id": record.call_id},
-            )
-            return
-        record.usage.input_tokens = usage.prompt_tokens
-        record.usage.output_tokens = usage.completion_tokens
-        details = usage.completion_tokens_details
-        if details is not None and details.reasoning_tokens is not None:
-            record.usage.reasoning_tokens = details.reasoning_tokens
+        return _outcome(response, record, self._api_key.get_secret_value())
 
     def _finish(self, record: LlmCallRecord, start: float) -> None:
         """Complete ``record`` from its attempts, and hand the recorder a copy of its own."""
@@ -684,10 +617,30 @@ class LlmClient:
         )
 
     def _redact(self, text: str) -> str:
-        return text.replace(self._api_key.get_secret_value(), "[redacted]")
+        return _redact(text, self._api_key.get_secret_value())
 
     def _quote(self, text: str) -> str:
         return _cut(self._redact(text))
+
+
+def _http_client(
+    settings: Settings,
+    share: int,
+    timeout_s: float,
+    headers: Mapping[str, str],
+    transport: httpx.AsyncBaseTransport | None,
+) -> httpx.AsyncClient:
+    """A model's connection pool, of ``share`` connections, by TCP or by settings.llm_uds."""
+    limits = httpx.Limits(max_connections=share, max_keepalive_connections=share)
+    if transport is None and settings.llm_uds is not None:
+        transport = httpx.AsyncHTTPTransport(uds=str(settings.llm_uds), limits=limits)
+    return httpx.AsyncClient(
+        base_url=settings.base_url,
+        headers=headers,
+        timeout=timeout_s,
+        limits=limits,
+        transport=transport,
+    )
 
 
 class BoundLlmClient:
@@ -713,6 +666,28 @@ class BoundLlmClient:
         )
 
 
+# The keys a request body may hold, at its top level and in chat_template_kwargs. _request_body
+# writes no others, and the proxy (llm_proxy) forwards no others (spec §6.1).
+REQUEST_KEYS: Final = frozenset(
+    {"model", "messages", "temperature", "top_p", "top_k", "max_tokens", "presence_penalty"}
+    | {"chat_template_kwargs", "tools"}
+)
+THINKING_SWITCHES: Final = ("enable_thinking", "preserve_thinking")
+# The header that tells the proxy which call a request belongs to: compact JSON of its tags.
+CALL_TAGS_HEADER: Final = "X-Goaly-Call-Tags"
+
+
+def _call_headers(record: LlmCallRecord) -> dict[str, str]:
+    """A request's own headers: its content type, and the call's tags, which the proxy records."""
+    tags = {
+        "run_id": record.run_id,
+        "instance_id": record.instance_id,
+        "seed": record.seed,
+        "purpose": CallPurpose.Name(record.purpose),
+    }
+    return {**_JSON_HEADERS, CALL_TAGS_HEADER: json.dumps(tags, separators=(",", ":"))}
+
+
 def _request_body(
     profile: ModelProfile,
     messages: Sequence[ChatMessage],
@@ -724,7 +699,7 @@ def _request_body(
         "messages": [_wire_message(message) for message in messages],
     }
     params = profile.params.model_dump(exclude_none=True)
-    switches = {name: params.pop(name) for name in _THINKING_SWITCHES if name in params}
+    switches = {name: params.pop(name) for name in THINKING_SWITCHES if name in params}
     body.update(params)  # The sampling fields, named as the wire names them.
     if switches:
         body["chat_template_kwargs"] = switches
@@ -801,6 +776,97 @@ def _assistant_message(message: _WireMessage) -> ChatMessage:
             for call in message.tool_calls or ()
         ],
     )
+
+
+def judge_response(
+    response: httpx.Response, record: LlmCallRecord, *, secret: str
+) -> LlmCallStatus.ValueType:
+    """Say how an attempt that got ``response`` ended, and add the usage it reports to ``record``.
+
+    This is how the client judges each response. The proxy (llm_proxy) judges the gateway's
+    replies with it too, so that its records and the client's agree. ``secret`` is the key, which
+    no log line may quote.
+    """
+    outcome = _outcome(response, record, secret)
+    if outcome.cost_usd is not None:
+        record.usage.cost_usd += outcome.cost_usd
+    if outcome.response is not None:
+        _read_usage(outcome.response, record)
+    return outcome.status
+
+
+def _outcome(response: httpx.Response, record: LlmCallRecord, secret: str) -> _Outcome:
+    """Say how an attempt that got ``response`` ended (spec §5.1)."""
+    code = response.status_code
+    retry_after = _retry_after_s(response.headers)
+    cost = _cost_usd(response.headers, record, secret)
+    if response.is_success:
+        try:
+            parsed = _WireResponse.model_validate_json(response.content)
+        except ValidationError as error:
+            detail = f"HTTP {code}, but no chat completion: {_problems(error)}"
+            return _Outcome(_S.LLM_CALL_STATUS_INVALID_RESPONSE, code, detail, retry_after, cost)
+        return _Outcome(_S.LLM_CALL_STATUS_OK, code, "", retry_after, cost, parsed)
+    said = _redact(_error_message(response), secret)
+    if code == httpx.codes.TOO_MANY_REQUESTS:
+        status = _S.LLM_CALL_STATUS_RATE_LIMITED
+    elif code == httpx.codes.REQUEST_TIMEOUT:  # LiteLLM's own upstream request timed out.
+        status = _S.LLM_CALL_STATUS_TIMEOUT
+    elif code >= httpx.codes.INTERNAL_SERVER_ERROR:
+        status = _S.LLM_CALL_STATUS_SERVER_ERROR
+    elif code == httpx.codes.BAD_REQUEST and any(
+        mark in said.lower() for mark in _CONTEXT_OVERFLOW_MARKS
+    ):
+        status = _S.LLM_CALL_STATUS_CONTEXT_OVERFLOW
+    elif code >= httpx.codes.BAD_REQUEST:
+        status = _S.LLM_CALL_STATUS_CLIENT_ERROR
+    else:  # 1xx or 3xx: no chat completion comes that way.
+        status = _S.LLM_CALL_STATUS_INVALID_RESPONSE
+    detail = f"HTTP {code}: {_cut(said)}" if said else f"HTTP {code}"
+    return _Outcome(status, code, detail, retry_after, cost)
+
+
+def _cost_usd(headers: httpx.Headers, record: LlmCallRecord, secret: str) -> float | None:
+    """Return the cost the gateway reported in x-litellm-response-cost, or None for none."""
+    value = headers.get("x-litellm-response-cost")
+    if value is None:
+        return None
+    try:
+        cost = float(value)
+    except ValueError:
+        cost = math.nan
+    if math.isfinite(cost) and cost >= 0:
+        return cost
+    _logger.warning(
+        "ignored a malformed cost header",
+        extra={
+            "event": "llm_bad_cost",
+            "model": record.model,
+            "call_id": record.call_id,
+            "value": _redact(value, secret)[:40],  # Redacted first: a cut could split the key.
+        },
+    )
+    return None
+
+
+def _read_usage(response: _WireResponse, record: LlmCallRecord) -> None:
+    """Copy the tokens the gateway reported into ``record``, whose cost is already in."""
+    usage = response.usage
+    if usage is None:
+        _logger.warning(
+            "the gateway reported no usage, so the call counts no tokens",
+            extra={"event": "llm_no_usage", "model": record.model, "call_id": record.call_id},
+        )
+        return
+    record.usage.input_tokens = usage.prompt_tokens
+    record.usage.output_tokens = usage.completion_tokens
+    details = usage.completion_tokens_details
+    if details is not None and details.reasoning_tokens is not None:
+        record.usage.reasoning_tokens = details.reasoning_tokens
+
+
+def _redact(text: str, secret: str) -> str:
+    return text.replace(secret, "[redacted]")
 
 
 def _error_message(response: httpx.Response) -> str:
