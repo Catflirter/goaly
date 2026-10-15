@@ -55,13 +55,13 @@ We hand over the frozen harness. The organizers evaluate it on a hidden held-out
 
 | PDF criterion | How the design meets it | Evidence |
 |---|---|---|
-| Benchmark score: starting and final scores, with improvement on every benchmark | Baseline v0 (§5.4) and final are compared on the same held-out set, graded in official mode (§4.1). While SWE is on hold (2026-10-15), Effi-SQL is the only benchmark scored | T12 and T23 reports |
-| Robustness: run the same test at least 3 times and report the variation; survive tool errors, timeouts and bad model output | Three held-out runs; fault tolerance in core (§5.1); per-task exception isolation (§6.1); concurrency budgets and adaptive backoff (§6.2) | T23 report; T04 and T05 tests |
+| Benchmark score: starting and final scores, with improvement on every benchmark | Baseline v0 (§5.4) and final are compared on the same held-out set, graded in official mode (§4.1): v0 runs once there and the final three times. While SWE is on hold (2026-10-15), Effi-SQL is the only benchmark scored | T12 and T23 reports |
+| Robustness: run the same test at least 3 times and report the variation; survive tool errors, timeouts and bad model output | The final harness runs 3 times on held-out in official mode, which meets the 3-run requirement; v0 runs once there, and its variation comes from its 2 val seeds (§10). Fault tolerance in core (§5.1); per-task exception isolation (§6.1); concurrency budgets and adaptive backoff (§6.2) | T23 report; T04 and T05 tests |
 | Generalization: held-out tasks stay out of development; gains on more than one benchmark; no hard-coded answers | Three-way split (§7), a hard-coding scan (§8.5) and the grader's hard-coding checks (§4.1). The RSI machinery has no benchmark-specific code: a lane is a capability pack plus a `Benchmark` adapter (§3.3). **At risk:** while SWE is on hold, gains can be shown on one benchmark only, so "gains on more than one benchmark" is not met. The report says so plainly | Committed split ID lists; scan logs; held-out gains in the T23 report |
 | Lessons learned: what was tried, what worked, what failed and why, backed by experiments | Experiment ledger and lessons (§8.6) | `experiments.jsonl`, `lessons.jsonl`, and the generated `lessons.md` |
 | Efficiency: time, tokens, compute and cost reported alongside the score | Cost and tokens are recorded for every call (§9). Two limits in the decision rules (§8.3): a cost guardrail, and a hard cap that keeps the final harness at or below 3× v0's mean cost and wall time per task | Report tables, including the final harness's cost and time relative to v0 |
 | Reproducibility: code, configs, prompts, tool versions and a single command | uv lockfile, run manifests, `make final` (§10) | T23, T24 |
-| Automation: several improvement rounds with little human help | One command, `goaly rsi run`, runs every round with no person or AI assistant in the loop. A supervisor restarts a crashed lane, and the code opens the results PRs and sends the notifications itself (§8.0, §8.7) | Ledger entries across rounds; the supervisor log |
+| Automation: several improvement rounds with little human help | One command, `goaly rsi run`, runs every round with no person or AI assistant in the loop. A supervisor restarts a crashed lane, and the code opens the results PRs and sends the notifications itself (§8.0, §8.7). **At risk:** the schedule plans 1 round, with a second as upside, and no round may finish if the lane starts late (§13) | Ledger entries across rounds; the supervisor log |
 | Regression check: keep the best harness; new changes must not break tasks that already pass | Best-version tags and a regression rule (§8.3) | Decision log |
 
 ## 3. Architecture
@@ -493,8 +493,8 @@ The budgets now cover one active lane, Effi-SQL:
 
 | Phase | Qwen (48 total) | GLM (16 total) | Notes |
 |---|---|---|---|
-| Baseline (T12) | Effi-SQL 40, background 8 | unused | v0 runs on train and val first. Its three held-out runs start as soon as those are done |
-| RSI (T22) | Effi-SQL lane 32, background 8; 8 spare | Effi-SQL lane 8; the other 8 are headroom | Background covers confirmation reruns and any v0 held-out runs still pending |
+| Baseline (T12) | Effi-SQL 40, background 8 | unused | v0 runs on train and val first. Its held-out run, 1 seed in official mode, starts as soon as those are done |
+| RSI (T22) | Effi-SQL lane 32, background 8; 8 spare | Effi-SQL lane 8; the other 8 are headroom | Background covers confirmation reruns and v0's held-out run if it is still pending |
 | Final evaluation (T23) | Effi-SQL 40; 8 spare | unused | GLM is no longer available |
 
 The SWE lane is on hold (2026-10-15) and has no share. If it resumes, the shares and the CPU partition (below) have to be planned again.
@@ -523,9 +523,9 @@ In the RSI phase a lane's GLM share covers its analyst, its implementers and its
   - T12 measures the queue wait.
 - **Fetching and hashing.** Every comparison run fetches and hashes the whole result, at a few microseconds per row. At least 58 gradable tasks return more than 1M rows, and the largest, about 60M rows, takes several minutes. The estimates below include this time.
 - **Grading time per candidate** (dev mode, §4.1). A prediction costs one comparison run, up to 3 timed runs and the robustness check on the alternate database. From the dataset's timings, leaving out the 5 tasks over 300 s, that is about 55 s per task at gold speed and about 110 s at τ ≈ 1; an identity submission costs nothing. On the 3 grading instances, screening a candidate (20 tasks) takes about 6–12 minutes and validating it (30 tasks) about 9–18 minutes. A round of 3 candidates spends about 40–110 minutes on grading, depending on how many reach validation.
-- **Official mode** times both sides with no cache: about 2.5–3.5 minutes per task, so a 60-task held-out run takes about 55–70 minutes on 3 instances. v0's three held-out runs therefore take about 3.5 hours.
+- **Official mode** times both sides with no cache: about 2.5–3.5 minutes per task, so a 60-task held-out run takes about 55–70 minutes on 3 instances. v0's single held-out run therefore takes about an hour of grading.
 - **One-time setup.** The base cache, the identity τ, the alternate-database signatures, the gold check and the exclusions take about 14 instance-hours: about 3 hours on all 5 instances.
-- **Rounds.** An Effi-SQL round takes about 1.5–3 hours end to end: analysis and implementation, then screening, validation and one confirmation rerun, with solving and grading overlapping. Plan for 1–2 rounds (§13); more rounds are upside.
+- **Rounds.** An Effi-SQL round takes about 1.5–3 hours end to end: analysis and implementation, then screening, validation and one confirmation rerun, with solving and grading overlapping. The schedule (§13) plans 1 round, with a second as upside, and gives the conditions for each.
 - These figures are estimates from the authors' hardware. T10 and T12 measure the real times on this machine, and these numbers will be updated from those measurements.
 - **SWE (on hold, 2026-10-15).** The SWE lane is limited by CPU and evaluation, not by the gateway. An SWE round takes about 2.5 hours. Solving runs on 8 slots and is capped at 45 minutes per task; evaluation runs on 4 workers. That allows 3–4 rounds overnight. Config can fit in more rounds by using one candidate per round or by capping solving at 30 minutes. The SWE figures are estimates. T14 and T15 measure actual solving and evaluation times, and these numbers will be updated from those measurements.
 
@@ -535,8 +535,8 @@ In the RSI phase a lane's GLM share covers its analyst, its implementers and its
 |---|---|---|---|---|
 | Setup and exclusions (T10) | When T09 and T10 land | All 5: nothing solves before T12, so the solving instances grade too | First | About 14 instance-hours, about 3 h |
 | v0's dev runs: train with 1 seed, val with 2 (T12) | When T11 lands | 3 | First: RSI starts from these results | Up to about 6 instance-hours; identity submissions are free |
-| v0's official held-out runs, 3 of them (T12) | As soon as v0's dev runs are done | 3 | Ahead of the lane, because the final comparison needs them | About 11 instance-hours, about 3.5 h |
-| RSI rounds (T22) | 16:00 | What v0's held-out runs leave, then all 3 | After v0's held-out runs | About 2–5 instance-hours per round |
+| v0's official held-out run, 1 seed (T12) | As soon as v0's dev runs are done | 3 | Ahead of the lane, because the final comparison needs it | About 3–3.5 instance-hours, about 1–1.2 h |
+| RSI rounds (T22) | 16:00 | What v0's held-out run leaves, then all 3 | After v0's held-out run | About 2–5 instance-hours per round |
 | Final: held-out 3 times in official mode, val 3 times in dev mode (T23) | At the freeze | 3 while final solving runs, then all 5 | The only phase | About 10–14 instance-hours, about 2.5–3.5 h |
 
 A solving instance that grades, in setup or after final solving, also holds the alternate database. The agent's role cannot connect to it.
@@ -614,7 +614,7 @@ Each PostgreSQL instance is pinned with cpuset to both SMT siblings of its physi
 - Each split has one job:
   - **train:** the analyst may see full trajectories, grader feedback and gold answers.
   - **val:** results go to the decision step and to the final report. The analyst never sees per-task val results or val trajectories. Its ledger summary keeps each experiment's decision and aggregate result with the per-task val results stripped, and lessons cite only the aggregate decision.
-  - **held-out:** used only for v0's baseline runs and the final runs. No other version runs on it.
+  - **held-out:** used only for v0's baseline run and the final runs. No other version runs on it.
 - SWE (on hold): if an SWE task takes more than 25 minutes to evaluate, it is swapped for another task from the same repository, and the swap is recorded.
 - Exclusions (§4.1, §4.2) are applied after splitting, which keeps the split itself reproducible. An excluded Effi-SQL task is simply dropped from its split, so that split ends up slightly smaller. An excluded SWE task (on hold) is replaced with another task from the same repository, so every SWE split keeps 12 tasks.
 
@@ -726,7 +726,7 @@ A lane that stops writes a stop record to the ledger, opens its final results PR
 | Relying on the improvement model | The per-purpose model allowlist lives in core, which RSI cannot edit: executor calls may use only Qwen (§5.1) |
 | Special-casing the workload or caching between timing runs (SWE, on hold) | The official grader times each repetition in a fresh process and checks for stack inspection; the prompt and skills forbid both; held-out results expose this kind of overfitting |
 | Editing test files (SWE, on hold) | The official grader resets test files before it runs them |
-| Overfitting to val | The analyst never sees per-task val results or val trajectories, and lessons cite only the aggregate decision (§7). Held-out is used only for v0's baseline runs and the final runs |
+| Overfitting to val | The analyst never sees per-task val results or val trajectories, and lessons cite only the aggregate decision (§7). Held-out is used only for v0's baseline run and the final runs |
 
 ### 8.6 Ledger and lessons
 
@@ -835,10 +835,10 @@ The implementer is mini-swe-agent's `DefaultAgent` (`mini-swe-agent==2.4.6`, MIT
 - **Runs:**
   - final runs 3 times on held-out in official mode (§4.1), plus 3 times on val in dev mode;
   - once final solving finishes, the 2 solving instances are converted into grading instances, so final grading uses all 5 (§6.2);
-  - v0's three held-out runs, also in official mode, were already done during the baseline phase.
+  - v0's held-out run, 1 seed in official mode, was already done during the baseline phase. The project lead decided on 1 seed (2026-10-15) to free grading time for RSI. v0 and the final are compared in the same mode, and the final's 3 runs meet the 3-run requirement (§2).
 - **The report includes:**
-  - starting score, final score and the improvement, with mean ± standard deviation and confidence intervals, for both the official and the checked R-VES (§4.1);
-  - how much scores vary between runs;
+  - starting score, final score and the improvement, with confidence intervals, for both the official and the checked R-VES (§4.1). The final's score is the mean ± standard deviation of its 3 held-out runs; v0's is its single run;
+  - how much scores vary between runs: the final's 3 held-out runs, and v0's 2 val seeds in dev mode, since v0 has only 1 held-out run;
   - results by difficulty, and by repository if SWE resumes;
   - efficiency and experiment cost;
   - a plot of score by round;
@@ -849,7 +849,7 @@ The implementer is mini-swe-agent's `DefaultAgent` (`mini-swe-agent==2.4.6`, MIT
   3. grades the results;
   4. generates the report.
 
-  The report reads v0's held-out results from the runs archived during the baseline phase. A separate `make baseline` reruns v0 for anyone who wants to reproduce it too. We keep the two commands apart because rerunning v0 as part of `make final` would add about 3.5 hours of official-mode grading (§6.2).
+  The report reads v0's held-out results from the runs archived during the baseline phase. A separate `make baseline` reruns v0 for anyone who wants to reproduce it too. We keep the two commands apart because rerunning v0 as part of `make final` would add its solving and about an hour of official-mode grading (§6.2).
 
   Dependencies are pinned in `uv.lock`, and the manifests record every version.
 
@@ -891,7 +891,8 @@ The implementer is mini-swe-agent's `DefaultAgent` (`mini-swe-agent==2.4.6`, MIT
 
 | Risk | Mitigation |
 |---|---|
-| Grading time. Grading capacity binds the whole day: the setup takes about 14 instance-hours, each official held-out run about 55–70 minutes, and dev mode about 40–110 minutes per round (§6.2). A slow prediction can hold an instance for up to the 300 s statement timeout on each run | The grading-instance plan (§6.2) fixes each phase's instances and priority. Dev mode caches the base side and grades identity submissions for free, and the setup and the final also use the 2 solving instances. v0's held-out runs start as soon as v0's train and val dev runs are done (T12). T10 measures the real times first, and the schedule (§13) plans for 1–2 RSI rounds |
+| Grading time. Grading capacity binds the whole day: the setup takes about 14 instance-hours, each official held-out run about 55–70 minutes, and dev mode about 40–110 minutes per round (§6.2). A slow prediction can hold an instance for up to the 300 s statement timeout on each run | The grading-instance plan (§6.2) fixes each phase's instances and priority. Dev mode caches the base side and grades identity submissions for free, and the setup and the final also use the 2 solving instances. v0's held-out run, 1 seed, starts as soon as v0's train and val dev runs are done (T12). T10 measures the real times first, and the schedule (§13) plans 1 RSI round, with a second as upside |
+| RSI completes no round before the freeze: a late T11 or a late lane start, with slow rounds (§13) | Report it honestly: the final harness is then v0, and the report says that no round completed. Keep what the partial round learned: its hypotheses, implementations, screening results and lessons are in the ledger and go into the report |
 | Solving capacity. Every agent statement runs on the 2 solving instances, at about 50–75 core-seconds per task | At most 2 statements in flight per solving instance, with the queue wait reported to the agent separately; a 120 s statement timeout; about 16 lane tasks at once (§6.2). T12 measures the queue wait |
 | Hard-coded results: a prediction that returns the base result as constants matches and scores τ = 1000 | The robustness check on the alternate database and the plan check (§4.1). A flagged candidate fails outright, and the report gives the checked R-VES next to the official one |
 | The organizers' evaluation mode is unknown: patch, the runner's default, or end2end | Every prediction carries both forms (§3.3), and T11 tests both extraction paths against a reimplemented extractor. The project lead may ask the organizers |
@@ -899,7 +900,7 @@ The implementer is mini-swe-agent's `DefaultAgent` (`mini-swe-agent==2.4.6`, MIT
 | Timing noise at tier boundaries: a τ near 1 can flip between credit 0.25 and 0.5 from one run to the next | Medians of 3 runs on dedicated, pinned grading instances, with periodic identity probes (§6.2). Dev mode gives identity submissions a fixed τ (§4.1). The decision rules add a sign test, a regression bound and a confirmation seed (§8.3). Final scores are reported as mean ± standard deviation over 3 runs |
 | The official evaluator's repository has no license | We reimplement its algorithm (§4.1) rather than vendor its code. Negative self-checks, which a broken matcher would fail, test the reimplementation together with the gold, identity and data checks |
 | SWE on hold: the PDF's "gains on more than one benchmark" is at risk (§2) | Nothing within this deadline; the report states the gap plainly. The SWE design stays in this document and the RSI machinery has no benchmark-specific code, so the lane can resume without a redesign |
-| Tight schedule: 21 hours from 2026-10-15 03:00 UTC to the deadline | One active lane. Contracts come first, then component PRs in parallel; stacked PRs keep review from blocking work. RSI must be running by about 16:00 UTC, and the plan counts on 1–2 rounds (§13) |
+| Tight schedule: 21 hours from 2026-10-15 03:00 UTC to the deadline | One active lane. Contracts come first, then component PRs in parallel; stacked PRs keep review from blocking work. RSI must be running by about 16:00 UTC, and the plan counts on 1 round, with a second as upside (§13) |
 | The implementer writes outside its pack: bash can write anywhere | The Docker sandbox with read-only mounts prevents it (§8.8), and the guards and checksums detect it. A unit-tested function builds the mount arguments, and an integration test asserts the read-only refusal |
 | Candidate pack code runs on the host during smoke tests, screening and validation | The static AST allowlist (§8.5) checks it before every run, and the checksums are verified before every evaluation |
 | mini-swe-agent changes or breaks | An exact pin. The adapter uses only `DefaultAgent`, `DockerEnvironment`, its exceptions and two helper functions. Vendoring them, about 450 lines under MIT, is the fallback |
@@ -925,10 +926,22 @@ The schedule runs from now, 2026-10-15 03:00 UTC, to the deadline, 2026-10-16 00
 | 07:30–09:30 | T05 and T10 |
 | 09:30–12:30 | T06, then T07 and T18. As soon as T10 lands, the setup runs on all 5 instances: the base cache, the identity τ, the alternate-database signatures, the self-checks and the exclusion list, about 3 h |
 | 12:30–14:30 | T11, T19 and T20; T20 needs only T03 and T18, not T04 or T05. v0's dev runs (T12) start as soon as T11 lands. T11 is on the grading instances' critical path |
-| 14:30–16:00 | T21. v0's held-out runs start as soon as its train and val dev runs are done, and take about 3.5 h. The project lead reviews the stack the lane runs on |
-| 16:00–20:00 | T22: the Effi-SQL lane runs under the supervisor, with no assistant in the loop (§8.0). Its grading queues behind v0's held-out runs (§6.2), so plan for 1–2 rounds; more are upside. It must be running by about 16:00 |
-| 20:00–23:30 | T23: the freeze; final solving, then grading on all 5 instances, about 2.5–3.5 h in all; the report |
-| 23:30–00:00 | T24, and buffer before the deadline |
+| 14:30–16:00 | T21. v0's held-out run, 1 seed in official mode, starts as soon as its train and val dev runs are done, and takes about 1–1.5 h with its solving. The project lead reviews the stack the lane runs on |
+| 16:00–20:00 | T22: the Effi-SQL lane runs under the supervisor, with no assistant in the loop (§8.0). Its grading queues behind v0's held-out run (§6.2). Plan for 1 round, with a second as upside (below). It must be running by about 16:00 |
+| 20:00–23:30 | T23: the freeze, then final solving and grading on all 5 instances, about 2.5–3.5 h in all. A 3.5 h final leaves no time for the report afterwards, so the report is drafted while the final runs |
+| 23:30–00:00 | The final numbers go into the report; T24; buffer before the deadline |
+
+**RSI rounds.** The hours freed by v0's single held-out run support 1 round, with a second as upside, but not more. These end times assume the lane starts at 16:00 and use the estimates in §6.2. The fast case assumes 4-minute tasks, 55 s of dev grading per task, 1 candidate reaching validation and 20 minutes of analysis and implementation; the slow case 8 minutes, 107 s, 2 candidates and 40 minutes.
+
+| T11 lands | v0's held-out run ends | Round 1 ends | Round 2 ends |
+|---|---|---|---|
+| 12:30 | about 14:45 (fast) to 16:15 (slow) | about 17:25 to 19:10 | about 18:50 to 22:15 |
+| 13:30 | about 15:45 to 17:15 | about 17:25 to 19:10 | about 18:50 to 22:15 |
+| 14:30 | about 16:45 to 18:15 | about 17:35 to 20:10 | about 19:00 to 23:15 |
+
+- Round 1 finishes before the 20:00 freeze if T11 lands by about 13:30. If T11 lands at 14:30 and the rounds are slow, round 1 ends just after the freeze.
+- A second round fits only when the rounds run at the fast end, whenever T11 lands. At the slow end, round 2 ends after 22:00.
+- If the lane starts after 16:00, every time shifts by the delay. No round may then finish, and the §12 risk "RSI completes no round before the freeze" applies.
 
 The project lead's review latency is budgeted. PRs stack, so no slot waits for a review, and the 14:30–16:00 slot leaves time to review the code the lane runs on before it starts.
 
