@@ -3,7 +3,7 @@
 import json
 from collections.abc import Sequence
 
-from goaly.contracts.gen.experiment_pb2 import PhaseResult
+from goaly.contracts.gen.experiment_pb2 import DecisionThresholds, Lane, PhaseResult
 from goaly.contracts.gen.trajectory_pb2 import (
     Chat,
     ChatMessage,
@@ -69,8 +69,8 @@ def prompt(trajectory: Trajectory, index: int) -> list[ChatMessage]:
     ]
 
 
-SYSTEM = ChatMessage(role=ChatRole.CHAT_ROLE_SYSTEM, content="You fix PostgreSQL queries.")
-TASK = ChatMessage(role=ChatRole.CHAT_ROLE_USER, content="Return each region's top 3 sales.")
+SYSTEM = ChatMessage(role=ChatRole.CHAT_ROLE_SYSTEM, content="You make slow queries faster.")
+TASK = ChatMessage(role=ChatRole.CHAT_ROLE_USER, content="Speed up: SELECT count(*) FROM lineitem")
 
 
 def make_step(
@@ -180,3 +180,11 @@ def test_an_optional_statistic_keeps_its_presence_through_jsonl() -> None:
     assert "gain_probability" not in fields
     assert read.HasField("sign_test_p")
     assert not read.HasField("gain_probability")
+
+
+def test_every_lane_has_its_own_thresholds() -> None:
+    lanes = {value.name.removeprefix("LANE_").lower() for value in Lane.DESCRIPTOR.values}
+    variants = DecisionThresholds.DESCRIPTOR.oneofs_by_name["benchmark"].fields
+
+    # A lane is decided by its own variant's thresholds, so each lane needs exactly one.
+    assert {field.name for field in variants} == lanes - {"unspecified"} == {"effisql", "swe"}

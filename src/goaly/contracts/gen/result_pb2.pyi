@@ -130,8 +130,8 @@ class TaskResult(_message.Message):
     @_builtins.property
     def grade(self) -> _task_pb2.Grade:
         """How the task was graded. A task with no prediction, after a crash or an error, is graded as
-        an empty prediction: BIRD scores 0, and SWE scores 1/gold speedup without an evaluation run
-        (spec §4.2). Absent only in a run without gold answers, such as an organizers' run.
+        an empty prediction: Effi-SQL scores 0, and SWE scores 1/gold speedup without an evaluation
+        run (spec §4.2). Absent only in a run without gold answers, such as an organizers' run.
         """
 
     @_builtins.property

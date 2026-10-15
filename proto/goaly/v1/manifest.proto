@@ -10,7 +10,7 @@ import "google/protobuf/timestamp.proto";
 message RunManifest {
   // A unique ID for the run.
   string run_id = 1;
-  // The benchmark, by its adapter's name, the same as the CLI's --bench: "birdcritic" or
+  // The benchmark, by its adapter's name, the same as the CLI's --bench: "effisql" or
   // "swefficiency".
   string benchmark = 2;
   // The split the tasks came from; SPLIT_EXTERNAL for a task file from outside our splits, such
@@ -32,8 +32,8 @@ message RunManifest {
   // How the loader changed the dataset, such as rewriting the SWE image registry (spec §4.2);
   // empty if it changed nothing.
   repeated string dataset_notes = 9;
-  // The SHA-256 of the gold-answer files the grader used, in hex, such as BIRD's emailed ground
-  // truth (spec §4.1); empty if the run had none.
+  // The SHA-256 of the gold-answer files the grader used that are not part of the dataset, in
+  // hex; empty if there were none, as when the gold answers ship with the dataset.
   string gold_sha256 = 10;
   // The settings of every model the run called.
   repeated ModelSettings models = 11;

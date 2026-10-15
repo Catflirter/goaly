@@ -32,23 +32,23 @@ class _LaneEnumTypeWrapper(_enum_type_wrapper._EnumTypeWrapper[_Lane.ValueType],
     DESCRIPTOR: _descriptor.EnumDescriptor
     LANE_UNSPECIFIED: _Lane.ValueType  # 0
     """Not set."""
-    LANE_BIRD: _Lane.ValueType  # 1
-    """The BIRD-CRITIC lane."""
+    LANE_EFFISQL: _Lane.ValueType  # 1
+    """The Effi-SQL lane."""
     LANE_SWE: _Lane.ValueType  # 2
-    """The SWE-fficiency lane."""
+    """The SWE-fficiency lane, on hold since 2026-10-15."""
 
 class Lane(_Lane, metaclass=_LaneEnumTypeWrapper):
     """An RSI lane (spec §8.1): one benchmark's improvement loop, which edits only that benchmark's
-    pack. LANE_BIRD is the benchmark whose adapter is named "birdcritic", and LANE_SWE the one
-    named "swefficiency".
+    pack. LANE_EFFISQL is the benchmark whose adapter is named "effisql", and LANE_SWE the one
+    named "swefficiency". The SWE lane is on hold (2026-10-15).
     """
 
 LANE_UNSPECIFIED: Lane.ValueType  # 0
 """Not set."""
-LANE_BIRD: Lane.ValueType  # 1
-"""The BIRD-CRITIC lane."""
+LANE_EFFISQL: Lane.ValueType  # 1
+"""The Effi-SQL lane."""
 LANE_SWE: Lane.ValueType  # 2
-"""The SWE-fficiency lane."""
+"""The SWE-fficiency lane, on hold since 2026-10-15."""
 Global___Lane: _TypeAlias = Lane  # noqa: Y015
 
 class _ChangeKind:
@@ -128,7 +128,7 @@ class _GuardEnumTypeWrapper(_enum_type_wrapper._EnumTypeWrapper[_Guard.ValueType
     GUARD_CHECKSUMS: _Guard.ValueType  # 2
     """The bench/, harness/core/ and contracts/ checksums are unchanged."""
     GUARD_HARD_CODING_SCAN: _Guard.ValueType  # 3
-    """The hard-coding scan finds no instance_id, gold fragment or full db_id in the diff."""
+    """The hard-coding scan finds no fragment of a gold answer in the diff (spec §8.5)."""
     GUARD_UNIT_TESTS: _Guard.ValueType  # 4
     """The pack's unit tests pass."""
 
@@ -142,7 +142,7 @@ GUARD_ALLOWED_PATHS: Guard.ValueType  # 1
 GUARD_CHECKSUMS: Guard.ValueType  # 2
 """The bench/, harness/core/ and contracts/ checksums are unchanged."""
 GUARD_HARD_CODING_SCAN: Guard.ValueType  # 3
-"""The hard-coding scan finds no instance_id, gold fragment or full db_id in the diff."""
+"""The hard-coding scan finds no fragment of a gold answer in the diff (spec §8.5)."""
 GUARD_UNIT_TESTS: Guard.ValueType  # 4
 """The pack's unit tests pass."""
 Global___Guard: _TypeAlias = Guard  # noqa: Y015
@@ -208,7 +208,7 @@ class _RejectionReasonEnumTypeWrapper(_enum_type_wrapper._EnumTypeWrapper[_Rejec
     REJECTION_REASON_COST_GUARDRAIL: _RejectionReason.ValueType  # 6
     """Its gain reached the threshold, but not the doubled one that the cost guardrail set."""
     REJECTION_REASON_NOT_SIGNIFICANT: _RejectionReason.ValueType  # 7
-    """Its gain was not significant: BIRD's win count or sign test, or SWE's bootstrap, failed."""
+    """Its gain was not significant: Effi-SQL's sign test or SWE's bootstrap failed."""
     REJECTION_REASON_REGRESSION: _RejectionReason.ValueType  # 8
     """It caused more regressions than allowed."""
     REJECTION_REASON_OUTRANKED: _RejectionReason.ValueType  # 9
@@ -216,7 +216,7 @@ class _RejectionReasonEnumTypeWrapper(_enum_type_wrapper._EnumTypeWrapper[_Rejec
     queue.
     """
     REJECTION_REASON_NOT_CONFIRMED: _RejectionReason.ValueType  # 10
-    """BIRD: its gain over the validation seeds plus the confirmation seed fell below the
+    """Effi-SQL: its gain over the validation seeds plus the confirmation seed fell below the
     confirmation threshold.
     """
 
@@ -238,7 +238,7 @@ REJECTION_REASON_INSUFFICIENT_GAIN: RejectionReason.ValueType  # 5
 REJECTION_REASON_COST_GUARDRAIL: RejectionReason.ValueType  # 6
 """Its gain reached the threshold, but not the doubled one that the cost guardrail set."""
 REJECTION_REASON_NOT_SIGNIFICANT: RejectionReason.ValueType  # 7
-"""Its gain was not significant: BIRD's win count or sign test, or SWE's bootstrap, failed."""
+"""Its gain was not significant: Effi-SQL's sign test or SWE's bootstrap failed."""
 REJECTION_REASON_REGRESSION: RejectionReason.ValueType  # 8
 """It caused more regressions than allowed."""
 REJECTION_REASON_OUTRANKED: RejectionReason.ValueType  # 9
@@ -246,7 +246,7 @@ REJECTION_REASON_OUTRANKED: RejectionReason.ValueType  # 9
 queue.
 """
 REJECTION_REASON_NOT_CONFIRMED: RejectionReason.ValueType  # 10
-"""BIRD: its gain over the validation seeds plus the confirmation seed fell below the
+"""Effi-SQL: its gain over the validation seeds plus the confirmation seed fell below the
 confirmation threshold.
 """
 Global___RejectionReason: _TypeAlias = RejectionReason  # noqa: Y015
@@ -371,8 +371,8 @@ class ExperimentRecord(_message.Message):
 
     @_builtins.property
     def confirmation(self) -> Global___PhaseResult:
-        """BIRD only: the confirmation's results, over the validation seeds plus the confirmation
-        seed; absent if it did not run.
+        """Effi-SQL only: the confirmation's results, over the validation seeds plus the
+        confirmation seed; absent if it did not run.
         """
 
     @_builtins.property
@@ -493,9 +493,9 @@ Global___GuardResult: _TypeAlias = GuardResult  # noqa: Y015
 @_typing.final
 class PhaseResult(_message.Message):
     """How a candidate did against the best in one phase: screen, validate or confirm (spec §8.2,
-    §8.3). Scores and deltas are fractions, not percentages: 3pp is 0.03. A task's tokens are its
-    input plus output tokens, output including reasoning. A statistic the phase did not compute
-    is absent.
+    §8.3). Scores and deltas are fractions, not percentages: 5 R-VES points is 0.05. A task's
+    tokens are its input plus output tokens, output including reasoning. A statistic the phase
+    did not compute is absent.
     """
 
     DESCRIPTOR: _descriptor.Descriptor
@@ -526,15 +526,15 @@ class PhaseResult(_message.Message):
     seed_count: _builtins.int
     """How many seeds it compared per task."""
     candidate_score: _builtins.float
-    """The candidate's score: BIRD mean success rate; SWE harmonic-mean SR."""
+    """The candidate's score: Effi-SQL's mean credit (R-VES / 100); SWE's harmonic-mean SR."""
     best_score: _builtins.float
     """The best's score on the same tasks and seeds."""
     delta: _builtins.float
     """candidate_score - best_score."""
     effective_min_delta: _builtins.float
-    """The smallest delta the phase accepted. For the validation: BIRD's min_gain, or SWE's
+    """The smallest delta the phase accepted. For the validation: Effi-SQL's min_delta, or SWE's
     min_relative_gain times best_score, doubled if the cost guardrail tripped. For the
-    confirmation: min_confirmed_gain. Absent for the screen, which needs only a delta above 0.
+    confirmation: confirm_min_delta. Absent for the screen, which needs only a delta above 0.
     """
     wins: _builtins.int
     """How many tasks the candidate beat the best on, by each task's score averaged over seeds."""
@@ -644,13 +644,10 @@ class DecisionThresholds(_message.Message):
 
     DESCRIPTOR: _descriptor.Descriptor
 
-    MAX_REGRESSIONS_FIELD_NUMBER: _builtins.int
     COST_GUARDRAIL_RATIO_FIELD_NUMBER: _builtins.int
     EFFICIENCY_CAP_RATIO_FIELD_NUMBER: _builtins.int
-    BIRD_FIELD_NUMBER: _builtins.int
+    EFFISQL_FIELD_NUMBER: _builtins.int
     SWE_FIELD_NUMBER: _builtins.int
-    max_regressions: _builtins.int
-    """The most regressions a candidate may cause."""
     cost_guardrail_ratio: _builtins.float
     """The cost guardrail: above this multiple of the best's mean tokens or wall time per task, the
     gain threshold doubles.
@@ -660,8 +657,8 @@ class DecisionThresholds(_message.Message):
     is rejected whatever its gain.
     """
     @_builtins.property
-    def bird(self) -> Global___BirdThresholds:
-        """The BIRD-CRITIC lane's."""
+    def effisql(self) -> Global___EffiSqlThresholds:
+        """The Effi-SQL lane's."""
 
     @_builtins.property
     def swe(self) -> Global___SweThresholds:
@@ -670,75 +667,88 @@ class DecisionThresholds(_message.Message):
     def __init__(
         self,
         *,
-        max_regressions: _builtins.int = ...,
         cost_guardrail_ratio: _builtins.float = ...,
         efficiency_cap_ratio: _builtins.float = ...,
-        bird: Global___BirdThresholds | None = ...,
+        effisql: Global___EffiSqlThresholds | None = ...,
         swe: Global___SweThresholds | None = ...,
     ) -> None: ...
-    _HasFieldArgType: _TypeAlias = _typing.Literal["benchmark", b"benchmark", "bird", b"bird", "swe", b"swe"]  # noqa: Y015
+    _HasFieldArgType: _TypeAlias = _typing.Literal["benchmark", b"benchmark", "effisql", b"effisql", "swe", b"swe"]  # noqa: Y015
     def HasField(self, field_name: _HasFieldArgType) -> _builtins.bool: ...
-    _ClearFieldArgType: _TypeAlias = _typing.Literal["benchmark", b"benchmark", "bird", b"bird", "cost_guardrail_ratio", b"cost_guardrail_ratio", "efficiency_cap_ratio", b"efficiency_cap_ratio", "max_regressions", b"max_regressions", "swe", b"swe"]  # noqa: Y015
+    _ClearFieldArgType: _TypeAlias = _typing.Literal["benchmark", b"benchmark", "cost_guardrail_ratio", b"cost_guardrail_ratio", "efficiency_cap_ratio", b"efficiency_cap_ratio", "effisql", b"effisql", "swe", b"swe"]  # noqa: Y015
     def ClearField(self, field_name: _ClearFieldArgType) -> None: ...
-    _WhichOneofReturnType_benchmark: _TypeAlias = _typing.Literal["bird", "swe"]  # noqa: Y015
+    _WhichOneofReturnType_benchmark: _TypeAlias = _typing.Literal["effisql", "swe"]  # noqa: Y015
     _WhichOneofArgType_benchmark: _TypeAlias = _typing.Literal["benchmark", b"benchmark"]  # noqa: Y015
     def WhichOneof(self, oneof_group: _WhichOneofArgType_benchmark) -> _WhichOneofReturnType_benchmark | None: ...
 
 Global___DecisionThresholds: _TypeAlias = DecisionThresholds  # noqa: Y015
 
 @_typing.final
-class BirdThresholds(_message.Message):
-    """The BIRD-CRITIC lane's gain and significance thresholds."""
+class EffiSqlThresholds(_message.Message):
+    """The Effi-SQL lane's thresholds (spec §8.3). The defaults named here are config's."""
 
     DESCRIPTOR: _descriptor.Descriptor
 
-    MIN_GAIN_FIELD_NUMBER: _builtins.int
-    MAX_SIGN_TEST_P_FIELD_NUMBER: _builtins.int
-    MIN_CONFIRMED_GAIN_FIELD_NUMBER: _builtins.int
-    min_gain: _builtins.float
-    """The smallest gain in mean success rate accepted."""
-    max_sign_test_p: _builtins.float
-    """The largest sign-test p-value accepted."""
-    min_confirmed_gain: _builtins.float
-    """The smallest gain over the validation seeds plus the confirmation seed that the
-    confirmation accepts.
+    MIN_DELTA_FIELD_NUMBER: _builtins.int
+    SIGN_TEST_MAX_P_FIELD_NUMBER: _builtins.int
+    MAX_REGRESSIONS_FIELD_NUMBER: _builtins.int
+    CONFIRM_MIN_DELTA_FIELD_NUMBER: _builtins.int
+    min_delta: _builtins.float
+    """The smallest gain in R-VES accepted, as a fraction: by default 0.05, i.e. 5 points."""
+    sign_test_max_p: _builtins.float
+    """The largest p-value accepted from the one-sided sign test on per-task credit: by default
+    0.1.
+    """
+    max_regressions: _builtins.int
+    """The most regressions accepted, by default 1. A task regresses if its credit is at least
+    0.75 under the best and at most 0.25 under the candidate.
+    """
+    confirm_min_delta: _builtins.float
+    """The smallest gain in R-VES over both seeds, the validation seed plus the confirmation
+    seed, that the confirmation accepts: by default 0.03.
     """
     def __init__(
         self,
         *,
-        min_gain: _builtins.float = ...,
-        max_sign_test_p: _builtins.float = ...,
-        min_confirmed_gain: _builtins.float = ...,
+        min_delta: _builtins.float = ...,
+        sign_test_max_p: _builtins.float = ...,
+        max_regressions: _builtins.int = ...,
+        confirm_min_delta: _builtins.float = ...,
     ) -> None: ...
     _HasFieldArgType: _TypeAlias = _Never  # noqa: Y015
     def HasField(self, field_name: _HasFieldArgType) -> _builtins.bool: ...
-    _ClearFieldArgType: _TypeAlias = _typing.Literal["max_sign_test_p", b"max_sign_test_p", "min_confirmed_gain", b"min_confirmed_gain", "min_gain", b"min_gain"]  # noqa: Y015
+    _ClearFieldArgType: _TypeAlias = _typing.Literal["confirm_min_delta", b"confirm_min_delta", "max_regressions", b"max_regressions", "min_delta", b"min_delta", "sign_test_max_p", b"sign_test_max_p"]  # noqa: Y015
     def ClearField(self, field_name: _ClearFieldArgType) -> None: ...
     def WhichOneof(self, oneof_group: _Never) -> None: ...
 
-Global___BirdThresholds: _TypeAlias = BirdThresholds  # noqa: Y015
+Global___EffiSqlThresholds: _TypeAlias = EffiSqlThresholds  # noqa: Y015
 
 @_typing.final
 class SweThresholds(_message.Message):
-    """The SWE-fficiency lane's gain and significance thresholds."""
+    """The SWE-fficiency lane's thresholds (spec §8.3). The lane is on hold (2026-10-15)."""
 
     DESCRIPTOR: _descriptor.Descriptor
 
     MIN_RELATIVE_GAIN_FIELD_NUMBER: _builtins.int
     MIN_GAIN_PROBABILITY_FIELD_NUMBER: _builtins.int
+    MAX_REGRESSIONS_FIELD_NUMBER: _builtins.int
     min_relative_gain: _builtins.float
     """The smallest gain in harmonic-mean SR accepted, relative to the best's: 0.1 is 10%."""
     min_gain_probability: _builtins.float
     """The smallest bootstrap P(Δ>0) accepted."""
+    max_regressions: _builtins.int
+    """The most regressions accepted. A task regresses if it has a real speedup under the best,
+    SR above 1/gold speedup, and drops to SR at most 1/gold speedup under the candidate.
+    """
     def __init__(
         self,
         *,
         min_relative_gain: _builtins.float = ...,
         min_gain_probability: _builtins.float = ...,
+        max_regressions: _builtins.int = ...,
     ) -> None: ...
     _HasFieldArgType: _TypeAlias = _Never  # noqa: Y015
     def HasField(self, field_name: _HasFieldArgType) -> _builtins.bool: ...
-    _ClearFieldArgType: _TypeAlias = _typing.Literal["min_gain_probability", b"min_gain_probability", "min_relative_gain", b"min_relative_gain"]  # noqa: Y015
+    _ClearFieldArgType: _TypeAlias = _typing.Literal["max_regressions", b"max_regressions", "min_gain_probability", b"min_gain_probability", "min_relative_gain", b"min_relative_gain"]  # noqa: Y015
     def ClearField(self, field_name: _ClearFieldArgType) -> None: ...
     def WhichOneof(self, oneof_group: _Never) -> None: ...
 

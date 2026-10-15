@@ -47,7 +47,7 @@ class RunManifest(_message.Message):
     run_id: _builtins.str
     """A unique ID for the run."""
     benchmark: _builtins.str
-    """The benchmark, by its adapter's name, the same as the CLI's --bench: "birdcritic" or
+    """The benchmark, by its adapter's name, the same as the CLI's --bench: "effisql" or
     "swefficiency".
     """
     split: _task_pb2.Split.ValueType
@@ -70,8 +70,8 @@ class RunManifest(_message.Message):
     dataset_revision: _builtins.str
     """The revision of the dataset the tasks came from: the commit hash of its Hugging Face repo."""
     gold_sha256: _builtins.str
-    """The SHA-256 of the gold-answer files the grader used, in hex, such as BIRD's emailed ground
-    truth (spec §4.1); empty if the run had none.
+    """The SHA-256 of the gold-answer files the grader used that are not part of the dataset, in
+    hex; empty if there were none, as when the gold answers ship with the dataset.
     """
     uv_lock_sha256: _builtins.str
     """The SHA-256 of uv.lock, in hex. The lock file pins every dependency's version (spec §10)."""

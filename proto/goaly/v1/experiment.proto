@@ -9,14 +9,14 @@ import "goaly/v1/task.proto";
 import "google/protobuf/timestamp.proto";
 
 // An RSI lane (spec §8.1): one benchmark's improvement loop, which edits only that benchmark's
-// pack. LANE_BIRD is the benchmark whose adapter is named "birdcritic", and LANE_SWE the one
-// named "swefficiency".
+// pack. LANE_EFFISQL is the benchmark whose adapter is named "effisql", and LANE_SWE the one
+// named "swefficiency". The SWE lane is on hold (2026-10-15).
 enum Lane {
   // Not set.
   LANE_UNSPECIFIED = 0;
-  // The BIRD-CRITIC lane.
-  LANE_BIRD = 1;
-  // The SWE-fficiency lane.
+  // The Effi-SQL lane.
+  LANE_EFFISQL = 1;
+  // The SWE-fficiency lane, on hold since 2026-10-15.
   LANE_SWE = 2;
 }
 
@@ -95,8 +95,8 @@ message ExperimentRecord {
   PhaseResult screening = 9;
   // The validation's results; absent if it did not run.
   PhaseResult validation = 10;
-  // BIRD only: the confirmation's results, over the validation seeds plus the confirmation
-  // seed; absent if it did not run.
+  // Effi-SQL only: the confirmation's results, over the validation seeds plus the
+  // confirmation seed; absent if it did not run.
   PhaseResult confirmation = 11;
   // What became of the candidate.
   Decision decision = 12;
@@ -145,16 +145,16 @@ enum Guard {
   GUARD_ALLOWED_PATHS = 1;
   // The bench/, harness/core/ and contracts/ checksums are unchanged.
   GUARD_CHECKSUMS = 2;
-  // The hard-coding scan finds no instance_id, gold fragment or full db_id in the diff.
+  // The hard-coding scan finds no fragment of a gold answer in the diff (spec §8.5).
   GUARD_HARD_CODING_SCAN = 3;
   // The pack's unit tests pass.
   GUARD_UNIT_TESTS = 4;
 }
 
 // How a candidate did against the best in one phase: screen, validate or confirm (spec §8.2,
-// §8.3). Scores and deltas are fractions, not percentages: 3pp is 0.03. A task's tokens are its
-// input plus output tokens, output including reasoning. A statistic the phase did not compute
-// is absent.
+// §8.3). Scores and deltas are fractions, not percentages: 5 R-VES points is 0.05. A task's
+// tokens are its input plus output tokens, output including reasoning. A statistic the phase
+// did not compute is absent.
 message PhaseResult {
   // The split the phase ran on.
   Split split = 1;
@@ -162,15 +162,15 @@ message PhaseResult {
   int32 task_count = 2;
   // How many seeds it compared per task.
   int32 seed_count = 3;
-  // The candidate's score: BIRD mean success rate; SWE harmonic-mean SR.
+  // The candidate's score: Effi-SQL's mean credit (R-VES / 100); SWE's harmonic-mean SR.
   double candidate_score = 4;
   // The best's score on the same tasks and seeds.
   double best_score = 5;
   // candidate_score - best_score.
   double delta = 6;
-  // The smallest delta the phase accepted. For the validation: BIRD's min_gain, or SWE's
+  // The smallest delta the phase accepted. For the validation: Effi-SQL's min_delta, or SWE's
   // min_relative_gain times best_score, doubled if the cost guardrail tripped. For the
-  // confirmation: min_confirmed_gain. Absent for the screen, which needs only a delta above 0.
+  // confirmation: confirm_min_delta. Absent for the screen, which needs only a delta above 0.
   optional double effective_min_delta = 7;
   // How many tasks the candidate beat the best on, by each task's score averaged over seeds.
   optional int32 wins = 8;
@@ -230,14 +230,14 @@ enum RejectionReason {
   REJECTION_REASON_INSUFFICIENT_GAIN = 5;
   // Its gain reached the threshold, but not the doubled one that the cost guardrail set.
   REJECTION_REASON_COST_GUARDRAIL = 6;
-  // Its gain was not significant: BIRD's win count or sign test, or SWE's bootstrap, failed.
+  // Its gain was not significant: Effi-SQL's sign test or SWE's bootstrap failed.
   REJECTION_REASON_NOT_SIGNIFICANT = 7;
   // It caused more regressions than allowed.
   REJECTION_REASON_REGRESSION = 8;
   // It passed, but another candidate in the round gained more; its hypothesis goes back in the
   // queue.
   REJECTION_REASON_OUTRANKED = 9;
-  // BIRD: its gain over the validation seeds plus the confirmation seed fell below the
+  // Effi-SQL: its gain over the validation seeds plus the confirmation seed fell below the
   // confirmation threshold.
   REJECTION_REASON_NOT_CONFIRMED = 10;
 }
@@ -245,41 +245,46 @@ enum RejectionReason {
 // The decision thresholds, as config set them (spec §8.3: every decision records the thresholds
 // it used). Gains are fractions, and a task's tokens are counted, as in PhaseResult.
 message DecisionThresholds {
-  // The most regressions a candidate may cause.
-  int32 max_regressions = 1;
   // The cost guardrail: above this multiple of the best's mean tokens or wall time per task, the
   // gain threshold doubles.
-  double cost_guardrail_ratio = 2;
+  double cost_guardrail_ratio = 1;
   // The efficiency cap: above this multiple of v0's mean cost or wall time per task, a candidate
   // is rejected whatever its gain.
-  double efficiency_cap_ratio = 3;
+  double efficiency_cap_ratio = 2;
 
-  // The lane's own gain and significance thresholds.
+  // The lane's own gain, significance and regression thresholds.
   oneof benchmark {
-    // The BIRD-CRITIC lane's.
-    BirdThresholds bird = 4;
+    // The Effi-SQL lane's.
+    EffiSqlThresholds effisql = 3;
     // The SWE-fficiency lane's.
-    SweThresholds swe = 5;
+    SweThresholds swe = 4;
   }
 }
 
-// The BIRD-CRITIC lane's gain and significance thresholds.
-message BirdThresholds {
-  // The smallest gain in mean success rate accepted.
-  double min_gain = 1;
-  // The largest sign-test p-value accepted.
-  double max_sign_test_p = 2;
-  // The smallest gain over the validation seeds plus the confirmation seed that the
-  // confirmation accepts.
-  double min_confirmed_gain = 3;
+// The Effi-SQL lane's thresholds (spec §8.3). The defaults named here are config's.
+message EffiSqlThresholds {
+  // The smallest gain in R-VES accepted, as a fraction: by default 0.05, i.e. 5 points.
+  double min_delta = 1;
+  // The largest p-value accepted from the one-sided sign test on per-task credit: by default
+  // 0.1.
+  double sign_test_max_p = 2;
+  // The most regressions accepted, by default 1. A task regresses if its credit is at least
+  // 0.75 under the best and at most 0.25 under the candidate.
+  int32 max_regressions = 3;
+  // The smallest gain in R-VES over both seeds, the validation seed plus the confirmation
+  // seed, that the confirmation accepts: by default 0.03.
+  double confirm_min_delta = 4;
 }
 
-// The SWE-fficiency lane's gain and significance thresholds.
+// The SWE-fficiency lane's thresholds (spec §8.3). The lane is on hold (2026-10-15).
 message SweThresholds {
   // The smallest gain in harmonic-mean SR accepted, relative to the best's: 0.1 is 10%.
   double min_relative_gain = 1;
   // The smallest bootstrap P(Δ>0) accepted.
   double min_gain_probability = 2;
+  // The most regressions accepted. A task regresses if it has a real speedup under the best,
+  // SR above 1/gold speedup, and drops to SR at most 1/gold speedup under the candidate.
+  int32 max_regressions = 3;
 }
 
 // The tokens and cost of the calls made for one purpose (spec §9).
