@@ -1,13 +1,16 @@
 """Tests for goaly.rsi.notify: the queued notifier, its ledger events and the ntfy channel."""
 
+import itertools
 import json
 import threading
 import time
 from collections.abc import Iterator
+from datetime import UTC, datetime, timedelta
 from pathlib import Path
 
 import httpx
 import pytest
+from google.protobuf.timestamp_pb2 import Timestamp
 from pydantic import SecretStr
 
 from goaly.contracts.gen.experiment_pb2 import (
@@ -15,6 +18,7 @@ from goaly.contracts.gen.experiment_pb2 import (
     LANE_EVENT_KIND_NOTIFIED,
     LANE_EVENT_KIND_NOTIFY_FAILED,
     LANE_UNSPECIFIED,
+    LaneEvent,
 )
 from goaly.harness.core.settings import Settings
 from goaly.rsi.ledger import Ledger
@@ -27,6 +31,7 @@ from goaly.rsi.notify import (
     QueuedNotifier,
     notifier_from_settings,
     redact,
+    sanitize,
 )
 
 TOPIC = "goaly-test-topic-0123456789"
@@ -150,20 +155,153 @@ def test_close_gives_a_waiting_retry_one_last_attempt(
     assert [event.kind for event in ledger.lane_events()][-1] == LANE_EVENT_KIND_NOTIFIED
 
 
-def test_close_records_a_last_failure_without_a_retry(
+def test_close_retries_until_its_budget_runs_out(
     ledger: Ledger, notifiers: list[QueuedNotifier]
 ) -> None:
-    channel = FakeChannel(failures=5)
-    notifier = QueuedNotifier(channel, ledger, retry_delays_s=(3600.0,))
+    channel = FakeChannel(failures=1000)
+    notifier = QueuedNotifier(
+        channel, ledger, retry_delays_s=(3600.0,), close_retry_delays_s=(0.05,)
+    )
     notifiers.append(notifier)
     notifier.notify(LANE_EFFISQL, NotificationKind.STOPPED, "stopped")
     wait_for(lambda: len(channel.attempts) == 1)
-    notifier.close()
+    started = time.monotonic()
+    notifier.close(timeout_s=0.3)
+    assert time.monotonic() - started < 2
+    details = [event.detail for event in ledger.lane_events()]
+    assert details[0] == "attempt 1: the fake channel is down; retry in 3600 s"
+    assert len(details) >= 3
+    assert all(detail.endswith("retry in 0.05 s") for detail in details[1:-1])
+    assert details[-1].endswith("; no retry: the process is exiting")
+    assert notifier.pending() == 0
+
+
+def test_a_notification_queued_just_before_close_survives_one_failure(
+    ledger: Ledger, notifiers: list[QueuedNotifier]
+) -> None:
+    for _ in range(20):  # Whether or not the worker took it before close() began.
+        channel = FakeChannel(failures=1)
+        notifier = QueuedNotifier(
+            channel, ledger, retry_delays_s=(3600.0,), close_retry_delays_s=(0.01,)
+        )
+        notifiers.append(notifier)
+        notifier.notify(LANE_EFFISQL, NotificationKind.STOPPED, "stopped")
+        notifier.close(timeout_s=5)
+        assert len(channel.delivered) == 1
+    kinds = [event.kind for event in ledger.lane_events()]
+    assert kinds == [LANE_EVENT_KIND_NOTIFY_FAILED, LANE_EVENT_KIND_NOTIFIED] * 20
+
+
+def test_the_retry_schedule_follows_the_delays_and_repeats_the_last(
+    ledger: Ledger, notifiers: list[QueuedNotifier]
+) -> None:
+    clock = itertools.count(0.0, 10.0)  # Ten seconds pass at every look: retries are due.
+    channel = FakeChannel(failures=4)
+    notifier = QueuedNotifier(
+        channel, ledger, retry_delays_s=(1.0, 2.0, 3.0), monotonic=lambda: next(clock)
+    )
+    notifiers.append(notifier)
+    notifier.notify(LANE_EFFISQL, NotificationKind.STOPPED, "stopped")
+    wait_for(lambda: len(channel.delivered) == 1)
     details = [event.detail for event in ledger.lane_events()]
     assert details == [
-        "attempt 1: the fake channel is down; retry in 3600 s",
-        "attempt 2: the fake channel is down; no retry: the process is exiting",
+        "attempt 1: the fake channel is down; retry in 1 s",
+        "attempt 2: the fake channel is down; retry in 2 s",
+        "attempt 3: the fake channel is down; retry in 3 s",
+        "attempt 4: the fake channel is down; retry in 3 s",
+        "",
     ]
+
+
+def test_resume_requeues_what_an_earlier_process_failed_to_deliver(
+    ledger: Ledger, notifiers: list[QueuedNotifier]
+) -> None:
+    first = make(FakeChannel(failures=1000), ledger, notifiers)
+    first.notify(LANE_EFFISQL, NotificationKind.RESULTS_PR, "Results PR #3 is open.")
+    first.notify(LANE_EFFISQL, NotificationKind.RECOVERY_FAILED, "given up")
+    wait_for(lambda: len(ledger.lane_events()) >= 4)
+    first._closing = True  # The process dies: nothing more is attempted.
+    channel = FakeChannel()
+    second = make(channel, ledger, notifiers)
+    kinds = {NotificationKind.RESULTS_PR, NotificationKind.STOPPED}
+    assert second.resume(LANE_EFFISQL, kinds) == 1
+    second.close()
+    (sent,) = channel.delivered
+    assert sent.kind is NotificationKind.RESULTS_PR
+    assert sent.text == "Results PR #3 is open."
+    failed = [e for e in ledger.lane_events() if e.notification_id == sent.notification_id]
+    assert failed[-1].kind == LANE_EVENT_KIND_NOTIFIED
+    third = make(FakeChannel(), ledger, notifiers)
+    assert third.resume(LANE_EFFISQL, kinds) == 0  # Delivered now.
+
+
+def test_resume_skips_old_off_and_foreign_notifications(
+    ledger: Ledger, notifiers: list[QueuedNotifier]
+) -> None:
+    def failed(notification_id: str, detail: str, age: timedelta) -> LaneEvent:
+        moment = Timestamp()
+        moment.FromDatetime(datetime.now(UTC) - age)
+        return LaneEvent(
+            lane=LANE_EFFISQL,
+            kind=LANE_EVENT_KIND_NOTIFY_FAILED,
+            occurred_at=moment,
+            notification_id=notification_id,
+            notification="lane stopped: x",
+            detail=detail,
+        )
+
+    for event in (
+        failed("stopped-old", "attempt 1: down", timedelta(hours=13)),
+        failed("stopped-off", "GOALY_NTFY_TOPIC is not set", timedelta(0)),
+        failed("unknown-kind", "attempt 1: down", timedelta(0)),
+        failed("stopped-new", "attempt 1: down", timedelta(0)),
+    ):
+        ledger.record_lane_event(event)
+    channel = FakeChannel()
+    notifier = make(channel, ledger, notifiers)
+    assert notifier.resume(LANE_EFFISQL, {NotificationKind.STOPPED}) == 1
+    notifier.close()
+    assert [n.notification_id for n in channel.delivered] == ["stopped-new"]
+    assert channel.delivered[0].text == "x"
+
+
+def test_a_bug_in_an_attempt_never_kills_the_worker(
+    ledger: Ledger, notifiers: list[QueuedNotifier], caplog: pytest.LogCaptureFixture
+) -> None:
+    calls = [0]
+
+    def now() -> datetime:
+        calls[0] += 1
+        if calls[0] == 1:
+            raise RuntimeError("clock bug")
+        return datetime.now(UTC)
+
+    channel = FakeChannel()
+    notifier = make(channel, ledger, notifiers, now=now)
+    notifier.notify(LANE_EFFISQL, NotificationKind.STOPPED, "one")
+    notifier.notify(LANE_EFFISQL, NotificationKind.STOPPED, "two")
+    notifier.close()
+    assert len(channel.delivered) == 2
+    assert len(ledger.lane_events()) == 1
+    assert "a notification attempt failed unexpectedly" in caplog.text
+
+
+def test_close_closes_the_channel(ledger: Ledger) -> None:
+    class Closing(FakeChannel):
+        closed = False
+
+        def close(self) -> None:
+            Closing.closed = True
+
+    QueuedNotifier(Closing(), ledger).close()
+    assert Closing.closed
+
+
+def test_sanitize_keeps_plain_words_only() -> None:
+    text = "Effi-SQL: PR #4 https://github.com/o/r/pull/4?x=1 `SELECT * FROM t` <b>\n'q'"
+    assert sanitize(text, ["o/r"]) == (
+        "Effi-SQL: PR #4 https://github.com/[redacted]/pull/4?x=1 SELECT FROM t b q"
+    )
 
 
 def test_a_channel_bug_is_recorded_and_the_worker_goes_on(
@@ -207,6 +345,7 @@ def test_secrets_are_redacted_from_text_events_and_channel(
     notifier.notify(LANE_EFFISQL, NotificationKind.STOPPED, f"key sk-secret on {TOPIC}\x07!")
     notifier.close()
     assert channel.delivered[0].text == "key [redacted] on [redacted] !"
+    assert "\x07" not in channel.delivered[0].text
     raw = (ledger.directory / "lane_events.jsonl").read_text(encoding="utf-8")
     assert "sk-secret" not in raw
     assert TOPIC not in raw
@@ -260,7 +399,7 @@ def test_retry_delays_must_be_sane(ledger: Ledger) -> None:
     with pytest.raises(ValueError, match="at least one delay"):
         QueuedNotifier(FakeChannel(), ledger, retry_delays_s=())
     with pytest.raises(ValueError, match="none negative"):
-        QueuedNotifier(FakeChannel(), ledger, retry_delays_s=(-1.0,))
+        QueuedNotifier(FakeChannel(), ledger, close_retry_delays_s=(-1.0,))
 
 
 # The ntfy channel, against httpx.MockTransport.
@@ -326,6 +465,6 @@ def test_notifier_from_settings_redacts_every_secret(ledger: Ledger) -> None:
     )
     notifier = notifier_from_settings(settings, ledger)
     assert isinstance(notifier._channel, NtfyChannel)
-    assert set(notifier._secret_values) == {"sk-key", TOPIC, "ghu_token"}
+    assert set(notifier._secrets()) == {"sk-key", TOPIC, "ghu_token"}
     off = notifier_from_settings(Settings(api_key=SecretStr("sk-key")), ledger)
     assert off._channel is None

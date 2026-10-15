@@ -55,3 +55,17 @@ async def test_a_failed_beat_is_logged_and_tried_again(
         await asyncio.sleep(0.05)
         assert path.is_file()
     assert "could not write the heartbeat" in caplog.text
+
+
+async def test_a_cancellation_at_the_block_exit_is_not_swallowed(tmp_path: Path) -> None:
+    after: list[str] = []
+
+    async def lane() -> None:
+        async with heartbeat(tmp_path / "beat", interval_s=10):
+            asyncio.current_task().cancel()  # type: ignore[union-attr]  # Inside a task.
+        after.append("ran past the block")  # pragma: no cover  (must not run)
+
+    task = asyncio.create_task(lane())
+    with pytest.raises(asyncio.CancelledError):
+        await task
+    assert after == []
