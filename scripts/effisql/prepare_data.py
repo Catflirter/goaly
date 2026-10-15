@@ -46,7 +46,7 @@ def main(argv: Sequence[str] | None = None) -> int:
         dataset = fetch_dataset(cache_dir, url=args.url)
         runtime = cache_dir / RUNTIME_FILE
         write_runtime_file(dataset, runtime)
-    except DatasetError as error:
+    except (DatasetError, OSError) as error:  # OSError: the cache cannot be written, say.
         sys.stderr.write(f"prepare_data: {error}\n")
         return 1
     sys.stdout.write(f"prepare_data: {dataset} is verified; wrote {runtime}\n")

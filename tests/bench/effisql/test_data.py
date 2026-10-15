@@ -138,6 +138,14 @@ def test_an_empty_plan_counts_as_no_plan(plan: JsonValue) -> None:
     assert inst.record["base_explain_analyze"] == plan  # The record keeps it as loaded.
 
 
+@pytest.mark.parametrize("blank", ["", " \t\n"], ids=["empty", "blank"])
+def test_a_blank_difficulty_or_time_counts_as_missing(blank: str) -> None:
+    inst = EffiSqlInstance.model_validate(task(difficulty=blank, base_time=blank, fast_time=blank))
+
+    assert (inst.difficulty, inst.base_time, inst.fast_time) == (None, None, None)
+    assert inst.record["difficulty"] == blank  # The record keeps it as loaded.
+
+
 def test_an_empty_gold_answer_is_kept_as_it_is() -> None:
     # Gold answers are never checked here: an organizers' file may blank them.
     assert EffiSqlInstance.model_validate(task(optimized_sql="")).optimized_sql == ""
@@ -217,6 +225,30 @@ def test_an_instance_survives_pickling_and_deep_copying() -> None:
         assert twin.record == inst.record
 
 
+def test_an_instance_hashes_by_its_instance_id() -> None:
+    inst = EffiSqlInstance.model_validate(task())  # Its plans are dicts, which do not hash.
+    twin = EffiSqlInstance.model_validate(task())
+    other = EffiSqlInstance.model_validate(task(base_time=1.0))
+
+    assert hash(inst) == hash(twin) == hash(other) == hash("7")
+    assert {inst, twin} == {inst}
+    assert other != inst
+
+
+def test_a_validation_error_never_shows_the_input() -> None:
+    # A gold answer must not reach a log through pydantic's own error text either.
+    gold = "SELECT 'gold that must stay hidden'"
+
+    with pytest.raises(ValidationError) as caught:
+        EffiSqlInstance.model_validate(task(fast_time=gold, optimized_explain_analyze=gold))
+
+    assert [error["loc"][0] for error in caught.value.errors()] == [
+        "fast_time",
+        "optimized_explain_analyze",
+    ]
+    assert gold not in str(caught.value)
+
+
 def test_validating_an_instance_again_keeps_its_record() -> None:
     inst = EffiSqlInstance.model_validate(task(note=[1, 2]))
 
@@ -256,7 +288,7 @@ def test_rejects_a_task_without_a_required_field(name: str) -> None:
         ("base_explain_analyze", [BASE_PLAN]),
         ("base_explain_analyze", '{"Node Type": "Aggregate"}'),
         ("difficulty", "Easy"),
-        ("difficulty", ""),
+        ("difficulty", 1),
         ("optimized_sql", 5),
         ("fast_time", -1),
         ("fast_time", math.nan),
@@ -374,7 +406,10 @@ def test_reports_the_file_and_line_of_an_invalid_task(tmp_path: Path) -> None:
 @pytest.mark.parametrize(
     ("line", "reason"),
     [
-        (b'{"id": 1,', "not valid JSON: Expecting property name enclosed in double quotes"),
+        (
+            b'{"id": 1,',
+            "not valid JSON: Expecting property name enclosed in double quotes at column 10",
+        ),
         (b'{"id": 1, "base_time": NaN}', "not valid JSON: NaN is not a JSON value"),
         (b'{"id": 1, "base_time": -Infinity}', "not valid JSON: -Infinity is not a JSON value"),
         (b'[{"id": 1}]', "not a JSON object"),
@@ -389,7 +424,7 @@ def test_reports_a_line_that_is_not_a_task(tmp_path: Path, line: bytes, reason: 
     with pytest.raises(TaskFileError) as caught:
         load_instances(path)
 
-    assert str(caught.value).startswith(f"{path}:2: {reason}")
+    assert str(caught.value) == f"{path}:2: {reason}"
 
 
 def test_rejects_an_id_that_repeats(tmp_path: Path) -> None:
@@ -511,7 +546,14 @@ def test_fetch_reports_a_download_that_fails(tmp_path: Path) -> None:
 @pytest.mark.parametrize(
     "url", ["http://huggingface.co/datasets/x.jsonl", "ftp://example.com/x.jsonl", "/data/x.jsonl"]
 )
-def test_fetch_refuses_a_url_that_is_not_https_or_file(tmp_path: Path, url: str) -> None:
+def test_fetch_refuses_a_url_that_is_not_https_or_file(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, url: str
+) -> None:
+    def never_opened(url: str, *, timeout: float) -> NoReturn:
+        pytest.fail(f"fetch_dataset opened {url}, which it must refuse")
+
+    monkeypatch.setattr(urllib.request, "urlopen", never_opened)
+
     with pytest.raises(DatasetError) as caught:
         fetch_dataset(tmp_path / "cache", url=url)
 
