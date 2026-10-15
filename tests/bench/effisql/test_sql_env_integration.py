@@ -18,7 +18,7 @@ from pydantic import SecretStr
 
 from goaly.bench.effisql.pg_build import connector, read_golden_record
 from goaly.bench.effisql.pg_instances import apply_roles, socket_dirs
-from goaly.bench.effisql.pg_settings import ADMIN_ROLE, AGENT_ROLE, GRADER_ROLE, AgentCredentials
+from goaly.bench.effisql.pg_settings import ADMIN_ROLE, AGENT_ROLE, AgentCredentials
 from goaly.bench.effisql.sql_env import (
     STATEMENT_TIMEOUT,
     PgSqlEnvironment,
@@ -177,6 +177,7 @@ ATTEMPTS = [
     ),
     ("SET work_mem = '64MB'", "SHOW work_mem", [["4MB"]]),
     ("SET temp_file_limit = -1", "SHOW temp_file_limit", [["5GB"]]),
+    ("SET statement_timeout = 0", "SHOW statement_timeout", [["130s"]]),  # The backstop holds.
     (
         "CREATE TEMP TABLE itest_tmp (x int)",
         "SELECT to_regclass('pg_temp.itest_tmp')::text",
@@ -250,10 +251,6 @@ async def test_preflight_names_an_agent_role_that_is_not_read_only(writable_env:
     with admin("postgres") as conn:
         conn.execute("ALTER ROLE effisql_agent RESET default_transaction_read_only")
         conn.execute("ALTER ROLE effisql_agent RESET temp_file_limit")
-    with admin("tpch") as conn:
-        conn.execute(
-            "REVOKE EXECUTE ON FUNCTION pg_terminate_backend(integer, bigint) FROM effisql_agent"
-        )
     try:
         with pytest.raises(EnvironmentFailure) as caught:
             await _pool(writable_env, instances=[instance]).preflight()
@@ -261,9 +258,8 @@ async def test_preflight_names_an_agent_role_that_is_not_read_only(writable_env:
         apply_roles(admin, writable_env.credentials, instance.kind)
 
     message = str(caught.value)
-    assert "not read-only by default" in message
+    assert "default_transaction_read_only is off, not on" in message
     assert "temp_file_limit is -1, not 5GB" in message
-    assert "cannot end its own sessions" in message
 
 
 async def test_a_failing_statement_is_a_result_and_the_session_lives_on(
@@ -317,7 +313,7 @@ async def test_a_long_query_is_stopped_from_the_client_even_with_statement_timeo
     assert _rows(await env.execute("SELECT 2", timeout_s=10)) == [[2.0]]
 
 
-async def test_a_statement_whose_cancel_goes_astray_is_ended_by_the_agent_role(
+async def test_a_statement_whose_cancel_goes_astray_is_stopped_by_closing_its_session(
     pool: SolvingPool, pg_env: PgEnv, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     async def lost(self: psycopg.AsyncConnection[Any], *, timeout: float = 30.0) -> None:
@@ -329,10 +325,13 @@ async def test_a_statement_whose_cancel_goes_astray_is_ended_by_the_agent_role(
         result = await env.execute(SLEEP, timeout_s=1)
         second = await _backend(env)
         async with _watching(pg_env, env.instance) as active:
-            running = await active("pg_sleep(30)")
+            # The client closed the socket; the server notices within its 5 s check.
+            deadline = time.monotonic() + 15
+            while (running := await active("pg_sleep(30)")) and time.monotonic() < deadline:
+                await asyncio.sleep(0.5)
 
     assert result.error == STATEMENT_TIMEOUT
-    assert second != first  # The agent role ended the old backend; a new session took over.
+    assert second != first  # A new session took over from the closed one.
     assert running == 0
 
 
@@ -457,35 +456,19 @@ async def test_a_session_ended_from_outside_is_an_error_and_the_next_call_reconn
     assert await _backend(env) != pid
 
 
-async def test_a_statement_that_ends_its_own_session_is_an_error_not_a_failure(
-    env: PgSqlEnvironment,
-) -> None:
-    pid = await _backend(env)
+async def test_no_statement_may_cancel_or_end_a_session(pool: SolvingPool) -> None:
+    async with pool.environment() as env, pool.environment() as other:
+        own = await _backend(env)
+        others = await _backend(other)
+        attempts = [
+            await env.execute(f"SELECT {function}({pid})", timeout_s=10)
+            for function in ("pg_cancel_backend", "pg_terminate_backend")
+            for pid in (own, others)
+        ]
 
-    ended = await env.execute("SELECT pg_terminate_backend(pg_backend_pid())", timeout_s=10)
-
-    assert ended.error.startswith("the session ended")
-    assert await _backend(env) != pid  # The next call opened a new session.
-
-
-async def test_one_agent_session_may_end_another_but_never_the_graders(pg_env: PgEnv) -> None:
-    instance = _solving(pg_env)[0]
-    one_instance = _pool(pg_env, instances=[instance])
-    with pg_env.connect(instance, GRADER_ROLE, "tpch", autocommit=True) as grader:
-        grader_pid = grader.info.backend_pid
-        async with one_instance.environment() as first, one_instance.environment() as second:
-            other = await _backend(second)
-            ended = await first.execute(f"SELECT pg_terminate_backend({other})", timeout_s=10)
-            refused = await first.execute(
-                f"SELECT pg_terminate_backend({grader_pid})", timeout_s=10
-            )
-            assert (await second.execute("SELECT 1", timeout_s=10)).error.startswith(
-                "the session ended"
-            )
-        assert grader.execute("SELECT 1").fetchone() == (1,)  # The grader's session lives.
-
-    assert _rows(ended) == [[True]]  # The residual risk the module docstring names.
-    assert "permission denied to terminate process" in refused.error
+        assert all("permission denied" in attempt.error for attempt in attempts)
+        assert await _backend(env) == own  # Both sessions live on.
+        assert await _backend(other) == others
 
 
 async def test_defaults_set_on_the_agent_role_never_reach_a_session(

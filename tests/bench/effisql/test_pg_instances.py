@@ -147,7 +147,12 @@ def test_roles_get_login_a_limit_a_verifier_and_exactly_their_defaults() -> None
         "effisql_agent",
         64,
         "SCRAM-SHA-256$v1",
-        ["\"default_transaction_read_only\" = 'on'", "\"temp_file_limit\" = '5GB'"],
+        [
+            "\"default_transaction_read_only\" = 'on'",
+            "\"temp_file_limit\" = '5GB'",
+            "\"statement_timeout\" = '130s'",  # The backstop behind the client-side stop,
+            "\"client_connection_check_interval\" = '5s'",  # which an abandon relies on.
+        ],
     ) + expected(
         "effisql_grader", -1, "SCRAM-SHA-256$v2", ["\"default_transaction_read_only\" = 'on'"]
     )
@@ -209,15 +214,6 @@ def test_each_database_grants_select_to_its_readers_and_revokes_the_rest(
         REVOKED_FUNCTIONS,
         REVOKE_STAT_ACTIVITY,
         'REVOKE USAGE ON LANGUAGE plpgsql FROM PUBLIC, "effisql_agent", "effisql_grader"',
-        # Only where the agent reads: it ends its own statement that ignored a cancel.
-        *(
-            [
-                "GRANT EXECUTE ON FUNCTION pg_catalog.pg_terminate_backend(integer, bigint) "
-                'TO "effisql_agent"'
-            ]
-            if (db, kind) == ("tpch", "solving")
-            else []
-        ),
     ]
 
 

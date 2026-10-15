@@ -4,7 +4,6 @@ import math
 from collections.abc import AsyncIterator, Mapping, Sequence
 from contextlib import asynccontextmanager
 from dataclasses import dataclass, field
-from datetime import UTC, datetime
 from pathlib import Path
 from types import SimpleNamespace
 from typing import Any
@@ -16,6 +15,7 @@ from psycopg.pq import ExecStatus
 from psycopg.waiting import Ready, Wait
 from pydantic import SecretStr
 
+from goaly.bench.effisql import sql_env
 from goaly.bench.effisql.pg_instances import SOLVING
 from goaly.bench.effisql.pg_settings import AgentCredentials, PgCredentials, PgEnvConfig
 from goaly.bench.effisql.sql_env import (
@@ -264,10 +264,14 @@ def test_statement_text_postgresql_cannot_take_is_named(sql: str, problem: str |
         assert problem in found
 
 
-GOOD_DEFAULTS: list[tuple[Any, ...]] = [
-    (None, ["temp_file_limit=5GB", "default_transaction_read_only=on"])
+ROLE_WIDE = [
+    "client_connection_check_interval=5s",
+    "default_transaction_read_only=on",
+    "statement_timeout=130s",
+    "temp_file_limit=5GB",
 ]
-EXPECTED_DEFAULTS = "['default_transaction_read_only=on', 'temp_file_limit=5GB']"
+GOOD_DEFAULTS: list[tuple[Any, ...]] = [(None, list(reversed(ROLE_WIDE)))]  # In any order.
+EXPECTED_DEFAULTS = str(ROLE_WIDE)
 
 
 @pytest.mark.parametrize(
@@ -277,8 +281,8 @@ EXPECTED_DEFAULTS = "['default_transaction_read_only=on', 'temp_file_limit=5GB']
         # The role's own RESET ALL removed the row: its sessions would start read-write.
         ([], [f"role-wide defaults [], not {EXPECTED_DEFAULTS}"]),
         (
-            [(None, ["default_transaction_read_only=on"])],
-            [f"role-wide defaults ['default_transaction_read_only=on'], not {EXPECTED_DEFAULTS}"],
+            [(None, ROLE_WIDE[:3])],  # The temp-file cap is gone.
+            [f"role-wide defaults {ROLE_WIDE[:3]}, not {EXPECTED_DEFAULTS}"],
         ),
         (
             [*GOOD_DEFAULTS, ("template1", ["work_mem=1GB"])],
@@ -355,8 +359,6 @@ def test_a_copy_from_the_client_is_refused_with_a_failure() -> None:
 
 # The orchestration around a statement, with a fake connection and a fake runner.
 
-STARTED = datetime(2026, 10, 15, 9, 0, tzinfo=UTC)
-
 
 class FakeCursor:
     def __init__(self, rows: Sequence[tuple[Any, ...]]) -> None:
@@ -387,8 +389,14 @@ class FakeConn:
         self.settings_gate = settings_gate
         self.cancelled = asyncio.Event()
         self.closed = False
+        self.finished = False  # The socket was closed under a running statement.
         self.executed: list[str] = []
         self.params: list[object] = []
+        self.pgconn = SimpleNamespace(finish=self._finish)
+
+    def _finish(self) -> None:
+        self.finished = True
+        self.closed = True
 
     async def cancel_safe(self, *, timeout: float) -> None:
         self.cancelled.set()
@@ -408,8 +416,6 @@ class FakeConn:
             if self.settings_gate is not None:
                 await self.settings_gate.wait()
             return FakeCursor(self.defaults)
-        if "WHERE pg_stat_get_backend_pid(id) = pg_backend_pid()" in text:
-            return FakeCursor([(STARTED,)])
         return FakeCursor([])
 
     @asynccontextmanager
@@ -426,26 +432,22 @@ class FakeConn:
 
 
 class Scenario:
-    """A fake runner, and the sessions and terminations it saw."""
+    """A fake runner, and the sessions it opened."""
 
     def __init__(self, behave: str = "ok", seconds: float = 0.0) -> None:
         self.behave = behave
         self.seconds = seconds
         self.connections: list[FakeConn] = []
-        self.terminated: list[tuple[int, datetime]] = []
         self.statements: list[str] = []
-        self.terminate_event = asyncio.Event()
+        self.stopped = 0  # Statements whose runner was cancelled under them.
         self.connect_delay = 0.0
+        self.hold_on_cancel_s = 0.0  # How long a cancelled runner still keeps its session.
 
     async def connect(self) -> Any:
         await asyncio.sleep(self.connect_delay)
         conn = FakeConn(pid=1000 + len(self.connections))
         self.connections.append(conn)
         return conn
-
-    async def terminate(self, pid: int, started: datetime) -> None:
-        self.terminated.append((pid, started))
-        self.terminate_event.set()
 
     async def run(self, conn: Any, sql: str, builder: ResultBuilder) -> None:
         self.statements.append(sql)
@@ -456,9 +458,14 @@ class Scenario:
         elif self.behave == "cancellable":
             await conn.cancelled.wait()
             builder.add(_error(b"57014", b"ERROR:  canceling statement due to user request"))
-        elif self.behave == "stubborn":
-            await self.terminate_event.wait()
-            raise psycopg.OperationalError("terminating connection due to administrator command")
+        elif self.behave == "stubborn":  # It ignores its cancel, until its runner is cancelled.
+            try:
+                await asyncio.Event().wait()
+            except asyncio.CancelledError:
+                self.stopped += 1
+                if self.hold_on_cancel_s:  # As psycopg's own cleanup may take a while.
+                    await asyncio.shield(asyncio.sleep(self.hold_on_cancel_s))
+                raise
         elif self.behave == "broken":
             raise psycopg.OperationalError("server closed the connection unexpectedly")
         elif self.behave == "shutdown":
@@ -478,14 +485,12 @@ def _environment(
     cap: asyncio.Semaphore | None = None,
     grace: float = 0.2,
     timeout_s: float = 120.0,
-    terminate: Any = None,
 ) -> PgSqlEnvironment:
     return PgSqlEnvironment(
         SOLVING[0],
         cap if cap is not None else asyncio.Semaphore(2),
         SqlEnvOptions(cancel_grace_s=grace, timeout_s=timeout_s),
         connect=scenario.connect,
-        terminate=terminate if terminate is not None else scenario.terminate,
         runner=scenario.run,
     )
 
@@ -560,26 +565,32 @@ async def test_a_timeout_cancels_the_statement_and_keeps_the_session() -> None:
     assert result.error == STATEMENT_TIMEOUT
     assert 0.1 <= result.elapsed_s < 1
     assert scenario.connections[0].cancelled.is_set()
-    assert scenario.terminated == []
+    assert scenario.stopped == 0
     scenario.behave = "ok"
     assert (await env.execute("SELECT 1", timeout_s=5)).error == ""
     assert len(scenario.connections) == 1  # The same session.
 
 
 @pytest.mark.anyio
-async def test_a_statement_that_ignores_its_cancel_has_its_backend_terminated() -> None:
+async def test_a_statement_that_ignores_its_cancel_has_its_session_closed(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
     scenario = Scenario("stubborn")
     env = _environment(scenario)
     await env.open()
 
-    result = await env.execute("SELECT stubborn()", timeout_s=0.1)
+    with caplog.at_level(logging.WARNING, logger=LOGGER):
+        result = await env.execute("SELECT stubborn()", timeout_s=0.1)
 
     assert result.error == STATEMENT_TIMEOUT
-    assert scenario.terminated == [(1000, STARTED)]  # Its PID and its backend's start.
-    assert scenario.connections[0].closed  # The old session is closed, not just dropped.
+    assert scenario.connections[0].cancelled.is_set()  # The cancel key came first;
+    assert scenario.stopped == 1  # then its runner let go of the session,
+    assert scenario.connections[0].closed  # which was closed: the server ends the backend.
+    closing = _logged(caplog, "closing the session of backend 1000 on solve-1")
+    assert closing.levelno == logging.WARNING
     scenario.behave = "ok"
     assert (await env.execute("SELECT 1", timeout_s=5)).error == ""
-    assert len(scenario.connections) == 2  # A new session after the terminated one.
+    assert len(scenario.connections) == 2  # A new session after the closed one.
 
 
 @pytest.mark.anyio
@@ -600,46 +611,25 @@ async def test_a_failed_cancel_is_logged_with_its_cause(caplog: pytest.LogCaptur
 
 
 @pytest.mark.anyio
-async def test_a_statement_that_survives_even_termination_is_abandoned(
-    caplog: pytest.LogCaptureFixture,
+async def test_a_runner_that_keeps_its_session_has_the_socket_closed_under_it(
+    caplog: pytest.LogCaptureFixture, monkeypatch: pytest.MonkeyPatch
 ) -> None:
+    monkeypatch.setattr(sql_env, "_CLOSE_WAIT_S", 0.05)
     scenario = Scenario("stubborn")
-
-    async def refuse(pid: int, started: datetime) -> None:
-        raise psycopg.OperationalError("the agent's own session failed")
-
-    env = _environment(scenario, grace=0.05, terminate=refuse)
+    scenario.hold_on_cancel_s = 0.3  # Longer than the environment waits for it.
+    env = _environment(scenario, grace=0.05)
     await env.open()
 
     with caplog.at_level(logging.WARNING, logger=LOGGER):
-        result = await env.execute("SELECT stuck()", timeout_s=0.05)
+        async with asyncio.timeout(2):
+            result = await env.execute("SELECT stuck()", timeout_s=0.05)
 
     assert result.error == STATEMENT_TIMEOUT
-    assert scenario.connections[0].closed  # Its socket is closed,
-    failed = _logged(caplog, "terminating backend 1000 on solve-1 failed")
-    assert failed.levelno == logging.WARNING
-    assert failed.exc_info is not None  # the failure is logged with its cause,
-    assert _logged(caplog, "abandoning a statement on solve-1").levelno == logging.ERROR
+    assert scenario.connections[0].finished  # Its socket was closed under the statement,
+    assert _logged(caplog, "the statement on solve-1 kept its session").levelno == logging.ERROR
     scenario.behave = "ok"
     assert (await env.execute("SELECT 1", timeout_s=5)).error == ""  # and the next call
     assert len(scenario.connections) == 2  # opens a new session.
-
-
-@pytest.mark.anyio
-async def test_a_terminate_that_hangs_is_given_up_after_the_grace_period() -> None:
-    scenario = Scenario("stubborn")
-
-    async def hang(pid: int, started: datetime) -> None:
-        await asyncio.sleep(60)
-
-    env = _environment(scenario, grace=0.05, terminate=hang)
-    await env.open()
-
-    async with asyncio.timeout(2):
-        result = await env.execute("SELECT stuck()", timeout_s=0.05)
-
-    assert result.error == STATEMENT_TIMEOUT
-    assert scenario.connections[0].closed
 
 
 @pytest.mark.anyio
@@ -667,13 +657,13 @@ async def test_a_second_cancel_still_waits_for_the_statement_to_stop() -> None:
     task = asyncio.create_task(env.execute("SELECT stubborn()", timeout_s=60))
     await asyncio.sleep(0.05)
 
-    task.cancel()  # The stop starts: a cancel, then a terminate 0.2 s later.
+    task.cancel()  # The stop starts: a cancel, then the session closed 0.2 s later.
     await asyncio.sleep(0.1)
     task.cancel()  # A second cancel while it runs.
     with pytest.raises(asyncio.CancelledError):
         await task
 
-    assert scenario.terminated == [(1000, STARTED)]  # The stop finished before the raise.
+    assert scenario.stopped == 1  # The stop finished before the raise.
     assert scenario.connections[0].closed
 
 
@@ -744,9 +734,7 @@ async def test_an_instance_that_refuses_the_session_is_an_environment_failure() 
     async def refuse() -> Any:
         raise psycopg.OperationalError("password authentication failed")
 
-    env = PgSqlEnvironment(
-        SOLVING[0], asyncio.Semaphore(2), SqlEnvOptions(), refuse, Scenario().terminate
-    )
+    env = PgSqlEnvironment(SOLVING[0], asyncio.Semaphore(2), SqlEnvOptions(), refuse)
 
     with pytest.raises(EnvironmentFailure, match="cannot open a session on solve-1"):
         await env.open()
@@ -760,9 +748,7 @@ async def test_a_cancel_while_the_session_opens_closes_it() -> None:
     async def connect() -> Any:
         return conn
 
-    env = PgSqlEnvironment(
-        SOLVING[0], asyncio.Semaphore(2), SqlEnvOptions(), connect, Scenario().terminate
-    )
+    env = PgSqlEnvironment(SOLVING[0], asyncio.Semaphore(2), SqlEnvOptions(), connect)
     opening = asyncio.create_task(env.open())
     await asyncio.sleep(0.05)  # Connected, and reading the role's defaults.
 
@@ -780,16 +766,14 @@ async def test_role_defaults_an_earlier_session_changed_are_restored_first(
     changed: list[tuple[Any, ...]] = [
         (None, ["default_transaction_read_only=off", "temp_file_limit=5GB"]),
         ("template1", ["work_mem=1GB"]),
-    ]
+    ]  # The session lifted read-only and both timeouts, and set work_mem for template1.
     first, second = FakeConn(defaults=changed), FakeConn()
     connections = [first, second]
 
     async def connect() -> Any:
         return connections.pop(0)
 
-    env = PgSqlEnvironment(
-        SOLVING[0], asyncio.Semaphore(2), SqlEnvOptions(), connect, Scenario().terminate
-    )
+    env = PgSqlEnvironment(SOLVING[0], asyncio.Semaphore(2), SqlEnvOptions(), connect)
     with caplog.at_level(logging.WARNING, logger=LOGGER):
         await env.open()
 
@@ -798,8 +782,10 @@ async def test_role_defaults_an_earlier_session_changed_are_restored_first(
         "BEGIN",
         "SET TRANSACTION READ WRITE",
         'ALTER ROLE CURRENT_USER IN DATABASE "template1" RESET ALL',
-        "ALTER ROLE CURRENT_USER RESET ALL",
+        "ALTER ROLE CURRENT_USER RESET ALL",  # It leaves the superuser-only temp_file_limit.
         "ALTER ROLE CURRENT_USER SET \"default_transaction_read_only\" = 'on'",
+        "ALTER ROLE CURRENT_USER SET \"statement_timeout\" = '130s'",
+        "ALTER ROLE CURRENT_USER SET \"client_connection_check_interval\" = '5s'",
         "COMMIT",
     ]
     assert connections == []  # The second, clean session is the one in use.
@@ -809,16 +795,14 @@ async def test_role_defaults_an_earlier_session_changed_are_restored_first(
 
 @pytest.mark.anyio
 async def test_defaults_the_agent_role_cannot_restore_fail_the_session() -> None:
-    lost_cap: list[tuple[Any, ...]] = [(None, ["default_transaction_read_only=on"])]
+    lost_cap: list[tuple[Any, ...]] = [(None, ROLE_WIDE[:3])]  # temp_file_limit is gone.
     first, second = FakeConn(defaults=lost_cap), FakeConn(defaults=lost_cap)
     connections = [first, second]
 
     async def connect() -> Any:
         return connections.pop(0)
 
-    env = PgSqlEnvironment(
-        SOLVING[0], asyncio.Semaphore(2), SqlEnvOptions(), connect, Scenario().terminate
-    )
+    env = PgSqlEnvironment(SOLVING[0], asyncio.Semaphore(2), SqlEnvOptions(), connect)
 
     with pytest.raises(EnvironmentFailure, match=r"cannot restore them.*pgenv\.py start"):
         await env.open()
@@ -839,6 +823,28 @@ async def test_close_stops_a_statement_still_in_flight() -> None:
     assert scenario.connections[0].cancelled.is_set()  # Its backend does not run on,
     assert scenario.connections[0].closed
     assert "canceling statement" in (await running).error  # and its caller gets a result.
+
+
+@pytest.mark.anyio
+async def test_close_stops_even_a_statement_nothing_stops_within_its_bound() -> None:
+    scenario = Scenario("stubborn")
+    env = _environment(scenario, grace=0.05)
+    await env.open()
+    running = asyncio.create_task(env.execute("SELECT stuck()", timeout_s=60))  # Left behind.
+    await asyncio.sleep(0.05)
+
+    async with asyncio.timeout(1):  # The grace periods, not the statement's 60 s.
+        await env.close()
+
+    assert scenario.connections[0].cancelled.is_set()  # The cancel key came first,
+    assert scenario.connections[0].closed  # and the socket closed at the end.
+    assert (await running).error.startswith("the session ended")
+
+
+def test_the_trusted_timeout_stays_below_the_servers_backstop() -> None:
+    assert SqlEnvOptions(timeout_s=129).timeout_s == 129
+    with pytest.raises(ValueError, match="less than 130"):
+        SqlEnvOptions(timeout_s=130)
 
 
 @pytest.mark.anyio
@@ -970,23 +976,6 @@ def test_the_pool_refuses_credentials_beyond_the_agents() -> None:
 
 
 @pytest.mark.anyio
-async def test_the_pool_terminates_as_the_agent_matching_pid_and_start(
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    terminator = FakeConn()
-    opened = _fake_connect(monkeypatch, {55433: terminator})
-    pool = SolvingPool(PgEnvConfig(), AGENT)
-
-    await pool._terminate(SOLVING[1], 4242, STARTED)
-
-    assert [(o["user"], o["port"]) for o in opened] == [("effisql_agent", 55433)]
-    assert "pg_terminate_backend(pid)" in terminator.executed[0]
-    assert terminator.executed[0].endswith("WHERE pid = %s AND started = %s")
-    assert terminator.params[0] == [4242, STARTED]
-    assert terminator.closed
-
-
-@pytest.mark.anyio
 async def test_an_environment_is_released_even_when_its_close_is_cut_short(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -1017,7 +1006,7 @@ class PreflightConn(FakeConn):
         return FakeCursor([self.row])
 
 
-READY = ("on", "5GB", True, True)
+READY = (True, ["on", "5GB", "130s", "5s"])
 
 
 @pytest.mark.anyio
@@ -1038,7 +1027,7 @@ async def test_preflight_fails_fast_naming_every_problem(monkeypatch: pytest.Mon
         monkeypatch,
         {
             55432: psycopg.OperationalError("password authentication failed"),
-            55433: PreflightConn(("off", "-1", False, False)),
+            55433: PreflightConn((False, ["off", "-1", "0", "5s"])),
         },
     )
 
@@ -1047,34 +1036,14 @@ async def test_preflight_fails_fast_naming_every_problem(monkeypatch: pytest.Mon
 
     message = str(caught.value)
     assert "solve-1 (port 55432): the agent role cannot log in: password" in message
-    assert "solve-2 (port 55433): the agent's transactions are not read-only by default" in message
-    assert "solve-2 (port 55433): the agent's temp_file_limit is -1, not 5GB" in message
-    assert "solve-2 (port 55433): the agent role cannot read the TPC-H tables" in message
-    assert "solve-2 (port 55433): the agent role cannot end its own sessions" in message
-    assert "pgenv.py start" in message
-
-
-class NoStartConn(FakeConn):
-    async def execute(self, query: object, params: object = None) -> FakeCursor:
-        if "pg_db_role_setting" in as_text(query):
-            return FakeCursor(GOOD_DEFAULTS)
-        return FakeCursor([])  # Its own backend is missing from what it can see.
-
-
-@pytest.mark.anyio
-async def test_a_session_that_cannot_name_its_own_backend_is_refused() -> None:
-    conn = NoStartConn()
-
-    async def connect() -> Any:
-        return conn
-
-    env = PgSqlEnvironment(
-        SOLVING[0], asyncio.Semaphore(2), SqlEnvOptions(), connect, Scenario().terminate
+    assert "solve-2 (port 55433): the agent's default_transaction_read_only is off, not on" in (
+        message
     )
-
-    with pytest.raises(EnvironmentFailure, match="cannot see when its own backend started"):
-        await env.open()
-    assert conn.closed
+    assert "solve-2 (port 55433): the agent's temp_file_limit is -1, not 5GB" in message
+    assert "solve-2 (port 55433): the agent's statement_timeout is 0, not 130s" in message
+    assert "client_connection_check_interval" not in message  # That one is right.
+    assert "solve-2 (port 55433): the agent role cannot read the TPC-H tables" in message
+    assert "pgenv.py start" in message
 
 
 class FailingConn(FakeConn):
