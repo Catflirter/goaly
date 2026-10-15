@@ -25,7 +25,11 @@ from goaly.contracts.gen.trajectory_pb2 import (
     ToolResult,
 )
 from goaly.contracts.interfaces import Environment, JsonValue, SqlEnvironment
-from goaly.harness.core.tool_calls import parse_tool_calls, repair_arguments
+from goaly.harness.core.tool_calls import (
+    parse_tool_calls,
+    repair_arguments,
+    strip_tool_call_markup,
+)
 from goaly.harness.core.tools import ToolRegistry, bind
 from tests.fakes import FakeSqlEnvironment, SubmitTool
 
@@ -675,3 +679,71 @@ async def test_an_xml_call_with_no_parameters_has_empty_arguments() -> None:
 
     assert call.arguments_json == "{}"
     assert (result.content, result.is_error) == ("customer, orders", False)
+
+
+def test_strip_removes_a_call_block_and_leaves_the_rest_as_it_was() -> None:
+    text = "Let me look.\n\n" + xml_call("execute_sql", sql="SELECT 1")
+
+    assert strip_tool_call_markup(text) == "Let me look.\n\n"
+
+
+def test_strip_removes_each_of_two_call_blocks() -> None:
+    first, second = xml_call("execute_sql", sql="SELECT 1"), xml_call("submit", sql="SELECT 1")
+    text = f"First:\n{first}\nthen:\n{second}\nDone."
+
+    assert strip_tool_call_markup(text) == "First:\n\nthen:\n\nDone."
+
+
+def test_strip_removes_a_call_written_into_the_reasoning() -> None:
+    reasoning = QWEN_REPLIES["replies"]["call_in_reasoning"]["reasoning_content"]
+
+    stripped = strip_tool_call_markup(reasoning)
+
+    assert stripped == reasoning[: reasoning.index("<tool_call>")]
+    assert stripped.endswith("Let's do that.\n")
+
+
+def test_strip_leaves_text_with_no_call_as_it_was() -> None:
+    text = "I will run `EXPLAIN SELECT 1`; a <function> tag with no name is not a call.\n"
+
+    assert strip_tool_call_markup(text) == text
+
+
+def test_strip_removes_an_unclosed_block_to_the_end_as_the_parser_reads_it() -> None:
+    content = QWEN_REPLIES["replies"]["truncated_xml_in_content"]["content"]
+
+    assert strip_tool_call_markup(content) == (
+        "Let me first look at the query plan for the original query to understand how it's "
+        "being executed.\n\n"
+    )
+
+
+def test_strip_removes_a_block_that_holds_no_call_as_the_parser_skips_it() -> None:
+    text = "Before <tool_call>not a call</tool_call> after"
+
+    assert parse_tool_calls(assistant(content=text), OFFERED) == []
+    assert strip_tool_call_markup(text) == "Before  after"
+
+
+def test_strip_removes_bare_function_blocks_only_where_the_parser_reads_them() -> None:
+    bare = (
+        "I'll run it:\n<function=execute_sql>\n<parameter=sql>\nSELECT 1\n</parameter>\n</function>"
+    )
+    # With a <tool_call> block in the text, the parser reads only the blocks, so a bare function
+    # block outside them is not a call, and stays.
+    outside = "\n<function=execute_sql>\n</function>"
+
+    assert strip_tool_call_markup(bare + "\nThen check.") == "I'll run it:\n\nThen check."
+    assert strip_tool_call_markup(xml_call("submit", sql="SELECT 1") + outside) == outside
+
+
+@pytest.mark.parametrize(
+    "name",
+    ["xml_in_content", "truncated_xml_in_content", "unknown_tool_in_content", "call_in_reasoning"],
+)
+def test_after_strip_no_call_is_left_in_a_qwen_reply(name: str) -> None:
+    reply = QWEN_REPLIES["replies"][name]
+    content = strip_tool_call_markup(reply["content"])
+    reasoning = strip_tool_call_markup(reply["reasoning_content"])
+
+    assert parse_tool_calls(assistant(content=content, reasoning=reasoning), OFFERED) == []

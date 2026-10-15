@@ -7,6 +7,9 @@ A call can be in three places. :func:`parse_tool_calls` takes the first that has
    when the request offered no tools;
 3. Qwen3-Coder XML in the reasoning_content: Qwen sometimes writes a call before it ends its
    thinking, where the gateway does not look for calls.
+
+:func:`strip_tool_call_markup` removes the XML markup from a text, so that a reply whose calls
+were parsed from it can be replayed with them as structured calls only.
 """
 
 import hashlib
@@ -24,7 +27,7 @@ from goaly.contracts.gen.trajectory_pb2 import (
 )
 from goaly.contracts.interfaces import JsonValue
 
-__all__ = ["parse_tool_calls", "repair_arguments"]
+__all__ = ["parse_tool_calls", "repair_arguments", "strip_tool_call_markup"]
 
 # Qwen3-Coder's XML form of a call, in which any closing tag may be missing, as in a reply that
 # was cut off: <tool_call><function=NAME><parameter=KEY>VALUE</parameter>...</function></tool_call>
@@ -69,6 +72,21 @@ def parse_tool_calls(
         if not call.id:
             call.id = _call_id(index, call)
     return calls
+
+
+def strip_tool_call_markup(text: str) -> str:
+    """Return ``text`` without the Qwen3-Coder XML call markup that :func:`parse_tool_calls` reads.
+
+    The markup is each ``<tool_call>`` block, to its closing tag, or to the end of the text when
+    it was cut off, whether or not the block holds a call. In a text with no ``<tool_call>``
+    tag, it is each bare ``<function=...>`` block, as the parser reads those then. Everything
+    else stays as it was, whitespace included.
+
+    A reply whose calls came from its content or its reasoning is replayed without them, as the
+    structured calls they were parsed into; otherwise the model sees each call twice.
+    """
+    markup = _TOOL_CALL if _TOOL_CALL.search(text) else _FUNCTION
+    return markup.sub("", text)
 
 
 def repair_arguments(text: str) -> str | None:
