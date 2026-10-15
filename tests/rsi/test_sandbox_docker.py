@@ -6,6 +6,7 @@ with an experiment ID of its own, so cleanup never touches anyone else's contain
 
 import os
 import secrets
+import shlex
 import subprocess
 import time
 from collections.abc import Iterator
@@ -213,3 +214,19 @@ def test_a_file_past_the_size_limit_cannot_be_written(image: str, worktree: Work
 
     assert "status=0" not in result.output, result.output
     assert (pack / "big").stat().st_size <= 1024 * 1024
+
+
+def test_the_implementer_sandbox_cannot_open_a_tcp_socket(image: str, worktree: Worktree) -> None:
+    code = (
+        "import socket\n"
+        "try:\n"
+        "    socket.create_connection(('127.0.0.1', 13337), timeout=5)\n"
+        "    print('tcp connected')\n"
+        "except PermissionError:\n"
+        "    print('tcp refused')\n"
+    )
+
+    result = run(image, worktree, f"python -c {shlex.quote(code)}", writable_packs=True)
+
+    assert result.exit_code == 0, result.output
+    assert "tcp refused" in result.output
