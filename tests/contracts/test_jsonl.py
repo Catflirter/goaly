@@ -3,6 +3,7 @@
 import json
 import logging
 import math
+import pickle
 import stat
 from collections.abc import Iterator
 from datetime import UTC, datetime
@@ -294,6 +295,21 @@ def test_names_the_file_and_line_of_text_that_is_not_utf8(tmp_path: Path) -> Non
         list(read_jsonl(path, TaskInput))
 
     assert (raised.value.path, raised.value.line_number) == (path, 2)
+
+
+def test_a_jsonl_error_survives_pickling(tmp_path: Path) -> None:
+    # Errors cross process boundaries, as from a ProcessPoolExecutor worker.
+    error = JsonlError(tmp_path / "tasks.jsonl", 3, "not valid UTF-8 at byte 16")
+
+    copy = pickle.loads(pickle.dumps(error))  # noqa: S301  # Pickled just above.
+
+    assert type(copy) is JsonlError
+    assert (str(copy), copy.path, copy.line_number, copy.reason) == (
+        f"{tmp_path / 'tasks.jsonl'}:3: not valid UTF-8 at byte 16",
+        tmp_path / "tasks.jsonl",
+        3,
+        "not valid UTF-8 at byte 16",
+    )
 
 
 # write_jsonl and append_jsonl.

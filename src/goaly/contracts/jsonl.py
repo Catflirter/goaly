@@ -19,7 +19,7 @@ import os
 import secrets
 from collections.abc import Iterable, Iterator
 from pathlib import Path
-from typing import Any, BinaryIO, cast
+from typing import Any, BinaryIO, Self, cast
 
 from google.protobuf import json_format
 from google.protobuf.descriptor import Descriptor, FieldDescriptor
@@ -48,6 +48,11 @@ class JsonlError(ValueError):
         super().__init__(f"{path}:{line_number}: {reason}")
         self.path = path
         self.line_number = line_number
+        self.reason = reason
+
+    def __reduce__(self) -> tuple[type[Self], tuple[Path, int, str]]:
+        # Pickling would rebuild the error from args, which hold only the formatted text.
+        return type(self), (self.path, self.line_number, self.reason)
 
 
 def to_json_line(message: Message) -> str:
