@@ -1,0 +1,43 @@
+// What the task environments return (spec §3.3): the results of running SQL and shell commands.
+syntax = "proto3";
+
+package goaly.v1;
+
+import "google/protobuf/struct.proto";
+
+// The result of running SQL in a task's database: what the agent's SQL tool shows. Grading never
+// uses it; the grader runs its own queries.
+message SqlResult {
+  // The result's column names, in order.
+  repeated string columns = 1;
+  // The rows, in order, each a list of one value per column; only the first rows if truncated.
+  // SQL NULL is a null value, so it stays distinct from the string "NULL". Integers beyond
+  // ±2^53 and values of the SQL type numeric are strings, so no precision is lost. So are NaN
+  // and infinite floats, which protobuf's JSON mapping cannot write as numbers.
+  repeated google.protobuf.ListValue rows = 2;
+  // For a statement that returns rows, how many it returned before truncation; for any other
+  // statement, how many rows it affected, as the database reports it.
+  int32 row_count = 3;
+  // True if rows holds only the first of the row_count rows.
+  bool truncated = 4;
+  // The database's error message, or empty if the statement succeeded.
+  string error = 5;
+  // How long the statement ran, in seconds.
+  double elapsed_s = 6;
+}
+
+// The result of running a shell command in a task's container.
+message ShellResult {
+  // The command's exit status; 0 means success.
+  int32 exit_code = 1;
+  // What the command wrote to standard output, as UTF-8; invalid bytes become U+FFFD.
+  string stdout = 2;
+  // What the command wrote to standard error, as UTF-8; invalid bytes become U+FFFD.
+  string stderr = 3;
+  // True if the environment capped stdout or stderr, so it holds only part of the output.
+  bool truncated = 6;
+  // True if the command ran past its timeout and was stopped; exit_code then means nothing.
+  bool timed_out = 4;
+  // How long the command ran, in seconds.
+  double elapsed_s = 5;
+}

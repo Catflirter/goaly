@@ -1,0 +1,200 @@
+// The task contracts (spec §3.3): what a policy is given, what it returns, and how the result is
+// graded. Each has one variant per benchmark, in a oneof named benchmark: effisql for the
+// "effisql" benchmark, and swe for "swefficiency".
+syntax = "proto3";
+
+package goaly.v1;
+
+// A data split (spec §7).
+enum Split {
+  // Not set.
+  SPLIT_UNSPECIFIED = 0;
+  // The analyst may see its trajectories, grader feedback and gold answers.
+  SPLIT_TRAIN = 1;
+  // Its results go to the decision step and to the final report; the analyst never sees them.
+  SPLIT_VAL = 2;
+  // Used only for baseline v0's runs and for the final runs.
+  SPLIT_HELDOUT = 3;
+  // A task file outside our splits, such as the organizers' --instances file.
+  SPLIT_EXTERNAL = 4;
+}
+
+// What the agent may see of a task (spec §3.3, §4): nothing gold, and nothing that gives it away.
+// Not even the task's ID: an SWE ID names the upstream pull request whose diff is the gold patch.
+message TaskInput {
+  // The benchmark-specific fields.
+  oneof benchmark {
+    // An Effi-SQL task.
+    EffiSqlTaskInput effisql = 1;
+    // A SWE-fficiency task.
+    SweTaskInput swe = 2;
+  }
+}
+
+// An Effi-SQL task (spec §4.1): rewrite a slow PostgreSQL query into an equivalent, faster one.
+// The agent never sees the gold optimized_sql, nor its fast_time or optimized_explain_analyze.
+message EffiSqlTaskInput {
+  // The database the task runs against, such as "tpch".
+  string db = 1;
+  // The original, slow query.
+  string base_sql = 2;
+  // The database's DDL, row counts and indexes, as text.
+  string schema = 3;
+  // The base query's plan, as JSON text: the task file's base_explain_analyze when it has one,
+  // otherwise our own EXPLAIN (FORMAT JSON).
+  string base_plan = 4;
+  // The dataset's difficulty label: easy, medium or hard.
+  string difficulty = 5;
+}
+
+// A SWE-fficiency task (spec §4.2): make the workload faster without breaking the tests. The
+// repository is checked out at base_commit in /testbed, inside the task's container.
+message SweTaskInput {
+  // The GitHub repository, such as "pandas-dev/pandas".
+  string repo = 1;
+  // The commit that /testbed is checked out at.
+  string base_commit = 2;
+  // The source text of the workload script, whose run time is measured.
+  string workload = 3;
+  // The command that runs the repository's tests.
+  string test_cmd = 4;
+  // The command that rebuilds the package after the code changes, e.g. to compile extensions.
+  string rebuild_cmd = 5;
+  // The test files that cover the task, as the dataset lists them: paths under /testbed for
+  // some tasks, paths relative to the repository for others. T13 normalizes them.
+  repeated string covering_tests = 6;
+}
+
+// What a policy returns for a task.
+message Prediction {
+  // The task this answers. The runner sets it after solve, since TaskInput does not carry it.
+  string instance_id = 1;
+  // True if the policy's budget fallback produced this prediction instead of a submit (spec §5.4).
+  bool fallback = 2;
+
+  // The benchmark-specific answer.
+  oneof benchmark {
+    // An Effi-SQL answer.
+    EffiSqlPrediction effisql = 3;
+    // A SWE-fficiency answer.
+    SwePrediction swe = 4;
+  }
+}
+
+// An Effi-SQL answer.
+message EffiSqlPrediction {
+  // The optimized query. The adapter maps it to the official record.
+  string sql = 1;
+}
+
+// A SWE-fficiency answer.
+message SwePrediction {
+  // A git diff against base_commit; empty means no change.
+  string patch = 1;
+}
+
+// How a prediction was graded.
+message Grade {
+  // The task graded.
+  string instance_id = 1;
+  // The score: Effi-SQL the R-VES credit (EffiSqlGrade.credit); SWE SR_i (spec §4.2), already
+  // floored at 0.001.
+  double score = 2;
+  // Effi-SQL: EffiSqlGrade.matched AND (alt_matched unset or true). SWE: the patch applied and
+  // the tests passed, never for an empty patch. Never true unless status is GRADE_STATUS_GRADED.
+  bool correct = 3;
+  // How grading went.
+  GradeStatus status = 4;
+  // What happened, in words, for people and for the RSI analyst (spec §8.2).
+  string feedback = 5;
+
+  // The benchmark-specific details.
+  oneof benchmark {
+    // Effi-SQL details.
+    EffiSqlGrade effisql = 6;
+    // SWE-fficiency details.
+    SweGrade swe = 7;
+  }
+}
+
+// How grading went.
+enum GradeStatus {
+  // Not set.
+  GRADE_STATUS_UNSPECIFIED = 0;
+  // The grader evaluated the prediction.
+  GRADE_STATUS_GRADED = 1;
+  // The prediction failed to run (Effi-SQL: the query raised an error) or to apply (SWE).
+  GRADE_STATUS_PREDICTION_FAILED = 2;
+  // The prediction ran past the grader's time limit.
+  GRADE_STATUS_TIMEOUT = 3;
+  // The grader's own infrastructure failed, so the score says nothing about the prediction.
+  GRADE_STATUS_GRADER_ERROR = 4;
+}
+
+// The Effi-SQL details of a grade, following the official evaluator's algorithm (spec §4.1). The
+// grade's score is credit. Its correct is matched AND (alt_matched unset or true), and is never
+// true unless the status is GRADE_STATUS_GRADED.
+message EffiSqlGrade {
+  // True if the prediction ran without an error or a timeout and its result equals the base
+  // query's: the same row count and the same multiset of row hashes.
+  bool matched = 1;
+  // The robustness check against hard-coded results: whether the prediction also returns the
+  // base query's result on an alternate TPC-H database with different data. Set when the check
+  // ran (dev mode and RSI, and our checked R-VES); unset when it did not, as for the
+  // official-protocol numbers. False flags the task as hard-coded: credit is then 0 and the
+  // grade's correct is false. The final report gives both the official and the checked R-VES.
+  optional bool alt_matched = 10;
+  // The base query's median EXPLAIN ANALYZE execution time, in seconds; unset if not measured.
+  optional double base_time_s = 2;
+  // The prediction's median EXPLAIN ANALYZE execution time, in seconds; unset if not measured.
+  optional double pred_time_s = 3;
+  // τ = base_time_s / pred_time_s, capped at 1000. Set only when matched and both sides were
+  // timed.
+  optional double speedup = 4;
+  // The R-VES tier credit g(τ): 1 for τ ≥ 2, 0.75 for τ ≥ 1.2, 0.5 for τ ≥ 1, 0.25 for τ ≥ 0.5,
+  // and 0 otherwise. 0 when not matched, or when alt_matched is false.
+  double credit = 5;
+  // How many timed runs the times come from.
+  int32 timing_runs = 6;
+  // How many rows the prediction returned.
+  int32 pred_row_count = 7;
+  // How many rows the base query returned.
+  int32 base_row_count = 8;
+  // How long the evaluation held its grading instance, in seconds of wall time (spec §9); unset
+  // if the grade was not measured.
+  optional double eval_wall_s = 11;
+  // True if dev mode reused the base query's cached result signature and timing.
+  bool base_cached = 9;
+}
+
+// The SWE-fficiency details of a grade, as spec §4.2 scores it. For metrics, an SWE task counts as
+// solved when the grade is correct and sr > 1 / gold_speedup: a real speedup.
+message SweGrade {
+  // True if the patch applied to base_commit.
+  bool patch_applied = 1;
+  // True if the tests passed with the patch applied.
+  bool tests_passed = 2;
+  // True if the patch was empty, so the task was scored without an evaluation run. Then
+  // patch_applied, tests_passed and the grade's correct are all false.
+  bool empty_patch = 3;
+  // The agent's speedup, T_pre / T_post. A patch that is empty, does not apply or fails the
+  // tests counts as 1: no speedup.
+  double agent_speedup = 4;
+  // The expert patch's speedup on this machine, T_pre / T_post_gold.
+  double gold_speedup = 5;
+  // SR_i = agent_speedup / gold_speedup, before the grade's score floors it at 0.001.
+  double sr = 6;
+  // How long the workload ran before the patch (T_pre), in seconds.
+  double t_pre_s = 7;
+  // How long the workload ran with the patch (T_post), in seconds; 0 if it was not measured.
+  double t_post_s = 8;
+  // How long the evaluation run took, in seconds of wall time. 0 for an empty patch, which is
+  // never evaluated; a cached grade keeps the original run's times.
+  double eval_wall_s = 10;
+  // How much CPU time the evaluation run used, in seconds (spec §9). 0 for an empty patch, which
+  // is never evaluated; a cached grade keeps the original run's times.
+  double eval_cpu_s = 11;
+  // True if the result came from the grading cache, keyed by (patch hash, task), instead of a
+  // new evaluation run.
+  bool cached = 9;
+}

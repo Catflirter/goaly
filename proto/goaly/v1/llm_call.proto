@@ -1,0 +1,112 @@
+// The record of one LLM call (spec §5.1, §6.2, §9), and the Usage that other records reuse.
+syntax = "proto3";
+
+package goaly.v1;
+
+import "google/protobuf/timestamp.proto";
+
+// One call to the model gateway, with all its retries: one line of the call log (spec §5.1).
+message LlmCallRecord {
+  // A unique ID for the call.
+  string call_id = 1;
+  // The run the call belongs to, or empty if it belongs to none.
+  string run_id = 2;
+  // The task the call works on, or empty if none, as for an RSI analyst call.
+  string instance_id = 3;
+  // The replicate index, as in Trajectory.seed. Calls join to trajectories on run_id,
+  // instance_id and seed.
+  int32 seed = 13;
+  // Why the call was made.
+  CallPurpose purpose = 4;
+  // The model called, such as "qwen3.6-35b-a3b".
+  string model = 5;
+  // The tokens and cost the gateway reported for the call.
+  Usage usage = 6;
+  // The whole call, from its start to its end, in seconds: every attempt and every wait included.
+  double latency_s = 7;
+  // The part of latency_s spent waiting for a concurrency slot or a retry backoff: the sum of the
+  // attempts' wait_s (spec §6.2).
+  double wait_s = 8;
+  // Every request the call sent, in order: the first attempt, then each retry.
+  repeated LlmCallAttempt attempts = 9;
+  // How the call ended: the status of its last attempt.
+  LlmCallStatus status = 10;
+  // The HTTP status of the last attempt's response, or 0 if no response arrived.
+  int32 http_status = 11;
+  // When the call began, before any wait for a concurrency slot.
+  google.protobuf.Timestamp started_at = 12;
+}
+
+// One request of an LLM call: its first attempt, or a retry. Every 429 or 503 response and every
+// backoff is on record here (spec §6.2).
+message LlmCallAttempt {
+  // When the attempt began, before its wait.
+  google.protobuf.Timestamp started_at = 1;
+  // The time waited before this attempt's request was sent: for a concurrency slot and, for a
+  // retry, the backoff.
+  double wait_s = 2;
+  // From sending the request to its response or its failure, in seconds.
+  double latency_s = 3;
+  // How the attempt ended.
+  LlmCallStatus status = 4;
+  // The HTTP status of the response, or 0 if no response arrived.
+  int32 http_status = 5;
+  // The server's Retry-After value, in seconds, when it sent one.
+  optional double retry_after_s = 6;
+}
+
+// Why an LLM call was made (spec §9).
+enum CallPurpose {
+  // Not set.
+  CALL_PURPOSE_UNSPECIFIED = 0;
+  // The executor, solving a task.
+  CALL_PURPOSE_EXEC = 1;
+  // The RSI analyst, grouping failures and proposing hypotheses (spec §8.2).
+  CALL_PURPOSE_RSI_ANALYST = 2;
+  // The RSI coding agent, implementing a hypothesis (spec §8.2).
+  CALL_PURPOSE_RSI_IMPL = 3;
+  // The RSI system, writing a lesson about an experiment (spec §8.6).
+  CALL_PURPOSE_RSI_LESSON = 4;
+}
+
+// How an LLM call, or one attempt of it, ended. A call reports its last attempt's status.
+enum LlmCallStatus {
+  // Not set.
+  LLM_CALL_STATUS_UNSPECIFIED = 0;
+  // The call returned a usable response.
+  LLM_CALL_STATUS_OK = 1;
+  // The request timed out.
+  LLM_CALL_STATUS_TIMEOUT = 2;
+  // The gateway answered 429 Too Many Requests.
+  LLM_CALL_STATUS_RATE_LIMITED = 3;
+  // The gateway answered with a 5xx status.
+  LLM_CALL_STATUS_SERVER_ERROR = 4;
+  // The connection to the gateway failed.
+  LLM_CALL_STATUS_CONNECTION_ERROR = 5;
+  // The request did not fit in the model's context window.
+  LLM_CALL_STATUS_CONTEXT_OVERFLOW = 6;
+  // A response arrived but could not be used, for example because it was malformed.
+  LLM_CALL_STATUS_INVALID_RESPONSE = 7;
+  // Any other 4xx: not 429 and not a context overflow, which LiteLLM also reports as a 400.
+  LLM_CALL_STATUS_CLIENT_ERROR = 8;
+  // Our own code cancelled the call, for example when a task's wall-clock budget ran out. The
+  // gateway may still have billed it.
+  LLM_CALL_STATUS_CANCELLED = 9;
+}
+
+// Tokens and cost, of one call or summed over many. output_tokens includes the reasoning tokens,
+// so "tokens per task" in the decision rules (spec §8.3) means input_tokens + output_tokens.
+message Usage {
+  // Prompt tokens.
+  int64 input_tokens = 1;
+  // Completion tokens, reasoning tokens included.
+  int64 output_tokens = 2;
+  // How many of output_tokens the model spent reasoning; unset if the gateway reported no
+  // reasoning breakdown. In a sum, the field is set if any summed call reported it, and holds the
+  // total of the reported values.
+  optional int64 reasoning_tokens = 3;
+  // The cost in US dollars, as the gateway reports it in the x-litellm-response-cost header;
+  // unset if it reported none, as for a failed or cancelled call without the header. In a sum, the
+  // field is set if any summed call reported it, and holds the total of the reported values.
+  optional double cost_usd = 4;
+}

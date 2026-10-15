@@ -4,7 +4,7 @@
 UV_RUN := uv run --locked
 
 .DEFAULT_GOAL := help
-.PHONY: help setup lint format typecheck imports test test-integration check
+.PHONY: help setup lint format typecheck imports proto proto-check test test-integration check
 
 help: ## List the targets
 	@awk 'BEGIN {FS = ":.*## "} /^[a-z][a-z-]*:.*## / {printf "  %-18s %s\n", $$1, $$2}' $(MAKEFILE_LIST)
@@ -21,11 +21,17 @@ format: ## Format, then apply lint fixes
 	$(UV_RUN) ruff format
 	$(UV_RUN) ruff check --fix
 
-typecheck: ## Type-check src and tests (mypy --strict)
+typecheck: ## Type-check src, tests and scripts (mypy --strict)
 	$(UV_RUN) mypy
 
 imports: ## Check the import-layer contracts
 	$(UV_RUN) lint-imports --no-logo
+
+proto: ## Regenerate src/goaly/contracts/gen/ from proto/
+	$(UV_RUN) python scripts/protogen.py
+
+proto-check: ## Fail if src/goaly/contracts/gen/ is out of date with proto/
+	$(UV_RUN) python scripts/protogen.py --check
 
 test: ## Run the unit tests with branch coverage
 	$(UV_RUN) pytest --cov
@@ -34,4 +40,4 @@ test: ## Run the unit tests with branch coverage
 test-integration: ## Run only the integration tests (Docker, databases, the real model API)
 	$(UV_RUN) pytest --integration -m integration || test $$? -eq 5
 
-check: lint typecheck imports test ## Run everything CI runs
+check: lint typecheck imports proto-check test ## Run everything CI runs
