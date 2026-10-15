@@ -228,11 +228,17 @@ enum Guard {
   // normalization, and any instance_id from any split.
   GUARD_HARD_CODING_SCAN = 3;
   // The static AST allowlist passes on the candidate's pack code, which runs on the host during
-  // smoke tests, screening and validation (spec §8.5). Imports may come only from
-  // goaly.contracts, goaly.harness.core, pydantic and pure stdlib modules, such as json, re and
-  // typing. The builtins open, eval, exec, compile and __import__ are banned; so are the modules
-  // importlib, subprocess, os, sys, socket, pathlib, shutil and ctypes, and attribute access to
-  // dunder internals.
+  // smoke tests, screening and validation (spec §8.5). It is a static defense in depth, not a
+  // sandbox. Imports may come only from: an explicit list of goaly.harness.core modules, which
+  // leaves out settings and every llm* module; goaly.contracts; pydantic; relative imports and
+  // goaly.harness.packs.<lane>, the lane's own pack; a closed list of pure stdlib modules, such
+  // as json, re and typing; and asyncio, for concurrency only. Banned: the builtins open, eval,
+  // exec, compile, __import__, getattr, setattr, delattr, vars, globals, locals, dir, type,
+  // breakpoint, input and memoryview; any attribute name that starts with _, except on self or
+  // cls; calls to .format and .format_map; the frame and coroutine attributes f_*, gi_*, cr_*,
+  // ag_* and tb_*; any attribute of an imported module that is itself a module; and the attribute
+  // names sys, os, modules, builtins and subprocess, and asyncio's process, socket and pipe
+  // functions.
   GUARD_PACK_CODE_ALLOWLIST = 5;
   // The pack's unit tests pass.
   GUARD_UNIT_TESTS = 4;
