@@ -178,12 +178,17 @@ def main(argv: Sequence[str], registry: Registry, *, budgets_file: Path) -> int:
 
 
 async def _run(args: argparse.Namespace, command_line: list[str], registry: Registry) -> RunSummary:
-    if args.instances is not None and not args.instances.is_file():
-        raise UsageError(f"no such task file: {args.instances}")
+    instances_sha256 = None
+    if args.instances is not None:
+        if not await asyncio.to_thread(args.instances.is_file):
+            raise UsageError(f"no such task file: {args.instances}")
+        # Hashed once, before the harness reads it.
+        instances_sha256 = await asyncio.to_thread(sha256_file, args.instances)
     factory = registry.factory(args.bench, args.harness)  # First: the benchmark names the share.
     harness_name = args.harness or registry.harnesses(args.bench)[0]
     share = args.share or args.bench
     llm_shares = (await asyncio.to_thread(load_budgets, args.budgets)).share(args.phase, share)
+    _logger.info("LLM shares of %s in the phase %s: %s", share, args.phase, llm_shares)
     files = RunFiles(args.out)
     # Locked before the harness opens, so that nothing it writes there, such as the LLM call log,
     # can meet another process's run.
@@ -191,7 +196,9 @@ async def _run(args: argparse.Namespace, command_line: list[str], registry: Regi
         await asyncio.to_thread(_preflight, args, files)
         options = HarnessOptions(files=files, instances_file=args.instances, llm_shares=llm_shares)
         async with factory(options) as harness:
-            return await _run_harness(args, command_line, harness, harness_name, llm_shares, lock)
+            return await _run_harness(
+                args, command_line, harness, harness_name, instances_sha256, lock
+            )
 
 
 async def _run_harness(
@@ -199,7 +206,7 @@ async def _run_harness(
     command_line: list[str],
     harness: RunnableHarness,
     harness_name: str,
-    llm_shares: dict[str, int],
+    instances_sha256: str | None,
     lock: RunLock,
 ) -> RunSummary:
     if harness.benchmark_name != args.bench:
@@ -213,19 +220,18 @@ async def _run_harness(
             raise UsageError(f"the harness {harness_name!r} names no grading namespace for --cache")
         cache = EvalCache(args.cache, harness.cache_namespace)
     seeds = list(range(args.first_seed, args.first_seed + args.seeds))
-    # Every option that shapes the run: not where it is written, cached or logged.
+    # Every option that shapes the run's results: the config hash, which a resume must match.
+    # Not where it is written, cached or logged, nor how much of the gateway it may use at once,
+    # such as --max-tasks and the LLM shares: a run may resume under other limits.
     settings: dict[str, JsonValue] = {
         "benchmark": args.bench,
         "harness": harness_name,
         "split": args.split,
-        "instances_sha256": None if args.instances is None else sha256_file(args.instances),
-        "only": None if args.only is None else sorted(args.only),
+        "instances_sha256": instances_sha256,
+        "only": None if args.only is None else sorted(set(args.only)),
         "seeds": [*seeds],
-        "max_tasks": args.max_tasks,
         "task_timeout_s": args.task_timeout,
-        "phase": args.phase,
-        "share": args.share or args.bench,
-        "llm_shares": dict(llm_shares),
+        "grading": harness.cache_namespace,  # A run never mixes two grading identities.
     }
     manifest = await asyncio.to_thread(_manifest, args, command_line, harness, settings)
     runner = harness.runner(cache=cache, max_tasks=args.max_tasks, task_timeout_s=args.task_timeout)

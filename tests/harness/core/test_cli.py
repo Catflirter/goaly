@@ -16,7 +16,14 @@ from goaly.contracts.gen.result_pb2 import TASK_ERROR_TYPE_TIMEOUT, TaskResult
 from goaly.contracts.gen.task_pb2 import SPLIT_EXTERNAL, SPLIT_TRAIN, SPLIT_VAL, Split
 from goaly.contracts.jsonl import read_jsonl
 from goaly.harness.core import cli
-from goaly.harness.core.manifest import CORE_DIR, git_state, harness_hash, read_manifest
+from goaly.harness.core.manifest import (
+    CORE_DIR,
+    config_hash,
+    core_hash,
+    git_state,
+    harness_hash,
+    read_manifest,
+)
 from goaly.harness.core.registry import Harness, HarnessOptions, Registry
 from goaly.harness.core.runner import RunFiles, lock_run_dir
 from tests.fakes import TOY_DATASET_SHA256, FakeSqlEnvironment, ToyInstance
@@ -37,6 +44,10 @@ BUDGETS = """
 [phases.test]
 toy = { "qwen3.6-35b-a3b" = 4 }
 quiet = {}
+
+[phases.later]
+toy = { "qwen3.6-35b-a3b" = 2 }
+other = { "qwen3.6-35b-a3b" = 3 }
 """
 
 type ToyHarness = Harness[ToyInstance, FakeSqlEnvironment, StubContext]
@@ -214,6 +225,20 @@ def test_runs_the_toy_benchmark_end_to_end(
     assert manifest.harness_hash == harness_hash(pack)
     assert len(manifest.config_hash) == 64
     assert list(manifest.command_line) == ["goaly", "run", *argv]
+    # What makes the run's results, and so its resume identity, and nothing else: not where it
+    # is written, cached or logged, nor how much of the gateway it may use at once.
+    assert manifest.config_hash == config_hash(
+        {
+            "benchmark": "toy",
+            "harness": "v0",
+            "split": "train",
+            "instances_sha256": None,
+            "only": None,
+            "seeds": [0, 1],
+            "task_timeout_s": None,
+            "grading": "toy-dev",
+        }
+    )
     # The benchmark's manifest_fields() alone gives the dataset's and the environment's fields.
     assert manifest.dataset_revision == "toy-revision-1"
     assert list(manifest.dataset_notes) == ["the toy tasks are held in memory"]
@@ -383,6 +408,78 @@ def test_resume_continues_the_run_and_a_new_run_refuses_its_directory(
     assert len(results(out)) == 3
 
 
+def test_a_run_resumes_under_other_concurrency_settings(
+    capsys: pytest.CaptureFixture[str], registry: Registry, budgets: Path, tmp_path: Path
+) -> None:
+    out = tmp_path / "run"
+    common = ["--bench", "toy", "--split", "train", "--out", str(out)]
+    first = goaly(capsys, registry, budgets, *common, "--phase", "test", "--only", "t0", "t1")
+    files = RunFiles(out)
+    lines = files.results.read_text(encoding="utf-8").splitlines(keepends=True)
+    files.results.write_text("".join(lines[:-1]), encoding="utf-8")  # Interrupted.
+
+    resumed = goaly(
+        capsys,
+        registry,
+        budgets,
+        *common,
+        "--phase",
+        "later",
+        "--share",
+        "other",
+        "--max-tasks",
+        "1",
+        "--only",
+        "t1",
+        "t0",
+        "t1",  # The same instances, in another order and once more.
+        "--resume",
+    )
+
+    assert resumed.status == 0, resumed.stderr
+    assert resumed.summary["run_id"] == first.summary["run_id"]
+    assert (resumed.summary["resumed"], resumed.summary["ran"]) == (1, 1)
+
+
+def test_a_resume_under_another_grading_namespace_is_refused(
+    capsys: pytest.CaptureFixture[str], budgets: Path, tmp_path: Path
+) -> None:
+    argv = ["--bench", "toy", "--split", "train", "--phase", "test", "--out", str(tmp_path / "r")]
+    dev, official = Registry(), Registry()
+    dev.add("toy", "v0", ToyFactory())
+    official.add("toy", "v0", ToyFactory(cache_namespace="toy-official"))
+    goaly(capsys, dev, budgets, *argv)
+
+    resumed = goaly(capsys, official, budgets, *argv, "--resume")
+
+    assert resumed.status == cli.USAGE
+    assert "config_hash" in resumed.stderr
+
+
+def test_a_run_without_a_pack_has_cores_hash(
+    capsys: pytest.CaptureFixture[str], budgets: Path, tmp_path: Path
+) -> None:
+    registry = Registry()
+    registry.add("toy", "v0", ToyFactory(pack_dir=None))
+    out = tmp_path / "r"
+
+    goaly(
+        capsys,
+        registry,
+        budgets,
+        "--bench",
+        "toy",
+        "--split",
+        "train",
+        "--phase",
+        "test",
+        "--out",
+        str(out),
+    )
+
+    assert read_manifest(RunFiles(out).manifest).harness_hash == core_hash()
+
+
 def test_a_resumed_run_must_use_the_same_options(
     capsys: pytest.CaptureFixture[str], registry: Registry, budgets: Path, tmp_path: Path
 ) -> None:
@@ -409,6 +506,26 @@ def test_the_cache_makes_a_second_run_free(
     assert (second.summary["cached"], second.summary["ran"]) == (3, 0)
     hashes = {read_manifest(RunFiles(tmp_path / name).manifest).config_hash for name in ("a", "b")}
     assert len(hashes) == 1  # The output and cache directories are not settings of the run.
+
+
+def test_runs_that_grade_differently_never_share_a_cache_entry(
+    capsys: pytest.CaptureFixture[str], budgets: Path, tmp_path: Path
+) -> None:
+    common = ["--bench", "toy", "--split", "train", "--phase", "test"]
+    cache = tmp_path / "cache"
+    dev, official = Registry(), Registry()
+    dev.add("toy", "v0", ToyFactory())
+    official.add("toy", "v0", ToyFactory(cache_namespace="toy-official"))
+    goaly(capsys, dev, budgets, *common, "--cache", str(cache), "--out", str(tmp_path / "a"))
+
+    other = goaly(
+        capsys, official, budgets, *common, "--cache", str(cache), "--out", str(tmp_path / "b")
+    )
+
+    assert other.status == 0, other.stderr
+    assert (other.summary["cached"], other.summary["ran"]) == (0, 3)
+    assert sorted(path.name for path in cache.iterdir()) == ["toy-dev", "toy-official"]
+    assert all(list((cache / name).rglob("*.json")) for name in ("toy-dev", "toy-official"))
 
 
 def test_a_harness_without_a_grading_namespace_cannot_use_the_cache(
@@ -498,7 +615,7 @@ def test_the_share_is_the_one_the_phase_gives_the_process(
 @pytest.mark.parametrize(
     ("argv", "message"),
     [
-        (["--phase", "rsi"], "no phase 'rsi'; the phases are: test"),
+        (["--phase", "rsi"], "no phase 'rsi'; the phases are: later, test"),
         (["--phase", "test", "--share", "background"], "gives no share to 'background'"),
     ],
 )
