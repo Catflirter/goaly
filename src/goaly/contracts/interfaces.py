@@ -212,7 +212,7 @@ class Benchmark[InstanceT: Instance, EnvT: Environment](Protocol):
         """
 
     def provision(self, inst: InstanceT) -> AbstractAsyncContextManager[EnvT]:
-        """Create the environment to solve ``inst`` in. Leaving the context closes it.
+        """Create the environment to solve ``inst`` in.
 
         The context closes the environment however it exits: normally, on an exception or on
         cancellation. It never suppresses an exception raised in its body. If the environment
