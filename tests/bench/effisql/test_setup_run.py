@@ -9,7 +9,7 @@ from typing import Any
 import pytest
 
 from goaly.bench.effisql.data import EffiSqlInstance
-from goaly.bench.effisql.grader import GraderError, QueryTimeoutError
+from goaly.bench.effisql.grader import GraderError, QueryTimeoutError, ResourceError
 from goaly.bench.effisql.grading import BaseCache
 from goaly.bench.effisql.grading_pool import GradingInstance, GradingPool
 from goaly.bench.effisql.grading_service import SlotRunner, ThreadRunner
@@ -624,3 +624,79 @@ def test_a_failing_task_is_logged_and_left_for_a_rerun(
     assert measure(FakeSlot(main, fake_alt()), store, BaseCache(tmp_path / "c"), instance("7")) == 0
     assert store.load() == {}
     assert "setup task failed" in caplog.text
+
+
+class TestRulingsOfTheTail:
+    def test_a_resource_failure_is_retried_once_then_stands(self, tmp_path: Path) -> None:
+        store, cache = RecordStore(tmp_path / "records"), BaseCache(tmp_path / "dev")
+        main = fake_main()
+        main.results[BASE_SQL] = ResourceError("the server ran out of resources: shm")
+        slot = FakeSlot(main, fake_alt())
+        assert measure(slot, store, cache, instance("7")) == 1
+        first = store.load()["7"]
+        assert (first.resource_failures, first.base_timed_out) == (1, False)
+        assert exclusion_reason(first) == "base query fails on this machine"
+        assert measure(slot, store, cache, instance("7")) == 1, "retried once"
+        assert store.load()["7"].resource_failures == 2
+        assert measure(slot, store, cache, instance("7")) == 0, "then the exclusion stands"
+
+    def test_an_old_record_that_ran_out_of_shared_memory_is_retried(self, tmp_path: Path) -> None:
+        store, cache = RecordStore(tmp_path / "records"), BaseCache(tmp_path / "dev")
+        failure = 'could not resize shared memory segment "/PostgreSQL.7" to 16777216 bytes'
+        store.save(record("7", base=None, gold=None, data=None, base_failure=failure))
+        assert measure(FakeSlot(fake_main(), fake_alt()), store, cache, instance("7")) == 1
+        assert store.load()["7"].base is not None
+
+    def test_a_base_timeout_from_the_old_clock_is_measured_again(self, tmp_path: Path) -> None:
+        store, cache = RecordStore(tmp_path / "records"), BaseCache(tmp_path / "dev")
+        old = record("7", base=None, gold=None, data=None, base_failure="late", base_timed_out=True)
+        store.save(old)
+        slot = FakeSlot(fake_main(base_times=[QueryTimeoutError("statement timeout")]), fake_alt())
+        assert measure(slot, store, cache, instance("7")) == 1
+        again = store.load()["7"]
+        assert again.base_timed_out
+        assert again.timeout_rechecked
+        assert measure(slot, store, cache, instance("7")) == 0
+
+    def test_marginal_golds_and_off_identities_are_graded_again_officially(
+        self, tmp_path: Path
+    ) -> None:
+        store, cache = RecordStore(tmp_path / "records"), BaseCache(tmp_path / "dev")
+        store.save(record("7", gold=gold(speedup=1.1)))
+        store.save(record("8", base=entry(instance_id="8", identity_speedup=1.3)))
+        store.save(record("9"))
+        main = FakeSession(
+            plans={BASE_SQL: plan("lineitem"), GOLD_SQL: plan("lineitem")},
+            results={BASE_SQL: BASE_ROWS, GOLD_SQL: BASE_ROWS},
+            times={BASE_SQL: [1000.0] * 12, GOLD_SQL: [400.0] * 3},
+        )
+        pool = pool_of(FakeSlot(main, fake_alt()))
+        tasks = [instance("7"), instance("8"), instance("9")]
+        assert asyncio.run(run_phase("recheck", pool, tasks, store, cache)) == 2
+        records = store.load()
+        assert records["7"].gold_recheck is not None
+        assert records["7"].gold_recheck.speedup == 2.5
+        assert records["7"].identity_recheck is None
+        assert exclusion_reason(records["7"]) is None, "the official re-measure decides"
+        assert records["8"].identity_recheck is not None
+        assert records["8"].identity_recheck.speedup == 1.0
+        assert records["8"].gold_recheck is None
+        assert records["9"].gold_recheck is None
+        assert asyncio.run(run_phase("recheck", pool, tasks, store, cache)) == 0
+        summary = summarize(["7", "8", "9"], records, val=[])
+        assert summary.gold_rechecks == {"7": [1.1, 2.5]}
+        assert summary.identity_rechecks == {"8": [1.3, 1.0]}
+        assert "8" not in summary.identity_failures, "the idle re-measure is within tolerance"
+
+    def test_exclusions_are_counted_by_reason_and_split(self) -> None:
+        records = {str(i): record(str(i)) for i in range(1, 21)}
+        records["1"] = record("1", gold=gold(speedup=1.1))
+        records["2"] = record("2", base=None, gold=None, base_failure="x", base_timed_out=True)
+        splits = {"1": "train", "2": "heldout"}
+        summary = summarize(list(records), records, val=[], splits=splits)
+        assert summary.exclusions_by_reason == {
+            "base query exceeds the 300 s statement timeout on this machine": 1,
+            "gold under 1.2x": 1,
+        }
+        assert summary.exclusions_by_split == {"heldout": 1, "train": 1}
+        assert "by split" in to_markdown(summary)

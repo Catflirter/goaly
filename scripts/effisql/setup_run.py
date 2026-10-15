@@ -3,10 +3,12 @@
     uv run python scripts/effisql/setup_run.py [--phase PHASE] [--ids 1,2,...] [--write-exclusions]
 
 Phases: ``measure`` on all 5 instances (base cache, identity τ under load, data and gold
-checks), ``official`` on the 3 grading instances (val golds and identity in official mode, with
-the solving instances idle), ``negatives`` (the fixed sample of 10), and ``summary``; ``all``
-runs them in that order. Each phase resumes from the records under ``--records``, and retries
-any task a grader failure left unrecorded. The summary is written next to the records as
+checks; it also retries a base the server ran out of resources on, once, and re-measures a base
+timeout under the server's statement_timeout), ``recheck`` on the 3 idle grading instances (the
+marginal golds and the identity outliers again, in official mode), ``official`` (the kept val
+golds and identity in official mode), ``negatives`` (the fixed sample of 10), and ``summary``;
+``all`` runs them in that order. Each phase resumes from the records under ``--records``, and
+retries any task a grader failure left unrecorded. The summary is written next to the records as
 ``summary.json`` and ``summary.md``.
 
 ``--write-exclusions`` writes the exclusion list, the measured exclusions plus the reviewed ones
@@ -53,10 +55,11 @@ from goaly.bench.effisql.setup_run import (
 from goaly.bench.effisql.splits import EXCLUSIONS_PATH, SPLIT_DB, load_splits
 
 PYTHON_CPUS = {0, 1, 12, 13}  # Physical cores 0-1 (spec §6.2).
-PHASES: tuple[Phase, ...] = ("measure", "official", "negatives")
+PHASES: tuple[Phase, ...] = ("measure", "recheck", "official", "negatives")
 # Each phase's instances: the measure phase on all 5, the others with the solving ones idle.
 PHASE_INSTANCES: dict[Phase, tuple[GradingInstance, ...]] = {
     "measure": SETUP_INSTANCES,
+    "recheck": GRADING_INSTANCES,
     "official": GRADING_INSTANCES,
     "negatives": GRADING_INSTANCES,
 }
@@ -126,7 +129,13 @@ def main(argv: Sequence[str] | None = None) -> int:
         wanted = set(args.ids.split(","))
         tasks = [t for t in tasks if t.instance_id in wanted]
     args.tasks = tasks
-    val = load_splits().val
+    splits = load_splits()
+    val = splits.val
+    split_of = {
+        task: name
+        for name, ids in (("train", splits.train), ("val", splits.val), ("heldout", splits.heldout))
+        for task in ids
+    }
 
     phases = PHASES if args.phase == "all" else () if args.phase == "summary" else (args.phase,)
     for phase in phases:
@@ -140,6 +149,7 @@ def main(argv: Sequence[str] | None = None) -> int:
         tasks={t.instance_id: t for t in tasks},
         manual=load_manual_exclusions(args.manual_exclusions),
         identity_tolerance=args.identity_tolerance,
+        splits=split_of,
     )
     out = args.records.parent
     write_private(out / "summary.json", summary.model_dump_json(indent=2) + "\n")

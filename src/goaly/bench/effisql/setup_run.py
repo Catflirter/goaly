@@ -39,6 +39,7 @@ from goaly.bench.effisql.grader import (
     GraderError,
     QueryError,
     QueryTimeoutError,
+    ResourceError,
     statement_body,
     time_interleaved,
 )
@@ -99,6 +100,11 @@ SMALL_RESULT_ROWS = 10_000  # Negative checks run on tasks with fewer base rows 
 NEGATIVE_SAMPLE = 10
 EXCLUSION_BOUND = 0.10  # More than this share of tasks excluded stops the setup.
 AGREEMENT_BOUND = 0.90  # Dev and official mode give the same tier on at least this share.
+# A gold whose dev-mode speedup falls in this range is graded again in official mode, and its
+# exclusion decided on that (the controller's ruling).
+MARGINAL_GOLD = (0.8, 1.5)
+# How a base failure from before ResourceError existed says the server ran out of resources.
+_RESOURCE_SIGNS = ("could not resize shared memory", "no space left on device", "out of memory")
 # Exclusions a review decided, such as a gold a hard-coding check flags with the gold at fault.
 MANUAL_EXCLUSIONS_PATH = EXCLUSIONS_PATH.with_name("effisql_exclusions_manual.json")
 _TOLERANCE_EPSILON = 1e-9  # So 1.1 counts as within 1 ± 0.1 despite floating point.
@@ -108,7 +114,7 @@ _GRADED = GradeStatus.Name(GRADE_STATUS_GRADED)
 
 _log = logging.getLogger(__name__)
 
-type Phase = Literal["measure", "official", "negatives"]
+type Phase = Literal["measure", "recheck", "official", "negatives"]
 
 
 class _Model(BaseModel):
@@ -170,6 +176,13 @@ class SetupRecord(_Model):
     official_gold: GradeSummary | None = None
     official_identity: GradeSummary | None = None
     negatives: dict[str, bool] | None = None  # Variant name: whether it matched the base.
+    # Measurements again, on the idle grading instances (the controller's rulings): the server
+    # ran out of resources, the base was measured under the old timeout, the gold's dev-mode
+    # speedup was marginal (graded again in official mode), or the identity τ was off.
+    resource_failures: int = 0
+    timeout_rechecked: bool = False
+    gold_recheck: GradeSummary | None = None
+    identity_recheck: GradeSummary | None = None
 
 
 def data_check(inst: EffiSqlInstance, row_count: int) -> DataCheck:
@@ -201,6 +214,9 @@ def exclusion_reason(record: SetupRecord) -> str | None:
     if record.base is not None and record.base.base_ms > STATEMENT_TIMEOUT_S * 1000:
         return _BASE_TIMEOUT_REASON
     gold = record.gold
+    recheck = record.gold_recheck
+    if recheck is not None and recheck.status != _GRADER_ERROR:
+        gold = recheck  # The official re-measure of a marginal gold decides (ruling).
     if gold is None or gold.status == _GRADER_ERROR:
         return None
     if not gold.matched:
@@ -240,14 +256,25 @@ def _resetting[T](slot: GradingSlot, work: Callable[[], T]) -> T:
 
 
 def measure_task(
-    slot: GradingSlot, inst: EffiSqlInstance, gold_sql: str | None, cache: BaseCache
+    slot: GradingSlot,
+    inst: EffiSqlInstance,
+    gold_sql: str | None,
+    cache: BaseCache,
+    resource_failures: int = 0,
 ) -> SetupRecord:
-    """Phase 1 for one task: the base cache entry, the data check and the gold check."""
-    return _resetting(slot, lambda: _measure(slot, inst, gold_sql, cache))
+    """Phase 1 for one task: the base cache entry, the data check and the gold check.
+
+    ``resource_failures`` counts the earlier attempts the server ran out of resources on.
+    """
+    return _resetting(slot, lambda: _measure(slot, inst, gold_sql, cache, resource_failures))
 
 
 def _measure(
-    slot: GradingSlot, inst: EffiSqlInstance, gold_sql: str | None, cache: BaseCache
+    slot: GradingSlot,
+    inst: EffiSqlInstance,
+    gold_sql: str | None,
+    cache: BaseCache,
+    resource_failures: int,
 ) -> SetupRecord:
     sessions = slot.sessions()
     rng = random.Random()  # noqa: S311  # Shuffles timing order; not a secret.
@@ -262,11 +289,21 @@ def _measure(
             )
             taus.append(again.speedup)
             entry = entry.model_copy(update={"identity_speedup": statistics.fmean(taus)})
+    except ResourceError as error:  # Recorded, and retried once by the next measure phase.
+        return SetupRecord(
+            instance_id=inst.instance_id,
+            base_failure=str(error),
+            resource_failures=resource_failures + 1,
+            timeout_rechecked=True,
+            base_wall_s=time.monotonic() - began,
+        )
     except (QueryError, QueryTimeoutError) as error:
         return SetupRecord(
             instance_id=inst.instance_id,
             base_failure=str(error),
             base_timed_out=isinstance(error, QueryTimeoutError),
+            resource_failures=resource_failures,
+            timeout_rechecked=True,
             base_wall_s=time.monotonic() - began,
         )
     cache.put(entry)
@@ -296,6 +333,28 @@ def official_task(
         gold_summary = GradeSummary.of(_no_grader_error(slot, gold), keep_feedback=False)
         identity = evaluate(sessions, inst, inst.base_sql, Mode.OFFICIAL, cache=None, rng=rng)
         return gold_summary, GradeSummary.of(_no_grader_error(slot, identity))
+
+    return _resetting(slot, work)
+
+
+def recheck_task(
+    slot: GradingSlot, inst: EffiSqlInstance, gold_sql: str | None, identity: bool
+) -> tuple[GradeSummary | None, GradeSummary | None]:
+    """The recheck phase for one task, in official mode on an idle grading instance: the gold,
+    when its dev-mode speedup was marginal, and the identity submission, when its τ was off."""
+
+    def work() -> tuple[GradeSummary | None, GradeSummary | None]:
+        sessions = slot.sessions()
+        rng = random.Random()  # noqa: S311  # Shuffles timing order; not a secret.
+        gold = None
+        if gold_sql is not None:
+            graded = evaluate(sessions, inst, gold_sql, Mode.OFFICIAL, cache=None, rng=rng)
+            gold = GradeSummary.of(_no_grader_error(slot, graded), keep_feedback=False)
+        same = None
+        if identity:
+            graded = evaluate(sessions, inst, inst.base_sql, Mode.OFFICIAL, cache=None, rng=rng)
+            same = GradeSummary.of(_no_grader_error(slot, graded))
+        return gold, same
 
     return _resetting(slot, work)
 
@@ -435,6 +494,12 @@ async def run_phase(
         pending = [t for t in tasks if _needs_measuring(records.get(t.instance_id))]
         pending.sort(key=lambda t: -(t.base_time or 0.0))  # Longest first, to finish together.
         jobs = [(task, _measure_job(task, cache)) for task in pending]
+    elif phase == "recheck":
+        jobs = [
+            (task, _recheck_job(task))
+            for task in tasks
+            if (record := records.get(task.instance_id)) is not None and _needs_recheck(record)
+        ]
     elif phase == "official":
         wanted = set(val)
         jobs = [
@@ -480,11 +545,47 @@ async def run_phase(
 
 
 def _needs_measuring(record: SetupRecord | None) -> bool:
+    """Say whether a task needs (another) measure: never measured, a grader failure, a first
+    failure for lack of server resources (retried once), or a base that timed out under the
+    old client-side clock (measured again under the server's statement_timeout)."""
     if record is None:
         return True
     if record.base is None:
-        return record.base_failure is None
+        if record.base_failure is None:
+            return True
+        if _resource_failures(record) == 1:
+            return True
+        return record.base_timed_out and not record.timeout_rechecked
     return record.gold is not None and record.gold.status == _GRADER_ERROR
+
+
+def _resource_failures(record: SetupRecord) -> int:
+    """The attempts the server ran out of resources on; old records only say so in words."""
+    if record.resource_failures:
+        return record.resource_failures
+    failure = (record.base_failure or "").lower()
+    return int(any(sign in failure for sign in _RESOURCE_SIGNS))
+
+
+def _marginal_gold(record: SetupRecord) -> bool:
+    gold = record.gold
+    return (
+        gold is not None
+        and gold.matched
+        and gold.speedup is not None
+        and MARGINAL_GOLD[0] <= gold.speedup < MARGINAL_GOLD[1]
+    )
+
+
+def _off_identity(record: SetupRecord) -> bool:
+    base = record.base
+    return base is not None and not _within(base.identity_speedup, IDENTITY_TOLERANCE)
+
+
+def _needs_recheck(record: SetupRecord) -> bool:
+    gold = _marginal_gold(record) and record.gold_recheck is None
+    identity = _off_identity(record) and record.identity_recheck is None
+    return gold or identity
 
 
 def _needs_official(record: SetupRecord) -> bool:
@@ -493,8 +594,25 @@ def _needs_official(record: SetupRecord) -> bool:
 
 
 def _measure_job(task: EffiSqlInstance, cache: BaseCache) -> _Job:
-    async def job(runner: SlotRunner, _: SetupRecord | None) -> SetupRecord:
-        return await runner.call(measure_task, task, task.optimized_sql, cache)
+    async def job(runner: SlotRunner, record: SetupRecord | None) -> SetupRecord:
+        failures = 0 if record is None else _resource_failures(record)
+        return await runner.call(measure_task, task, task.optimized_sql, cache, failures)
+
+    return job
+
+
+def _recheck_job(task: EffiSqlInstance) -> _Job:
+    async def job(runner: SlotRunner, record: SetupRecord | None) -> SetupRecord:
+        if record is None:
+            raise ValueError(f"task {task.instance_id} was not measured")
+        gold_sql = task.optimized_sql if _marginal_gold(record) else None
+        gold, identity = await runner.call(recheck_task, task, gold_sql, _off_identity(record))
+        return record.model_copy(
+            update={
+                "gold_recheck": gold or record.gold_recheck,
+                "identity_recheck": identity or record.identity_recheck,
+            }
+        )
 
     return job
 
@@ -562,6 +680,10 @@ class SetupSummary(_Model):
     review: list[str]  # Kept golds that a hard-coding check flagged: review decides.
     data: dict[str, list[str]]  # Data check outcome: tasks.
     identity_failures: dict[str, float | None]  # Kept tasks whose identity τ is off.
+    identity_rechecks: dict[str, list[float | None]]  # Task: [τ under load, τ idle, official].
+    gold_rechecks: dict[str, list[float | None]]  # Task: [dev-mode speedup, official speedup].
+    exclusions_by_reason: dict[str, int]
+    exclusions_by_split: dict[str, int]
     gold_failures: list[str]  # Kept tasks whose gold check fails (should be none).
     negative_sample: list[str]  # The sample the negative checks must cover.
     negative_tasks: list[str]  # The tasks they did cover.
@@ -604,6 +726,7 @@ def summarize(
     tasks: Mapping[str, EffiSqlInstance] | None = None,
     manual: Sequence[Exclusion] = (),
     identity_tolerance: float = IDENTITY_TOLERANCE,
+    splits: Mapping[str, str] | None = None,
 ) -> SetupSummary:
     """Decide the exclusions and check the setup's results (spec §4.1).
 
@@ -677,11 +800,28 @@ def summarize(
         review=[task for task in kept if (gold := records[task].gold) is not None and gold.flagged],
         data=data,
         identity_failures={
-            task: base.identity_speedup
+            task: tau
             for task in kept
-            if (base := records[task].base) is not None
-            and not _within(base.identity_speedup, identity_tolerance)
+            if records[task].base is not None
+            and not _within(tau := _identity_tau(records[task]), identity_tolerance)
         },
+        identity_rechecks={
+            task: [
+                record.base.identity_speedup if record.base else None,
+                record.identity_recheck.speedup,
+            ]
+            for task in present
+            if (record := records[task]).identity_recheck is not None
+        },
+        gold_rechecks={
+            task: [record.gold.speedup if record.gold else None, record.gold_recheck.speedup]
+            for task in present
+            if (record := records[task]).gold_recheck is not None
+        },
+        exclusions_by_reason=_count(_reason_kind(e.reason) for e in exclusions),
+        exclusions_by_split=_count(
+            (splits or {}).get(e.instance_id, "unsplit") for e in exclusions
+        ),
         gold_failures=[
             task
             for task in kept
@@ -718,6 +858,27 @@ def summarize(
             ),
         },
     )
+
+
+def _identity_tau(record: SetupRecord) -> float | None:
+    """The identity τ the self-check reads: the idle re-measure if there is one (ruling)."""
+    recheck = record.identity_recheck
+    if recheck is not None and recheck.status == _GRADED and recheck.speedup is not None:
+        return recheck.speedup
+    return record.base.identity_speedup if record.base is not None else None
+
+
+def _reason_kind(reason: str) -> str:
+    if "faster than base_sql" in reason:
+        return "gold under 1.2x"
+    return reason.split(":")[0]
+
+
+def _count(values: Iterable[str]) -> dict[str, int]:
+    counts: dict[str, int] = {}
+    for value in values:
+        counts[value] = counts.get(value, 0) + 1
+    return dict(sorted(counts.items()))
 
 
 def _has_grader_error(record: SetupRecord) -> bool:
@@ -759,7 +920,13 @@ def to_markdown(summary: SetupSummary) -> str:
         "- Data check: "
         + ", ".join(f"{outcome} {len(tasks)}" for outcome, tasks in summary.data.items())
         + (f"; failures {summary.data['fail']}" if summary.data["fail"] else ""),
-        f"- Identity τ outside the tolerance (kept tasks): {listed(summary.identity_failures)}",
+        f"- Exclusions by reason {summary.exclusions_by_reason}, by split "
+        f"{summary.exclusions_by_split}",
+        f"- Marginal golds graded again in official mode [dev, official]: "
+        f"{listed(summary.gold_rechecks)}",
+        f"- Identity τ outside the tolerance (kept tasks, the idle re-measure when there is "
+        f"one): {listed(summary.identity_failures)}; re-measured idle [under load, idle]: "
+        f"{listed(summary.identity_rechecks)}",
         f"- Gold check failures (kept tasks): {listed(summary.gold_failures)}",
         f"- Negative checks: sample {summary.negative_sample}, run on {summary.negative_tasks}; "
         f"failures {listed(summary.negative_failures)}",
