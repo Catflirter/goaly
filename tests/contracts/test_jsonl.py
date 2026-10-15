@@ -98,6 +98,11 @@ def test_writes_int64_values_as_strings_without_losing_precision() -> None:
     assert from_json_line(line, Usage) == message
 
 
+def test_writes_a_row_count_as_a_json_number() -> None:
+    # Counts are int32, which JSON holds as numbers; int64 would be a string such as "3".
+    assert parse(to_json_line(SqlResult(row_count=3)))["row_count"] == 3
+
+
 @pytest.mark.parametrize(
     ("value", "written"), [(math.nan, "NaN"), (math.inf, "Infinity"), (-math.inf, "-Infinity")]
 )

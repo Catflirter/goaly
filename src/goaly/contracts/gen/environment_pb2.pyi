@@ -34,7 +34,9 @@ class SqlResult(_message.Message):
     ERROR_FIELD_NUMBER: _builtins.int
     ELAPSED_S_FIELD_NUMBER: _builtins.int
     row_count: _builtins.int
-    """How many rows the statement returned, before truncation."""
+    """For a statement that returns rows, how many it returned before truncation; for any other
+    statement, how many rows it affected, as the database reports it.
+    """
     truncated: _builtins.bool
     """True if rows holds only the first of the row_count rows."""
     error: _builtins.str
@@ -48,8 +50,9 @@ class SqlResult(_message.Message):
     @_builtins.property
     def rows(self) -> _containers.RepeatedCompositeFieldContainer[_struct_pb2.ListValue]:
         """The rows, in order, each a list of one value per column; only the first rows if truncated.
-        SQL NULL is a null value, so it stays distinct from the string "NULL". A NaN or infinite
-        float must be a string: protobuf's JSON mapping cannot write it as a number.
+        SQL NULL is a null value, so it stays distinct from the string "NULL". Integers beyond
+        ±2^53 and numeric values are strings, so no precision is lost. So are NaN and infinite
+        floats, which protobuf's JSON mapping cannot write as numbers.
         """
 
     def __init__(
