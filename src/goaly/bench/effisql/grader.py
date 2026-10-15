@@ -65,6 +65,7 @@ __all__ = [
     "Psycopg2Timestamptz",
     "QueryError",
     "QueryTimeoutError",
+    "ResourceError",
     "ResultDigest",
     "Timing",
     "TimingError",
@@ -224,6 +225,13 @@ class QueryTimeoutError(GradingFailure):
 
 class GraderError(GradingFailure):
     """The grader's own infrastructure failed, such as a lost connection: nothing was measured."""
+
+
+class ResourceError(GraderError):
+    """The server ran out of a resource (SQLSTATE class 53), such as shared memory or disk.
+
+    It says nothing about the query, so it is the grader's failure, retried once.
+    """
 
 
 @dataclass(frozen=True, slots=True)
@@ -563,6 +571,8 @@ class PgSession:
             return QueryTimeoutError(f"stopped by the {self._hard_cap_s:g} s hard cap")
         if isinstance(error, psycopg.errors.QueryCanceled):
             return QueryTimeoutError(f"{_message(error)} ({self._timeout_s:g} s)")
+        if (error.sqlstate or "").startswith("53"):
+            return ResourceError(f"the server ran out of resources: {_message(error)}")
         return QueryError(_message(error))
 
 

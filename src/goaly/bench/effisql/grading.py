@@ -198,6 +198,7 @@ class BaseEntry(BaseModel):
     model_config = ConfigDict(frozen=True, extra="forbid")
 
     instance_id: str
+    mode: Mode = Mode.DEV  # The grading mode the entry serves; part of the cache key.
     base_sql_sha256: str  # The entry belongs to this base_sql only.
     row_count: int
     row_hash_sum: str
@@ -224,10 +225,15 @@ def _sql_sha256(sql: str) -> str:
 
 
 class BaseCache:
-    """One JSON file per task under ``directory``, each written atomically."""
+    """One JSON file per task under ``directory``, each written atomically.
 
-    def __init__(self, directory: Path) -> None:
+    An entry is keyed by the grading mode, the task and its ``base_sql``: a lookup in one mode
+    never returns an entry for another, nor for another base query.
+    """
+
+    def __init__(self, directory: Path, *, mode: Mode = Mode.DEV) -> None:
         self.directory = directory
+        self.mode = mode
 
     def path(self, instance_id: str) -> Path:
         return self.directory / f"{instance_id}.json"
@@ -243,9 +249,12 @@ class BaseCache:
             _log.warning("ignoring an unreadable base cache entry", extra={"path": str(path)})
             _log.debug("base cache error", exc_info=error)
             return None
-        return entry if entry.base_sql_sha256 == _sql_sha256(inst.base_sql) else None
+        key = (entry.mode, entry.base_sql_sha256)
+        return entry if key == (self.mode, _sql_sha256(inst.base_sql)) else None
 
     def put(self, entry: BaseEntry) -> None:
+        if entry.mode is not self.mode:
+            raise ValueError(f"a {entry.mode} entry does not belong in the {self.mode} cache")
         write_private(self.path(entry.instance_id), entry.model_dump_json(indent=2) + "\n")
 
     def put_measured(self, inst: EffiSqlInstance, entry: BaseEntry) -> None:
@@ -313,10 +322,8 @@ class GradingSessions:
 
 
 def _base_relations(document: dict[str, Any]) -> frozenset[str]:
-    relations = scanned_relations(document)
-    if not relations:
-        raise GraderError("the base query's plan scans no table, so the plan check cannot run")
-    return relations
+    """The tables the base query's plan scans; none means the plan check does not apply."""
+    return scanned_relations(document)
 
 
 def measure_base(

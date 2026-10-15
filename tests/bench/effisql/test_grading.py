@@ -417,6 +417,13 @@ class TestBaseCache:
         assert cache.get(INST) == entry()
         assert (tmp_path / "dev" / "7.json").stat().st_mode & 0o777 == 0o600
 
+    def test_the_grading_mode_is_part_of_the_key(self, tmp_path: Path) -> None:
+        official = BaseCache(tmp_path, mode=Mode.OFFICIAL)
+        BaseCache(tmp_path).put(entry())
+        assert official.get(INST) is None
+        with pytest.raises(ValueError, match="does not belong"):
+            official.put(entry())
+
     def test_an_entry_for_another_base_sql_is_ignored(self, tmp_path: Path) -> None:
         cache = BaseCache(tmp_path)
         cache.put(entry(base_sql_sha256="0" * 64))
@@ -511,9 +518,10 @@ class TestReviewFixes:
         assert kept is not None
         assert kept.identity_speedup == 1.02
 
-    def test_a_base_without_tables_is_a_grader_error(self) -> None:
-        main = main_session()
+    def test_the_plan_check_does_not_apply_to_a_base_without_tables(self) -> None:
+        main = main_session(pred_plan=plan())
         main.plans[BASE_SQL] = plan()
         grade = grade_official(main, alt_session())
-        assert grade.status == GRADE_STATUS_GRADER_ERROR
-        assert "scans no table" in grade.feedback
+        assert grade.status == GRADE_STATUS_GRADED
+        assert grade.effisql.matched
+        assert not grade.effisql.literal_result
