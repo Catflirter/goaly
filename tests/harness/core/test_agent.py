@@ -1186,6 +1186,19 @@ async def test_a_long_chat_folds_its_oldest_tool_outputs() -> None:
     assert rebuilt_prompts(trajectory, keep_turns=2) == sent(llm)
 
 
+async def test_the_last_eight_turns_never_fold() -> None:
+    calls = [page(n) for n in range(10)]
+    script = [reply(call, usage=counted(10_000 * (n + 1))) for n, call in enumerate(calls)]
+    llm = FakeLLM([*script, reply(submit())])
+    ctx = context(llm, window=ContextWindow(fold_above_tokens=1000))  # The default 8-turn tail.
+
+    await run_agent(environment(), ctx, hooks())
+
+    last = [m.content for m in sent(llm)[10] if m.role == TOOL]
+    assert last == [folded(0), folded(1), *(big(n) for n in range(2, 10))]
+    assert rebuilt_prompts(ctx.trajectory()) == sent(llm)
+
+
 async def test_only_the_last_turns_go_out_with_their_reasoning() -> None:
     script = [reply(execute_sql(FAST), reasoning=f"Thought {n}.") for n in range(3)]
     llm = FakeLLM([*script, reply(submit())])

@@ -106,13 +106,12 @@ _REMINDER: Final = (
 class AgentContext:
     """One task's context for the agent loop: its model, budgets and trajectory (spec §5.1).
 
-    The runner's context factory builds one for each task and replicate seed (T06), and T11
-    wires in the pack's config, its ``budgets``, request ``params`` and context ``window``
-    (ContextWindow's defaults if none), and ``llm``: the client
-    bound to purpose exec, the executor model, and the task's run, instance and seed
-    (LlmClient.bind). A pack reaches the model only through :func:`run_agent`, so it can choose
-    neither the purpose nor the model, and every call it makes is held to the budgets and
-    recorded (spec §8.5).
+    The runner's context factory builds one for each task and replicate seed (T06). T11 wires
+    in the pack's config, its ``budgets``, request ``params`` and context ``window``
+    (ContextWindow's defaults if none), and ``llm``: the client bound to purpose exec, the
+    executor model, and the task's run, instance and seed (LlmClient.bind). A pack reaches the
+    model only through :func:`run_agent`, so it can choose neither the purpose nor the model,
+    and every call it makes is held to the budgets and recorded (spec §8.5).
 
     The context is the task's: every loop a policy runs with it adds a chat to one trajectory
     and spends the same budgets, whose wall clock starts with the first loop.
