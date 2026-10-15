@@ -39,7 +39,9 @@ __all__ = [
 ]
 
 DEFAULT_MAX_ATTEMPTS: Final = 3
-_FENCE = re.compile(r"```(?:json)?[ \t]*\n(.*?)\n?```", re.DOTALL)
+# A fenced block: its language label, if any, and its body. Matched left to right, so a closing
+# fence is never taken for an opening one.
+_FENCE = re.compile(r"```([\w+-]*)[ \t]*\n(.*?)\n?```", re.DOTALL)
 _ERRORS_SHOWN: Final = 20  # How many validation errors a retry quotes.
 _INPUT_QUOTED: Final = 200  # How much of an invalid value an error quotes.
 _CUT_OFF: Final = (
@@ -154,22 +156,30 @@ def _validate[M: BaseModel](
     """Return the reply's value, or None and what is wrong with it, in words."""
     if reply.finish_reason == "length":
         return None, _CUT_OFF
-    text = _json_text(reply.message.content)
-    if not text:
+    candidates = _json_candidates(reply.message.content)
+    if not candidates:
         return None, "The answer held no JSON object: the content was empty."
-    try:
-        return schema.model_validate_json(text, context=dict(context or {})), ""
-    except ValidationError as error:
-        return None, _describe(error)
+    problems = ""
+    for text in candidates:
+        try:
+            return schema.model_validate_json(text, context=dict(context or {})), ""
+        except ValidationError as error:
+            problems = problems or _describe(error)  # The likeliest candidate's problems.
+    return None, problems
 
 
-def _json_text(content: str) -> str:
-    """Return the JSON in ``content``: a fenced block's body, else the first { to the last }."""
-    fenced = _FENCE.search(content)
-    if fenced:
-        return fenced.group(1).strip()
+def _json_candidates(content: str) -> list[str]:
+    """Return where the JSON may be in ``content``, likeliest first.
+
+    That is: ```json blocks, then other fenced blocks, then the text from the first { to the
+    last }, or else the whole content. Empty candidates are left out.
+    """
+    blocks = [(label.lower(), body.strip()) for label, body in _FENCE.findall(content)]
+    candidates = [body for label, body in blocks if label == "json"]
+    candidates += [body for label, body in blocks if label != "json"]
     start, end = content.find("{"), content.rfind("}")
-    return content[start : end + 1] if 0 <= start < end else content.strip()
+    candidates.append(content[start : end + 1] if 0 <= start < end else content.strip())
+    return [text for text in dict.fromkeys(candidates) if text]
 
 
 def _describe(error: ValidationError) -> str:
