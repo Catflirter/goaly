@@ -1229,6 +1229,24 @@ async def test_the_last_eight_turns_never_fold() -> None:
     assert rebuilt_prompts(ctx.trajectory()) == sent(llm)
 
 
+async def test_each_prompt_keeps_the_reasoning_of_the_chats_last_turns_before_it() -> None:
+    script = [reply(execute_sql(f"SELECT {n}"), reasoning=f"Thought {n}.") for n in range(4)]
+    llm = FakeLLM([*script, reply(submit())])
+    ctx = context(llm, window=ContextWindow(keep_turns=2))
+
+    await run_agent(environment(), ctx, hooks())
+
+    kept = [[m.reasoning_content for m in prompt if m.role == ASSISTANT] for prompt in sent(llm)]
+    assert kept == [
+        [],
+        ["Thought 0."],
+        ["Thought 0.", "Thought 1."],
+        ["", "Thought 1.", "Thought 2."],
+        ["", "", "Thought 2.", "Thought 3."],
+    ]
+    assert rebuilt_prompts(ctx.trajectory(), keep_turns=2) == sent(llm)
+
+
 async def test_only_the_last_turns_go_out_with_their_reasoning() -> None:
     script = [reply(execute_sql(FAST), reasoning=f"Thought {n}.") for n in range(3)]
     llm = FakeLLM([*script, reply(submit())])

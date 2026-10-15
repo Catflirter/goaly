@@ -253,3 +253,19 @@ def test_with_no_turns_to_keep_no_reasoning_goes_out() -> None:
     prompt.add_turn(0, thinking(0, "r" * 400))
 
     assert [m.reasoning_content for m in prompt.messages() if m.role == ASSISTANT] == [""]
+
+
+def test_the_reasoning_tail_is_the_chats_last_turns_before_the_next_call() -> None:
+    # The steps are global: other chats' steps came between, and do not count.
+    prompt = ChatPrompt(OPENING, TOOLS, window(keep_turns=2))
+    kept = []
+    for step in (0, 3, 4, 9):
+        prompt.add_turn(step, thinking(step, f"thought {step}"))
+        kept.append([m.reasoning_content for m in prompt.messages() if m.role == ASSISTANT])
+
+    assert kept == [
+        ["thought 0"],
+        ["thought 0", "thought 3"],
+        ["", "thought 3", "thought 4"],
+        ["", "", "thought 4", "thought 9"],
+    ]
