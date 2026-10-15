@@ -208,3 +208,13 @@ def test_nothing_is_named_benchmark(files: list[FileDescriptorProto]) -> None:
     names += [enum.name for file in files for enum, _ in enums(file)]
 
     assert "Benchmark" not in names
+
+
+def test_enum_values_are_declared_in_numeric_order(files: list[FileDescriptorProto]) -> None:
+    # An order that matters, such as the order guards run in, is stated in the enum's comment.
+    assert [
+        f"{file.name}: {enum.name}"
+        for file in files
+        for enum, _ in enums(file)
+        if [value.number for value in enum.value] != sorted(value.number for value in enum.value)
+    ] == []
