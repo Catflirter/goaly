@@ -1,3 +1,6 @@
-# Written by scripts/protogen.py (make proto): GitHub collapses these files in diffs.
-src/goaly/contracts/gen/*_pb2.py linguist-generated
-src/goaly/contracts/gen/*_pb2.pyi linguist-generated
+# Written by scripts/protogen.py (make proto) and compared byte for byte by make proto-check:
+# GitHub collapses them in diffs, and every checkout keeps their LF line endings.
+src/goaly/contracts/gen/*_pb2.py linguist-generated text eol=lf
+src/goaly/contracts/gen/*_pb2.pyi linguist-generated text eol=lf
+# The generator's input: protoc copies comments into the stubs, line endings included.
+proto/**/*.proto text eol=lf
