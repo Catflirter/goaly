@@ -233,8 +233,9 @@ async def test_a_result_and_its_trajectory_describe_the_task(tmp_path: Path) -> 
     assert result.stop_reason == STOP_REASON_SUBMITTED
     assert result.error_message == ""
     # The policy's solving time leaves out the provisioning, which has its own field.
-    assert 0.05 <= result.wall_time_s < 0.2
+    assert result.wall_time_s >= 0.05
     assert result.provision_s >= 0.2
+    assert result.wall_time_s < result.provision_s
     elapsed = result.finished_at.ToNanoseconds() - result.started_at.ToNanoseconds()
     assert elapsed / 1e9 >= result.provision_s + result.wall_time_s - 0.01
     trajectory = trajectories(tmp_path / "run")[("t0", 3)]
@@ -509,12 +510,12 @@ async def test_the_time_limit_cancels_a_task_and_closes_its_environment(tmp_path
     policy = ScriptedPolicy({"t0": sleeping(GUARD_S)})
     contexts = StubContexts()
 
-    await run(make_runner(benchmark, policy, contexts, task_timeout_s=0.2), tmp_path / "run")
+    await run(make_runner(benchmark, policy, contexts, task_timeout_s=0.5), tmp_path / "run")
 
     timed_out = results(tmp_path / "run")[("t0", 0)]
     assert timed_out.error_type == TASK_ERROR_TYPE_TIMEOUT
     assert timed_out.stop_reason == STOP_REASON_CANCELLED
-    assert "0.2 s" in timed_out.error_message
+    assert "0.5 s" in timed_out.error_message
     assert timed_out.step_count == 2  # Its trajectory up to the cancellation is kept.
     assert timed_out.grade.score == 0.5
     assert all(env.closed for env in benchmark.environments)

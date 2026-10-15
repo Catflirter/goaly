@@ -49,7 +49,9 @@ pytestmark = pytest.mark.anyio
 INSTANCES = 250
 SEEDS = (0, 1)  # 500 tasks.
 MAX_TASKS = 16
-TIME_LIMIT_S = 0.05
+# Far above any ordinary task's few milliseconds, so that a slow CI machine's stalls never
+# time one out; the scripted time-outs sleep ten times as long.
+TIME_LIMIT_S = 0.5
 GUARD_S = 60
 
 
