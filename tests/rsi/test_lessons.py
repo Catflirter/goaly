@@ -1,5 +1,7 @@
 """Tests for goaly.rsi.lessons: the lessons store and the generated lessons.md."""
 
+import os
+import re
 import subprocess
 import sys
 from collections.abc import Callable
@@ -11,12 +13,16 @@ from google.protobuf import json_format
 from google.protobuf.timestamp_pb2 import Timestamp
 
 from goaly.contracts.gen.experiment_pb2 import (
+    DECISION_PENDING,
     LANE_EFFISQL,
     LANE_SWE,
     LANE_UNSPECIFIED,
+    ExperimentRecord,
+    Hypothesis,
     Lane,
     Lesson,
 )
+from goaly.rsi import lessons
 from goaly.rsi.ledger import Ledger
 from goaly.rsi.lessons import LessonNotFoundError, LessonStore, render_markdown
 
@@ -35,9 +41,26 @@ def ticking_clock() -> Callable[[], datetime]:
     return lambda: next(moments)
 
 
+def record_experiments(ledger: Ledger, *experiment_ids: str, lane: Lane.ValueType) -> None:
+    for experiment_id in experiment_ids:
+        ledger.record_experiment(
+            ExperimentRecord(
+                experiment_id=experiment_id,
+                lane=lane,
+                round=1,
+                decision=DECISION_PENDING,
+                hypothesis=Hypothesis(hypothesis_id=f"h-{experiment_id}"),
+            )
+        )
+
+
 @pytest.fixture
 def ledger(tmp_path: Path) -> Ledger:
-    return Ledger(tmp_path / "ledger")
+    """A ledger that holds the experiments the lessons below cite."""
+    ledger = Ledger(tmp_path / "ledger")
+    record_experiments(ledger, "e1", "e2", "e3", "e4", "e9", lane=LANE_EFFISQL)
+    record_experiments(ledger, "s0", lane=LANE_SWE)
+    return ledger
 
 
 @pytest.fixture
@@ -102,6 +125,9 @@ def test_an_unknown_lesson_is_none(store: LessonStore) -> None:
         ("l1", LANE_UNSPECIFIED, "text", [], "lane"),
         ("l1", LANE_EFFISQL, " \n ", [], "text"),
         ("l1", LANE_EFFISQL, "text", ["e1", "bad id"], "experiment_id"),
+        # A lesson cites only experiments of its own lane that the ledger holds.
+        ("l1", LANE_EFFISQL, "text", ["e1", "e404"], "e404"),
+        ("l1", LANE_SWE, "text", ["e1"], "e1"),
     ],
 )
 def test_an_invalid_lesson_is_refused_and_nothing_is_written(
@@ -134,6 +160,20 @@ def test_repeated_evidence_is_kept_once(store: LessonStore) -> None:
     assert list(lesson.experiment_ids) == ["e1", "e2"]
 
 
+def test_a_failed_render_stores_nothing(
+    store: LessonStore, ledger: Ledger, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    def fail(lessons: object) -> str:
+        raise RuntimeError("cannot render")
+
+    monkeypatch.setattr(lessons, "render_markdown", fail)
+
+    with pytest.raises(RuntimeError, match="cannot render"):
+        store.add("l1", LANE_EFFISQL, "text")
+
+    assert not (ledger.directory / "lessons.jsonl").exists()
+
+
 # Helped and hurt counters.
 
 
@@ -162,6 +202,16 @@ def test_marking_an_experiment_again_changes_nothing(store: LessonStore, ledger:
     assert jsonl_lines(ledger) == 2
 
 
+def test_a_retried_mark_regenerates_lessons_md(store: LessonStore, ledger: Ledger) -> None:
+    store.add("l1", LANE_EFFISQL, "text")
+    store.mark_helped("l1", "e2")
+    (ledger.directory / "lessons.md").unlink()  # As if the lane crashed before writing it.
+
+    store.mark_helped("l1", "e2")
+
+    assert "`l1`: helped 1, hurt 0" in markdown(ledger)
+
+
 def test_an_experiment_cannot_both_help_and_hurt_a_lesson(store: LessonStore) -> None:
     store.add("l1", LANE_EFFISQL, "text")
     store.mark_helped("l1", "e2")
@@ -180,6 +230,18 @@ def test_marking_needs_a_valid_experiment_id(store: LessonStore) -> None:
 
     with pytest.raises(ValueError, match="experiment_id"):
         store.mark_hurt("l1", "not valid")
+
+
+@pytest.mark.parametrize("experiment_id", ["e404", "s0"])
+def test_marking_needs_an_experiment_of_the_lessons_lane(
+    store: LessonStore, ledger: Ledger, experiment_id: str
+) -> None:
+    store.add("l1", LANE_EFFISQL, "text")
+
+    with pytest.raises(ValueError, match=experiment_id):
+        store.mark_helped("l1", experiment_id)
+
+    assert jsonl_lines(ledger) == 1
 
 
 # Deleting lessons.
@@ -213,6 +275,16 @@ def test_deleting_a_lesson_again_changes_nothing(store: LessonStore, ledger: Led
     store.delete("l1")
 
     assert jsonl_lines(ledger) == 2
+
+
+def test_a_retried_delete_regenerates_lessons_md(store: LessonStore, ledger: Ledger) -> None:
+    store.add("l1", LANE_EFFISQL, "text")
+    store.delete("l1")
+    (ledger.directory / "lessons.md").unlink()  # As if the lane crashed before writing it.
+
+    store.delete("l1")
+
+    assert "No lessons yet." in markdown(ledger)
 
 
 def test_deleting_an_unknown_lesson_is_an_error(store: LessonStore) -> None:
@@ -263,8 +335,10 @@ for n in range(int(sys.argv[3])):
 def test_two_processes_marking_one_lesson_lose_no_update(
     store: LessonStore, ledger: Ledger
 ) -> None:
-    store.add("l1", LANE_EFFISQL, "text")
     count = 40
+    marked = [f"{prefix}-{n}" for prefix in ("a", "b") for n in range(count)]
+    record_experiments(ledger, *marked, lane=LANE_EFFISQL)
+    store.add("l1", LANE_EFFISQL, "text")
     markers = [
         subprocess.Popen(  # noqa: S603  (a fixed script and arguments built here)
             [sys.executable, "-c", MARKER, str(ledger.directory), prefix, str(count)],
@@ -281,9 +355,7 @@ def test_two_processes_marking_one_lesson_lose_no_update(
     lesson = store.get("l1")
 
     assert lesson is not None
-    assert sorted(lesson.helped_by) == sorted(
-        f"{prefix}-{n}" for prefix in ("a", "b") for n in range(count)
-    )
+    assert sorted(lesson.helped_by) == sorted(marked)
 
 
 # lessons.md.
@@ -373,6 +445,12 @@ def test_render_markdown_with_no_lessons() -> None:
     )
 
 
+def test_render_markdown_names_a_lane_it_does_not_know_by_number() -> None:
+    unknown = Lesson(lesson_id="x1", lane=Lane.ValueType(99), text="From a newer lane.")
+
+    assert "## Lane 99\n\n### `x1`: helped 0, hurt 0" in render_markdown([unknown])
+
+
 def test_every_write_regenerates_lessons_md(store: LessonStore, ledger: Ledger) -> None:
     store.add("l1", LANE_EFFISQL, "Keep the identity fallback.")
     assert markdown(ledger) == render_markdown(store.lessons())
@@ -380,6 +458,29 @@ def test_every_write_regenerates_lessons_md(store: LessonStore, ledger: Ledger) 
     store.mark_helped("l1", "e9")
     assert "helped 1, hurt 0" in markdown(ledger)
     assert markdown(ledger) == render_markdown(store.lessons())
+
+
+def test_lessons_md_is_synced_and_stale_temporary_files_are_cleared(
+    store: LessonStore, ledger: Ledger, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    stale = ledger.directory / ".lessons.md.0123456789abcdef.tmp"
+    stale.write_text("left by a crash\n", encoding="utf-8")
+    synced: list[str] = []
+    real_fsync = os.fsync
+
+    def fsync(descriptor: int) -> None:
+        synced.append(str(Path(f"/proc/self/fd/{descriptor}").readlink()))
+        real_fsync(descriptor)
+
+    monkeypatch.setattr(os, "fsync", fsync)
+
+    store.add("l1", LANE_EFFISQL, "text")
+
+    assert not stale.exists()
+    temporary = [n for n, path in enumerate(synced) if re.search(r"/\.lessons\.md\.\w+\.tmp", path)]
+    assert len(temporary) == 1
+    # The new page is synced before it replaces the old one, and the directory after.
+    assert synced[temporary[0] + 1 :] == [str(ledger.directory)]
 
 
 def test_write_markdown_rebuilds_a_missing_page(store: LessonStore, ledger: Ledger) -> None:

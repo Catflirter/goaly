@@ -31,8 +31,8 @@ from pathlib import Path
 
 from goaly.contracts.gen.experiment_pb2 import Lane
 from goaly.rsi.git import GitError, run_git, run_git_unless_no
+from goaly.rsi.ids import check_id
 from goaly.rsi.lanes import lane_info
-from goaly.rsi.ledger import check_id
 from goaly.rsi.locks import file_lock
 
 __all__ = [

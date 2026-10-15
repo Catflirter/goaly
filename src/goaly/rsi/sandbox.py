@@ -28,8 +28,8 @@ from pathlib import Path
 from pydantic import BaseModel, ConfigDict, Field, field_validator
 
 from goaly.contracts.gen.experiment_pb2 import Lane
+from goaly.rsi.ids import check_id
 from goaly.rsi.lanes import lane_info
-from goaly.rsi.ledger import check_id
 
 __all__ = [
     "DOCKERFILE",
