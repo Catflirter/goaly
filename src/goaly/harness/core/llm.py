@@ -261,8 +261,10 @@ class BoundLlm(Protocol):
 class LlmClient:
     """An async client of the OpenAI-compatible model gateway; the module docstring has more.
 
-    ``profiles`` replace the default profiles of their models (llm_models.DEFAULT_PROFILES),
-    and ``shares`` the default shares, each model's whole budget (llm_throttle.DEFAULT_SHARES).
+    ``profiles`` replace the default profiles of their models (llm_models.DEFAULT_PROFILES).
+    ``shares`` gives every model this process's share of its budget, a positive int each (spec
+    §6.2). The runner passes the shares of the phase it runs in. Without them each model gets its
+    whole budget (llm_throttle.DEFAULT_SHARES), right only for a process that runs alone.
     ``transport``, ``clock`` and ``rng`` are for tests: a mock transport, a clock that skips
     waits, and a seeded source of jitter.
     """
@@ -285,10 +287,15 @@ class LlmClient:
             if profile.model not in self._profiles:
                 raise ValueError(f"no call purpose may use {profile.model}, so it has no profile")
             self._profiles[profile.model] = profile
-        shares = {**DEFAULT_SHARES, **(shares or {})}
-        for model in shares:
-            if model not in self._profiles:
-                raise ValueError(f"no call purpose may use {model}, so it has no share")
+        shares = DEFAULT_SHARES if shares is None else shares
+        if set(shares) != set(self._profiles):
+            raise ValueError(f"the shares must name every model, {sorted(self._profiles)}, only")
+        for model, share in shares.items():
+            if isinstance(share, bool) or not isinstance(share, int) or share < 1:
+                raise ValueError(f"{model}: a share must be a positive int, not {share!r}")
+        _logger.info(
+            "LLM concurrency shares", extra={"event": "llm_shares", "shares": dict(shares)}
+        )
         self._recorder = recorder
         self._retry = RetryPolicy() if retry is None else retry
         self._clock: Clock = SystemClock() if clock is None else clock

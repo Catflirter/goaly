@@ -728,7 +728,7 @@ async def test_slot_waits_count_into_the_attempts_wait() -> None:
     async with LlmClient(
         settings(),
         Recorder(),
-        shares={QWEN: 1},
+        shares={QWEN: 1, GLM: 1},
         transport=httpx.MockTransport(gateway.handle),
         clock=clock,
     ) as llm:
@@ -778,7 +778,10 @@ async def test_bound_clients_share_the_limit_of_the_client_that_bound_them() -> 
 
     gateway = Gateway(*(answer for _ in range(6)))
     async with LlmClient(
-        settings(), Recorder(), shares={QWEN: 2}, transport=httpx.MockTransport(gateway.handle)
+        settings(),
+        Recorder(),
+        shares={QWEN: 2, GLM: 1},
+        transport=httpx.MockTransport(gateway.handle),
     ) as llm:
         tasks = [
             llm.bind(model=QWEN, tags=CallTags(CallPurpose.CALL_PURPOSE_EXEC, instance_id=f"t{n}"))
@@ -827,11 +830,36 @@ async def test_each_model_has_its_own_limit(caplog: pytest.LogCaptureFixture) ->
 
 @pytest.mark.parametrize(
     ("shares", "message"),
-    [({"gpt-4o": 4}, "gpt-4o"), ({QWEN: 0}, "share")],
+    [
+        pytest.param({QWEN: 4}, "every model", id="a-model-missing"),
+        pytest.param({QWEN: 4, GLM: 2, "gpt-4o": 1}, "every model", id="an-unknown-model"),
+        pytest.param({QWEN: 0, GLM: 2}, "positive int", id="zero"),
+        pytest.param({QWEN: True, GLM: 2}, "positive int", id="a-bool"),
+        pytest.param({QWEN: 2.0, GLM: 2}, "positive int", id="a-float"),
+    ],
 )
-def test_the_client_refuses_a_share_it_cannot_use(shares: dict[str, int], message: str) -> None:
+def test_the_client_refuses_shares_it_cannot_use(shares: dict[str, Any], message: str) -> None:
     with pytest.raises(ValueError, match=message):
         LlmClient(settings(), Recorder(), shares=shares)
+
+
+@pytest.mark.parametrize(
+    ("shares", "logged"),
+    [
+        pytest.param(None, {QWEN: 48, GLM: 16}, id="the-whole-budgets"),
+        pytest.param({QWEN: 4, GLM: 2}, {QWEN: 4, GLM: 2}, id="given"),
+    ],
+)
+async def test_logs_the_shares_it_runs_with(
+    shares: dict[str, int] | None, logged: dict[str, int], caplog: pytest.LogCaptureFixture
+) -> None:
+    caplog.set_level(logging.INFO, logger="goaly.harness.core.llm")
+    async with LlmClient(settings(), Recorder(), shares=shares):
+        pass
+
+    (entry,) = events(caplog, "llm_shares")
+    assert entry.levelno == logging.INFO
+    assert getattr(entry, "shares", None) == logged
 
 
 # The stress test (spec §6.2): faults, latency and timeouts, 500 calls at once.
