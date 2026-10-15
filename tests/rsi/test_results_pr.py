@@ -32,6 +32,7 @@ from goaly.contracts.gen.experiment_pb2 import (
     PhaseResult,
 )
 from goaly.rsi import results_pr
+from goaly.rsi.git import GitError
 from goaly.rsi.ledger import Ledger
 from goaly.rsi.notify import NotificationKind
 from goaly.rsi.results_pr import (
@@ -383,36 +384,56 @@ def test_github_errors_name_the_status_but_never_the_token() -> None:
 def test_https_remote_passes_the_token_only_in_the_environment(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    calls: list[tuple[list[str], dict[str, str] | None]] = []
+    runs: list[tuple[list[str], dict[str, str]]] = []
 
-    def fake_git(
-        args: list[str], *, cwd: Path, env: dict[str, str] | None = None, **_: object
-    ) -> str:
-        calls.append((list(args), env))
-        return "abc\n"
+    def fake_run(command: list[str], *, env: dict[str, str], **_: object) -> Any:
+        runs.append((list(command), env))
+        return subprocess.CompletedProcess(command, 0, b"", b"")
 
-    monkeypatch.setattr(results_pr, "run_git", fake_git)
+    monkeypatch.setenv("GIT_DIR", "/elsewhere")  # Dropped, as run_git drops it.
+    monkeypatch.setattr("subprocess.run", fake_run)
+    monkeypatch.setattr(results_pr, "run_git", lambda args, **_: "abc\n")
     remote = HttpsRemote(REPO, lambda: TOKEN)
     assert remote.fetch(tmp_path, "main") == "abc"
     remote.push(tmp_path, "abc", "rsi/effisql/results-1")
     with pytest.raises(ResultsPrError, match="only rsi/"):
         remote.push(tmp_path, "abc", "main")
-    pushes = [args for args, _ in calls if args[0] == "push"]
-    assert pushes == [
-        [
-            "push",
-            "--no-verify",
-            "https://github.com/Catflirter/goaly.git",
-            "abc:refs/heads/rsi/effisql/results-1",
-        ]
+    assert [command[-4:] for command, _ in runs][1] == [
+        "push",
+        "--no-verify",
+        "https://github.com/Catflirter/goaly.git",
+        "abc:refs/heads/rsi/effisql/results-1",
     ]
-    for args, env in calls:
-        assert all(TOKEN not in arg for arg in args)
-        if args[0] in ("fetch", "push"):
-            assert env is not None
-            assert env["GIT_CONFIG_KEY_0"] == "http.https://github.com/.extraheader"
-            assert TOKEN not in env["GIT_CONFIG_VALUE_0"]  # Base64, in a header.
-            assert env["GIT_CONFIG_VALUE_0"].startswith("Authorization: Basic ")
+    for command, env in runs:
+        assert command[0] == "git"
+        assert "core.hooksPath=/dev/null" in command
+        assert all(TOKEN not in part for part in command)
+        assert env["GIT_CONFIG_KEY_0"] == "http.https://github.com/.extraheader"
+        assert TOKEN not in env["GIT_CONFIG_VALUE_0"]  # Base64, in a header.
+        assert env["GIT_CONFIG_VALUE_0"].startswith("Authorization: Basic ")
+        assert env["GIT_CONFIG_GLOBAL"] == "/dev/null"
+        assert "GIT_DIR" not in env
+
+
+def test_https_remote_failures_never_show_the_header(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    def failing(command: list[str], *, env: dict[str, str], **_: object) -> Any:
+        return subprocess.CompletedProcess(command, 128, b"", env["GIT_CONFIG_VALUE_0"].encode())
+
+    monkeypatch.setattr("subprocess.run", failing)
+    remote = HttpsRemote(REPO, lambda: TOKEN)
+    with pytest.raises(GitError) as caught:
+        remote.push(tmp_path, "abc", "rsi/effisql/results-1")
+    assert "Basic" not in str(caught.value)
+    assert "[redacted]" in str(caught.value)
+
+    def slow(command: list[str], **_: object) -> Any:
+        raise subprocess.TimeoutExpired(command, 1)
+
+    monkeypatch.setattr("subprocess.run", slow)
+    with pytest.raises(GitError, match="timed out"):
+        remote.push(tmp_path, "abc", "rsi/effisql/results-1")
 
 
 def test_runtime_token_prefers_the_setting(monkeypatch: pytest.MonkeyPatch) -> None:
