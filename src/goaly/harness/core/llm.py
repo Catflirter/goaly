@@ -119,9 +119,10 @@ _QUOTE_CHARS: Final = 500  # How much of the gateway's error text an error messa
 class RetryPolicy(BaseModel):
     """How long an attempt may take, and how the client retries a failed one (spec §5.1, §6.2).
 
-    ``timeout_s`` runs from sending an attempt's request to reading all of its response. A retry
-    waits for full jitter on an exponential backoff, or for the server's Retry-After when that is
-    longer; either way no longer than ``backoff_cap_s``.
+    ``timeout_s`` runs from sending an attempt's request to reading all of its response; a call
+    may give its attempts longer (LlmClient.complete's ``attempt_timeout_s``). A retry waits for
+    full jitter on an exponential backoff, or for the server's Retry-After when that is longer;
+    either way no longer than ``backoff_cap_s``.
     """
 
     model_config = ConfigDict(frozen=True, extra="forbid", allow_inf_nan=False)
@@ -275,6 +276,7 @@ class BoundLlm(Protocol):
         *,
         tools: Sequence[Mapping[str, JsonValue]] = (),
         params: ModelParams | None = None,
+        attempt_timeout_s: float | None = None,
     ) -> LlmReply:
         """Send ``messages`` and return the assistant's reply, as LlmClient.complete does."""
 
@@ -367,11 +369,14 @@ class LlmClient:
         tags: CallTags,
         tools: Sequence[Mapping[str, JsonValue]] = (),
         params: ModelParams | None = None,
+        attempt_timeout_s: float | None = None,
     ) -> LlmReply:
         """Send ``messages`` to ``model`` and return the assistant's reply.
 
         ``tools`` are OpenAI tool entries, as core's tool registry makes them (T04). ``params``
-        override the fields of the model's profile that they set.
+        override the fields of the model's profile that they set. ``attempt_timeout_s`` gives
+        each of this call's attempts that long instead of RetryPolicy.timeout_s, for a reply
+        that takes longer to write: a GLM answer of 24K tokens, at about 45 tokens/s, needs 900 s.
 
         A purpose that may not use ``model`` raises ModelNotAllowed, and arguments that cannot
         be sent raise ValueError, both before any I/O and with no record. Any other call gets
@@ -382,6 +387,9 @@ class LlmClient:
         self._check_open()
         if allowed_model(tags.purpose) != model:
             raise self._refuse(model, tags)
+        timeout_s = self._retry.timeout_s if attempt_timeout_s is None else attempt_timeout_s
+        if not (math.isfinite(timeout_s) and timeout_s > 0):
+            raise ValueError(f"attempt_timeout_s must be a positive time, not {timeout_s!r}")
         body = _request_body(self._profiles[model].with_overrides(params), messages, tools)
         record = LlmCallRecord(
             call_id=uuid.uuid4().hex,
@@ -394,7 +402,7 @@ class LlmClient:
         record.started_at.GetCurrentTime()
         start = self._clock.monotonic()
         try:
-            response = await self._send(body, record)
+            response = await self._send(body, record, timeout_s)
             _read_usage(response, record)
         finally:
             self._finish(record, start)
@@ -409,6 +417,7 @@ class LlmClient:
         tags: CallTags,
         tools: Sequence[Mapping[str, JsonValue]] = (),
         params: ModelParams | None = None,
+        attempt_timeout_s: float | None = None,
         timeout_s: float | None = None,
     ) -> LlmReply:
         """Make a call from a worker thread: run complete() on the client's loop and wait for it.
@@ -443,7 +452,14 @@ class LlmClient:
         if running is loop:
             raise RuntimeError("complete_sync would block the loop it needs: await complete()")
         self._check_open()
-        call = self.complete(messages, model=model, tags=tags, tools=tools, params=params)
+        call = self.complete(
+            messages,
+            model=model,
+            tags=tags,
+            tools=tools,
+            params=params,
+            attempt_timeout_s=attempt_timeout_s,
+        )
         try:
             future = asyncio.run_coroutine_threadsafe(call, loop)
         except RuntimeError:  # The loop closed since the check above.
@@ -500,11 +516,14 @@ class LlmClient:
         may = f"it may call only {allowed}" if allowed else "it may call no model"
         return ModelNotAllowed(f"{purpose} may not call {model}: {may}")
 
-    async def _send(self, body: bytes, record: LlmCallRecord) -> _WireResponse:
-        """Make attempts until one succeeds, one fails for good, or the retries run out."""
+    async def _send(self, body: bytes, record: LlmCallRecord, timeout_s: float) -> _WireResponse:
+        """Make attempts until one succeeds, one fails for good, or the retries run out.
+
+        Each attempt may take ``timeout_s``.
+        """
         delay = 0.0
         while True:
-            outcome = await self._attempt(record, record.attempts.add(), body, delay)
+            outcome = await self._attempt(record, record.attempts.add(), body, delay, timeout_s)
             if outcome.cost_usd is not None:
                 record.usage.cost_usd += outcome.cost_usd  # Every attempt the gateway billed.
             if outcome.response is not None:
@@ -520,7 +539,12 @@ class LlmClient:
             self._log_backoff(record, outcome, delay)
 
     async def _attempt(
-        self, record: LlmCallRecord, attempt: LlmCallAttempt, body: bytes, delay: float
+        self,
+        record: LlmCallRecord,
+        attempt: LlmCallAttempt,
+        body: bytes,
+        delay: float,
+        timeout_s: float,
     ) -> _Outcome:
         """Wait ``delay`` and then for a slot, send the request once, and fill in ``attempt``.
 
@@ -535,7 +559,7 @@ class LlmClient:
                 await self._clock.sleep(delay)
             async with throttle.slot(record):
                 sent = self._clock.monotonic()
-                outcome = await self._request(self._http[record.model], body, record)
+                outcome = await self._request(self._http[record.model], body, record, timeout_s)
                 throttle.observe(outcome.status, outcome.http_status, sent, record)
         except asyncio.CancelledError:
             attempt.status = _S.LLM_CALL_STATUS_CANCELLED
@@ -551,18 +575,21 @@ class LlmClient:
         return outcome
 
     async def _request(
-        self, http: httpx.AsyncClient, body: bytes, record: LlmCallRecord
+        self, http: httpx.AsyncClient, body: bytes, record: LlmCallRecord, timeout_s: float
     ) -> _Outcome:
         """Send the request and say how it went. Only cancellation and bugs raise."""
         if self._closed:  # It closed while this attempt waited: send nothing.
             return _Outcome(_S.LLM_CALL_STATUS_CANCELLED)
         try:
-            async with asyncio.timeout(self._retry.timeout_s):
+            async with asyncio.timeout(timeout_s):
                 response = await http.post(
-                    "/chat/completions", content=body, headers=_call_headers(record)
+                    "/chat/completions",
+                    content=body,
+                    headers=_call_headers(record),
+                    timeout=timeout_s,
                 )
         except (TimeoutError, httpx.TimeoutException):
-            detail = f"no response within {self._retry.timeout_s:g} s"
+            detail = f"no response within {timeout_s:g} s"
             return _Outcome(_S.LLM_CALL_STATUS_TIMEOUT, detail=detail)
         except httpx.LocalProtocolError as error:
             # The request itself breaks HTTP, so a retry fails the same way. The error's text
@@ -659,10 +686,16 @@ class BoundLlmClient:
         *,
         tools: Sequence[Mapping[str, JsonValue]] = (),
         params: ModelParams | None = None,
+        attempt_timeout_s: float | None = None,
     ) -> LlmReply:
         """Send ``messages`` to the bound model with the bound tags; see LlmClient.complete."""
         return await self._client.complete(
-            messages, model=self._model, tags=self._tags, tools=tools, params=params
+            messages,
+            model=self._model,
+            tags=self._tags,
+            tools=tools,
+            params=params,
+            attempt_timeout_s=attempt_timeout_s,
         )
 
 
