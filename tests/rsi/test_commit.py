@@ -274,3 +274,18 @@ def test_a_worktree_with_a_detached_head_is_refused(
 
     with pytest.raises(WorkspaceError, match="no branch"):
         commit_candidate(workspace, worktree, hypothesis_id="h", summary="x")
+
+
+def test_a_commit_is_refused_while_the_sandbox_still_exists(tmp_path: Path) -> None:
+    space = Workspace(
+        make_repo(tmp_path / "repo"),
+        root=tmp_path / "worktrees",
+        sandbox_probe=lambda experiment_id: ["c1", "c2"],
+    )
+    worktree = space.create(LANE_EFFISQL, "exp-1")
+    write(worktree.path, {f"{PACK}/prompt.md": "Be faster.\n"})
+
+    with pytest.raises(WorkspaceError, match="2 containers left"):
+        commit_candidate(space, worktree, hypothesis_id="h1", summary="x")
+
+    assert git(worktree.path, "status", "--porcelain") != ""  # Nothing was staged or committed.

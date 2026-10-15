@@ -4,16 +4,20 @@ runs the real thing.
 
 import hashlib
 import logging
+import math
 import os
 from pathlib import Path
+from typing import Any
 
 import pytest
 
 from goaly.contracts.gen.experiment_pb2 import LANE_EFFISQL, LANE_SWE
+from goaly.rsi import sandbox
 from goaly.rsi.sandbox import (
     SandboxConfig,
     SandboxError,
     SandboxResult,
+    containers,
     ensure_image,
     image_tag,
     remove_containers,
@@ -36,6 +40,8 @@ READ_ONLY_OPTIONS = [
     "--cap-drop=ALL",
     "--security-opt=no-new-privileges",
     "--pids-limit=512",
+    "--ulimit=fsize=67108864:67108864",
+    "--ulimit=nofile=1024:1024",
     "--memory=4g",
     "--memory-swap=4g",
     "--cpuset-cpus=0,1,12,13",
@@ -101,7 +107,14 @@ def test_an_implementer_sandbox_can_write_only_the_lanes_two_pack_directories() 
 
 
 def test_the_options_come_from_config() -> None:
-    config = SandboxConfig(cpus="2,3", memory="2g", pids_limit=64, tmp_size="256m")
+    config = SandboxConfig(
+        cpus="2,3",
+        memory="2g",
+        pids_limit=64,
+        tmp_size="256m",
+        max_file_bytes=1024,
+        max_open_files=64,
+    )
 
     options = run_options(
         WORKTREE,
@@ -120,6 +133,8 @@ def test_the_options_come_from_config() -> None:
     assert "--pids-limit=64" in options
     assert "--tmpfs=/tmp:rw,nosuid,nodev,noexec,size=256m" in options
     assert "--label=goaly.rsi.lane=swe" in options
+    assert "--ulimit=fsize=1024:1024" in options
+    assert "--ulimit=nofile=64:64" in options
 
 
 def test_no_host_variable_reaches_the_options(monkeypatch: pytest.MonkeyPatch) -> None:
@@ -147,7 +162,14 @@ def test_no_host_variable_reaches_the_options(monkeypatch: pytest.MonkeyPatch) -
 
 @pytest.mark.parametrize(
     "worktree",
-    [Path("relative/worktree"), Path("/home/u/a,b"), Path('/home/u/a"b'), Path("/home/u/a\nb")],
+    [
+        Path("relative/worktree"),
+        Path("/home/u/a,b"),
+        Path('/home/u/a"b'),
+        Path("/home/u/a\nb"),
+        Path("/home/u/../etc"),  # Docker would not resolve it the way a reader expects.
+        Path("/home/u/a:b"),  # It would split PYTHONPATH in two.
+    ],
 )
 def test_a_worktree_path_docker_could_misread_is_refused(worktree: Path) -> None:
     with pytest.raises(ValueError, match="worktree"):
@@ -162,13 +184,32 @@ def test_a_worktree_path_docker_could_misread_is_refused(worktree: Path) -> None
         )
 
 
-def test_labels_take_only_valid_ids() -> None:
-    with pytest.raises(ValueError, match="purpose"):
+@pytest.mark.parametrize(
+    ("experiment_id", "purpose", "problem"),
+    [("exp 1", "unit-tests", "experiment_id"), ("exp-1", "unit tests", "purpose")],
+)
+def test_labels_take_only_valid_ids(experiment_id: str, purpose: str, problem: str) -> None:
+    with pytest.raises(ValueError, match=problem):
         run_options(
             WORKTREE,
             LANE_EFFISQL,
+            experiment_id=experiment_id,
+            purpose=purpose,
+            writable_packs=False,
+            uid=1001,
+            gid=1002,
+        )
+
+
+def test_a_main_repository_is_never_mounted(tmp_path: Path) -> None:
+    (tmp_path / ".git").mkdir()  # A worktree's .git is a file; only a main repository's is not.
+
+    with pytest.raises(ValueError, match="main repository"):
+        run_options(
+            tmp_path,
+            LANE_EFFISQL,
             experiment_id="exp-1",
-            purpose="unit tests",
+            purpose="unit-tests",
             writable_packs=False,
             uid=1001,
             gid=1002,
@@ -177,11 +218,28 @@ def test_labels_take_only_valid_ids() -> None:
 
 @pytest.mark.parametrize(
     ("field", "value"),
-    [("cpus", "0;rm"), ("memory", "4 g"), ("tmp_size", "1g,exec"), ("pids_limit", 0)],
+    [
+        ("cpus", "0;rm"),
+        ("memory", "4 g"),
+        ("tmp_size", "1g,exec"),
+        ("pids_limit", 0),
+        # A limit of 0 would turn the limit off.
+        ("memory", "0g"),
+        ("tmp_size", "0m"),
+        ("kill_after_s", 0),
+        ("max_file_bytes", 0),
+        ("max_open_files", 0),
+    ],
 )
 def test_config_refuses_values_docker_would_misread(field: str, value: object) -> None:
     with pytest.raises(ValueError, match=field):
         SandboxConfig.model_validate({field: value})
+
+
+@pytest.mark.parametrize("timeout_s", [0, -1, math.inf, math.nan])
+def test_a_timeout_that_would_not_stop_the_command_is_refused(timeout_s: float) -> None:
+    with pytest.raises(ValueError, match="timeout"):
+        timed_shell(timeout_s)
 
 
 def test_commands_run_under_an_in_container_timeout() -> None:
@@ -198,17 +256,37 @@ def test_commands_run_under_an_in_container_timeout() -> None:
 # One-shot runs.
 
 
-def run(config: SandboxConfig, command: str = "pytest -q", timeout_s: float = 30) -> SandboxResult:
+def run(
+    config: SandboxConfig,
+    command: str = "pytest -q",
+    timeout_s: float = 30,
+    *,
+    writable_packs: bool = False,
+) -> SandboxResult:
     return run_once(
         "goaly-rsi-sandbox:abc",
         WORKTREE,
         LANE_EFFISQL,
         experiment_id="exp-1",
-        purpose="unit-tests",
+        purpose="implementer" if writable_packs else "unit-tests",
         command=command,
         timeout_s=timeout_s,
+        writable_packs=writable_packs,
         config=config,
     )
+
+
+def test_an_implementer_run_mounts_the_packs_writable(
+    docker: FakeDocker, config: SandboxConfig
+) -> None:
+    docker.script({"wait": {"stdout": "0\n"}})
+
+    run(config, writable_packs=True)
+
+    run_args = docker.calls()[0]["args"]
+    assert f"--mount=type=bind,source={PACK},target={PACK}" in run_args
+    assert f"--mount=type=bind,source={PACK_TESTS},target={PACK_TESTS}" in run_args
+    assert "--label=goaly.rsi.purpose=implementer" in run_args
 
 
 def test_a_one_shot_run_waits_reads_the_output_and_removes_the_container(
@@ -251,6 +329,71 @@ def test_the_in_container_timeout_shows_as_timed_out(
     assert result.timed_out
 
 
+@pytest.mark.parametrize(("wait_s", "timed_out"), [(0.6, True), (0, False)])
+def test_a_kill_counts_as_a_timeout_only_once_the_timeout_has_passed(
+    docker: FakeDocker, config: SandboxConfig, wait_s: float, timed_out: bool
+) -> None:
+    # 137 comes from timeout's KILL after the deadline, or from the kernel at any time.
+    docker.script({"wait": {"stdout": "137\n", "sleep": wait_s}})
+
+    result = run(config, timeout_s=0.5)
+
+    assert result.exit_code == 137
+    assert result.timed_out is timed_out
+
+
+def test_messages_on_the_containers_stderr_are_kept(
+    docker: FakeDocker, config: SandboxConfig
+) -> None:
+    docker.script(
+        {
+            "wait": {"stdout": "124\n"},
+            "logs": {"stdout": "collected 3 items\n", "stderr": "timeout: sending signal KILL\n"},
+        }
+    )
+
+    result = run(config)
+
+    assert "collected 3 items" in result.output
+    assert "timeout: sending signal KILL" in result.output
+
+
+def test_the_wait_allows_the_timeout_the_kill_and_the_docker_margin(
+    docker: FakeDocker, config: SandboxConfig, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    docker.script({"wait": {"stdout": "0\n"}})
+    limits: dict[str, float | None] = {}
+    real_docker = sandbox._docker
+
+    def spy(config: SandboxConfig, args: list[str], **options: Any) -> str:
+        limits[args[0]] = options.get("timeout_s")
+        return real_docker(config, args, **options)
+
+    monkeypatch.setattr(sandbox, "_docker", spy)
+
+    run(config.model_copy(update={"kill_after_s": 2}), timeout_s=30)
+
+    assert limits["wait"] == 30 + 2 + 10
+
+
+def test_an_interrupt_while_waiting_still_removes_the_container(
+    docker: FakeDocker, config: SandboxConfig, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    real_docker = sandbox._docker
+
+    def interrupted(config: SandboxConfig, args: list[str], **options: Any) -> str:
+        if args[0] == "wait":
+            raise KeyboardInterrupt
+        return real_docker(config, args, **options)
+
+    monkeypatch.setattr(sandbox, "_docker", interrupted)
+
+    with pytest.raises(KeyboardInterrupt):
+        run(config)
+
+    assert docker.commands() == ["run", "rm"]
+
+
 def test_only_the_end_of_long_output_is_kept(docker: FakeDocker, tmp_path: Path) -> None:
     config = SandboxConfig(docker=str(docker.path), output_limit=10)
     docker.script({"wait": {"stdout": "1\n"}, "logs": {"stdout": "a" * 50 + "0123456789"}})
@@ -285,7 +428,7 @@ def test_an_unreadable_exit_status_is_a_sandbox_error(
 def test_a_container_that_outlives_its_timeout_is_removed(docker: FakeDocker) -> None:
     # docker wait gets the command's timeout plus a margin; past that, docker itself is stuck.
     # The margin leaves the fake docker time to start even on a loaded machine.
-    config = SandboxConfig(docker=str(docker.path), docker_timeout_s=3, kill_after_s=0)
+    config = SandboxConfig(docker=str(docker.path), docker_timeout_s=3, kill_after_s=0.1)
     docker.script({"wait": {"sleep": 30}})
 
     with pytest.raises(SandboxError, match="docker wait timed out"):
@@ -341,6 +484,32 @@ def test_remove_containers_finds_leftovers_by_label(
     assert rm_args == ["rm", "--force", "c1", "c2"]
 
 
+def test_containers_lists_an_experiments_containers_running_or_not(
+    docker: FakeDocker, config: SandboxConfig
+) -> None:
+    docker.script({"ps": {"stdout": "c1\n"}})
+
+    found = containers(experiment_id="exp-1", purpose="implementer", config=config)
+
+    assert found == ["c1"]
+    assert docker.calls()[0]["args"] == [
+        "ps",
+        "--all",
+        "--quiet",
+        "--filter=label=goaly.rsi.sandbox=1",
+        "--filter=label=goaly.rsi.experiment=exp-1",
+        "--filter=label=goaly.rsi.purpose=implementer",
+    ]
+
+
+@pytest.mark.parametrize(("experiment_id", "purpose"), [("exp 1", None), ("exp-1", "a b")])
+def test_containers_takes_only_valid_labels(
+    config: SandboxConfig, experiment_id: str, purpose: str | None
+) -> None:
+    with pytest.raises(ValueError, match=r"experiment_id|purpose"):
+        containers(experiment_id=experiment_id, purpose=purpose, config=config)
+
+
 def test_remove_containers_with_no_leftovers_removes_nothing(
     docker: FakeDocker, config: SandboxConfig
 ) -> None:
@@ -365,11 +534,27 @@ def write_project(repo: Path) -> None:
     (repo / "secret.env").write_text("never in the context\n", encoding="utf-8")
 
 
-def test_the_image_is_tagged_with_the_uv_lock_hash(tmp_path: Path) -> None:
+def test_the_image_is_tagged_with_the_hash_of_the_lock_and_the_dockerfile(tmp_path: Path) -> None:
     write_project(tmp_path)
 
-    expected = hashlib.sha256(b"version = 1\n").hexdigest()
+    lock = hashlib.sha256(b"version = 1\n").hexdigest()
+    recipe = hashlib.sha256(b"FROM scratch\n").hexdigest()
+    expected = hashlib.sha256(f"uv.lock {lock}\nDockerfile {recipe}\n".encode()).hexdigest()
     assert image_tag(tmp_path) == f"goaly-rsi-sandbox:{expected}"
+
+    (tmp_path / "docker" / "rsi-sandbox.Dockerfile").write_text("FROM debian\n", encoding="utf-8")
+    assert image_tag(tmp_path) != f"goaly-rsi-sandbox:{expected}"
+
+
+@pytest.mark.parametrize("missing", ["uv.lock", "pyproject.toml", "docker/rsi-sandbox.Dockerfile"])
+def test_a_missing_project_file_is_a_sandbox_error(
+    docker: FakeDocker, config: SandboxConfig, tmp_path: Path, missing: str
+) -> None:
+    write_project(tmp_path)
+    (tmp_path / missing).unlink()
+
+    with pytest.raises(SandboxError, match="cannot read"):
+        ensure_image(tmp_path, config=config)
 
 
 def test_a_missing_image_is_built_from_a_context_of_two_files(
