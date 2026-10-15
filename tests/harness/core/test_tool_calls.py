@@ -8,7 +8,7 @@ import enum
 import json
 import re
 import time
-from collections.abc import Sequence
+from collections.abc import Callable, Sequence
 from pathlib import Path
 
 import pytest
@@ -747,3 +747,174 @@ def test_after_strip_no_call_is_left_in_a_qwen_reply(name: str) -> None:
     reasoning = strip_tool_call_markup(reply["reasoning_content"])
 
     assert parse_tool_calls(assistant(content=content, reasoning=reasoning), OFFERED) == []
+
+
+def deepest(fits: Callable[[int], bool]) -> int:
+    """The largest depth, below 100,000, at which nesting still ``fits``."""
+    low, high = 1, 100_000
+    while low < high:
+        middle = (low + high + 1) // 2
+        low, high = (middle, high) if fits(middle) else (low, middle - 1)
+    return low
+
+
+def nested(depth: int) -> str:
+    return "[" * depth + "]" * depth
+
+
+def loads_fits(depth: int) -> bool:
+    try:
+        json.loads(nested(depth))
+    except RecursionError:
+        return False
+    return True
+
+
+def dumps_one_deeper_fits(depth: int) -> bool:
+    try:
+        json.dumps([json.loads(nested(depth))])
+    except RecursionError:
+        return False
+    return True
+
+
+def json_limits() -> tuple[int, int]:
+    """The deepest lists json.loads parses, and the deepest it parses that json.dumps can still
+    write one level deeper, as inside a call's arguments.
+
+    They depend on how much C stack the caller has used, so a test measures them where it calls
+    the parser: about 9,997 and 9,996 on CPython 3.12.
+    """
+    return deepest(loads_fits), deepest(
+        lambda depth: loads_fits(depth) and dumps_one_deeper_fits(depth)
+    )
+
+
+@pytest.mark.parametrize(
+    "where",
+    ["writable", "parses but is unwritable one level deeper", "deepest parsed", "too deep"],
+)
+def test_an_xml_value_at_the_json_depth_limits_is_typed_or_kept_and_never_raises(
+    where: str,
+) -> None:
+    loads_limit, write_limit = json_limits()
+    assert write_limit < loads_limit  # Else this test would not reach the boundary.
+    depth = {
+        "writable": write_limit,
+        "parses but is unwritable one level deeper": write_limit + 1,
+        "deepest parsed": loads_limit,
+        "too deep": loads_limit + 1,
+    }[where]
+    message = assistant(content=xml_call("configure", tags=nested(depth)))
+
+    [call] = parse_tool_calls(message, OFFERED)
+
+    if depth <= write_limit:
+        assert call.arguments_json == '{"tags": ' + nested(depth) + "}"
+    else:
+        assert call.arguments_json == '{"tags": "' + nested(depth) + '"}'
+
+
+@pytest.mark.parametrize("where", ["one below the limit", "at the limit", "past the limit"])
+def test_repair_at_the_json_depth_limit_repairs_or_gives_up_and_never_raises(where: str) -> None:
+    loads_limit, _ = json_limits()
+    depth = loads_limit + {"one below the limit": -1, "at the limit": 0, "past the limit": 1}[where]
+    text = '{"tags": ' + nested(depth - 1) + ",}"  # The object is one level of the depth.
+
+    repaired = repair_arguments(text)
+
+    if depth <= loads_limit:
+        assert repaired == '{"tags": ' + nested(depth - 1) + "}"
+    else:
+        assert repaired is None
+
+
+def test_a_repaired_lone_surrogate_is_escaped_so_the_call_can_hold_it() -> None:
+    written = '{"sql": "SELECT \'\\ud800\'",}'  # A \ud800 escape: a lone surrogate.
+    message = assistant(calls=[ToolCall(id="call_a", name="execute_sql", arguments_json=written)])
+
+    [call] = parse_tool_calls(message, OFFERED)
+
+    assert call.repaired_arguments_json == '{"sql": "SELECT \'\\ud800\'"}'
+    assert json.loads(call.repaired_arguments_json) == {"sql": "SELECT '\ud800'"}
+
+
+def test_an_xml_value_with_a_lone_surrogate_is_escaped_so_the_call_can_hold_it() -> None:
+    message = assistant(content=xml_call("configure", tags='["caf\\u00e9", "\\ud800"]'))
+
+    [call] = parse_tool_calls(message, OFFERED)
+
+    assert call.arguments_json == '{"tags": ["caf\\u00e9", "\\ud800"]}'
+    assert arguments(call) == {"tags": ["café", "\ud800"]}
+
+
+@pytest.mark.parametrize("number", ["NaN", "Infinity", "-Infinity", "1e999"])
+def test_a_non_finite_xml_number_stays_a_string(number: str) -> None:
+    message = assistant(content=xml_call("configure", ratio=number, tags=f"[{number}]"))
+
+    [call] = parse_tool_calls(message, OFFERED)
+
+    assert call.arguments_json == json.dumps({"ratio": number, "tags": f"[{number}]"})
+
+
+@pytest.mark.parametrize(
+    "text",
+    ['{"limit": NaN,}', '{"limit": Infinity', '{"limit": -Infinity,}', '{"limit": 1e999,}'],
+)
+def test_repair_gives_up_on_non_finite_numbers(text: str) -> None:
+    assert repair_arguments(text) is None
+
+
+def test_a_standard_call_with_a_non_finite_number_gets_no_repaired_arguments() -> None:
+    message = assistant(
+        calls=[ToolCall(id="call_a", name="execute_sql", arguments_json='{"limit": NaN}')]
+    )
+
+    [call] = parse_tool_calls(message, OFFERED)
+
+    assert call.repaired_arguments_json == ""
+
+
+def test_a_calls_id_is_the_sha256_of_its_index_name_and_arguments() -> None:
+    message = assistant(calls=[ToolCall(name="execute_sql", arguments_json='{"sql": "SELECT 1"}')])
+
+    [call] = parse_tool_calls(message, OFFERED)
+
+    # The first 24 hex digits of sha256('0\nexecute_sql\n{"sql": "SELECT 1"}').
+    assert call.id == "call_edd3f0731f55e9d52bf87b18"
+
+
+@pytest.mark.parametrize(
+    ("name", "arguments_json"),
+    [("submit", '{"sql": "SELECT 1"}'), ("execute_sql", '{"sql": "SELECT 2"}')],
+    ids=["only the name differs", "only the arguments differ"],
+)
+def test_calls_that_differ_in_name_or_arguments_get_different_ids(
+    name: str, arguments_json: str
+) -> None:
+    first = assistant(calls=[ToolCall(name="execute_sql", arguments_json='{"sql": "SELECT 1"}')])
+    second = assistant(calls=[ToolCall(name=name, arguments_json=arguments_json)])
+
+    [one], [other] = parse_tool_calls(first, OFFERED), parse_tool_calls(second, OFFERED)
+
+    assert one.id != other.id
+
+
+async def test_a_gateway_id_repeated_in_one_reply_is_replaced_so_each_result_answers_one_call() -> (
+    None
+):
+    calls = [
+        ToolCall(id="call_0", name="execute_sql", arguments_json='{"sql": "SELECT 1"}'),
+        ToolCall(id="call_0", name="execute_sql", arguments_json='{"sql": "SELECT 1"}'),
+    ]
+    env = FakeSqlEnvironment({"SELECT 1": SqlResult(row_count=1)})
+
+    first, second = parse_tool_calls(assistant(calls=calls), OFFERED)
+    results = [await REGISTRY.execute(call, env) for call in (first, second)]
+
+    # The first keeps the gateway's id; the second gets the formula's id for index 1.
+    assert (first.id, second.id) == ("call_0", "call_7a300c3273e4108aa15a6c53")
+    assert [result.tool_call_id for result in results] == [
+        "call_0",
+        "call_7a300c3273e4108aa15a6c53",
+    ]
