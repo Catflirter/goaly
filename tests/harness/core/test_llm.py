@@ -325,6 +325,19 @@ async def test_refuses_a_message_without_an_id_it_needs_before_any_io(
     assert gateway.requests == []
 
 
+async def test_sends_the_calls_tags_for_the_hosts_proxy_to_record() -> None:
+    gateway = Gateway(completion(), completion())
+    abroad = CallTags(CallPurpose.CALL_PURPOSE_RSI_ANALYST, instance_id="tâche-1")
+    async with connect(gateway) as llm:
+        await llm.complete([user("hi")], model=QWEN, tags=EXEC)
+        await llm.complete([user("hi")], model=GLM, tags=abroad)
+
+    assert [request.headers["x-goaly-call-tags"] for request in gateway.requests] == [
+        '{"run_id":"run-1","instance_id":"task-7","seed":2,"purpose":"CALL_PURPOSE_EXEC"}',
+        '{"run_id":"","instance_id":"t\\u00e2che-1","seed":0,"purpose":"CALL_PURPOSE_RSI_ANALYST"}',
+    ]
+
+
 # The reply.
 
 
@@ -915,6 +928,18 @@ async def test_a_call_may_give_its_attempts_longer() -> None:
             await llm.complete([user("hi")], model=QWEN, tags=EXEC, attempt_timeout_s=0.2)
 
     assert request_timeouts(gateway) == [0.2]
+
+
+async def test_a_longer_attempt_timeout_lets_a_slow_reply_arrive() -> None:
+    async def slow(request: httpx.Request) -> httpx.Response:
+        await asyncio.sleep(0.1)  # Past the default 0.05 s, within the call's own 0.5 s.
+        return completion()
+
+    gateway = Gateway(slow)
+    async with connect(gateway, retry=RetryPolicy(timeout_s=0.05, max_retries=0)) as llm:
+        reply = await llm.complete([user("hi")], model=QWEN, tags=EXEC, attempt_timeout_s=0.5)
+
+    assert attempts(reply.record) == [(OK, 200)]
 
 
 async def test_a_longer_attempt_timeout_holds_for_every_retry_of_that_call_only() -> None:
