@@ -44,6 +44,7 @@ class Layout:
     checkout: Path
     run_dir: Path
     solve_dir: Path
+    inputs_dir: Path
     instances: Path
     proxy_socket: Path
     pg_dirs: tuple[Path, Path]
@@ -121,6 +122,9 @@ def layout(tmp_path: Path) -> Iterator[Layout]:
     solve_dir.mkdir(parents=True)
     for name in ("results.jsonl", "manifest.json", "llm_calls.jsonl"):
         (run_dir / name).write_text("{}\n", encoding="utf-8")
+    inputs_dir = run_dir / "inputs"
+    inputs_dir.mkdir()
+    (inputs_dir / "plans.json").write_text('{"plan": 1}\n', encoding="utf-8")
     instances = root / "data" / "tasks.jsonl"
     instances.parent.mkdir()
     instances.write_text(json.dumps({"id": 1, "base_sql": "SELECT 1"}) + "\n", encoding="utf-8")
@@ -133,7 +137,7 @@ def layout(tmp_path: Path) -> Iterator[Layout]:
         directory.mkdir()
         servers.append(_UnixServer(str(directory / f".s.PGSQL.{port}"), _Postgres))
     threads = [serve(server) for server in servers]
-    yield Layout(checkout, run_dir, solve_dir, instances, proxy_socket, pg_dirs)
+    yield Layout(checkout, run_dir, solve_dir, inputs_dir, instances, proxy_socket, pg_dirs)
     for server in servers:
         server.shutdown()
         server.server_close()
@@ -158,6 +162,7 @@ def solve(image: str, layout: Layout, run_id: str, script: str) -> SandboxResult
         layout.checkout,
         layout.solve_dir,
         layout.instances,
+        inputs_dir=layout.inputs_dir,
         environment=environment(layout, run_id),
         argv=["bash", "-c", script],
         timeout_s=120,
@@ -201,12 +206,14 @@ def test_a_write_outside_the_solve_directory_fails(image: str, layout: Layout, r
     targets = {
         "checkout": layout.checkout / "planted",
         "instances": layout.instances,
+        "inputs": layout.inputs_dir / "plans.json",
         "proxy": layout.proxy_socket.parent / "planted",
         "pg": layout.pg_dirs[0] / "planted",
         "root": Path("/planted"),
     }
     script = "".join(f"echo x >> {path}; echo {name}=$?\n" for name, path in targets.items())
     script += f"echo solved > {layout.solve_dir}/predictions.jsonl; echo solve=$?\n"
+    script += f"cat {layout.inputs_dir}/plans.json\n"
 
     result = solve(image, layout, run_id, script)
 
@@ -214,6 +221,7 @@ def test_a_write_outside_the_solve_directory_fails(image: str, layout: Layout, r
     for name in targets:
         assert f"{name}=1" in result.output, result.output
     assert "solve=0" in result.output
+    assert '{"plan": 1}' in result.output  # The staged inputs can be read.
     assert not (layout.checkout / "planted").exists()
     assert (layout.solve_dir / "predictions.jsonl").read_text(encoding="utf-8") == "solved\n"
 

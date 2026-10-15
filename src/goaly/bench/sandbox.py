@@ -4,11 +4,11 @@
   a candidate's worktree.
 - **The solve phase of goaly run** (spec §6.1, §8.8): :func:`solve_options` and :func:`run_solve`
   run a pack's policy away from the key, the grader and gold. The container sees the candidate's
-  checkout and the gold-free instances file, read-only; the LLM proxy's and the solving
-  PostgreSQL instances' socket directories, read-only; and ``<run>/solve/``, its only writable
-  mount. The host-only files of the run, such as the graded results, the manifest and the
-  proxy's call records, are never mounted. Besides PYTHONPATH, which points at the checkout's
-  ``src``, the environment holds only what :class:`SolveEnvironment` allows.
+  checkout, the gold-free instances file and the run's staged inputs, read-only; the LLM proxy's
+  and the solving PostgreSQL instances' socket directories, read-only; and ``<run>/solve/``, its
+  only writable mount. The host-only files of the run, such as the graded results, the manifest
+  and the proxy's call records, are never mounted. Besides PYTHONPATH, which points at the
+  checkout's ``src``, the environment holds only what :class:`SolveEnvironment` allows.
 
 The builder lives in goaly.bench, so that goaly run can use it without loading goaly.rsi (spec
 §3.1).
@@ -392,6 +392,7 @@ def solve_options(
     solve_dir: Path,
     instances_file: Path | None,
     *,
+    inputs_dir: Path | None = None,
     socket_dirs: Sequence[Path],
     run_id: str,
     uid: int,
@@ -405,6 +406,10 @@ def solve_options(
     - ``checkout``, the candidate's snapshot, read-only, pack directories included. It may hold
       no ``.git``.
     - ``instances_file``, the gold-free file of the run's instances, read-only, if there is one.
+    - ``inputs_dir``, ``<run>/inputs/``, the files the launcher staged for the run, such as the
+      gold-free task file, the schema snapshot and the plans, read-only, if there is one. It may
+      hold only regular files: no directory, symlink or ``.git``. The launcher stages only
+      gold-free files; goaly.rsi.guards.gold_free can check them.
     - ``socket_dirs``, the proxy's and the solving instances' socket directories, read-only. Each
       may hold only sockets and PostgreSQL's lock files.
     - ``solve_dir``, ``<run>/solve/``, the only writable mount. It holds no host-only file
@@ -421,6 +426,9 @@ def solve_options(
     _check_canonical(solve_dir, "solve directory", is_directory=True)
     if instances_file is not None:
         _check_canonical(instances_file, "instances file", is_directory=False)
+    if inputs_dir is not None:
+        _check_canonical(inputs_dir, "inputs directory", is_directory=True)
+        _check_inputs_dir(inputs_dir)
     for directory in socket_dirs:
         _check_canonical(directory, "socket directory", is_directory=True)
     if os.path.lexists(checkout / ".git"):
@@ -430,7 +438,8 @@ def solve_options(
     host_only = sorted(entry.name for entry in solve_dir.iterdir() if entry.name in HOST_ONLY_NAMES)
     if host_only:
         raise ValueError(f"the solve directory {solve_dir} holds host-only {', '.join(host_only)}")
-    mounts = [checkout, solve_dir, *([instances_file] if instances_file else []), *socket_dirs]
+    optional = [path for path in (instances_file, inputs_dir) if path is not None]
+    mounts = [checkout, solve_dir, *optional, *socket_dirs]
     for first, second in ((a, b) for i, a in enumerate(mounts) for b in mounts[i + 1 :]):
         if first.is_relative_to(second) or second.is_relative_to(first):
             raise ValueError(f"the mounts {first} and {second} overlap")
@@ -441,6 +450,7 @@ def solve_options(
         *hardened_options(uid=uid, gid=gid, workdir=checkout, labels=labels, config=config),
         bind(checkout, what="checkout"),
         *([bind(instances_file, what="instances file")] if instances_file else []),
+        *([bind(inputs_dir, what="inputs directory")] if inputs_dir else []),
         *(bind(directory, what="socket directory") for directory in socket_dirs),
         bind(solve_dir, writable=True, what="solve directory"),
     ]
@@ -452,6 +462,7 @@ def run_solve(
     solve_dir: Path,
     instances_file: Path | None,
     *,
+    inputs_dir: Path | None = None,
     environment: SolveEnvironment,
     argv: Sequence[str],
     timeout_s: float,
@@ -470,6 +481,7 @@ def run_solve(
         checkout,
         solve_dir,
         instances_file,
+        inputs_dir=inputs_dir,
         socket_dirs=environment.socket_dirs(),
         run_id=environment.run_id,
         uid=os.getuid(),
@@ -517,6 +529,13 @@ def _check_canonical(path: Path, what: str, *, is_directory: bool) -> None:
     if not (stat.S_ISDIR(mode) if is_directory else stat.S_ISREG(mode)):
         kind = "a directory" if is_directory else "a regular file"
         raise ValueError(f"the {what} {path} is not {kind}")
+
+
+def _check_inputs_dir(directory: Path) -> None:
+    """Refuse an inputs directory that holds anything but regular files."""
+    for entry in directory.iterdir():
+        if entry.name == ".git" or not stat.S_ISREG(entry.lstat().st_mode):
+            raise ValueError(f"the inputs directory {directory} holds {entry.name}, not a file")
 
 
 def _check_socket_dir(directory: Path) -> None:
