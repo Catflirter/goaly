@@ -1,0 +1,126 @@
+"""Effi-SQL's two v0 tools (spec §5.4): execute_sql, to run and time queries, and submit.
+
+execute_sql runs one query in the task's read-only solving database and shows the model its first
+rows, or the error, with how long it ran and, apart from that, how long it waited for a statement
+slot. Its statement timeout is enforced by the environment, which cancels the statement from the
+client. The policy binds it with the task's wall budget as core's executor backstop (600 s in v0),
+which also bounds the queue wait, so a timed-out statement is an ordinary result.
+"""
+
+from pydantic import BaseModel, ConfigDict, Field
+
+from goaly.contracts.gen.environment_pb2 import SqlResult
+from goaly.contracts.gen.task_pb2 import EffiSqlPrediction, Prediction
+from goaly.contracts.gen.trajectory_pb2 import ToolResult
+from goaly.contracts.interfaces import SqlEnvironment
+
+# PostgreSQL's message for a statement past its timeout, which the environment reports.
+STATEMENT_TIMEOUT = "canceling statement due to statement timeout"
+
+
+class ExecuteSqlConfig(BaseModel):
+    """execute_sql's settings, from the ``pack.execute_sql`` section of config.yaml."""
+
+    model_config = ConfigDict(frozen=True, extra="forbid")
+
+    # The statement timeout, enforced by client-side cancellation in the environment.
+    statement_timeout_s: float = Field(default=120.0, gt=0)
+    # How many rows the model sees, at most; the environment keeps no more than its own limit.
+    rows_shown: int = Field(default=20, ge=0)
+    # How many characters of each value the model sees.
+    value_chars: int = Field(default=200, ge=1)
+
+
+class ExecuteSqlArgs(BaseModel):
+    """Run one SQL query in the task's database, read-only, and see its result and timing."""
+
+    sql: str = Field(min_length=1, description="The query to run.")
+
+
+class SubmitArgs(BaseModel):
+    """Hand in the final query; this ends the task."""
+
+    sql: str = Field(
+        min_length=1,
+        description="The rewritten query: one statement that begins with SELECT or WITH.",
+    )
+
+
+class ExecuteSql:
+    """Runs a query with the statement timeout and reports rows, errors and timing."""
+
+    name = "execute_sql"
+    description = (
+        "Run one SQL query in the task's PostgreSQL database, which is read-only. Returns the "
+        "first rows or the error, how long the query ran, and how long it first waited for a "
+        "free statement slot."
+    )
+    args_model = ExecuteSqlArgs
+
+    def __init__(self, config: ExecuteSqlConfig) -> None:
+        self.config = config
+
+    async def run(self, args: ExecuteSqlArgs, env: SqlEnvironment) -> ToolResult:
+        result = await env.execute(args.sql, timeout_s=self.config.statement_timeout_s)
+        return ToolResult(content=render(result, self.config))
+
+
+class Submit:
+    """Submits the final query, which ends the episode."""
+
+    name = "submit"
+    description = (
+        "Submit your final query, which must return the same result as the original query on "
+        "any data. This ends the task."
+    )
+    args_model = SubmitArgs
+
+    async def run(self, args: SubmitArgs, env: SqlEnvironment) -> ToolResult:
+        prediction = Prediction(effisql=EffiSqlPrediction(sql=args.sql))
+        return ToolResult(content="Submitted.", submission=prediction)
+
+
+def render(result: SqlResult, config: ExecuteSqlConfig) -> str:
+    """The text the model sees for ``result``: its rows or its error, then its timing."""
+    lines = []
+    if result.error:
+        lines.append(f"The query failed: {result.error}")
+        if result.error == STATEMENT_TIMEOUT:
+            limit = config.statement_timeout_s
+            lines.append(f"It was stopped at the {limit:g} s statement timeout.")
+    else:
+        lines.extend(render_rows(result, config))
+    lines.append(
+        f"Execution time: {result.elapsed_s:.3f} s"
+        f" (it waited {result.queue_wait_s:.3f} s for a statement slot before that)."
+    )
+    return "\n".join(lines)
+
+
+def render_rows(result: SqlResult, config: ExecuteSqlConfig) -> list[str]:
+    """The result's column names, row count and first rows, as lines."""
+    rows = [
+        " | ".join(cell(value, config.value_chars) for value in row.items())
+        for row in result.rows[: config.rows_shown]
+    ]
+    count = f"{result.row_count} row" + ("" if result.row_count == 1 else "s")
+    if len(rows) < result.row_count:
+        count += f", the first {len(rows)} shown"
+    return [f"Columns: {', '.join(result.columns)}", f"Rows: {count}.", *rows]
+
+
+def cell(value: object, limit: int) -> str:
+    """One value as text: NULL, a number without a needless .0, or the string, cut to ``limit``.
+
+    Rows hold JSON-like values: None for NULL, a bool, a float, or a string, which numeric and
+    large integer values are, so they lose no precision.
+    """
+    if value is None:
+        text = "NULL"
+    elif isinstance(value, bool):
+        text = "true" if value else "false"
+    elif isinstance(value, float):
+        text = str(int(value)) if value.is_integer() else repr(value)
+    else:
+        text = str(value)
+    return text if len(text) <= limit else text[:limit] + "…"

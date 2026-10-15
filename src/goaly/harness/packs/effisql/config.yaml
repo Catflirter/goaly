@@ -1,0 +1,29 @@
+# The v0 Effi-SQL pack's settings (spec §5.4); RSI may tune any value here.
+# The harness factory gives `model`, `budgets` and `context` to core, and `pack` to build_policy.
+# The loop's error rules (3 errors to the reminder, 5 to the stop, 16 calls a reply) are core's.
+
+# Sampling for each executor call: thinking on, Qwen's thinking-mode sampling, 16K tokens a call.
+model:
+  enable_thinking: true
+  temperature: 0.6
+  top_p: 0.95
+  top_k: 20
+  max_tokens: 16000
+
+# What a task may spend: 30 model steps or 10 minutes, whichever runs out first.
+budgets:
+  steps: 30
+  wall_clock_s: 600
+
+# When older tool outputs fold: past 96K prompt tokens, keeping the last 8 turns.
+context:
+  fold_above_tokens: 96000
+  keep_turns: 8
+  folded_chars: 500
+
+pack:
+  execute_sql:
+    statement_timeout_s: 120 # Enforced by client-side cancellation.
+    rows_shown: 20
+    value_chars: 200
+  submit_timeout_s: 10
