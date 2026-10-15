@@ -1224,6 +1224,63 @@ async def test_a_bug_still_leaves_exactly_one_record() -> None:
     assert len(record.attempts) == 1
 
 
+class BrokenRecorder:
+    """A CallRecorder that breaks the rule that it must not raise."""
+
+    def record(self, record: LlmCallRecord) -> None:
+        raise OSError("disk full")
+
+
+def broken_recorder_client(gateway: Gateway) -> LlmClient:
+    return LlmClient(
+        settings(),
+        BrokenRecorder(),
+        transport=httpx.MockTransport(gateway.handle),
+        clock=FakeClock(),
+    )
+
+
+async def test_a_failing_recorder_loses_the_record_but_not_the_reply(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    gateway = Gateway(completion())
+    async with broken_recorder_client(gateway) as llm:
+        reply = await llm.complete([user("hi")], model=QWEN, tags=EXEC)
+
+    assert reply.message.content == "391"
+    (lost,) = [
+        entry for entry in caplog.records if getattr(entry, "event", None) == "llm_record_lost"
+    ]
+    assert lost.levelno == logging.ERROR
+    assert {key: getattr(lost, key) for key in ("model", "call_id")} == {
+        "model": QWEN,
+        "call_id": reply.record.call_id,
+    }
+
+
+async def test_a_failing_recorder_hides_no_error_of_the_call() -> None:
+    gateway = Gateway(failure(400, "bad request"))
+    async with broken_recorder_client(gateway) as llm:
+        with pytest.raises(ClientError, match="bad request"):
+            await llm.complete([user("hi")], model=QWEN, tags=EXEC)
+
+
+async def test_a_failing_recorder_hides_no_cancellation() -> None:
+    arrived = asyncio.Event()
+
+    async def hold(request: httpx.Request) -> httpx.Response:
+        arrived.set()
+        return await hang(request)
+
+    gateway = Gateway(hold)
+    async with broken_recorder_client(gateway) as llm:
+        task = asyncio.create_task(llm.complete([user("hi")], model=QWEN, tags=EXEC))
+        await arrived.wait()
+        task.cancel()
+        with pytest.raises(asyncio.CancelledError):
+            await task
+
+
 async def test_jsonl_recorder_appends_one_line_per_call(tmp_path: Path) -> None:
     path = tmp_path / "calls.jsonl"
     gateway = Gateway(completion(), failure(400, "bad request"))

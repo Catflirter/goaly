@@ -165,7 +165,9 @@ class CallRecorder(Protocol):
         """Take ``record``, which is the recorder's own copy.
 
         The client calls this on its event loop, so it must not block for long: the runner's
-        single-writer call log (T06) only queues the record.
+        single-writer call log (T06) only queues the record. It must not raise either. If it
+        does, the client logs the lost record and goes on, so a call never loses its reply or
+        its own error to its recorder.
         """
 
 
@@ -525,7 +527,17 @@ class LlmClient:
         record.http_status = last.http_status
         copy = LlmCallRecord()
         copy.CopyFrom(record)
-        self._recorder.record(copy)
+        try:
+            self._recorder.record(copy)
+        except Exception:  # A broken recorder must not take the call's outcome with it.
+            _logger.exception(
+                "the call recorder failed, so this call's record is lost",
+                extra={
+                    "event": "llm_record_lost",
+                    "model": record.model,
+                    "call_id": record.call_id,
+                },
+            )
 
     def _log_backoff(self, record: LlmCallRecord, outcome: _Outcome, delay: float) -> None:
         """Log a throttling event (spec §6.2): the wait before the next attempt, and why."""
