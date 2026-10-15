@@ -2,9 +2,10 @@
 
 lessons.jsonl is the source of truth. Lessons are added one at a time, as in ACE, and each one
 counts the experiments in which it helped or hurt. Every change appends the lesson's full new
-state as one line, under the ledger's lock, and the last line for a lesson_id wins: no line is
-ever rewritten, so nothing is lost by accident. lessons.md, for people to read, is regenerated
-after every change; counters kept in hand-edited Markdown could not be updated reliably.
+state as one line, under the ledger's lock, and the last line for a lesson_id wins. A deletion
+too is such a line, with deleted_at set: no line is ever rewritten, so nothing is lost by
+accident. lessons.md, for people to read, is regenerated after every change; counters kept in
+hand-edited Markdown could not be updated reliably.
 """
 
 from collections.abc import Callable, Iterable
@@ -21,7 +22,7 @@ __all__ = ["LessonNotFoundError", "LessonStore", "render_markdown"]
 
 
 class LessonNotFoundError(LookupError):
-    """No lesson has the ID."""
+    """No standing lesson has the ID: there is none, or it was deleted."""
 
 
 def _utc_now() -> datetime:
@@ -45,7 +46,8 @@ class LessonStore:
         """Add a lesson that cites ``experiment_ids`` as its evidence, and return it.
 
         The text is stripped, and evidence cited twice is kept once. Raises ValueError, writing
-        nothing, for an invalid ID or lane, a blank text, or a lesson_id already used.
+        nothing, for an invalid ID or lane, a blank text, or a lesson_id already used, even by a
+        deleted lesson.
         """
         check_id(lesson_id, "lesson_id")
         lane_info(lane)
@@ -75,8 +77,8 @@ class LessonStore:
         """Record that the lesson helped in ``experiment_id``, and return the lesson.
 
         Recording an experiment again changes nothing, so a resumed lane cannot count it twice.
-        Raises LessonNotFoundError for an unknown lesson, and ValueError if the experiment already
-        hurt it.
+        Raises LessonNotFoundError for an unknown or deleted lesson, and ValueError if the
+        experiment already hurt it.
         """
         return self._mark(lesson_id, experiment_id, helped=True)
 
@@ -84,16 +86,39 @@ class LessonStore:
         """Record that the lesson hurt in ``experiment_id``, as :meth:`mark_helped` does."""
         return self._mark(lesson_id, experiment_id, helped=False)
 
+    def delete(self, lesson_id: str) -> None:
+        """Delete the lesson by appending its last state with deleted_at set.
+
+        Its earlier lines stay, and deleting it again changes nothing. Raises
+        LessonNotFoundError if no lesson has the ID.
+        """
+        with self._ledger.session(write=True) as files:
+            lessons = _latest(files)
+            if lesson_id not in lessons:
+                raise LessonNotFoundError(f"no lesson has the ID {lesson_id}")
+            lesson = lessons[lesson_id]
+            if not _stands(lesson):
+                return
+            deleted = Lesson()
+            deleted.CopyFrom(lesson)
+            now = self._now()
+            deleted.updated_at.CopyFrom(now)
+            deleted.deleted_at.CopyFrom(now)
+            _write(files, lessons, deleted)
+
     def lessons(self, lane: Lane.ValueType | None = None) -> list[Lesson]:
-        """Return the lessons, of one ``lane`` or of all, in the order they were added."""
+        """Return the standing lessons, of one ``lane`` or of all, in the order they were added."""
         with self._ledger.session() as files:
             lessons = _latest(files)
-        return [lesson for lesson in lessons.values() if lane in (None, lesson.lane)]
+        return [
+            lesson for lesson in lessons.values() if _stands(lesson) and lane in (None, lesson.lane)
+        ]
 
     def get(self, lesson_id: str) -> Lesson | None:
-        """Return the lesson with ``lesson_id``, or None if there is none."""
+        """Return the standing lesson with ``lesson_id``, or None if there is none."""
         with self._ledger.session() as files:
-            return _latest(files).get(lesson_id)
+            lesson = _latest(files).get(lesson_id)
+        return lesson if lesson is not None and _stands(lesson) else None
 
     def write_markdown(self) -> None:
         """Regenerate lessons.md from lessons.jsonl, as every change already does."""
@@ -107,6 +132,8 @@ class LessonStore:
             if lesson_id not in lessons:
                 raise LessonNotFoundError(f"no lesson has the ID {lesson_id}")
             lesson = lessons[lesson_id]
+            if not _stands(lesson):
+                raise LessonNotFoundError(f"lesson {lesson_id} was deleted")
             marked, other = (
                 (lesson.helped_by, lesson.hurt_by) if helped else (lesson.hurt_by, lesson.helped_by)
             )
@@ -138,6 +165,10 @@ def _latest(files: LedgerFiles) -> dict[str, Lesson]:
     return lessons
 
 
+def _stands(lesson: Lesson) -> bool:
+    return not lesson.HasField("deleted_at")
+
+
 def _write(files: LedgerFiles, lessons: dict[str, Lesson], lesson: Lesson) -> None:
     """Append ``lesson``'s new state, then regenerate lessons.md from every lesson's latest."""
     files.append(LESSONS, lesson)
@@ -146,13 +177,13 @@ def _write(files: LedgerFiles, lessons: dict[str, Lesson], lesson: Lesson) -> No
 
 
 def render_markdown(lessons: Iterable[Lesson]) -> str:
-    """Render ``lessons`` as lessons.md: grouped by lane, oldest first.
+    """Render ``lessons`` as lessons.md: grouped by lane, oldest first, deleted ones left out.
 
     The text depends only on the lessons given, not on their order.
     """
     blocks = ["# RSI lessons", "Generated from lessons.jsonl by goaly.rsi; do not edit."]
     ordered = sorted(
-        lessons,
+        filter(_stands, lessons),
         key=lambda lesson: (
             lesson.lane,
             lesson.created_at.seconds,

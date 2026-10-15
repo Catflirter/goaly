@@ -7,6 +7,7 @@ from datetime import UTC, datetime, timedelta
 from pathlib import Path
 
 import pytest
+from google.protobuf import json_format
 from google.protobuf.timestamp_pb2 import Timestamp
 
 from goaly.contracts.gen.experiment_pb2 import (
@@ -179,6 +180,70 @@ def test_marking_needs_a_valid_experiment_id(store: LessonStore) -> None:
 
     with pytest.raises(ValueError, match="experiment_id"):
         store.mark_hurt("l1", "not valid")
+
+
+# Deleting lessons.
+
+
+def test_a_deleted_lesson_is_skipped_but_its_lines_stay(store: LessonStore, ledger: Ledger) -> None:
+    store.add("l1", LANE_EFFISQL, "Keep the identity fallback.", ["e1"])
+    store.add("l2", LANE_EFFISQL, "Profile first.")
+    store.mark_helped("l1", "e2")
+
+    store.delete("l1")
+
+    assert [lesson.lesson_id for lesson in store.lessons()] == ["l2"]
+    assert store.get("l1") is None
+    assert "`l1`" not in markdown(ledger)
+    # Nothing is lost: the deletion is one more line, holding the lesson's last state.
+    stored = (ledger.directory / "lessons.jsonl").read_text(encoding="utf-8").splitlines()
+    assert len(stored) == 4
+    deleted = Lesson()
+    json_format.Parse(stored[-1], deleted)
+    assert deleted.text == "Keep the identity fallback."
+    assert list(deleted.helped_by) == ["e2"]
+    assert deleted.deleted_at == timestamp(START + timedelta(minutes=3))
+    assert deleted.updated_at == deleted.deleted_at
+
+
+def test_deleting_a_lesson_again_changes_nothing(store: LessonStore, ledger: Ledger) -> None:
+    store.add("l1", LANE_EFFISQL, "text")
+    store.delete("l1")
+
+    store.delete("l1")
+
+    assert jsonl_lines(ledger) == 2
+
+
+def test_deleting_an_unknown_lesson_is_an_error(store: LessonStore) -> None:
+    with pytest.raises(LessonNotFoundError, match="nope"):
+        store.delete("nope")
+
+
+def test_a_deleted_lesson_cannot_be_marked(store: LessonStore) -> None:
+    store.add("l1", LANE_EFFISQL, "text")
+    store.delete("l1")
+
+    with pytest.raises(LessonNotFoundError, match="deleted"):
+        store.mark_helped("l1", "e2")
+
+
+def test_a_deleted_lessons_id_is_not_reused(store: LessonStore) -> None:
+    store.add("l1", LANE_EFFISQL, "text")
+    store.delete("l1")
+
+    with pytest.raises(ValueError, match="l1"):
+        store.add("l1", LANE_EFFISQL, "new text")
+
+
+def test_render_markdown_skips_deleted_lessons() -> None:
+    deleted = Lesson()
+    deleted.CopyFrom(sample_lessons()[0])
+    deleted.deleted_at.CopyFrom(timestamp(START))
+
+    assert render_markdown([*sample_lessons()[1:], deleted]) == render_markdown(
+        sample_lessons()[1:]
+    )
 
 
 # Marks argv[3] experiments, named after argv[2], as having helped lesson l1.
