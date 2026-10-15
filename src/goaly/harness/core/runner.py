@@ -31,7 +31,7 @@ from collections.abc import Callable, Collection, Mapping, Sequence
 from contextlib import AbstractAsyncContextManager
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import BinaryIO, Protocol
+from typing import BinaryIO, Protocol, Self
 
 from google.protobuf.timestamp_pb2 import Timestamp
 
@@ -67,6 +67,7 @@ from goaly.contracts.jsonl import read_jsonl, to_json_line
 from goaly.harness.core.atomic import write_text_atomically
 from goaly.harness.core.eval_cache import CachedEvaluation, CacheKey, EvalCache, task_digest
 from goaly.harness.core.jsonl_writer import JsonlWriter
+from goaly.harness.core.logs import log_context
 from goaly.harness.core.manifest import read_manifest, write_manifest
 
 __all__ = [
@@ -76,11 +77,14 @@ __all__ = [
     "RunDirectoryError",
     "RunFiles",
     "RunIdentity",
+    "RunLock",
     "RunSummary",
     "Runner",
     "TaskContext",
+    "UsageError",
     "classify_error",
     "error_classifier",
+    "lock_run_dir",
 ]
 
 _logger = logging.getLogger(__name__)
@@ -112,6 +116,14 @@ type _Key = tuple[str, int]  # (instance ID, seed)
 
 class RunDirectoryError(Exception):
     """The run directory cannot be used: it holds another run, or another process uses it."""
+
+
+class UsageError(ValueError):
+    """The caller asked for a run that cannot run as asked; the message says what to change.
+
+    `goaly run` exits with its usage status for this error, and for any other ValueError exits
+    as a failed run, with the traceback logged: such an error is a bug to debug.
+    """
 
 
 @dataclass(frozen=True)
@@ -148,6 +160,57 @@ class RunFiles:
     def official(self, seed: int) -> Path:
         """The official prediction file of replicate ``seed``: one record per instance."""
         return self.root / "official" / f"seed-{seed}.jsonl"
+
+
+class RunLock:
+    """The lock that keeps every other process out of a run directory, until it is released.
+
+    lock_run_dir() takes it. It is a context manager, and release() releases it; releasing it
+    again does nothing. A process that dies releases it too.
+    """
+
+    def __init__(self, files: RunFiles, handle: BinaryIO) -> None:
+        self._files = files
+        self._handle = handle
+
+    @property
+    def files(self) -> RunFiles:
+        """The run directory it locks."""
+        return self._files
+
+    @property
+    def released(self) -> bool:
+        """Whether it was released, so that it keeps no other process out any more."""
+        return self._handle.closed
+
+    def release(self) -> None:
+        """Release the lock."""
+        self._handle.close()
+
+    def __enter__(self) -> Self:
+        return self
+
+    def __exit__(self, *exc_info: object) -> None:
+        self.release()
+
+
+def lock_run_dir(files: RunFiles) -> RunLock:
+    """Create the run directory if needed, and lock it for this process.
+
+    Raise RunDirectoryError if another process holds its lock. It opens a file, so run it in a
+    worker thread from the event loop.
+    """
+    try:
+        files.root.mkdir(parents=True, exist_ok=True)
+    except (FileExistsError, NotADirectoryError) as error:  # It, or a parent, is a file.
+        raise RunDirectoryError(f"{files.root} cannot be a run directory: {error}") from error
+    handle = files.lock.open("ab")
+    try:
+        fcntl.flock(handle, fcntl.LOCK_EX | fcntl.LOCK_NB)
+    except BlockingIOError:
+        handle.close()
+        raise RunDirectoryError(f"another process is running in {files.root}") from None
+    return RunLock(files, handle)
 
 
 @dataclass(frozen=True)
@@ -249,9 +312,9 @@ class Runner[InstanceT: Instance, EnvT: Environment, CtxT: TaskContext]:
         task_timeout_s: float | None = None,
     ) -> None:
         if max_tasks < 1:
-            raise ValueError(f"max_tasks must be at least 1: {max_tasks}")
+            raise UsageError(f"max_tasks must be at least 1: {max_tasks}")
         if task_timeout_s is not None and not 0 < task_timeout_s < math.inf:
-            raise ValueError(f"task_timeout_s must be a positive, finite number: {task_timeout_s}")
+            raise UsageError(f"task_timeout_s must be a positive, finite number: {task_timeout_s}")
         self._benchmark = benchmark
         self._policy = policy
         self._contexts = contexts
@@ -270,6 +333,7 @@ class Runner[InstanceT: Instance, EnvT: Environment, CtxT: TaskContext]:
         instance_ids: Collection[str] | None = None,
         resume: bool = False,
         retry_errors: bool = False,
+        lock: RunLock | None = None,
     ) -> RunSummary:
         """Run each instance of ``split`` once per seed, in ``run_dir``, and record every task.
 
@@ -288,14 +352,21 @@ class Runner[InstanceT: Instance, EnvT: Environment, CtxT: TaskContext]:
         new records supersede the old ones. A directory with no run starts one. Without
         ``resume``, a directory that holds a run raises RunDirectoryError, as does one another
         process runs in.
+
+        The run holds the directory's lock throughout. A caller that holds it already, as
+        `goaly run` does from before it opens the harness, passes it as ``lock``.
         """
         if not manifest.run_id:
-            raise ValueError("the manifest has no run_id")
+            raise UsageError("the manifest has no run_id")
         if self._cache is not None and not manifest.harness_hash:
-            raise ValueError("the evaluation cache needs the manifest's harness_hash")
+            raise UsageError("the evaluation cache needs the manifest's harness_hash")
         seeds = _checked_seeds(seeds)
         files = RunFiles(run_dir)
-        lock = await asyncio.to_thread(_lock, files)
+        if lock is not None and lock.files != files:
+            raise UsageError(f"the lock given is on {lock.files.root}, not on {run_dir}")
+        if lock is not None and lock.released:
+            raise UsageError(f"the lock given on {run_dir} is released already")
+        own_lock = None if lock is not None else await asyncio.to_thread(lock_run_dir, files)
         try:
             plan = await asyncio.to_thread(
                 self._plan, files, manifest, split, seeds, instance_ids, resume, retry_errors
@@ -303,7 +374,8 @@ class Runner[InstanceT: Instance, EnvT: Environment, CtxT: TaskContext]:
             run = await self._run_tasks(files, plan)
             await asyncio.to_thread(self._finish, files, plan)
         finally:
-            lock.close()  # Unlocks the directory.
+            if own_lock is not None:
+                own_lock.release()
         summary = RunSummary(
             run_id=plan.manifest.run_id,
             tasks=len(plan.instances) * len(plan.seeds),
@@ -391,7 +463,7 @@ class Runner[InstanceT: Instance, EnvT: Environment, CtxT: TaskContext]:
             return instances
         unknown = sorted(set(instance_ids) - known)
         if unknown:
-            raise ValueError(f"{Split.Name(split)} has no instance {', '.join(map(repr, unknown))}")
+            raise UsageError(f"{Split.Name(split)} has no instance {', '.join(map(repr, unknown))}")
         return [inst for inst in instances if inst.instance_id in instance_ids]
 
     def _finish(self, files: RunFiles, plan: "_Plan[InstanceT]") -> None:
@@ -443,6 +515,11 @@ class Runner[InstanceT: Instance, EnvT: Environment, CtxT: TaskContext]:
         return run
 
     async def _task(self, run: "_Run", inst: InstanceT, seed: int) -> None:
+        # Every line the task's code logs names the task, the pack's and the adapter's too.
+        with log_context(run_id=run.identity.run_id, instance_id=inst.instance_id, seed=seed):
+            await self._task_records(run, inst, seed)
+
+    async def _task_records(self, run: "_Run", inst: InstanceT, seed: int) -> None:
         key = None
         task: TaskInput | None = None
         try:
@@ -769,23 +846,11 @@ class _Attempt:
         self.finished_at = _now()
 
 
-def _lock(files: RunFiles) -> BinaryIO:
-    """Create the run directory if needed, and lock it for this process, or raise."""
-    files.root.mkdir(parents=True, exist_ok=True)
-    handle = files.lock.open("ab")
-    try:
-        fcntl.flock(handle, fcntl.LOCK_EX | fcntl.LOCK_NB)
-    except BlockingIOError:
-        handle.close()
-        raise RunDirectoryError(f"another process is running in {files.root}") from None
-    return handle
-
-
 def _checked_seeds(seeds: Sequence[int]) -> list[int]:
     if not seeds:
-        raise ValueError("a run needs at least one seed")
+        raise UsageError("a run needs at least one seed")
     if any(seed < 0 for seed in seeds) or len(set(seeds)) != len(seeds):
-        raise ValueError(f"the seeds must be distinct replicate indices, 0 or more: {list(seeds)}")
+        raise UsageError(f"the seeds must be distinct replicate indices, 0 or more: {list(seeds)}")
     return list(seeds)
 
 
