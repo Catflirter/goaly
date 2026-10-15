@@ -4,14 +4,17 @@ import json
 from collections.abc import Sequence
 
 from goaly.contracts.gen.experiment_pb2 import (
+    Decision,
     DecisionThresholds,
+    ExperimentRecord,
     Guard,
     GuardResult,
     Lane,
     PhaseResult,
+    RejectionReason,
 )
 from goaly.contracts.gen.manifest_pb2 import RunManifest
-from goaly.contracts.gen.task_pb2 import Prediction
+from goaly.contracts.gen.task_pb2 import Prediction, Split
 from goaly.contracts.gen.trajectory_pb2 import (
     Chat,
     ChatMessage,
@@ -237,3 +240,23 @@ def test_a_guard_result_names_the_pack_code_allowlist() -> None:
 
     assert json.loads(line)["guard"] == "GUARD_PACK_CODE_ALLOWLIST"
     assert from_json_line(line, GuardResult) == result
+
+
+def test_a_phase_lists_the_tasks_a_hard_coding_check_flagged() -> None:
+    # One flagged prediction fails the candidate outright (spec §8.2 step 4).
+    screening = PhaseResult(
+        split=Split.SPLIT_TRAIN, task_count=20, flagged_instance_ids=["17", "203"]
+    )
+    record = ExperimentRecord(
+        experiment_id="exp-3",
+        screening=screening,
+        decision=Decision.DECISION_REJECTED,
+        rejection_reasons=[RejectionReason.REJECTION_REASON_HARD_CODED],
+    )
+
+    line = to_json_line(record)
+
+    fields = json.loads(line)
+    assert fields["screening"]["flagged_instance_ids"] == ["17", "203"]
+    assert fields["rejection_reasons"] == ["REJECTION_REASON_HARD_CODED"]
+    assert from_json_line(line, ExperimentRecord) == record

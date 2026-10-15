@@ -194,6 +194,11 @@ message PhaseResult {
   optional double gain_probability = 11;
   // How many tasks regressed, as spec §8.3 defines a regression for the lane.
   optional int32 regressions = 12;
+  // The tasks on which a check against hard-coded results flagged the candidate's prediction, in
+  // any seed, each listed once (spec §4.1): hard_coded, which is EffiSqlGrade.alt_matched false,
+  // or literal_result. Each task's grade, in the runs candidate_run_ids names, says which check
+  // flagged it. One flagged task fails the candidate outright, as REJECTION_REASON_HARD_CODED.
+  repeated string flagged_instance_ids = 20;
   // The candidate's mean tokens per task over the best's, which the cost guardrail checks.
   optional double token_ratio_vs_best = 13;
   // Its mean wall time per task over the best's, which the cost guardrail checks.
@@ -234,6 +239,11 @@ enum RejectionReason {
   REJECTION_REASON_IMPLEMENTATION_FAILED = 1;
   // A guard failed; guards says which.
   REJECTION_REASON_GUARD_FAILED = 2;
+  // A check against hard-coded results flagged one of its predictions in the screen, the
+  // validation or the confirmation (spec §4.1, §8.2 step 4). This covers both flags: hard_coded,
+  // which is EffiSqlGrade.alt_matched false, and literal_result. That phase's
+  // flagged_instance_ids lists the flagged tasks.
+  REJECTION_REASON_HARD_CODED = 11;
   // The screen showed no net gain over the best.
   REJECTION_REASON_NO_SCREEN_GAIN = 3;
   // Its mean cost or wall time per task exceeded the efficiency cap.

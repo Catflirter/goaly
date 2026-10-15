@@ -227,6 +227,12 @@ class _RejectionReasonEnumTypeWrapper(_enum_type_wrapper._EnumTypeWrapper[_Rejec
     """The implementer made no commit for the hypothesis."""
     REJECTION_REASON_GUARD_FAILED: _RejectionReason.ValueType  # 2
     """A guard failed; guards says which."""
+    REJECTION_REASON_HARD_CODED: _RejectionReason.ValueType  # 11
+    """A check against hard-coded results flagged one of its predictions in the screen, the
+    validation or the confirmation (spec §4.1, §8.2 step 4). This covers both flags: hard_coded,
+    which is EffiSqlGrade.alt_matched false, and literal_result. That phase's
+    flagged_instance_ids lists the flagged tasks.
+    """
     REJECTION_REASON_NO_SCREEN_GAIN: _RejectionReason.ValueType  # 3
     """The screen showed no net gain over the best."""
     REJECTION_REASON_EFFICIENCY_CAP: _RejectionReason.ValueType  # 4
@@ -257,6 +263,12 @@ REJECTION_REASON_IMPLEMENTATION_FAILED: RejectionReason.ValueType  # 1
 """The implementer made no commit for the hypothesis."""
 REJECTION_REASON_GUARD_FAILED: RejectionReason.ValueType  # 2
 """A guard failed; guards says which."""
+REJECTION_REASON_HARD_CODED: RejectionReason.ValueType  # 11
+"""A check against hard-coded results flagged one of its predictions in the screen, the
+validation or the confirmation (spec §4.1, §8.2 step 4). This covers both flags: hard_coded,
+which is EffiSqlGrade.alt_matched false, and literal_result. That phase's
+flagged_instance_ids lists the flagged tasks.
+"""
 REJECTION_REASON_NO_SCREEN_GAIN: RejectionReason.ValueType  # 3
 """The screen showed no net gain over the best."""
 REJECTION_REASON_EFFICIENCY_CAP: RejectionReason.ValueType  # 4
@@ -540,6 +552,7 @@ class PhaseResult(_message.Message):
     SIGN_TEST_P_FIELD_NUMBER: _builtins.int
     GAIN_PROBABILITY_FIELD_NUMBER: _builtins.int
     REGRESSIONS_FIELD_NUMBER: _builtins.int
+    FLAGGED_INSTANCE_IDS_FIELD_NUMBER: _builtins.int
     TOKEN_RATIO_VS_BEST_FIELD_NUMBER: _builtins.int
     TIME_RATIO_VS_BEST_FIELD_NUMBER: _builtins.int
     COST_RATIO_VS_V0_FIELD_NUMBER: _builtins.int
@@ -583,6 +596,14 @@ class PhaseResult(_message.Message):
     time_ratio_vs_v0: _builtins.float
     """Its mean wall time per task over v0's on the same split, which the efficiency cap checks."""
     @_builtins.property
+    def flagged_instance_ids(self) -> _containers.RepeatedScalarFieldContainer[_builtins.str]:
+        """The tasks on which a check against hard-coded results flagged the candidate's prediction, in
+        any seed, each listed once (spec §4.1): hard_coded, which is EffiSqlGrade.alt_matched false,
+        or literal_result. Each task's grade, in the runs candidate_run_ids names, says which check
+        flagged it. One flagged task fails the candidate outright, as REJECTION_REASON_HARD_CODED.
+        """
+
+    @_builtins.property
     def candidate_run_ids(self) -> _containers.RepeatedScalarFieldContainer[_builtins.str]:
         """The candidate's runs whose results the phase compared."""
 
@@ -609,6 +630,7 @@ class PhaseResult(_message.Message):
         sign_test_p: _builtins.float | None = ...,
         gain_probability: _builtins.float | None = ...,
         regressions: _builtins.int | None = ...,
+        flagged_instance_ids: _abc.Iterable[_builtins.str] | None = ...,
         token_ratio_vs_best: _builtins.float | None = ...,
         time_ratio_vs_best: _builtins.float | None = ...,
         cost_ratio_vs_v0: _builtins.float | None = ...,
@@ -619,7 +641,7 @@ class PhaseResult(_message.Message):
     ) -> None: ...
     _HasFieldArgType: _TypeAlias = _typing.Literal["_cost_ratio_vs_v0", b"_cost_ratio_vs_v0", "_effective_min_delta", b"_effective_min_delta", "_gain_probability", b"_gain_probability", "_losses", b"_losses", "_regressions", b"_regressions", "_sign_test_p", b"_sign_test_p", "_time_ratio_vs_best", b"_time_ratio_vs_best", "_time_ratio_vs_v0", b"_time_ratio_vs_v0", "_token_ratio_vs_best", b"_token_ratio_vs_best", "_wins", b"_wins", "cost_ratio_vs_v0", b"cost_ratio_vs_v0", "effective_min_delta", b"effective_min_delta", "gain_probability", b"gain_probability", "losses", b"losses", "regressions", b"regressions", "sign_test_p", b"sign_test_p", "time_ratio_vs_best", b"time_ratio_vs_best", "time_ratio_vs_v0", b"time_ratio_vs_v0", "token_ratio_vs_best", b"token_ratio_vs_best", "wins", b"wins"]  # noqa: Y015
     def HasField(self, field_name: _HasFieldArgType) -> _builtins.bool: ...
-    _ClearFieldArgType: _TypeAlias = _typing.Literal["_cost_ratio_vs_v0", b"_cost_ratio_vs_v0", "_effective_min_delta", b"_effective_min_delta", "_gain_probability", b"_gain_probability", "_losses", b"_losses", "_regressions", b"_regressions", "_sign_test_p", b"_sign_test_p", "_time_ratio_vs_best", b"_time_ratio_vs_best", "_time_ratio_vs_v0", b"_time_ratio_vs_v0", "_token_ratio_vs_best", b"_token_ratio_vs_best", "_wins", b"_wins", "best_run_ids", b"best_run_ids", "best_score", b"best_score", "candidate_run_ids", b"candidate_run_ids", "candidate_score", b"candidate_score", "cost_ratio_vs_v0", b"cost_ratio_vs_v0", "delta", b"delta", "effective_min_delta", b"effective_min_delta", "gain_probability", b"gain_probability", "losses", b"losses", "regressions", b"regressions", "seed_count", b"seed_count", "sign_test_p", b"sign_test_p", "split", b"split", "task_count", b"task_count", "time_ratio_vs_best", b"time_ratio_vs_best", "time_ratio_vs_v0", b"time_ratio_vs_v0", "token_ratio_vs_best", b"token_ratio_vs_best", "v0_run_ids", b"v0_run_ids", "wins", b"wins"]  # noqa: Y015
+    _ClearFieldArgType: _TypeAlias = _typing.Literal["_cost_ratio_vs_v0", b"_cost_ratio_vs_v0", "_effective_min_delta", b"_effective_min_delta", "_gain_probability", b"_gain_probability", "_losses", b"_losses", "_regressions", b"_regressions", "_sign_test_p", b"_sign_test_p", "_time_ratio_vs_best", b"_time_ratio_vs_best", "_time_ratio_vs_v0", b"_time_ratio_vs_v0", "_token_ratio_vs_best", b"_token_ratio_vs_best", "_wins", b"_wins", "best_run_ids", b"best_run_ids", "best_score", b"best_score", "candidate_run_ids", b"candidate_run_ids", "candidate_score", b"candidate_score", "cost_ratio_vs_v0", b"cost_ratio_vs_v0", "delta", b"delta", "effective_min_delta", b"effective_min_delta", "flagged_instance_ids", b"flagged_instance_ids", "gain_probability", b"gain_probability", "losses", b"losses", "regressions", b"regressions", "seed_count", b"seed_count", "sign_test_p", b"sign_test_p", "split", b"split", "task_count", b"task_count", "time_ratio_vs_best", b"time_ratio_vs_best", "time_ratio_vs_v0", b"time_ratio_vs_v0", "token_ratio_vs_best", b"token_ratio_vs_best", "v0_run_ids", b"v0_run_ids", "wins", b"wins"]  # noqa: Y015
     def ClearField(self, field_name: _ClearFieldArgType) -> None: ...
     _WhichOneofReturnType__cost_ratio_vs_v0: _TypeAlias = _typing.Literal["cost_ratio_vs_v0"]  # noqa: Y015
     _WhichOneofArgType__cost_ratio_vs_v0: _TypeAlias = _typing.Literal["_cost_ratio_vs_v0", b"_cost_ratio_vs_v0"]  # noqa: Y015
