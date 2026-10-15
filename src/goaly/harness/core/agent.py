@@ -53,6 +53,10 @@ __all__ = ["AgentContext", "AgentHooks", "run_agent"]
 
 # The finish_reason of a reply that max_tokens cut off.
 _CUT_OFF: Final = "length"
+# Where the parser finds calls written as Qwen3-Coder XML.
+_XML_SOURCES: Final = frozenset(
+    {ToolCallSource.TOOL_CALL_SOURCE_CONTENT_XML, ToolCallSource.TOOL_CALL_SOURCE_REASONING_XML}
+)
 
 # What the loop tells the model. {tools} lists the tools' names.
 _CUT_OFF_CALL: Final = (
@@ -328,14 +332,14 @@ def _with_calls(message: ChatMessage, calls: Sequence[ToolCall]) -> ChatMessage:
 def _replayed(assistant: ChatMessage) -> ChatMessage:
     """``assistant`` as later prompts carry it: each call only once, as a structured call.
 
-    Markup that calls were parsed from is taken out of the content or the reasoning, or the
-    model would see each of those calls twice. The trajectory keeps the reply as it came.
+    When its calls were parsed from XML, the call markup is taken out of both the content and
+    the reasoning. A call drafted in one and written again in the other then reaches the model
+    once, and a drafted call that never ran cannot look as if it ran. The trajectory keeps the
+    reply as it came.
     """
     message = _copy(assistant)
-    sources = {call.source for call in assistant.tool_calls}
-    if ToolCallSource.TOOL_CALL_SOURCE_CONTENT_XML in sources:
+    if any(call.source in _XML_SOURCES for call in assistant.tool_calls):
         message.content = strip_tool_call_markup(message.content)
-    if ToolCallSource.TOOL_CALL_SOURCE_REASONING_XML in sources:
         message.reasoning_content = strip_tool_call_markup(message.reasoning_content)
     return message
 

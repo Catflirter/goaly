@@ -205,13 +205,14 @@ def tool_message(result: ToolResult) -> ChatMessage:
 
 
 def replayed(assistant: ChatMessage) -> ChatMessage:
-    """An assistant message as a later prompt carries it: its calls only as structured calls."""
+    """An assistant message as a later prompt carries it: its calls only as structured calls.
+
+    Once any call was parsed from XML, neither the content nor the reasoning keeps call markup.
+    """
     message = ChatMessage()
     message.CopyFrom(assistant)
-    sources = {call.source for call in assistant.tool_calls}
-    if CONTENT_XML in sources:
+    if {call.source for call in assistant.tool_calls} & {CONTENT_XML, REASONING_XML}:
         message.content = strip_tool_call_markup(message.content)
-    if REASONING_XML in sources:
         message.reasoning_content = strip_tool_call_markup(message.reasoning_content)
     return message
 
@@ -351,6 +352,32 @@ async def test_a_call_in_the_content_runs_and_is_replayed_without_its_markup() -
     assert "<tool_call>" not in replay.content
     assert replay.content.startswith("Let me first examine the query plan")
     assert list(replay.tool_calls) == [call]
+
+
+async def test_a_call_drafted_in_the_reasoning_is_taken_out_of_the_replay_too() -> None:
+    def xml(name: str, sql: str) -> str:
+        return (
+            f"<tool_call>\n<function={name}>\n<parameter=sql>\n{sql}\n</parameter>\n"
+            "</function>\n</tool_call>"
+        )
+
+    drafted = reply(
+        content=f"Running it.\n{xml('execute_sql', FAST)}",
+        reasoning=f"Submit it now?\n{xml('submit', FAST)}\nNo: run it first.",
+    )
+    llm = FakeLLM([drafted, reply(submit())])
+    ctx = context(llm)
+
+    await run_agent(environment(), ctx, hooks())
+
+    first = ctx.trajectory().steps[0]
+    assert [(call.name, call.source) for call in first.assistant.tool_calls] == [
+        ("execute_sql", CONTENT_XML)  # The content's call wins; the drafted submit never ran.
+    ]
+    assert first.assistant.reasoning_content == drafted.message.reasoning_content
+    replay = sent(llm)[1][2]
+    assert replay.content == "Running it.\n"
+    assert replay.reasoning_content == "Submit it now?\n\nNo: run it first."
 
 
 async def test_a_call_in_the_reasoning_runs_and_is_replayed_without_its_markup() -> None:
