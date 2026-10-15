@@ -22,7 +22,7 @@ import concurrent.futures
 import logging
 import threading
 import time
-from collections.abc import Callable, Mapping
+from collections.abc import Callable, Collection, Mapping
 from contextlib import AbstractContextManager
 from dataclasses import dataclass
 from pathlib import Path, PurePosixPath
@@ -46,7 +46,7 @@ from goaly.rsi.git import GitError
 from goaly.rsi.guards.allowlist import ALLOWED_CORE_MODULES, ALLOWED_STDLIB
 from goaly.rsi.implementer import msa
 from goaly.rsi.implementer.config import ImplementerConfig, load_config
-from goaly.rsi.implementer.environment import SandboxEnvironment
+from goaly.rsi.implementer.environment import HostCommand, SandboxEnvironment
 from goaly.rsi.implementer.model import (
     EXIT_COST_LIMIT,
     EXIT_INTERRUPTED,
@@ -55,6 +55,7 @@ from goaly.rsi.implementer.model import (
     GlmModel,
     SyncLlm,
 )
+from goaly.rsi.implementer.smoke import SmokeRunner, SmokeService
 from goaly.rsi.lanes import lane_info
 from goaly.rsi.sandbox import SandboxConfig, SandboxError, remove_containers
 from goaly.rsi.workspace import UnsafePackError, Workspace, WorkspaceError, Worktree
@@ -95,8 +96,11 @@ _INFRASTRUCTURE_ERRORS: Final = (
 
 _logger = logging.getLogger(__name__)
 
-# Starts the sandbox for a worktree; leaving the context removes it, and must wait until it is gone.
-type EnvironmentFactory = Callable[[Worktree], AbstractContextManager[msa.Environment]]
+# Starts the sandbox for a worktree, with goaly-smoke's host side if it is on; leaving the context
+# removes it, and must wait until it is gone.
+type EnvironmentFactory = Callable[
+    [Worktree, HostCommand | None], AbstractContextManager[msa.Environment]
+]
 type ModelFactory = Callable[[str, threading.Event], msa.Model]
 
 
@@ -143,8 +147,10 @@ class Implementer:
     ``llm`` is the lane's LlmClient, on the lane's event loop. ``pool`` is the lane's implementer
     thread pool, of k threads (spec §6.2); runs never use the loop's default executor, which file
     and git work share. ``image`` is the sandbox image (goaly.rsi.sandbox.ensure_image), and
-    ``runs_dir`` the runs directory. ``make_environment`` and ``make_model`` replace the sandbox
-    and GlmModel, for tests and dry runs.
+    ``runs_dir`` the runs directory. With ``smoke``, the agent may run goaly-smoke on the tasks of
+    ``train_ids``, at most ``limits.smoke_limit`` times; without it, goaly-smoke is off and the
+    prompt does not offer it. ``make_environment`` and ``make_model`` replace the sandbox and
+    GlmModel, for tests and dry runs.
     """
 
     def __init__(
@@ -159,8 +165,12 @@ class Implementer:
         sandbox: SandboxConfig = SandboxConfig(),  # noqa: B008  (frozen, so one default is safe)
         make_environment: EnvironmentFactory | None = None,
         make_model: ModelFactory | None = None,
+        smoke: SmokeRunner | None = None,
+        train_ids: Collection[str] = (),
     ) -> None:
         self._llm = llm
+        self._smoke = smoke
+        self._train_ids = frozenset(train_ids)
         self._workspace = workspace
         self._image = image
         self._runs_dir = runs_dir
@@ -210,8 +220,10 @@ class Implementer:
         record = ImplementerRun()
         commit = None
         agent: msa.DefaultAgent | None = None
+        smoke = self._smoke_service(worktree, stop)
         try:
-            with self._make_environment(worktree) as environment:
+            host = None if smoke is None else smoke.handle
+            with self._make_environment(worktree, host) as environment:
                 model = self._make_model(worktree.experiment_id, stop)
                 agent = msa.make_agent(
                     model,
@@ -245,6 +257,8 @@ class Implementer:
         if stop.is_set() and commit is None:
             # goaly.rsi stopped it, whatever the run then saw, such as its removed sandbox.
             record.exit = _E.IMPLEMENTER_EXIT_INTERRUPTED
+        if smoke is not None:
+            record.smoke_tests.extend(smoke.tests)
         if agent is not None:
             record.step_count = _steps(agent.messages)
             record.trajectory_path = str(relative) if output_path.exists() else ""
@@ -278,15 +292,32 @@ class Implementer:
             "pack_dirs": [str(path) for path in lane_info(worktree.lane).pack_dirs],
             "allowed_stdlib": sorted(ALLOWED_STDLIB),
             "allowed_core_modules": sorted(ALLOWED_CORE_MODULES),
+            "smoke": self._smoke is not None and self._config.limits.smoke_limit > 0,
         }
 
-    def _sandbox_environment(self, worktree: Worktree) -> SandboxEnvironment:
+    def _smoke_service(self, worktree: Worktree, stop: threading.Event) -> SmokeService | None:
+        """goaly-smoke's host side for one run, or None if goaly-smoke is off."""
+        if self._smoke is None or self._config.limits.smoke_limit == 0:
+            return None
+        return SmokeService(
+            self._smoke,
+            self._workspace,
+            worktree,
+            train_ids=self._train_ids,
+            limit=self._config.limits.smoke_limit,
+            stop=stop,
+        )
+
+    def _sandbox_environment(
+        self, worktree: Worktree, smoke: HostCommand | None
+    ) -> SandboxEnvironment:
         return SandboxEnvironment(
             image=self._image,
             worktree=worktree,
             command_timeout_s=self._config.limits.command_timeout_s,
             lifetime_s=self._config.limits.wall_time_limit_s + _LIFETIME_MARGIN_S,
             sandbox=self._sandbox,
+            smoke=smoke,
         )
 
     def _glm_model(self, experiment_id: str, stop: threading.Event) -> GlmModel:

@@ -12,6 +12,7 @@ import pytest
 from goaly.contracts.gen.experiment_pb2 import LANE_EFFISQL
 from goaly.rsi.implementer import msa
 from goaly.rsi.implementer.environment import SandboxEnvironment, SandboxStoppedError
+from goaly.rsi.implementer.smoke import Pause
 from goaly.rsi.sandbox import SandboxConfig, SandboxError
 from goaly.rsi.workspace import Workspace, Worktree
 from tests.rsi.fakedocker import FakeDocker
@@ -348,3 +349,60 @@ def test_a_docker_cli_gone_mid_run_is_a_sandbox_error(
             environment.execute({"command": "ls"})
     finally:
         docker.path.with_name("moved").rename(docker.path)
+
+
+def test_goaly_smoke_runs_on_the_host_with_the_sandbox_stopped_then_started_afresh(
+    docker: FakeDocker, worktree: Worktree
+) -> None:
+    seen: list[list[str]] = []
+
+    def smoke(command: str, pause: Pause) -> dict[str, Any]:
+        with pause():
+            seen.append(docker.commands())  # What docker had done when the pin would run.
+        return {"output": "goaly-smoke 3: score 1\n", "returncode": 0, "exception_info": ""}
+
+    environment = SandboxEnvironment(
+        image="image",
+        worktree=worktree,
+        command_timeout_s=5,
+        lifetime_s=60,
+        sandbox=SandboxConfig(docker=str(docker.path)),
+        smoke=smoke,
+    )
+    first = environment.container_id
+    with environment:
+        output = environment.execute({"command": "goaly-smoke 3"})
+        environment.execute({"command": "grep -rn goaly-smoke ."})  # A mention runs inside.
+        second = environment.container_id
+
+    assert output["output"] == "goaly-smoke 3: score 1\n"
+    # Removed, and checked to be gone, before the host touched the worktree.
+    assert seen == [["ps", "run", "rm", "ps", "ps"]]
+    assert docker.commands() == [
+        *("ps", "run", "rm", "ps", "ps"),  # Started, then stopped for the smoke run.
+        *("ps", "run", "exec"),  # Started afresh; the mention ran in it.
+        *("rm", "ps", "ps"),
+    ]
+    assert second != first
+
+
+def test_a_failed_smoke_run_still_starts_the_sandbox_afresh(
+    docker: FakeDocker, worktree: Worktree
+) -> None:
+    def smoke(command: str, pause: Pause) -> dict[str, Any]:
+        with pause():
+            raise SandboxError("the solve container failed")
+
+    with SandboxEnvironment(
+        image="image",
+        worktree=worktree,
+        command_timeout_s=5,
+        lifetime_s=60,
+        sandbox=SandboxConfig(docker=str(docker.path)),
+        smoke=smoke,
+    ) as environment:
+        with pytest.raises(SandboxError, match="solve container"):
+            environment.execute({"command": "goaly-smoke 3"})
+        assert environment.container_id is not None
+
+    assert docker.commands().count("run") == 2

@@ -29,10 +29,13 @@ import secrets
 import signal
 import subprocess
 import threading
+from collections.abc import Callable, Iterator
+from contextlib import contextmanager
 from types import TracebackType
 from typing import IO, Any, Final, Self, cast
 
 from goaly.rsi.implementer import msa
+from goaly.rsi.implementer.smoke import Pause, is_smoke_call
 from goaly.rsi.lanes import lane_info
 from goaly.rsi.sandbox import (
     SandboxConfig,
@@ -44,7 +47,7 @@ from goaly.rsi.sandbox import (
 )
 from goaly.rsi.workspace import Worktree
 
-__all__ = ["PURPOSE", "SandboxEnvironment", "SandboxStoppedError"]
+__all__ = ["PURPOSE", "HostCommand", "SandboxEnvironment", "SandboxStoppedError"]
 
 PURPOSE: Final = "implementer"  # The sandbox's purpose label.
 _TIMED_OUT: Final = 124  # timeout's exit status once it has stopped the command.
@@ -52,6 +55,10 @@ _HEAD_BYTES: Final = 4096  # How much of an output's start is kept, for its firs
 _CHUNK: Final = 64 * 1024
 
 _logger = logging.getLogger(__name__)
+
+# Answers, on the host, a command the sandbox must not run, as that command's output; it may
+# pause the sandbox meanwhile.
+type HostCommand = Callable[[str, Pause], dict[str, Any]]
 
 
 class SandboxStoppedError(Exception):
@@ -65,7 +72,9 @@ class SandboxEnvironment(msa.DockerEnvironment):
 
     The container starts when the environment is made, and lives at most ``lifetime_s``;
     :meth:`cleanup` removes it before it returns. Use the environment as a context manager. Each
-    command runs in a fresh bash in the worktree, for at most ``command_timeout_s``. Raises
+    command runs in a fresh bash in the worktree, for at most ``command_timeout_s``, except that a
+    goaly-smoke call goes to ``smoke`` on the host (goaly.rsi.implementer.smoke), which may stop
+    the container and start a fresh one meanwhile. Raises
     SandboxError if docker fails or hangs, and SandboxStoppedError if the container stopped by
     itself.
     """
@@ -78,14 +87,13 @@ class SandboxEnvironment(msa.DockerEnvironment):
         command_timeout_s: float,
         lifetime_s: float,
         sandbox: SandboxConfig = SandboxConfig(),  # noqa: B008  (frozen, so one default is safe)
+        smoke: HostCommand | None = None,
     ) -> None:
         self._worktree = worktree
+        self._smoke = smoke
         self._sandbox = sandbox
         self._command_timeout_s = command_timeout_s
-        self._name = (
-            f"goaly-rsi-{lane_info(worktree.lane).name}-{worktree.experiment_id}-{PURPOSE}-"
-            f"{secrets.token_hex(4)}"
-        )
+        self._name = ""  # Each container started gets a name of its own.
         options = run_options(
             worktree.path,
             worktree.lane,
@@ -121,6 +129,10 @@ class SandboxEnvironment(msa.DockerEnvironment):
     def _start_container(self) -> None:
         # A container of the experiment that is still there could change the worktree.
         remove_containers(experiment_id=self._worktree.experiment_id, config=self._sandbox)
+        lane = lane_info(self._worktree.lane).name
+        self._name = (
+            f"goaly-rsi-{lane}-{self._worktree.experiment_id}-{PURPOSE}-{secrets.token_hex(4)}"
+        )
         options = list(self.config.run_args)
         command = ["run", "--detach", f"--name={self._name}", *options, self.config.image]
         try:
@@ -144,6 +156,8 @@ class SandboxEnvironment(msa.DockerEnvironment):
         rest of its output. Raises SandboxError if docker fails or hangs, and SandboxStoppedError if
         the container is no longer running.
         """
+        if self._smoke is not None and is_smoke_call(action.get("command", "")):
+            return self._smoke(action["command"], self._paused)
         container = self.container_id
         if container is None:
             raise SandboxError("the sandbox container is not running")
@@ -203,6 +217,15 @@ class SandboxEnvironment(msa.DockerEnvironment):
         left = containers(experiment_id=experiment_id, config=self._sandbox)
         if left:
             raise SandboxError(f"sandbox containers of the experiment remain: {', '.join(left)}")
+
+    @contextmanager
+    def _paused(self) -> Iterator[None]:
+        """Stop and remove the sandbox for the block, then start a fresh one, whatever happens."""
+        self.cleanup()
+        try:
+            yield
+        finally:
+            self._start_container()
 
     def __del__(self) -> None:
         """Do nothing: the base class would remove the container in the background. Leftovers of

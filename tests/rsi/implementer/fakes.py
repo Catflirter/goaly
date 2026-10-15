@@ -6,11 +6,14 @@ pytest puts the repository root on sys.path, so tests import these as
 
 import json
 import subprocess
-from collections.abc import Callable
+import threading
+from collections.abc import Callable, Iterator
+from contextlib import contextmanager
 from pathlib import Path
 from typing import Any, Final, Self
 
 from goaly.rsi.implementer import msa
+from goaly.rsi.implementer.smoke import Pause, SmokeOutcome, is_smoke_call
 
 # After msa, which makes the first import of minisweagent.
 from minisweagent.models.test_models import (  # isort: skip
@@ -55,6 +58,10 @@ class FakeEnvironment:
         self.config: dict[str, Any] = {}
         self.commands: list[str] = []
         self.cleanups = 0
+        # goaly-smoke's host side, which answers goaly-smoke calls, as in the sandbox.
+        self.smoke: Callable[[str, Pause], dict[str, Any]] | None = None
+        # What happened to the fake sandbox, in order: "paused" and "resumed" around a smoke run.
+        self.events: list[str] = []
         self._handler = handler
 
     def __enter__(self) -> Self:
@@ -63,9 +70,19 @@ class FakeEnvironment:
     def __exit__(self, *exc_info: object) -> None:
         self.cleanups += 1
 
+    @contextmanager
+    def paused(self) -> Iterator[None]:
+        self.events.append("paused")
+        try:
+            yield
+        finally:
+            self.events.append("resumed")
+
     def execute(self, action: dict[str, Any], cwd: str = "") -> dict[str, Any]:
         command = action["command"]
         self.commands.append(command)
+        if self.smoke is not None and is_smoke_call(command):
+            return self.smoke(command, self.paused)
         output: dict[str, Any] = {"output": "", "returncode": 0, "exception_info": ""}
         if self._handler is not None:
             output.update(self._handler(command))
@@ -163,3 +180,34 @@ class NoLlm:
 
     def complete_sync(self, *args: Any, **kwargs: Any) -> Any:
         raise AssertionError("the scripted model makes no call")
+
+
+class FakeRunner:
+    """A SmokeRunner that records what it was asked, and answers as told."""
+
+    def __init__(self, *, guard_failure: str | None = None, score: float | None = 0.75) -> None:
+        self.guarded: list[str] = []
+        self.ran: list[tuple[str, str]] = []
+        self._guard_failure = guard_failure
+        self._score = score
+        self.error: Exception | None = None
+        self.during_run: Callable[[], None] | None = None
+
+    def guard(self, commit: str) -> str | None:
+        self.guarded.append(commit)
+        return self._guard_failure
+
+    def run(self, commit: str, instance_id: str, stop: threading.Event) -> SmokeOutcome:
+        self.ran.append((commit, instance_id))
+        if self.during_run is not None:
+            self.during_run()
+        if self.error is not None:
+            raise self.error
+        return SmokeOutcome(
+            run_id=f"smoke-{len(self.ran)}",
+            score=self._score,
+            stop_reason="STOP_REASON_SUBMITTED",
+            steps=7,
+            cost_usd=0.0123,
+            last_tool_error="",
+        )

@@ -2,13 +2,14 @@
 
 # One run's limits. The model adapter enforces the steps, the GLM cost (the gateway's
 # x-litellm-response-cost of each call) and the wall time; the agent stops after the format errors;
-# the sandbox stops each command after its timeout.
+# the sandbox stops each command after its timeout; goaly-smoke refuses calls after its limit.
 limits:
   step_limit: 60
   cost_limit_usd: 3.0
   wall_time_limit_s: 1800
   max_consecutive_format_errors: 3
   command_timeout_s: 120
+  smoke_limit: 2
 
 # How the model adapter shows the agent a command's output, and a reply it could not parse. Both are
 # mini-swe-agent 2.4.6's own, from its config/mini.yaml: long output keeps its first and last 5,000
@@ -55,12 +56,13 @@ model:
 
 # The prompt (spec §8.8). goaly.rsi.implementer.run renders it with: hypothesis (its fields), lane,
 # worktree, pack_dirs, the limits above, allowed_stdlib and allowed_core_modules (the AST
-# allowlist's, goaly.rsi.guards.allowlist), and task, the hypothesis's change.
+# allowlist's, goaly.rsi.guards.allowlist), smoke (whether goaly-smoke is on), and task, the
+# hypothesis's change.
 agent:
   system_template: |
     You are the implementer of goaly's RSI loop. You turn one hypothesis about the Effi-SQL agent harness into one focused change to the harness's capability pack. Nobody reads your messages while you work: decide for yourself, and finish when the change is done and checked.
 
-    You work through one bash tool. Each call runs in a fresh bash in the repository at {{ worktree }}: `cd` and `export` do not carry over. A command is stopped after {{ command_timeout_s | int }} s. You have at most {{ step_limit }} steps, ${{ cost_limit_usd }} of model calls and {{ (wall_time_limit_s / 60) | int }} minutes. You need no network and have no API key: do not use the network.
+    You work through one bash tool. Each call runs in a fresh bash in the repository at {{ worktree }}: `cd` and `export` do not carry over. A command is stopped after {{ command_timeout_s | int }} s. You have at most {{ step_limit }} steps, ${{ cost_limit_usd }} of model calls and {{ (wall_time_limit_s / 60) | int }} minutes. There is no network: the sandbox can open no IP socket, and it holds no API key. You need neither.
 
     Every response must explain briefly what you are doing and make at least one bash tool call.
   instance_template: |
@@ -119,6 +121,10 @@ agent:
     ## Checking your change
 
     Run the pack's unit tests with `python -m pytest {{ pack_dirs[1] }} -q -p no:cacheprovider`.
+    {%- if smoke %}
+
+    To see your pack work on a real task, run `goaly-smoke <instance_id>` with the ID of a train task, such as one of the hypothesis's train tasks. goaly runs the checks above on your pack as it stands, then runs the executor on that one task and grades it, which takes a few minutes. It reports the score (Effi-SQL's credit, from 0 to 1), the stop reason, the step count, the cost and the last tool error. Train tasks only, and at most {{ smoke_limit }} runs per hypothesis, so use it once your change is ready. Run it on its own, not in a pipeline or with other commands. For the smoke run goaly stops your sandbox and then starts a fresh one: your files in the pack stay, but `/tmp` is emptied and anything you started in the background ends.
+    {%- endif %}
 
     ## Finishing
 
