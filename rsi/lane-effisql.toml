@@ -3,10 +3,9 @@
 
 name = "effisql"
 repo = "."
-v0 = "baseline-v0"
+v0 = "v0"  # T12's tag: the integration commit v0's baseline ran at.
 # T11's evaluator factory, "module:function", which drives `goaly run --phase all` (V27).
-# The lane exits with 3, a configuration error, until it is set.
-evaluator = ""
+evaluator = "goaly.bench.effisql.evaluate:make_evaluator"
 # T22's hooks: results PRs, ntfy.sh notifications and the heartbeat the supervisor watches.
 hooks = "goaly.rsi.hooks:lane_hooks"
 
