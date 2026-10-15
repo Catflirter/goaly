@@ -11,6 +11,7 @@ from types import SimpleNamespace
 from typing import Any
 
 from psycopg import sql
+from psycopg.pq import TransactionStatus
 
 type Answer = Sequence[tuple[Any, ...]] | BaseException | Callable[[Any], Sequence[tuple[Any, ...]]]
 
@@ -74,12 +75,22 @@ class FakeCopy:
 
 
 class FakeConnection:
-    def __init__(self, dbname: str, responses: Sequence[tuple[str, Answer]] = ()) -> None:
+    """An idle autocommit connection, as connector() opens, unless told otherwise."""
+
+    def __init__(
+        self,
+        dbname: str,
+        responses: Sequence[tuple[str, Answer]] = (),
+        *,
+        autocommit: bool = True,
+        transaction_status: TransactionStatus = TransactionStatus.IDLE,
+    ) -> None:
         self.statements: list[str] = []
         self.copied: dict[str, bytes] = {}
         self.responses = list(responses)
         self.prepared: list[str] = []
-        self.info = SimpleNamespace(dbname=dbname)
+        self.autocommit = autocommit
+        self.info = SimpleNamespace(dbname=dbname, transaction_status=transaction_status)
         self.loaders: list[tuple[str, object]] = []
         self.adapters = SimpleNamespace(register_loader=lambda *args: self.loaders.append(args))
         self.pgconn = SimpleNamespace(encrypt_password=_fake_verifier)
@@ -134,3 +145,37 @@ class FakeServer:
 
     def statements(self, dbname: str) -> list[str]:
         return [s for c in self.connections if c.info.dbname == dbname for s in c.statements]
+
+
+class AsyncFakeCursor:
+    def __init__(self, cursor: FakeCursor) -> None:
+        self._cursor = cursor
+
+    async def fetchone(self) -> tuple[Any, ...] | None:
+        return self._cursor.fetchone()
+
+    async def fetchall(self) -> list[tuple[Any, ...]]:
+        return self._cursor.fetchall()
+
+
+class AsyncFakeConnection:
+    """The async face of a FakeConnection: same canned answers, same record of statements."""
+
+    def __init__(
+        self, dbname: str, responses: Sequence[tuple[str, Answer]] = (), **state: Any
+    ) -> None:
+        self.sync = FakeConnection(dbname, responses, **state)
+        self.info = self.sync.info
+
+    @property
+    def autocommit(self) -> bool:
+        return self.sync.autocommit
+
+    @property
+    def statements(self) -> list[str]:
+        return self.sync.statements
+
+    async def execute(
+        self, query: object, params: object = None, *, prepare: bool | None = None
+    ) -> AsyncFakeCursor:
+        return AsyncFakeCursor(self.sync.execute(query, params, prepare=prepare))
