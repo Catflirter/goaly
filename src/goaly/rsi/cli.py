@@ -1,4 +1,5 @@
-"""The lane's command line: ``goaly rsi lane --lane effisql`` and ``goaly rsi status``.
+"""The lane's command line: ``goaly rsi lane --lane effisql`` and ``goaly rsi status``, plus
+``goaly rsi run``, the supervisor (goaly.rsi.supervisor).
 
 ``python -m goaly.rsi`` runs it too, until goaly's own CLI (T06) mounts it as ``goaly rsi``.
 
@@ -98,6 +99,11 @@ def import_object(spec: str, what: str) -> object:
 
 
 def main(argv: Sequence[str] | None = None) -> int:
+    argv = sys.argv[1:] if argv is None else list(argv)
+    if argv[:1] == ["run"]:  # The supervisor (T22), which runs this command's lanes.
+        from goaly.rsi.supervisor import main as run
+
+        return run(argv[1:])
     parser = argparse.ArgumentParser(prog="goaly rsi", description=__doc__.splitlines()[0])
     commands = parser.add_subparsers(dest="command", required=True)
     for name, text in (("lane", "run a lane until it stops"), ("status", "show a lane's state")):

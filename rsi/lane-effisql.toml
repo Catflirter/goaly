@@ -7,8 +7,8 @@ v0 = "baseline-v0"
 # T11's evaluator factory, "module:function", which drives `goaly run --phase all` (V27).
 # The lane exits with 3, a configuration error, until it is set.
 evaluator = ""
-# T22's stop hooks, "module:function": the final results PR and the notification.
-hooks = ""
+# T22's hooks: results PRs, ntfy.sh notifications and the heartbeat the supervisor watches.
+hooks = "goaly.rsi.hooks:lane_hooks"
 
 [lane]
 # The freeze (spec §13), absolute, so a restart never moves it.
