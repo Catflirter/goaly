@@ -1,3 +1,4 @@
+import fcntl
 import hashlib
 import io
 import stat
@@ -29,6 +30,7 @@ from goaly.bench.effisql.pg_build import (
     dbgen_binary,
     ensure_dbgen,
     ensure_generated,
+    hba_problems,
     inspect_table_file,
     read_golden_record,
     run_command,
@@ -37,7 +39,7 @@ from goaly.bench.effisql.pg_build import (
 )
 from goaly.bench.effisql.pg_containers import ContainerSpec
 from goaly.bench.effisql.pg_settings import PgEnvConfig
-from tests.bench.effisql.pg_fakes import FakeServer
+from tests.bench.effisql.pg_fakes import Answer, FakeServer
 
 # The official schema (Diff-SQL docker/tpch/postgresql/schema.sql): every column in order, with
 # its type, plus each table's primary and foreign keys.
@@ -182,11 +184,13 @@ class FakeRunner:
         head: str = DBGEN_COMMIT,
         dirty: bool = False,
         tables: Mapping[str, bytes] | None = None,
+        checked_out: bool = False,
     ) -> None:
         self.calls: list[list[str]] = []
         self.head = head
         self.dirty = dirty
         self.tables = dict(tables or {})
+        self.checked_out = checked_out  # HEAD resolves only once a checkout has happened.
 
     def __call__(
         self,
@@ -199,7 +203,11 @@ class FakeRunner:
         if args[:2] == ["git", "init"]:
             (Path(args[3]) / ".git").mkdir(parents=True)
         elif "rev-parse" in args:
+            if not self.checked_out:
+                raise BuildError("git rev-parse failed with exit code 1: ")
             return self.head + "\n"
+        elif "checkout" in args:
+            self.checked_out = True
         elif "diff" in args and self.dirty:
             raise BuildError("git diff failed with exit code 1")
         elif args[0] == "make":
@@ -209,6 +217,7 @@ class FakeRunner:
             assert cwd is not None
             assert env is not None
             assert env["DSS_PATH"] == str(cwd)
+            assert env["DSS_CONFIG"] == str(Path(args[0]).parent)  # Where dists.dss lives.
             for name, content in self.tables.items():
                 (cwd / f"{name}.tbl").write_bytes(content)
         return ""
@@ -238,11 +247,24 @@ def test_ensure_dbgen_checks_out_and_builds_the_pinned_commit(tmp_path: Path) ->
 
 def test_ensure_dbgen_reuses_an_existing_build(tmp_path: Path) -> None:
     ensure_dbgen(tmp_path, run=FakeRunner())
-    runner = FakeRunner()
+    runner = FakeRunner(checked_out=True)
 
     ensure_dbgen(tmp_path, run=runner)
 
     assert not any(call[0] == "make" or "fetch" in call for call in runner.calls)
+
+
+def test_an_interrupted_checkout_is_started_over(tmp_path: Path) -> None:
+    source = tmp_path / "tpch-kit"
+    (source / ".git").mkdir(parents=True)  # git init ran; the fetch never finished.
+    (source / "stale").write_text("left by the interrupted build")
+    runner = FakeRunner()
+
+    assert ensure_dbgen(tmp_path, run=runner).commit == DBGEN_COMMIT
+
+    assert not (source / "stale").exists()
+    assert any("fetch" in call for call in runner.calls)
+    assert any("checkout" in call for call in runner.calls)
 
 
 def test_ensure_dbgen_refuses_a_checkout_at_another_commit(tmp_path: Path) -> None:
@@ -286,6 +308,23 @@ def test_ensure_generated_skips_dbgen_when_the_files_already_match(tmp_path: Pat
     assert runner.calls == []
 
 
+def test_stale_files_make_dbgen_run_again(tmp_path: Path) -> None:
+    dataset = _synthetic_dataset(CONTENTS)
+    for name, content in CONTENTS.items():
+        (tmp_path / f"{name}.tbl").write_bytes(content)
+    (tmp_path / "lineitem.tbl").write_bytes(b"cut short by a crash")
+    runner = FakeRunner(tables=CONTENTS)
+
+    assert ensure_generated(dataset, tmp_path / "dbgen", tmp_path, run=runner) == dataset.files
+    assert runner.calls == [[str(tmp_path / "dbgen"), "-s", "0.01", "-f", "-q"]]
+
+
+def test_commands_are_named_by_program_and_subcommand() -> None:
+    assert pg_build._command(["git", "-C", "/data/tpch-kit", "fetch", "-q"]) == "git fetch"
+    assert pg_build._command(["/usr/bin/make", "-C", "/data", "dbgen"]) == "make"
+    assert pg_build._command(["/data/dbgen/dbgen", "-s", "3"]) == "dbgen"
+
+
 def test_ensure_generated_rejects_output_that_differs_from_the_pinned_build(
     tmp_path: Path,
 ) -> None:
@@ -298,7 +337,7 @@ def test_ensure_generated_rejects_output_that_differs_from_the_pinned_build(
 
 def _record() -> GoldenRecord:
     return GoldenRecord(
-        image="postgres@sha256:" + "0" * 64,
+        image=PgEnvConfig().image,
         dbgen=DbgenBuild(
             repository=DBGEN_REPOSITORY,
             commit=DBGEN_COMMIT,
@@ -326,16 +365,52 @@ def test_an_unreadable_golden_record_is_reported(tmp_path: Path) -> None:
         read_golden_record(path)
 
 
-def test_build_golden_returns_an_existing_record_without_building(tmp_path: Path) -> None:
+def _refuse(*args: object, **kwargs: object) -> str:
+    raise AssertionError("nothing may run when the golden build is complete")
+
+
+def _finished(tmp_path: Path, record: GoldenRecord) -> PgEnvConfig:
     config = PgEnvConfig(data_root=tmp_path)
-    config.golden_record.parent.mkdir(parents=True)
-    config.golden_record.write_text(_record().model_dump_json())
+    config.golden_pgdata.mkdir(parents=True)
+    config.golden_record.write_text(record.model_dump_json())
+    return config
 
-    def refuse(*args: object, **kwargs: object) -> str:
-        raise AssertionError("nothing may run when the golden record exists")
 
-    run: Callable[..., str] = refuse
+def test_build_golden_returns_a_matching_record_without_building(tmp_path: Path) -> None:
+    config = _finished(tmp_path, _record())
+
+    run: Callable[..., str] = _refuse
     assert build_golden(config, SecretStr("unused"), run=run) == _record()
+
+
+@pytest.mark.parametrize(
+    ("change", "named"),
+    [
+        ({"image": "postgres@sha256:" + "9" * 64}, "used the image postgres@sha256:999"),
+        ({"databases": {TPCH.db: TPCH.record()}}, "lacks database tpch_alt"),
+        (
+            {"databases": {TPCH.db: TPCH_ALT.record(), TPCH_ALT.db: TPCH_ALT.record()}},
+            "its tpch (SF 0.3) differs in customer, lineitem, orders, part, partsupp, supplier",
+        ),
+    ],
+    ids=["image", "missing database", "other data"],
+)
+def test_a_record_of_another_build_is_refused_naming_the_difference(
+    tmp_path: Path, change: dict[str, object], named: str
+) -> None:
+    config = _finished(tmp_path, _record().model_copy(update=change))
+
+    with pytest.raises(BuildError, match="does not match this setup") as caught:
+        build_golden(config, SecretStr("unused"), run=_refuse)
+    assert named in str(caught.value)
+
+
+def test_a_record_whose_data_directory_is_gone_is_refused(tmp_path: Path) -> None:
+    config = _finished(tmp_path, _record())
+    config.golden_pgdata.rmdir()
+
+    with pytest.raises(BuildError, match=r"data directory .* is missing"):
+        build_golden(config, SecretStr("unused"), run=_refuse)
 
 
 def test_run_command_returns_standard_output() -> None:
@@ -352,10 +427,69 @@ def test_run_command_reports_a_missing_program() -> None:
         run_command(["goaly-no-such-program"])
 
 
+# What initdb --auth=scram-sha-256 and the image's entrypoint write, as on the real instances.
+SCRAM_HBA = """# TYPE  DATABASE        USER            ADDRESS                 METHOD
+local   all             all                                     scram-sha-256
+host    all             all             127.0.0.1/32            scram-sha-256
+host    all             all             ::1/128                 scram-sha-256
+local   replication     all                                     scram-sha-256
+host    replication     all             127.0.0.1/32            scram-sha-256
+host    replication     all             ::1/128                 scram-sha-256
+
+host all all all scram-sha-256
+"""
+
+
+def test_a_pg_hba_that_requires_scram_everywhere_passes() -> None:
+    assert hba_problems(SCRAM_HBA) == []
+    assert hba_problems("hostssl all all 10.0.0.0 255.0.0.0 scram-sha-256\n") == []
+
+
+@pytest.mark.parametrize(
+    ("rule", "named"),
+    [
+        ("host all all 127.0.0.1/32 trust", "host rule authenticates by trust"),
+        ("host all all ::1/128 trust", "host rule authenticates by trust"),
+        ("local all all peer", "local rule authenticates by peer"),
+        ("host all all 127.0.0.1 255.255.255.255 md5", "host rule authenticates by md5"),
+        ("hostnossl all all all password", "hostnossl rule authenticates by password"),
+        ("include_dir conf.d", "include_dir pulls in rules"),
+    ],
+)
+def test_any_rule_that_skips_scram_is_named(rule: str, named: str) -> None:
+    assert [named in problem for problem in hba_problems(SCRAM_HBA + rule + "\n")] == [True]
+
+
+def test_a_pg_hba_with_no_rule_lets_nobody_in_and_is_refused() -> None:
+    assert hba_problems("# nothing\n") == ["it has no rule"]
+
+
+def test_a_build_whose_pg_hba_allows_trust_is_refused(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    containers = FakeContainers(hba=SCRAM_HBA + "host all all 127.0.0.1/32 trust\n")
+    _install_server(monkeypatch, FakeServer([("SELECT count(*)", [(1,)]), CLUSTER]), containers)
+
+    with pytest.raises(BuildError, match="lets in without a password"):
+        build_golden(
+            PgEnvConfig(data_root=tmp_path),
+            SecretStr("pw"),
+            run=FakeRunner(tables=CONTENTS),
+            datasets=[_synthetic_dataset(CONTENTS)],
+        )
+    assert containers.events[-1] == "remove"
+
+
+CLUSTER: tuple[str, Answer] = ("pg_encoding_to_char", [("16.15", "UTF8", "en_US.utf8")])
+
+
 class FakeContainers:
     """Stands in for pg_containers: records the build server's lifecycle."""
 
-    def __init__(self, *, exit_code: int = 0, status: str = "running") -> None:
+    def __init__(
+        self, *, exit_code: int = 0, status: str = "running", hba: str = SCRAM_HBA
+    ) -> None:
+        self.hba = hba
         self.events: list[str] = []
         self.specs: list[ContainerSpec] = []
         self.password_files: list[str] = []
@@ -372,6 +506,7 @@ class FakeContainers:
     def start(self, spec: ContainerSpec) -> None:
         self.events.append("start")
         self.specs.append(spec)
+        (spec.data_dir / "pg_hba.conf").write_text(self.hba)  # What initdb would write.
         secrets_dir = spec.mounts[0].source
         password_file = secrets_dir / "admin_password"
         assert stat.S_IMODE(password_file.stat().st_mode) == 0o600
@@ -401,7 +536,7 @@ def test_build_golden_builds_loads_and_records_from_scratch(
 ) -> None:
     config = PgEnvConfig(data_root=tmp_path)
     dataset = _synthetic_dataset({**CONTENTS, "lineitem": b"1|2|\n3|4|\n"})
-    server = FakeServer([("SELECT count(*)", lambda params: [(1,)])])
+    server = FakeServer([("SELECT count(*)", lambda params: [(1,)]), CLUSTER])
     server.responses.insert(0, ('SELECT count(*) FROM "lineitem"', [(2,)]))
     containers = FakeContainers()
     _install_server(monkeypatch, server, containers)
@@ -447,6 +582,22 @@ def test_build_golden_builds_loads_and_records_from_scratch(
     assert read_golden_record(config.golden_record) == record
     assert stat.S_IMODE(config.golden_record.stat().st_mode) == 0o600
     assert record.databases == {"tpch_test": dataset.record()}
+    assert (record.server_version, record.encoding, record.collation) == (
+        "16.15",
+        "UTF8",
+        "en_US.utf8",
+    )
+
+
+def test_two_builds_never_run_at_once(tmp_path: Path) -> None:
+    config = PgEnvConfig(data_root=tmp_path)
+    lock = config.golden_record.parent / ".lock"
+    lock.parent.mkdir(parents=True)
+    with lock.open("a") as held:
+        fcntl.flock(held, fcntl.LOCK_EX)
+
+        with pytest.raises(BuildError, match="another golden build"):
+            build_golden(config, SecretStr("pw"), run=_refuse)
 
 
 def test_a_table_that_loads_short_fails_the_build(
@@ -472,7 +623,7 @@ def test_an_unclean_shutdown_fails_the_build(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     containers = FakeContainers(exit_code=137)
-    _install_server(monkeypatch, FakeServer([("SELECT count(*)", [(1,)])]), containers)
+    _install_server(monkeypatch, FakeServer([("SELECT count(*)", [(1,)]), CLUSTER]), containers)
 
     with pytest.raises(BuildError, match="exited with code 137"):
         build_golden(
@@ -551,8 +702,9 @@ def test_the_connector_opens_autocommit_connections_with_the_given_role(
     ]
 
 
-def test_a_dbgen_checkout_that_is_not_a_git_repository_is_refused(tmp_path: Path) -> None:
+def test_a_directory_that_is_not_a_git_checkout_is_replaced(tmp_path: Path) -> None:
     (tmp_path / "tpch-kit").mkdir()
+    runner = FakeRunner()
 
-    with pytest.raises(BuildError, match="not a git checkout"):
-        ensure_dbgen(tmp_path, run=FakeRunner())
+    assert ensure_dbgen(tmp_path, run=runner).commit == DBGEN_COMMIT
+    assert ["git", "init", "-q", str(tmp_path / "tpch-kit")] in runner.calls
