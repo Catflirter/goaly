@@ -6,12 +6,15 @@ tool calls as the model wrote them, for core's parser (T04). The OpenAI wire for
 inside this module. For each call the client:
 
 - checks the model allowlist and applies the model's profile (``llm_models``);
+- holds each attempt to the model's concurrency limit, which adapts to how the gateway copes
+  (``llm_throttle``);
 - gives every attempt a timeout, and retries 429s, 5xx responses, timeouts and connection
   errors with exponential backoff (``RetryPolicy``);
 - raises a typed error when the call fails (``llm_errors``);
 - hands one ``LlmCallRecord`` to a ``CallRecorder``, however the call ends.
 
-A process uses one client, on its event loop::
+A process uses one client, on its event loop, so that each model has one limit and one
+connection pool, sized to the process's share of the model's budget::
 
     async with LlmClient(load_settings(), JsonlCallRecorder(path)) as llm:
         reply = await llm.complete(
@@ -23,17 +26,20 @@ just ``complete(messages, *, tools, params)``: whoever holds it cannot choose an
 model. T11's per-task factory binds CALL_PURPOSE_EXEC with the task's run, instance and seed;
 only goaly.rsi binds the rsi-* purposes.
 
+Synchronous code in a worker thread, such as the mini-swe-agent that RSI's implementer runs
+(T20), calls ``complete_sync``, which runs the call on the client's own loop.
+
 The API key goes in the Authorization header and nowhere else: no message, log line, repr or
 record holds it, and the client removes it from any text it quotes from the gateway.
 """
 
 import asyncio
+import contextlib
 import json
 import logging
 import math
 import random
 import threading
-import time
 import uuid
 from collections.abc import Iterable, Mapping, Sequence
 from dataclasses import dataclass
@@ -63,6 +69,14 @@ from goaly.harness.core.llm_models import (
     ModelProfile,
     allowed_model,
 )
+from goaly.harness.core.llm_throttle import (
+    DEFAULT_SHARES,
+    TRANSIENT_FAILURES,
+    Clock,
+    ModelThrottle,
+    SystemClock,
+    ThrottlePolicy,
+)
 from goaly.harness.core.settings import Settings
 
 __all__ = [
@@ -80,14 +94,6 @@ __all__ = [
 _logger = logging.getLogger(__name__)
 
 _S = LlmCallStatus
-_RETRYABLE: Final = frozenset(
-    {
-        _S.LLM_CALL_STATUS_RATE_LIMITED,
-        _S.LLM_CALL_STATUS_SERVER_ERROR,
-        _S.LLM_CALL_STATUS_TIMEOUT,
-        _S.LLM_CALL_STATUS_CONNECTION_ERROR,
-    }
-)
 # How a 400 says the request does not fit in the context, in both forms seen on 2026-10-15:
 # LiteLLM marks a prompt too long by itself, but passes SGLang's message on as a plain
 # BadRequestError when the prompt fits and max_tokens does not.
@@ -189,24 +195,6 @@ class JsonlCallRecorder:
             append_jsonl(self.path, record)
 
 
-class Clock(Protocol):
-    """The time a client measures waits and latency with, and sleeps through backoffs on."""
-
-    def monotonic(self) -> float:
-        """Return the time in seconds on a clock that never goes back."""
-
-    async def sleep(self, seconds: float) -> None:
-        """Wait ``seconds``."""
-
-
-class _SystemClock:
-    def monotonic(self) -> float:
-        return time.monotonic()
-
-    async def sleep(self, seconds: float) -> None:
-        await asyncio.sleep(seconds)
-
-
 # The parts of a chat completion the client reads. Anything else in the body is ignored.
 
 
@@ -278,6 +266,9 @@ class LlmClient:
     """An async client of the OpenAI-compatible model gateway; the module docstring has more.
 
     ``profiles`` replace the default profiles of their models (llm_models.DEFAULT_PROFILES).
+    ``shares`` gives every model this process's share of its budget, a positive int each (spec
+    §6.2). The runner passes the shares of the phase it runs in. Without them each model gets its
+    whole budget (llm_throttle.DEFAULT_SHARES), right only for a process that runs alone.
     ``transport``, ``clock`` and ``rng`` are for tests: a mock transport, a clock that skips
     waits, and a seeded source of jitter.
     """
@@ -288,7 +279,9 @@ class LlmClient:
         recorder: CallRecorder,
         *,
         profiles: Iterable[ModelProfile] = (),
+        shares: Mapping[str, int] | None = None,
         retry: RetryPolicy | None = None,
+        throttle: ThrottlePolicy | None = None,
         transport: httpx.AsyncBaseTransport | None = None,
         clock: Clock | None = None,
         rng: random.Random | None = None,
@@ -298,19 +291,40 @@ class LlmClient:
             if profile.model not in self._profiles:
                 raise ValueError(f"no call purpose may use {profile.model}, so it has no profile")
             self._profiles[profile.model] = profile
+        shares = DEFAULT_SHARES if shares is None else shares
+        if set(shares) != set(self._profiles):
+            raise ValueError(f"the shares must name every model, {sorted(self._profiles)}, only")
+        for model, share in shares.items():
+            if isinstance(share, bool) or not isinstance(share, int) or share < 1:
+                raise ValueError(f"{model}: a share must be a positive int, not {share!r}")
+        _logger.info(
+            "LLM concurrency shares", extra={"event": "llm_shares", "shares": dict(shares)}
+        )
         self._recorder = recorder
         self._retry = RetryPolicy() if retry is None else retry
-        self._clock: Clock = _SystemClock() if clock is None else clock
+        self._clock: Clock = SystemClock() if clock is None else clock
         self._rng = random.Random() if rng is None else rng  # noqa: S311 - jitter, not secrecy.
+        policy = ThrottlePolicy() if throttle is None else throttle
+        self._throttles = {
+            model: ModelThrottle(model, share, policy, self._clock)
+            for model, share in shares.items()
+        }
+        self._loop: asyncio.AbstractEventLoop | None = None  # Set by the first async use.
         self._api_key = settings.api_key
-        self._http = httpx.AsyncClient(
-            base_url=settings.base_url,
-            headers={"Authorization": f"Bearer {settings.api_key.get_secret_value()}"},
-            timeout=self._retry.timeout_s,
-            transport=transport,
-        )
+        headers = {"Authorization": f"Bearer {settings.api_key.get_secret_value()}"}
+        self._http = {  # One connection pool per model, as large as its share.
+            model: httpx.AsyncClient(
+                base_url=settings.base_url,
+                headers=headers,
+                timeout=self._retry.timeout_s,
+                limits=httpx.Limits(max_connections=share, max_keepalive_connections=share),
+                transport=transport,
+            )
+            for model, share in shares.items()
+        }
 
     async def __aenter__(self) -> Self:
+        self._bind_loop()
         return self
 
     async def __aexit__(
@@ -322,8 +336,13 @@ class LlmClient:
         await self.aclose()
 
     async def aclose(self) -> None:
-        """Close the client's connections; it cannot make calls after."""
-        await self._http.aclose()
+        """Close the client's connections; it cannot make calls after.
+
+        Every model's pool is closed, even when closing another fails.
+        """
+        async with contextlib.AsyncExitStack() as pools:
+            for http in self._http.values():
+                pools.push_async_callback(http.aclose)
 
     async def complete(
         self,
@@ -344,6 +363,7 @@ class LlmClient:
         exactly one record, however it ends: a failure raises an LlmError, and
         asyncio.CancelledError goes through at once, with no retry.
         """
+        self._bind_loop()
         if allowed_model(tags.purpose) != model:
             raise self._refuse(model, tags)
         body = _request_body(self._profiles[model].with_overrides(params), messages, tools)
@@ -365,6 +385,43 @@ class LlmClient:
         choice = response.choices[0]
         return LlmReply(_assistant_message(choice.message), choice.finish_reason or "", record)
 
+    def complete_sync(
+        self,
+        messages: Sequence[ChatMessage],
+        *,
+        model: str,
+        tags: CallTags,
+        tools: Sequence[Mapping[str, JsonValue]] = (),
+        params: ModelParams | None = None,
+    ) -> LlmReply:
+        """Make a call from a worker thread: run complete() on the client's loop and wait for it.
+
+        The call runs on the client's own event loop, the one it was entered or first used on, so
+        it shares that loop's limits and connections: there is no second loop, and no second set
+        of limits. Any number of threads may call at once. RSI's implementer (T20) drives
+        mini-swe-agent, which is synchronous, this way::
+
+            async with LlmClient(settings, recorder) as llm:
+                await asyncio.to_thread(run_agent, llm)  # The agent's model calls complete_sync.
+
+        It returns or raises as complete() does. It raises RuntimeError if the client's loop is
+        not running, or if called in the loop's own thread, where waiting would deadlock. If the
+        loop cancels the call, at shutdown say, it raises concurrent.futures.CancelledError.
+        """
+        loop = self._loop
+        if loop is None:
+            raise RuntimeError("complete_sync needs the client's loop: `async with` it there first")
+        if not loop.is_running():
+            raise RuntimeError("complete_sync needs the client's event loop, which is not running")
+        try:
+            running = asyncio.get_running_loop()
+        except RuntimeError:  # No loop runs in this thread: the usual case, a worker thread.
+            running = None
+        if running is loop:
+            raise RuntimeError("complete_sync would block the loop it needs: await complete()")
+        call = self.complete(messages, model=model, tags=tags, tools=tools, params=params)
+        return asyncio.run_coroutine_threadsafe(call, loop).result()
+
     def bind(self, *, model: str, tags: CallTags) -> "BoundLlmClient":
         """Return a client whose calls all go to ``model``, tagged ``tags``.
 
@@ -375,6 +432,14 @@ class LlmClient:
         if allowed_model(tags.purpose) != model:
             raise self._refuse(model, tags)
         return BoundLlmClient(self, model, tags)
+
+    def _bind_loop(self) -> None:
+        """Make the running loop the client's own, the one its connections and limits live on."""
+        loop = asyncio.get_running_loop()
+        if self._loop is None:
+            self._loop = loop
+        elif loop is not self._loop:
+            raise RuntimeError("an LlmClient serves one event loop: the one it was first used on")
 
     def _refuse(self, model: str, tags: CallTags) -> ModelNotAllowed:
         try:
@@ -406,7 +471,7 @@ class LlmClient:
             if outcome.response is not None:
                 return outcome.response
             retries = len(record.attempts) - 1
-            if outcome.status not in _RETRYABLE or retries >= self._retry.max_retries:
+            if outcome.status not in TRANSIENT_FAILURES or retries >= self._retry.max_retries:
                 count = f"{retries + 1} attempt{'s' if retries else ''}"
                 message = f"{record.model}: {outcome.detail} ({count})"
                 raise error_type(outcome.status)(message, record=record)
@@ -416,15 +481,21 @@ class LlmClient:
     async def _attempt(
         self, record: LlmCallRecord, attempt: LlmCallAttempt, body: bytes, delay: float
     ) -> _Outcome:
-        """Wait ``delay``, send the request once, and fill in ``attempt`` with how it went."""
+        """Wait ``delay`` and then for a slot, send the request once, and fill in ``attempt``.
+
+        Its wait is the backoff and the time the model's throttle held it back (spec §6.2).
+        """
         attempt.started_at.GetCurrentTime()
         began = self._clock.monotonic()
         sent: float | None = None
+        throttle = self._throttles[record.model]
         try:
             if delay > 0:
                 await self._clock.sleep(delay)
-            sent = self._clock.monotonic()
-            outcome = await self._request(body, record)
+            async with throttle.slot(record):
+                sent = self._clock.monotonic()
+                outcome = await self._request(self._http[record.model], body, record)
+                throttle.observe(outcome.status, outcome.http_status, sent, record)
         except asyncio.CancelledError:
             attempt.status = _S.LLM_CALL_STATUS_CANCELLED
             raise
@@ -438,13 +509,13 @@ class LlmClient:
             attempt.retry_after_s = outcome.retry_after_s
         return outcome
 
-    async def _request(self, body: bytes, record: LlmCallRecord) -> _Outcome:
+    async def _request(
+        self, http: httpx.AsyncClient, body: bytes, record: LlmCallRecord
+    ) -> _Outcome:
         """Send the request and say how it went. Only cancellation and bugs raise."""
         try:
             async with asyncio.timeout(self._retry.timeout_s):
-                response = await self._http.post(
-                    "/chat/completions", content=body, headers=_JSON_HEADERS
-                )
+                response = await http.post("/chat/completions", content=body, headers=_JSON_HEADERS)
         except (TimeoutError, httpx.TimeoutException):
             detail = f"no response within {self._retry.timeout_s:g} s"
             return _Outcome(_S.LLM_CALL_STATUS_TIMEOUT, detail=detail)
