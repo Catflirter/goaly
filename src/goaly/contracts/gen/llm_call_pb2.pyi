@@ -155,7 +155,7 @@ class LlmCallRecord(_message.Message):
 
     @_builtins.property
     def started_at(self) -> _timestamp_pb2.Timestamp:
-        """When the call started."""
+        """When the call began, before any wait for a concurrency slot."""
 
     def __init__(
         self,

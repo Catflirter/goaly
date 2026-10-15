@@ -32,7 +32,7 @@ message LlmCallRecord {
   LlmCallStatus status = 10;
   // The HTTP status of the last response, or 0 if no response arrived.
   int32 http_status = 11;
-  // When the call started.
+  // When the call began, before any wait for a concurrency slot.
   google.protobuf.Timestamp started_at = 12;
 }
 
