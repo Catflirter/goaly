@@ -27,6 +27,7 @@ from tests.harness.core.llm_fakes import (
     FakeLLM,
     Gateway,
     Recorder,
+    TopOfRange,
     completion,
     failure,
     settings,
@@ -557,6 +558,7 @@ async def test_an_open_breaker_holds_back_new_calls_and_counts_as_their_wait() -
         throttle=ThrottlePolicy(breaker_min_attempts=2),
         transport=httpx.MockTransport(gateway.handle),
         clock=clock,
+        rng=TopOfRange(),  # A fixed backoff keeps the clock's sums exact.
     ) as llm:
         with pytest.raises(ServerError):
             await llm.complete([user("hi")], model=QWEN, tags=EXEC)
