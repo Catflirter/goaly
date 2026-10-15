@@ -200,7 +200,8 @@ class _Outcome(NamedTuple):
 
 
 class _Sent(NamedTuple):
-    """A model call that got a reply: the reply, and the prompt it was sent, as folded."""
+    """A model call that got a reply: the reply, the folds made for it, and the estimate that
+    the folding threshold compared, before any fold (Step.estimated_prompt_tokens)."""
 
     reply: LlmReply
     folds: list[ContextFold]
@@ -304,8 +305,8 @@ class _Chat[E: Environment]:
         A prompt that the gateway says does not fit folds every older output it may and goes
         once more. With nothing more to fold, or a second overflow, ContextOverflow propagates.
         """
+        estimate = self._prompt.estimated_tokens  # What the threshold compares.
         folds = self._prompt.fold()
-        estimate = self._prompt.estimated_tokens
         try:
             reply = await self._complete()
         except ContextOverflow:
@@ -313,7 +314,6 @@ class _Chat[E: Environment]:
             if not more:
                 raise
             folds += more
-            estimate = self._prompt.estimated_tokens
             reply = await self._complete()
         self._prompt.sent(reply.usage.input_tokens)
         return _Sent(reply, folds, estimate)

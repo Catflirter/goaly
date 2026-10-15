@@ -79,6 +79,7 @@ class ChatPrompt:
         self._window = window
         self._opening = list(opening)
         self._turns: list[_Turn] = []
+        self._counted = 0  # How many turns the gateway's last count of the prompt took in.
         tool_chars = len(json.dumps(tools, ensure_ascii=False))
         self._estimate = (sum(map(_chars, opening)) + tool_chars) / _CHARS_PER_TOKEN
 
@@ -96,7 +97,7 @@ class ChatPrompt:
         self._estimate += _chars(assistant) / _CHARS_PER_TOKEN
         leaving = len(self._turns) - 1 - self._window.keep_turns
         if self._window.keep_turns > 0 and leaving >= 0:
-            self._drop_reasoning(self._turns[leaving])
+            self._drop_reasoning(leaving)
 
     def add(self, message: ChatMessage) -> None:
         """Add a tool message, or an injected one, to the last turn."""
@@ -107,11 +108,12 @@ class ChatPrompt:
         """Take the gateway's count of the prompt just sent; 0 means it reported none."""
         if input_tokens > 0:
             self._estimate = input_tokens
+            self._counted = len(self._turns)
 
     @property
     def estimated_tokens(self) -> int:
         """The estimated size of the next call's prompt, which the threshold is compared with."""
-        return math.ceil(self._estimate)
+        return max(math.ceil(self._estimate), 0)
 
     def fold(self, *, everything_older: bool = False) -> list[ContextFold]:
         """Fold older tool outputs, oldest first, and return the folds made.
@@ -145,14 +147,21 @@ class ChatPrompt:
                 )
         return folds
 
-    def _drop_reasoning(self, turn: _Turn) -> None:
+    def _drop_reasoning(self, index: int) -> None:
+        """Send the reply of turn ``index`` without its reasoning from now on.
+
+        Its reasoning comes off the estimate only if the estimate added it since the gateway's
+        last count: that count may never have held it, as the chat template may have dropped it.
+        """
+        turn = self._turns[index]
         reply = turn.messages[0]
         if reply.reasoning_content:
             plain = ChatMessage()  # A new message, as a fold makes.
             plain.CopyFrom(reply)
             plain.reasoning_content = ""
             turn.messages[0] = plain
-            self._estimate -= len(reply.reasoning_content) / _CHARS_PER_TOKEN
+            if index >= self._counted:
+                self._estimate -= len(reply.reasoning_content) / _CHARS_PER_TOKEN
 
     def _fits(self) -> bool:
         return self.estimated_tokens <= self._window.fold_above_tokens

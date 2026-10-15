@@ -1260,10 +1260,10 @@ async def test_a_long_chat_folds_its_oldest_tool_outputs() -> None:
         [ContextFold(step=0, tool_call_id=calls[0].id, replacement=folded(0))],
         [ContextFold(step=1, tool_call_id=calls[1].id, replacement=folded(1))],
     ]
+    # Each step records the estimate the threshold compared, before any fold: past 3,000, the
+    # fourth call folded one output, the fifth another, and went though still past it.
     estimates = [step.estimated_prompt_tokens for step in trajectory.steps]
-    assert 0 < estimates[0] < estimates[1] < estimates[2] < 3000
-    assert estimates[3] <= 3000  # One fold brought it back under the threshold.
-    assert estimates[4] > 3000  # The two outputs it may fold were not enough; it went anyway.
+    assert 0 < estimates[0] < estimates[1] < estimates[2] < 3000 < estimates[3] < estimates[4]
     assert [step.tool_results[0].content for step in trajectory.steps[:4]] == [
         big(n) for n in range(4)
     ]
@@ -1337,6 +1337,8 @@ async def test_a_prompt_too_long_for_the_model_folds_and_goes_once_more() -> Non
         (0, calls[0].id),
         (1, calls[1].id),
     ]
+    # The estimate before the folds: 1,000 counted, and the last turn's 4,012 characters.
+    assert trajectory.steps[3].estimated_prompt_tokens == 2003
     overflowed, retried = sent(llm)[3], sent(llm)[4]
     assert [m.content for m in overflowed if m.role == TOOL] == [big(0), big(1), big(2)]
     assert [m.content for m in retried if m.role == TOOL] == [folded(0), folded(1), big(2)]
