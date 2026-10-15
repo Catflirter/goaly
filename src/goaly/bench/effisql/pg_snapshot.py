@@ -129,10 +129,12 @@ def write_snapshots(connect: Connect, config: PgEnvConfig, dbs: Sequence[str]) -
 def foreign_scale_plan(plan_json: object) -> bool:
     """Say whether a task file's plan was recorded on another TPC-H scale than SF3.
 
-    It was if any scan of a TPC-H table returned, or was estimated to return, more rows than
-    the table holds at SF3. Some of the dataset's plans were recorded on SF10, where lineitem
-    holds 59,986,052 rows; the agent should see our plan for those tasks instead. Accepts a
-    plan's root node, EXPLAIN's object or list, or their JSON text; anything else is not one.
+    It was if any pass of a scan over a TPC-H table read, or was estimated to return, more
+    rows than the table holds at SF3: counting the rows it returned, the rows its filters
+    removed, and the rows a subplan in its filter was run for. Some of the dataset's plans were
+    recorded on SF10, where lineitem holds 59,986,052 rows; the agent should see our plan for
+    those tasks instead. Accepts a plan's root node, EXPLAIN's object or list, or their JSON
+    text; anything else is not one.
     """
     root = _plan_root(plan_json)
     return root is not None and any(_beyond_sf3(node) for node in _nodes(root))
@@ -289,23 +291,50 @@ def _plan_root(value: object) -> Mapping[str, object] | None:
 
 def _nodes(node: Mapping[str, object]) -> Iterator[Mapping[str, object]]:
     yield node
-    children = node.get("Plans")
-    if isinstance(children, list):
-        for child in children:
-            if isinstance(child, Mapping):
-                yield from _nodes(child)
+    for child in _children(node):
+        yield from _nodes(child)
 
 
 def _beyond_sf3(node: Mapping[str, object]) -> bool:
+    """Whether one pass of this scan read more rows than its table holds at SF3.
+
+    The rows a pass read are those it returned plus those its filters removed. A subplan in
+    the scan's filter or output runs at most once per row read, so its loops count them too:
+    task 40's lineitem scan returned 15M rows, but its filter's subplan ran 59,986,052 times.
+    The loops of an inner scan reveal nothing: it runs once per outer row.
+    """
     rows = _SF3_ROWS.get(str(node.get("Relation Name")))
     if rows is None or node.get("Node Type") not in _SCANS:
         return False
-    bound = rows * _SCALE_MARGIN
-    estimated = node.get("Plan Rows")
-    actual = node.get("Actual Rows")
-    loops = node.get("Actual Loops")
-    if isinstance(actual, int | float) and node.get("Parallel Aware") is True:
-        # A parallel scan shares one pass over the table among its processes, and EXPLAIN
-        # reports rows per process. Any other scan reports rows per loop, each loop one pass.
-        actual *= loops if isinstance(loops, int | float) and loops > 0 else 1
-    return any(isinstance(value, int | float) and value > bound for value in (estimated, actual))
+    # A parallel scan shares one pass among its processes, and EXPLAIN reports each count per
+    # process; any other scan reports counts per loop, each loop one pass.
+    loops = _count(node.get("Actual Loops")) or 1
+    passes = 1 if node.get("Parallel Aware") is True else loops
+    per_process = loops if node.get("Parallel Aware") is True else 1
+    read = [_count(node.get("Plan Rows"))]
+    actual = _count(node.get("Actual Rows"))
+    if actual is not None:
+        removed = sum(
+            _count(node.get(key)) or 0
+            for key in ("Rows Removed by Filter", "Rows Removed by Index Recheck")
+        )
+        read.append(actual * per_process)
+        read.append((actual + removed) * per_process)
+    for child in _children(node):
+        child_loops = _count(child.get("Actual Loops"))
+        if child.get("Parent Relationship") == "SubPlan" and child_loops is not None:
+            read.append(child_loops / passes)  # A subplan's loops are summed over passes.
+    return any(value is not None and value > rows * _SCALE_MARGIN for value in read)
+
+
+def _count(value: object) -> float | None:
+    return float(value) if isinstance(value, int | float) and not isinstance(value, bool) else None
+
+
+def _children(node: Mapping[str, object]) -> list[Mapping[str, object]]:
+    children = node.get("Plans")
+    return (
+        [child for child in children if isinstance(child, Mapping)]
+        if isinstance(children, list)
+        else []
+    )
