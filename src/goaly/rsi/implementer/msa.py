@@ -25,7 +25,7 @@ from contextlib import contextmanager
 from pathlib import Path
 from typing import Any, Final, cast
 
-import yaml  # type: ignore[import-untyped]  # PyYAML ships no types; mini-swe-agent requires it.
+import yaml  # mini-swe-agent requires it; types-pyyaml types it.
 
 from goaly.contracts.interfaces import JsonValue
 
