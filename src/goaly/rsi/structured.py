@@ -39,7 +39,9 @@ __all__ = [
 ]
 
 DEFAULT_MAX_ATTEMPTS: Final = 3
-_FENCE = re.compile(r"```(?:json)?[ \t]*\n(.*?)\n?```", re.DOTALL)
+# A fenced block: its language label, if any, and its body. Matched left to right, so a closing
+# fence is never taken for an opening one.
+_FENCE = re.compile(r"```([\w+-]*)[ \t]*\n(.*?)\n?```", re.DOTALL)
 _ERRORS_SHOWN: Final = 20  # How many validation errors a retry quotes.
 _INPUT_QUOTED: Final = 200  # How much of an invalid value an error quotes.
 _CUT_OFF: Final = (
@@ -85,13 +87,16 @@ async def complete_structured[M: BaseModel](
     *,
     context: Mapping[str, Any] | None = None,
     params: ModelParams | None = None,
+    attempt_timeout_s: float | None = None,
     max_attempts: int = DEFAULT_MAX_ATTEMPTS,
 ) -> StructuredReply[M]:
     """Ask ``llm`` for one JSON object of ``schema`` and return it validated.
 
     ``messages`` must end with a user message; the schema is appended to a copy of it.
     ``context`` is pydantic's validation context, for checks that depend on the call, such as
-    which task IDs exist. Raises StructuredOutputError after ``max_attempts`` invalid replies,
+    which task IDs exist. ``params`` and ``attempt_timeout_s`` go with every call, as
+    LlmClient.complete takes them: a long answer needs both a larger max_tokens and more than the
+    default 300 s per attempt. Raises StructuredOutputError after ``max_attempts`` invalid replies,
     and the LlmError of a call that failed.
     """
     if max_attempts < 1:
@@ -106,7 +111,7 @@ async def complete_structured[M: BaseModel](
     usage = Usage()
     problems = ""
     for attempt in range(1, max_attempts + 1):
-        reply = await llm.complete(chat, params=params)
+        reply = await llm.complete(chat, params=params, attempt_timeout_s=attempt_timeout_s)
         call_ids.append(reply.record.call_id)
         add_usage(usage, reply.usage)
         value, problems = _validate(reply, schema, context)
@@ -154,22 +159,30 @@ def _validate[M: BaseModel](
     """Return the reply's value, or None and what is wrong with it, in words."""
     if reply.finish_reason == "length":
         return None, _CUT_OFF
-    text = _json_text(reply.message.content)
-    if not text:
+    candidates = _json_candidates(reply.message.content)
+    if not candidates:
         return None, "The answer held no JSON object: the content was empty."
-    try:
-        return schema.model_validate_json(text, context=dict(context or {})), ""
-    except ValidationError as error:
-        return None, _describe(error)
+    problems = ""
+    for text in candidates:
+        try:
+            return schema.model_validate_json(text, context=dict(context or {})), ""
+        except ValidationError as error:
+            problems = problems or _describe(error)  # The likeliest candidate's problems.
+    return None, problems
 
 
-def _json_text(content: str) -> str:
-    """Return the JSON in ``content``: a fenced block's body, else the first { to the last }."""
-    fenced = _FENCE.search(content)
-    if fenced:
-        return fenced.group(1).strip()
+def _json_candidates(content: str) -> list[str]:
+    """Return where the JSON may be in ``content``, likeliest first.
+
+    That is: ```json blocks, then other fenced blocks, then the text from the first { to the
+    last }, or else the whole content. Empty candidates are left out.
+    """
+    blocks = [(label.lower(), body.strip()) for label, body in _FENCE.findall(content)]
+    candidates = [body for label, body in blocks if label == "json"]
+    candidates += [body for label, body in blocks if label != "json"]
     start, end = content.find("{"), content.rfind("}")
-    return content[start : end + 1] if 0 <= start < end else content.strip()
+    candidates.append(content[start : end + 1] if 0 <= start < end else content.strip())
+    return [text for text in dict.fromkeys(candidates) if text]
 
 
 def _describe(error: ValidationError) -> str:

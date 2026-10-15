@@ -21,6 +21,7 @@ from goaly.contracts.gen.experiment_pb2 import (
 from goaly.contracts.gen.llm_call_pb2 import CallPurpose
 from goaly.contracts.gen.trajectory_pb2 import ChatMessage, ChatRole
 from goaly.rsi.analyst import (
+    ANALYST_ATTEMPT_TIMEOUT_S,
     ANALYST_MAX_TOKENS,
     Analysis,
     AnalysisSkipped,
@@ -178,6 +179,7 @@ async def test_a_cut_off_answer_is_retried_at_the_same_max_tokens() -> None:
     analysis = await run(gateway)
     assert isinstance(analysis, Analysis)
     assert [body["max_tokens"] for body in gateway.bodies] == [ANALYST_MAX_TOKENS] * 2
+    assert gateway.read_timeouts == [ANALYST_ATTEMPT_TIMEOUT_S] * 2 == [900.0] * 2
     assert gateway.bodies[1]["messages"][2]["reasoning_content"] == "A long think."
 
 
