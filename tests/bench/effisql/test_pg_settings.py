@@ -72,14 +72,44 @@ def test_load_credentials_reads_the_file_and_hides_the_values(tmp_path: Path) ->
     assert values["GOALY_PG_AGENT_PASSWORD"] not in repr(credentials)
 
 
-def test_an_environment_variable_overrides_the_file(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
-) -> None:
+def test_environment_variables_are_ignored(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
     path = tmp_path / "pg.env"
     ensure_credentials(path)
     monkeypatch.setenv("GOALY_PG_GRADER_PASSWORD", "from-the-environment")
 
-    assert load_credentials(path).grader_password.get_secret_value() == "from-the-environment"
+    password = load_credentials(path).grader_password.get_secret_value()
+    assert password == _values(path)["GOALY_PG_GRADER_PASSWORD"]
+
+
+def test_a_lost_admin_password_is_not_replaced_once_a_golden_build_exists(
+    tmp_path: Path,
+) -> None:
+    path = tmp_path / "pg.env"
+    pgdata = tmp_path / "golden" / "pgdata"
+    pgdata.mkdir(parents=True)
+
+    with pytest.raises(PgSettingsError, match="lost the admin password"):
+        ensure_credentials(path, golden_pgdata=pgdata)
+    assert not path.exists()
+
+    path.write_text("GOALY_PG_ADMIN_PASSWORD=kept\n")
+    path.chmod(0o600)
+    ensure_credentials(path, golden_pgdata=pgdata)  # Only the other two are new.
+    assert _values(path)["GOALY_PG_ADMIN_PASSWORD"] == "kept"  # noqa: S105  # A test value.
+
+
+def test_the_file_is_read_with_the_dotenv_parser(tmp_path: Path) -> None:
+    path = tmp_path / "pg.env"
+    path.write_text(
+        "# a comment\nexport GOALY_PG_ADMIN_PASSWORD='quoted value'\n"
+        "GOALY_PG_AGENT_PASSWORD=a\nGOALY_PG_GRADER_PASSWORD=g\n"
+    )
+    path.chmod(0o600)
+
+    ensure_credentials(path)  # Complete as dotenv reads it: nothing is rewritten.
+
+    assert load_credentials(path).admin_password.get_secret_value() == "quoted value"
+    assert path.read_text().startswith("# a comment")
 
 
 def test_a_missing_password_is_named_without_echoing_any_value(tmp_path: Path) -> None:

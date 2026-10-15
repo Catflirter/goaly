@@ -63,6 +63,13 @@ def test_every_instance_runs_pinned_to_both_smt_siblings_of_its_cores(pg_env: Pg
         assert _cpus(status.split(":", 1)[1].strip()) == set(instance.cpus)
 
 
+def test_every_instance_listens_on_loopback_only(pg_env: PgEnv) -> None:
+    # The image's postgresql.conf says listen_addresses = '*'; the command line overrides it.
+    for instance in pg_env.instances:
+        with pg_env.connect(instance, GRADER_ROLE, "tpch") as conn:
+            assert conn.execute("SHOW listen_addresses").fetchone() == ("127.0.0.1",)
+
+
 def test_python_processes_and_their_children_stay_on_cpus_0_1_12_13() -> None:
     before = os.sched_getaffinity(0)
     try:

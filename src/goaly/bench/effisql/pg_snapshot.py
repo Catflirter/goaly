@@ -156,7 +156,7 @@ def plan_requests(tasks: Path, *, db: str) -> list[PlanRequest]:
             continue
         plan = record.get("base_explain_analyze")
         reason: Literal["no plan", "foreign scale"]
-        if plan is None or plan in ("", {}, []):
+        if plan is None or plan in ({}, []) or (isinstance(plan, str) and not plan.strip()):
             reason = "no plan"
         elif foreign_scale_plan(plan):
             reason = "foreign scale"
@@ -176,19 +176,25 @@ def explain_plans(
     is only planned, never run, in a read-only transaction, and as one prepared statement, so a
     task's SQL can never smuggle in a second statement.
     """
-    conn.adapters.register_loader("json", TextLoader)  # Keep the server's text as it is.
     plans: dict[str, str] = {}
     errors: dict[str, str] = {}
-    for request in requests:
-        statement = sql.SQL("EXPLAIN (FORMAT JSON) {}").format(
-            sql.SQL(request.base_sql.strip().rstrip(";").rstrip())
-        )
-        try:
-            with conn.transaction():
-                conn.execute("SET TRANSACTION READ ONLY")
-                plans[request.instance_id] = str(_scalar(conn, statement, prepare=True))
-        except psycopg.Error as error:
-            errors[request.instance_id] = error.diag.message_primary or type(error).__name__
+    with conn.cursor() as cursor:
+        cursor.adapters.register_loader("json", TextLoader)  # The server's text, as printed.
+        for request in requests:
+            statement = sql.SQL("EXPLAIN (FORMAT JSON) {}").format(
+                sql.SQL(request.base_sql.strip().rstrip(";").rstrip())
+            )
+            try:
+                with conn.transaction():
+                    cursor.execute("SET TRANSACTION READ ONLY")
+                    row = cursor.execute(statement, prepare=True).fetchone()
+            except psycopg.Error as error:
+                errors[request.instance_id] = error.diag.message_primary or type(error).__name__
+                continue
+            if row is None:
+                errors[request.instance_id] = "EXPLAIN returned no row"
+            else:
+                plans[request.instance_id] = str(row[0])
     return plans, errors
 
 
