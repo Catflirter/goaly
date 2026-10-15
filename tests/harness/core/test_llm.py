@@ -852,6 +852,23 @@ async def test_raises_client_error_without_retrying(status: int, message: str) -
     assert attempts(raised.value.record) == [(CLIENT_ERROR, status)]
 
 
+async def test_a_request_httpx_refuses_to_send_is_not_retried_or_quoted(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    # h11's error for an illegal header quotes the header, which holds the key.
+    refused = httpx.LocalProtocolError(f"Illegal header value b'Bearer {KEY}\\n'")
+    gateway = Gateway(refused, completion())
+    async with connect(gateway) as llm:
+        with pytest.raises(ClientError, match="refused to send the request") as raised:
+            await llm.complete([user("hi")], model=QWEN, tags=EXEC)
+
+    assert len(gateway.requests) == 1
+    assert raised.value.record is not None
+    assert attempts(raised.value.record) == [(CLIENT_ERROR, 0)]
+    assert KEY not in str(raised.value)
+    assert all(KEY not in JsonFormatter().format(entry) for entry in caplog.records)
+
+
 INVALID = [
     pytest.param(lambda: httpx.Response(200, text="<html>Bad gateway</html>"), 200, id="not-json"),
     pytest.param(lambda: httpx.Response(200, json=[1, 2]), 200, id="not-an-object"),

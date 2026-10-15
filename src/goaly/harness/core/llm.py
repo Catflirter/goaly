@@ -397,6 +397,11 @@ class LlmClient:
         except (TimeoutError, httpx.TimeoutException):
             detail = f"no response within {self._retry.timeout_s:g} s"
             return _Outcome(_S.LLM_CALL_STATUS_TIMEOUT, detail=detail)
+        except httpx.LocalProtocolError as error:
+            # The request itself breaks HTTP, so a retry fails the same way. The error's text
+            # quotes the offending header, which may be the one holding the key: leave it out.
+            detail = f"httpx refused to send the request ({type(error).__name__})"
+            return _Outcome(_S.LLM_CALL_STATUS_CLIENT_ERROR, detail=detail)
         except httpx.TransportError as error:
             detail = self._quote(f"connection failed: {type(error).__name__}: {error}")
             return _Outcome(_S.LLM_CALL_STATUS_CONNECTION_ERROR, detail=detail)
