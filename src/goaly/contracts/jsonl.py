@@ -5,6 +5,9 @@ Each line holds one message in protobuf's standard JSON mapping, under the field
 ``"correct": false`` shows instead of disappearing. Reading ignores unknown fields, which keeps
 files written before a field was removed (and reserved) readable.
 
+On disk, field names and enum value names are the keys. So never rename a field or an enum
+value, and when one is removed, reserve its name as well as its number.
+
 A crash loses at most the line being written (spec §6.2): read_jsonl skips the torn tail it
 leaves, and the next append_jsonl cuts it off. Nothing here locks or fsyncs, so a caller with
 concurrent writers must hold its own lock across each call.
