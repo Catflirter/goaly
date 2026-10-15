@@ -35,7 +35,7 @@ from goaly.contracts.gen.trajectory_pb2 import (
 from goaly.contracts.interfaces import Environment, SqlEnvironment
 from goaly.contracts.jsonl import append_jsonl, read_jsonl
 from goaly.harness.core.agent import AgentContext, AgentHooks, run_agent
-from goaly.harness.core.budgets import Budgets, BudgetUse
+from goaly.harness.core.budgets import CALLS_PER_REPLY, Budgets, BudgetUse
 from goaly.harness.core.llm import BoundLlm, CallTags, LlmClient
 from goaly.harness.core.llm_errors import ContextOverflow, ServerError
 from goaly.harness.core.llm_models import EXECUTOR_MODEL, ModelParams
@@ -73,7 +73,7 @@ CANCELLED = StopReason.STOP_REASON_CANCELLED
 EXPLAIN = f"EXPLAIN {QWEN_BASE_SQL}"
 FAST = "SELECT count(*) FROM orders JOIN customer ON c_custkey = o_custkey WHERE c_nationkey = 7"
 SLOW = "SELECT pg_sleep(60)"
-PAUSE = "SELECT pg_sleep(0.3)"
+PAUSE = "SELECT pg_sleep(0.6)"
 DEAD = "SELECT 'the connection dies'"
 SYSTEM_PROMPT = "You rewrite slow PostgreSQL queries into equivalent, faster ones."
 TASK_PROMPT = f"Rewrite this query:\n{QWEN_BASE_SQL}"
@@ -143,7 +143,7 @@ def environment() -> FakeSqlEnvironment:
             EXPLAIN: SqlResult(row_count=12),
             FAST: SqlResult(row_count=1),
             SLOW: SqlResult(row_count=1, elapsed_s=60.0),
-            PAUSE: SqlResult(row_count=1, elapsed_s=0.3),
+            PAUSE: SqlResult(row_count=1, elapsed_s=0.6),
             DEAD: EnvironmentFailure("the database connection died"),
         }
     )
@@ -218,7 +218,12 @@ def replayed(assistant: ChatMessage) -> ChatMessage:
 
 
 def rebuilt_prompts(trajectory: Trajectory) -> list[list[ChatMessage]]:
-    """Each step's prompt, rebuilt from the trajectory by the rule trajectory.proto gives."""
+    """Each step's prompt, rebuilt from the trajectory: the reference rebuild.
+
+    It follows the rule trajectory.proto gives, plus the loop's own: a reply goes out with its
+    calls only as structured calls (replayed). The contracts follow-up will write that into the
+    rule.
+    """
     histories: dict[int, list[ChatMessage]] = {}
     prompts = []
     for step in trajectory.steps:
@@ -302,10 +307,11 @@ async def test_every_prompt_can_be_rebuilt_from_the_trajectory() -> None:
         qwen_reply("call_in_reasoning"),
         qwen_reply("truncated_standard_call"),
         reply(tool_call("explain_query", {"sql": QWEN_BASE_SQL})),
+        reply(content="Done."),  # The third failed reply in a row: a nudge and the reminder.
         reply(submit()),
     ]
     llm = FakeLLM(script)
-    ctx = context(llm, remind_after_errors=2, stop_after_errors=4)
+    ctx = context(llm)
 
     await run_agent(
         environment(),
@@ -319,6 +325,7 @@ async def test_every_prompt_can_be_rebuilt_from_the_trajectory() -> None:
     trajectory = ctx.trajectory()
     assert trajectory.stop_reason == SUBMITTED
     assert len(trajectory.steps) == len(script)
+    assert trajectory.steps[6].injected[1].content.startswith("You have made 3 errors in a row.")
     assert rebuilt_prompts(trajectory) == sent(llm)
 
 
@@ -456,15 +463,18 @@ async def test_the_wall_clock_cancels_a_call_and_ends_in_the_fallback() -> None:
 
 async def test_the_wall_clock_stops_a_running_tool() -> None:
     env = environment()
-    ctx = context(FakeLLM([reply(execute_sql(SLOW))]), wall_clock_s=0.2)
+    ctx = context(FakeLLM([reply(execute_sql(SLOW), execute_sql(FAST))]), wall_clock_s=0.2)
 
     async with asyncio.timeout(10):
         prediction = await run_agent(env, ctx, hooks())
 
     assert prediction.fallback
     assert env.stopped == [SLOW]
+    assert [sql for sql, _ in env.executed] == [SLOW]
     [step] = ctx.trajectory().steps
-    assert not step.tool_results  # The call was stopped, so it has no result.
+    assert [(result.content, result.is_error) for result in step.tool_results] == [
+        ("Error: no result: the task's time ran out.", True)
+    ] * 2  # The call that was stopped, and the one after it.
     assert ctx.trajectory().stop_reason == TIME
 
 
@@ -530,7 +540,7 @@ async def test_errors_in_a_row_bring_one_reminder_then_the_fallback() -> None:
         f"them:\n{json.dumps(SCHEMAS, ensure_ascii=False, indent=2)}"
     )
     assert injected(trajectory) == [[], [], [reminder], [], []]
-    assert sent(llm)[3][-1] == user(reminder)
+    assert sent(llm)[3][-1] == user(reminder)  # Two replies came after it, before the stop.
 
 
 async def test_every_kind_of_error_counts_toward_the_streak() -> None:
@@ -541,15 +551,48 @@ async def test_every_kind_of_error_counts_toward_the_streak() -> None:
             reply(tool_call("execute_sql", '{"sql": ')),  # JSON that cannot be repaired.
             reply(tool_call("fragile")),  # A tool that raised.
             reply(content="The query is already as fast as it gets."),  # No call at all.
-            qwen_reply("truncated_standard_call"),  # A reply cut off at the output limit.
         ]
     )
-    ctx = context(llm, remind_after_errors=5, stop_after_errors=6)
+    ctx = context(llm)
 
     prediction = await run_agent(environment(), ctx, hooks())
 
     assert prediction.fallback
-    assert len(llm.requests) == 6
+    assert len(llm.requests) == 5
+    assert ctx.trajectory().stop_reason == ERRORS
+
+
+async def test_a_reply_whose_parallel_calls_all_failed_is_one_error() -> None:
+    llm = FakeLLM([reply(*(tool_call("explain_query") for _ in range(5))), reply(submit())])
+    ctx = context(llm)
+
+    prediction = await run_agent(environment(), ctx, hooks())
+
+    assert prediction == SUBMISSION  # One failed reply: no stop,
+    assert injected(ctx.trajectory()) == [[], []]  # and no reminder either.
+
+
+async def test_a_reply_with_one_call_that_worked_ends_the_streak() -> None:
+    error = reply(tool_call("explain_query"))
+    mixed = reply(execute_sql(FAST), tool_call("explain_query"))
+    llm = FakeLLM([error, error, mixed, error, error, reply(submit())])
+    ctx = context(llm)
+
+    prediction = await run_agent(environment(), ctx, hooks())
+
+    assert prediction == SUBMISSION
+    assert not any(injected(ctx.trajectory()))  # The streak never reached 3.
+
+
+async def test_cut_off_replies_count_once_each_however_many_calls_they_had() -> None:
+    cut = reply(execute_sql(FAST), execute_sql(EXPLAIN), finish_reason="length")
+    llm = FakeLLM([cut] * 5)
+    ctx = context(llm)
+
+    prediction = await run_agent(environment(), ctx, hooks())
+
+    assert prediction.fallback
+    assert len(llm.requests) == 5  # Ten failed calls, but five failed replies.
     assert ctx.trajectory().stop_reason == ERRORS
 
 
@@ -583,7 +626,7 @@ async def test_a_reply_cut_off_at_the_output_limit_runs_none_of_its_calls() -> N
     env = environment()
     cut = reply(submit(QWEN_BASE_SQL), execute_sql(FAST), finish_reason="length")
     llm = FakeLLM([cut, reply(submit())])
-    ctx = context(llm, remind_after_errors=1, stop_after_errors=2)
+    ctx = context(llm)
 
     prediction = await run_agent(env, ctx, hooks())
 
@@ -597,33 +640,66 @@ async def test_a_reply_cut_off_at_the_output_limit_runs_none_of_its_calls() -> N
         assert result.is_error
         assert result.content.startswith("Error: your reply was cut off at the output limit")
         assert "more concisely" in result.content
-    # Both calls make one error: the reminder came, after 1, and the stop, after 2, did not.
-    assert len(first.injected) == 1
-    assert first.injected[0].content.startswith("You have made 1 error in a row.")
 
 
 async def test_calls_past_the_cap_of_a_reply_are_answered_but_not_run() -> None:
     env = environment()
-    calls = [execute_sql(FAST), execute_sql(EXPLAIN), execute_sql(SLOW), submit(QWEN_BASE_SQL)]
+    queries = [f"SELECT {n}" for n in range(CALLS_PER_REPLY)]
+    calls = [*map(execute_sql, queries), submit(QWEN_BASE_SQL), execute_sql(FAST)]
     llm = FakeLLM([reply(*calls), reply(submit())])
-    ctx = context(llm, calls_per_reply=2, remind_after_errors=1, stop_after_errors=2)
+    ctx = context(llm)
 
     prediction = await run_agent(env, ctx, hooks())
 
     assert prediction == SUBMISSION  # The capped submit never ran.
-    assert [sql for sql, _ in env.executed] == [FAST, EXPLAIN]
+    assert [sql for sql, _ in env.executed] == queries
     first = ctx.trajectory().steps[0]
     assert [result.tool_call_id for result in first.tool_results] == [call.id for call in calls]
-    assert [result.is_error for result in first.tool_results] == [False, False, True, True]
-    for result in first.tool_results[2:]:
+    assert [result.is_error for result in first.tool_results] == [False] * 16 + [True] * 2
+    for result in first.tool_results[16:]:
         assert result.content == (
-            "Error: a reply may make at most 2 tool calls, so this call was not run. "
+            "Error: a reply may make at most 16 tool calls, so this call was not run. "
             "Make fewer calls in each reply."
         )
-    # The capped calls make one error: the reminder came, after 1, and the stop, after 2, did not.
-    assert [message.content[:31] for message in first.injected] == [
-        "You have made 1 error in a row."
-    ]
+    assert not first.injected  # Calls of the reply worked, so it is no error.
+
+
+async def test_a_submission_drafted_in_the_reasoning_does_not_submit() -> None:
+    drafted = reply(
+        reasoning=(
+            "The join is faster, so I will submit it.\n<tool_call>\n<function=submit>\n"
+            f"<parameter=sql>\n{QWEN_BASE_SQL}\n</parameter>\n</function>\n</tool_call>"
+        ),
+        finish_reason="stop",
+    )
+    llm = FakeLLM([drafted, reply(submit())])
+    ctx = context(llm)
+
+    prediction = await run_agent(environment(), ctx, hooks())
+
+    assert prediction == SUBMISSION  # The submit in the reply, not the drafted one.
+    [result] = ctx.trajectory().steps[0].tool_results
+    assert not result.HasField("submission")
+    assert result.is_error
+    assert result.content == (
+        "Error: call submit in your reply, not in your reasoning. A call in your reasoning "
+        "cannot submit, so nothing was submitted."
+    )
+
+
+async def test_calls_after_a_submission_are_answered_but_not_run() -> None:
+    env = environment()
+    ctx = context(FakeLLM([reply(submit(), execute_sql(FAST))]))
+
+    prediction = await run_agent(env, ctx, hooks())
+
+    assert prediction == SUBMISSION
+    assert env.executed == []
+    later = ctx.trajectory().steps[0].tool_results[1]
+    assert (later.content, later.is_error) == (
+        "Error: not run: an earlier call in this reply submitted, which ended the episode.",
+        True,
+    )
 
 
 async def test_a_reply_cut_off_before_any_call_is_nudged_to_think_less() -> None:
@@ -707,7 +783,7 @@ async def test_the_hooks_get_copies() -> None:
 
 
 async def test_an_environment_failure_propagates() -> None:
-    ctx = context(FakeLLM([reply(execute_sql(DEAD))]))
+    ctx = context(FakeLLM([reply(execute_sql(DEAD), execute_sql(FAST))]))
 
     with pytest.raises(EnvironmentFailure, match="connection died"):
         await run_agent(environment(), ctx, hooks())
@@ -715,7 +791,10 @@ async def test_an_environment_failure_propagates() -> None:
     trajectory = ctx.trajectory()
     assert trajectory.stop_reason == CRASHED
     assert trajectory.error_message == "EnvironmentFailure: the database connection died"
-    assert len(trajectory.steps) == 1  # The step that hit it is kept.
+    [step] = trajectory.steps  # The step that hit it is kept, with its calls answered.
+    assert [result.content for result in step.tool_results] == [
+        "Error: no result: the task stopped on EnvironmentFailure."
+    ] * 2
 
 
 async def test_an_environment_failure_in_a_tools_task_group_propagates() -> None:
@@ -814,6 +893,22 @@ async def test_cancellation_propagates() -> None:
     assert trajectory.error_message == ""
 
 
+async def test_cancellation_in_a_tool_answers_the_steps_calls() -> None:
+    env = environment()
+    ctx = context(FakeLLM([reply(execute_sql(SLOW))]))
+    task = asyncio.create_task(run_agent(env, ctx, hooks()))
+    while not env.executed:  # Until the statement runs.
+        await asyncio.sleep(0)
+
+    task.cancel()
+    with pytest.raises(asyncio.CancelledError):
+        await task
+
+    assert env.stopped == [SLOW]
+    [result] = ctx.trajectory().steps[0].tool_results
+    assert result.content == "Error: no result: the task was cancelled."
+
+
 # The context: one per task, shared by the task's loops, with no way to choose a purpose.
 
 
@@ -834,6 +929,28 @@ async def test_a_second_loop_adds_a_chat_and_spends_the_same_budgets() -> None:
     assert sent(llm)[2] == [system(SYSTEM_PROMPT), user(TASK_PROMPT)]  # A chat of its own.
 
 
+async def test_a_label_another_chat_has_is_refused_with_a_stop_reason() -> None:
+    ctx = context(FakeLLM([reply(submit())]))
+    await run_agent(environment(), ctx, hooks())
+
+    with pytest.raises(ValueError, match="already has a chat named 'main'"):
+        await run_agent(environment(), ctx, hooks())
+
+    trajectory = ctx.trajectory()
+    assert [chat.label for chat in trajectory.chats] == ["main"]
+    assert trajectory.stop_reason == CRASHED
+    assert trajectory.error_message.startswith("ValueError: the task already has a chat named")
+
+
+async def test_a_blank_label_is_refused_with_a_stop_reason() -> None:
+    ctx = context(FakeLLM([]))
+
+    with pytest.raises(ValueError, match="label"):
+        await run_agent(environment(), ctx, hooks(), label="")
+
+    assert ctx.trajectory().stop_reason == CRASHED
+
+
 async def test_the_wall_clock_runs_from_the_first_loop() -> None:
     llm = FakeLLM([HANG])
     ctx = context(llm, wall_clock_s=0.05)
@@ -848,14 +965,14 @@ async def test_the_wall_clock_runs_from_the_first_loop() -> None:
 
 async def test_a_later_loop_gets_only_the_time_left() -> None:
     llm = FakeLLM([reply(execute_sql(PAUSE)), reply(submit()), HANG])
-    ctx = context(llm, wall_clock_s=0.5)
-    await run_agent(environment(), ctx, hooks())  # Its query takes 0.3 s.
+    ctx = context(llm, wall_clock_s=1.0)
+    await run_agent(environment(), ctx, hooks())  # Its query takes 0.6 s.
 
     started = time.monotonic()
     second = await run_agent(environment(), ctx, hooks(), label="again")
 
     assert second.fallback
-    assert time.monotonic() - started < 0.4  # The 0.2 s left, not a new 0.5 s.
+    assert time.monotonic() - started < 0.7  # The 0.4 s left, not a new 1.0 s.
     assert ctx.trajectory().stop_reason == TIME
 
 

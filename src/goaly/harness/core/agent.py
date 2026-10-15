@@ -6,11 +6,12 @@ runs the tool calls in its reply, and repeats until a tool's result carries a su
 it returns. When a budget runs out first, it returns the pack's fallback, marked ``fallback``
 (spec §5.4).
 
-Bad model output never raises. These are errors, and each counts toward the error streak: a
-call to an unknown tool, or whose arguments do not parse or validate, or whose tool failed; a
-reply that calls no tool; a reply cut off at the output limit, none of whose calls run; and a
-reply with more calls than the budgets allow, whose calls past the cap do not run. After 3
-errors in a row (by default) the model is reminded of the tool schemas, and after 5 the loop
+Bad model output never raises: it becomes an error result or a nudge, and the reply counts
+toward the error streak unless one of its calls gave a result that is no error. A call fails
+when its tool is unknown, its arguments do not parse or validate, or its tool failed. A reply
+cut off at the output limit runs none of its calls, and only the first 16 calls of a reply
+run. A call parsed from the reasoning never submits: Qwen drafts calls while it thinks. After
+3 failed replies in a row the model is reminded of the tool schemas, and after 5 the loop
 stops.
 
 What raises is what the Policy.solve docstring lets through: an EnvironmentFailure, an LLM
@@ -42,7 +43,7 @@ from goaly.contracts.gen.trajectory_pb2 import (
     Trajectory,
 )
 from goaly.contracts.interfaces import Environment
-from goaly.harness.core.budgets import Budgets, BudgetUse, ErrorStreak
+from goaly.harness.core.budgets import CALLS_PER_REPLY, Budgets, BudgetUse, ErrorStreak
 from goaly.harness.core.llm import BoundLlm, LlmReply
 from goaly.harness.core.llm_errors import ContextOverflow, LlmError
 from goaly.harness.core.llm_models import ModelParams
@@ -54,10 +55,9 @@ __all__ = ["AgentContext", "AgentHooks", "run_agent"]
 
 # The finish_reason of a reply that max_tokens cut off.
 _CUT_OFF: Final = "length"
+_REASONING_XML: Final = ToolCallSource.TOOL_CALL_SOURCE_REASONING_XML
 # Where the parser finds calls written as Qwen3-Coder XML.
-_XML_SOURCES: Final = frozenset(
-    {ToolCallSource.TOOL_CALL_SOURCE_CONTENT_XML, ToolCallSource.TOOL_CALL_SOURCE_REASONING_XML}
-)
+_XML_SOURCES: Final = frozenset({ToolCallSource.TOOL_CALL_SOURCE_CONTENT_XML, _REASONING_XML})
 
 # What the loop tells the model. {tools} lists the tools' names.
 _CUT_OFF_CALL: Final = (
@@ -72,11 +72,21 @@ _NO_CALL: Final = (
     "Error: your reply called no tool. Each reply must call one of the tools: {tools}."
 )
 _OVER_CAP: Final = (
-    "Error: a reply may make at most {cap} tool calls, so this call was not run. "
+    f"Error: a reply may make at most {CALLS_PER_REPLY} tool calls, so this call was not run. "
     "Make fewer calls in each reply."
 )
+_DRAFTED_SUBMISSION: Final = (
+    "Error: call {tool} in your reply, not in your reasoning. A call in your reasoning cannot "
+    "submit, so nothing was submitted."
+)
+# The results of calls that a step's end left unanswered, by why the chat ended.
+_UNRUN_AFTER_SUBMISSION: Final = (
+    "Error: not run: an earlier call in this reply submitted, which ended the episode."
+)
+_NO_RESULT: Final = "Error: no result: {why}."
 _REMINDER: Final = (
-    "You have made {errors} in a row. Call the tools exactly as these schemas define them:\n"
+    "You have made {errors} errors in a row. Call the tools exactly as these schemas define "
+    "them:\n"
     "{schemas}"
 )
 
@@ -110,10 +120,11 @@ class AgentContext:
         return self._budgets
 
     def trajectory(self) -> Trajectory:
-        """Return a copy of the task's trajectory so far: its chats, steps, usage and stop reason.
+        """Return a copy of the task's trajectory so far, as the loop records it.
 
+        The loop sets the chats, the steps, the usage, the stop reason and the error message.
         The runner fills in the rest once the policy returns or raises (T06): the run, task and
-        seed, the prediction and the grade, the error and the timestamps.
+        seed, the prediction, the grade and the timestamps.
         """
         return self._recorder.trajectory()
 
@@ -154,8 +165,9 @@ async def run_agent[E: Environment](
     """Drive the model through ``hooks.tools`` in ``env`` until a tool submits or a budget runs out.
 
     Return the submission, or the fallback, with ``fallback`` set, if a budget runs out first.
-    The chat goes into ``ctx``'s trajectory under ``label``, with why it stopped. What may raise
-    is as the module docstring says; the trajectory then records STOP_REASON_CANCELLED, or
+    The chat goes into ``ctx``'s trajectory under ``label``, which no other chat of the task may
+    have, with why it stopped. What may raise is as the module docstring says, and a label
+    already taken raises ValueError; the trajectory then records STOP_REASON_CANCELLED, or
     STOP_REASON_CRASHED and the error.
     """
     return await _Chat(env, ctx, hooks, label).run()
@@ -179,28 +191,38 @@ class _Chat[E: Environment]:
         self._recorder = ctx._recorder
         self._tools = hooks.tools.json_schemas()
         self._tool_names = ", ".join(tool.name for tool in hooks.tools) or "none"
-        opening = [
+        self._label = label
+        self._chat = -1  # The chat's index in the trajectory, once run() opens it.
+        # The next call's messages; the recorder holds its own copies.
+        self._prompt = [
             ChatMessage(role=ChatRole.CHAT_ROLE_SYSTEM, content=hooks.system_prompt),
             ChatMessage(role=ChatRole.CHAT_ROLE_USER, content=hooks.task_prompt),
         ]
-        self._chat = self._recorder.start_chat(label, opening)
-        self._prompt = opening  # The next call's messages; the recorder holds its own copies.
-        self._streak = ErrorStreak(ctx.budgets)
+        self._streak = ErrorStreak()
         self._last: Step | None = None  # The step the next call follows.
         self._notes: list[str] = []  # The loop's own messages to send after that step.
 
     async def run(self) -> Prediction:
+        """Open the chat and converse; every exit, an exception's included, sets a stop reason."""
         try:
+            self._chat = self._recorder.start_chat(self._label, self._prompt)
             outcome = await self._converse_in_time()
             prediction = outcome.submission
             if prediction is None:
                 prediction = self._fallback()
         except asyncio.CancelledError:
+            self._answer_the_rest(_NO_RESULT.format(why="the task was cancelled"))
             self._recorder.stop(StopReason.STOP_REASON_CANCELLED)
             raise
         except BaseException as error:
+            why = f"the task stopped on {type(error).__name__}"
+            self._answer_the_rest(_NO_RESULT.format(why=why))
             self._recorder.stop(StopReason.STOP_REASON_CRASHED, error_message=_describe(error))
             raise
+        if outcome.stop_reason == StopReason.STOP_REASON_SUBMITTED:
+            self._answer_the_rest(_UNRUN_AFTER_SUBMISSION)
+        else:  # Only the wall clock stops a chat partway through a step.
+            self._answer_the_rest(_NO_RESULT.format(why="the task's time ran out"))
         self._recorder.stop(outcome.stop_reason, error_message=outcome.error_message)
         return prediction
 
@@ -274,18 +296,19 @@ class _Chat[E: Environment]:
             self._streak.add(error=True)
             self._notes.append(_NO_CALL.format(tools=self._tool_names))
             return None
-        cap = self._ctx.budgets.calls_per_reply
-        for call in calls[:cap]:
+        worked = False  # Whether a call gave a result that is no error.
+        for call in calls[:CALLS_PER_REPLY]:
             result = await self._hooks.tools.execute(call, self._env)
-            self._streak.add(error=result.is_error)
+            if result.HasField("submission") and call.source == _REASONING_XML:
+                result = _drafted(call, result)
+            worked = worked or not result.is_error
             self._add_guidance(call, result)
             self._answer(step, result)
             if result.HasField("submission"):  # The episode ends: later calls do not run.
                 return result.submission
-        if len(calls) > cap:
-            for call in calls[cap:]:
-                self._answer(step, _not_run(call, _OVER_CAP.format(cap=cap)))
-            self._streak.add(error=True)  # One error for the reply, however far past the cap.
+        for call in calls[CALLS_PER_REPLY:]:
+            self._answer(step, _not_run(call, _OVER_CAP))
+        self._streak.add(error=not worked)  # One count for the reply, however many calls failed.
         return None
 
     def _add_guidance(self, call: ToolCall, result: ToolResult) -> None:
@@ -311,11 +334,8 @@ class _Chat[E: Environment]:
             return
         texts, self._notes = self._notes, []
         if self._streak.take_reminder():
-            errors = self._streak.count
             schemas = json.dumps(self._tools, ensure_ascii=False, indent=2)
-            texts.append(
-                _REMINDER.format(errors=f"{errors} error{'s' * (errors != 1)}", schemas=schemas)
-            )
+            texts.append(_REMINDER.format(errors=self._streak.count, schemas=schemas))
         hook = self._hooks.on_step
         guidance = hook(_copy(step), self._spent()) if hook is not None else None
         if guidance:
@@ -324,6 +344,17 @@ class _Chat[E: Environment]:
             message = ChatMessage(role=ChatRole.CHAT_ROLE_USER, content=text)
             step.injected.append(message)
             self._prompt.append(message)
+
+    def _answer_the_rest(self, content: str) -> None:
+        """Answer the last step's calls that have no result yet, with ``content``.
+
+        A submission or the end of the chat can leave calls unanswered; this keeps a step's
+        tool results matched one to one with its calls. The model sees none of these.
+        """
+        step = self._last
+        if step is not None:
+            for call in step.assistant.tool_calls[len(step.tool_results) :]:
+                step.tool_results.append(_not_run(call, content))
 
     def _fallback(self) -> Prediction:
         prediction = _copy(self._hooks.fallback())
@@ -352,6 +383,17 @@ def _replayed(assistant: ChatMessage) -> ChatMessage:
         message.content = strip_tool_call_markup(message.content)
         message.reasoning_content = strip_tool_call_markup(message.reasoning_content)
     return message
+
+
+def _drafted(call: ToolCall, result: ToolResult) -> ToolResult:
+    """The error result of a call from the reasoning that would have submitted: it does not."""
+    return ToolResult(
+        tool_call_id=call.id,
+        name=call.name,
+        content=_DRAFTED_SUBMISSION.format(tool=call.name),
+        is_error=True,
+        elapsed_s=result.elapsed_s,
+    )
 
 
 def _not_run(call: ToolCall, content: str) -> ToolResult:
