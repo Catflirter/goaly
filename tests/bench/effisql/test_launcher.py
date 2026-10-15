@@ -19,6 +19,7 @@ from pydantic import SecretStr
 from goaly.bench.effisql.benchmark import EffiSqlBenchmark
 from goaly.bench.effisql.harness import EffiSqlPaths, EffiSqlWiring, open_host
 from goaly.bench.effisql.launcher import (
+    SOLVE_RUNS,
     EffiSqlLauncher,
     SolveContainerError,
     SolveRequestLike,
@@ -207,6 +208,13 @@ async def test_it_stages_the_inputs_and_runs_the_container(tmp_path: Path) -> No
     assert proxy.opened == [("run-1", proxy_socket(request.solve_dir.parent, "run-1"))]
     log = request.solve_dir.parent / "solve-container.log"
     assert log.read_text() == "exit code 0; timed out: False\ncontainer output"
+    (run,) = [
+        json.loads(x) for x in (request.solve_dir.parent / SOLVE_RUNS).read_text().splitlines()
+    ]
+    assert run["tasks"] == [["1", 0], ["3", 0], ["1", 1]]  # What the host sent.
+    assert run["max_tasks"] == 2
+    assert run["exit_code"] == 0
+    assert 0 <= run["wall_s"] < 5
     assert not request.solve_dir.exists()  # Core makes it; the launcher writes nothing there.
 
 

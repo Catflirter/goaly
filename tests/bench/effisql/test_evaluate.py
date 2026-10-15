@@ -2,7 +2,6 @@
 
 import asyncio
 import json
-import logging
 import subprocess
 import sys
 from collections.abc import Sequence
@@ -134,8 +133,12 @@ class FakeHost:
         calls: Sequence[LlmCallRecord],
         status: int = 0,
         usage: dict[str, float] | None = None,
+        sent: Sequence[tuple[str, int]] | None = None,
+        wall_s: float = 40.0,
     ):
         self.usage = usage
+        self.sent = sent
+        self.wall_s = wall_s
         self.results = results
         self.calls = calls
         self.status = status
@@ -155,6 +158,16 @@ class FakeHost:
         (out / "llm_calls.jsonl").write_text("".join(to_json_line(c) + "\n" for c in self.calls))
         if self.usage is not None:
             (out / "usage.json").write_text(json.dumps({"proxy_total": self.usage}))
+        sent = self.sent
+        if sent is None:  # By default the host sent every requested task to the container.
+            only = argv[argv.index("--only") + 1 : argv.index("--first-seed")]
+            first = int(argv[argv.index("--first-seed") + 1])
+            seeds = range(first, first + int(argv[argv.index("--seeds") + 1]))
+            sent = [(i, s) for i in only for s in seeds]
+        max_tasks = int(argv[argv.index("--max-tasks") + 1])
+        run = {"tasks": [list(t) for t in sent], "wall_s": self.wall_s, "max_tasks": max_tasks}
+        run |= {"started_at": 0.0, "exit_code": 0, "timed_out": False}
+        (out / "solve-runs.jsonl").write_text(json.dumps(run) + "\n")
         return self.status, "host output"
 
 
@@ -180,6 +193,7 @@ def tagged(instance_id: str, tokens: int, cost: float) -> LlmCallRecord:
         run_id="run-1",
         instance_id=instance_id,
         seed=0,
+        http_status=200,
         usage=Usage(input_tokens=tokens, cost_usd=cost),
     )
 
@@ -215,7 +229,8 @@ async def test_it_runs_the_host_command_on_a_read_only_snapshot(repo: Path, tmp_
         ("2", 200),
     ]
     stats = evaluation.stats
-    assert (stats.mean_tokens, stats.mean_wall_time_s, stats.count) == (250.0, 25.0, 2)
+    # The proxy's 500 tokens over the 2 tasks sent; 40 s of host clock / 2 tasks x 2 at once.
+    assert (stats.mean_tokens, stats.mean_wall_time_s, stats.count) == (250.0, 40.0, 2)
     assert stats.mean_cost_usd == pytest.approx(0.025)
 
 
@@ -270,23 +285,6 @@ async def test_the_budget_never_takes_more_than_it_has() -> None:
     assert await budget.acquire(0) == 1
 
 
-async def test_a_drift_from_the_proxy_total_is_flagged(
-    repo: Path, tmp_path: Path, caplog: pytest.LogCaptureFixture
-) -> None:
-    commit, tree = head(repo)
-    host = FakeHost(
-        [result("1", 0, 100, 0.0, 5)], [*calls(150, run_id="run-5"), *calls(9, run_id="x")]
-    )
-
-    with caplog.at_level(logging.WARNING):
-        evaluation = await evaluator(repo, tmp_path, host).evaluate(
-            Request(commit, tree, SPLIT_TRAIN, ("1",), (0,), "run-5")
-        )
-
-    assert "differ from the proxy's total" in caplog.text
-    assert evaluation.stats.mean_cost_usd is None  # Nothing was priced.
-
-
 def test_known_train_finds_the_commits_finished_train_runs(repo: Path, tmp_path: Path) -> None:
     commit, tree = head(repo)
     made = evaluator(repo, tmp_path, FakeHost([], []))
@@ -322,7 +320,10 @@ async def test_a_cached_task_brings_its_stored_host_numbers(repo: Path, tmp_path
     commit, tree = head(repo)
     # Task 1 solved now (the proxy saw it); task 2 came from the cache (no call was made).
     host = FakeHost(
-        [result("1", 0, 300, 0.03, 30), result("2", 0, 100, 0.01, 10)], [tagged("1", 300, 0.03)]
+        [result("1", 0, 300, 0.03, 30), result("2", 0, 100, 0.01, 10)],
+        [tagged("1", 300, 0.03)],
+        sent=[("1", 0)],  # The host took task 2 from the cache before the launch.
+        wall_s=12.0,
     )
 
     evaluation = await evaluator(repo, tmp_path, host).evaluate(
@@ -332,6 +333,7 @@ async def test_a_cached_task_brings_its_stored_host_numbers(repo: Path, tmp_path
     stats = evaluation.stats
     assert stats.mean_tokens == 200.0  # (300 from the proxy + 100 stored) / 2
     assert stats.mean_cost_usd == pytest.approx(0.02)
+    assert stats.mean_wall_time_s == 11.0  # (12 s of host clock + 10 s stored) / 2
     assert evaluation.infra_failed == frozenset()  # The host saw no infrastructure failure.
 
 
@@ -360,25 +362,52 @@ async def test_the_proxy_totals_come_from_usage_json(repo: Path, tmp_path: Path)
     assert evaluation.stats.mean_cost_usd == pytest.approx(0.5)
 
 
-def test_infra_failures_are_the_hosts_infrastructure_errors() -> None:
-    def failed(
-        instance_id: str,
-        error: TaskErrorType.ValueType,
-        status: GradeStatus.ValueType = GRADE_STATUS_GRADED,
-    ) -> TaskResult:
-        return TaskResult(
-            instance_id=instance_id, seed=0, error_type=error, grade=Grade(status=status)
-        )
+def _result(
+    instance_id: str,
+    error: TaskErrorType.ValueType = TASK_ERROR_TYPE_NONE,
+    status: GradeStatus.ValueType = GRADE_STATUS_GRADED,
+) -> TaskResult:
+    return TaskResult(instance_id=instance_id, seed=0, error_type=error, grade=Grade(status=status))
 
+
+def _call(instance_id: str, http_status: int, at_s: int) -> LlmCallRecord:
+    call = LlmCallRecord(run_id="run-1", instance_id=instance_id, seed=0, http_status=http_status)
+    call.started_at.FromSeconds(at_s)
+    return call
+
+
+def test_forged_container_errors_are_not_infrastructure_failures() -> None:
+    # The container claims LLM and environment failures, with no host evidence for either.
+    forged = [_result("1", TASK_ERROR_TYPE_LLM), _result("2", TASK_ERROR_TYPE_ENVIRONMENT)]
+    calls = [_call("1", 200, 1), _call("2", 200, 1)]
+
+    assert infra_failed(forged, calls) == frozenset()
+
+
+def test_infra_failures_rest_on_the_proxy_the_launcher_and_the_grader() -> None:
     results = [
-        failed("1", TASK_ERROR_TYPE_LLM),
-        failed("2", TASK_ERROR_TYPE_ENVIRONMENT),
-        failed("3", TASK_ERROR_TYPE_NONE, GRADE_STATUS_GRADER_ERROR),
-        failed("4", TASK_ERROR_TYPE_POLICY_CRASH),
-        failed("5", TASK_ERROR_TYPE_NONE),
+        _result("1", TASK_ERROR_TYPE_LLM),  # Its last call got a 503 at the proxy.
+        _result("2"),  # A 502 that a retry recovered from: no failure.
+        _result("3", status=GRADE_STATUS_GRADER_ERROR),  # The host's own grade.
+        _result("4", TASK_ERROR_TYPE_POLICY_CRASH),  # No record, but the container exited 0.
+        _result("5", TASK_ERROR_TYPE_LLM),  # The proxy saw no reply: a timeout.
+    ]
+    calls = [
+        _call("1", 200, 1),
+        _call("1", 503, 2),
+        _call("2", 502, 1),
+        _call("2", 200, 2),
+        _call("5", 0, 1),
+        _call("9", 503, 1),  # Another task's call: not this evaluation's.
     ]
 
-    assert infra_failed(results) == {("1", 0), ("2", 0), ("3", 0)}
+    assert infra_failed(results, calls) == {("1", 0), ("3", 0), ("5", 0)}
+    assert infra_failed(results, calls, container_failed=True) == {
+        ("1", 0),
+        ("3", 0),
+        ("4", 0),
+        ("5", 0),
+    }
 
 
 async def test_a_probe_makes_a_grader_and_closes_it(
@@ -419,3 +448,21 @@ class FakeProbeGrader:
 
     def close(self) -> None:
         self.closed = True
+
+
+async def test_a_forged_tag_cannot_make_a_task_look_cached(repo: Path, tmp_path: Path) -> None:
+    commit, tree = head(repo)
+    # The container tagged every call as task 1; the host sent both tasks.
+    host = FakeHost(
+        [result("1", 0, 900, 0.09, 1), result("2", 0, 1, 0.0, 1)],
+        [tagged("1", 600, 0.06)],
+        wall_s=10.0,
+    )
+
+    evaluation = await evaluator(repo, tmp_path, host).evaluate(
+        Request(commit, tree, SPLIT_TRAIN, ("1", "2"), (0,), "run-1")
+    )
+
+    stats = evaluation.stats
+    assert stats.mean_tokens == 300.0  # The proxy's 600 over both sent tasks, tags aside.
+    assert stats.mean_wall_time_s == 10.0  # 10 s / 2 tasks x 2 at once; claims aside.
