@@ -1,168 +1,168 @@
-"""The grading-instance pool, for the grader (T10; spec §6.2, §8.5).
+"""Grader-role connections to the grading instances (spec §6.2, §8.5).
 
-A grading instance runs one evaluation at a time, so acquiring one is exclusive. Each request
-carries a :class:`GradingPriority`. A free instance goes to the request with the lowest value,
-and among requests with the same value, to the earliest. goaly-smoke's requests (SMOKE) go
-ahead of every other phase, so they wait at most for the evaluations already running. After
-final solving, :meth:`GradingPool.add` brings in the solving instances, which hold the
-alternate database too.
+:class:`GradingConnections` keeps one small connection pool per instance and database (``tpch``
+and ``tpch_alt``), as the grader role: it opens a pool on first use, looks it up after that,
+and closes them all at the end. It schedules nothing. T10's ``grading_pool`` is the one
+scheduler: it decides which evaluation runs on which instance, one at a time per instance, by
+phase priority with SMOKE first, and T20 and T21 take that priority from T10.
 
-A lease lends grader-role connections to ``tpch`` and ``tpch_alt``, from one small connection
-pool per instance and database. The connections are in autocommit mode: open a transaction to
-use a server-side cursor (``async with conn.transaction():`` and then ``conn.cursor(name=...)``).
-They default to read-only transactions, as the grader role does, and each goes back to its
-pool with its session settings reset.
+The connections are in autocommit mode: open a transaction to use a server-side cursor
+(``async with conn.transaction():`` and then ``conn.cursor(name=...)``). They default to
+read-only transactions, as the grader role does, and each goes back to its pool with DISCARD
+ALL, so no setting, prepared statement, cursor, lock or listen outlives a loan.
 
-This module only lends instances and connections. T10 owns comparison, timing, hashing and the
-catalog-fingerprint checks.
+T10 owns comparison, timing, hashing and the catalog-fingerprint checks.
 """
 
 import asyncio
-import heapq
-import itertools
-from collections.abc import AsyncIterator, Callable, Sequence
-from contextlib import asynccontextmanager
-from enum import IntEnum
+import contextlib
+import logging
+from collections.abc import AsyncIterator, Callable
+from contextlib import AbstractAsyncContextManager, asynccontextmanager
 from typing import Any, Protocol
 
 import psycopg
 from psycopg_pool import AsyncConnectionPool
+from pydantic import SecretStr
 
-from goaly.bench.effisql.pg_instances import GRADING, Instance
-from goaly.bench.effisql.pg_settings import ALT_DB, GRADER_ROLE, MAIN_DB, PgCredentials, PgEnvConfig
+from goaly.bench.effisql.pg_instances import Instance
+from goaly.bench.effisql.pg_settings import (
+    ALT_DB,
+    GRADER_ROLE,
+    MAIN_DB,
+    PgEnvConfig,
+    connection_kwargs,
+)
 
-__all__ = ["GradingLease", "GradingPool", "GradingPriority"]
+__all__ = ["GradingConnections"]
 
-
-class GradingPriority(IntEnum):
-    """Who gets the next free grading instance: the lowest value first, then first come.
-
-    T10's scheduler maps the phases (spec §6.2) onto these levels; SMOKE is goaly-smoke's.
-    """
-
-    SMOKE = 0
-    HIGH = 1
-    NORMAL = 2
-    LOW = 3
+_log = logging.getLogger(__name__)
 
 
 class _ConnectionPool(Protocol):
-    """What a lease needs of psycopg_pool.AsyncConnectionPool."""
+    """What GradingConnections needs of psycopg_pool.AsyncConnectionPool."""
 
     async def open(self, wait: bool = False, timeout: float = 30.0) -> None: ...
-    def connection(self) -> Any: ...  # An async context manager lending a connection.
-    async def close(self) -> None: ...
+    def connection(
+        self, timeout: float | None = None
+    ) -> AbstractAsyncContextManager[psycopg.AsyncConnection[Any]]: ...
+    async def close(self, timeout: float = 5.0) -> None: ...
 
 
-class GradingLease:
-    """One exclusive hold on a grading instance, until its ``acquire`` block exits."""
-
-    def __init__(self, instance: Instance, pool: "GradingPool") -> None:
-        self.instance = instance
-        self._pool = pool
-
-    @asynccontextmanager
-    async def connection(self, db: str) -> AsyncIterator[psycopg.AsyncConnection[Any]]:
-        """Lend a grader-role connection to ``db``, tpch or tpch_alt, on this instance."""
-        if db not in (MAIN_DB, ALT_DB):
-            raise ValueError(f"grading connects to {MAIN_DB} or {ALT_DB}, not {db!r}")
-        connections = await self._pool._connections(self.instance, db)
-        async with connections.connection() as conn:
-            yield conn
+type _Key = tuple[str, str]  # (instance name, database)
 
 
-class GradingPool:
-    """Lends the grading instances one evaluation at a time, by priority, then in order."""
+class GradingConnections:
+    """One connection pool per grading instance and database, as the grader role.
+
+    Each pool keeps one connection open and lends at most ``max_size`` at once: a caller that
+    asks for more waits for one to come back, up to the pool's 30 s, and then gets
+    psycopg_pool.PoolTimeout. Opening a pool waits up to ``open_timeout_s`` for its first
+    connection; if the instance refuses it, the call raises psycopg_pool.PoolTimeout too, and
+    the next call tries again. Opening one instance's pool never holds up another instance.
+    """
 
     def __init__(
         self,
         config: PgEnvConfig,
-        credentials: PgCredentials,
-        instances: Sequence[Instance] = GRADING,
+        password: SecretStr,
         *,
+        max_size: int = 2,
+        open_timeout_s: float = 30.0,
         pool_factory: Callable[[Instance, str], _ConnectionPool] | None = None,
     ) -> None:
+        """``password`` is the grader role's, the only one these connections need."""
+        if max_size < 1:
+            raise ValueError(f"max_size must be at least 1, not {max_size}")
         self._config = config
-        self._credentials = credentials
-        self._instances = list(instances)
-        self._free = list(instances)
-        self._waiting: list[tuple[int, int, asyncio.Future[Instance]]] = []
-        self._arrivals = itertools.count()
+        self._password = password
+        self._max_size = max_size
+        self._open_timeout_s = open_timeout_s
         self._make_pool = pool_factory if pool_factory is not None else self._new_pool
-        self._pools: dict[tuple[str, str], _ConnectionPool] = {}
-        self._pools_lock = asyncio.Lock()
+        self._pools: dict[_Key, _ConnectionPool] = {}
+        self._opening: dict[_Key, asyncio.Task[_ConnectionPool]] = {}
+        self._closed = False
 
-    @property
-    def instances(self) -> tuple[Instance, ...]:
-        return tuple(self._instances)
+    def lookup(self, instance: Instance, db: str) -> _ConnectionPool | None:
+        """The open pool for ``db`` on ``instance``, or None if it has not opened yet."""
+        return self._pools.get((instance.name, _checked(db)))
 
-    def add(self, instances: Sequence[Instance]) -> None:
-        """Bring more instances into the pool, such as the solving instances after solving."""
-        for instance in instances:
-            if instance not in self._instances:
-                self._instances.append(instance)
-                self._release(instance)
+    async def open(self, instance: Instance, db: str) -> _ConnectionPool:
+        """The pool for ``db`` on ``instance``, opened on first use.
+
+        Callers that ask at once share one opening. A caller cancelled meanwhile leaves the
+        opening to finish: its pool is kept, and closed by :meth:`close`, never leaked.
+        """
+        key = (instance.name, _checked(db))
+        if self._closed:
+            raise RuntimeError("the grading connections are closed")
+        if (pool := self._pools.get(key)) is not None:  # No lock: a lookup never waits.
+            return pool
+        opening = self._opening.get(key)
+        if opening is None:
+            opening = asyncio.create_task(self._open(key, instance, db))
+            self._opening[key] = opening
+            opening.add_done_callback(lambda task: self._opened(key, task))
+        return await asyncio.shield(opening)
 
     @asynccontextmanager
-    async def acquire(
-        self, priority: GradingPriority = GradingPriority.NORMAL
-    ) -> AsyncIterator[GradingLease]:
-        """Hold a grading instance exclusively for the block, waiting by ``priority``."""
-        instance = await self._take(priority)
-        try:
-            yield GradingLease(instance, self)
-        finally:
-            self._release(instance)
+    async def connection(
+        self, instance: Instance, db: str
+    ) -> AsyncIterator[psycopg.AsyncConnection[Any]]:
+        """Lend a grader-role connection to ``db``, tpch or tpch_alt, on ``instance``.
+
+        It goes back to its pool however the block exits. A caller that abandons a statement
+        must cancel it first (``conn.cancel_safe()``): the pool closes a connection that comes
+        back mid-statement, and its backend may run on until it next writes to the socket.
+        """
+        pool = await self.open(instance, db)
+        async with pool.connection() as conn:
+            yield conn
 
     async def close(self) -> None:
-        """Close every connection pool. Leases already handed out must have ended."""
-        pools, self._pools = list(self._pools.values()), {}
-        for connections in pools:
-            await connections.close()
+        """Close every pool, those still opening too; later calls raise RuntimeError.
 
-    async def _take(self, priority: GradingPriority) -> Instance:
-        if self._free and not self._waiting:
-            return self._free.pop(0)
-        waiter: asyncio.Future[Instance] = asyncio.get_running_loop().create_future()
-        heapq.heappush(self._waiting, (int(priority), next(self._arrivals), waiter))
+        A pool that fails to close is logged at WARNING, and the others are still closed.
+        """
+        self._closed = True
+        openings = list(self._opening.values())
+        for opening in openings:
+            opening.cancel()  # Each closes the pool it was opening.
+        await asyncio.gather(*openings, return_exceptions=True)
+        pools, self._pools = list(self._pools.items()), {}
+        for (name, db), pool in pools:
+            try:
+                await pool.close()
+            except Exception:  # noqa: BLE001  # Logged with its cause; the rest still close.
+                _log.warning("closing the %s pool on %s failed", db, name, exc_info=True)
+
+    async def _open(self, key: _Key, instance: Instance, db: str) -> _ConnectionPool:
+        pool = self._make_pool(instance, db)
         try:
-            return await waiter
-        except asyncio.CancelledError:
-            if waiter.done() and not waiter.cancelled():
-                self._release(waiter.result())  # It arrived as we were cancelled: pass it on.
+            await pool.open(wait=True, timeout=self._open_timeout_s)
+        except BaseException:
+            await asyncio.shield(_close_quietly(pool))  # Its workers must not linger.
             raise
+        if self._closed:  # close() ran meanwhile: this pool must not outlive it.
+            await _close_quietly(pool)
+            raise RuntimeError("the grading connections were closed while a pool opened")
+        self._pools[key] = pool
+        return pool
 
-    def _release(self, instance: Instance) -> None:
-        while self._waiting:
-            _, _, waiter = heapq.heappop(self._waiting)
-            if not waiter.done():  # A cancelled waiter is skipped here, lazily.
-                waiter.set_result(instance)
-                return
-        self._free.append(instance)
-
-    async def _connections(self, instance: Instance, db: str) -> _ConnectionPool:
-        key = (instance.name, db)
-        async with self._pools_lock:
-            if key not in self._pools:
-                connections = self._make_pool(instance, db)
-                await connections.open(wait=True)
-                self._pools[key] = connections
-            return self._pools[key]
+    def _opened(self, key: _Key, task: asyncio.Task[_ConnectionPool]) -> None:
+        if self._opening.get(key) is task:
+            del self._opening[key]  # A failed opening is tried again by the next call.
+        if not task.cancelled():
+            task.exception()  # Retrieved, so asyncio does not log it as never retrieved.
 
     def _new_pool(self, instance: Instance, db: str) -> AsyncConnectionPool:
+        kwargs = connection_kwargs(
+            self._config.host, instance.port, GRADER_ROLE, self._password, db
+        )
         return AsyncConnectionPool(
-            kwargs={
-                "host": self._config.host,
-                "port": instance.port,
-                "user": GRADER_ROLE,
-                "password": self._credentials.grader_password.get_secret_value(),
-                "dbname": db,
-                "autocommit": True,
-                "connect_timeout": 10,
-                "application_name": "goaly-effisql-grader",
-            },
+            kwargs={**kwargs, "application_name": "goaly-effisql-grader"},
             min_size=1,
-            max_size=2,
+            max_size=self._max_size,
             open=False,
             name=f"grading-{instance.name}-{db}",
             check=AsyncConnectionPool.check_connection,
@@ -170,6 +170,20 @@ class GradingPool:
         )
 
 
+def _checked(db: str) -> str:
+    if db not in (MAIN_DB, ALT_DB):
+        raise ValueError(f"grading connects to {MAIN_DB} or {ALT_DB}, not {db!r}")
+    return db
+
+
 async def _reset_session(conn: psycopg.AsyncConnection[Any]) -> None:
-    """Return a connection with its session settings as the grader role's defaults set them."""
-    await conn.execute("RESET ALL")
+    """Return a connection to its pool as a new session of the grader role would start.
+
+    DISCARD ALL also drops prepared statements, which psycopg sees and forgets too.
+    """
+    await conn.execute("DISCARD ALL")
+
+
+async def _close_quietly(pool: _ConnectionPool) -> None:
+    with contextlib.suppress(Exception):
+        await pool.close()
