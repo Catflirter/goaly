@@ -6,6 +6,7 @@ from collections.abc import Sequence
 from datetime import UTC, datetime
 from pathlib import Path
 
+import pytest
 from google.protobuf.message import Message
 from google.protobuf.timestamp_pb2 import Timestamp
 
@@ -48,11 +49,8 @@ from goaly.contracts.jsonl import append_jsonl, from_json_line, read_jsonl, to_j
 type Origin = tuple[int, str] | int | None
 type Located = tuple[Origin, ChatMessage]
 
-XML_SOURCES = {
-    ToolCallSource.TOOL_CALL_SOURCE_REASONING_XML,
-    ToolCallSource.TOOL_CALL_SOURCE_CONTENT_XML,
-}
-# Qwen3-Coder's call markup: a block ends at its closing tag, at the next block, or at the end.
+# Qwen3-Coder's tool-call markup: a block ends at its closing tag, at the next block of its kind,
+# or at the end of the text.
 TOOL_CALL_BLOCK = re.compile(r"<tool_call>.*?(?:</tool_call>|(?=<tool_call>)|\Z)", re.DOTALL)
 FUNCTION_BLOCK = re.compile(r"<function=[^>\n]*>.*?(?:</function>|(?=<function=)|\Z)", re.DOTALL)
 
@@ -89,41 +87,36 @@ def unfolded(trajectory: Trajectory, step: Step) -> tuple[list[Located], list[Co
     return messages, [*folds, *step.folds]
 
 
-def without_markup(text: str, *, reasoning: bool) -> str:
-    """``text`` without its <tool_call> blocks, or, in a content with none, its <function> ones."""
-    markup = TOOL_CALL_BLOCK if reasoning or TOOL_CALL_BLOCK.search(text) else FUNCTION_BLOCK
-    return markup.sub("", text)
+def without_markup(text: str) -> str:
+    """``text`` without its <tool_call> blocks, then without its bare <function=...> blocks."""
+    return FUNCTION_BLOCK.sub("", TOOL_CALL_BLOCK.sub("", text))
 
 
 def replayed(assistant: ChatMessage, *, keep_reasoning: bool) -> ChatMessage:
-    """An earlier assistant message as a later prompt carries it."""
+    """An earlier assistant message as a later prompt of an executor chat carries it."""
     message = ChatMessage()
-    message.CopyFrom(assistant)
-    if any(call.source in XML_SOURCES for call in assistant.tool_calls):
-        message.content = without_markup(message.content, reasoning=False)
-        message.reasoning_content = without_markup(message.reasoning_content, reasoning=True)
-    if not keep_reasoning:
-        message.reasoning_content = ""
+    message.CopyFrom(assistant)  # Its tool_calls stay, whatever their source.
+    message.content = without_markup(message.content)
+    message.reasoning_content = without_markup(message.reasoning_content) if keep_reasoning else ""
     return message
 
 
 def prompt(trajectory: Trajectory, index: int) -> list[ChatMessage]:
-    """The messages the model was sent at step ``index``: folds, XML and reasoning rules applied."""
+    """The messages the model was sent at step ``index``: folds and the replay rules applied."""
     step = trajectory.steps[index]
     messages, folds = unfolded(trajectory, step)
     replacements: dict[Origin, str] = {
         (fold.step, fold.tool_call_id): fold.replacement for fold in folds
     }
-    chat = trajectory.chats[step.chat]
+    keep_turns = trajectory.chats[step.chat].keep_turns  # Unset reads as 0: not an executor chat.
     assistants = [origin for origin, _ in messages if isinstance(origin, int)]
-    if chat.HasField("keep_turns"):  # An executor chat: only the latest steps keep reasoning.
-        assistants = assistants[max(len(assistants) - chat.keep_turns, 0) :]
+    window = assistants[max(len(assistants) - keep_turns, 0) :]
     sent = []
     for origin, message in messages:
         if origin in replacements:
             sent.append(tool_message(message.tool_call_id, replacements[origin]))
-        elif isinstance(origin, int):
-            sent.append(replayed(message, keep_reasoning=origin in assistants))
+        elif isinstance(origin, int) and keep_turns > 0:
+            sent.append(replayed(message, keep_reasoning=origin in window))
         else:
             sent.append(message)
     return sent
@@ -230,6 +223,19 @@ def test_chats_forked_from_a_step_continue_its_context() -> None:
     assert prompt(trajectory, 6) == at_fork  # The main chat sees none of the samples.
 
 
+def test_an_optional_statistic_keeps_its_presence_through_jsonl() -> None:
+    # A sign-test p of exactly 0 was computed; a gain probability never set was not.
+    line = to_json_line(PhaseResult(sign_test_p=0.0))
+
+    fields = json.loads(line)
+    read = from_json_line(line, PhaseResult)
+
+    assert fields["sign_test_p"] == 0.0
+    assert "gain_probability" not in fields
+    assert read.HasField("sign_test_p")
+    assert not read.HasField("gain_probability")
+
+
 def without_reasoning(message: ChatMessage) -> ChatMessage:
     """``message`` as a prompt carries it once its step is out of the reasoning window."""
     sent = ChatMessage()
@@ -261,12 +267,15 @@ def test_an_executor_chat_replays_reasoning_for_its_last_keep_turns_steps_only()
     assert steps[0].assistant.reasoning_content == "thinking 0"
 
 
-def test_a_chat_without_keep_turns_replays_reasoning_unchanged() -> None:
-    # As GLM's reasoning is (spec §5.1).
-    trajectory = Trajectory(
-        chats=[Chat(label="main", initial_messages=[SYSTEM, TASK])],
-        steps=[make_step(0, 0, "t0"), make_step(1, 0, "t1"), make_step(2, 0)],
-    )
+@pytest.mark.parametrize("keep_turns", [None, 0], ids=["unset", "zero"])
+def test_a_chat_that_is_not_an_executor_chat_replays_its_messages_unchanged(
+    keep_turns: int | None,
+) -> None:
+    # As GLM's are (spec §5.1): reasoning and any XML markup included.
+    chat = Chat(label="main", initial_messages=[SYSTEM, TASK], keep_turns=keep_turns)
+    marked = make_step(0, 0, "t0")
+    marked.assistant.content = "<tool_call><function=execute_sql></function></tool_call>"
+    trajectory = Trajectory(chats=[chat], steps=[marked, make_step(1, 0, "t1"), make_step(2, 0)])
     steps = trajectory.steps
 
     assert prompt(trajectory, 2) == [
@@ -301,7 +310,7 @@ def test_a_forked_chat_counts_its_reasoning_window_through_the_forked_context() 
 
 
 def xml_step(index: int, source: ToolCallSource.ValueType, content: str, reasoning: str) -> Step:
-    """Step ``index`` of chat 0, whose one call ``t{index}`` was parsed from XML."""
+    """Step ``index`` of chat 0, with one call ``t{index}`` from ``source``."""
     step = make_step(index, 0, f"t{index}")
     step.assistant.content = content
     step.assistant.reasoning_content = reasoning
@@ -309,24 +318,26 @@ def xml_step(index: int, source: ToolCallSource.ValueType, content: str, reasoni
     return step
 
 
-def test_a_call_parsed_from_xml_is_replayed_only_as_a_structured_call() -> None:
+def test_an_executor_chat_replays_no_xml_markup_whatever_became_of_it() -> None:
     call = (
         "<tool_call><function=execute_sql><parameter=sql>SELECT 1</parameter></function>"
         "</tool_call>"
     )
     bare = "<function=execute_sql><parameter=sql>SELECT 2</parameter></function>"
-    content_xml = ToolCallSource.TOOL_CALL_SOURCE_CONTENT_XML
-    reasoning_xml = ToolCallSource.TOOL_CALL_SOURCE_REASONING_XML
-    standard = make_step(3, 0, "t3")
-    standard.assistant.content = call  # Its call came from the standard field.
+    unparsed = make_step(1, 0)  # Its markup gave no call.
+    unparsed.assistant.content = f"Again. {bare}"
+    unparsed.assistant.reasoning_content = ""
     trajectory = Trajectory(
         chats=[Chat(label="main", initial_messages=[SYSTEM, TASK], keep_turns=8)],
         steps=[
-            xml_step(0, content_xml, f"Run it. {call}", f"Plan. {call}"),
-            xml_step(1, content_xml, f"Again. {bare}", ""),
-            # Cut off: the block runs to the end of the text. A bare block in reasoning stays.
-            xml_step(2, reasoning_xml, "", f"{bare} <tool_call>x"),
-            standard,
+            xml_step(
+                0, ToolCallSource.TOOL_CALL_SOURCE_CONTENT_XML, f"Run it. {call}", f"Plan. {call}"
+            ),
+            unparsed,
+            # Cut off: the block runs to the end of the text. A bare block in reasoning goes too.
+            xml_step(2, ToolCallSource.TOOL_CALL_SOURCE_REASONING_XML, "", f"{bare} <tool_call>x"),
+            # Its call came from the standard field; the markup beside it goes all the same.
+            xml_step(3, ToolCallSource.TOOL_CALL_SOURCE_STANDARD, call, f"thinking 3 {bare}"),
             make_step(4, 0),
         ],
     )
@@ -338,10 +349,12 @@ def test_a_call_parsed_from_xml_is_replayed_only_as_a_structured_call() -> None:
     assert [(message.content, message.reasoning_content) for message in sent] == [
         ("Run it. ", "Plan. "),
         ("Again. ", ""),
-        ("", f"{bare} "),
-        (call, "thinking 3"),
+        ("", " "),
+        ("", "thinking 3 "),
     ]
-    assert [len(message.tool_calls) for message in sent] == [1, 1, 1, 1]
+    # The calls stay as structured calls, whatever their source.
+    assert [len(message.tool_calls) for message in sent] == [1, 0, 1, 1]
+    assert trajectory.steps[3].assistant.content == call  # The trajectory keeps it as written.
 
 
 def test_every_lane_has_its_own_thresholds() -> None:
