@@ -37,6 +37,8 @@ def check_gold_free(paths: Iterable[Path]) -> None:
                 problems.extend(f"{path}:{line}: {field}" for field in sorted(_gold_in(value)))
         except (OSError, ValueError) as error:
             problems.append(f"{path}: cannot be checked: {error}")
+        except RecursionError:
+            problems.append(f"{path}: cannot be checked: it nests too deeply")
     if problems:
         raise GoldDataError(problems)
 
@@ -45,7 +47,8 @@ def _documents(path: Path) -> Iterator[tuple[int, object]]:
     """Each JSON document of the file with its line: one per line of a JSONL file."""
     text = path.read_text(encoding="utf-8")
     if path.suffix == ".jsonl":
-        for number, line in enumerate(text.splitlines(), start=1):
+        # Only a newline ends a line: goaly's writer leaves U+2028 and its kind as they are.
+        for number, line in enumerate(text.split("\n"), start=1):
             if line.strip():
                 yield number, json.loads(line)
     elif path.suffix == ".json":
