@@ -45,6 +45,8 @@ def analyzed(result: subprocess.CompletedProcess[str]) -> tuple[int, int]:
         ("goaly.bench", "goaly.rsi", "broken"),
         ("goaly.bench", "goaly.harness", "kept"),
         ("goaly.rsi", "goaly.bench", "kept"),
+        ("goaly.contracts", "goaly.harness", "broken"),
+        ("goaly.harness", "goaly.contracts", "kept"),
     ],
 )
 def test_layers_contract(

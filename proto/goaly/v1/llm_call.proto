@@ -1,0 +1,82 @@
+// The record of one LLM call (spec §5.1, §6.2, §9), and the Usage that other records reuse.
+syntax = "proto3";
+
+package goaly.v1;
+
+import "google/protobuf/timestamp.proto";
+
+// One call to the model gateway, with all its retries: one line of the call log (spec §5.1).
+message LlmCallRecord {
+  // A unique ID for the call.
+  string call_id = 1;
+  // The run the call belongs to, or empty if it belongs to none.
+  string run_id = 2;
+  // The task the call works on, or empty if none, as for an RSI analyst call.
+  string instance_id = 3;
+  // Why the call was made.
+  CallPurpose purpose = 4;
+  // The model called, such as "qwen3.6-35b-a3b".
+  string model = 5;
+  // The tokens and cost the gateway reported for the call.
+  Usage usage = 6;
+  // From the start of the call to its end, in seconds, every attempt and every wait included.
+  double latency_s = 7;
+  // The part of latency_s spent waiting for a concurrency slot or a retry backoff (spec §6.2).
+  double wait_s = 8;
+  // How many requests the call sent: 1, plus one per retry.
+  int32 attempts = 9;
+  // How the call ended.
+  LlmCallStatus status = 10;
+  // The HTTP status of the last response, or 0 if no response arrived.
+  int32 http_status = 11;
+  // When the call started.
+  google.protobuf.Timestamp started_at = 12;
+}
+
+// Why an LLM call was made (spec §9).
+enum CallPurpose {
+  // Not set.
+  CALL_PURPOSE_UNSPECIFIED = 0;
+  // The executor, solving a task.
+  CALL_PURPOSE_EXEC = 1;
+  // The RSI analyst, grouping failures and proposing hypotheses (spec §8.2).
+  CALL_PURPOSE_RSI_ANALYST = 2;
+  // The RSI coding agent, implementing a hypothesis (spec §8.2).
+  CALL_PURPOSE_RSI_IMPL = 3;
+  // The RSI system, writing a lesson about an experiment (spec §8.6).
+  CALL_PURPOSE_RSI_LESSON = 4;
+}
+
+// How an LLM call ended. A failed call reports the error of its last attempt.
+enum LlmCallStatus {
+  // Not set.
+  LLM_CALL_STATUS_UNSPECIFIED = 0;
+  // The call returned a usable response.
+  LLM_CALL_STATUS_OK = 1;
+  // The request timed out.
+  LLM_CALL_STATUS_TIMEOUT = 2;
+  // The gateway answered 429 Too Many Requests.
+  LLM_CALL_STATUS_RATE_LIMITED = 3;
+  // The gateway answered with a 5xx status.
+  LLM_CALL_STATUS_SERVER_ERROR = 4;
+  // The connection to the gateway failed.
+  LLM_CALL_STATUS_CONNECTION_ERROR = 5;
+  // The request did not fit in the model's context window.
+  LLM_CALL_STATUS_CONTEXT_OVERFLOW = 6;
+  // A response arrived but could not be used, for example because it was malformed.
+  LLM_CALL_STATUS_INVALID_RESPONSE = 7;
+  // The gateway refused the request with another 4xx status, such as for a parameter it rejects.
+  LLM_CALL_STATUS_CLIENT_ERROR = 8;
+}
+
+// Tokens and cost, of one call or summed over many.
+message Usage {
+  // Prompt tokens.
+  int64 input_tokens = 1;
+  // Completion tokens, reasoning tokens included.
+  int64 output_tokens = 2;
+  // How many of output_tokens the model spent reasoning.
+  int64 reasoning_tokens = 3;
+  // The cost in US dollars, as the gateway reports it in the x-litellm-response-cost header.
+  double cost_usd = 4;
+}

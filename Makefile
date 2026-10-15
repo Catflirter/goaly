@@ -40,4 +40,4 @@ test: ## Run the unit tests with branch coverage
 test-integration: ## Run only the integration tests (Docker, databases, the real model API)
 	$(UV_RUN) pytest --integration -m integration || test $$? -eq 5
 
-check: lint typecheck imports test ## Run everything CI runs
+check: lint typecheck imports proto-check test ## Run everything CI runs

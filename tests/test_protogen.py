@@ -278,3 +278,54 @@ def test_fails_when_there_is_no_proto(tmp_path: Path) -> None:
     assert result.returncode == 1
     assert "no .proto files" in result.stderr
     assert not out_dir.exists()
+
+
+# The freshness check on copies of the repository, as CI's make proto-check runs it.
+
+
+@pytest.fixture
+def repository_copy(tmp_path: Path) -> tuple[Path, Path]:
+    """Copies of proto/ and of the committed src/goaly/contracts/gen/."""
+    proto_dir = shutil.copytree(REPO_ROOT / "proto", tmp_path / "proto")
+    out_dir = shutil.copytree(
+        REPO_ROOT / "src" / "goaly" / "contracts" / "gen",
+        tmp_path / "gen",
+        ignore=shutil.ignore_patterns("__pycache__"),
+    )
+    return proto_dir, out_dir
+
+
+def test_check_passes_on_the_committed_code(repository_copy: tuple[Path, Path]) -> None:
+    proto_dir, out_dir = repository_copy
+
+    result = protogen("--check", "--proto-dir", proto_dir, "--out-dir", out_dir)
+
+    assert result.returncode == 0, result.stderr
+
+
+def test_check_fails_when_a_proto_gains_a_field(repository_copy: tuple[Path, Path]) -> None:
+    proto_dir, out_dir = repository_copy
+    task = proto_dir / "goaly" / "v1" / "task.proto"
+    original = task.read_text(encoding="utf-8")
+    grown = original.replace("message TaskInput {\n", "message TaskInput {\n  string added = 99;\n")
+    assert grown != original
+    task.write_text(grown, encoding="utf-8")
+
+    result = protogen("--check", "--proto-dir", proto_dir, "--out-dir", out_dir)
+
+    assert result.returncode == 1
+    assert "changed: task_pb2.py\n" in result.stderr
+    assert "changed: task_pb2.pyi\n" in result.stderr
+    assert "make proto" in result.stderr
+
+
+def test_check_fails_when_a_generated_file_is_edited(repository_copy: tuple[Path, Path]) -> None:
+    proto_dir, out_dir = repository_copy
+    stub = out_dir / "llm_call_pb2.pyi"
+    stub.write_text(stub.read_text(encoding="utf-8") + "# A hand edit.\n", encoding="utf-8")
+
+    result = protogen("--check", "--proto-dir", proto_dir, "--out-dir", out_dir)
+
+    assert result.returncode == 1
+    assert "changed: llm_call_pb2.pyi\n" in result.stderr
+    assert "make proto" in result.stderr

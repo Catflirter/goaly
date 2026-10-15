@@ -1,0 +1,172 @@
+// The task contracts (spec §3.3): what a policy is given, what it returns, and how the result is
+// graded. Each has one variant per benchmark, in a oneof named benchmark.
+syntax = "proto3";
+
+package goaly.v1;
+
+// A data split (spec §7).
+enum Split {
+  // Not one of our splits: a task file from elsewhere, such as the organizers' --instances file.
+  SPLIT_UNSPECIFIED = 0;
+  // The analyst may see its trajectories, grader feedback and gold answers.
+  SPLIT_TRAIN = 1;
+  // Only the decision step sees its results.
+  SPLIT_VAL = 2;
+  // Used only by the final evaluation and by v0's baseline runs.
+  SPLIT_HELDOUT = 3;
+}
+
+// What the agent may see of a task (spec §3.3, §4): nothing gold, and nothing that gives it away.
+message TaskInput {
+  // The benchmark's ID for the task.
+  string instance_id = 1;
+
+  // The benchmark-specific fields.
+  oneof benchmark {
+    // A BIRD-CRITIC task.
+    BirdTaskInput bird = 2;
+    // A SWE-fficiency task.
+    SweTaskInput swe = 3;
+  }
+}
+
+// A BIRD-CRITIC task (spec §4.1): SQL that does not do what its user wants, to be fixed.
+message BirdTaskInput {
+  // The database the task runs against.
+  string db_id = 1;
+  // The user's question: what they want their SQL to do.
+  string query = 2;
+  // The user's SQL statements, which fail or do the wrong thing.
+  repeated string issue_sql = 3;
+  // Statements that set up the task's database copy before anything else runs on it.
+  repeated string preprocess_sql = 4;
+  // Statements that undo the task's changes to the database once its test cases have run.
+  repeated string clean_up_sql = 5;
+  // The task's category as the dataset names it; spec §4.1 lists the four.
+  string category = 6;
+  // The database schema, as text.
+  string schema = 7;
+}
+
+// A SWE-fficiency task (spec §4.2): make the workload faster without breaking the tests. The
+// repository is checked out at base_commit in /testbed, inside the task's container.
+message SweTaskInput {
+  // The GitHub repository, such as "pandas-dev/pandas".
+  string repo = 1;
+  // The commit that /testbed is checked out at.
+  string base_commit = 2;
+  // The Python script whose run time is measured.
+  string workload = 3;
+  // The command that runs the repository's tests.
+  string test_cmd = 4;
+  // The command that rebuilds the package after the code changes, e.g. to compile extensions.
+  string rebuild_cmd = 5;
+  // The test files the dataset lists as covering the task, as paths inside the container.
+  repeated string covering_tests = 6;
+}
+
+// What a policy returns for a task.
+message Prediction {
+  // The task this answers.
+  string instance_id = 1;
+  // True if the policy's budget fallback produced this prediction instead of a submit (spec §5.4).
+  bool fallback = 2;
+
+  // The benchmark-specific answer.
+  oneof benchmark {
+    // A BIRD-CRITIC answer.
+    BirdPrediction bird = 3;
+    // A SWE-fficiency answer.
+    SwePrediction swe = 4;
+  }
+}
+
+// A BIRD-CRITIC answer.
+message BirdPrediction {
+  // The fixed SQL statements, in order. The adapter writes them out as the official pred_sqls.
+  repeated string sqls = 1;
+}
+
+// A SWE-fficiency answer.
+message SwePrediction {
+  // A git diff against base_commit; empty means no change.
+  string patch = 1;
+}
+
+// How a prediction was graded.
+message Grade {
+  // The task graded.
+  string instance_id = 1;
+  // The score: BIRD 1 or 0; SWE SR_i (spec §4.2), already floored at 0.001.
+  double score = 2;
+  // BIRD: the prediction passed every test case. SWE: the patch applied and the tests passed.
+  bool correct = 3;
+  // How grading went.
+  GradeStatus status = 4;
+  // What happened, in words, for people and for the RSI analyst (spec §8.2).
+  string feedback = 5;
+
+  // The benchmark-specific details.
+  oneof benchmark {
+    // BIRD-CRITIC details.
+    BirdGrade bird = 6;
+    // SWE-fficiency details.
+    SweGrade swe = 7;
+  }
+}
+
+// How grading went.
+enum GradeStatus {
+  // Not set.
+  GRADE_STATUS_UNSPECIFIED = 0;
+  // The grader evaluated the prediction.
+  GRADE_STATUS_GRADED = 1;
+  // The prediction failed to run (BIRD: a statement raised an error) or to apply (SWE).
+  GRADE_STATUS_PREDICTION_FAILED = 2;
+  // The prediction ran past the grader's time limit.
+  GRADE_STATUS_TIMEOUT = 3;
+  // The grader's own infrastructure failed, so the score says nothing about the prediction.
+  GRADE_STATUS_GRADER_ERROR = 4;
+}
+
+// The BIRD-CRITIC details of a grade.
+message BirdGrade {
+  // One result per test case, in the order the grader ran them.
+  repeated BirdTestCaseResult test_cases = 1;
+  // The error the predicted SQL raised, or empty if it raised none.
+  string execution_error = 2;
+}
+
+// The result of one BIRD-CRITIC test case.
+message BirdTestCaseResult {
+  // The test case's position in the task's list of test cases, from 0.
+  int32 index = 1;
+  // True if the prediction passed the test case.
+  bool passed = 2;
+  // What the test case reported, such as why it failed; may be empty.
+  string message = 3;
+}
+
+// The SWE-fficiency details of a grade, as spec §4.2 scores it.
+message SweGrade {
+  // True if the patch applied to base_commit.
+  bool patch_applied = 1;
+  // True if the tests passed with the patch applied.
+  bool tests_passed = 2;
+  // True if the patch was empty, so the task was scored without an evaluation run.
+  bool empty_patch = 3;
+  // The agent's speedup, T_pre / T_post. A patch that is empty, does not apply or fails the
+  // tests counts as 1: no speedup.
+  double speedup = 4;
+  // The expert patch's speedup on this machine, T_pre / T_post_gold.
+  double gold_speedup = 5;
+  // SR_i = speedup / gold_speedup, before the grade's score floors it at 0.001.
+  double sr = 6;
+  // How long the workload ran before the patch (T_pre), in seconds.
+  double t_pre_s = 7;
+  // How long the workload ran with the patch (T_post), in seconds; 0 if it was not measured.
+  double t_post_s = 8;
+  // True if the result came from the evaluation cache, keyed by patch hash and task, instead of
+  // a new evaluation run.
+  bool cached = 9;
+}
