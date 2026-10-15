@@ -317,31 +317,34 @@ ENUM_FIELDS = [
     for field in descriptor.fields
     if field.enum_type is not None
 ]
+ENUM_VALUES = [
+    (message_type, field, value.name)
+    for message_type, field in ENUM_FIELDS
+    for value in (field.enum_type.values if field.enum_type is not None else [])
+]
 
 
 @pytest.mark.parametrize(
-    ("message_type", "field"),
-    ENUM_FIELDS,
-    ids=lambda item: item.full_name if isinstance(item, FieldDescriptor) else "",
+    ("message_type", "field", "name"),
+    ENUM_VALUES,
+    ids=[f"{field.full_name}={name}" for _, field, name in ENUM_VALUES],
 )
 def test_every_value_of_every_enum_field_round_trips_by_name(
-    message_type: type[Message], field: FieldDescriptor
+    message_type: type[Message], field: FieldDescriptor, name: str
 ) -> None:
     # JSONL keys enum values by name, so each value must be written as its name and read back.
-    enum = field.enum_type
-    assert enum is not None
-    for value in enum.values:
-        message = message_type()
-        if field.is_repeated:
-            getattr(message, field.name).append(value.number)
-        else:
-            setattr(message, field.name, value.number)
+    message = message_type()
+    assert field.enum_type is not None
+    number = field.enum_type.values_by_name[name].number
+    if field.is_repeated:
+        getattr(message, field.name).append(number)
+    else:
+        setattr(message, field.name, number)
 
-        line = to_json_line(message)
-        written = json.loads(line)[field.name]
+    line = to_json_line(message)
 
-        assert written == ([value.name] if field.is_repeated else value.name)
-        assert from_json_line(line, message_type) == message
+    assert json.loads(line)[field.name] == ([name] if field.is_repeated else name)
+    assert from_json_line(line, message_type) == message
 
 
 def test_there_are_enum_fields_to_round_trip() -> None:
