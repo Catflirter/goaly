@@ -28,7 +28,6 @@ import logging
 import math
 import random
 import threading
-import time
 import uuid
 from collections.abc import Iterable, Mapping, Sequence
 from dataclasses import dataclass
@@ -57,6 +56,7 @@ from goaly.harness.core.llm_models import (
     ModelProfile,
     allowed_model,
 )
+from goaly.harness.core.llm_throttle import Clock, SystemClock
 from goaly.harness.core.settings import Settings
 
 __all__ = [
@@ -177,24 +177,6 @@ class JsonlCallRecorder:
             append_jsonl(self.path, record)
 
 
-class Clock(Protocol):
-    """The time a client measures waits and latency with, and sleeps through backoffs on."""
-
-    def monotonic(self) -> float:
-        """Return the time in seconds on a clock that never goes back."""
-
-    async def sleep(self, seconds: float) -> None:
-        """Wait ``seconds``."""
-
-
-class _SystemClock:
-    def monotonic(self) -> float:
-        return time.monotonic()
-
-    async def sleep(self, seconds: float) -> None:
-        await asyncio.sleep(seconds)
-
-
 # The parts of a chat completion the client reads. Anything else in the body is ignored.
 
 
@@ -272,7 +254,7 @@ class LlmClient:
             self._profiles[profile.model] = profile
         self._recorder = recorder
         self._retry = RetryPolicy() if retry is None else retry
-        self._clock: Clock = _SystemClock() if clock is None else clock
+        self._clock: Clock = SystemClock() if clock is None else clock
         self._rng = random.Random() if rng is None else rng  # noqa: S311 - jitter, not secrecy.
         self._api_key = settings.api_key
         self._http = httpx.AsyncClient(
