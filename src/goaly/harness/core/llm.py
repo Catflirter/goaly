@@ -427,6 +427,8 @@ class LlmClient:
         said = self._redact(_error_message(response))
         if code == httpx.codes.TOO_MANY_REQUESTS:
             status = _S.LLM_CALL_STATUS_RATE_LIMITED
+        elif code == httpx.codes.REQUEST_TIMEOUT:  # LiteLLM's own upstream request timed out.
+            status = _S.LLM_CALL_STATUS_TIMEOUT
         elif code >= httpx.codes.INTERNAL_SERVER_ERROR:
             status = _S.LLM_CALL_STATUS_SERVER_ERROR
         elif code == httpx.codes.BAD_REQUEST and any(

@@ -588,6 +588,8 @@ async def test_counts_no_tokens_and_warns_when_no_usage_is_reported(
 
 TRANSIENT = [
     pytest.param(lambda: failure(429), RATE_LIMITED, 429, id="429"),
+    # LiteLLM answers 408 when its own upstream request timed out.
+    pytest.param(lambda: failure(408, "Request Timeout"), TIMEOUT, 408, id="408"),
     pytest.param(lambda: failure(500), SERVER_ERROR, 500, id="500"),
     pytest.param(lambda: failure(502), SERVER_ERROR, 502, id="502"),
     pytest.param(lambda: failure(503), SERVER_ERROR, 503, id="503"),
@@ -620,6 +622,7 @@ async def test_retries_a_transient_failure(
 
 GIVE_UP = [
     pytest.param(lambda: failure(429), RateLimited, RATE_LIMITED, 429, id="429"),
+    pytest.param(lambda: failure(408), TimedOut, TIMEOUT, 408, id="408"),
     pytest.param(lambda: failure(502), ServerError, SERVER_ERROR, 502, id="502"),
     pytest.param(lambda: httpx.ReadTimeout("timed out"), TimedOut, TIMEOUT, 0, id="timeout"),
     pytest.param(
@@ -837,7 +840,6 @@ async def test_raises_context_overflow_without_retrying(message: str) -> None:
         (400, "Assistant tool call function.arguments must be valid JSON."),
         (401, "Authentication Error"),
         (404, "Not Found"),
-        (408, "Request Timeout"),
         (422, "Unprocessable Entity"),
     ],
 )
