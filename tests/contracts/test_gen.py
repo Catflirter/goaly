@@ -270,6 +270,16 @@ def test_every_message_round_trips_through_jsonl(message: Message) -> None:
     assert from_json_line(to_json_line(message), type(message)) == message
 
 
+@pytest.mark.parametrize("message_type", MESSAGES, ids=lambda cls: cls.DESCRIPTOR.full_name)
+def test_every_message_with_only_defaults_round_trips_through_jsonl(
+    message_type: type[Message],
+) -> None:
+    read = from_json_line(to_json_line(message_type()), message_type)
+
+    assert read == message_type()
+    assert read.ListFields() == []  # Reading the written defaults back sets nothing.
+
+
 @pytest.mark.parametrize("message", SAMPLES, ids=sample_id)
 def test_the_samples_set_every_field(message: Message) -> None:
     descriptor = message.DESCRIPTOR
