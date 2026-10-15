@@ -1,9 +1,9 @@
 # RSI Self-Evolving Harness: Design
 
 - Date: 2026-10-14
-- Status: in review
+- Status: approved 2026-10-14; amended 2026-10-15
 - Linear: project P-CIR-12; this document is T01 = CIR-1633
-- Deadline: 2026-10-15
+- Deadline: 2026-10-15 17:00 Pacific (PDT) = 2026-10-16 00:00 UTC
 
 ## 1. Background and goals
 
@@ -12,9 +12,15 @@
 We are building a self-evolving harness system:
 
 - The **improvement model**, GLM-5.3, drives an RSI agent. The agent creates and refines the executor's harness: tools, skills, system prompts, the agent loop and context management.
-- The **executor model**, Qwen3.6-35B-A3B, solves tasks using that harness. The goal is to beat a human-designed baseline on both SWE-fficiency and BIRD-CRITIC.
+- The **executor model**, Qwen3.6-35B-A3B, solves tasks using that harness. The goal is to beat a human-designed baseline on Effi-SQL, which asks for a slow PostgreSQL query to be rewritten into an equivalent, faster one (§4.1).
 
 We hand over the frozen harness. The organizers evaluate it on a hidden held-out set using only the executor model. The improvement model is not available after development ends.
+
+**Amendment (2026-10-15).** The project lead made three decisions:
+
+- Effi-SQL replaces the BIRD-CRITIC PG-530 benchmark.
+- The SWE-fficiency lane is on hold (2026-10-15). Its design stays in this document, marked on hold, so the lane can resume without a redesign.
+- The deadline is fixed at 2026-10-15 17:00 Pacific (PDT) = 2026-10-16 00:00 UTC.
 
 ### 1.2 Deliverables
 
@@ -31,7 +37,7 @@ We hand over the frozen harness. The organizers evaluate it on a hidden held-out
 
 | Item | Value |
 |---|---|
-| Time | One day; deadline 2026-10-15 |
+| Time | One day; deadline 2026-10-15 17:00 Pacific (PDT) = 2026-10-16 00:00 UTC |
 | Model gateway | `https://api.goaly.ai/inference/v1` (LiteLLM 1.92 + SGLang), OpenAI-compatible; key in `GOALY_API_KEY` |
 | Executor model | `qwen3.6-35b-a3b`: FP8, 35B total / 3B active parameters; 262K native context, which the gateway stretches to 1.01M with YaRN; $0.15 input / $1.00 output per 1M tokens |
 | Improvement model | `glm-5.3`: ~744B total / 40B active; thinking cannot be turned off; 1M context; $1.40 input / $4.40 output per 1M tokens |
@@ -42,16 +48,16 @@ We hand over the frozen harness. The organizers evaluate it on a hidden held-out
 ### 1.4 Non-goals
 
 - No training or fine-tuning.
-- No BIRD-CRITIC MySQL, SQL Server or Oracle support. The interfaces leave room for these dialects.
-- No full 498-task SWE-fficiency run. This machine can't evaluate that many.
+- No development on Effi-SQL's 62 BIRD-Interact tasks, which run on `polar_equipment`, `robot_fault_prediction` and `solar_panel`. Their "scale" dumps are not published, so we use only the 238 TPC-H tasks (§4.1). This is a documented deviation: the harness still handles such tasks if the organizers' file contains them and they provide the database.
+- No SWE-fficiency work while that lane is on hold (2026-10-15). Even after it resumes, there is no full 498-task run: this machine can't evaluate that many.
 
 ## 2. Acceptance criteria mapping
 
 | PDF criterion | How the design meets it | Evidence |
 |---|---|---|
-| Benchmark score: starting and final scores, with improvement on every benchmark | Baseline v0 (§5.4) and final are compared on the same held-out set | T12, T17 and T23 reports |
+| Benchmark score: starting and final scores, with improvement on every benchmark | Baseline v0 (§5.4) and final are compared on the same held-out set, graded in official mode (§4.1). While SWE is on hold (2026-10-15), Effi-SQL is the only benchmark scored | T12 and T23 reports |
 | Robustness: run the same test at least 3 times and report the variation; survive tool errors, timeouts and bad model output | Three held-out runs; fault tolerance in core (§5.1); per-task exception isolation (§6.1); concurrency budgets and adaptive backoff (§6.2) | T23 report; T04 and T05 tests |
-| Generalization: held-out tasks stay out of development; gains on more than one benchmark; no hard-coded answers | Three-way split (§7) and a hard-coding scan (§8.5). Each benchmark gets its own lane, and both lanes run the same RSI machinery with no benchmark-specific code, so a gain on two very different tasks shows that the method generalizes | Committed split ID lists; scan logs; per-benchmark gains in the T23 report |
+| Generalization: held-out tasks stay out of development; gains on more than one benchmark; no hard-coded answers | Three-way split (§7) and a hard-coding scan (§8.5). The RSI machinery has no benchmark-specific code: a lane is a capability pack plus a `Benchmark` adapter (§3.3). **At risk:** while SWE is on hold, gains can be shown on one benchmark only, so "gains on more than one benchmark" is not met. The report says so plainly | Committed split ID lists; scan logs; held-out gains in the T23 report |
 | Lessons learned: what was tried, what worked, what failed and why, backed by experiments | Experiment ledger and lessons (§8.6) | `experiments.jsonl`, `lessons.jsonl`, and the generated `lessons.md` |
 | Efficiency: time, tokens, compute and cost reported alongside the score | Cost and tokens are recorded for every call (§9). Two limits in the decision rules (§8.3): a cost guardrail, and a hard cap that keeps the final harness at or below 3× v0's mean cost and wall time per task | Report tables, including the final harness's cost and time relative to v0 |
 | Reproducibility: code, configs, prompts, tool versions and a single command | uv lockfile, run manifests, `make final` (§10) | T23, T24 |
@@ -89,8 +95,8 @@ import-linter checks these rules in CI:
 ### 3.2 Repository layout
 
 ```
-proto/goaly/v1/      shared data contracts: task.proto, trajectory.proto, result.proto,
-                     manifest.proto, llm_call.proto, experiment.proto
+proto/goaly/v1/      shared data contracts: task.proto, environment.proto, trajectory.proto,
+                     result.proto, manifest.proto, llm_call.proto, experiment.proto
 src/goaly/
   contracts/
     gen/             Python code generated from proto/ (committed; CI checks it is up to date)
@@ -98,11 +104,11 @@ src/goaly/
   harness/
     core/            llm.py, tools.py, agent.py, policy.py, context.py, trajectory.py, config.py
     packs/
-      birdcritic/    prompt.md, skills/, tools.py, policy.py, config.yaml
-      swefficiency/  (same files)
+      effisql/       prompt.md, skills/, tools.py, policy.py, config.yaml
+      swefficiency/  (same files; on hold)
   bench/
-    birdcritic/      data.py, env.py, grader.py, adapter.py
-    swefficiency/    data.py, env.py, grader.py, adapter.py
+    effisql/         data.py, env.py, grader.py, adapter.py
+    swefficiency/    data.py, env.py, grader.py, adapter.py (on hold)
     runner.py, metrics.py, manifest.py
     splits/          split ID lists
   rsi/
@@ -114,24 +120,27 @@ docs/results/                     experiment results
 runs/                             run artifacts (not committed)
 ```
 
+**Names.** Effi-SQL's benchmark name, which is also its CLI value (§6.4), is `effisql`. Its RSI lane is the `LANE_EFFISQL` enum value, and the lane's best version carries the tag `best/effisql` (§8.1). SWE-fficiency, on hold, keeps `swefficiency` and `best/swe`.
+
 ### 3.3 Shared contracts
 
 Every shared type lives in `goaly.contracts`. These types come in two kinds, and each kind uses a different technology.
 
 **Data contracts (protobuf).** Data that is written to disk, read by another process, or has to stay readable across schema versions is defined once, in `proto/goaly/v1/`:
 
-| Message | Purpose |
-|---|---|
-| `TaskInput`, `Prediction`, `Grade` | What a policy receives, what it returns, and how the result was graded. Each has one variant per benchmark |
-| `Trajectory`, `Step` | Every step of a run: messages, tool calls, results, usage and timing |
-| `TaskResult` | Per-task record: score, correctness, time, tokens, cost, steps and error type |
-| `RunManifest` | Commit, content and config hashes, dataset revision, model settings, timestamps and machine |
-| `LlmCallRecord` | One LLM call: purpose, model, tokens, cost, latency and status |
-| `ExperimentRecord`, `Hypothesis`, `Lesson` | The RSI ledger |
+| Message | File | Purpose |
+|---|---|---|
+| `TaskInput`, `Prediction`, `Grade` | `task.proto` | What a policy receives, what it returns, and how the result was graded. Each has one variant per benchmark |
+| `SqlResult`, `ShellResult` | `environment.proto` | What a task's environment returns for a SQL statement or a shell command |
+| `Trajectory`, `Step`, `ToolResult` | `trajectory.proto` | Every step of a run: messages, tool calls and their results, usage and timing |
+| `TaskResult` | `result.proto` | Per-task record: score, correctness, time, tokens, cost, steps and error type |
+| `RunManifest` | `manifest.proto` | Commit, content and config hashes, dataset revision, model settings, timestamps and machine |
+| `LlmCallRecord` | `llm_call.proto` | One LLM call: purpose, model, tokens, cost, latency and status |
+| `ExperimentRecord`, `Hypothesis`, `Lesson` | `experiment.proto` | The RSI ledger |
 
-- Field numbers are never reused, and removed fields are marked `reserved`, so files written today stay readable after the schema changes.
 - On disk, messages are stored as JSONL using protobuf's standard JSON mapping, keeping the original field names. People and the GLM analyst read trajectories directly, so a readable text format matters more than a compact binary one.
-- The official submission formats (BIRD `pred_sqls`, SWE predictions) are not our contracts. Each adapter converts to them and keeps the official field names exactly.
+- Files written today must stay readable after the schema changes. Field numbers are never reused. On disk, field names are the JSON keys and enum values are written by name, so a field or an enum value is never renamed either, and when one is removed, its name is reserved as well as its number.
+- The official submission formats (Effi-SQL's prediction file, SWE predictions) are not our contracts. Each adapter converts to them and keeps the official field names exactly.
 - Toolchain:
   - `grpcio-tools` bundles protoc, so no system package is needed.
   - `mypy-protobuf` generates type stubs, so the generated code passes `mypy --strict`.
@@ -172,60 +181,94 @@ class Benchmark(Protocol[InstanceT]):
 ```
 
 - **Instances versus agent input.** `InstanceT` is the benchmark's own record and may hold gold answers. `agent_input` copies out only the fields the agent is allowed to see, so the type system itself keeps gold answers away from the agent.
-- **harness never cares where an environment comes from.** bench provides the implementations: `SqlEnvironment` as a PostgreSQL sandbox, `ShellEnvironment` as a Docker container. harness unit tests use fake environments and need neither a database nor a container.
+- **harness never cares where an environment comes from.** bench provides the implementations: `SqlEnvironment` as a read-only session on a PostgreSQL solving instance (§4.1), `ShellEnvironment` as a Docker container. harness unit tests use fake environments and need neither a database nor a container.
 - **Tool arguments stay as pydantic models.** The OpenAI tools API takes JSON Schema, which pydantic generates directly. GLM also edits tools during RSI, and with protobuf every edit would mean changing a `.proto` file and rerunning code generation.
-- **gRPC-ready, but no gRPC yet.** Interface methods take and return only contract types (protobuf messages or plain values), never framework objects. That way a gRPC-backed implementation can later replace an in-process one without changing any caller. One example is running SWE evaluation workers on other machines, which would lift the CPU ceiling described in §6.2. We are not building gRPC now.
+- **gRPC-ready, but no gRPC yet.** Interface methods take and return only contract types (protobuf messages or plain values), never framework objects. That way a gRPC-backed implementation can later replace an in-process one without changing any caller. One example is running grading instances, or SWE's evaluation workers, on other machines, which would lift the CPU ceiling described in §6.2. We are not building gRPC now.
 
 Adding a benchmark takes a `Benchmark` adapter and a capability pack. core does not change.
 
 ## 4. Benchmarks
 
-### 4.1 BIRD-CRITIC (fixing broken SQL)
+### 4.1 Effi-SQL (making slow SQL faster)
 
 **Data**
 
-- We use `birdsql/bird-critic-1.0-postgresql`: 530 PostgreSQL tasks, pinned to one HF revision.
-- Public fields: instance_id, db_id, query (the user's question), issue_sql, preprocess_sql, clean_up_sql, category, and schema text for each task.
-- The gold `sol_sql` and `test_cases` are not public. We request them by email: write to bird.bench25@gmail.com with `[bird-critic-1 GT&Test Cases]` in the subject. GT files are never committed.
+- We use the Hugging Face dataset `birdsql/Effi-SQL`, pinned at revision `86cbcc9efbd31db32a46897d47cbf865b1cba3a4`. It is licensed Apache-2.0 and is not gated.
+- It is one file, `effi-sql-pg.jsonl`, with sha256 `2af3bdc9fe6c1197f23e31089660e7ce10fca6956b32e5970a3113f0c87e9d97`: 300 PostgreSQL tasks, released 2026-06-12.
+- Fields:
 
-**Scoring**
+  | Field | Meaning |
+  |---|---|
+  | `id` | int |
+  | `db` | database name |
+  | `base_sql` | the original slow query |
+  | `optimized_sql` | the human-verified optimized query (gold) |
+  | `base_time`, `fast_time` | milliseconds, measured on the authors' hardware |
+  | `base_explain_analyze`, `optimized_explain_analyze` | JSON query plans |
+  | `difficulty` | easy, medium or hard |
 
-A task counts as solved when the prediction runs with no error or timeout and passes every test case for that task. The score is the share of solved tasks. Each of the four categories checks something different:
+- Databases:
+  - 238 tasks run on `tpch`, which is TPC-H at scale factor 3. Only its raw data is external, and we generate that locally with dbgen.
+  - 62 tasks run on three BIRD-Interact databases: `polar_equipment` (14), `robot_fault_prediction` (22) and `solar_panel` (26). Their "scale" dumps are not published: the official code says to prepare them locally.
+- **We use only the 238 TPC-H tasks.** The other 62 are a documented deviation (§1.4). The harness still handles such tasks if the organizers' file contains them and they provide the database.
+- **What the agent sees:** `base_sql`; the database schema (DDL, row counts and indexes); the base query's plan; and `difficulty`.
+- **What the agent never sees:** `optimized_sql`, `fast_time` and `optimized_explain_analyze`.
 
-| Category | Check |
-|---|---|
-| Query | `ex_base` compares result sets |
-| Personalization | extra constraint checks |
-| Management | checks the database state after execution |
-| Efficiency | EXPLAIN cost must be lower than for issue_sql |
+**Task**
 
-**Grading details** (these must match the official harness exactly)
+- The agent rewrites `base_sql` into one query that returns the same rows, faster, and submits it.
+- It may not create indexes or change data (Environment, below).
 
-- Results are compared as sets of rows, so row order and duplicate rows don't matter, but column order does.
-- Dates are truncated to the day. Floats must match exactly.
-- An empty result fails.
-- Only the last statement's result counts.
-- The predicted SQL runs twice.
-- Grading limits are 60 s per statement, 300 s per task and 10,000 rows. The agent's own solving budget is set separately (§5.4).
+**Scoring** (the official evaluator's algorithm)
+
+1. **Equivalence.** The prediction is executed fully and its rows are fetched in batches. Its result signature is the multiset of `sha256(str(row))`, plus the row count. The same is done for `base_sql`: the comparison is against the base query, not against `optimized_sql`. The two match only if the row counts and the multisets are equal.
+2. **Timing.** `EXPLAIN (ANALYZE, FORMAT JSON)` is run, and the plan root's `"Execution Time"` is read in ms. There are 3 runs, and each run executes the prediction and the base in random order (interleaved). Timing stops after 2 runs if either side took 60 s or more. The time for each side is the median of its runs.
+3. **Speedup.** τ = base_time / pred_time, capped at 1000. A pred time of 0 counts as 0.001 ms.
+4. **Statement timeout:** 300 s.
+5. **Per-task credit g(τ),** for matched tasks only:
+
+   | τ | credit |
+   |---|---|
+   | ≥ 2 | 1.0 |
+   | ≥ 1.2 | 0.75 |
+   | ≥ 1 | 0.5 |
+   | ≥ 0.5 | 0.25 |
+   | otherwise | 0 |
+
+   An unmatched or failed task gets 0.
+6. **Metrics:**
+   - **R-VES** = 100 × mean credit over all tasks.
+   - **Coverage@2x** = 100 × the share of tasks that are matched with τ ≥ 2.
+   - **GMS** = the geometric mean of τ over matched tasks.
 
 **Environment**
 
-- PostgreSQL 14.12 + PostGIS, taken from the official compose setup, with host networking and the official time zone.
-- The official dump is restored into template databases.
-- Each task gets its own copy via `CREATE DATABASE … TEMPLATE`. preprocess_sql runs on that copy, and the copy is dropped afterwards.
-- Solving and grading never share a copy.
+- PostgreSQL 16, the same major version the official evaluator uses.
+- TPC-H SF3 is generated locally with an open-source dbgen build. The schema has primary and foreign keys only, matching the official schema, and loading is followed by `ANALYZE`. The data is never committed.
+- One data directory is copied into 5 instances, each pinned with cpuset (§6.2): 2 solving instances and 3 grading instances, 2 physical cores each. Solving and grading never share an instance.
+- Agent sessions connect with a read-only role, plus a `statement_timeout`. The agent cannot create indexes or change data: the official evaluation runs on the pristine database.
 
 **Grader**
 
-- We vendor the official test_case helpers (MIT license, attribution kept). They run on our template-clone sandboxes, so many tasks can be graded at once.
-- Two checks show that we match the official harness:
-  - In gold mode, the gold answers should pass every task. Tasks with known-bad official answers are listed separately.
-  - On a sample of tasks, results are compared one by one against the official harness.
-- **Excluded tasks.** A task whose gold answer fails in gold mode is removed from our splits, and the list of removed tasks is committed along with the reason for each. Such a task cannot be scored, so keeping it would only add noise to development and to accept/reject decisions. This applies only to our development sets: the harness still handles any such task that appears in the organizers' held-out set.
+- A clean reimplementation of the official algorithm (Scoring, above). The official evaluator is GitHub `L-nshpp/Diff-SQL`, file `diff_sql/evaluation/eval_execution_runner.py`. That repository has no license, so we reimplement its algorithm rather than vendor its code.
+- Two modes:
+  - **Dev mode,** for RSI screening and validation. The base query's result signature and its timing (the median of 3 runs) are measured once per task and cached. Each evaluation then runs only the prediction: one comparison run plus up to 3 timed runs. The 3 grading instances run in parallel.
+  - **Official mode,** for the reported held-out numbers: the exact interleaved protocol, with no base cache.
+- Self-checks:
+  - In gold mode, the gold SQL must match and speed up.
+  - In identity mode, submitting `base_sql` must give τ ≈ 1.
+- **Excluded tasks.** A task is excluded if, on this machine, its base query errors or exceeds 300 s, or the gold `optimized_sql` does not match or is less than 1.2× faster. On such a task either nothing can be scored or even the gold shows no reliable gain, so keeping it would only add noise to development and to accept/reject decisions. Exclusions are applied after splitting (§7), and the excluded tasks are committed with the reason for each. This affects only our own splits: the harness still handles any such task in the organizers' held-out set.
+- **Noise.** Tier boundaries make a τ near 1 flip between credit 0.25 and 0.5 from one run to the next (§12).
 
-**Reference scores (PG-530):** ~30B open models 28–32%; Claude Opus 4.6 43.4%; leaderboard best 56.8%; humans 78.9%.
+**Reference numbers for the TPC-H subset**, from the dataset's own timings:
 
-### 4.2 SWE-fficiency (making repository code faster)
+- Base time: median 11.8 s, p90 69 s, max 450 s. 5 tasks exceed 300 s, and one pass over every base query takes 2.13 h.
+- Difficulty: easy 71, medium 111, hard 56.
+- Gold scores: R-VES 88.3, Coverage@2x 53.4, GMS 3.55. This GMS uses the uncapped speedups; with τ capped at 1000, as the grader caps it, gold's GMS is 3.29.
+
+### 4.2 SWE-fficiency (making repository code faster): on hold (2026-10-15)
+
+**On hold (2026-10-15).** The project lead put this lane on hold. Its design stays below so the lane can resume without a redesign, but nothing in this section is being built now, and T13–T17 wait in the Linear backlog.
 
 **Data**
 
@@ -266,10 +309,10 @@ A task counts as solved when the prediction runs with no error or timeout and pa
 - Gold is rerun on this machine to get T_post_gold for our hardware.
 - Empty patches are scored without running an evaluation.
 - Results are cached by (patch hash, task). T_pre and gold timings are cached too.
-- **Excluded tasks.** A task is removed and replaced with another task from the same repository if, on this machine, its gold patch fails its tests or speeds the workload up by less than 1.5×. Expert speedups depend on hardware, and on such tasks no change can show a reliable gain. The removed tasks and the reason for each are committed. As with BIRD, this affects only our development sets.
+- **Excluded tasks.** A task is removed and replaced with another task from the same repository if, on this machine, its gold patch fails its tests or speeds the workload up by less than 1.5×. Expert speedups depend on hardware, and on such tasks no change can show a reliable gain. The removed tasks and the reason for each are committed. As with Effi-SQL, this affects only our own splits.
 - **Open question: what the official evaluation runs.** Some tasks list a huge number of PASS_TO_PASS tests: one Lite pandas task has about 211K, alongside about 900 `covering_tests`. Whether evaluation runs every PASS_TO_PASS test or only `covering_tests` decides whether one task takes minutes or hours. T15 measures this first. Tasks that take more than 25 minutes to evaluate are swapped out (§7).
 
-**Resource constraint:** evaluation is the project's biggest bottleneck. Solving and evaluation run on separate CPU slots so one does not distort the other's timings.
+**Resource constraint:** evaluation is this lane's biggest bottleneck. Solving and evaluation run on separate CPU slots so one does not distort the other's timings.
 
 **Known failure modes**
 
@@ -344,24 +387,24 @@ The first option costs more tokens, although the gateway's prefix cache absorbs 
 
 ### 5.4 Baseline v0 (the "simple tools" setup the PDF asks for)
 
-- BIRD has two tools:
-  - `execute_sql` runs a query in the task sandbox and returns truncated results or the error.
+- Effi-SQL has two tools:
+  - `execute_sql` runs a query on a solving instance, with a timeout, and returns truncated rows or the error, plus the elapsed time.
   - `submit` hands in the answer.
 
   The prompt is minimal.
-- SWE has two tools:
+- SWE (on hold, 2026-10-15) has two tools:
   - `bash` runs a command in the task container.
   - `submit` hands in the answer.
 
   The prompt is minimal but lists the official constraints.
 - Both use the same settings:
   - Thinking is on. Sampling is T=0.6, top_p=0.95, top_k=20, with max_tokens 16K per call.
-  - Solving budgets are 30 steps or 10 minutes for BIRD, and 60 steps or 45 minutes for SWE.
+  - Solving budgets are 30 steps or 10 minutes for Effi-SQL, and 60 steps or 45 minutes for SWE.
 - Fallback when a budget runs out before `submit`: v0 still submits something rather than nothing.
-  - BIRD submits the last SQL that executed successfully. If none did, it submits the original issue_sql.
+  - Effi-SQL submits `base_sql` unchanged. That gives τ ≈ 1, so a credit of 0.25–0.5.
   - SWE submits the container's final git diff, as OpenHands and other common agents do.
 
-  Neither fallback checks whether the result is any good. Smarter policies, such as never submitting an unverified patch, are left for RSI to discover.
+  Neither fallback makes use of what the agent found before its budget ran out. Smarter policies, such as submitting the fastest rewrite the agent verified, or never submitting an unverified patch, are left for RSI to discover.
 - v0 is frozen and tagged `baseline-v0`. Every comparison is made against it.
 
 ## 6. Evaluation framework (goaly.bench)
@@ -370,7 +413,7 @@ The first option costs more tokens, although the gateway's prefix cache absorbs 
 
 **Runner**
 
-- Built on asyncio, with separate resource pools for: LLM concurrency, database slots, SWE solving CPU slots and SWE evaluation workers (at most 4).
+- Built on asyncio, with separate resource pools for: LLM concurrency, the solving and grading database instances, and, for SWE (on hold), solving CPU slots and evaluation workers (at most 4).
 - An exception in one task never affects the others. Each task's result is written to disk as soon as it's done, so an interrupted run can resume.
 - Evaluations are cached by (harness content hash, task, seed).
 
@@ -414,11 +457,15 @@ What the numbers show:
 
 Config divides each budget among the processes that run at the same time, and the division changes by phase. Each process enforces its share with one asyncio semaphore per model.
 
+The budgets now cover one active lane, Effi-SQL:
+
 | Phase | Qwen (48 total) | GLM (16 total) | Notes |
 |---|---|---|---|
-| Baseline (T12, T17) | BIRD 36, SWE 12 | unused | Run train and val first, then v0's three held-out runs |
-| RSI (T22) | BIRD lane 28, SWE lane 12, background 8 | BIRD lane 8, SWE lane 8 | Background covers confirmation reruns and any v0 held-out runs still pending |
-| Final evaluation (T23) | BIRD 40, SWE 8 | unused | GLM is no longer available |
+| Baseline (T12) | Effi-SQL 40, background 8 | unused | v0 runs on train and val; its three held-out runs go in the background |
+| RSI (T22) | Effi-SQL lane 32, background 8; 8 spare | Effi-SQL lane 8; the other 8 are headroom | Background covers confirmation reruns and any v0 held-out runs still pending |
+| Final evaluation (T23) | Effi-SQL 40; 8 spare | unused | GLM is no longer available |
+
+The SWE lane is on hold (2026-10-15) and has no share. If it resumes, the shares and the CPU partition (below) have to be planned again.
 
 An agent never has more than one LLM request in flight, so a process runs about as many tasks at once as its Qwen share. Each share is an upper limit: adaptive limiting (below) lowers it when the gateway is busy. Shares are config values, so changing them does not require a code change.
 
@@ -432,13 +479,16 @@ An agent never has more than one LLM request in flight, so a process runs about 
 - Circuit breaker: if more than half of a model's calls fail within 2 minutes, the process stops starting new tasks for 60 s and logs a warning. Calls already in flight finish or time out as usual.
 - Every throttling event is logged with the call's purpose, so the report can show how much time the gateway cost us.
 
-**Throughput planning.** Qwen output tokens are the scarce resource.
+**Throughput planning.** With one active lane, the scarce resources are Qwen output tokens and time on the grading instances.
 
-- A BIRD val pass is 100 tasks × 2 seeds, with about 15 calls per task and about 1.5K output tokens per call. That comes to about 4.5M output tokens, or roughly 12–16 minutes depending on what else is running.
-- Most of those tokens are spent on thinking. A policy that uses fewer tokens therefore also speeds up RSI iterations.
-- A BIRD RSI round takes about 45–60 minutes: 3 candidates, screening, validation and one confirmation rerun. That gives the BIRD lane about 8–10 rounds overnight.
-- The SWE lane is limited by CPU and evaluation, not by the gateway. An SWE round takes about 2.5 hours. Solving runs on 8 slots and is capped at 45 minutes per task; evaluation runs on 4 workers. That allows 3–4 rounds overnight. Config can fit in more rounds by using one candidate per round or by capping solving at 30 minutes.
-- The SWE figures are estimates. T14 and T15 measure actual solving and evaluation times, and these numbers will be updated from those measurements.
+- **Tokens.** An Effi-SQL val pass is 30 tasks × 1 seed. At about 15 calls per task and about 1.5K output tokens per call, that is about 0.7M output tokens, only a few minutes of gateway time, so the 10-minute task budget bounds a pass instead. Most of those tokens are spent on thinking. A policy that uses fewer tokens therefore also speeds up RSI iterations.
+- **Grading time per candidate** (dev mode, §4.1). A prediction costs one comparison run plus up to 3 timed runs. From the dataset's timings, leaving out the 5 tasks over 300 s, that is about 40 s per task at gold speed and about 90 s at τ ≈ 1. On the 3 grading instances, screening a candidate (20 tasks) takes about 4–10 minutes and validating it (30 tasks) about 7–15 minutes. A round of 3 candidates spends about 30–90 minutes on grading, depending on how many reach validation.
+- **Official mode** times both sides with no cache: about 2–3 minutes per task, so a 60-task held-out run takes about 40–60 minutes. v0's three held-out runs therefore take about 3 hours of grading, and the final three about 2–3 hours.
+- **One-time setup.** Measuring every task's base query (for the cache and the exclusions) and its gold (for the gold check) takes about 3 hours of grading-instance time.
+- **Rounds.** An Effi-SQL round takes about 1–2 hours: analysis and implementation, then screening, validation and one confirmation rerun, with solving and grading overlapping. The schedule (§13) gives the lane about 4 hours, so expect about 2–4 rounds.
+- **Solving.** Every agent session shares the 2 solving instances: up to 48 sessions on 4 cores. Their queries therefore run slower than in grading, and the elapsed times the agent sees are only a rough guide. Grading never uses them.
+- These figures are estimates from the authors' hardware. T10 measures the real times on this machine, and these numbers will be updated from those measurements.
+- **SWE (on hold, 2026-10-15).** The SWE lane is limited by CPU and evaluation, not by the gateway. An SWE round takes about 2.5 hours. Solving runs on 8 slots and is capped at 45 minutes per task; evaluation runs on 4 workers. That allows 3–4 rounds overnight. Config can fit in more rounds by using one candidate per round or by capping solving at 30 minutes. The SWE figures are estimates. T14 and T15 measure actual solving and evaluation times, and these numbers will be updated from those measurements.
 
 **Inside a process**
 
@@ -450,26 +500,28 @@ An agent never has more than one LLM request in flight, so a process runs about 
 
 | Physical cores | Used for |
 |---|---|
-| 0–1 | OS, dockerd and our Python processes |
-| 2–3 | PostgreSQL for BIRD |
-| 4–11 (8 cores) | SWE only. Each wave uses one of two modes: solving (8 slots, 1 core each) or official evaluation (4 workers, 2 cores each) |
+| 0–1 | system, dockerd and our Python processes |
+| 2–5 | 2 solving instances, 2 cores each |
+| 6–11 | 3 grading instances, 2 cores each |
 
-SWE solving and SWE evaluation never run at the same time. Solving agents run tests and workloads that keep their cores fully busy. If official timing ran next to them, the measured speedups would be distorted, and so would every accept/reject decision based on them. The SWE lane therefore works in waves: it solves a batch, then evaluates that batch. BIRD is not affected: its database has its own cores, and its bottleneck is LLM throughput.
+Each PostgreSQL instance is pinned with cpuset. Solving and grading never share an instance, so solving agents can never distort the timings that accept/reject decisions rest on, and no SWE-style waves are needed.
+
+**SWE (on hold, 2026-10-15).** The SWE plan used cores 4–11 in waves: each wave either solved (8 slots, 1 core each) or ran official evaluation (4 workers, 2 cores each), never both at once. Solving agents run tests and workloads that keep their cores fully busy; if official timing ran next to them, the measured speedups would be distorted, and so would every accept/reject decision based on them. Effi-SQL now uses those cores, so the partition has to be planned again if SWE resumes.
 
 **Other shared resources**
 
 | Resource | Limit | How it is enforced |
 |---|---|---|
-| PostgreSQL connections | `max_connections` 200. Pools: 32 for the BIRD lane, 12 for background runs, 12 for the grader | psycopg async pools; each task gets its own sandbox database |
-| Template clones | One clone at a time per template database | PostgreSQL refuses to clone a template while it has other connections. The databases are small, so serializing clones costs little |
-| SWE solving and evaluation | 8 solving slots or 4 evaluation workers, never both at once | The slot scheduler (T14) pins containers with cpuset and switches mode between waves |
-| Disk | Image budget | Images are pruned in batches (T13) |
+| Solving instances | 2, shared by every agent session through a read-only role with a `statement_timeout` | psycopg async pools (T09) |
+| Grading instances | 3, each running one evaluation at a time, so evaluations never disturb each other's timings | The grader's instance pool (T10) |
+| SWE solving and evaluation (on hold) | 8 solving slots or 4 evaluation workers, never both at once | The slot scheduler (T14) pins containers with cpuset and switches mode between waves |
+| Disk (SWE, on hold) | Image budget | Images are pruned in batches (T13) |
 
 **Concurrent writes**
 
 - Each per-run JSONL file (results, trajectories, call logs) has a single writer task that reads from an asyncio queue. Lines are flushed as they are written, so a crash loses at most the line being written.
 - Cache entries are written to a temporary file and then renamed into place, so readers never see a partial entry.
-- Both lanes write `experiments.jsonl` and `lessons.jsonl`, and the lanes run as separate processes. Every write takes an exclusive `fcntl` lock.
+- Lanes run as separate processes and share `experiments.jsonl` and `lessons.jsonl`. Only one lane is active while SWE is on hold, but every write still takes an exclusive `fcntl` lock.
 - A repository-level file lock serializes git operations on the main repository, such as adding or removing worktrees and moving tags. Each candidate edits only its own worktree.
 
 **Tests**
@@ -479,51 +531,52 @@ SWE solving and SWE evaluation never run at the same time. Solving agents run te
 
 ### 6.3 Metrics
 
-- Main metrics: BIRD success rate and SWE harmonic-mean SR.
+- Main metric: Effi-SQL R-VES. Coverage@2x and GMS are secondary (§4.1). SWE (on hold, 2026-10-15): harmonic-mean SR.
 - With several seeds, we report mean ± standard deviation and bootstrap 95% confidence intervals.
-- Two versions are compared task by task. We count the tasks each version wins and run a one-sided sign test. SWE uses a paired bootstrap.
-- The stably solved set is the tasks solved in every seed.
-- Results are broken down by category and by repository.
+- Two versions are compared task by task, on per-task credit for Effi-SQL. We count the tasks each version wins and run a one-sided sign test. SWE uses a paired bootstrap.
+- An Effi-SQL task counts as solved when its credit is at least 0.75 (matched, with τ ≥ 1.2), the bar the regression rule uses (§8.3). Any other task is a failure. The stably solved set is the tasks solved in every seed.
+- Results are broken down by difficulty, and for SWE by repository.
 
 ### 6.4 CLI
 
-- `goaly run --bench {birdcritic,swefficiency} --split {train,val,heldout} --harness <path|tag> --seeds N --out runs/<id>`
+- `goaly run --bench {effisql,swefficiency} --split {train,val,heldout} --harness <path|tag> --seeds N --out runs/<id>`
 - `--instances <official-format jsonl>` runs any task file. The organizers use this for their held-out set, and the README documents it as the official entry point:
 
   ```
-  goaly run --bench birdcritic --instances heldout.jsonl --harness final --out predictions.jsonl
+  goaly run --bench effisql --instances heldout.jsonl --harness final --out predictions.jsonl
   ```
 
-  This needs only the executor API and the matching environment: a database for BIRD, Docker for SWE.
+  This needs only the executor API and the matching environment: a PostgreSQL database for Effi-SQL, Docker for SWE.
 
 ## 7. Data splits
 
 | | train | val | held-out |
 |---|---|---|---|
-| BIRD (PG-530, stratified by category) | 150 | 100 | 280 |
-| SWE (IDs from the 100-task Lite set, stratified by repository; task data from the revised main dataset) | 12 | 12 | 12 |
+| Effi-SQL (the 238 TPC-H tasks, stratified by difficulty) | 148 | 30 | 60 |
+| SWE (on hold, 2026-10-15; IDs from the 100-task Lite set, stratified by repository; task data from the revised main dataset) | 12 | 12 | 12 |
 
 - The random seed is fixed at `20261014`. The split ID lists are committed to `src/goaly/bench/splits/`.
+- Effi-SQL's train split is all the tasks not drawn for val or held-out.
 - Each split has one job:
   - **train:** the analyst may see full trajectories, grader feedback and gold answers.
-  - **val:** results go only to the decision step; the analyst never sees them.
-  - **held-out:** no modified version runs on it during development. The one exception is v0, whose held-out results are the baseline for the final comparison.
+  - **val:** results go to the decision step and to the final report; the analyst never sees them.
+  - **held-out:** used only for v0's baseline runs and the final runs. No other version runs on it.
 - If an SWE task takes more than 25 minutes to evaluate, it is swapped for another task from the same repository, and the swap is recorded.
-- Exclusions (§4.1, §4.2) are applied after splitting, which keeps the split itself reproducible. An excluded BIRD task is simply dropped from its split, so that split ends up slightly smaller. An excluded SWE task is replaced with another task from the same repository, so every SWE split keeps 12 tasks.
+- Exclusions (§4.1, §4.2) are applied after splitting, which keeps the split itself reproducible. An excluded Effi-SQL task is simply dropped from its split, so that split ends up slightly smaller. An excluded SWE task is replaced with another task from the same repository, so every SWE split keeps 12 tasks.
 
 ## 8. RSI system (goaly.rsi)
 
 ### 8.1 Lanes
 
-- BIRD and SWE each get their own lane, and the two run in parallel.
-- Each lane tracks its best version with a git tag (`best/bird`, `best/swe`) and edits only its own pack.
+- One lane is active: Effi-SQL. The SWE lane is on hold (2026-10-15). Its design below stays, so it can resume, and the two lanes would then run in parallel.
+- Each lane tracks its best version with a git tag (`best/effisql`, `best/swe`) and edits only its own pack.
 - core and bench are frozen while RSI runs.
 
 ### 8.2 One round
 
 1. **Analyze** (GLM, purpose `rsi-analyst`)
    - Inputs:
-     - a summary of the ledger, rejected attempts included;
+     - a summary of the ledger, rejected attempts included, but without val results (§7);
      - the current best's per-task results on train;
      - summaries of failed trajectories, with grader feedback and gold answers;
      - an explanation of the benchmark's scoring rules;
@@ -535,7 +588,7 @@ SWE solving and SWE evaluation never run at the same time. Solving agents run te
      - the expected effect and the risk;
      - where the idea came from: the idea bank, or GLM's own analysis.
 2. **Implement** (GLM coding agent, purpose `rsi-impl`)
-   - The top k hypotheses (k=3 for BIRD, k=2 for SWE) are built in parallel, each in its own git worktree.
+   - The top k hypotheses (k=3 for Effi-SQL, k=2 for SWE) are built in parallel, each in its own git worktree.
    - The agent may:
      - read anything in the repository;
      - write only to `src/goaly/harness/packs/<lane>/` and `tests/harness/packs/<lane>/`;
@@ -548,33 +601,35 @@ SWE solving and SWE evaluation never run at the same time. Solving agents run te
    - the hard-coding scan passes;
    - the pack's unit tests pass.
 4. **Screen.** The candidate's results are compared with the best's cached results on the same tasks. No net gain means rejection.
-   - BIRD: 1 seed on up to 15 train failures the hypothesis targets, plus 5 train tasks the best already solves.
-   - SWE: the 3 train tasks the hypothesis targets.
-5. **Validate.** BIRD runs all 100 val tasks with 2 seeds. SWE runs all 12 val tasks with 1 seed.
+   - Effi-SQL: up to 15 train failures the hypothesis targets, plus 5 train tasks the best already solves, 1 seed. Solved and failed are as defined in §6.3.
+   - SWE (on hold): the 3 train tasks the hypothesis targets.
+5. **Validate.** Effi-SQL runs all 30 val tasks with 1 seed. SWE (on hold) runs all 12 val tasks with 1 seed.
 6. **Decide** using the rules in §8.3. If more than one candidate passes, the one with the largest Δ is accepted. The other passing hypotheses go back in the queue and are rebuilt on the new best next round.
-7. **Confirm** (BIRD only). The accepted candidate runs on val with one more seed. The best changes only if Δ over all 3 seeds is still at least 2pp.
+7. **Confirm** (Effi-SQL only). The accepted candidate runs on val with 1 more seed. The best changes only if ΔR-VES over both seeds is still at least 3 points (§8.3).
 8. **Record.** Every candidate goes into the ledger. For each one, GLM writes a lesson: what was tried, what happened and why, citing the experiment ID.
 
 ### 8.3 Decision rules
 
-**BIRD.** A task's solve rate is its average over seeds. All four conditions must hold:
+**Effi-SQL.** Val is 30 tasks with 1 seed, and a confirmation runs on 1 more seed. All four rules must hold:
 
-- Net gain: Δ = candidate mean success rate − best mean success rate ≥ 3pp.
-- Significance: the candidate wins more tasks than it loses (a win is a task where its solve rate is higher than the best's), and a one-sided sign test gives p ≤ 0.1.
-- Regression: at most 1 task that the best solves in every seed and the candidate fails in every seed.
-- Cost guardrail: if the candidate uses more than 1.5× the best's mean tokens or wall time per task, the Δ threshold doubles.
+- Net gain: ΔR-VES = candidate R-VES − best R-VES ≥ 5 points.
+- Significance: a one-sided sign test on per-task credit gives p ≤ 0.1.
+- Regression: at most 1 task whose credit is ≥ 0.75 under the best and ≤ 0.25 under the candidate.
+- Confirmation: ΔR-VES ≥ 3 points over both seeds.
 
-**SWE.** All three conditions must hold:
+Cost guardrail: if the candidate uses more than 1.5× the best's mean tokens or wall time per task, both Δ thresholds double.
+
+**SWE (on hold, 2026-10-15).** All three conditions must hold:
 
 - Gain: harmonic-mean SR on val improves by at least 10% relative, and a paired bootstrap gives P(Δ>0) ≥ 0.8.
 - Regression: at most 1 task that has a real speedup under the best (SR > 1/gold) and drops to SR ≤ 1/gold under the candidate.
-- Cost guardrail: same as BIRD.
+- Cost guardrail: same as Effi-SQL.
 
-**Both lanes: efficiency cap.** A candidate is rejected outright, whatever its gain, if on the same split its mean cost or mean wall time per task is more than 3× that of baseline v0. Without this cap, many small accepted changes could add up to a large cost increase; the cap keeps gains from depending on unlimited extra compute. The report states the cap and where the final harness stands against it.
+**Every lane: efficiency cap.** A candidate is rejected outright, whatever its gain, if on the same split its mean cost or mean wall time per task is more than 3× that of baseline v0. Without this cap, many small accepted changes could add up to a large cost increase; the cap keeps gains from depending on unlimited extra compute. The report states the cap and where the final harness stands against it.
 
 **Why these thresholds.** A higher bar accepts fewer changes, but the ones it accepts are more trustworthy. A lower bar accepts more changes, but more of them are noise mistaken for gains.
 
-- BIRD: with 100 val tasks and 2 seeds, 3pp is roughly the smallest gain that clears noise.
+- Effi-SQL: with 30 val tasks, each task carries up to 3.3 points of R-VES, and one credit tier (0.25) is worth about 0.8 points. A 5-point gain therefore needs at least two tasks to improve, so one noisy flip at a tier boundary (§4.1) cannot pass on its own, and the confirmation seed checks that the gain holds.
 - SWE: with only 12 tasks the noise is larger, so SWE requires a larger relative gain.
 
 All thresholds are set in config, and every decision records the thresholds it used.
@@ -588,11 +643,12 @@ A lane stops after 4 rounds in a row with no accepted change, or when its time b
 | Risk | Defense |
 |---|---|
 | Editing the grader, core or contracts | The implementer can write only to its lane's directories, and a candidate whose diff touches any other path is rejected. The `bench/`, `harness/core/` and `contracts/` checksums are verified before every evaluation |
-| Hard-coded answers | A scan of the diff rejects it if it contains any of: an instance_id from any split; part of any split's gold SQL or gold patch (≥ 40 characters after normalization); a db_id written as a full identifier. A db_id that is also an ordinary English word only raises a warning |
+| Hard-coded answers | A scan of the diff rejects it if it contains a fragment of any split's gold answer (≥ 40 characters after normalization): gold `optimized_sql` for Effi-SQL, the gold patch for SWE (on hold). Effi-SQL instance ids are not scanned: they are small integers, so a match would mean nothing. There is no database-name rule either, since every task runs on the one `tpch` database. The SWE scan (on hold) also rejects an instance_id from any split |
+| Changing the database: indexes or data | Agent sessions connect with a read-only role (§4.1). Grading runs on its own instances, and the official evaluation runs on the pristine database |
 | Relying on the improvement model | The model allowlist lives in core, which RSI cannot edit |
-| Special-casing the workload or caching between timing runs | The official grader times each repetition in a fresh process and checks for stack inspection; the prompt and skills forbid both; held-out results expose this kind of overfitting |
-| Editing test files | The official grader resets test files before it runs them |
-| Overfitting to val | The analyst never sees val trajectories, and held-out is used only once, at the end |
+| Special-casing the workload or caching between timing runs (SWE, on hold) | The official grader times each repetition in a fresh process and checks for stack inspection; the prompt and skills forbid both; held-out results expose this kind of overfitting |
+| Editing test files (SWE, on hold) | The official grader resets test files before it runs them |
+| Overfitting to val | The analyst never sees val results or trajectories. Held-out is used only for v0's baseline runs and the final runs |
 
 ### 8.6 Ledger and lessons
 
@@ -603,7 +659,7 @@ A lane stops after 4 rounds in a row with no accepted change, or when its time b
 ### 8.7 Operations
 
 - **Processes.** Each lane runs as its own background process. Every step is recorded in the ledger, so a lane that crashes restarts from the ledger and picks up where it stopped.
-- **Results PRs.** A lane opens an "RSI results" PR when it has 3 accepted changes since its last PR, or when 3 hours have passed since then, whichever happens first. A final results PR is opened before the freeze. Each PR contains the accepted pack changes, the ledger entries and the lessons. PRs opened overnight wait for the project lead's review.
+- **Results PRs.** A lane opens an "RSI results" PR when it has 3 accepted changes since its last PR, or when 3 hours have passed since then, whichever happens first. A final results PR is opened before the freeze. Each PR contains the accepted pack changes, the ledger entries and the lessons. Results PRs wait for the project lead's review; the lane does not pause for them.
 - **Notifications.** The project lead receives a push notification when:
   - a lane crashes and automatic recovery fails;
   - the gateway circuit breaker trips repeatedly;
@@ -616,29 +672,29 @@ A lane stops after 4 rounds in a row with no accepted change, or when its time b
 - The report shows two costs separately:
   - what the final harness costs, in money and time, to run on the held-out set;
   - what the RSI experiments cost in total, by lane and by purpose.
-- On the machine side, we record wall time per task and the CPU time used by SWE evaluation.
+- On the machine side, we record wall time per task, how long each Effi-SQL evaluation holds its grading instance, and the CPU time used by SWE evaluation (on hold).
 - The report compares the final harness's mean cost and wall time per task with v0's, against the 3× efficiency cap (§8.3).
 
 ## 10. Final evaluation and reproducibility
 
-- **Freeze:** core, `best/bird` and `best/swe` are merged and tagged `final`.
+- **Freeze:** core and `best/effisql` are merged and tagged `final`. `best/swe` would join them only if the SWE lane resumes.
 - **Runs:**
-  - final runs 3 times on each benchmark's held-out set and 3 times on val;
-  - v0's three held-out runs were already done during the baseline phase.
+  - final runs 3 times on held-out in official mode (§4.1), plus 3 times on val;
+  - v0's three held-out runs, also in official mode, were already done during the baseline phase.
 - **The report includes:**
   - starting score, final score and the improvement, with mean ± standard deviation and confidence intervals;
   - how much scores vary between runs;
-  - results by category and by repository;
+  - results by difficulty, and by repository if SWE resumes;
   - efficiency and experiment cost;
   - a plot of score by round;
   - lessons, each citing experiment IDs.
 - **Reproduction:** `make final` does the following in order:
-  1. prepares environments (images and databases);
+  1. prepares environments (the TPC-H database and its PostgreSQL instances; SWE images only if that lane resumes);
   2. runs final;
   3. grades the results;
   4. generates the report.
 
-  The report reads v0's held-out results from the runs archived during the baseline phase. A separate `make baseline` reruns v0 for anyone who wants to reproduce it too. We keep the two commands apart because rerunning v0 as part of `make final` would double the time; SWE evaluation alone would add several hours.
+  The report reads v0's held-out results from the runs archived during the baseline phase. A separate `make baseline` reruns v0 for anyone who wants to reproduce it too. We keep the two commands apart because rerunning v0 as part of `make final` would add about 3 hours of official-mode grading (§6.2).
 
   Dependencies are pinned in `uv.lock`, and the manifests record every version.
 
@@ -670,28 +726,49 @@ A lane stops after 4 rounds in a row with no accepted change, or when its time b
 
 | Risk | Mitigation |
 |---|---|
-| SWE evaluation is too slow | T15 measures it first. If it's too slow, shrink the subset. Empty patches skip evaluation, results are cached, and v0's held-out runs start early in the background |
-| BIRD gold answers arrive late | Build everything else first. If needed, use public Six-Gym-PG data for train in the meantime |
-| Tight schedule (critical path ≈ 20 h) | BIRD and SWE tracks run in parallel. Stacked PRs keep review from blocking work. RSI runs overnight |
+| Grading time. Dev mode spends about 30–90 minutes per round on grading, each official held-out run takes about 40–60 minutes, and the one-time setup about 3 hours (§6.2). v0's held-out runs share the 3 grading instances with the RSI lane, and a slow prediction can hold an instance for up to the 300 s statement timeout on each run | Dev mode caches the base side, and the 3 grading instances run in parallel. The setup starts as soon as TPC-H is loaded and the grader lands (T10), and v0's held-out runs start in the background as soon as v0 exists (T12). T10 measures the real times first, and the schedule (§13) is adjusted from them |
+| Generating TPC-H. Our dbgen build and load may not match the authors' setup, and generating and loading SF3 takes time | T09 does it first, in the background: the official schema (primary and foreign keys only), then `ANALYZE`, then one data directory copied into the 5 instances. Exclusions and the gold and identity self-checks run on this machine's data (T10), so a mismatch shows up before RSI starts |
+| Timing noise at tier boundaries: a τ near 1 can flip between credit 0.25 and 0.5 from one run to the next | Medians of 3 runs on dedicated, pinned grading instances. The decision rules add a sign test, a regression bound and a confirmation seed (§8.3). Final scores are reported as mean ± standard deviation over 3 runs |
+| The official evaluator's repository has no license | We reimplement its algorithm (§4.1) rather than vendor its code. The gold and identity self-checks confirm that the reimplementation behaves as expected |
+| SWE on hold: the PDF's "gains on more than one benchmark" is at risk (§2) | Nothing within this deadline; the report states the gap plainly. The SWE design stays in this document and the RSI machinery has no benchmark-specific code, so the lane can resume without a redesign |
+| Tight schedule: 21 hours from 2026-10-15 03:00 UTC to the deadline | One active lane. Contracts come first, then component PRs in parallel; stacked PRs keep review from blocking work. RSI must be running by about 16:00 UTC (§13) |
 | Upstream interfaces change during review | Settle the interfaces first, in T05 and T06. Downstream PRs rebase |
 | Malformed Qwen tool calls | Fallback parsing and fault tolerance in core (T04) |
 | The gateway gets overloaded, possibly because other teams share it | Concurrency budgets at about 75% of measured capacity; adaptive limiting and a circuit breaker (§6.2) |
 | Noisy evaluations | Paired comparisons, multiple seeds and confirmation reruns |
-| SWE images use too much disk | Pull only the images the subsets need, and prune in batches |
+| SWE evaluation is too slow (on hold) | T15 measures it first. If it's too slow, shrink the subset. Empty patches skip evaluation, results are cached, and v0's held-out runs start early in the background |
+| SWE images use too much disk (on hold) | Pull only the images the subsets need, and prune in batches |
 
 ## 13. Schedule (critical path)
 
-| Hours from start | Work |
+The schedule runs from now, 2026-10-15 03:00 UTC, to the deadline, 2026-10-16 00:00 UTC (2026-10-15 17:00 PDT). All times are UTC. T02 is done, and the SWE track (T13–T17) is on hold.
+
+| Time (UTC) | Work |
 |---|---|
-| 0–1 | T01, T02 |
-| 1–1.5 | T02a (shared contracts) |
-| 1.5–3 | T03, T04, T08, T09, T13 and T14 in parallel; images and database dumps download in the background |
-| 3–5 | T05, T06, T10, T15 |
-| 5–7 | T07, T11, T16, T18; baseline experiments start (T12, T17) |
-| 7–9 | T19, T20, T21 |
-| 9–17 | T22: both lanes running |
-| 17–20 | T23, T24 |
+| 03:00–05:00 | T01 (this amendment); T02a's contracts reworked for Effi-SQL |
+| 05:00–07:30 | T03, T04, T08 and T09 in parallel; T09 generates and loads TPC-H SF3 in the background |
+| 07:30–09:30 | T05 and T10. Once T10 lands, the setup runs in the background: the base cache, the self-checks and the exclusion list |
+| 09:30–12:30 | T06, then T07 and T18 |
+| 12:30–14:30 | T11, T19 and T20. T12 starts as soon as T11 lands: v0 on train and val first, then its three held-out runs in the background |
+| 14:30–16:00 | T21 |
+| 16:00–20:00 | T22: the Effi-SQL lane runs, about 2–4 rounds. It must be running by about 16:00 |
+| 20:00–23:00 | T23: freeze, the final runs (3 on held-out in official mode, 3 on val) and the report |
+| 23:00–00:00 | T24, and buffer before the deadline |
 
 ## Appendix A: Ticket mapping
 
 T01–T24 correspond, in order, to CIR-1633 through CIR-1656, so T_n = CIR-(1632+n). T02a (shared contracts) was added during spec review and is tracked separately in Linear. The dependencies here match the blocked-by relations in Linear.
+
+**Tracks after the 2026-10-15 amendment**
+
+- T08–T12 (CIR-1640 to CIR-1644) are now the Effi-SQL track:
+
+  | Ticket | Linear | Work |
+  |---|---|---|
+  | T08 | CIR-1640 | Effi-SQL data, splits and exclusions (§4.1, §7) |
+  | T09 | CIR-1641 | PostgreSQL 16 environment: TPC-H SF3 and the 5 pinned instances (§4.1, §6.2) |
+  | T10 | CIR-1642 | Grader: dev and official modes, self-checks and the exclusion run (§4.1) |
+  | T11 | CIR-1643 | Baseline pack v0 and `goaly run --bench effisql` (§5.4, §6.4) |
+  | T12 | CIR-1644 | Baseline experiment (§6.2, §10) |
+
+- T13–T17 (CIR-1645 to CIR-1649), the SWE-fficiency track, are on hold (2026-10-15).
