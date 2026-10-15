@@ -4,6 +4,9 @@ The runs here are the FakeLLM dry run: synthetic tasks, a scripted model, fake s
 instances and a fake grader, wired through the real CLI, runner and grade phase.
 """
 
+import asyncio
+import dataclasses
+import hashlib
 import json
 import logging
 import subprocess
@@ -12,27 +15,33 @@ from collections.abc import Iterator
 from pathlib import Path
 
 import pytest
-from pydantic import ValidationError
+from pydantic import SecretStr, ValidationError
 
 from goaly import cli as goaly_cli
 from goaly.bench.effisql.data import (
+    DATASET_FILE,
     DATASET_REVISION,
     DATASET_SHA256,
     RUNTIME_FILE,
+    ChecksumMismatchError,
     EffiSqlInstance,
+    fetch_dataset,
 )
 from goaly.bench.effisql.grading import Mode
 from goaly.bench.effisql.grading_pool import Priority
-from goaly.bench.effisql.harness import (  # Private helpers.
+from goaly.bench.effisql.harness import (
     PACK_DIR,
+    SOLVING_STATEMENT_TIMEOUT_S,
     EffiSqlPaths,
     EffiSqlWiring,
     PackRunConfig,
     RunCallLog,
+    _full_shares,  # The share rule, tested directly.
     classify_error,
     context_factory,
     grading_priority,
     load_pack,
+    load_tasks,
     model_settings,
     open_harness,
     open_host,
@@ -40,8 +49,9 @@ from goaly.bench.effisql.harness import (  # Private helpers.
     recorded_priority,
 )
 from goaly.bench.effisql.pg_instances import SOLVING
+from goaly.bench.effisql.pg_settings import AgentCredentials
 from goaly.bench.effisql.splits import load_splits
-from goaly.bench.effisql.sql_env import SolvingPool
+from goaly.bench.effisql.sql_env import STATEMENT_TIMEOUT, PgSqlEnvironment, SolvingPool
 from goaly.contracts.errors import EnvironmentFailure
 from goaly.contracts.gen.llm_call_pb2 import CALL_PURPOSE_EXEC, LlmCallRecord
 from goaly.contracts.gen.manifest_pb2 import RunManifest
@@ -56,7 +66,7 @@ from goaly.contracts.jsonl import read_jsonl
 from goaly.harness.core import cli
 from goaly.harness.core.budgets import Budgets
 from goaly.harness.core.jsonl_writer import JsonlWriter
-from goaly.harness.core.llm import CallTags
+from goaly.harness.core.llm import BoundLlmClient, CallTags, LlmClient
 from goaly.harness.core.llm_errors import (
     ClientError,
     ConnectionFailed,
@@ -67,12 +77,21 @@ from goaly.harness.core.llm_errors import (
     ServerError,
     TimedOut,
 )
-from goaly.harness.core.llm_models import EXECUTOR_MODEL, ModelParams
+from goaly.harness.core.llm_models import EXECUTOR_MODEL, IMPROVEMENT_MODEL, ModelParams
 from goaly.harness.core.manifest import read_manifest, write_manifest
 from goaly.harness.core.registry import HarnessOptions, HostOptions, Registry
 from goaly.harness.core.runner import RunFiles, RunIdentity
-from tests.bench.effisql.fake_run import OFFICIAL_FORM, FakeClient, FakeWiring, fake_wiring
+from goaly.harness.core.tools import bind
+from goaly.harness.packs.effisql.tools import ExecuteSql, ExecuteSqlConfig
+from tests.bench.effisql.fake_run import (
+    OFFICIAL_FORM,
+    FakeClient,
+    FakeWiring,
+    fake_wiring,
+    write_inputs,
+)
 from tests.bench.effisql.synthetic import task
+from tests.bench.effisql.test_sql_env import Scenario
 
 pytestmark = pytest.mark.anyio
 
@@ -348,8 +367,9 @@ class TestRealWiring:
         client = await EffiSqlWiring().llm(recorder, {EXECUTOR_MODEL: 7})
 
         async with client as opened:
+            assert isinstance(opened, LlmClient)
             bound = opened.bind(model=EXECUTOR_MODEL, tags=CallTags(purpose=CALL_PURPOSE_EXEC))
-            assert bound is not None
+            assert isinstance(bound, BoundLlmClient)
 
     def test_the_default_paths_are_the_hosts(self) -> None:
         paths = EffiSqlPaths.default()
@@ -359,7 +379,7 @@ class TestRealWiring:
         assert paths.plans.name == "plans.json"
         assert paths.grading_cache_root.name == "grader"
 
-    def testmodel_settings_leave_out_what_the_profile_does_not_set(self) -> None:
+    def test_model_settings_leave_out_what_the_profile_does_not_set(self) -> None:
         settings = model_settings(ModelParams(enable_thinking=False))
 
         assert settings.model == EXECUTOR_MODEL
@@ -375,7 +395,7 @@ class TestRealWiring:
             ("", Priority.RSI),
         ],
     )
-    def test_therecorded_priority(self, recorded: str, priority: Priority) -> None:
+    def test_the_recorded_priority(self, recorded: str, priority: Priority) -> None:
         manifest = RunManifest(environment_settings={"grading_priority": recorded})
 
         assert recorded_priority(manifest) is priority
@@ -405,6 +425,130 @@ class TestRealWiring:
         assert fields.environment_settings["grading_priority"] == "baseline"
 
 
+class TestReviewFixes:
+    def test_the_executor_needs_a_share_and_every_model_gets_one(self) -> None:
+        assert _full_shares({EXECUTOR_MODEL: 7}) == {EXECUTOR_MODEL: 7, IMPROVEMENT_MODEL: 1}
+        with pytest.raises(ValueError, match="no share of qwen"):
+            _full_shares({IMPROVEMENT_MODEL: 3})
+
+    def test_a_changed_runtime_copy_is_refused(self, tmp_path: Path) -> None:
+        paths = write_inputs(tmp_path)
+        pinned = dataclasses.replace(paths, tasks_sha256="0" * 64)
+
+        with pytest.raises(ChecksumMismatchError, match="runtime copy"):
+            load_tasks(pinned, None, Mode.DEV, {})
+
+    def test_a_missing_runtime_copy_is_derived_from_the_dataset(self, tmp_path: Path) -> None:
+        source = write_inputs(tmp_path)
+        cache = tmp_path / "cache"
+        cache.mkdir()
+        dataset = cache / DATASET_FILE
+        dataset.write_bytes(source.tasks_file.read_bytes())
+        digest = hashlib.sha256(dataset.read_bytes()).hexdigest()
+        paths = dataclasses.replace(
+            source, tasks_file=cache / RUNTIME_FILE, dataset_cache=cache, tasks_sha256=None
+        )
+        monkeypatch_fetch = pytest.MonkeyPatch()
+        monkeypatch_fetch.setattr(
+            "goaly.bench.effisql.harness.fetch_dataset",
+            lambda root: fetch_dataset(root, url=dataset.as_uri(), sha256=digest),
+        )
+        try:
+            loaded = load_tasks(paths, None, Mode.DEV, {})
+        finally:
+            monkeypatch_fetch.undo()
+
+        assert (cache / RUNTIME_FILE).exists()
+        assert "optimized_sql" not in (cache / RUNTIME_FILE).read_text()
+        assert loaded.benchmark.tasks
+
+    def test_the_dev_namespace_changes_with_the_base_cache(self, tmp_path: Path) -> None:
+        paths = write_inputs(tmp_path)
+        before = load_tasks(paths, None, Mode.DEV, {}).namespace
+        (paths.grading_cache_root / "dev").mkdir(parents=True)
+        (paths.grading_cache_root / "dev" / "1.json").write_text("{}")
+        after = load_tasks(paths, None, Mode.DEV, {}).namespace
+        official = load_tasks(paths, None, Mode.OFFICIAL, {}).namespace
+
+        assert before.endswith("-nobase")
+        assert after.startswith("dev-")
+        assert after != before
+        assert official.startswith("official-")
+        assert official.count("-") == 1
+
+    def test_a_broken_pack_config_gives_no_models(self, tmp_path: Path) -> None:
+        (tmp_path / "config.yaml").write_text("model: [unclosed\n")
+
+        assert pack_models(tmp_path) == ()
+        assert [m.model for m in pack_models()] == [EXECUTOR_MODEL]
+
+    def test_main_confines_on_the_host_only(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        confined: list[bool] = []
+        monkeypatch.setattr(cli, "main", lambda argv, registry, budgets_file: 0)
+
+        def confine() -> None:
+            confined.append(True)
+            raise OSError(22, "Invalid argument")  # A cpuset without the Python CPUs.
+
+        monkeypatch.setattr(goaly_cli, "confine_to_python_cpus", confine)
+        monkeypatch.setattr(sys, "argv", ["goaly", "run", "--phase", "solve", "--in-container"])
+        assert goaly_cli.main() == 0
+        assert confined == []
+        monkeypatch.setattr(sys, "argv", ["goaly", "run"])
+        assert goaly_cli.main() == 0  # EINVAL is a warning, not a failure.
+        assert confined == [True]
+
+
+class TestSolvingTrust:
+    async def test_the_solving_pool_holds_the_agent_password_alone(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        def refuse() -> None:
+            raise AssertionError("the solve path must never load every password")
+
+        monkeypatch.setattr("goaly.bench.effisql.pg_settings.load_credentials", refuse)
+        monkeypatch.setattr(
+            "goaly.bench.effisql.harness.load_agent_credentials",
+            lambda: AgentCredentials(agent_password=SecretStr("agent-only")),
+        )
+
+        pool = await EffiSqlWiring().solving()
+
+        assert isinstance(pool, SolvingPool)
+        assert pool.options.timeout_s == SOLVING_STATEMENT_TIMEOUT_S == 120
+        assert not hasattr(AgentCredentials(agent_password=SecretStr("x")), "admin_password")
+
+    async def test_the_trusted_cap_stops_a_lifted_pack_timeout_end_to_end(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        monkeypatch.setattr("goaly.bench.effisql.harness.SOLVING_STATEMENT_TIMEOUT_S", 0.2)
+        monkeypatch.setattr(
+            "goaly.bench.effisql.harness.load_agent_credentials",
+            lambda: AgentCredentials(agent_password=SecretStr("agent-only")),
+        )
+        pool = await EffiSqlWiring().solving()
+        assert isinstance(pool, SolvingPool)
+        scenario = Scenario("cancellable")
+        env = PgSqlEnvironment(
+            SOLVING[0],
+            asyncio.Semaphore(2),
+            pool.options,  # The wiring's options: the trusted side's cap.
+            connect=scenario.connect,
+            terminate=scenario.terminate,
+            runner=scenario.run,
+        )
+        await env.open()
+        lifted = ExecuteSqlConfig.model_construct(statement_timeout_s=1e9)  # As pack code may.
+
+        result = await bind(ExecuteSql(lifted), timeout_s=600).invoke(
+            json.dumps({"sql": "SELECT pg_sleep(1e9)"}), env
+        )
+
+        assert result.content.startswith(f"The query failed: {STATEMENT_TIMEOUT}\n")
+        assert result.elapsed_s < 1
+        await env.close()
+
+
 class TestInContainer:
     def test_the_container_reads_its_inputs_directory(self, tmp_path: Path) -> None:
         paths = EffiSqlWiring.in_container(tmp_path / "inputs").paths()
@@ -412,32 +556,39 @@ class TestInContainer:
         assert paths.tasks_file == tmp_path / "inputs" / "tasks.jsonl"
         assert paths.snapshot == tmp_path / "inputs" / "schema_snapshot.json"
         assert paths.plans == tmp_path / "inputs" / "plans.json"
+        assert paths.tasks_sha256 is None  # An organizers' staged file has its own sha.
 
-    async def test_the_container_reaches_the_solving_instances_as_the_agent(
+    async def test_the_container_reaches_the_solving_sockets_as_the_agent_alone(
         self, monkeypatch: pytest.MonkeyPatch, tmp_path: Path
     ) -> None:
-        monkeypatch.setenv("GOALY_PG_HOST", "127.0.0.1")
-        monkeypatch.setenv("GOALY_PG_PORTS", ",".join(str(i.port) for i in SOLVING))
+        dirs = [tmp_path / instance.name for instance in SOLVING]
+        monkeypatch.setenv("GOALY_PG_SOCKET_DIRS", ",".join(map(str, dirs)))
         monkeypatch.setenv("GOALY_PG_AGENT_PASSWORD", "agent-secret")
+
+        def refuse(*_: object) -> None:
+            raise AssertionError("the container never reads a credentials file")
+
+        monkeypatch.setattr("goaly.bench.effisql.pg_settings.load_credentials", refuse)
+        monkeypatch.setattr("goaly.bench.effisql.harness.load_agent_credentials", refuse)
 
         pool = await EffiSqlWiring.in_container(tmp_path).solving()
 
         assert isinstance(pool, SolvingPool)
         assert sorted(pool.load()) == sorted(i.name for i in SOLVING)
+        assert pool.options.timeout_s == SOLVING_STATEMENT_TIMEOUT_S
 
     @pytest.mark.parametrize(
-        ("ports", "message"),
-        [(None, "GOALY_PG_PORTS"), ("1,x", "invalid literal"), ("1", "unknown")],
+        ("dirs", "message"),
+        [(None, "GOALY_PG_SOCKET_DIRS"), ("/a", "2 absolute"), ("a,b", "2 absolute")],
     )
     async def test_missing_or_wrong_settings_fail_the_environment(
-        self, monkeypatch: pytest.MonkeyPatch, tmp_path: Path, ports: str | None, message: str
+        self, monkeypatch: pytest.MonkeyPatch, tmp_path: Path, dirs: str | None, message: str
     ) -> None:
-        monkeypatch.setenv("GOALY_PG_HOST", "127.0.0.1")
         monkeypatch.setenv("GOALY_PG_AGENT_PASSWORD", "agent-secret")
-        if ports is None:
-            monkeypatch.delenv("GOALY_PG_PORTS", raising=False)
+        if dirs is None:
+            monkeypatch.delenv("GOALY_PG_SOCKET_DIRS", raising=False)
         else:
-            monkeypatch.setenv("GOALY_PG_PORTS", ports)
+            monkeypatch.setenv("GOALY_PG_SOCKET_DIRS", dirs)
 
         with pytest.raises(EnvironmentFailure, match=message):
             await EffiSqlWiring.in_container(tmp_path).solving()

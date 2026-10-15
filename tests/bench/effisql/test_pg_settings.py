@@ -2,13 +2,18 @@ import stat
 from pathlib import Path
 
 import pytest
+from pydantic import SecretStr
 
 from goaly.bench.effisql.pg_settings import (
+    AgentCredentials,
     PgEnvConfig,
     PgSettingsError,
+    connection_kwargs,
     default_credentials_file,
     ensure_credentials,
+    load_agent_credentials,
     load_credentials,
+    write_agent_credentials,
 )
 
 VARIABLES = ("GOALY_PG_ADMIN_PASSWORD", "GOALY_PG_AGENT_PASSWORD", "GOALY_PG_GRADER_PASSWORD")
@@ -165,3 +170,64 @@ def test_a_stale_temporary_file_cannot_widen_the_credentials_files_mode(tmp_path
     assert stat.S_IMODE((tmp_path / "pg.env").stat().st_mode) == 0o600
     leftovers = sorted(path.name for path in tmp_path.iterdir() if "pg.env" in path.name)
     assert leftovers == [".pg.env.tmp", "pg.env"]  # No temporary file of ours remains.
+
+
+def test_the_solving_side_loads_the_agent_password_and_no_other(tmp_path: Path) -> None:
+    path = tmp_path / "pg.env"
+    ensure_credentials(path)  # The host's file, with all three passwords.
+
+    agent = load_agent_credentials(path)
+
+    values = _values(path)
+    assert agent.agent_password.get_secret_value() == values["GOALY_PG_AGENT_PASSWORD"]
+    assert set(type(agent).model_fields) == {"agent_password"}  # Nowhere to hold the others.
+    assert not any(value in repr(agent) for value in values.values())
+    assert load_credentials(path).agent_only() == agent
+
+
+def test_an_agent_only_file_is_private_and_holds_one_password(tmp_path: Path) -> None:
+    host = tmp_path / "pg.env"
+    ensure_credentials(host)
+    mounted = tmp_path / "solve" / "pg.env"
+
+    write_agent_credentials(mounted, load_credentials(host))
+
+    assert stat.S_IMODE(mounted.stat().st_mode) == 0o600
+    assert _values(mounted) == {"GOALY_PG_AGENT_PASSWORD": _values(host)["GOALY_PG_AGENT_PASSWORD"]}
+    assert load_agent_credentials(mounted) == load_agent_credentials(host)
+    with pytest.raises(PgSettingsError, match="GOALY_PG_ADMIN_PASSWORD is missing"):
+        load_credentials(mounted)  # Nothing in it lets anyone log in as the admin.
+
+
+def test_an_agent_file_without_the_agent_password_is_refused(tmp_path: Path) -> None:
+    path = tmp_path / "pg.env"
+    path.write_text("GOALY_PG_ADMIN_PASSWORD=do-not-echo\n")
+    path.chmod(0o600)
+
+    with pytest.raises(PgSettingsError, match="GOALY_PG_AGENT_PASSWORD is missing") as caught:
+        load_agent_credentials(path)
+    assert "do-not-echo" not in str(caught.value)
+
+
+def test_agent_credentials_ignore_the_environment(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setenv("GOALY_PG_AGENT_PASSWORD", "from-the-environment")
+
+    with pytest.raises(PgSettingsError, match="GOALY_PG_AGENT_PASSWORD is missing"):
+        load_agent_credentials(tmp_path / "absent.env")
+
+
+def test_every_connection_to_the_servers_is_autocommit_with_a_bounded_connect() -> None:
+    kwargs = connection_kwargs("/run/pg/solve-1", 55432, "effisql_agent", SecretStr("pw"), "tpch")
+
+    assert kwargs == {
+        "host": "/run/pg/solve-1",  # A directory: the server's Unix socket there.
+        "port": 55432,
+        "user": "effisql_agent",
+        "password": "pw",
+        "dbname": "tpch",
+        "autocommit": True,
+        "connect_timeout": 10,
+    }
+    assert AgentCredentials(agent_password=SecretStr("pw"), _env_file=None).agent_password

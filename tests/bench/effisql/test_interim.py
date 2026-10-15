@@ -13,7 +13,6 @@ from collections.abc import AsyncIterator
 from contextlib import AbstractAsyncContextManager, asynccontextmanager
 from pathlib import Path
 
-import httpx
 import pytest
 from pydantic import SecretStr
 
@@ -21,16 +20,14 @@ from goaly import cli as goaly_cli
 from goaly.bench.effisql.harness import EffiSqlWiring, open_harness
 from goaly.bench.effisql.interim import (
     InterimRequest,
-    RecordingTransport,
     SolveRequest,
     _lines,  # The reader of the container's untrusted files, tested directly.
     run_interim,
 )
 from goaly.bench.effisql.launcher import EffiSqlLauncher, SolveRequestLike
-from goaly.bench.effisql.pg_settings import PgCredentials
+from goaly.bench.effisql.pg_settings import AgentCredentials
 from goaly.bench.effisql.splits import load_splits
 from goaly.bench.sandbox import SandboxResult, SolveEnvironment
-from goaly.contracts.gen.llm_call_pb2 import LlmCallRecord
 from goaly.contracts.gen.result_pb2 import TASK_ERROR_TYPE_POLICY_CRASH, TaskResult
 from goaly.contracts.gen.task_pb2 import GRADE_STATUS_PREDICTION_FAILED, SPLIT_TRAIN
 from goaly.contracts.jsonl import read_jsonl
@@ -98,7 +95,7 @@ class FakeProxy:
 
 
 @asynccontextmanager
-async def fake_proxy(recorder: CallRecorder, run_id: str) -> AsyncIterator[FakeProxy]:
+async def fake_proxy(recorder: CallRecorder, run_id: str, uds: Path) -> AsyncIterator[FakeProxy]:
     yield FakeProxy()
 
 
@@ -108,9 +105,7 @@ def launcher(fakes: FakeWiring, container: FakeContainer, locks: Path) -> EffiSq
         paths=fakes.wiring.paths,
         sandbox=lambda: container,
         proxy=fake_proxy,
-        credentials=lambda: PgCredentials(
-            admin_password=secret, agent_password=secret, grader_password=secret
-        ),
+        credentials=lambda: AgentCredentials(agent_password=secret),
         socket_dirs=lambda: (Path("/sock/solve-1"), Path("/sock/solve-2")),
         lock_dir=lambda: locks,
     )
@@ -203,26 +198,6 @@ def test_the_request_names_every_task_and_seed(tmp_path: Path) -> None:
     assert args[args.index("--seeds") + 1] == "2"
     assert args[-2:] == ["--task-timeout", "30"]
     assert args[args.index("--split") : args.index("--split") + 2] == ["--split", "train"]
-
-
-async def test_the_recording_transport_records_each_forwarded_call(tmp_path: Path) -> None:
-    def gateway(request: httpx.Request) -> httpx.Response:
-        body = {"usage": {"prompt_tokens": 10, "completion_tokens": 4,
-                          "completion_tokens_details": {"reasoning_tokens": 3}}}  # fmt: skip
-        return httpx.Response(200, json=body, headers={"x-litellm-response-cost": "0.002"})
-
-    path = tmp_path / "calls.jsonl"
-    transport = RecordingTransport(path, "run-1")
-    transport._inner = httpx.MockTransport(gateway)  # type: ignore[assignment]  # The test's gateway.
-    async with httpx.AsyncClient(transport=transport, base_url="http://gateway") as client:
-        response = await client.post("/chat/completions", json={"model": "qwen3.6-35b-a3b"})
-
-    assert response.json()["usage"]["prompt_tokens"] == 10
-    (record,) = read_jsonl(path, LlmCallRecord)
-    assert (record.run_id, record.model, record.http_status) == ("run-1", "qwen3.6-35b-a3b", 200)
-    assert (record.usage.input_tokens, record.usage.output_tokens) == (10, 4)
-    assert record.usage.reasoning_tokens == 3
-    assert record.usage.cost_usd == pytest.approx(0.002)
 
 
 def test_a_planted_symlink_in_solve_is_refused(tmp_path: Path) -> None:

@@ -19,9 +19,11 @@ import asyncio
 import fcntl
 import logging
 import math
+import os
 import shutil
 import subprocess
 import tarfile
+import tempfile
 from collections.abc import AsyncIterator, Callable, Iterator, Sequence
 from contextlib import AbstractAsyncContextManager, asynccontextmanager, contextmanager
 from dataclasses import dataclass
@@ -34,7 +36,7 @@ from goaly.bench.effisql.data import write_runtime_file
 from goaly.bench.effisql.harness import EffiSqlPaths, RunCallLog
 from goaly.bench.effisql.layout import SolveInputs
 from goaly.bench.effisql.pg_instances import SOLVING
-from goaly.bench.effisql.pg_settings import PgCredentials, PgEnvConfig, load_credentials
+from goaly.bench.effisql.pg_settings import AgentCredentials, PgEnvConfig, load_agent_credentials
 from goaly.bench.sandbox import (
     SandboxResult,
     SolveEnvironment,
@@ -57,6 +59,7 @@ __all__ = [
     "checkout_of",
     "container_argv",
     "hold_solving_instances",
+    "proxy_socket",
     "snapshot_checkout",
     "stage_inputs",
 ]
@@ -176,14 +179,25 @@ class DockerSandbox:
         await asyncio.to_thread(stop_solve, run_id)
 
 
-def _open_proxy(recorder: CallRecorder, run_id: str) -> AbstractAsyncContextManager[Gateway]:
-    """T03's proxy for run ``run_id``, which records every request to ``recorder``.
+def _open_proxy(
+    recorder: CallRecorder, run_id: str, uds: Path
+) -> AbstractAsyncContextManager[Gateway]:
+    """T03's proxy for run ``run_id``: it records every request to ``recorder``, on the host,
+    and listens on the Unix socket ``uds``, which the container reaches (V28)."""
+    return LlmProxy(load_settings(), recorder, run_id=run_id, uds=uds)
 
-    TODO(T03 fix round, #33): becomes ``LlmProxy(load_settings(), recorder, run_id=run_id)``,
-    listening on a Unix socket too (V28), once the proxy takes them.
-    """
-    del recorder, run_id
-    return LlmProxy(load_settings())
+
+# The longest Unix-socket path the kernel takes, less a margin (sockaddr_un.sun_path is 108).
+_UDS_MAX = 100
+
+
+def proxy_socket(run_root: Path, run_id: str) -> Path:
+    """Where the run's proxy listens: ``<run>/proxy/llm.sock``, beside solve/, or a short per-run
+    directory under /tmp when that path is too long for a Unix socket."""
+    socket = run_root / "proxy" / "llm.sock"
+    if len(os.fsencode(socket)) <= _UDS_MAX:
+        return socket
+    return Path(tempfile.gettempdir()) / f"goaly-proxy-{run_id}" / "llm.sock"
 
 
 def _solving_socket_dirs() -> tuple[Path, ...]:
@@ -236,8 +250,9 @@ class EffiSqlLauncher:
 
     paths: Callable[[], EffiSqlPaths] = EffiSqlPaths.default
     sandbox: Callable[[], Sandbox] = DockerSandbox
-    proxy: Callable[[CallRecorder, str], AbstractAsyncContextManager[Gateway]] = _open_proxy
-    credentials: Callable[[], PgCredentials] = load_credentials
+    proxy: Callable[[CallRecorder, str, Path], AbstractAsyncContextManager[Gateway]] = _open_proxy
+    # Only the agent role's password: the container never gets the admin's or the grader's.
+    credentials: Callable[[], AgentCredentials] = load_agent_credentials
     # The solving instances' Unix-socket directories, which the container mounts (V28).
     socket_dirs: Callable[[], tuple[Path, ...]] = _solving_socket_dirs
     # Where T10's graders lock the instances they grade on.
@@ -260,9 +275,10 @@ class EffiSqlLauncher:
         argv = container_argv(request, staged)
         timeout_s = _timeout(len(request.tasks), request.max_tasks, request.task_timeout_s)
         log = request.solve_dir.parent / "solve-container.log"  # Host-side, beside solve/.
+        uds = proxy_socket(request.solve_dir.parent, request.run_id)
         async with (
             self._recorder(request.llm_calls) as recorder,
-            self.proxy(recorder, request.run_id) as gateway,
+            self.proxy(recorder, request.run_id, uds) as gateway,
         ):
             env = gateway.container_env()
             environment = SolveEnvironment(

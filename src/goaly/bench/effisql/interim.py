@@ -8,30 +8,26 @@ the launcher call and host grading behind the V27 hook) is in. It keeps V27 thro
 - the solve container writes only ``<run>/solve/``, through the real EffiSqlLauncher;
 - the host grades every expected (task, seed) from that directory, as untrusted input: a
   missing, duplicate or malformed record gets POLICY_CRASH and credit 0;
-- the run's usage totals come from the proxy, which :class:`RecordingTransport` records on the
-  host until T03's proxy records calls itself. Per-task usage is the container's claim until the
-  client tags its requests (X-Goaly-Call-Tags), so the summary shows both.
+- the run's usage comes from the proxy's own records, written host-side to llm_calls.jsonl,
+  which carry each call's task from the client's X-Goaly-Call-Tags; the summary shows them
+  beside the container's own counts.
 
 No evaluation cache: every task solves.
 """
 
 import argparse
 import asyncio
-import contextlib
 import json
 import logging
 import os
 import stat
 import sys
-import threading
 import time
 from collections.abc import Sequence
 from dataclasses import dataclass, field
 from pathlib import Path
 
-import httpx
 from google.protobuf import json_format
-from google.protobuf.timestamp_pb2 import Timestamp
 
 from goaly.bench.effisql.benchmark import BENCHMARK_NAME, EffiSqlBenchmark
 from goaly.bench.effisql.data import EffiSqlInstance
@@ -39,9 +35,6 @@ from goaly.bench.effisql.harness import EffiSqlWiring, load_pack, model_settings
 from goaly.bench.effisql.launcher import EffiSqlLauncher, SolveContainerError
 from goaly.bench.effisql.pg_instances import confine_to_python_cpus
 from goaly.contracts.gen.llm_call_pb2 import (
-    CALL_PURPOSE_EXEC,
-    LLM_CALL_STATUS_OK,
-    LLM_CALL_STATUS_SERVER_ERROR,
     LlmCallRecord,
 )
 from goaly.contracts.gen.result_pb2 import (
@@ -63,86 +56,18 @@ from goaly.contracts.gen.task_pb2 import (
 from goaly.contracts.gen.trajectory_pb2 import StopReason, Trajectory
 from goaly.contracts.jsonl import from_json_line, to_json_line
 from goaly.harness.core.atomic import write_text_atomically
-from goaly.harness.core.llm_proxy import LlmProxy
 from goaly.harness.core.logs import configure_logging
 from goaly.harness.core.manifest import harness_hash, new_run_id, provenance, write_manifest
 from goaly.harness.core.registry import HostBenchmark, HostOptions
 from goaly.harness.core.runner import RunFiles, lock_run_dir
-from goaly.harness.core.settings import load_settings
 
-__all__ = ["InterimRequest", "RecordingTransport", "SolveRequest", "main", "run_interim"]
+__all__ = ["InterimRequest", "SolveRequest", "main", "run_interim"]
 
 _logger = logging.getLogger(__name__)
 
 _SPLITS = {"train": SPLIT_TRAIN, "val": SPLIT_VAL, "heldout": SPLIT_HELDOUT}
 _PACK = Path("src/goaly/harness/packs/effisql")
 _RECORDS_LIMIT = 512 * 1024 * 1024  # The largest records file read from the container.
-
-
-class RecordingTransport(httpx.AsyncBaseTransport):
-    """The proxy's upstream transport, recording one LlmCallRecord per forwarded call.
-
-    It runs on the proxy's own thread and appends each record to ``path`` at once, under a
-    lock, as one whole JSON line. TEMPORARY, until T03's proxy takes a recorder.
-    """
-
-    def __init__(self, path: Path, run_id: str) -> None:
-        self._inner = httpx.AsyncHTTPTransport()
-        self._path = path
-        self._run_id = run_id
-        self._lock = threading.Lock()
-        self._count = 0
-
-    async def handle_async_request(self, request: httpx.Request) -> httpx.Response:
-        started = Timestamp()
-        started.GetCurrentTime()
-        clock = time.monotonic()
-        response = await self._inner.handle_async_request(request)
-        body = await response.aread()
-        record = LlmCallRecord(
-            run_id=self._run_id,
-            purpose=CALL_PURPOSE_EXEC,
-            model=_model_of(request.content),
-            latency_s=time.monotonic() - clock,
-            http_status=response.status_code,
-            status=LLM_CALL_STATUS_OK
-            if response.status_code == 200
-            else LLM_CALL_STATUS_SERVER_ERROR,
-        )
-        record.started_at.CopyFrom(started)
-        _usage_into(record, body, response.headers.get("x-litellm-response-cost"))
-        with self._lock:
-            self._count += 1
-            record.call_id = f"proxy-{self._count}"
-            with self._path.open("a", encoding="utf-8") as file:
-                file.write(to_json_line(record) + "\n")
-        return httpx.Response(
-            response.status_code, headers=response.headers, content=body, request=request
-        )
-
-    async def aclose(self) -> None:
-        await self._inner.aclose()
-
-
-def _model_of(content: bytes) -> str:
-    try:
-        model = json.loads(content).get("model")
-    except (ValueError, AttributeError):
-        return ""
-    return model if isinstance(model, str) else ""
-
-
-def _usage_into(record: LlmCallRecord, body: bytes, cost: str | None) -> None:
-    try:
-        usage = json.loads(body).get("usage") or {}
-        record.usage.input_tokens = int(usage.get("prompt_tokens") or 0)
-        record.usage.output_tokens = int(usage.get("completion_tokens") or 0)
-        details = usage.get("completion_tokens_details") or {}
-        record.usage.reasoning_tokens = int(details.get("reasoning_tokens") or 0)
-    except (ValueError, AttributeError, TypeError):
-        pass
-    with contextlib.suppress(ValueError):
-        record.usage.cost_usd = float(cost) if cost else 0.0
 
 
 @dataclass(frozen=True)
@@ -237,12 +162,7 @@ async def run_interim(
             raise RuntimeError(f"{request.out} holds a run already")
         options = HostOptions(files, None, request.split, request.budget_phase)
         if launcher is None:
-            launcher = EffiSqlLauncher(
-                paths=wiring.paths,
-                proxy=lambda _recorder, _run_id: LlmProxy(
-                    load_settings(), transport=RecordingTransport(llm_calls, run_id)
-                ),
-            )
+            launcher = EffiSqlLauncher(paths=wiring.paths)
         async with open_host(options, wiring, launcher) as host:
             if not isinstance(host, HostBenchmark):
                 raise TypeError("Effi-SQL's host side is a HostBenchmark")

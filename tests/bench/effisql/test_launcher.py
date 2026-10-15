@@ -24,11 +24,12 @@ from goaly.bench.effisql.launcher import (
     SolveRequestLike,
     checkout_of,
     hold_solving_instances,
+    proxy_socket,
     snapshot_checkout,
     stage_inputs,
 )
 from goaly.bench.effisql.layout import SolveInputs
-from goaly.bench.effisql.pg_settings import PgCredentials
+from goaly.bench.effisql.pg_settings import AgentCredentials, load_agent_credentials
 from goaly.bench.sandbox import SandboxResult, SolveEnvironment
 from goaly.contracts.gen.llm_call_pb2 import LlmCallRecord
 from goaly.contracts.gen.task_pb2 import SPLIT_EXTERNAL, SPLIT_HELDOUT, SPLIT_VAL
@@ -109,6 +110,7 @@ class FakeSandbox:
 @dataclass
 class FakeProxy:
     recorders: list[CallRecorder] = field(default_factory=list)
+    opened: list[tuple[str, Path]] = field(default_factory=list)
     stopped: bool = False
 
     uds: Path = Path("/run/goaly/proxy/llm.sock")
@@ -121,9 +123,8 @@ class FakeProxy:
         }
 
 
-def credentials() -> PgCredentials:
-    secret = SecretStr("agent-secret")
-    return PgCredentials(admin_password=secret, agent_password=secret, grader_password=secret)
+def credentials() -> AgentCredentials:
+    return AgentCredentials(agent_password=SecretStr("agent-secret"))
 
 
 def fake_checkout(root: Path) -> Path:
@@ -142,8 +143,11 @@ def setup(
     proxy = FakeProxy()
 
     @asynccontextmanager
-    async def open_proxy(recorder: CallRecorder, run_id: str) -> AsyncIterator[FakeProxy]:
+    async def open_proxy(
+        recorder: CallRecorder, run_id: str, uds: Path
+    ) -> AsyncIterator[FakeProxy]:
         proxy.recorders.append(recorder)
+        proxy.opened.append((run_id, uds))
         recorder.record(LlmCallRecord(call_id="via-proxy"))
         try:
             yield proxy
@@ -198,6 +202,7 @@ async def test_it_stages_the_inputs_and_runs_the_container(tmp_path: Path) -> No
     assert "optimized_sql" not in inputs.tasks.read_text()
     assert [r.call_id for r in read_jsonl(request.llm_calls, LlmCallRecord)] == ["via-proxy"]
     assert proxy.stopped
+    assert proxy.opened == [("run-1", proxy_socket(request.solve_dir.parent, "run-1"))]
     log = request.solve_dir.parent / "solve-container.log"
     assert log.read_text() == "exit code 0; timed out: False\ncontainer output"
     assert not request.solve_dir.exists()  # Core makes it; the launcher writes nothing there.
@@ -300,6 +305,39 @@ def test_solve_phases_share_the_locks_and_keep_graders_out(tmp_path: Path) -> No
         fcntl.flock(grader, fcntl.LOCK_EX | fcntl.LOCK_NB)
     with (tmp_path / "solve-1.lock").open("w") as grader:
         fcntl.flock(grader, fcntl.LOCK_EX | fcntl.LOCK_NB)  # Free once the solves end.
+
+
+async def test_the_container_gets_the_agent_password_alone(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    def refuse() -> None:
+        raise AssertionError("the launcher must never load every password")
+
+    monkeypatch.setattr("goaly.bench.effisql.pg_settings.load_credentials", refuse)
+    sandbox = FakeSandbox()
+    launcher, _, request, _ = setup(tmp_path, sandbox)
+
+    await launcher(request)
+
+    (_, _, environment, _) = sandbox.runs[0]
+    variables = environment.variables()
+    assert [name for name in variables if name.startswith("GOALY_PG_")] == [
+        "GOALY_PG_SOCKET_DIRS",
+        "GOALY_PG_AGENT_PASSWORD",
+    ]
+    assert not any("pg.env" in value for value in variables.values())
+    assert EffiSqlLauncher().credentials is load_agent_credentials
+
+
+def test_the_proxy_socket_is_beside_solve_unless_too_long(tmp_path: Path) -> None:
+    assert proxy_socket(Path("/runs/r1"), "r1") == Path("/runs/r1/proxy/llm.sock")
+    deep = Path("/" + "d" * 120)
+
+    fallback = proxy_socket(deep, "r1")
+
+    assert fallback.name == "llm.sock"
+    assert fallback.parent.name == "goaly-proxy-r1"
+    assert len(str(fallback)) <= 100
 
 
 def test_staging_twice_replaces_the_inputs(tmp_path: Path) -> None:

@@ -21,6 +21,8 @@ from goaly.harness.packs.effisql.tools import (
     cell,
     render,
 )
+from tests.bench.effisql.test_sql_env import Scenario
+from tests.bench.effisql.test_sql_env import _environment as trusted_environment
 from tests.fakes import STATEMENT_TIMEOUT as FAKE_STATEMENT_TIMEOUT
 from tests.fakes import FakeSqlEnvironment
 from tests.harness.core.agent_fakes import tool_call
@@ -202,3 +204,20 @@ class TestOutput:
     async def test_submit_is_named_and_described_for_the_model(self) -> None:
         assert Submit.name == "submit"
         assert "same result" in Submit.description
+
+
+class TestTrustedCap:
+    async def test_a_pack_asking_for_1e9_s_stops_at_the_environments_cap(self) -> None:
+        # Pack code is untrusted: it may drop the le=120 bound, as model_construct does here.
+        lifted = ExecuteSqlConfig.model_construct(statement_timeout_s=1e9)
+        scenario = Scenario("cancellable")
+        env = trusted_environment(scenario, timeout_s=0.2)  # The trusted side's cap.
+        await env.open()
+        bound = bind(ExecuteSql(lifted), timeout_s=600)
+
+        result = await bound.invoke(json.dumps({"sql": "SELECT pg_sleep(1e9)"}), env)
+
+        assert not result.is_error
+        assert result.content.startswith(f"The query failed: {STATEMENT_TIMEOUT}\n")
+        assert result.elapsed_s < 1  # The environment's 0.2 s, not the 1e9 s asked for.
+        await env.close()

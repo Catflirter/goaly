@@ -53,7 +53,7 @@ def test_grading_in_both_modes(effisql: EffiSqlGrader) -> None:
 
     async def scenario() -> dict[str, Grade]:
         first = await grade(BASE, Mode.DEV)  # Measures the base and caches it.
-        cache = effisql.cache(Mode.DEV)
+        cache = effisql.dev_cache
         stored = cache.get(INST)
         assert stored is not None
         cache.put(stored.model_copy(update={"identity_speedup": 1.0}))

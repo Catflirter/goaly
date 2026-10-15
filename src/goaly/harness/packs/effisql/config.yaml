@@ -23,7 +23,7 @@ context:
 
 pack:
   execute_sql:
-    statement_timeout_s: 120 # At most 120: the environment caps it, by client-side cancellation.
+    statement_timeout_s: 120 # At most 120; the environment caps it there too, by client-side cancel.
     rows_shown: 100
     value_chars: 2000 # Enough for a plan's EXPLAIN text.
   submit_timeout_s: 10
