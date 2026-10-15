@@ -186,10 +186,10 @@ def error_classifier(
     """Return a classifier that says what kind of error an exception is, by its type.
 
     An EnvironmentFailure is TASK_ERROR_TYPE_ENVIRONMENT. Then ``rules``, pairs of an exception
-    type and its error type, apply in order, and
-    anything else is TASK_ERROR_TYPE_POLICY_CRASH, the only other crash result.proto has. A rule
-    matches the exception itself or, in an exception group, any exception at any depth: a pack's
-    own TaskGroup can wrap an EnvironmentFailure. The wiring adds, say, the LLM client's error.
+    type and its error type, apply in order, and anything else is TASK_ERROR_TYPE_POLICY_CRASH,
+    the only other crash result.proto has. A rule matches the exception itself or, in an
+    exception group, any exception at any depth: a pack's own TaskGroup can wrap an
+    EnvironmentFailure. The wiring adds, say, the LLM client's error.
     """
     ordered = [(EnvironmentFailure, TASK_ERROR_TYPE_ENVIRONMENT), *rules]
 
