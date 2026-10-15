@@ -89,9 +89,11 @@ def test_a_document_without_a_plan_is_rejected() -> None:
         scanned_relations({"Planning Time": 1.0})
 
 
-def test_a_base_without_tables_is_refused() -> None:
-    with pytest.raises(ValueError, match="scans no table"):
-        check(scan("lineitem"), base=frozenset())
+def test_the_check_does_not_apply_when_the_base_reads_no_table() -> None:
+    """Task 278's base is a constant list, and so is its gold (spec §4.1)."""
+    verdict = check(node("Values Scan", rows=5), base=frozenset())
+    assert not verdict.literal_result
+    assert not verdict.reasons
 
 
 class TestPlanCheck:
@@ -225,6 +227,83 @@ class TestPlanCheck:
         assert not check(scan("region"), base=small).literal_result
         assert check(scan("lineitem"), base=small).literal_result
 
+    def test_reading_a_system_catalog_is_flagged(self) -> None:
+        root = node("Nested Loop", scan("lineitem"), scan("pg_class", link="Inner"))
+        verdict = check(root)
+        assert verdict.literal_result
+        assert "reads the system catalog: pg_class" in verdict.reasons[0]
+
+    @pytest.mark.parametrize(
+        "root",
+        [
+            pytest.param(
+                node(
+                    "Result",
+                    node(
+                        "Seq Scan",
+                        relation="lineitem",
+                        link="InitPlan",
+                        fields={"Subplan Name": "InitPlan 1 (returns $0)"},
+                    ),
+                    fields={"One-Time Filter": "$0"},
+                ),
+                id="constants behind EXISTS over lineitem (PostgreSQL 16)",
+            ),
+            pytest.param(
+                node(
+                    "Limit",
+                    node("Result", link="Outer", fields={"One-Time Filter": "(InitPlan 1).col1"}),
+                    node(
+                        "Seq Scan",
+                        relation="lineitem",
+                        link="InitPlan",
+                        fields={"Subplan Name": "InitPlan 1"},
+                    ),
+                ),
+                id="constants behind EXISTS over lineitem (PostgreSQL 17)",
+            ),
+            pytest.param(
+                node(
+                    "Append",
+                    node("Result", link="Member", rows=1),
+                    node("Result", link="Member", rows=1),
+                    scan("lineitem", link="Member"),
+                ),
+                id="an Append of one-row constant Results",
+            ),
+        ],
+    )
+    def test_constants_gated_by_a_filter_or_split_into_rows_are_flagged(self, root: Node) -> None:
+        assert check(root).literal_result
+
+    def test_a_subplan_feeding_the_output_still_counts(self) -> None:
+        root = node(
+            "Limit",
+            node("Result", link="Outer"),
+            scan(
+                "lineitem",
+                link="InitPlan",
+                kind="Index Only Scan",
+            ),
+        )
+        root["Plans"][1]["Subplan Name"] = "InitPlan 1 (returns $0)"
+        root["Plans"][0]["Filter"] = "(x > $01)"  # $01 is not $0.
+        assert not check(root).literal_result
+
+    def test_an_unnamed_cte_counts_as_read(self) -> None:
+        """Task 279's stored plan: the dataset leaves out the CTE names."""
+        root = node(
+            "Append",
+            node("Aggregate", scan("lineitem"), link="InitPlan", rows=939),
+            node("CTE Scan", link="Member", rows=939),
+            node("CTE Scan", link="Member", rows=939),
+        )
+        assert not check(root).literal_result
+
+    def test_time_functions_are_not_probes(self) -> None:
+        sql = "SELECT current_timestamp, current_date, now() FROM lineitem"
+        assert environment_probes(sql) == []
+
     def test_detects_a_modify_table_anywhere(self) -> None:
         root = node(
             "CTE Scan",
@@ -243,7 +322,6 @@ class TestPlanCheck:
             "SELECT CASE WHEN current_setting('cluster_name') = '' THEN 1 END",
             "SELECT 1 WHERE current_user = 'x' OR session_user = 'y'",
             "SELECT inet_server_port(), pg_backend_pid(), version()",
-            "SELECT reltuples FROM pg_class WHERE relname = 'lineitem'",
             "SELECT pg_total_relation_size('lineitem'), pg_stat_get_live_tuples(1)",
             "SELECT 'lineitem'::regclass::oid, tableoid FROM lineitem",
         ],
