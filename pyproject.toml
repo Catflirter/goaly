@@ -8,6 +8,7 @@ version = "0.1.0"
 description = "Self-evolving harness: GLM-5.3 improves the agent harness Qwen uses on Effi-SQL and SWE-fficiency."
 requires-python = ">=3.12,<3.13"
 dependencies = [
+    "httpx>=0.28", # Pre-1.0, so a minor release may break: 0.28 is the one the client is tested on
     "protobuf>=7.35.1", # The generated code rejects a runtime older than its gencode, 7.35.1
     "pydantic>=2.4", # 2.4 added ValidationError.errors(include_input=...)
     "pydantic-settings>=2",
@@ -50,6 +51,8 @@ select = [
 
 [tool.ruff.lint.per-file-ignores]
 "tests/**" = ["S101"]
+# The LLM errors are named for the failure, as the spec names them: ContextOverflow, RateLimited...
+"src/goaly/harness/core/llm_errors.py" = ["N818"]
 
 [tool.mypy]
 strict = true
