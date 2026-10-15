@@ -16,7 +16,7 @@ import pytest
 
 
 def goaly_variables():
-    return sorted(name for name in os.environ if name.startswith("GOALY_"))
+    return sorted(name for name in os.environ if name.upper().startswith("GOALY_"))
 
 
 def test_unit(tmp_path):
@@ -28,7 +28,7 @@ def test_unit(tmp_path):
 @pytest.mark.integration
 def test_integration(tmp_path):
     assert not Path.home().is_relative_to(tmp_path)
-    assert goaly_variables() == ["GOALY_API_KEY"]
+    assert goaly_variables() == ["GOALY_API_KEY", "goaly_api_key"]
 """
 
 
@@ -36,17 +36,19 @@ def test_integration(tmp_path):
 def project(pytester: pytest.Pytester, monkeypatch: pytest.MonkeyPatch) -> pytest.Pytester:
     """A pytest session with this repository's pytest configuration and conftest.py.
 
-    The environment carries a GOALY_* variable, as a developer's shell might.
+    The environment carries GOALY_* variables, as a developer's shell might, in both cases:
+    pydantic-settings matches names case-insensitively.
     """
     pytester.makepyprojecttoml((REPO_ROOT / "pyproject.toml").read_text(encoding="utf-8"))
     pytester.makeconftest((REPO_ROOT / "tests" / "conftest.py").read_text(encoding="utf-8"))
     pytester.makepyfile(test_probe=PROBE_TESTS)
     monkeypatch.setenv("GOALY_API_KEY", "not-a-real-key")
+    monkeypatch.setenv("goaly_api_key", "not-a-real-key")
     return pytester
 
 
 def test_integration_tests_are_skipped_by_default(project: pytest.Pytester) -> None:
-    result = project.runpytest("test_probe.py")
+    result = project.runpytest("-rs", "test_probe.py")
 
     result.assert_outcomes(passed=1, skipped=1)
     result.stdout.fnmatch_lines(["SKIPPED * integration test: pass --integration to run"])

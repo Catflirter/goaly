@@ -2,8 +2,9 @@
 
 - Tests marked ``integration`` need Docker, a database or the real model API. They are skipped
   unless pytest runs with ``--integration``.
-- Every other test runs with a fresh, empty ``HOME`` and no ``GOALY_*`` environment variables,
-  so it can never read ``~/.config/goaly/.env`` or a real API key.
+- Every other test runs with a fresh, empty ``HOME`` and no ``GOALY_*`` environment variables
+  (in any case, as pydantic-settings matches names case-insensitively), so it can never read
+  ``~/.config/goaly/.env`` or a real API key.
 """
 
 import os
@@ -42,5 +43,5 @@ def _isolate_from_real_secrets(
     home.mkdir()
     monkeypatch.setenv("HOME", str(home))
     for name in list(os.environ):
-        if name.startswith("GOALY_"):
+        if name.upper().startswith("GOALY_"):
             monkeypatch.delenv(name)

@@ -104,6 +104,9 @@ def test_never_reads_a_dotenv_in_the_working_directory(
 
     with pytest.raises(SettingsError, match="GOALY_API_KEY is not set"):
         load_settings()
+    # load_settings always passes its own env file, so check the class's defaults too.
+    with pytest.raises(ValidationError, match="api_key"):
+        Settings()
 
 
 def test_ignores_unknown_goaly_variables(monkeypatch: pytest.MonkeyPatch) -> None:
