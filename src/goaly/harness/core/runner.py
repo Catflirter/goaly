@@ -29,6 +29,7 @@ import time
 from collections import Counter
 from collections.abc import Callable, Collection, Mapping, Sequence
 from contextlib import AbstractAsyncContextManager
+from contextvars import ContextVar
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import BinaryIO, Protocol, Self
@@ -65,29 +66,40 @@ from goaly.contracts.gen.trajectory_pb2 import (
 from goaly.contracts.interfaces import Benchmark, Environment, Instance, Policy
 from goaly.contracts.jsonl import read_jsonl, to_json_line
 from goaly.harness.core.atomic import write_text_atomically
-from goaly.harness.core.eval_cache import CachedEvaluation, CacheKey, EvalCache, task_digest
+from goaly.harness.core.eval_cache import (
+    CachedEvaluation,
+    CacheKey,
+    EvalCache,
+    evaluation_key,
+    put_evaluation,
+)
+from goaly.harness.core.isolation import TASKS_FILE, write_predictions
 from goaly.harness.core.jsonl_writer import JsonlWriter
 from goaly.harness.core.logs import log_context
 from goaly.harness.core.manifest import read_manifest, write_manifest
 
 __all__ = [
     "DEFAULT_MAX_TASKS",
+    "GRADING_TASK",
     "ContextFactory",
     "ErrorClassifier",
     "RunDirectoryError",
     "RunFiles",
     "RunIdentity",
     "RunLock",
+    "RunPlan",
     "RunSummary",
     "Runner",
     "TaskContext",
     "UsageError",
     "cacheable",
     "classify_error",
+    "differing_adapter_fields",
     "error_classifier",
     "grade_prediction",
     "last_records",
     "lock_run_dir",
+    "plan_run",
 ]
 
 _logger = logging.getLogger(__name__)
@@ -163,6 +175,39 @@ class RunFiles:
     def official(self, seed: int) -> Path:
         """The official prediction file of replicate ``seed``: one record per instance."""
         return self.root / "official" / f"seed-{seed}.jsonl"
+
+    # A two-phase run's own files (spec §6.1, V27). The host writes every file above; the solve
+    # container writes only the solve directory.
+
+    @property
+    def solve(self) -> "RunFiles":
+        """The solve directory: the solve container's only writable mount, which holds the
+        solve phase's own run directory. The host reads it as untrusted input."""
+        return RunFiles(self.root / "solve")
+
+    @property
+    def inputs(self) -> Path:
+        """The read-only inputs a benchmark's launcher stages for the solve container."""
+        return self.root / "inputs"
+
+    @property
+    def tasks(self) -> Path:
+        """In a solve directory, the tasks file: what the container solves."""
+        return self.root / TASKS_FILE
+
+    def predictions(self, seed: int) -> Path:
+        """In a solve directory, replicate ``seed``'s predictions, which the host grades."""
+        return self.root / "predictions" / f"seed-{seed}.jsonl"
+
+    @property
+    def usage(self) -> Path:
+        """The usage the host attributed to the run's tasks from the proxy's records."""
+        return self.root / "usage.json"
+
+    @property
+    def launches(self) -> Path:
+        """When the host started each of the run's solve containers, one JSON line each."""
+        return self.root / "launches.jsonl"
 
 
 class RunLock:
@@ -338,6 +383,7 @@ class Runner[InstanceT: Instance, EnvT: Environment, CtxT: TaskContext]:
         retry_errors: bool = False,
         lock: RunLock | None = None,
         grading: bool = True,
+        tasks: Collection[tuple[str, int]] | None = None,
     ) -> RunSummary:
         """Run each instance of ``split`` once per seed, in ``run_dir``, and record every task.
 
@@ -360,15 +406,22 @@ class Runner[InstanceT: Instance, EnvT: Environment, CtxT: TaskContext]:
         The run holds the directory's lock throughout. A caller that holds it already, as
         `goaly run` does from before it opens the harness, passes it as ``lock``.
 
-        Without ``grading``, this is the solve phase of a two-phase run: it records each task
-        ungraded and never calls the benchmark's grader, and the grade phase (grading.Grader)
-        grades the run and finishes it later. A task the cache holds is recorded from it, graded,
-        as it is in any run; only graded evaluations go into the cache, so this phase puts none.
+        Without ``grading``, this is the solve phase of a two-phase run, in the solve container
+        (spec §6.1, V27): it records each task ungraded, never calls the benchmark's grader, and
+        neither reads nor writes an evaluation cache, which only the host may. Once its tasks are
+        recorded, it writes each seed's predictions file (RunFiles.predictions), which the host
+        grades, and it leaves the official files and finishing the run to the host. ``tasks``
+        then names the (instance ID, seed) pairs to solve now, some of the run's: the others are
+        the host's, from the cache, or another call's.
         """
         if not manifest.run_id:
             raise UsageError("the manifest has no run_id")
         if self._cache is not None and not manifest.harness_hash:
             raise UsageError("the evaluation cache needs the manifest's harness_hash")
+        if self._cache is not None and not grading:
+            raise UsageError("a solve phase has no evaluation cache: only the host reads one")
+        if tasks is not None and grading:
+            raise UsageError("only a solve phase solves some of a run's tasks")
         seeds = _checked_seeds(seeds)
         files = RunFiles(run_dir)
         if lock is not None and lock.files != files:
@@ -378,17 +431,21 @@ class Runner[InstanceT: Instance, EnvT: Environment, CtxT: TaskContext]:
         own_lock = None if lock is not None else await asyncio.to_thread(lock_run_dir, files)
         try:
             plan = await asyncio.to_thread(
-                self._plan,
+                plan_run,
+                self._benchmark,
                 files,
                 manifest,
-                split,
-                seeds,
-                instance_ids,
-                resume,
-                retry_errors,
-                grading,
+                split=split,
+                seeds=seeds,
+                instance_ids=instance_ids,
+                resume=resume,
+                retry_errors=retry_errors,
+                grading=grading,
             )
-            run = await self._run_tasks(files, plan, grading=grading)
+            only = None if tasks is None else set(tasks)
+            if only is not None and not only <= plan.keys:
+                raise UsageError("the tasks to solve now are not all the run's")
+            run = await self._run_tasks(files, plan, grading=grading, only=only)
             await asyncio.to_thread(self._finish, files, plan, grading=grading)
         finally:
             if own_lock is not None:
@@ -404,97 +461,25 @@ class Runner[InstanceT: Instance, EnvT: Environment, CtxT: TaskContext]:
         _logger.info("finished run %s: %s", summary.run_id, summary)
         return summary
 
-    # Planning and finishing, in worker threads.
+    # Finishing, in a worker thread.
 
-    def _plan(
-        self,
-        files: RunFiles,
-        template: RunManifest,
-        split: Split.ValueType,
-        seeds: list[int],
-        instance_ids: Collection[str] | None,
-        resume: bool,
-        retry_errors: bool,
-        grading: bool,
-    ) -> "_Plan[InstanceT]":
-        instances = self._instances(split, instance_ids)
-        manifest = RunManifest()
-        manifest.CopyFrom(template)
-        _take_adapter_fields(manifest, self._benchmark.manifest_fields())
-        manifest.benchmark = self._benchmark.name
-        manifest.split = split
-        manifest.seeds[:] = seeds
-        manifest.instance_ids[:] = [inst.instance_id for inst in instances]
-        manifest.ClearField("started_at")
-        manifest.ClearField("finished_at")
-        keys = {(inst.instance_id, seed) for inst in instances for seed in seeds}
-        if files.manifest.exists():
-            stored = read_manifest(files.manifest)
-            if not resume:
-                raise RunDirectoryError(
-                    f"{files.root} already holds the run {stored.run_id}: resume it,"
-                    " or choose another directory"
-                )
-            different = [
-                name for name in _MUST_MATCH if getattr(stored, name) != getattr(manifest, name)
-            ]
-            if different:
-                raise RunDirectoryError(
-                    f"the run {stored.run_id} in {files.root} does not match this one in:"
-                    f" {', '.join(different)}"
-                )
-            recorded = _recorded(files, keys)
-            ungraded = [key for key, result in recorded.items() if not result.HasField("grade")]
-            if grading and split != SPLIT_EXTERNAL and ungraded:
-                # A graded resume would finish the run with these tasks never graded.
-                raise RunDirectoryError(
-                    f"the run {stored.run_id} in {files.root} has {len(ungraded)} tasks its solve"
-                    " phase left ungraded: its grade phase grades it (goaly run --phase grade)"
-                )
-            done = {
-                key
-                for key, result in recorded.items()
-                if not (retry_errors and result.error_type != TASK_ERROR_TYPE_NONE)
-            }
-            if template.run_id != stored.run_id:
-                _logger.info(
-                    "resuming run %s, not %s: a resumed run keeps its run ID",
-                    stored.run_id,
-                    template.run_id,
-                )
-            _logger.info(
-                "resuming run %s: %d of %d tasks recorded", stored.run_id, len(done), len(keys)
-            )
-            return _Plan(stored, instances, seeds, done)
-        for path in (files.results, files.trajectories):
-            if path.exists():
-                raise RunDirectoryError(f"{path} exists, but {files.manifest} does not")
-        manifest.started_at.GetCurrentTime()
-        write_manifest(files.manifest, manifest)
-        _logger.info("started run %s: %d tasks", manifest.run_id, len(keys))
-        return _Plan(manifest, instances, seeds, set())
-
-    def _instances(
-        self, split: Split.ValueType, instance_ids: Collection[str] | None
-    ) -> list[InstanceT]:
-        """The instances of ``split``, or those of them in ``instance_ids``, in their order."""
-        instances = list(self._benchmark.load_instances(split))
-        known: set[str] = set()
-        for inst in instances:
-            if inst.instance_id in known:
-                raise ValueError(f"the benchmark has two instances {inst.instance_id!r}")
-            known.add(inst.instance_id)
-        if instance_ids is None:
-            return instances
-        unknown = sorted(set(instance_ids) - known)
-        if unknown:
-            raise UsageError(f"{Split.Name(split)} has no instance {', '.join(map(repr, unknown))}")
-        return [inst for inst in instances if inst.instance_id in instance_ids]
-
-    def _finish(self, files: RunFiles, plan: "_Plan[InstanceT]", *, grading: bool) -> None:
-        """Write the official prediction files from the trajectories, then finish the manifest,
-        unless the run has a grade phase still to come."""
+    def _finish(self, files: RunFiles, plan: "RunPlan[InstanceT]", *, grading: bool) -> None:
+        """Write the official prediction files from the trajectories, then finish the manifest;
+        or, in a solve phase, write the predictions the host grades."""
         predictions = _predictions(files)
+        if not grading:
+            recorded = _recorded(files, plan.keys)
+            for seed in plan.seeds:
+                path = files.predictions(seed)
+                path.parent.mkdir(exist_ok=True)
+                solved = []
+                for inst in plan.instances:
+                    key = (inst.instance_id, seed)
+                    if key in recorded and key in predictions:
+                        predictions[key].instance_id = inst.instance_id
+                        solved.append(predictions[key])
+                write_predictions(path, solved)
+            return
         for seed in plan.seeds:
             lines = []
             for inst in plan.instances:
@@ -510,14 +495,18 @@ class Runner[InstanceT: Instance, EnvT: Environment, CtxT: TaskContext]:
             path = files.official(seed)
             path.parent.mkdir(exist_ok=True)
             write_text_atomically(path, "".join(f"{line}\n" for line in lines))
-        if grading or plan.manifest.split == SPLIT_EXTERNAL:  # Else the grade phase finishes it.
-            plan.manifest.finished_at.GetCurrentTime()
-            write_manifest(files.manifest, plan.manifest)
+        plan.manifest.finished_at.GetCurrentTime()
+        write_manifest(files.manifest, plan.manifest)
 
     # The tasks.
 
     async def _run_tasks(
-        self, files: RunFiles, plan: "_Plan[InstanceT]", *, grading: bool
+        self,
+        files: RunFiles,
+        plan: "RunPlan[InstanceT]",
+        *,
+        grading: bool,
+        only: set[_Key] | None,
     ) -> "_Run":
         identity = RunIdentity(
             run_id=plan.manifest.run_id,
@@ -539,7 +528,8 @@ class Runner[InstanceT: Instance, EnvT: Environment, CtxT: TaskContext]:
             async with asyncio.TaskGroup() as group:
                 for seed in plan.seeds:  # A whole replicate first, then the next.
                     for inst in plan.instances:
-                        if (inst.instance_id, seed) not in plan.done:
+                        key = (inst.instance_id, seed)
+                        if key not in plan.done and (only is None or key in only):
                             name = f"task {inst.instance_id} seed {seed}"
                             group.create_task(self._task(run, inst, seed), name=name)
         return run
@@ -567,10 +557,14 @@ class Runner[InstanceT: Instance, EnvT: Environment, CtxT: TaskContext]:
                     return
             attempt = await self._attempt(run, inst, seed, task)
         prediction = self._submission(attempt, inst, seed)
-        grade = await grade_prediction(self._benchmark, inst, prediction) if run.grading else None
+        grade = (
+            await grade_prediction(self._benchmark, inst, prediction, seed=seed)
+            if run.grading
+            else None
+        )
         result, trajectory = self._records(run, inst, seed, task, attempt, prediction, grade)
         await run.record(result, trajectory, cached=False)
-        if key is not None and cacheable(result):
+        if key is not None and run.grading and cacheable(result):  # Graded evaluations only.
             await self._cache_put(key, result, trajectory)
 
     async def _attempt(
@@ -758,12 +752,12 @@ class Runner[InstanceT: Instance, EnvT: Environment, CtxT: TaskContext]:
     ) -> CacheKey | None:
         if self._cache is None or run.identity.split == SPLIT_EXTERNAL:
             return None  # Organizer IDs on SPLIT_EXTERNAL may collide with ours.
-        return CacheKey(
+        return evaluation_key(
             harness_hash=run.harness_hash,
             benchmark=run.identity.benchmark,
             instance_id=inst.instance_id,
             seed=seed,
-            task_digest=task_digest(task),
+            task=task,
         )
 
     async def _cache_get(self, key: CacheKey) -> CachedEvaluation | None:
@@ -772,26 +766,120 @@ class Runner[InstanceT: Instance, EnvT: Environment, CtxT: TaskContext]:
 
     async def _cache_put(self, key: CacheKey, result: TaskResult, trajectory: Trajectory) -> None:
         assert self._cache is not None  # noqa: S101 - As above.
-        try:
-            await self._cache.put(key, CachedEvaluation(result, trajectory))
-        except OSError as error:
-            _logger.warning(
-                "could not cache the evaluation of %s, seed %d: %s",
-                key.instance_id,
-                key.seed,
-                error,
-            )
+        await put_evaluation(self._cache, key, CachedEvaluation(result, trajectory))
 
 
 @dataclass(frozen=True)
-class _Plan[InstanceT]:
-    """What a call of Runner.run runs: the manifest, the instances, the seeds, and the tasks
-    recorded already, by an earlier call."""
+class RunPlan[InstanceT: Instance]:
+    """What a run runs: its manifest, its instances and seeds, and the tasks recorded already,
+    by an earlier call, which it does not run again."""
 
     manifest: RunManifest
     instances: list[InstanceT]
     seeds: list[int]
     done: set[_Key]
+
+    @property
+    def keys(self) -> set[_Key]:
+        """Every task of the run, by (instance ID, seed)."""
+        return {(inst.instance_id, seed) for inst in self.instances for seed in self.seeds}
+
+
+def plan_run[I: Instance, E: Environment](
+    benchmark: Benchmark[I, E],
+    files: RunFiles,
+    template: RunManifest,
+    *,
+    split: Split.ValueType,
+    seeds: list[int],
+    instance_ids: Collection[str] | None,
+    resume: bool,
+    retry_errors: bool,
+    grading: bool,
+) -> RunPlan[I]:
+    """Plan a run of ``benchmark`` in ``files``, as Runner.run documents, and write its manifest.
+
+    ``template`` is the caller's part of the manifest. A new run writes its manifest, with its
+    started_at; a resumed one reads it, and refuses one that does not match. The host of a
+    two-phase run plans with it too, with the benchmark alone. It reads and writes files, so it
+    blocks: run it in a worker thread from the event loop.
+    """
+    instances = _instances(benchmark, split, instance_ids)
+    manifest = RunManifest()
+    manifest.CopyFrom(template)
+    _take_adapter_fields(manifest, benchmark.manifest_fields())
+    manifest.benchmark = benchmark.name
+    manifest.split = split
+    manifest.seeds[:] = seeds
+    manifest.instance_ids[:] = [inst.instance_id for inst in instances]
+    manifest.ClearField("started_at")
+    manifest.ClearField("finished_at")
+    keys = {(inst.instance_id, seed) for inst in instances for seed in seeds}
+    if files.manifest.exists():
+        stored = read_manifest(files.manifest)
+        if not resume:
+            raise RunDirectoryError(
+                f"{files.root} already holds the run {stored.run_id}: resume it,"
+                " or choose another directory"
+            )
+        different = [
+            name for name in _MUST_MATCH if getattr(stored, name) != getattr(manifest, name)
+        ]
+        if different:
+            raise RunDirectoryError(
+                f"the run {stored.run_id} in {files.root} does not match this one in:"
+                f" {', '.join(different)}"
+            )
+        recorded = _recorded(files, keys)
+        ungraded = [key for key, result in recorded.items() if not result.HasField("grade")]
+        if grading and split != SPLIT_EXTERNAL and ungraded:
+            # A graded resume would finish the run with these tasks never graded.
+            unrecorded = len(keys) - len(recorded)
+            more = f", and {unrecorded} it never recorded," if unrecorded else ""
+            raise RunDirectoryError(
+                f"the run {stored.run_id} in {files.root} has {len(ungraded)} tasks a solve"
+                f" phase left ungraded{more}: only its own host side can finish it"
+            )
+        done = {
+            key
+            for key, result in recorded.items()
+            if not (retry_errors and result.error_type != TASK_ERROR_TYPE_NONE)
+        }
+        if template.run_id != stored.run_id:
+            _logger.info(
+                "resuming run %s, not %s: a resumed run keeps its run ID",
+                stored.run_id,
+                template.run_id,
+            )
+        _logger.info(
+            "resuming run %s: %d of %d tasks recorded", stored.run_id, len(done), len(keys)
+        )
+        return RunPlan(stored, instances, seeds, done)
+    for path in (files.results, files.trajectories):
+        if path.exists():
+            raise RunDirectoryError(f"{path} exists, but {files.manifest} does not")
+    manifest.started_at.GetCurrentTime()
+    write_manifest(files.manifest, manifest)
+    _logger.info("started run %s: %d tasks", manifest.run_id, len(keys))
+    return RunPlan(manifest, instances, seeds, set())
+
+
+def _instances[I: Instance, E: Environment](
+    benchmark: Benchmark[I, E], split: Split.ValueType, instance_ids: Collection[str] | None
+) -> list[I]:
+    """The instances of ``split``, or those of them in ``instance_ids``, in their order."""
+    instances = list(benchmark.load_instances(split))
+    known: set[str] = set()
+    for inst in instances:
+        if inst.instance_id in known:
+            raise ValueError(f"the benchmark has two instances {inst.instance_id!r}")
+        known.add(inst.instance_id)
+    if instance_ids is None:
+        return instances
+    unknown = sorted(set(instance_ids) - known)
+    if unknown:
+        raise UsageError(f"{Split.Name(split)} has no instance {', '.join(map(repr, unknown))}")
+    return [inst for inst in instances if inst.instance_id in instance_ids]
 
 
 @dataclass
@@ -873,6 +961,14 @@ def _take_adapter_fields(manifest: RunManifest, fields: RunManifest) -> None:
     manifest.dataset_sha256 = fields.dataset_sha256
 
 
+def differing_adapter_fields(manifest: RunManifest, fields: RunManifest) -> list[str]:
+    """The adapter fields in which ``manifest`` differs from ``fields``, an adapter's partial
+    manifest (Benchmark.manifest_fields), as a run would take them from it."""
+    expected = RunManifest()
+    _take_adapter_fields(expected, fields)
+    return [name for name in _ADAPTER_FIELDS if getattr(manifest, name) != getattr(expected, name)]
+
+
 def _recorded(files: RunFiles, keys: set[_Key]) -> dict[_Key, TaskResult]:
     """The last result of each task of ``keys`` that the run's results file records. A torn last
     line is skipped, and the next write cuts it off. A run directory holds one run, so every line
@@ -909,19 +1005,29 @@ def _predictions(files: RunFiles) -> dict[_Key, Prediction]:
     return predictions
 
 
+# The task a benchmark's grade() call grades, as (instance ID, seed), for a grader that records
+# something of each task, such as a plan: Benchmark.grade gets no seed. None outside a grade.
+GRADING_TASK: ContextVar[tuple[str, int] | None] = ContextVar("goaly_grading_task", default=None)
+
+
 async def grade_prediction[I: Instance, E: Environment](
-    benchmark: Benchmark[I, E], inst: I, prediction: Prediction
+    benchmark: Benchmark[I, E], inst: I, prediction: Prediction, *, seed: int
 ) -> Grade:
-    """Grade ``prediction`` of ``inst`` with ``benchmark``, which must never raise.
+    """Grade ``prediction`` of ``inst``, seed ``seed``, with ``benchmark``; it never raises.
 
     A grader that raises gives a GRADER_ERROR grade that says why. The grader runs in a task of
-    its own: a cancel request it leaves behind, as Python 3.12's TaskGroup can, stays out of
-    the caller's task. A cancellation of the caller propagates, even if the grader turns it
-    into an error or swallows it.
+    its own, which sees GRADING_TASK set to the task: a cancel request it leaves behind, as
+    Python 3.12's TaskGroup can, stays out of the caller's task. A cancellation of the caller
+    propagates, even if the grader turns it into an error or swallows it.
     """
     cancel_requests = _cancel_requests()
+    grading = GRADING_TASK.set((inst.instance_id, seed))
     try:
-        grade = await asyncio.create_task(benchmark.grade(inst, prediction))
+        grader = asyncio.create_task(benchmark.grade(inst, prediction))  # Copies GRADING_TASK.
+    finally:
+        GRADING_TASK.reset(grading)
+    try:
+        grade = await grader
     except BaseException as error:
         _reraise_unless_the_tasks_own(error, cancel_requests, "grading")
         _logger.warning(

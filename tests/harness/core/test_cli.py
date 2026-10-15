@@ -40,6 +40,7 @@ from goaly.harness.core.manifest import (
 )
 from goaly.harness.core.registry import (
     Harness,
+    HarnessFactory,
     HarnessOptions,
     HostBenchmark,
     HostOptions,
@@ -47,6 +48,7 @@ from goaly.harness.core.registry import (
 )
 from goaly.harness.core.runner import RunFiles, lock_run_dir
 from tests.fakes import TOY_DATASET_SHA256, FakeSqlEnvironment, ToyInstance
+from tests.harness.core.host_doubles import InProcessLauncher
 from tests.harness.core.runner_doubles import (
     Action,
     ScriptedBenchmark,
@@ -123,10 +125,13 @@ class ToyFactory:
 
 @dataclass
 class ToyHostFactory:
-    """The toy benchmark's host side: the benchmark alone, which opens no pack."""
+    """The toy benchmark's host side: the benchmark alone, which opens no pack, with a launcher
+    that runs the solve container's command in this process."""
 
     name: str = "toy"
     cache_namespace: str = "toy-dev"
+    benchmark_type: type[ScriptedBenchmark] = ScriptedBenchmark
+    launcher: InProcessLauncher | None = None
     options: list[HostOptions] = field(default_factory=list)
     benchmarks: list[ScriptedBenchmark] = field(default_factory=list)
 
@@ -135,13 +140,39 @@ class ToyHostFactory:
         self, options: HostOptions
     ) -> AsyncIterator[HostBenchmark[ToyInstance, FakeSqlEnvironment]]:
         self.options.append(options)
+        external = None
+        if options.instances_file is not None:
+            lines = options.instances_file.read_text(encoding="utf-8").splitlines()
+            external = [
+                ToyInstance(record["id"], SPLIT_EXTERNAL, record["base_sql"], gold_sql=None)
+                for record in map(json.loads, lines)
+            ]
         instances = [*toy_instances(3), ToyInstance("v0", SPLIT_VAL, base_sql(9), "SELECT 9")]
-        benchmark = ScriptedBenchmark(instances)
+        benchmark = self.benchmark_type(instances, external=external)
         benchmark.name = self.name
         self.benchmarks.append(benchmark)
         yield HostBenchmark(
-            benchmark=benchmark, cache_namespace=self.cache_namespace, gold_sha256="g" * 64
+            benchmark=benchmark,
+            cache_namespace=self.cache_namespace,
+            gold_sha256="g" * 64,
+            launcher=self.launcher,
         )
+
+
+def registry_of(
+    budgets: Path, factory: "HarnessFactory", host: ToyHostFactory | None = None
+) -> Registry:
+    """A registry of the toy benchmark: ``factory``'s harness, and ``host`` (a ToyHostFactory by
+    default) with an in-process launcher, which runs the container's side with the registry."""
+    host = ToyHostFactory() if host is None else host
+    if host.launcher is None:
+        host.launcher = InProcessLauncher(budgets)
+    registry = Registry()
+    pack_dir = factory.pack_dir if isinstance(factory, ToyFactory) else None
+    registry.add("toy", "v0", factory, pack_dir=pack_dir, models=TOY_MODELS)
+    registry.add_benchmark("toy", host)
+    host.launcher.registry = registry
+    return registry
 
 
 @pytest.fixture(autouse=True)
@@ -184,11 +215,8 @@ def grading() -> ToyHostFactory:
 
 
 @pytest.fixture
-def registry(factory: ToyFactory, grading: ToyHostFactory) -> Registry:
-    registry = Registry()
-    registry.add("toy", "v0", factory, pack_dir=factory.pack_dir, models=TOY_MODELS)
-    registry.add_benchmark("toy", grading)
-    return registry
+def registry(budgets: Path, factory: ToyFactory, grading: ToyHostFactory) -> Registry:
+    return registry_of(budgets, factory, grading)
 
 
 @dataclass
@@ -290,6 +318,7 @@ def test_runs_the_toy_benchmark_end_to_end(
             "seeds": [0, 1],
             "task_timeout_s": None,
             "grading": "toy-dev",
+            "isolated": True,
         }
     )
     # The benchmark's manifest_fields() alone gives the dataset's and the environment's fields.
@@ -304,15 +333,16 @@ def test_runs_the_toy_benchmark_end_to_end(
     assert manifest.git_commit == ("" if state is None else state.commit)
     assert manifest.HasField("started_at")
     assert manifest.HasField("finished_at")
+    # The harness opened once, in the solve container, with the host's shares and directories.
     (options,) = factory.options
     assert options == HarnessOptions(
-        files=RunFiles(out),
+        files=RunFiles(out).solve,
         instances_file=None,
         llm_shares={"qwen3.6-35b-a3b": 4},
         split=SPLIT_TRAIN,
-        budget_phase="test",
-        in_container=False,
-        inputs_dir=None,
+        budget_phase=None,
+        in_container=True,
+        inputs_dir=RunFiles(out).inputs,
     )
     assert factory.closed
 
@@ -524,9 +554,8 @@ def test_a_resume_under_another_grading_namespace_is_refused(
         "--out",
         str(tmp_path / "r"),
     ]
-    dev, official = Registry(), Registry()
-    dev.add("toy", "v0", ToyFactory())
-    official.add("toy", "v0", ToyFactory(cache_namespace="toy-official"))
+    dev = registry_of(budgets, ToyFactory())
+    official = registry_of(budgets, ToyFactory(), ToyHostFactory(cache_namespace="toy-official"))
     goaly(capsys, dev, budgets, *argv)
 
     resumed = goaly(capsys, official, budgets, *argv, "--resume")
@@ -538,8 +567,7 @@ def test_a_resume_under_another_grading_namespace_is_refused(
 def test_a_run_without_a_pack_has_cores_hash(
     capsys: pytest.CaptureFixture[str], budgets: Path, tmp_path: Path
 ) -> None:
-    registry = Registry()
-    registry.add("toy", "v0", ToyFactory(pack_dir=None))
+    registry = registry_of(budgets, ToyFactory(pack_dir=None))
     out = tmp_path / "r"
 
     goaly(
@@ -592,9 +620,8 @@ def test_runs_that_grade_differently_never_share_a_cache_entry(
 ) -> None:
     common = ["--bench", "toy", "--split", "train", "--budget-phase", "test"]
     cache = tmp_path / "cache"
-    dev, official = Registry(), Registry()
-    dev.add("toy", "v0", ToyFactory())
-    official.add("toy", "v0", ToyFactory(cache_namespace="toy-official"))
+    dev = registry_of(budgets, ToyFactory())
+    official = registry_of(budgets, ToyFactory(), ToyHostFactory(cache_namespace="toy-official"))
     goaly(capsys, dev, budgets, *common, "--cache", str(cache), "--out", str(tmp_path / "a"))
 
     other = goaly(
@@ -607,11 +634,20 @@ def test_runs_that_grade_differently_never_share_a_cache_entry(
     assert all(list((cache / name).rglob("*.json")) for name in ("toy-dev", "toy-official"))
 
 
-def test_a_harness_without_a_grading_namespace_cannot_use_the_cache(
-    capsys: pytest.CaptureFixture[str], budgets: Path, tmp_path: Path
+@pytest.mark.parametrize(
+    ("mode", "owner"), [((), "the benchmark 'toy'"), (("--in-process",), "the harness 'v0'")]
+)
+def test_a_run_without_a_grading_namespace_cannot_use_the_cache(
+    capsys: pytest.CaptureFixture[str],
+    budgets: Path,
+    tmp_path: Path,
+    mode: tuple[str, ...],
+    owner: str,
 ) -> None:
-    registry = Registry()
-    registry.add("toy", "v0", ToyFactory(cache_namespace=""))
+    # The isolated pipeline caches under the host side's namespace, --in-process the harness's.
+    registry = registry_of(
+        budgets, ToyFactory(cache_namespace=""), ToyHostFactory(cache_namespace="")
+    )
 
     outcome = goaly(
         capsys,
@@ -627,10 +663,11 @@ def test_a_harness_without_a_grading_namespace_cannot_use_the_cache(
         str(tmp_path / "r"),
         "--cache",
         str(tmp_path / "cache"),
+        *mode,
     )
 
     assert outcome.status == cli.USAGE
-    assert "names no grading namespace" in outcome.stderr
+    assert f"{owner} names no grading namespace for --cache" in outcome.stderr
 
 
 def test_a_run_directory_another_process_uses_is_refused_before_the_harness_opens(
@@ -699,21 +736,24 @@ def test_a_run_solves_then_grades_and_the_grade_phase_opens_no_pack(
 
     assert solved.status == 0, solved.stderr
     assert graded.status == 0, graded.stderr
-    # The grade phase's host side gets the run's split, from its manifest, and the budget phase.
-    assert grading.options == [
-        HostOptions(
-            files=RunFiles(out), instances_file=None, split=SPLIT_TRAIN, budget_phase="test"
-        )
-    ]
+    # Both phases open the host side; the grade phase gets the run's split from its manifest.
+    host = HostOptions(
+        files=RunFiles(out), instances_file=None, split=SPLIT_TRAIN, budget_phase="test"
+    )
+    assert grading.options == [host, host]
     assert (solved.summary["phase"], graded.summary["phase"]) == ("solve", "grade")
-    assert (solved.summary["ran"], graded.summary["ran"]) == (3, 3)
+    assert (solved.summary["ran"], graded.summary["ran"]) == (0, 3)  # The host graded them.
     assert graded.summary["run_id"] == solved.summary["run_id"]
-    assert len(factory.options) == 1  # The harness, and so the pack, opened for solving only.
+    # The harness, and so the pack, opened only in the solve container.
+    (opened,) = factory.options
+    assert (opened.in_container, opened.files) == (True, RunFiles(out).solve)
     assert factory.benchmarks[0].graded == []
-    assert len(grading.benchmarks[0].graded) == 3
+    assert grading.benchmarks[0].graded == []  # The solve phase's host side graded nothing.
+    assert len(grading.benchmarks[1].graded) == 3
     found = results(out)
-    assert len(found) == 6  # Each task's ungraded line, then its graded one.
-    assert all(result.HasField("grade") for result in found[3:])
+    assert len(found) == 3  # Only the host writes the results: a graded line each.
+    assert all(result.HasField("grade") for result in found)
+    assert not results(RunFiles(out).solve.root)[0].HasField("grade")  # The container's.
     assert official(out) == [{"instance_id": f"t{n}", "sql": base_sql(n)} for n in range(3)]
     assert read_manifest(RunFiles(out).manifest).HasField("finished_at")
 
@@ -737,7 +777,7 @@ def test_the_grade_phase_fills_the_cache_for_the_next_solve_phase(
             ["--seeds", "2", "--resume", "--budget-share", "toy"],
             "--seeds, --budget-share, --resume",
         ),
-        (["--first-seed", "0", "--retry-errors"], "--first-seed, --retry-errors"),  # 0 is given.
+        (["--first-seed", "0", "--resume"], "--first-seed, --resume"),  # 0 is given.
         (["--harness", "v0", "--max-tasks", "2"], "--harness, --max-tasks"),
     ],
 )
@@ -794,28 +834,48 @@ def test_a_benchmark_registered_without_a_host_side_cannot_grade(
     assert "no host side for the benchmark 'toy'; none has one" in outcome.stderr
 
 
-def test_a_grading_without_a_namespace_cannot_use_the_cache(
-    capsys: pytest.CaptureFixture[str], factory: ToyFactory, budgets: Path, tmp_path: Path
-) -> None:
-    registry = Registry()
-    registry.add("toy", "v0", factory)
-    registry.add_benchmark("toy", ToyHostFactory(cache_namespace=""))
-    out = tmp_path / "run"
+def solved(capsys: pytest.CaptureFixture[str], budgets: Path, out: Path) -> None:
+    """Solve a toy run in ``out``, with a registry of its own, for another to grade."""
+    argv = ["--bench", "toy", "--phase", "solve", "--split", "train", "--budget-phase", "test"]
+    outcome = goaly(capsys, registry_of(budgets, ToyFactory()), budgets, *argv, "--out", str(out))
+    assert outcome.status == 0, outcome.stderr
 
-    _, graded = solve_and_grade(capsys, registry, budgets, out, "--cache", str(tmp_path / "c"))
+
+def test_a_grading_without_a_namespace_cannot_use_the_cache(
+    capsys: pytest.CaptureFixture[str], budgets: Path, tmp_path: Path
+) -> None:
+    out = tmp_path / "run"
+    solved(capsys, budgets, out)
+    registry = registry_of(budgets, ToyFactory(), ToyHostFactory(cache_namespace=""))
+
+    graded = goaly(
+        capsys,
+        registry,
+        budgets,
+        "--bench",
+        "toy",
+        "--phase",
+        "grade",
+        "--out",
+        str(out),
+        "--cache",
+        str(tmp_path / "c"),
+    )
 
     assert graded.status == cli.USAGE
     assert "the benchmark 'toy' names no grading namespace for --cache" in graded.stderr
 
 
 def test_a_grading_of_another_benchmark_is_refused(
-    capsys: pytest.CaptureFixture[str], factory: ToyFactory, budgets: Path, tmp_path: Path
+    capsys: pytest.CaptureFixture[str], budgets: Path, tmp_path: Path
 ) -> None:
-    registry = Registry()
-    registry.add("toy", "v0", factory)
-    registry.add_benchmark("toy", ToyHostFactory(name="not-toy"))
+    out = tmp_path / "run"
+    solved(capsys, budgets, out)
+    registry = registry_of(budgets, ToyFactory(), ToyHostFactory(name="not-toy"))
 
-    _, graded = solve_and_grade(capsys, registry, budgets, tmp_path / "run")
+    graded = goaly(
+        capsys, registry, budgets, "--bench", "toy", "--phase", "grade", "--out", str(out)
+    )
 
     assert graded.status == cli.FAILED
     assert "is of 'not-toy'" in graded.stderr
@@ -1069,8 +1129,7 @@ def test_a_phase_that_solves_needs_its_tasks_and_its_budget(
 def test_a_harness_of_another_benchmark_is_refused(
     capsys: pytest.CaptureFixture[str], budgets: Path, tmp_path: Path
 ) -> None:
-    registry = Registry()
-    registry.add("toy", "v0", ToyFactory(name="not-toy"))
+    registry = registry_of(budgets, ToyFactory(name="not-toy"))
 
     outcome = goaly(
         capsys,
@@ -1087,7 +1146,7 @@ def test_a_harness_of_another_benchmark_is_refused(
     )
 
     assert outcome.status == cli.FAILED
-    assert "runs the benchmark 'not-toy'" in outcome.stderr
+    assert "the harness registered for 'toy' is of 'not-toy'" in outcome.stderr
 
 
 # Failures and interruptions.
@@ -1099,9 +1158,7 @@ def test_a_run_that_fails_exits_1_and_logs_why(
     def broken(options: HarnessOptions) -> AbstractAsyncContextManager[ToyHarness]:
         raise RuntimeError("the gateway key is missing")
 
-    registry = Registry()
-    registry.add("toy", "v0", broken)
-
+    registry = registry_of(budgets, broken)
     outcome = goaly(
         capsys,
         registry,
@@ -1132,8 +1189,11 @@ class UnreadableData(ScriptedBenchmark):
 def test_any_other_value_error_fails_the_run_with_its_traceback(
     capsys: pytest.CaptureFixture[str], budgets: Path, tmp_path: Path
 ) -> None:
-    registry = Registry()
-    registry.add("toy", "v0", ToyFactory(benchmark_type=UnreadableData))
+    registry = registry_of(
+        budgets,
+        ToyFactory(benchmark_type=UnreadableData),
+        ToyHostFactory(benchmark_type=UnreadableData),
+    )
 
     outcome = goaly(
         capsys,
@@ -1236,7 +1296,7 @@ def test_a_used_directory_is_refused_before_the_harness_opens(
     assert "already holds the run first" in again.stderr
     assert other.status == cli.USAGE
     assert "holds the run first, not second" in other.stderr
-    assert len(factory.options) == 1  # Only the resume that can go on opened the harness.
+    assert factory.options == []  # The refused ones opened nothing; the resume had no task left.
     assert same.status == 0, same.stderr
 
 
