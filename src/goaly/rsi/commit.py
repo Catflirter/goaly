@@ -13,22 +13,21 @@ from pathlib import PurePosixPath
 
 from goaly.rsi.git import run_git, run_git_unless_no
 from goaly.rsi.ids import check_id
-from goaly.rsi.lanes import LaneInfo, lane_info
+from goaly.rsi.lanes import lane_info
 from goaly.rsi.workspace import (
-    GIT_FILES,
     UnsafePackError,
     Workspace,
     WorkspaceError,
     Worktree,
+    check_modes,
     check_pack_files,
+    pack_modes,
 )
 
 __all__ = ["OutsidePackError", "commit_candidate"]
 
 _SUBJECT_LIMIT = 72  # Characters, as git's own tools expect of a subject line.
 _BODY_LIMIT = 4000
-_REGULAR = frozenset({"100644", "100755"})  # git's modes for a file; 120000 is a symlink, 160000
-# a gitlink.
 
 
 class OutsidePackError(Exception):
@@ -65,8 +64,10 @@ def commit_candidate(
     message = _message(info.name, summary, worktree.experiment_id, hypothesis_id)
     with workspace.lock():
         workspace.check_registered(worktree)
+        workspace.check_stopped(worktree)  # Host git never reads a worktree a sandbox can change.
         check_pack_files(worktree)  # Before any git command runs in the worktree.
-        _check_modes(_tracked(worktree, info), "in its best version")
+        timeout = workspace.git_timeout_s
+        check_modes(pack_modes(worktree, timeout_s=timeout), "in its best version")
         _check_branch(worktree)
         changed = [PurePosixPath(path) for path in _changed_paths(worktree)]
         outside = sorted(
@@ -87,7 +88,7 @@ def commit_candidate(
             return None
         run_git(["add", "--all", "--", *staged], cwd=worktree.path)
         try:
-            _check_modes(_staged(worktree, info), "staged")
+            check_modes(pack_modes(worktree, staged=True, timeout_s=timeout), "staged")
         except UnsafePackError:
             run_git(["reset", "--quiet", "--", *staged], cwd=worktree.path)
             raise
@@ -106,37 +107,6 @@ def _check_branch(worktree: Worktree) -> None:
     head = "no branch" if output is None else output.strip()  # None: a detached HEAD.
     if head != f"refs/heads/{worktree.branch}":
         raise WorkspaceError(f"{worktree.path} is on {head}, not on {worktree.branch}")
-
-
-def _tracked(worktree: Worktree, info: LaneInfo) -> dict[str, str]:
-    """The mode of every path the packs hold in HEAD; ls-tree reads no file of the worktree."""
-    output = run_git(
-        ["ls-tree", "-r", "-z", "HEAD", "--", *map(str, info.pack_dirs)], cwd=worktree.path
-    )
-    entries = (entry.partition("\t") for entry in output.split("\0") if entry)
-    return {path: meta.split(" ")[0] for meta, _, path in entries}  # "<mode> <type> <object>"
-
-
-def _staged(worktree: Worktree, info: LaneInfo) -> dict[str, str]:
-    """The mode of every path of the packs in the index."""
-    output = run_git(
-        ["ls-files", "--stage", "-z", "--", *map(str, info.pack_dirs)], cwd=worktree.path
-    )
-    entries = (entry.partition("\t") for entry in output.split("\0") if entry)
-    return {path: meta.split(" ")[0] for meta, _, path in entries}  # "<mode> <object> <stage>"
-
-
-def _check_modes(modes: dict[str, str], where: str) -> None:
-    problems = []
-    for path, mode in sorted(modes.items()):
-        if mode == "160000":
-            problems.append(f"{path}: a gitlink {where}")
-        elif mode not in _REGULAR:
-            problems.append(f"{path}: mode {mode} {where}")
-        elif PurePosixPath(path).name in GIT_FILES:
-            problems.append(f"{path}: git's own file {where}")
-    if problems:
-        raise UnsafePackError(problems)
 
 
 def _anything_staged(worktree: Worktree) -> bool:
