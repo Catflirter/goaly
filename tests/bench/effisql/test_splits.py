@@ -39,14 +39,18 @@ from tests.bench.effisql.synthetic import task
 SOURCE = "a" * 64  # A made-up dataset sha256.
 
 
-def tasks(easy: int, medium: int, hard: int, *, db: str = "tpch") -> list[EffiSqlInstance]:
-    """Return synthetic tasks with these difficulty counts, numbered from 1."""
-    sizes: list[tuple[Difficulty, int]] = [("easy", easy), ("medium", medium), ("hard", hard)]
-    labels = [label for label, size in sizes for _ in range(size)]
+def labelled(labels: Sequence[Difficulty]) -> list[EffiSqlInstance]:
+    """Return synthetic TPC-H tasks with these difficulties, numbered from 1."""
     return [
-        EffiSqlInstance.model_validate(task(id=number, db=db, difficulty=label))
+        EffiSqlInstance.model_validate(task(id=number, difficulty=label))
         for number, label in enumerate(labels, start=1)
     ]
+
+
+def tasks(easy: int, medium: int, hard: int) -> list[EffiSqlInstance]:
+    """Return synthetic TPC-H tasks with these difficulty counts, numbered from 1."""
+    sizes: list[tuple[Difficulty, int]] = [("easy", easy), ("medium", medium), ("hard", hard)]
+    return labelled([label for label, size in sizes for _ in range(size)])
 
 
 def counts(ids: Sequence[str], instances: Sequence[EffiSqlInstance]) -> Counter[str | None]:
@@ -127,16 +131,23 @@ def test_the_same_seed_always_gives_the_same_split() -> None:
 
 
 def test_the_split_of_a_small_set_is_pinned() -> None:
-    # Pins the algorithm: a change to it would also change the committed split. Tasks 1-4 are
-    # easy, 5-9 medium and 10-12 hard, so val and held-out get one of each, train 2, 3 and 1.
-    splits = split_tasks(tasks(4, 5, 3), source_sha256=SOURCE, val_size=3, heldout_size=3)
+    # Pins the algorithm: a change to it would also change the committed split. The difficulties
+    # are interleaved, so each one mixes one- and two-digit IDs and their order before the
+    # shuffle matters: easy is 1, 4, 6, 8 and 11, medium 2, 5, 9 and 12, hard 3, 7 and 10. Val and
+    # held-out get one of each, and train 3 easy, 2 medium and 1 hard.
+    e: Difficulty = "easy"
+    m: Difficulty = "medium"
+    h: Difficulty = "hard"
+    instances = labelled([e, m, h, e, m, e, h, e, m, h, e, m])
+
+    splits = split_tasks(instances, source_sha256=SOURCE, val_size=3, heldout_size=3)
 
     assert splits == EffiSqlSplits(
         seed=SPLIT_SEED,
         source_sha256=SOURCE,
-        train=("2", "3", "7", "8", "9", "11"),
-        val=("4", "5", "10"),
-        heldout=("1", "6", "12"),
+        train=("4", "5", "6", "7", "9", "11"),
+        val=("2", "3", "8"),
+        heldout=("1", "10", "12"),
     )
 
 
