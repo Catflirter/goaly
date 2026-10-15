@@ -1,10 +1,13 @@
 """Tests for goaly.rsi.workspace: candidate worktrees, best tags and the repository lock."""
 
+import logging
 from pathlib import Path
+from typing import Any
 
 import pytest
 
 from goaly.contracts.gen.experiment_pb2 import LANE_EFFISQL, LANE_SWE, LANE_UNSPECIFIED
+from goaly.rsi import workspace as workspace_module
 from goaly.rsi.git import GitError
 from goaly.rsi.locks import LockTimeoutError, file_lock
 from goaly.rsi.workspace import Workspace, WorkspaceError, Worktree
@@ -325,3 +328,78 @@ def test_a_git_failure_other_than_no_is_raised(tmp_path: Path) -> None:
 
     with pytest.raises(GitError, match="not a git repository"):
         Workspace(not_a_repo, root=tmp_path / "worktrees").best_commit(LANE_EFFISQL)
+
+
+# A failed create leaves nothing behind.
+
+
+def test_a_failed_create_removes_its_worktree_and_its_branch(
+    workspace: Workspace, repo: Path, tmp_path: Path
+) -> None:
+    write(repo, {"tests/harness/packs/effisql": "not a directory\n"})
+    git(repo, "add", "--all")
+    git(repo, "commit", "--quiet", "--message=a file where the pack tests go")
+    git(repo, "tag", "--force", "best/effisql")
+
+    with pytest.raises(WorkspaceError):
+        workspace.create(LANE_EFFISQL, "exp-1")
+
+    assert git(repo, "branch", "--list", "rsi/effisql/exp-1") == ""
+
+
+def test_a_failed_cleanup_after_a_failed_create_keeps_the_first_error(
+    workspace: Workspace, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    def refuse(worktree: Worktree) -> None:
+        raise WorkspaceError("the first error")
+
+    real_git = workspace._git
+
+    def failing_git(args: list[str], **options: Any) -> str:
+        if args[:2] == ["worktree", "remove"]:
+            raise GitError(args, 1, "the cleanup failed too")
+        return real_git(args, **options)
+
+    monkeypatch.setattr(workspace_module, "_make_pack_dirs", refuse)
+    monkeypatch.setattr(workspace, "_git", failing_git)
+
+    with pytest.raises(WorkspaceError, match="the first error"):
+        workspace.create(LANE_EFFISQL, "exp-1")
+
+
+# The tag moves only from the commit the caller saw.
+
+
+def test_a_tag_moved_between_the_check_and_the_update_is_left_alone(
+    workspace: Workspace, repo: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    old = git(repo, "rev-parse", "best/effisql").strip()
+    ours = add_commit(repo, "our candidate")
+    theirs = add_commit(repo, "someone else's")
+
+    def move_meanwhile(commit: str, ancestor: str) -> bool:
+        git(repo, "tag", "--force", "best/effisql", theirs)  # Outside the lock, by someone else.
+        return True
+
+    monkeypatch.setattr(workspace, "_descends", move_meanwhile)
+
+    with pytest.raises(WorkspaceError, match="best/effisql"):
+        workspace.set_best(LANE_EFFISQL, ours, expected=old)
+
+    assert workspace.best_commit(LANE_EFFISQL) == theirs
+
+
+# Listing worktrees.
+
+
+def test_a_worktree_on_an_unexpected_branch_is_listed_and_reported(
+    workspace: Workspace, repo: Path, tmp_path: Path, caplog: pytest.LogCaptureFixture
+) -> None:
+    path = tmp_path / "worktrees" / "effisql" / "exp-7"
+    git(repo, "worktree", "add", "--quiet", "-b", "something-else", str(path), "best/effisql")
+
+    with caplog.at_level(logging.WARNING):
+        listed = workspace.worktrees(LANE_EFFISQL)
+
+    assert listed == [Worktree(path, LANE_EFFISQL, "exp-7")]
+    assert "refs/heads/something-else" in caplog.text
