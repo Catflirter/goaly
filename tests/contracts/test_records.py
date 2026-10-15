@@ -19,6 +19,7 @@ from goaly.contracts.gen.experiment_pb2 import (
     Lane,
     LaneEvent,
     LaneEventKind,
+    Lesson,
     PhaseResult,
     RejectionReason,
     SmokeTest,
@@ -377,3 +378,27 @@ def test_lane_events_are_appended_to_lane_events_jsonl_and_read_back(tmp_path: P
     assert path.read_bytes().count(b"\n") == len(events)
     assert list(read_jsonl(path, LaneEvent)) == events
     assert set_fields(*events) == set(LaneEvent.DESCRIPTOR.fields_by_name)
+
+
+def test_a_deleted_lesson_keeps_its_earlier_lines_and_its_last_line_says_when(
+    tmp_path: Path,
+) -> None:
+    standing = Lesson(
+        lesson_id="lesson-4",
+        lane=Lane.LANE_EFFISQL,
+        text="Rewriting IN subqueries as joins helped on 3 tasks (exp-3).",
+        experiment_ids=["exp-3"],
+        created_at=at(18, 0),
+        updated_at=at(18, 0),
+    )
+    deleted = Lesson()
+    deleted.CopyFrom(standing)
+    deleted.updated_at.CopyFrom(at(21, 15))
+    deleted.deleted_at.CopyFrom(at(21, 15))
+    path = tmp_path / "lessons.jsonl"
+
+    append_jsonl(path, standing)
+    append_jsonl(path, deleted)
+
+    assert "deleted_at" not in json.loads(to_json_line(standing))
+    assert list(read_jsonl(path, Lesson)) == [standing, deleted]

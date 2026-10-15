@@ -394,7 +394,8 @@ message PurposeUsage {
 }
 
 // A lesson the RSI system learned (spec §8.6): one entry of lessons.jsonl, from which lessons.md
-// is generated.
+// is generated. The store appends a lesson's full state on every change, and the last line for a
+// lesson_id wins.
 message Lesson {
   // A unique ID.
   string lesson_id = 1;
@@ -414,6 +415,9 @@ message Lesson {
   google.protobuf.Timestamp created_at = 7;
   // When it last changed, as when an experiment was added to helped_by or hurt_by.
   google.protobuf.Timestamp updated_at = 8;
+  // When the lesson was deleted; absent while it stands. Readers and lessons.md skip a deleted
+  // lesson. Its earlier lines stay in the file, so nothing is lost by accident.
+  google.protobuf.Timestamp deleted_at = 9;
 }
 
 // Something that happened to a lane outside any one experiment (spec §8.6, §8.7): one line of

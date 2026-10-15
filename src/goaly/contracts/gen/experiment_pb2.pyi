@@ -1060,7 +1060,8 @@ Global___PurposeUsage: _TypeAlias = PurposeUsage  # noqa: Y015
 @_typing.final
 class Lesson(_message.Message):
     """A lesson the RSI system learned (spec §8.6): one entry of lessons.jsonl, from which lessons.md
-    is generated.
+    is generated. The store appends a lesson's full state on every change, and the last line for a
+    lesson_id wins.
     """
 
     DESCRIPTOR: _descriptor.Descriptor
@@ -1073,6 +1074,7 @@ class Lesson(_message.Message):
     HURT_BY_FIELD_NUMBER: _builtins.int
     CREATED_AT_FIELD_NUMBER: _builtins.int
     UPDATED_AT_FIELD_NUMBER: _builtins.int
+    DELETED_AT_FIELD_NUMBER: _builtins.int
     lesson_id: _builtins.str
     """A unique ID."""
     lane: Global___Lane.ValueType
@@ -1102,6 +1104,12 @@ class Lesson(_message.Message):
     def updated_at(self) -> _timestamp_pb2.Timestamp:
         """When it last changed, as when an experiment was added to helped_by or hurt_by."""
 
+    @_builtins.property
+    def deleted_at(self) -> _timestamp_pb2.Timestamp:
+        """When the lesson was deleted; absent while it stands. Readers and lessons.md skip a deleted
+        lesson. Its earlier lines stay in the file, so nothing is lost by accident.
+        """
+
     def __init__(
         self,
         *,
@@ -1113,10 +1121,11 @@ class Lesson(_message.Message):
         hurt_by: _abc.Iterable[_builtins.str] | None = ...,
         created_at: _timestamp_pb2.Timestamp | None = ...,
         updated_at: _timestamp_pb2.Timestamp | None = ...,
+        deleted_at: _timestamp_pb2.Timestamp | None = ...,
     ) -> None: ...
-    _HasFieldArgType: _TypeAlias = _typing.Literal["created_at", b"created_at", "updated_at", b"updated_at"]  # noqa: Y015
+    _HasFieldArgType: _TypeAlias = _typing.Literal["created_at", b"created_at", "deleted_at", b"deleted_at", "updated_at", b"updated_at"]  # noqa: Y015
     def HasField(self, field_name: _HasFieldArgType) -> _builtins.bool: ...
-    _ClearFieldArgType: _TypeAlias = _typing.Literal["created_at", b"created_at", "experiment_ids", b"experiment_ids", "helped_by", b"helped_by", "hurt_by", b"hurt_by", "lane", b"lane", "lesson_id", b"lesson_id", "text", b"text", "updated_at", b"updated_at"]  # noqa: Y015
+    _ClearFieldArgType: _TypeAlias = _typing.Literal["created_at", b"created_at", "deleted_at", b"deleted_at", "experiment_ids", b"experiment_ids", "helped_by", b"helped_by", "hurt_by", b"hurt_by", "lane", b"lane", "lesson_id", b"lesson_id", "text", b"text", "updated_at", b"updated_at"]  # noqa: Y015
     def ClearField(self, field_name: _ClearFieldArgType) -> None: ...
     def WhichOneof(self, oneof_group: _Never) -> None: ...
 
