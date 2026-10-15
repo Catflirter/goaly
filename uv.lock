@@ -135,6 +135,7 @@ dependencies = [
     { name = "protobuf" },
     { name = "pydantic" },
     { name = "pydantic-settings" },
+    { name = "python-dotenv" },
 ]
 
 [package.dev-dependencies]
@@ -155,6 +156,7 @@ requires-dist = [
     { name = "protobuf", specifier = ">=7.35.1" },
     { name = "pydantic", specifier = ">=2.4" },
     { name = "pydantic-settings", specifier = ">=2" },
+    { name = "python-dotenv", specifier = ">=1" },
 ]
 
 [package.metadata.requires-dev]

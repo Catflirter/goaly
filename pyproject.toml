@@ -11,6 +11,7 @@ dependencies = [
     "protobuf>=7.35.1", # The generated code rejects a runtime older than its gencode, 7.35.1
     "pydantic>=2.4", # 2.4 added ValidationError.errors(include_input=...)
     "pydantic-settings>=2",
+    "python-dotenv>=1", # Parses ~/.config/goaly/pg.env, as pydantic-settings does
 ]
 
 [dependency-groups]
