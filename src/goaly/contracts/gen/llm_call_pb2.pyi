@@ -73,7 +73,11 @@ class _LlmCallStatusEnumTypeWrapper(_enum_type_wrapper._EnumTypeWrapper[_LlmCall
     LLM_CALL_STATUS_INVALID_RESPONSE: _LlmCallStatus.ValueType  # 7
     """A response arrived but could not be used, for example because it was malformed."""
     LLM_CALL_STATUS_CLIENT_ERROR: _LlmCallStatus.ValueType  # 8
-    """The gateway refused the request with another 4xx status, such as for a parameter it rejects."""
+    """Any other 4xx: not 429 and not a context overflow, which LiteLLM also reports as a 400."""
+    LLM_CALL_STATUS_CANCELLED: _LlmCallStatus.ValueType  # 9
+    """Our own code cancelled the call, for example when a task's wall-clock budget ran out. The
+    gateway may still have billed it.
+    """
 
 class LlmCallStatus(_LlmCallStatus, metaclass=_LlmCallStatusEnumTypeWrapper):
     """How an LLM call ended. A failed call reports the error of its last attempt."""
@@ -95,7 +99,11 @@ LLM_CALL_STATUS_CONTEXT_OVERFLOW: LlmCallStatus.ValueType  # 6
 LLM_CALL_STATUS_INVALID_RESPONSE: LlmCallStatus.ValueType  # 7
 """A response arrived but could not be used, for example because it was malformed."""
 LLM_CALL_STATUS_CLIENT_ERROR: LlmCallStatus.ValueType  # 8
-"""The gateway refused the request with another 4xx status, such as for a parameter it rejects."""
+"""Any other 4xx: not 429 and not a context overflow, which LiteLLM also reports as a 400."""
+LLM_CALL_STATUS_CANCELLED: LlmCallStatus.ValueType  # 9
+"""Our own code cancelled the call, for example when a task's wall-clock budget ran out. The
+gateway may still have billed it.
+"""
 Global___LlmCallStatus: _TypeAlias = LlmCallStatus  # noqa: Y015
 
 @_typing.final

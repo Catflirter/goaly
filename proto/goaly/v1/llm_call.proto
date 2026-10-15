@@ -68,8 +68,11 @@ enum LlmCallStatus {
   LLM_CALL_STATUS_CONTEXT_OVERFLOW = 6;
   // A response arrived but could not be used, for example because it was malformed.
   LLM_CALL_STATUS_INVALID_RESPONSE = 7;
-  // The gateway refused the request with another 4xx status, such as for a parameter it rejects.
+  // Any other 4xx: not 429 and not a context overflow, which LiteLLM also reports as a 400.
   LLM_CALL_STATUS_CLIENT_ERROR = 8;
+  // Our own code cancelled the call, for example when a task's wall-clock budget ran out. The
+  // gateway may still have billed it.
+  LLM_CALL_STATUS_CANCELLED = 9;
 }
 
 // Tokens and cost, of one call or summed over many.
