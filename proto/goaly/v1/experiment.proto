@@ -216,7 +216,9 @@ message GuardResult {
   string detail = 3;
 }
 
-// A check that a candidate must pass before it is evaluated (spec §8.2, §8.5).
+// A check that a candidate must pass before it is evaluated (spec §8.2, §8.5). The values are
+// declared by number. The guards run in the order of spec §8.2 step 3: ALLOWED_PATHS, CHECKSUMS,
+// HARD_CODING_SCAN, PACK_CODE_ALLOWLIST, then UNIT_TESTS.
 enum Guard {
   // Not set.
   GUARD_UNSPECIFIED = 0;
@@ -232,6 +234,8 @@ enum Guard {
   // windows 40 or more characters long after normalization, and also rejects any instance_id
   // from any split.
   GUARD_HARD_CODING_SCAN = 3;
+  // The pack's unit tests pass.
+  GUARD_UNIT_TESTS = 4;
   // The static AST allowlist passes on the candidate's pack code, which runs on the host during
   // smoke tests, screening and validation (spec §8.5). It is a static defense in depth, not a
   // sandbox. Imports may come only from: an explicit list of goaly.harness.core modules, which
@@ -245,8 +249,6 @@ enum Guard {
   // names sys, os, modules, builtins and subprocess, and asyncio's process, socket and pipe
   // functions.
   GUARD_PACK_CODE_ALLOWLIST = 5;
-  // The pack's unit tests pass.
-  GUARD_UNIT_TESTS = 4;
 }
 
 // How a candidate did against the best in one phase: screen, validate or confirm (spec §8.2,
@@ -320,7 +322,10 @@ enum Decision {
   DECISION_ABORTED = 4;
 }
 
-// A rule that rejects a candidate: one value for each way spec §8.2 and §8.3 reject one.
+// A rule that rejects a candidate: one value for each way spec §8.2 and §8.3 reject one. The
+// values are declared by number. The decision code checks them in the order of the round's
+// steps: IMPLEMENTATION_FAILED, GUARD_FAILED, HARD_CODED, NO_SCREEN_GAIN, EFFICIENCY_CAP,
+// INSUFFICIENT_GAIN, COST_GUARDRAIL, NOT_SIGNIFICANT, REGRESSION, OUTRANKED, then NOT_CONFIRMED.
 enum RejectionReason {
   // Not set; never written.
   REJECTION_REASON_UNSPECIFIED = 0;
@@ -328,11 +333,6 @@ enum RejectionReason {
   REJECTION_REASON_IMPLEMENTATION_FAILED = 1;
   // A guard failed; guards says which.
   REJECTION_REASON_GUARD_FAILED = 2;
-  // It made a matched prediction that a check flagged, in the screen, the validation or the
-  // confirmation (spec §4.1, §8.2 step 4). The checks are those against hard-coded results, and
-  // this covers both flags: hard_coded, which is EffiSqlGrade.alt_matched false, and
-  // literal_result. That phase's flagged_instance_ids lists the flagged tasks.
-  REJECTION_REASON_HARD_CODED = 11;
   // The screen showed no net gain over the best.
   REJECTION_REASON_NO_SCREEN_GAIN = 3;
   // Its mean cost or wall time per task exceeded the efficiency cap.
@@ -351,6 +351,11 @@ enum RejectionReason {
   // Effi-SQL: its gain over the validation seeds plus the confirmation seed fell below the
   // confirmation threshold.
   REJECTION_REASON_NOT_CONFIRMED = 10;
+  // It made a matched prediction that a check flagged, in the screen, the validation or the
+  // confirmation (spec §4.1, §8.2 step 4). The checks are those against hard-coded results, and
+  // this covers both flags: hard_coded, which is EffiSqlGrade.alt_matched false, and
+  // literal_result. That phase's flagged_instance_ids lists the flagged tasks.
+  REJECTION_REASON_HARD_CODED = 11;
 }
 
 // The decision thresholds, as config set them (spec §8.3: every decision records the thresholds

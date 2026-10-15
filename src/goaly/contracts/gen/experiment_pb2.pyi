@@ -204,6 +204,8 @@ class _GuardEnumTypeWrapper(_enum_type_wrapper._EnumTypeWrapper[_Guard.ValueType
     windows 40 or more characters long after normalization, and also rejects any instance_id
     from any split.
     """
+    GUARD_UNIT_TESTS: _Guard.ValueType  # 4
+    """The pack's unit tests pass."""
     GUARD_PACK_CODE_ALLOWLIST: _Guard.ValueType  # 5
     """The static AST allowlist passes on the candidate's pack code, which runs on the host during
     smoke tests, screening and validation (spec §8.5). It is a static defense in depth, not a
@@ -218,11 +220,12 @@ class _GuardEnumTypeWrapper(_enum_type_wrapper._EnumTypeWrapper[_Guard.ValueType
     names sys, os, modules, builtins and subprocess, and asyncio's process, socket and pipe
     functions.
     """
-    GUARD_UNIT_TESTS: _Guard.ValueType  # 4
-    """The pack's unit tests pass."""
 
 class Guard(_Guard, metaclass=_GuardEnumTypeWrapper):
-    """A check that a candidate must pass before it is evaluated (spec §8.2, §8.5)."""
+    """A check that a candidate must pass before it is evaluated (spec §8.2, §8.5). The values are
+    declared by number. The guards run in the order of spec §8.2 step 3: ALLOWED_PATHS, CHECKSUMS,
+    HARD_CODING_SCAN, PACK_CODE_ALLOWLIST, then UNIT_TESTS.
+    """
 
 GUARD_UNSPECIFIED: Guard.ValueType  # 0
 """Not set."""
@@ -239,6 +242,8 @@ For SWE (on hold) it applies the same gold-only-fragment rule to the gold patche
 windows 40 or more characters long after normalization, and also rejects any instance_id
 from any split.
 """
+GUARD_UNIT_TESTS: Guard.ValueType  # 4
+"""The pack's unit tests pass."""
 GUARD_PACK_CODE_ALLOWLIST: Guard.ValueType  # 5
 """The static AST allowlist passes on the candidate's pack code, which runs on the host during
 smoke tests, screening and validation (spec §8.5). It is a static defense in depth, not a
@@ -253,8 +258,6 @@ ag_* and tb_*; any attribute of an imported module that is itself a module; and 
 names sys, os, modules, builtins and subprocess, and asyncio's process, socket and pipe
 functions.
 """
-GUARD_UNIT_TESTS: Guard.ValueType  # 4
-"""The pack's unit tests pass."""
 Global___Guard: _TypeAlias = Guard  # noqa: Y015
 
 class _Decision:
@@ -309,12 +312,6 @@ class _RejectionReasonEnumTypeWrapper(_enum_type_wrapper._EnumTypeWrapper[_Rejec
     """The implementer made no commit for the hypothesis."""
     REJECTION_REASON_GUARD_FAILED: _RejectionReason.ValueType  # 2
     """A guard failed; guards says which."""
-    REJECTION_REASON_HARD_CODED: _RejectionReason.ValueType  # 11
-    """It made a matched prediction that a check flagged, in the screen, the validation or the
-    confirmation (spec §4.1, §8.2 step 4). The checks are those against hard-coded results, and
-    this covers both flags: hard_coded, which is EffiSqlGrade.alt_matched false, and
-    literal_result. That phase's flagged_instance_ids lists the flagged tasks.
-    """
     REJECTION_REASON_NO_SCREEN_GAIN: _RejectionReason.ValueType  # 3
     """The screen showed no net gain over the best."""
     REJECTION_REASON_EFFICIENCY_CAP: _RejectionReason.ValueType  # 4
@@ -335,9 +332,19 @@ class _RejectionReasonEnumTypeWrapper(_enum_type_wrapper._EnumTypeWrapper[_Rejec
     """Effi-SQL: its gain over the validation seeds plus the confirmation seed fell below the
     confirmation threshold.
     """
+    REJECTION_REASON_HARD_CODED: _RejectionReason.ValueType  # 11
+    """It made a matched prediction that a check flagged, in the screen, the validation or the
+    confirmation (spec §4.1, §8.2 step 4). The checks are those against hard-coded results, and
+    this covers both flags: hard_coded, which is EffiSqlGrade.alt_matched false, and
+    literal_result. That phase's flagged_instance_ids lists the flagged tasks.
+    """
 
 class RejectionReason(_RejectionReason, metaclass=_RejectionReasonEnumTypeWrapper):
-    """A rule that rejects a candidate: one value for each way spec §8.2 and §8.3 reject one."""
+    """A rule that rejects a candidate: one value for each way spec §8.2 and §8.3 reject one. The
+    values are declared by number. The decision code checks them in the order of the round's
+    steps: IMPLEMENTATION_FAILED, GUARD_FAILED, HARD_CODED, NO_SCREEN_GAIN, EFFICIENCY_CAP,
+    INSUFFICIENT_GAIN, COST_GUARDRAIL, NOT_SIGNIFICANT, REGRESSION, OUTRANKED, then NOT_CONFIRMED.
+    """
 
 REJECTION_REASON_UNSPECIFIED: RejectionReason.ValueType  # 0
 """Not set; never written."""
@@ -345,12 +352,6 @@ REJECTION_REASON_IMPLEMENTATION_FAILED: RejectionReason.ValueType  # 1
 """The implementer made no commit for the hypothesis."""
 REJECTION_REASON_GUARD_FAILED: RejectionReason.ValueType  # 2
 """A guard failed; guards says which."""
-REJECTION_REASON_HARD_CODED: RejectionReason.ValueType  # 11
-"""It made a matched prediction that a check flagged, in the screen, the validation or the
-confirmation (spec §4.1, §8.2 step 4). The checks are those against hard-coded results, and
-this covers both flags: hard_coded, which is EffiSqlGrade.alt_matched false, and
-literal_result. That phase's flagged_instance_ids lists the flagged tasks.
-"""
 REJECTION_REASON_NO_SCREEN_GAIN: RejectionReason.ValueType  # 3
 """The screen showed no net gain over the best."""
 REJECTION_REASON_EFFICIENCY_CAP: RejectionReason.ValueType  # 4
@@ -370,6 +371,12 @@ queue.
 REJECTION_REASON_NOT_CONFIRMED: RejectionReason.ValueType  # 10
 """Effi-SQL: its gain over the validation seeds plus the confirmation seed fell below the
 confirmation threshold.
+"""
+REJECTION_REASON_HARD_CODED: RejectionReason.ValueType  # 11
+"""It made a matched prediction that a check flagged, in the screen, the validation or the
+confirmation (spec §4.1, §8.2 step 4). The checks are those against hard-coded results, and
+this covers both flags: hard_coded, which is EffiSqlGrade.alt_matched false, and
+literal_result. That phase's flagged_instance_ids lists the flagged tasks.
 """
 Global___RejectionReason: _TypeAlias = RejectionReason  # noqa: Y015
 

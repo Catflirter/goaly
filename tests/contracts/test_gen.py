@@ -1,6 +1,7 @@
 """Tests for goaly.contracts.gen, the code generated from proto/goaly/v1/."""
 
 import importlib
+import json
 import pickle
 import pkgutil
 import re
@@ -307,3 +308,46 @@ def test_the_samples_take_every_oneof_branch() -> None:
     }
 
     assert taken == branches
+
+
+ENUM_FIELDS = [
+    (GetMessageClass(descriptor), field)
+    for module in MODULES
+    for descriptor in message_types(module.DESCRIPTOR.message_types_by_name.values())
+    for field in descriptor.fields
+    if field.enum_type is not None
+]
+
+
+@pytest.mark.parametrize(
+    ("message_type", "field"),
+    ENUM_FIELDS,
+    ids=lambda item: item.full_name if isinstance(item, FieldDescriptor) else "",
+)
+def test_every_value_of_every_enum_field_round_trips_by_name(
+    message_type: type[Message], field: FieldDescriptor
+) -> None:
+    # JSONL keys enum values by name, so each value must be written as its name and read back.
+    enum = field.enum_type
+    assert enum is not None
+    for value in enum.values:
+        message = message_type()
+        if field.is_repeated:
+            getattr(message, field.name).append(value.number)
+        else:
+            setattr(message, field.name, value.number)
+
+        line = to_json_line(message)
+        written = json.loads(line)[field.name]
+
+        assert written == ([value.name] if field.is_repeated else value.name)
+        assert from_json_line(line, message_type) == message
+
+
+def test_there_are_enum_fields_to_round_trip() -> None:
+    assert {field.full_name for _, field in ENUM_FIELDS} >= {
+        "goaly.v1.Grade.status",
+        "goaly.v1.ExperimentRecord.rejection_reasons",
+        "goaly.v1.GuardResult.guard",
+        "goaly.v1.LaneEvent.kind",
+    }
