@@ -253,21 +253,32 @@ class Usage(_message.Message):
     output_tokens: _builtins.int
     """Completion tokens, reasoning tokens included."""
     reasoning_tokens: _builtins.int
-    """How many of output_tokens the model spent reasoning."""
+    """How many of output_tokens the model spent reasoning; unset if the gateway reported no
+    reasoning breakdown.
+    """
     cost_usd: _builtins.float
-    """The cost in US dollars, as the gateway reports it in the x-litellm-response-cost header."""
+    """The cost in US dollars, as the gateway reports it in the x-litellm-response-cost header;
+    unset if it reported none, as for a failed or cancelled call without the header.
+    """
     def __init__(
         self,
         *,
         input_tokens: _builtins.int = ...,
         output_tokens: _builtins.int = ...,
-        reasoning_tokens: _builtins.int = ...,
-        cost_usd: _builtins.float = ...,
+        reasoning_tokens: _builtins.int | None = ...,
+        cost_usd: _builtins.float | None = ...,
     ) -> None: ...
-    _HasFieldArgType: _TypeAlias = _Never  # noqa: Y015
+    _HasFieldArgType: _TypeAlias = _typing.Literal["_cost_usd", b"_cost_usd", "_reasoning_tokens", b"_reasoning_tokens", "cost_usd", b"cost_usd", "reasoning_tokens", b"reasoning_tokens"]  # noqa: Y015
     def HasField(self, field_name: _HasFieldArgType) -> _builtins.bool: ...
-    _ClearFieldArgType: _TypeAlias = _typing.Literal["cost_usd", b"cost_usd", "input_tokens", b"input_tokens", "output_tokens", b"output_tokens", "reasoning_tokens", b"reasoning_tokens"]  # noqa: Y015
+    _ClearFieldArgType: _TypeAlias = _typing.Literal["_cost_usd", b"_cost_usd", "_reasoning_tokens", b"_reasoning_tokens", "cost_usd", b"cost_usd", "input_tokens", b"input_tokens", "output_tokens", b"output_tokens", "reasoning_tokens", b"reasoning_tokens"]  # noqa: Y015
     def ClearField(self, field_name: _ClearFieldArgType) -> None: ...
-    def WhichOneof(self, oneof_group: _Never) -> None: ...
+    _WhichOneofReturnType__cost_usd: _TypeAlias = _typing.Literal["cost_usd"]  # noqa: Y015
+    _WhichOneofArgType__cost_usd: _TypeAlias = _typing.Literal["_cost_usd", b"_cost_usd"]  # noqa: Y015
+    _WhichOneofReturnType__reasoning_tokens: _TypeAlias = _typing.Literal["reasoning_tokens"]  # noqa: Y015
+    _WhichOneofArgType__reasoning_tokens: _TypeAlias = _typing.Literal["_reasoning_tokens", b"_reasoning_tokens"]  # noqa: Y015
+    @_typing.overload
+    def WhichOneof(self, oneof_group: _WhichOneofArgType__cost_usd) -> _WhichOneofReturnType__cost_usd | None: ...
+    @_typing.overload
+    def WhichOneof(self, oneof_group: _WhichOneofArgType__reasoning_tokens) -> _WhichOneofReturnType__reasoning_tokens | None: ...
 
 Global___Usage: _TypeAlias = Usage  # noqa: Y015

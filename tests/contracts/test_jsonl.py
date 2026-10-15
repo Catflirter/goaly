@@ -195,6 +195,18 @@ def test_writes_each_attempt_of_a_call_and_only_the_retry_after_it_was_sent() ->
     assert from_json_line(line, LlmCallRecord) == record
 
 
+def test_leaves_out_usage_the_gateway_did_not_report() -> None:
+    # Not reported, as when a failed call has no cost header, is not the same as zero.
+    unreported = parse(to_json_line(Usage(input_tokens=10, output_tokens=5)))
+    reported = parse(
+        to_json_line(Usage(input_tokens=10, output_tokens=5, reasoning_tokens=0, cost_usd=0.0))
+    )
+
+    assert "reasoning_tokens" not in unreported
+    assert "cost_usd" not in unreported
+    assert (reported["reasoning_tokens"], reported["cost_usd"]) == ("0", 0.0)
+
+
 def test_writes_timestamps_in_rfc_3339() -> None:
     started_at = Timestamp()
     started_at.FromDatetime(datetime(2026, 10, 15, 1, 2, 3, 456000, tzinfo=UTC))
