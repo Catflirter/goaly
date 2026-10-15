@@ -197,6 +197,16 @@ def test_a_trajectory_survives_a_jsonl_round_trip(tmp_path: Path) -> None:
     assert read.steps[0].folds[0].replacement == "[folded]"
 
 
+def test_a_label_names_one_chat() -> None:
+    record = TrajectoryRecorder()
+    record.start_chat("main", [])
+
+    with pytest.raises(ValueError, match="already has a chat named 'main'"):
+        record.start_chat("main", [])
+
+    assert len(record.trajectory().chats) == 1
+
+
 @pytest.mark.parametrize("label", ["", " "])
 def test_a_chat_needs_a_label(label: str) -> None:
     with pytest.raises(ValueError, match="label"):

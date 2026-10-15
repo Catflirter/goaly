@@ -7,7 +7,14 @@ import pytest
 from pydantic import ValidationError
 
 from goaly.contracts.gen.trajectory_pb2 import StopReason
-from goaly.harness.core.budgets import Budgets, BudgetUse, ErrorStreak
+from goaly.harness.core.budgets import (
+    CALLS_PER_REPLY,
+    REMIND_AFTER_ERRORS,
+    STOP_AFTER_ERRORS,
+    Budgets,
+    BudgetUse,
+    ErrorStreak,
+)
 
 STEPS = StopReason.STOP_REASON_STEP_BUDGET_EXHAUSTED
 TIME = StopReason.STOP_REASON_TIME_BUDGET_EXHAUSTED
@@ -31,8 +38,12 @@ def test_v0_effisql_budgets_read_from_config() -> None:
     assert v0 == Budgets(steps=30, wall_clock_s=600.0)
     assert v0.tokens is None
     assert v0.cost_usd is None
-    assert (v0.remind_after_errors, v0.stop_after_errors) == (3, 5)  # Spec §5.1.
-    assert v0.calls_per_reply == 16
+    assert set(Budgets.model_fields) == {"steps", "wall_clock_s", "tokens", "cost_usd"}
+
+
+def test_the_error_rules_are_cores_constants() -> None:
+    # Spec §5.1: remind after 3 errors in a row, stop after 5; at most 16 calls run per reply.
+    assert (REMIND_AFTER_ERRORS, STOP_AFTER_ERRORS, CALLS_PER_REPLY) == (3, 5, 16)
 
 
 @pytest.mark.parametrize(
@@ -48,10 +59,10 @@ def test_v0_effisql_budgets_read_from_config() -> None:
         {"steps": 30, "wall_clock_s": 600, "tokens": 0},
         {"steps": 30, "wall_clock_s": 600, "cost_usd": 0},
         {"steps": 30, "wall_clock_s": 600, "cost_usd": math.inf},
-        {"steps": 30, "wall_clock_s": 600, "remind_after_errors": 0},
-        {"steps": 30, "wall_clock_s": 600, "remind_after_errors": 5},  # Not before the stop.
-        {"steps": 30, "wall_clock_s": 600, "stop_after_errors": 3},
-        {"steps": 30, "wall_clock_s": 600, "calls_per_reply": 0},
+        # The error rules are core's (spec §5.1), so a pack's config cannot set them.
+        {"steps": 30, "wall_clock_s": 600, "remind_after_errors": 3},
+        {"steps": 30, "wall_clock_s": 600, "stop_after_errors": 5},
+        {"steps": 30, "wall_clock_s": 600, "calls_per_reply": 16},
         {"steps": 30, "wall_clock_s": 600, "max_steps": 30},  # Unknown fields are typos.
     ],
 )
@@ -101,7 +112,7 @@ def test_no_token_or_cost_budget_means_no_cap() -> None:
 
 
 def test_an_error_streak_counts_errors_in_a_row_and_a_success_resets_it() -> None:
-    streak = ErrorStreak(budgets())
+    streak = ErrorStreak()
 
     for error in (True, True, False, True):
         streak.add(error=error)
@@ -111,7 +122,7 @@ def test_an_error_streak_counts_errors_in_a_row_and_a_success_resets_it() -> Non
 
 
 def test_an_error_streak_reminds_once_when_it_reaches_the_reminder() -> None:
-    streak = ErrorStreak(budgets())
+    streak = ErrorStreak()
     reminders = []
     for _ in range(4):
         streak.add(error=True)
@@ -121,7 +132,7 @@ def test_an_error_streak_reminds_once_when_it_reaches_the_reminder() -> None:
 
 
 def test_a_new_streak_gets_a_new_reminder() -> None:
-    streak = ErrorStreak(budgets())
+    streak = ErrorStreak()
     for _ in range(3):
         streak.add(error=True)
     assert streak.take_reminder()
@@ -133,10 +144,13 @@ def test_a_new_streak_gets_a_new_reminder() -> None:
     assert streak.take_reminder()
 
 
-def test_an_error_streak_is_exhausted_at_the_stop() -> None:
-    streak = ErrorStreak(budgets(remind_after_errors=1, stop_after_errors=2))
+def test_an_error_streak_is_exhausted_at_the_stop_after_its_reminder() -> None:
+    streak = ErrorStreak()
+    for _ in range(STOP_AFTER_ERRORS - 1):
+        streak.add(error=True)
+    assert streak.take_reminder()  # The reminder came first...
+    assert not streak.exhausted
 
     streak.add(error=True)
-    assert not streak.exhausted
-    streak.add(error=True)
-    assert streak.exhausted
+
+    assert streak.exhausted  # ...and the stop only after another error.

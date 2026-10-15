@@ -1,10 +1,10 @@
 """Trajectories (spec §5.1): a task's chats and steps, as the agent loop records them in memory.
 
-A :class:`TrajectoryRecorder` builds the part of a task's Trajectory that the loop knows: its
+A :class:`TrajectoryRecorder` builds the part of a task's Trajectory that the loop owns: its
 chats, one Step per model call holding only what the call added to its chat, the usage of every
-model call, and why the agent stopped. The runner, the single writer of trajectories.jsonl
-(T06), reads it from the task's context once the policy returns or raises, and fills in the
-rest: the run, task and seed, the prediction and the grade, the error and the timestamps.
+model call, the stop reason and the error message. The runner, the single writer of
+trajectories.jsonl (T06), reads it from the task's context once the policy returns or raises,
+and fills in the rest: the run, task and seed, the prediction, the grade and the timestamps.
 
 Versioning is the contract's: a Trajectory is a ``goaly.v1`` message, whose package names the
 schema version, and the proto files' rules keep old lines readable (spec §3.3).
@@ -44,9 +44,14 @@ class TrajectoryRecorder:
         self._trajectory = Trajectory()
 
     def start_chat(self, label: str, messages: Sequence[ChatMessage]) -> int:
-        """Start a chat named ``label`` that begins with ``messages``, and return its index."""
+        """Start a chat named ``label`` that begins with ``messages``, and return its index.
+
+        Raise ValueError for a blank label, or one that another chat of the task has.
+        """
         if not label.strip():
             raise ValueError("a chat needs a label, such as 'main'")
+        if any(chat.label == label for chat in self._trajectory.chats):
+            raise ValueError(f"the task already has a chat named {label!r}")
         self._trajectory.chats.add(label=label, initial_messages=messages)
         return len(self._trajectory.chats) - 1
 
