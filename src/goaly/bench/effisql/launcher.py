@@ -166,13 +166,13 @@ class DockerSandbox:
         await asyncio.to_thread(remove_solve_containers, run_id=run_id)
 
 
-def _open_proxy(recorder: CallRecorder) -> AbstractAsyncContextManager[Gateway]:
-    """T03's proxy, which records each request it forwards to ``recorder``.
+def _open_proxy(recorder: CallRecorder, run_id: str) -> AbstractAsyncContextManager[Gateway]:
+    """T03's proxy for run ``run_id``, which records every request to ``recorder``.
 
-    TODO(T03 fix round): pass ``recorder`` to LlmProxy once it takes one; until then the proxy
-    keeps no records and the call log holds only what the container's client logged.
+    TODO(T03 fix round, #33): becomes ``LlmProxy(load_settings(), recorder, run_id=run_id)``
+    once the proxy takes a recorder; until then it keeps no records of its own.
     """
-    del recorder
+    del recorder, run_id
     return LlmProxy(load_settings())
 
 
@@ -182,7 +182,7 @@ class EffiSqlLauncher:
 
     paths: Callable[[], EffiSqlPaths] = EffiSqlPaths.default
     sandbox: Callable[[], Sandbox] = DockerSandbox
-    proxy: Callable[[CallRecorder], AbstractAsyncContextManager[Gateway]] = _open_proxy
+    proxy: Callable[[CallRecorder, str], AbstractAsyncContextManager[Gateway]] = _open_proxy
     credentials: Callable[[], PgCredentials] = load_credentials
     # The solving instances' ports, which the agent role reaches.
     solving_ports: tuple[int, ...] = field(
@@ -201,7 +201,10 @@ class EffiSqlLauncher:
         command = container_command(request, staged)
         timeout_s = _timeout(len(request.tasks), request.max_tasks, request.task_timeout_s)
         log = request.solve_dir.parent / "solve-container.log"  # Host-side, beside solve/.
-        async with self._recorder(request.llm_calls) as recorder, self.proxy(recorder) as gateway:
+        async with (
+            self._recorder(request.llm_calls) as recorder,
+            self.proxy(recorder, request.run_id) as gateway,
+        ):
             environment = SolveEnvironment(
                 base_url=gateway.base_url,
                 token=SecretStr(gateway.container_env()["GOALY_API_KEY"]),

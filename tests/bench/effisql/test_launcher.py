@@ -124,7 +124,7 @@ def setup(
     proxy = FakeProxy()
 
     @asynccontextmanager
-    async def open_proxy(recorder: CallRecorder) -> AsyncIterator[FakeProxy]:
+    async def open_proxy(recorder: CallRecorder, run_id: str) -> AsyncIterator[FakeProxy]:
         proxy.recorders.append(recorder)
         recorder.record(LlmCallRecord(call_id="via-proxy"))
         try:

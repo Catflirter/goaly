@@ -150,6 +150,17 @@ def build_parser(budgets_file: Path) -> argparse.ArgumentParser:
         help="the evaluation cache; runs that grade differently use different ones",
     )
     run.add_argument("--run-id", metavar="ID", help="the run's ID (default: a new one)")
+    run.add_argument(
+        "--in-container",
+        action="store_true",
+        help="this is the solve phase inside its container (with --phase solve and --inputs)",
+    )
+    run.add_argument(
+        "--inputs",
+        type=Path,
+        metavar="DIR",
+        help="the container's read-only inputs, which its launcher staged (with --in-container)",
+    )
     run.add_argument("--log-level", default="INFO", choices=["DEBUG", "INFO", "WARNING", "ERROR"])
     return parser
 
@@ -199,6 +210,10 @@ async def _run(args: argparse.Namespace, command_line: list[str], registry: Regi
         raise ValueError(f"--phase {args.phase} needs --split or --instances")
     if args.instances is not None and not args.instances.is_file():
         raise ValueError(f"no such task file: {args.instances}")
+    if args.in_container and (args.phase != "solve" or args.inputs is None):
+        raise ValueError("--in-container runs --phase solve only, with --inputs")
+    if args.inputs is not None and not args.in_container:
+        raise ValueError("--inputs is for --in-container")
     factory = registry.factory(args.bench, args.harness)  # First: the benchmark names the share.
     harness_name = args.harness or registry.harnesses(args.bench)[0]
     if args.budget_phase is None:
@@ -216,6 +231,8 @@ async def _run(args: argparse.Namespace, command_line: list[str], registry: Regi
             llm_shares=llm_shares,
             split=_split(args),
             budget_phase=args.budget_phase,
+            in_container=args.in_container,
+            inputs_dir=args.inputs,
         )
         async with factory(options) as harness:
             return await _run_harness(args, command_line, harness, harness_name, llm_shares, lock)
@@ -235,6 +252,8 @@ _SOLVING_OPTIONS = (
     "max_tasks",
     "task_timeout",
     "run_id",
+    "in_container",
+    "inputs",
 )
 
 
