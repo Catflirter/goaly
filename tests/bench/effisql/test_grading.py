@@ -436,6 +436,14 @@ class TestMeasureBase:
             measured_at=measured.measured_at,
         )
 
+    def test_with_an_rng_times_the_base_against_itself_for_the_identity_tau(self) -> None:
+        main = main_session(base_times=[1000.0, 1100.0, 900.0, 1000.0, 1000.0, 1000.0])
+        rng = random.Random(0)  # noqa: S311  # A reproducible order, not a secret.
+        measured = measure_base(sessions(main, alt_session()), INST, identity_rng=rng)
+        assert measured.timing_runs == 3
+        assert main.kinds(BASE_SQL).count("time") == 6
+        assert measured.identity_speedup == pytest.approx(measured.base_ms / 1000.0)
+
     @pytest.mark.parametrize("error", [QueryError("boom"), QueryTimeoutError("late")])
     def test_a_failed_base_timing_raises_its_error(self, error: Exception) -> None:
         main = main_session(base_times=[error])

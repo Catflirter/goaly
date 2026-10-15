@@ -291,10 +291,15 @@ class GradingSessions:
                 session.close()
 
 
-def measure_base(sessions: GradingSessions, inst: EffiSqlInstance) -> BaseEntry:
-    """Measure what dev mode caches of the task's base query; no identity τ yet.
+def measure_base(
+    sessions: GradingSessions, inst: EffiSqlInstance, *, identity_rng: random.Random | None = None
+) -> BaseEntry:
+    """Measure what dev mode caches of the task's base query.
 
-    Raise QueryError or QueryTimeoutError if the base query fails, GraderError if the grader does.
+    With ``identity_rng``, as the setup runs it, the base is timed against itself with the
+    interleaved protocol: the entry's time is one side's median and its identity τ the ratio.
+    Without, the base is timed alone and the entry has no identity τ. Raise QueryError or
+    QueryTimeoutError if the base query fails, GraderError if the grader does.
     """
     base_sql = inst.base_sql
     relations = inspect_plan(sessions.main.plan(base_sql), frozenset()).relations
@@ -303,8 +308,18 @@ def measure_base(sessions: GradingSessions, inst: EffiSqlInstance) -> BaseEntry:
     sessions.check_abort()
     alt = sessions.alt.digest(base_sql)
     sessions.check_abort()
+
+    def time_it() -> float:
+        sessions.check_abort()
+        return sessions.main.execution_ms(base_sql)
+
+    identity: float | None = None
     try:
-        base_ms, runs = time_base(lambda: sessions.main.execution_ms(base_sql))
+        if identity_rng is None:
+            base_ms, runs = time_base(time_it)
+        else:
+            timing = time_interleaved(time_it, time_it, rng=identity_rng)
+            base_ms, runs, identity = timing.base_ms, timing.runs, timing.speedup
     except TimingError as error:
         cause = error.__cause__
         assert isinstance(cause, QueryError | QueryTimeoutError)  # noqa: S101  # TimingError's contract.
@@ -319,6 +334,7 @@ def measure_base(sessions: GradingSessions, inst: EffiSqlInstance) -> BaseEntry:
         base_ms=base_ms,
         timing_runs=runs,
         relations=tuple(sorted(relations)),
+        identity_speedup=identity,
         measured_on=sessions.instance,
         measured_at=datetime.now(UTC),
     )
