@@ -2,7 +2,8 @@
 
 ``Gateway`` answers each request with the next of its scripted replies, shaped as the real
 gateway (LiteLLM 1.92 on SGLang) sent them on 2026-10-15. It runs behind httpx.MockTransport, so
-no test reaches the network. ``FakeClock`` makes every wait take no time.
+no test reaches the network. ``FakeClock`` makes every wait take no time, and ``FakeLLM``
+injects faults at random, for the stress test.
 
 pytest puts the repository root on sys.path, so tests import these as
 ``tests.harness.core.llm_fakes``.
@@ -11,6 +12,7 @@ pytest puts the repository root on sys.path, so tests import these as
 import asyncio
 import json
 import random
+from collections import Counter
 from collections.abc import Awaitable, Callable, Mapping, Sequence
 from typing import Any
 
@@ -181,3 +183,51 @@ def connect(
 def attempts(record: LlmCallRecord) -> list[tuple[int, int]]:
     """Each attempt's status and HTTP status."""
     return [(attempt.status, attempt.http_status) for attempt in record.attempts]
+
+
+class FakeLLM:
+    """A gateway that answers after a random latency and injects faults: 429s and timeouts.
+
+    Over its first ``storm_requests`` requests, a request gets a 429 with probability
+    ``rate_limited``, or else, with probability ``timeouts``, hangs for ``hang_s``: longer than
+    the client's timeout. After the storm it only answers, still after a random latency. It counts
+    each model's requests in flight, so a test can check the client never went over its share.
+    """
+
+    def __init__(
+        self,
+        *,
+        seed: int,
+        latency_s: float,
+        hang_s: float,
+        rate_limited: float,
+        timeouts: float,
+        storm_requests: int,
+    ) -> None:
+        self._rng = random.Random(seed)  # noqa: S311 - simulated faults, not security.
+        self._latency_s = latency_s
+        self._hang_s = hang_s
+        self._rate_limited = rate_limited
+        self._timeouts = timeouts
+        self._storm_requests = storm_requests
+        self.requests = 0
+        self.in_flight: Counter[str] = Counter()
+        self.max_in_flight: dict[str, int] = {}
+
+    async def handle(self, request: httpx.Request) -> httpx.Response:
+        model = json.loads(request.content)["model"]
+        self.requests += 1
+        roll = self._rng.random() if self.requests <= self._storm_requests else 1.0
+        latency = self._rng.uniform(0.0, self._latency_s)
+        self.in_flight[model] += 1
+        self.max_in_flight[model] = max(self.max_in_flight.get(model, 0), self.in_flight[model])
+        try:
+            if roll < self._rate_limited:
+                await asyncio.sleep(latency)
+                return failure(429)
+            if roll < self._rate_limited + self._timeouts:
+                await asyncio.sleep(self._hang_s)
+            await asyncio.sleep(latency)
+            return completion()
+        finally:
+            self.in_flight[model] -= 1

@@ -6,12 +6,15 @@ tool calls as the model wrote them, for core's parser (T04). The OpenAI wire for
 inside this module. For each call the client:
 
 - checks the model allowlist and applies the model's profile (``llm_models``);
+- holds each attempt to the model's concurrency limit, which adapts to how the gateway copes
+  (``llm_throttle``);
 - gives every attempt a timeout, and retries 429s, 5xx responses, timeouts and connection
   errors with exponential backoff (``RetryPolicy``);
 - raises a typed error when the call fails (``llm_errors``);
 - hands one ``LlmCallRecord`` to a ``CallRecorder``, however the call ends.
 
-A process uses one client, on its event loop::
+A process uses one client, on its event loop, so that each model has one limit and one
+connection pool, sized to the process's share of the model's budget::
 
     async with LlmClient(load_settings(), JsonlCallRecorder(path)) as llm:
         reply = await llm.complete(
@@ -56,7 +59,13 @@ from goaly.harness.core.llm_models import (
     ModelProfile,
     allowed_model,
 )
-from goaly.harness.core.llm_throttle import Clock, SystemClock
+from goaly.harness.core.llm_throttle import (
+    DEFAULT_SHARES,
+    Clock,
+    ModelThrottle,
+    SystemClock,
+    ThrottlePolicy,
+)
 from goaly.harness.core.settings import Settings
 
 __all__ = [
@@ -231,7 +240,8 @@ class _Outcome:
 class LlmClient:
     """An async client of the OpenAI-compatible model gateway; the module docstring has more.
 
-    ``profiles`` replace the default profiles of their models (llm_models.DEFAULT_PROFILES).
+    ``profiles`` replace the default profiles of their models (llm_models.DEFAULT_PROFILES),
+    and ``shares`` the default shares, each model's whole budget (llm_throttle.DEFAULT_SHARES).
     ``transport``, ``clock`` and ``rng`` are for tests: a mock transport, a clock that skips
     waits, and a seeded source of jitter.
     """
@@ -242,7 +252,9 @@ class LlmClient:
         recorder: CallRecorder,
         *,
         profiles: Iterable[ModelProfile] = (),
+        shares: Mapping[str, int] | None = None,
         retry: RetryPolicy | None = None,
+        throttle: ThrottlePolicy | None = None,
         transport: httpx.AsyncBaseTransport | None = None,
         clock: Clock | None = None,
         rng: random.Random | None = None,
@@ -252,17 +264,31 @@ class LlmClient:
             if profile.model not in self._profiles:
                 raise ValueError(f"no call purpose may use {profile.model}, so it has no profile")
             self._profiles[profile.model] = profile
+        shares = {**DEFAULT_SHARES, **(shares or {})}
+        for model in shares:
+            if model not in self._profiles:
+                raise ValueError(f"no call purpose may use {model}, so it has no share")
         self._recorder = recorder
         self._retry = RetryPolicy() if retry is None else retry
         self._clock: Clock = SystemClock() if clock is None else clock
         self._rng = random.Random() if rng is None else rng  # noqa: S311 - jitter, not secrecy.
+        policy = ThrottlePolicy() if throttle is None else throttle
+        self._throttles = {
+            model: ModelThrottle(model, share, policy, self._clock)
+            for model, share in shares.items()
+        }
         self._api_key = settings.api_key
-        self._http = httpx.AsyncClient(
-            base_url=settings.base_url,
-            headers={"Authorization": f"Bearer {settings.api_key.get_secret_value()}"},
-            timeout=self._retry.timeout_s,
-            transport=transport,
-        )
+        headers = {"Authorization": f"Bearer {settings.api_key.get_secret_value()}"}
+        self._http = {  # One connection pool per model, as large as its share.
+            model: httpx.AsyncClient(
+                base_url=settings.base_url,
+                headers=headers,
+                timeout=self._retry.timeout_s,
+                limits=httpx.Limits(max_connections=share, max_keepalive_connections=share),
+                transport=transport,
+            )
+            for model, share in shares.items()
+        }
 
     async def __aenter__(self) -> Self:
         return self
@@ -277,7 +303,8 @@ class LlmClient:
 
     async def aclose(self) -> None:
         """Close the client's connections; it cannot make calls after."""
-        await self._http.aclose()
+        for http in self._http.values():
+            await http.aclose()
 
     async def complete(
         self,
@@ -333,7 +360,7 @@ class LlmClient:
         """Make attempts until one succeeds, one fails for good, or the retries run out."""
         delay = 0.0
         while True:
-            outcome = await self._attempt(record.attempts.add(), body, delay)
+            outcome = await self._attempt(record, record.attempts.add(), body, delay)
             if outcome.cost_usd is not None:
                 record.usage.cost_usd += outcome.cost_usd  # Every attempt the gateway billed.
             if outcome.response is not None:
@@ -346,16 +373,24 @@ class LlmClient:
             delay = self._retry.delay_s(retries, outcome.retry_after_s, self._rng)
             self._log_backoff(record, outcome, delay)
 
-    async def _attempt(self, attempt: LlmCallAttempt, body: bytes, delay: float) -> _Outcome:
-        """Wait ``delay``, send the request once, and fill in ``attempt`` with how it went."""
+    async def _attempt(
+        self, record: LlmCallRecord, attempt: LlmCallAttempt, body: bytes, delay: float
+    ) -> _Outcome:
+        """Wait ``delay`` and then for a slot, send the request once, and fill in ``attempt``.
+
+        Its wait is the backoff and the time the model's throttle held it back (spec §6.2).
+        """
         attempt.started_at.GetCurrentTime()
         began = self._clock.monotonic()
         sent: float | None = None
+        throttle = self._throttles[record.model]
         try:
             if delay > 0:
                 await self._clock.sleep(delay)
-            sent = self._clock.monotonic()
-            outcome = await self._request(body)
+            async with throttle.slot(record):
+                sent = self._clock.monotonic()
+                outcome = await self._request(self._http[record.model], body)
+                throttle.observe(outcome.status, outcome.http_status, sent, record)
         except asyncio.CancelledError:
             attempt.status = _S.LLM_CALL_STATUS_CANCELLED
             raise
@@ -369,13 +404,11 @@ class LlmClient:
             attempt.retry_after_s = outcome.retry_after_s
         return outcome
 
-    async def _request(self, body: bytes) -> _Outcome:
+    async def _request(self, http: httpx.AsyncClient, body: bytes) -> _Outcome:
         """Send the request and say how it went. Only cancellation and bugs raise."""
         try:
             async with asyncio.timeout(self._retry.timeout_s):
-                response = await self._http.post(
-                    "/chat/completions", content=body, headers=_JSON_HEADERS
-                )
+                response = await http.post("/chat/completions", content=body, headers=_JSON_HEADERS)
         except (TimeoutError, httpx.TimeoutException):
             detail = f"no response within {self._retry.timeout_s:g} s"
             return _Outcome(_S.LLM_CALL_STATUS_TIMEOUT, detail=detail)

@@ -1,6 +1,8 @@
 """Tests for goaly.harness.core.llm_throttle: slots, AIMD and the circuit breaker.
 
-The tests drive a ModelThrottle directly, on a FakeClock.
+The unit tests drive a ModelThrottle directly, on a FakeClock. The tests at the end run the
+client: waits counted into the record, one throttle per model, and a stress test of 500 calls
+against a FakeLLM that injects 429s, latency and timeouts.
 """
 
 import asyncio
@@ -8,15 +10,27 @@ import logging
 from contextlib import AsyncExitStack
 from typing import Any
 
+import httpx
 import pytest
 from pydantic import ValidationError
 
 from goaly.contracts.gen.llm_call_pb2 import CallPurpose, LlmCallRecord, LlmCallStatus
+from goaly.harness.core.llm import LlmClient, LlmReply, RetryPolicy
+from goaly.harness.core.llm_errors import LlmError, ServerError
 from goaly.harness.core.llm_throttle import DEFAULT_SHARES, ModelThrottle, ThrottlePolicy
 from tests.harness.core.llm_fakes import (
+    ANALYST,
+    EXEC,
     GLM,
     QWEN,
     FakeClock,
+    FakeLLM,
+    Gateway,
+    Recorder,
+    completion,
+    failure,
+    settings,
+    user,
 )
 
 pytestmark = pytest.mark.anyio
@@ -502,3 +516,140 @@ async def test_logs_opening_and_closing_with_the_purpose_and_model(
         "open_s": 60.0,
     }
     assert {key: getattr(closed, key) for key in base} == base
+
+
+# Through the client.
+
+
+async def test_slot_waits_count_into_the_attempts_wait() -> None:
+    clock = FakeClock()
+
+    async def slow(request: httpx.Request) -> httpx.Response:
+        await asyncio.sleep(0)
+        clock.now += 2.0  # The first call holds the only slot for 2 s.
+        return completion()
+
+    gateway = Gateway(slow, completion())
+    async with LlmClient(
+        settings(),
+        Recorder(),
+        shares={QWEN: 1},
+        transport=httpx.MockTransport(gateway.handle),
+        clock=clock,
+    ) as llm:
+        first, second = await asyncio.gather(
+            llm.complete([user("one")], model=QWEN, tags=EXEC),
+            llm.complete([user("two")], model=QWEN, tags=EXEC),
+        )
+
+    assert first.record.attempts[0].wait_s == 0.0
+    assert second.record.attempts[0].wait_s == 2.0
+    assert second.record.wait_s == 2.0
+
+
+async def test_an_open_breaker_holds_back_new_calls_and_counts_as_their_wait() -> None:
+    clock = FakeClock()
+    gateway = Gateway(failure(500), failure(500), completion(), completion())
+    async with LlmClient(
+        settings(),
+        Recorder(),
+        retry=RetryPolicy(max_retries=1),
+        throttle=ThrottlePolicy(breaker_min_attempts=2),
+        transport=httpx.MockTransport(gateway.handle),
+        clock=clock,
+    ) as llm:
+        with pytest.raises(ServerError):
+            await llm.complete([user("hi")], model=QWEN, tags=EXEC)
+        clock.sleeps.clear()
+        held_back = await llm.complete([user("hi")], model=QWEN, tags=EXEC)
+        free = await llm.complete([user("hi")], model=GLM, tags=ANALYST)
+
+    assert clock.sleeps == [60.0]
+    assert held_back.record.attempts[0].wait_s == 60.0
+    assert free.record.wait_s == 0.0  # Each model has its own breaker.
+
+
+async def test_each_model_has_its_own_limit(caplog: pytest.LogCaptureFixture) -> None:
+    caplog.set_level(logging.INFO, logger="goaly.harness.core.llm_throttle")
+    gateway = Gateway(failure(429), completion(), completion())
+    async with LlmClient(
+        settings(), Recorder(), transport=httpx.MockTransport(gateway.handle), clock=FakeClock()
+    ) as llm:
+        await llm.complete([user("hi")], model=QWEN, tags=EXEC)
+        await llm.complete([user("hi")], model=GLM, tags=ANALYST)
+
+    (down,) = events(caplog, "llm_limit_down")
+    assert {key: getattr(down, key) for key in ("model", "limit", "share")} == {
+        "model": QWEN,
+        "limit": 24,
+        "share": 48,
+    }
+
+
+@pytest.mark.parametrize(
+    ("shares", "message"),
+    [({"gpt-4o": 4}, "gpt-4o"), ({QWEN: 0}, "share")],
+)
+def test_the_client_refuses_a_share_it_cannot_use(shares: dict[str, int], message: str) -> None:
+    with pytest.raises(ValueError, match=message):
+        LlmClient(settings(), Recorder(), shares=shares)
+
+
+# The stress test (spec §6.2): faults, latency and timeouts, 500 calls at once.
+
+STRESS_SHARES = {QWEN: 8, GLM: 3}
+
+
+async def test_500_faulty_calls_stay_within_the_share_and_are_each_recorded_once(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    caplog.set_level(logging.INFO, logger="goaly.harness.core.llm_throttle")
+    # A storm of 429s and timeouts over the first 100 requests drives both limits down to 1;
+    # the calm after it is long enough for them to grow back, with room to spare.
+    gateway = FakeLLM(
+        seed=20261015,
+        latency_s=0.005,
+        hang_s=1.0,
+        rate_limited=0.25,
+        timeouts=0.05,
+        storm_requests=100,
+    )
+    recorder = Recorder()
+    retry = RetryPolicy(timeout_s=0.2, backoff_base_s=0.001, backoff_cap_s=0.01)
+    policy = ThrottlePolicy(breaker_window_s=1.0, breaker_open_s=0.05)
+    async with LlmClient(
+        settings(),
+        recorder,
+        shares=STRESS_SHARES,
+        retry=retry,
+        throttle=policy,
+        transport=httpx.MockTransport(gateway.handle),
+    ) as llm:
+
+        async def one(n: int) -> LlmReply | LlmError:
+            model, tags = (GLM, ANALYST) if n % 4 == 0 else (QWEN, EXEC)
+            try:
+                return await llm.complete([user(f"task {n}")], model=model, tags=tags)
+            except LlmError as error:  # Retries can run out during the storm.
+                return error
+
+        async with asyncio.timeout(60):  # Nothing deadlocks.
+            results = await asyncio.gather(*(one(n) for n in range(500)))
+
+    assert gateway.max_in_flight == STRESS_SHARES
+    records = [result.record for result in results]
+    assert all(record is not None for record in records)
+    call_ids = [record.call_id for record in records if record is not None]
+    assert len(set(call_ids)) == 500
+    assert sorted(record.call_id for record in recorder.records) == sorted(call_ids)
+    assert sum(len(record.attempts) for record in recorder.records) == gateway.requests
+    # The limits backed off in the storm and grew back to the share in the calm.
+    for model, share in STRESS_SHARES.items():
+        downs = [entry for entry in events(caplog, "llm_limit_down") if fields(entry)[0] == model]
+        changes = [
+            fields(entry)[1]
+            for entry in caplog.records
+            if getattr(entry, "event", "").startswith("llm_limit") and fields(entry)[0] == model
+        ]
+        assert downs, model
+        assert changes[-1] == share, model
