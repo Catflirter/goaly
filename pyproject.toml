@@ -15,6 +15,7 @@ dependencies = [
     "pydantic>=2.4", # 2.4 added ValidationError.errors(include_input=...)
     "pydantic-settings>=2",
     "python-dotenv>=1", # Parses ~/.config/goaly/pg.env, as pydantic-settings does
+    "pyyaml>=6", # Reads the capability packs' config.yaml (spec §5.2)
 ]
 
 [project.scripts]
@@ -33,6 +34,7 @@ dev = [
     "ruff>=0.17", # ruff is pre-1.0: its minor releases are its breaking releases
     "sqlparse==0.5.2", # The official Effi-SQL runner's pin; the extractor parity tests use it
     "types-protobuf>=7",
+    "types-pyyaml>=6",
 ]
 # RSI only (spec §8.8, §11): `make setup` and CI install it, a plain `uv sync` leaves it out.
 rsi = [
