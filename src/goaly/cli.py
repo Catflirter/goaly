@@ -6,6 +6,7 @@ It wires the layers together. It registers each benchmark with the harnesses tha
 side. Neither imports pack code until a harness opens, so the host loads none (spec V24, V27).
 """
 
+import logging
 import sys
 from pathlib import Path
 
@@ -32,8 +33,14 @@ def registry() -> Registry:
 def main() -> int:
     """The console script: run the `goaly` command with this process's arguments.
 
-    The process keeps to the CPUs of our Python processes, away from the PostgreSQL instances'
-    (spec §6.2), and so does every thread and process it starts.
+    On the host, the process keeps to the CPUs of our Python processes, away from the
+    PostgreSQL instances' (spec §6.2), and so does every thread and process it starts; the solve
+    container's cpuset confines it there.
     """
-    confine_to_python_cpus()
-    return cli.main(sys.argv[1:], registry(), budgets_file=BUDGETS_FILE)
+    argv = sys.argv[1:]
+    if "--in-container" not in argv:  # The container's own cpuset already confines it.
+        try:
+            confine_to_python_cpus()
+        except OSError as error:  # A cpuset without those CPUs.
+            logging.getLogger(__name__).warning("cannot confine to the Python CPUs: %s", error)
+    return cli.main(argv, registry(), budgets_file=BUDGETS_FILE)

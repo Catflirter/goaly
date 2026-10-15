@@ -38,9 +38,12 @@ from goaly.bench.effisql.data import (
     DATASET_REVISION,
     DATASET_SHA256,
     RUNTIME_FILE,
+    ChecksumMismatchError,
     EffiSqlInstance,
     default_cache_dir,
+    fetch_dataset,
     load_instances,
+    write_runtime_file,
 )
 from goaly.bench.effisql.grading import InstanceCheck, Mode
 from goaly.bench.effisql.grading_pool import GRADING_INSTANCES, Priority
@@ -52,7 +55,7 @@ from goaly.bench.effisql.sql_env import SolvingPool, SqlEnvOptions
 from goaly.contracts.gen.llm_call_pb2 import CALL_PURPOSE_EXEC, LlmCallRecord
 from goaly.contracts.gen.manifest_pb2 import ModelSettings, RunManifest
 from goaly.contracts.gen.result_pb2 import TASK_ERROR_TYPE_LLM
-from goaly.contracts.gen.task_pb2 import SPLIT_EXTERNAL, SPLIT_HELDOUT, Grade, Prediction, Split
+from goaly.contracts.gen.task_pb2 import SPLIT_HELDOUT, Grade, Prediction, Split
 from goaly.contracts.interfaces import JsonValue, SqlEnvironment
 from goaly.harness.core.agent import AgentContext
 from goaly.harness.core.budgets import Budgets
@@ -60,7 +63,12 @@ from goaly.harness.core.context_window import ContextWindow
 from goaly.harness.core.jsonl_writer import JsonlWriter
 from goaly.harness.core.llm import BoundLlm, CallRecorder, CallTags, LlmClient
 from goaly.harness.core.llm_errors import ConnectionFailed, RateLimited, ServerError, TimedOut
-from goaly.harness.core.llm_models import EXECUTOR_MODEL, QWEN_PROFILE, ModelParams
+from goaly.harness.core.llm_models import (
+    DEFAULT_PROFILES,
+    EXECUTOR_MODEL,
+    QWEN_PROFILE,
+    ModelParams,
+)
 from goaly.harness.core.manifest import content_hash, read_manifest, sha256_file
 from goaly.harness.core.registry import (
     Harness,
@@ -75,6 +83,7 @@ from goaly.harness.core.settings import load_settings
 
 __all__ = [
     "PACK_DIR",
+    "RUNTIME_SHA256",
     "SOLVING_STATEMENT_TIMEOUT_S",
     "BindsLlm",
     "EffiSqlPaths",
@@ -102,6 +111,11 @@ _logger = logging.getLogger(__name__)
 # The v0 pack's directory, found without importing it: only open_harness imports pack code.
 PACK_DIR = Path(goaly.harness.__file__).resolve().parent / "packs" / "effisql"
 _BENCH_DIR = Path(goaly.bench.effisql.__file__).resolve().parent
+# Every model the client has a profile of; each needs a share.
+_ALL_MODELS = tuple(profile.model for profile in DEFAULT_PROFILES)
+# The sha256 of the runtime copy of the pinned dataset (data.write_runtime_file), which is
+# deterministic; the task file of our splits must be it.
+RUNTIME_SHA256 = "f5145f80e557194c455ad4e8eb42ba3e95c54cdebb0787425d1e80a90de63412"
 
 # The gateway's outages, after the client's retries: no property of the harness, so the task is
 # an infrastructure failure, never cached, and worth running again. Every other LLM failure,
@@ -145,16 +159,24 @@ class EffiSqlPaths:
     plans: Path
     # The grader's caches, one directory per mode; dev mode's holds the setup's base cache.
     grading_cache_root: Path
+    # The sha256 the task file must have: RUNTIME_SHA256, the runtime copy of the pinned
+    # dataset; None not to check, as for a test's synthetic tasks.
+    tasks_sha256: str | None = None
+    # The pinned dataset the runtime copy derives from when it is missing; None if it cannot.
+    dataset_cache: Path | None = None
 
     @classmethod
     def default(cls) -> Self:
         """The host's paths: the dataset cache and T09's data root."""
         pg = PgEnvConfig()
+        cache = default_cache_dir()
         return cls(
-            tasks_file=default_cache_dir() / RUNTIME_FILE,
+            tasks_file=cache / RUNTIME_FILE,
             snapshot=pg.snapshot_path(MAIN_DB),
             plans=pg.plans_path,
             grading_cache_root=pg.data_root / "grader",
+            tasks_sha256=RUNTIME_SHA256,
+            dataset_cache=cache,
         )
 
 
@@ -187,8 +209,11 @@ async def _real_llm(recorder: CallRecorder, shares: Mapping[str, int]) -> LlmCli
 
 
 def _full_shares(shares: Mapping[str, int]) -> dict[str, int]:
-    """``shares``, with a nominal 1 for a model without one: the exec purpose cannot call it."""
-    return {EXECUTOR_MODEL: 1, "glm-5.3": 1, **shares}
+    """``shares``, which must give the executor model one, and a nominal 1 for every other
+    model: the exec purpose cannot call it, but the client needs a share for each."""
+    if EXECUTOR_MODEL not in shares:
+        raise ValueError(f"this process has no share of {EXECUTOR_MODEL}, which the pack calls")
+    return {**dict.fromkeys(_ALL_MODELS, 1), **shares}
 
 
 # The agent's statement timeout, a capacity rule of the shared solving instances (spec §6.2): the
@@ -284,7 +309,7 @@ def load_tasks(
     mode: Mode | None,
     environment_settings: Mapping[str, str],
 ) -> LoadedTasks:
-    tasks = load_instances(paths.tasks_file)
+    tasks = load_instances(_checked_tasks_file(paths))
     external = None if instances_file is None else load_instances(instances_file)
     if instances_file is None:
         source = TaskSource(
@@ -307,9 +332,40 @@ def load_tasks(
         external=external,
         environment_settings=dict(environment_settings),
     )
+    # The grading identity: the mode, the grader's code and, for dev mode, the base cache it
+    # grades against, so a remeasured setup never hands out grades of the old one.
     fingerprint = content_hash({"bench/effisql": _BENCH_DIR})[:16]
-    namespace = "" if mode is None else f"{mode.value}-{fingerprint}"
+    if mode is None:
+        namespace = ""
+    elif mode is Mode.DEV:
+        namespace = f"dev-{fingerprint}-{_base_cache_digest(paths.grading_cache_root)}"
+    else:
+        namespace = f"{mode.value}-{fingerprint}"
     return LoadedTasks(benchmark, namespace)
+
+
+def _checked_tasks_file(paths: EffiSqlPaths) -> Path:
+    """The task file, derived from the pinned dataset if missing, and checked against its sha.
+
+    A stale or changed runtime copy would load other tasks under the pinned dataset's name in
+    the manifest, so it is refused: ChecksumMismatchError, a DatasetError.
+    """
+    if not paths.tasks_file.exists() and paths.dataset_cache is not None:
+        write_runtime_file(fetch_dataset(paths.dataset_cache), paths.tasks_file)
+    if paths.tasks_sha256 is not None:
+        actual = sha256_file(paths.tasks_file)
+        if actual != paths.tasks_sha256:
+            raise ChecksumMismatchError(
+                f"{paths.tasks_file} has sha256 {actual}, not the runtime copy's"
+                f" {paths.tasks_sha256}; delete it to derive it again from the pinned dataset"
+            )
+    return paths.tasks_file
+
+
+def _base_cache_digest(cache_root: Path) -> str:
+    """A digest of the dev base cache the setup measured, which dev grades depend on."""
+    dev = cache_root / Mode.DEV.value
+    return content_hash({"dev": dev})[:16] if dev.is_dir() else "nobase"
 
 
 class LazyGrader:
@@ -340,6 +396,8 @@ async def open_harness(
     options: HarnessOptions, wiring: EffiSqlWiring | None = None
 ) -> AsyncIterator[RunnableHarness]:
     """The v0 pack's harness for one run; the factory registered as effisql's "v0"."""
+    if options.in_container:  # Part (d) adds the solve container's wiring.
+        raise ValueError("the Effi-SQL solve container's wiring is not in this version yet")
     wiring = EffiSqlWiring() if wiring is None else wiring
     # The pack's code, imported here only, so that a grade phase never loads it (spec V24).
     from goaly.harness.packs.effisql.policy import build_policy
@@ -347,7 +405,7 @@ async def open_harness(
     config, prompt = await asyncio.to_thread(load_pack, wiring.pack_dir)
     policy = build_policy(config.pack, prompt)
     split = options.split
-    mode = Mode.DEV if split is None else grading_mode(split)
+    mode = grading_mode(split)
     priority = grading_priority(split, options.budget_phase)
     paths = wiring.paths()
     settings = {"grading_priority": priority.name.lower()}
@@ -356,7 +414,7 @@ async def open_harness(
     await solving.preflight()
     async with AsyncExitStack() as stack:
         grader = None
-        if mode is not None and split != SPLIT_EXTERNAL:
+        if mode is not None:
             grader = LazyGrader(
                 lambda: wiring.grader(paths.grading_cache_root, wiring.instance_check),
                 mode,
@@ -443,8 +501,16 @@ def with_parts(
 
 
 def pack_models(pack_dir: Path = PACK_DIR) -> tuple[ModelSettings, ...]:
-    """The settings of the models the pack calls, from its config.yaml, for Registry.add."""
-    config, _ = load_pack(pack_dir)
+    """The settings of the models the pack calls, from its config.yaml, for Registry.add.
+
+    A config that cannot be read gives none and a warning, so it never blocks a command that
+    does not run the pack, such as a grade phase or --help; a run of the pack fails on it.
+    """
+    try:
+        config, _ = load_pack(pack_dir)
+    except (OSError, ValueError, yaml.YAMLError):
+        _logger.warning("the pack's config.yaml cannot be read", extra={"pack": str(pack_dir)})
+        return ()
     return (model_settings(config.model),)
 
 

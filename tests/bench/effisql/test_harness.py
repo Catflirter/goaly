@@ -4,6 +4,8 @@ The runs here are the FakeLLM dry run: synthetic tasks, a scripted model, fake s
 instances and a fake grader, wired through the real CLI, runner and grade phase.
 """
 
+import dataclasses
+import hashlib
 import json
 import logging
 import subprocess
@@ -16,23 +18,28 @@ from pydantic import ValidationError
 
 from goaly import cli as goaly_cli
 from goaly.bench.effisql.data import (
+    DATASET_FILE,
     DATASET_REVISION,
     DATASET_SHA256,
     RUNTIME_FILE,
+    ChecksumMismatchError,
     EffiSqlInstance,
+    fetch_dataset,
 )
 from goaly.bench.effisql.grading import Mode
 from goaly.bench.effisql.grading_pool import Priority
-from goaly.bench.effisql.harness import (  # Private helpers.
+from goaly.bench.effisql.harness import (
     PACK_DIR,
     EffiSqlPaths,
     EffiSqlWiring,
     PackRunConfig,
     RunCallLog,
+    _full_shares,  # The share rule, tested directly.
     classify_error,
     context_factory,
     grading_priority,
     load_pack,
+    load_tasks,
     model_settings,
     open_harness,
     open_host,
@@ -54,7 +61,7 @@ from goaly.contracts.jsonl import read_jsonl
 from goaly.harness.core import cli
 from goaly.harness.core.budgets import Budgets
 from goaly.harness.core.jsonl_writer import JsonlWriter
-from goaly.harness.core.llm import CallTags
+from goaly.harness.core.llm import BoundLlmClient, CallTags, LlmClient
 from goaly.harness.core.llm_errors import (
     ClientError,
     ConnectionFailed,
@@ -65,11 +72,17 @@ from goaly.harness.core.llm_errors import (
     ServerError,
     TimedOut,
 )
-from goaly.harness.core.llm_models import EXECUTOR_MODEL, ModelParams
+from goaly.harness.core.llm_models import EXECUTOR_MODEL, IMPROVEMENT_MODEL, ModelParams
 from goaly.harness.core.manifest import read_manifest, write_manifest
-from goaly.harness.core.registry import HostOptions, Registry
+from goaly.harness.core.registry import HarnessOptions, HostOptions, Registry
 from goaly.harness.core.runner import RunFiles, RunIdentity
-from tests.bench.effisql.fake_run import OFFICIAL_FORM, FakeClient, FakeWiring, fake_wiring
+from tests.bench.effisql.fake_run import (
+    OFFICIAL_FORM,
+    FakeClient,
+    FakeWiring,
+    fake_wiring,
+    write_inputs,
+)
 from tests.bench.effisql.synthetic import task
 
 pytestmark = pytest.mark.anyio
@@ -346,8 +359,9 @@ class TestRealWiring:
         client = await EffiSqlWiring().llm(recorder, {EXECUTOR_MODEL: 7})
 
         async with client as opened:
+            assert isinstance(opened, LlmClient)
             bound = opened.bind(model=EXECUTOR_MODEL, tags=CallTags(purpose=CALL_PURPOSE_EXEC))
-            assert bound is not None
+            assert isinstance(bound, BoundLlmClient)
 
     def test_the_default_paths_are_the_hosts(self) -> None:
         paths = EffiSqlPaths.default()
@@ -357,7 +371,7 @@ class TestRealWiring:
         assert paths.plans.name == "plans.json"
         assert paths.grading_cache_root.name == "grader"
 
-    def testmodel_settings_leave_out_what_the_profile_does_not_set(self) -> None:
+    def test_model_settings_leave_out_what_the_profile_does_not_set(self) -> None:
         settings = model_settings(ModelParams(enable_thinking=False))
 
         assert settings.model == EXECUTOR_MODEL
@@ -373,7 +387,7 @@ class TestRealWiring:
             ("", Priority.RSI),
         ],
     )
-    def test_therecorded_priority(self, recorded: str, priority: Priority) -> None:
+    def test_the_recorded_priority(self, recorded: str, priority: Priority) -> None:
         manifest = RunManifest(environment_settings={"grading_priority": recorded})
 
         assert recorded_priority(manifest) is priority
@@ -401,3 +415,91 @@ class TestRealWiring:
         async with open_host(HostOptions(files, None, SPLIT_VAL, None), fakes.wiring) as host:
             fields = host.benchmark.manifest_fields()  # type: ignore[attr-defined]
         assert fields.environment_settings["grading_priority"] == "baseline"
+
+
+class TestReviewFixes:
+    def test_the_executor_needs_a_share_and_every_model_gets_one(self) -> None:
+        assert _full_shares({EXECUTOR_MODEL: 7}) == {EXECUTOR_MODEL: 7, IMPROVEMENT_MODEL: 1}
+        with pytest.raises(ValueError, match="no share of qwen"):
+            _full_shares({IMPROVEMENT_MODEL: 3})
+
+    def test_a_changed_runtime_copy_is_refused(self, tmp_path: Path) -> None:
+        paths = write_inputs(tmp_path)
+        pinned = dataclasses.replace(paths, tasks_sha256="0" * 64)
+
+        with pytest.raises(ChecksumMismatchError, match="runtime copy"):
+            load_tasks(pinned, None, Mode.DEV, {})
+
+    def test_a_missing_runtime_copy_is_derived_from_the_dataset(self, tmp_path: Path) -> None:
+        source = write_inputs(tmp_path)
+        cache = tmp_path / "cache"
+        cache.mkdir()
+        dataset = cache / DATASET_FILE
+        dataset.write_bytes(source.tasks_file.read_bytes())
+        digest = hashlib.sha256(dataset.read_bytes()).hexdigest()
+        paths = dataclasses.replace(
+            source, tasks_file=cache / RUNTIME_FILE, dataset_cache=cache, tasks_sha256=None
+        )
+        monkeypatch_fetch = pytest.MonkeyPatch()
+        monkeypatch_fetch.setattr(
+            "goaly.bench.effisql.harness.fetch_dataset",
+            lambda root: fetch_dataset(root, url=dataset.as_uri(), sha256=digest),
+        )
+        try:
+            loaded = load_tasks(paths, None, Mode.DEV, {})
+        finally:
+            monkeypatch_fetch.undo()
+
+        assert (cache / RUNTIME_FILE).exists()
+        assert "optimized_sql" not in (cache / RUNTIME_FILE).read_text()
+        assert loaded.benchmark.tasks
+
+    def test_the_dev_namespace_changes_with_the_base_cache(self, tmp_path: Path) -> None:
+        paths = write_inputs(tmp_path)
+        before = load_tasks(paths, None, Mode.DEV, {}).namespace
+        (paths.grading_cache_root / "dev").mkdir(parents=True)
+        (paths.grading_cache_root / "dev" / "1.json").write_text("{}")
+        after = load_tasks(paths, None, Mode.DEV, {}).namespace
+        official = load_tasks(paths, None, Mode.OFFICIAL, {}).namespace
+
+        assert before.endswith("-nobase")
+        assert after.startswith("dev-")
+        assert after != before
+        assert official.startswith("official-")
+        assert official.count("-") == 1
+
+    async def test_the_container_wiring_is_not_in_this_version(self, tmp_path: Path) -> None:
+        options = HarnessOptions(
+            files=RunFiles(tmp_path),
+            instances_file=None,
+            llm_shares={},
+            split=SPLIT_TRAIN,
+            budget_phase="rsi",
+            in_container=True,
+        )
+
+        with pytest.raises(ValueError, match="solve container"):
+            async with open_harness(options, fake_wiring(tmp_path).wiring):
+                pass
+
+    def test_a_broken_pack_config_gives_no_models(self, tmp_path: Path) -> None:
+        (tmp_path / "config.yaml").write_text("model: [unclosed\n")
+
+        assert pack_models(tmp_path) == ()
+        assert [m.model for m in pack_models()] == [EXECUTOR_MODEL]
+
+    def test_main_confines_on_the_host_only(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        confined: list[bool] = []
+        monkeypatch.setattr(cli, "main", lambda argv, registry, budgets_file: 0)
+
+        def confine() -> None:
+            confined.append(True)
+            raise OSError(22, "Invalid argument")  # A cpuset without the Python CPUs.
+
+        monkeypatch.setattr(goaly_cli, "confine_to_python_cpus", confine)
+        monkeypatch.setattr(sys, "argv", ["goaly", "run", "--phase", "solve", "--in-container"])
+        assert goaly_cli.main() == 0
+        assert confined == []
+        monkeypatch.setattr(sys, "argv", ["goaly", "run"])
+        assert goaly_cli.main() == 0  # EINVAL is a warning, not a failure.
+        assert confined == [True]
