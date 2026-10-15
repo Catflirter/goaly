@@ -428,6 +428,26 @@ async def test_a_window_of_0_replays_the_chat_unchanged() -> None:
     assert replies_sent(llm, 10) == as_written[:10]  # Markup and reasoning, all as they came.
 
 
+async def test_no_call_markup_reaches_the_model_whatever_the_reply() -> None:
+    drafted_submit = tool_call_block("submit", QWEN_BASE_SQL)
+    script = [
+        # A standard call, whose reasoning drafted a submit that never ran.
+        reply(execute_sql(FAST), reasoning=f"Or submit it now?\n{drafted_submit}"),
+        # No call at all: its <tool_call> was never closed.
+        reply(
+            content=f"Done.\n<tool_call>\n{function_block('submit', FAST)}", finish_reason="stop"
+        ),
+        reply(submit()),
+    ]
+    llm = FakeLLM(script)
+    ctx = context(llm)
+
+    await run_agent(environment(), ctx, hooks())
+
+    assert replies_sent(llm, 2) == [("", "Or submit it now?\n"), ("Done.\n", "")]
+    assert reference_prompts(ctx.trajectory()) == sent(llm)
+
+
 async def test_a_trajectory_round_trips_through_jsonl(tmp_path: Path) -> None:
     ctx = context(FakeLLM([qwen_reply("xml_in_content"), reply(submit())]))
     await run_agent(environment(), ctx, hooks())
@@ -662,13 +682,18 @@ async def test_every_kind_of_error_counts_toward_the_streak() -> None:
 
 
 async def test_a_reply_whose_parallel_calls_all_failed_is_one_error() -> None:
-    llm = FakeLLM([reply(*(tool_call("explain_query") for _ in range(5))), reply(submit())])
+    parallel = reply(*(tool_call("explain_query") for _ in range(5)))
+    error = reply(tool_call("explain_query"))
+    llm = FakeLLM([parallel, error, error, reply(submit())])
     ctx = context(llm)
 
     prediction = await run_agent(environment(), ctx, hooks())
 
-    assert prediction == SUBMISSION  # One failed reply: no stop,
-    assert injected(ctx.trajectory()) == [[], []]  # and no reminder either.
+    assert prediction == SUBMISSION  # Five failed calls in one reply did not stop the chat:
+    trajectory = ctx.trajectory()
+    assert [result.is_error for result in trajectory.steps[0].tool_results] == [True] * 5
+    # they made one failed reply, so the streak reached 3, and the reminder, at the third.
+    assert [bool(texts) for texts in injected(trajectory)] == [False, False, True, False]
 
 
 async def test_a_reply_with_one_call_that_worked_ends_the_streak() -> None:
@@ -1255,10 +1280,10 @@ async def test_a_long_chat_folds_its_oldest_tool_outputs() -> None:
         [ContextFold(step=0, tool_call_id=calls[0].id, replacement=folded(0))],
         [ContextFold(step=1, tool_call_id=calls[1].id, replacement=folded(1))],
     ]
+    # Each step records the estimate the threshold compared, before any fold: past 3,000, the
+    # fourth call folded one output, the fifth another, and went though still past it.
     estimates = [step.estimated_prompt_tokens for step in trajectory.steps]
-    assert 0 < estimates[0] < estimates[1] < estimates[2] < 3000
-    assert estimates[3] <= 3000  # One fold brought it back under the threshold.
-    assert estimates[4] > 3000  # The two outputs it may fold were not enough; it went anyway.
+    assert 0 < estimates[0] < estimates[1] < estimates[2] < 3000 < estimates[3] < estimates[4]
     assert [step.tool_results[0].content for step in trajectory.steps[:4]] == [
         big(n) for n in range(4)
     ]
@@ -1332,6 +1357,8 @@ async def test_a_prompt_too_long_for_the_model_folds_and_goes_once_more() -> Non
         (0, calls[0].id),
         (1, calls[1].id),
     ]
+    # The estimate before the folds: 1,000 counted, and the last turn's 4,012 characters.
+    assert trajectory.steps[3].estimated_prompt_tokens == 2003
     overflowed, retried = sent(llm)[3], sent(llm)[4]
     assert [m.content for m in overflowed if m.role == TOOL] == [big(0), big(1), big(2)]
     assert [m.content for m in retried if m.role == TOOL] == [folded(0), folded(1), big(2)]
@@ -1368,8 +1395,8 @@ async def test_a_prompt_too_long_with_nothing_to_fold_is_not_sent_again() -> Non
 
 REPEATED = (
     "Note: this call repeats your previous one, the same tool with the same arguments, so its "
-    "result is unchanged. Repeating a call does not help: change the arguments or try another "
-    "approach."
+    "result is unchanged, apart from timing. Repeating a call does not help: change the "
+    "arguments or try another approach."
 )
 
 
@@ -1390,6 +1417,25 @@ async def test_a_call_that_repeats_the_one_before_runs_with_a_note_and_counts_as
     # The three repeats are three failed replies in a row: the reminder came after them.
     assert injected(ctx.trajectory())[:3] == [[], [], []]
     assert steps[3].injected[0].content.startswith("You have made 3 errors in a row.")
+
+
+async def test_a_drafted_submission_is_not_the_call_a_real_one_repeats() -> None:
+    drafted = reply(reasoning=f"Submit it.\n{tool_call_block('submit', FAST)}")
+    ctx = context(FakeLLM([drafted, reply(submit(FAST))]))
+
+    prediction = await run_agent(environment(), ctx, hooks())
+
+    assert prediction == SUBMISSION
+    assert ctx.trajectory().steps[1].tool_results[0].content == "Submitted."  # No repeat note.
+
+
+async def test_a_repaired_call_and_the_same_call_written_well_repeat() -> None:
+    truncated = tool_call("execute_sql", '{"sql": "' + FAST + '"')  # Repaired to {"sql": FAST}.
+    ctx = context(FakeLLM([reply(truncated), reply(execute_sql(FAST)), reply(submit())]))
+
+    await run_agent(environment(), ctx, hooks())
+
+    assert ctx.trajectory().steps[1].tool_results[0].content.endswith(REPEATED)
 
 
 async def test_arguments_that_differ_only_in_layout_repeat() -> None:

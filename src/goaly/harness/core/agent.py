@@ -76,10 +76,11 @@ _CUT_OFF_NO_CALL: Final = (
 _NO_CALL: Final = (
     "Error: your reply called no tool. Each reply must call one of the tools: {tools}."
 )
+# The tool runs again, so the result may differ in timing, e.g. a statement's elapsed time.
 _REPEATED: Final = (
     "Note: this call repeats your previous one, the same tool with the same arguments, so its "
-    "result is unchanged. Repeating a call does not help: change the arguments or try another "
-    "approach."
+    "result is unchanged, apart from timing. Repeating a call does not help: change the "
+    "arguments or try another approach."
 )
 _OVER_CAP: Final = (
     f"Error: a reply may make at most {CALLS_PER_REPLY} tool calls, so this call was not run. "
@@ -184,7 +185,8 @@ async def run_agent[E: Environment](
     The chat goes into ``ctx``'s trajectory under ``label``, which no other chat of the task may
     have, with why it stopped. What may raise is as the module docstring says, and a label
     already taken raises ValueError; the trajectory then records STOP_REASON_CANCELLED, or
-    STOP_REASON_CRASHED and the error.
+    STOP_REASON_CRASHED and the error. The stop reason is the task's, so the last loop sets it:
+    a loop that raises marks the trajectory crashed even after an earlier chat submitted.
     """
     return await _Chat(env, ctx, hooks, label).run()
 
@@ -198,7 +200,8 @@ class _Outcome(NamedTuple):
 
 
 class _Sent(NamedTuple):
-    """A model call that got a reply: the reply, and the prompt it was sent, as folded."""
+    """A model call that got a reply: the reply, the folds made for it, and the estimate that
+    the folding threshold compared, before any fold (Step.estimated_prompt_tokens)."""
 
     reply: LlmReply
     folds: list[ContextFold]
@@ -302,8 +305,8 @@ class _Chat[E: Environment]:
         A prompt that the gateway says does not fit folds every older output it may and goes
         once more. With nothing more to fold, or a second overflow, ContextOverflow propagates.
         """
+        estimate = self._prompt.estimated_tokens  # What the threshold compares.
         folds = self._prompt.fold()
-        estimate = self._prompt.estimated_tokens
         try:
             reply = await self._complete()
         except ContextOverflow:
@@ -311,7 +314,6 @@ class _Chat[E: Environment]:
             if not more:
                 raise
             folds += more
-            estimate = self._prompt.estimated_tokens
             reply = await self._complete()
         self._prompt.sent(reply.usage.input_tokens)
         return _Sent(reply, folds, estimate)
@@ -355,9 +357,10 @@ class _Chat[E: Environment]:
         worked = False  # Whether a call gave a result that is no error.
         for call in calls[:CALLS_PER_REPLY]:
             result = await self._hooks.tools.execute(call, self._env)
-            if result.HasField("submission") and call.source == _REASONING_XML:
+            drafted = result.HasField("submission") and call.source == _REASONING_XML
+            if drafted:  # A call drafted in the reasoning is no call of the model's to repeat.
                 result = _drafted(call, result)
-            repeated = self._repeats(call)
+            repeated = not drafted and self._repeats(call)
             if repeated:
                 result.content = _appended(result.content, _REPEATED)
             worked = worked or not (result.is_error or repeated)
@@ -374,7 +377,9 @@ class _Chat[E: Environment]:
         """Whether ``call``, which ran, repeats the call that ran before it in this chat.
 
         Calls are compared by tool and normalized arguments, never by ID: an XML call's ID is
-        only unique within its reply.
+        only unique within its reply. A repeat counts toward the error streak, but its result
+        keeps ``is_error`` as the tool gave it, since the call itself did not fail: the note in
+        its content marks it, in the trajectory as for the model.
         """
         key = (call.name, _normalized_arguments(call))
         repeated = key == self._previous
@@ -464,7 +469,10 @@ def _without_markup(text: str) -> str:
 
 
 def _drafted(call: ToolCall, result: ToolResult) -> ToolResult:
-    """The error result of a call from the reasoning that would have submitted: it does not."""
+    """The error result of a call from the reasoning that would have submitted: it does not.
+
+    The tool has run, since only its result shows that it submits; its submission is dropped.
+    """
     return ToolResult(
         tool_call_id=call.id,
         name=call.name,
