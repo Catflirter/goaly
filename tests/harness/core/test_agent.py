@@ -1,0 +1,823 @@
+"""Tests for goaly.harness.core.agent: the agent loop, its budgets and errors, and its trajectory.
+
+FakeLLM (agent_fakes.py) scripts the executor model, with real Qwen replies among its items, and
+the tools run in tests/fakes.py's FakeSqlEnvironment, so no test needs a model, a database or
+the network.
+"""
+
+import asyncio
+import hashlib
+import inspect
+import json
+import time
+from collections.abc import Callable
+from pathlib import Path
+from typing import Any
+
+import pytest
+from pydantic import BaseModel
+
+from goaly.contracts.errors import EnvironmentFailure
+from goaly.contracts.gen.environment_pb2 import SqlResult
+from goaly.contracts.gen.llm_call_pb2 import Usage
+from goaly.contracts.gen.task_pb2 import EffiSqlPrediction, Prediction
+from goaly.contracts.gen.trajectory_pb2 import (
+    ChatMessage,
+    ChatRole,
+    Step,
+    StopReason,
+    ToolCall,
+    ToolCallSource,
+    ToolResult,
+    Trajectory,
+)
+from goaly.contracts.interfaces import Environment, SqlEnvironment
+from goaly.contracts.jsonl import append_jsonl, read_jsonl
+from goaly.harness.core.agent import AgentContext, AgentHooks, ChatModel, run_agent
+from goaly.harness.core.budgets import Budgets, BudgetUse
+from goaly.harness.core.llm_errors import ContextOverflow, ServerError
+from goaly.harness.core.llm_models import ModelParams
+from goaly.harness.core.tool_calls import strip_tool_call_markup
+from goaly.harness.core.tools import ToolRegistry, bind, environment_failure_in
+from tests.fakes import FakeSqlEnvironment, SubmitTool
+from tests.harness.core.agent_fakes import (
+    DEFAULT_USAGE,
+    HANG,
+    QWEN_BASE_SQL,
+    FakeLLM,
+    call_record,
+    qwen_reply,
+    reply,
+    tool_call,
+)
+
+pytestmark = pytest.mark.anyio
+
+SYSTEM, USER = ChatRole.CHAT_ROLE_SYSTEM, ChatRole.CHAT_ROLE_USER
+ASSISTANT, TOOL = ChatRole.CHAT_ROLE_ASSISTANT, ChatRole.CHAT_ROLE_TOOL
+CONTENT_XML = ToolCallSource.TOOL_CALL_SOURCE_CONTENT_XML
+REASONING_XML = ToolCallSource.TOOL_CALL_SOURCE_REASONING_XML
+
+SUBMITTED = StopReason.STOP_REASON_SUBMITTED
+STEPS = StopReason.STOP_REASON_STEP_BUDGET_EXHAUSTED
+TIME = StopReason.STOP_REASON_TIME_BUDGET_EXHAUSTED
+TOKENS = StopReason.STOP_REASON_TOKEN_BUDGET_EXHAUSTED
+COST = StopReason.STOP_REASON_COST_BUDGET_EXHAUSTED
+ERRORS = StopReason.STOP_REASON_CONSECUTIVE_ERRORS
+CRASHED = StopReason.STOP_REASON_CRASHED
+CANCELLED = StopReason.STOP_REASON_CANCELLED
+
+EXPLAIN = f"EXPLAIN {QWEN_BASE_SQL}"
+FAST = "SELECT count(*) FROM orders JOIN customer ON c_custkey = o_custkey WHERE c_nationkey = 7"
+SLOW = "SELECT pg_sleep(60)"
+PAUSE = "SELECT pg_sleep(0.3)"
+DEAD = "SELECT 'the connection dies'"
+SYSTEM_PROMPT = "You rewrite slow PostgreSQL queries into equivalent, faster ones."
+TASK_PROMPT = f"Rewrite this query:\n{QWEN_BASE_SQL}"
+FALLBACK = Prediction(effisql=EffiSqlPrediction(sql=QWEN_BASE_SQL))
+SUBMISSION = Prediction(effisql=EffiSqlPrediction(sql=FAST))
+PARAMS = ModelParams(max_tokens=4096)
+
+
+class ExecuteSqlArgs(BaseModel):
+    """execute_sql's arguments."""
+
+    sql: str
+    limit: int = 20
+
+
+class ExecuteSql:
+    """Effi-SQL's execute_sql, as v0 has it: it runs one statement, and a failed one is a result."""
+
+    name = "execute_sql"
+    description = "Run one SQL statement and return the rows or the error."
+    args_model = ExecuteSqlArgs
+
+    async def run(self, args: ExecuteSqlArgs, env: SqlEnvironment) -> ToolResult:
+        result = await env.execute(args.sql, timeout_s=120.0)
+        return ToolResult(content=result.error or f"rows: {result.row_count}")
+
+
+class NoArgs(BaseModel):
+    """No arguments."""
+
+
+class FragileTool:
+    """A tool with a bug: it raises, which the executor turns into an error result."""
+
+    name = "fragile"
+    description = "Fail."
+    args_model = NoArgs
+
+    async def run(self, args: NoArgs, env: Environment) -> ToolResult:
+        raise RuntimeError("the tool broke")
+
+
+class PairArgs(BaseModel):
+    """PairTool's arguments."""
+
+    first: str
+    second: str
+
+
+class PairTool:
+    """Runs two statements at once, in a TaskGroup."""
+
+    name = "pair"
+    description = "Run two SQL statements at once."
+    args_model = PairArgs
+
+    async def run(self, args: PairArgs, env: SqlEnvironment) -> ToolResult:
+        async with asyncio.TaskGroup() as group:
+            for sql in (args.first, args.second):
+                group.create_task(env.execute(sql, timeout_s=120.0))
+        return ToolResult(content="Both ran.")
+
+
+def environment() -> FakeSqlEnvironment:
+    return FakeSqlEnvironment(
+        {
+            EXPLAIN: SqlResult(row_count=12),
+            FAST: SqlResult(row_count=1),
+            SLOW: SqlResult(row_count=1, elapsed_s=60.0),
+            PAUSE: SqlResult(row_count=1, elapsed_s=0.3),
+            DEAD: EnvironmentFailure("the database connection died"),
+        }
+    )
+
+
+def registry() -> ToolRegistry[SqlEnvironment]:
+    return ToolRegistry[SqlEnvironment](
+        [bind(ExecuteSql()), bind(SubmitTool()), bind(FragileTool()), bind(PairTool())]
+    )
+
+
+TOOL_NAMES = "execute_sql, submit, fragile, pair"
+SCHEMAS = registry().json_schemas()
+
+
+def give_fallback() -> Prediction:
+    return FALLBACK
+
+
+def hooks(
+    *,
+    on_tool_result: Callable[[ToolCall, ToolResult], str | None] | None = None,
+    on_step: Callable[[Step, BudgetUse], str | None] | None = None,
+    fallback: Callable[[], Prediction] = give_fallback,
+) -> AgentHooks[SqlEnvironment]:
+    return AgentHooks(
+        system_prompt=SYSTEM_PROMPT,
+        task_prompt=TASK_PROMPT,
+        tools=registry(),
+        fallback=fallback,
+        on_tool_result=on_tool_result,
+        on_step=on_step,
+    )
+
+
+def context(llm: ChatModel, **budgets: Any) -> AgentContext:
+    limits = Budgets.model_validate({"steps": 30, "wall_clock_s": 600.0} | budgets)
+    return AgentContext(llm, budgets=limits, params=PARAMS)
+
+
+def execute_sql(sql: str) -> ToolCall:
+    return tool_call("execute_sql", {"sql": sql})
+
+
+def submit(sql: str = FAST) -> ToolCall:
+    return tool_call("submit", {"sql": sql})
+
+
+def system(text: str) -> ChatMessage:
+    return ChatMessage(role=SYSTEM, content=text)
+
+
+def user(text: str) -> ChatMessage:
+    return ChatMessage(role=USER, content=text)
+
+
+def tool_message(result: ToolResult) -> ChatMessage:
+    return ChatMessage(role=TOOL, content=result.content, tool_call_id=result.tool_call_id)
+
+
+def replayed(assistant: ChatMessage) -> ChatMessage:
+    """An assistant message as a later prompt carries it: its calls only as structured calls."""
+    message = ChatMessage()
+    message.CopyFrom(assistant)
+    sources = {call.source for call in assistant.tool_calls}
+    if CONTENT_XML in sources:
+        message.content = strip_tool_call_markup(message.content)
+    if REASONING_XML in sources:
+        message.reasoning_content = strip_tool_call_markup(message.reasoning_content)
+    return message
+
+
+def rebuilt_prompts(trajectory: Trajectory) -> list[list[ChatMessage]]:
+    """Each step's prompt, rebuilt from the trajectory by the rule trajectory.proto gives."""
+    histories: dict[int, list[ChatMessage]] = {}
+    prompts = []
+    for step in trajectory.steps:
+        initial = trajectory.chats[step.chat].initial_messages
+        history = histories.setdefault(step.chat, list(initial))
+        prompts.append(list(history))
+        history.append(replayed(step.assistant))
+        history.extend(tool_message(result) for result in step.tool_results)
+        history.extend(step.injected)
+    return prompts
+
+
+def sent(llm: FakeLLM) -> list[list[ChatMessage]]:
+    return [list(request.messages) for request in llm.requests]
+
+
+def injected(trajectory: Trajectory) -> list[list[str]]:
+    return [[message.content for message in step.injected] for step in trajectory.steps]
+
+
+# A normal run, and what the model and the trajectory get.
+
+
+async def test_a_submission_ends_the_loop_with_its_prediction() -> None:
+    llm = FakeLLM([reply(execute_sql(FAST)), reply(submit(FAST))])
+    ctx = context(llm)
+
+    prediction = await run_agent(environment(), ctx, hooks())
+
+    assert prediction == SUBMISSION
+    assert not prediction.fallback
+    trajectory = ctx.trajectory()
+    assert trajectory.stop_reason == SUBMITTED
+    assert trajectory.error_message == ""
+    assert [chat.label for chat in trajectory.chats] == ["main"]
+    assert list(trajectory.chats[0].initial_messages) == [system(SYSTEM_PROMPT), user(TASK_PROMPT)]
+    first, second = trajectory.steps
+    assert [result.content for result in first.tool_results] == ["rows: 1"]
+    assert second.tool_results[0].submission == SUBMISSION
+    assert trajectory.usage == Usage(input_tokens=2000, output_tokens=400, cost_usd=0.002)
+    assert sent(llm)[1] == [
+        system(SYSTEM_PROMPT),
+        user(TASK_PROMPT),
+        first.assistant,
+        tool_message(first.tool_results[0]),
+    ]
+
+
+async def test_each_call_offers_the_tools_and_sends_the_packs_parameters() -> None:
+    llm = FakeLLM([reply(submit())])
+
+    await run_agent(environment(), context(llm), hooks())
+
+    [request] = llm.requests
+    assert list(request.tools) == SCHEMAS
+    assert request.params == PARAMS
+
+
+async def test_a_step_records_its_call_with_its_timing_and_usage() -> None:
+    usage = Usage(input_tokens=5000, output_tokens=700, reasoning_tokens=600, cost_usd=0.004)
+    scripted = reply(submit(), usage=usage, latency_s=3.5)
+    ctx = context(FakeLLM([scripted]))
+
+    await run_agent(environment(), ctx, hooks())
+
+    [step] = ctx.trajectory().steps
+    assert (step.index, step.chat) == (0, 0)
+    assert step.call_id == scripted.record.call_id
+    assert step.started_at == scripted.record.started_at
+    assert step.latency_s == 3.5  # The record's: the client's waits included.
+    assert step.usage == usage
+    assert step.assistant == scripted.message
+
+
+async def test_every_prompt_can_be_rebuilt_from_the_trajectory() -> None:
+    """The trajectory schema: each step holds only what it added, and the prompts follow."""
+    script = [
+        qwen_reply("standard_call"),
+        reply(content="The query is already fast."),
+        qwen_reply("xml_in_content"),
+        qwen_reply("call_in_reasoning"),
+        qwen_reply("truncated_standard_call"),
+        reply(tool_call("explain_query", {"sql": QWEN_BASE_SQL})),
+        reply(submit()),
+    ]
+    llm = FakeLLM(script)
+    ctx = context(llm, remind_after_errors=2, stop_after_errors=4)
+
+    await run_agent(
+        environment(),
+        ctx,
+        hooks(
+            on_tool_result=lambda call, result: f"Checked {call.name}.",
+            on_step=lambda step, used: f"{30 - used.steps} steps left.",
+        ),
+    )
+
+    trajectory = ctx.trajectory()
+    assert trajectory.stop_reason == SUBMITTED
+    assert len(trajectory.steps) == len(script)
+    assert rebuilt_prompts(trajectory) == sent(llm)
+
+
+async def test_a_trajectory_round_trips_through_jsonl(tmp_path: Path) -> None:
+    ctx = context(FakeLLM([qwen_reply("xml_in_content"), reply(submit())]))
+    await run_agent(environment(), ctx, hooks())
+    path = tmp_path / "trajectories.jsonl"
+
+    append_jsonl(path, ctx.trajectory())
+
+    [read] = read_jsonl(path, Trajectory)
+    assert read == ctx.trajectory()
+
+
+# Qwen's replies: XML calls, repaired arguments and made-up IDs.
+
+
+async def test_a_call_in_the_content_runs_and_is_replayed_without_its_markup() -> None:
+    xml = qwen_reply("xml_in_content")
+    llm = FakeLLM([xml, reply(submit())])
+    ctx = context(llm)
+
+    await run_agent(environment(), ctx, hooks())
+
+    first = ctx.trajectory().steps[0]
+    [call] = first.assistant.tool_calls
+    assert (call.name, call.source) == ("execute_sql", CONTENT_XML)
+    assert first.assistant.content == xml.message.content  # The trajectory keeps it as written.
+    assert [result.content for result in first.tool_results] == ["rows: 12"]
+    replay = sent(llm)[1][2]
+    assert "<tool_call>" not in replay.content
+    assert replay.content.startswith("Let me first examine the query plan")
+    assert list(replay.tool_calls) == [call]
+
+
+async def test_a_call_in_the_reasoning_runs_and_is_replayed_without_its_markup() -> None:
+    xml = qwen_reply("call_in_reasoning")
+    llm = FakeLLM([xml, reply(submit())])
+    ctx = context(llm)
+
+    await run_agent(environment(), ctx, hooks())
+
+    first = ctx.trajectory().steps[0]
+    assert first.assistant.tool_calls[0].source == REASONING_XML
+    assert first.assistant.reasoning_content == xml.message.reasoning_content
+    assert [result.content for result in first.tool_results] == ["rows: 12"]
+    replay = sent(llm)[1][2]
+    assert "<tool_call>" not in replay.reasoning_content
+    assert replay.reasoning_content.rstrip().endswith("Let's do that.")
+
+
+async def test_a_call_without_an_id_gets_one_that_replays_identically() -> None:
+    arguments = json.dumps({"sql": FAST})
+    llm = FakeLLM([reply(tool_call("execute_sql", arguments, call_id="")), reply(submit())])
+    ctx = context(llm)
+
+    await run_agent(environment(), ctx, hooks())
+
+    made_up = "call_" + hashlib.sha256(f"0\nexecute_sql\n{arguments}".encode()).hexdigest()[:24]
+    first = ctx.trajectory().steps[0]
+    assert first.assistant.tool_calls[0].id == made_up
+    assert first.tool_results[0].tool_call_id == made_up
+    assert sent(llm)[1][2].tool_calls[0].id == made_up
+
+
+async def test_malformed_arguments_run_once_repaired() -> None:
+    llm = FakeLLM([reply(tool_call("execute_sql", '{"sql": "' + FAST + '"')), reply(submit())])
+    ctx = context(llm)
+
+    await run_agent(environment(), ctx, hooks())
+
+    first = ctx.trajectory().steps[0]
+    assert json.loads(first.assistant.tool_calls[0].repaired_arguments_json) == {"sql": FAST}
+    assert [result.content for result in first.tool_results] == ["rows: 1"]
+
+
+# Budgets: each one ends the loop with the fallback.
+
+
+async def test_the_step_budget_ends_in_the_fallback() -> None:
+    llm = FakeLLM([reply(execute_sql(FAST)), reply(execute_sql(FAST))])
+    ctx = context(llm, steps=2)
+
+    prediction = await run_agent(
+        environment(), ctx, hooks(on_step=lambda step, used: "Keep going.")
+    )
+
+    assert prediction.fallback
+    assert prediction.effisql == FALLBACK.effisql
+    assert not FALLBACK.fallback  # The loop marks a copy.
+    assert len(llm.requests) == 2
+    trajectory = ctx.trajectory()
+    assert trajectory.stop_reason == STEPS
+    assert injected(trajectory) == [["Keep going."], []]  # No call followed the last step.
+
+
+async def test_the_wall_clock_cancels_a_call_and_ends_in_the_fallback() -> None:
+    llm = FakeLLM([HANG])
+    ctx = context(llm, wall_clock_s=0.05)
+
+    async with asyncio.timeout(10):  # A guard: the budget must end the call long before.
+        prediction = await run_agent(environment(), ctx, hooks())
+
+    assert prediction.fallback
+    trajectory = ctx.trajectory()
+    assert trajectory.stop_reason == TIME
+    assert not trajectory.steps  # The cancelled call got no reply.
+
+
+async def test_the_wall_clock_stops_a_running_tool() -> None:
+    env = environment()
+    ctx = context(FakeLLM([reply(execute_sql(SLOW))]), wall_clock_s=0.2)
+
+    async with asyncio.timeout(10):
+        prediction = await run_agent(env, ctx, hooks())
+
+    assert prediction.fallback
+    assert env.stopped == [SLOW]
+    [step] = ctx.trajectory().steps
+    assert not step.tool_results  # The call was stopped, so it has no result.
+    assert ctx.trajectory().stop_reason == TIME
+
+
+async def test_the_token_budget_ends_in_the_fallback() -> None:
+    llm = FakeLLM([reply(execute_sql(FAST)) for _ in range(3)])  # 1,200 tokens each.
+    ctx = context(llm, tokens=3000)
+
+    prediction = await run_agent(environment(), ctx, hooks())
+
+    assert prediction.fallback
+    assert len(llm.requests) == 3  # 2,400 tokens leave room for a third call; 3,600 do not.
+    assert ctx.trajectory().stop_reason == TOKENS
+
+
+async def test_the_cost_budget_ends_in_the_fallback() -> None:
+    llm = FakeLLM([reply(execute_sql(FAST)) for _ in range(2)])  # $0.001 each.
+    ctx = context(llm, cost_usd=0.002)
+
+    prediction = await run_agent(environment(), ctx, hooks())
+
+    assert prediction.fallback
+    assert len(llm.requests) == 2
+    assert ctx.trajectory().stop_reason == COST
+
+
+async def test_a_context_overflow_ends_in_the_fallback() -> None:
+    overflow = ContextOverflow("qwen3.6-35b-a3b: HTTP 400: maximum context length is 131072")
+    ctx = context(FakeLLM([reply(execute_sql(FAST)), overflow]))
+
+    prediction = await run_agent(environment(), ctx, hooks())
+
+    assert prediction.fallback
+    trajectory = ctx.trajectory()
+    assert trajectory.stop_reason == TOKENS
+    assert trajectory.error_message == f"ContextOverflow: {overflow}"
+
+
+async def test_a_failed_calls_usage_is_counted() -> None:
+    record = call_record(Usage(input_tokens=0, output_tokens=0, cost_usd=0.0005))
+    overflow = ContextOverflow("too long", record=record)
+    ctx = context(FakeLLM([reply(execute_sql(FAST)), overflow]))
+
+    await run_agent(environment(), ctx, hooks())
+
+    assert ctx.trajectory().usage.cost_usd == pytest.approx(DEFAULT_USAGE.cost_usd + 0.0005)
+
+
+# Errors: none raises, each counts, and the streak reminds, then stops.
+
+
+async def test_errors_in_a_row_bring_one_reminder_then_the_fallback() -> None:
+    llm = FakeLLM([reply(tool_call("explain_query")) for _ in range(5)])
+    ctx = context(llm)
+
+    prediction = await run_agent(environment(), ctx, hooks())
+
+    assert prediction.fallback
+    assert len(llm.requests) == 5
+    trajectory = ctx.trajectory()
+    assert trajectory.stop_reason == ERRORS
+    reminder = (
+        "You have made 3 errors in a row. Call the tools exactly as these schemas define "
+        f"them:\n{json.dumps(SCHEMAS, ensure_ascii=False, indent=2)}"
+    )
+    assert injected(trajectory) == [[], [], [reminder], [], []]
+    assert sent(llm)[3][-1] == user(reminder)
+
+
+async def test_every_kind_of_error_counts_toward_the_streak() -> None:
+    llm = FakeLLM(
+        [
+            reply(tool_call("explain_query")),  # A tool the registry does not hold.
+            reply(tool_call("execute_sql", {"query": FAST})),  # Invalid arguments.
+            reply(tool_call("execute_sql", '{"sql": ')),  # JSON that cannot be repaired.
+            reply(tool_call("fragile")),  # A tool that raised.
+            reply(content="The query is already as fast as it gets."),  # No call at all.
+            qwen_reply("truncated_standard_call"),  # A reply cut off at the output limit.
+        ]
+    )
+    ctx = context(llm, remind_after_errors=5, stop_after_errors=6)
+
+    prediction = await run_agent(environment(), ctx, hooks())
+
+    assert prediction.fallback
+    assert len(llm.requests) == 6
+    assert ctx.trajectory().stop_reason == ERRORS
+
+
+async def test_a_call_that_works_ends_the_streak() -> None:
+    errors = [reply(tool_call("explain_query")) for _ in range(4)]
+    llm = FakeLLM([*errors, reply(execute_sql(FAST)), *errors, reply(submit())])
+    ctx = context(llm)
+
+    prediction = await run_agent(environment(), ctx, hooks())
+
+    assert prediction == SUBMISSION
+    reminders = [texts for texts in injected(ctx.trajectory()) if texts]
+    assert len(reminders) == 2  # One for each streak of 3 or more.
+
+
+async def test_a_reply_that_calls_no_tool_is_answered_with_a_nudge() -> None:
+    llm = FakeLLM([reply(content="It is fast now."), reply(submit())])
+    ctx = context(llm)
+
+    prediction = await run_agent(environment(), ctx, hooks())
+
+    assert prediction == SUBMISSION
+    nudge = (
+        f"Error: your reply called no tool. Each reply must call one of the tools: {TOOL_NAMES}."
+    )
+    assert injected(ctx.trajectory()) == [[nudge], []]
+    assert sent(llm)[1][-1] == user(nudge)
+
+
+async def test_a_reply_cut_off_at_the_output_limit_runs_none_of_its_calls() -> None:
+    env = environment()
+    cut = reply(submit(QWEN_BASE_SQL), execute_sql(FAST), finish_reason="length")
+    llm = FakeLLM([cut, reply(submit())])
+    ctx = context(llm, remind_after_errors=1, stop_after_errors=2)
+
+    prediction = await run_agent(env, ctx, hooks())
+
+    assert prediction == SUBMISSION  # The cut-off submit never ran.
+    assert env.executed == []
+    first = ctx.trajectory().steps[0]
+    assert [result.tool_call_id for result in first.tool_results] == [
+        call.id for call in cut.message.tool_calls
+    ]
+    for result in first.tool_results:
+        assert result.is_error
+        assert result.content.startswith("Error: your reply was cut off at the output limit")
+        assert "more concisely" in result.content
+    # Both calls make one error: the reminder came, after 1, and the stop, after 2, did not.
+    assert len(first.injected) == 1
+    assert first.injected[0].content.startswith("You have made 1 error in a row.")
+
+
+async def test_a_reply_cut_off_before_any_call_is_nudged_to_think_less() -> None:
+    thinking = reply(reasoning="Let me weigh every plan...", finish_reason="length")
+    llm = FakeLLM([thinking, reply(submit())])
+    ctx = context(llm)
+
+    prediction = await run_agent(environment(), ctx, hooks())
+
+    assert prediction == SUBMISSION
+    nudge = (
+        "Error: your reply was cut off at the output limit before it called a tool. "
+        f"Think briefly, then call one of the tools: {TOOL_NAMES}."
+    )
+    assert injected(ctx.trajectory()) == [[nudge], []]
+    assert sent(llm)[1][-1] == user(nudge)
+
+
+# The pack's hooks.
+
+
+async def test_tool_result_guidance_is_appended_to_what_the_model_sees() -> None:
+    seen: list[tuple[str, str]] = []
+
+    def guide(call: ToolCall, result: ToolResult) -> str | None:
+        seen.append((call.name, result.content))
+        return "Hint: compare the plans." if call.name == "execute_sql" else None
+
+    llm = FakeLLM([reply(execute_sql(FAST)), reply(submit())])
+    ctx = context(llm)
+
+    await run_agent(environment(), ctx, hooks(on_tool_result=guide))
+
+    assert seen == [("execute_sql", "rows: 1"), ("submit", "Submitted.")]
+    first, second = ctx.trajectory().steps
+    assert first.tool_results[0].content == "rows: 1\n\nHint: compare the plans."
+    assert second.tool_results[0].content == "Submitted."
+    assert sent(llm)[1][-1].content == "rows: 1\n\nHint: compare the plans."
+
+
+async def test_step_guidance_is_sent_between_steps() -> None:
+    seen: list[tuple[int, BudgetUse]] = []
+
+    def guide(step: Step, used: BudgetUse) -> str | None:
+        seen.append((step.index, used))
+        return f"{30 - used.steps} steps left." if used.steps < 2 else ""
+
+    llm = FakeLLM([reply(execute_sql(FAST)), reply(execute_sql(FAST)), reply(submit())])
+    ctx = context(llm)
+
+    await run_agent(environment(), ctx, hooks(on_step=guide))
+
+    assert [index for index, _ in seen] == [0, 1]  # Not after the last step: none follows it.
+    first_use = seen[0][1]
+    assert (first_use.steps, first_use.tokens, first_use.cost_usd) == (1, 1200, 0.001)
+    assert first_use.elapsed_s >= 0
+    assert injected(ctx.trajectory()) == [["29 steps left."], [], []]  # "" is no guidance.
+    assert sent(llm)[1][-1] == user("29 steps left.")
+
+
+async def test_the_hooks_get_copies() -> None:
+    def spoil_result(call: ToolCall, result: ToolResult) -> None:
+        call.name = "spoiled"
+        result.content = "spoiled"
+
+    def spoil_step(step: Step, used: BudgetUse) -> None:
+        step.assistant.content = "spoiled"
+        del step.tool_results[:]
+
+    ctx = context(FakeLLM([reply(execute_sql(FAST)), reply(submit())]))
+
+    await run_agent(environment(), ctx, hooks(on_tool_result=spoil_result, on_step=spoil_step))
+
+    first = ctx.trajectory().steps[0]
+    assert first.assistant.tool_calls[0].name == "execute_sql"
+    assert first.assistant.content == ""
+    assert [result.content for result in first.tool_results] == ["rows: 1"]
+
+
+# What propagates: environment failures, LLM failures, the pack's bugs, and cancellation.
+
+
+async def test_an_environment_failure_propagates() -> None:
+    ctx = context(FakeLLM([reply(execute_sql(DEAD))]))
+
+    with pytest.raises(EnvironmentFailure, match="connection died"):
+        await run_agent(environment(), ctx, hooks())
+
+    trajectory = ctx.trajectory()
+    assert trajectory.stop_reason == CRASHED
+    assert trajectory.error_message == "EnvironmentFailure: the database connection died"
+    assert len(trajectory.steps) == 1  # The step that hit it is kept.
+
+
+async def test_an_environment_failure_in_a_tools_task_group_propagates() -> None:
+    call = tool_call("pair", {"first": FAST, "second": DEAD})
+    ctx = context(FakeLLM([reply(call)]))
+
+    with pytest.raises(EnvironmentFailure, match="connection died"):
+        await run_agent(environment(), ctx, hooks())
+
+
+async def test_a_group_that_holds_an_environment_failure_is_never_converted() -> None:
+    def broken_hook(call: ToolCall, result: ToolResult) -> str:
+        raise ExceptionGroup("the hook's tasks", [EnvironmentFailure("the database died")])
+
+    ctx = context(FakeLLM([reply(execute_sql(FAST))]))
+
+    with pytest.raises(ExceptionGroup) as raised:
+        await run_agent(environment(), ctx, hooks(on_tool_result=broken_hook))
+
+    assert environment_failure_in(raised.value) is not None
+    trajectory = ctx.trajectory()
+    assert trajectory.stop_reason == CRASHED
+    assert trajectory.error_message == (
+        "ExceptionGroup: the hook's tasks (1 sub-exception) [EnvironmentFailure: the database died]"
+    )
+
+
+async def test_an_llm_failure_propagates_with_its_usage_counted() -> None:
+    failure = ServerError(
+        "qwen3.6-35b-a3b: HTTP 503 (6 attempts)",
+        record=call_record(Usage(cost_usd=0.0)),
+    )
+    ctx = context(FakeLLM([reply(execute_sql(FAST)), failure]))
+
+    with pytest.raises(ServerError):
+        await run_agent(environment(), ctx, hooks())
+
+    trajectory = ctx.trajectory()
+    assert trajectory.stop_reason == CRASHED
+    assert trajectory.error_message == "ServerError: qwen3.6-35b-a3b: HTTP 503 (6 attempts)"
+    assert trajectory.usage.input_tokens == DEFAULT_USAGE.input_tokens
+    assert trajectory.usage.cost_usd == DEFAULT_USAGE.cost_usd  # Plus the failed call's 0.
+
+
+async def test_a_bug_in_a_hook_propagates() -> None:
+    def broken_hook(step: Step, used: BudgetUse) -> str:
+        raise KeyError("missing")
+
+    ctx = context(FakeLLM([reply(execute_sql(FAST))]))
+
+    with pytest.raises(KeyError):
+        await run_agent(environment(), ctx, hooks(on_step=broken_hook))
+
+    assert ctx.trajectory().stop_reason == CRASHED
+    assert ctx.trajectory().error_message == "KeyError: 'missing'"
+
+
+async def test_a_hooks_own_timeout_is_not_the_wall_clock() -> None:
+    def impatient_hook(step: Step, used: BudgetUse) -> str:
+        raise TimeoutError("the hook gave up")
+
+    ctx = context(FakeLLM([reply(execute_sql(FAST))]))
+
+    with pytest.raises(TimeoutError, match="the hook gave up"):
+        await run_agent(environment(), ctx, hooks(on_step=impatient_hook))
+
+    assert ctx.trajectory().stop_reason == CRASHED
+
+
+async def test_a_fallback_that_raises_propagates() -> None:
+    def broken_fallback() -> Prediction:
+        raise ValueError
+
+    ctx = context(FakeLLM([reply(execute_sql(FAST))]), steps=1)
+
+    with pytest.raises(ValueError):  # noqa: PT011 - the bare error the fallback raised.
+        await run_agent(environment(), ctx, hooks(fallback=broken_fallback))
+
+    assert ctx.trajectory().stop_reason == CRASHED
+    assert ctx.trajectory().error_message == "ValueError"
+
+
+async def test_cancellation_propagates() -> None:
+    llm = FakeLLM([reply(execute_sql(FAST)), HANG])
+    ctx = context(llm)
+    task = asyncio.create_task(run_agent(environment(), ctx, hooks()))
+    while len(llm.requests) < 2:  # Until the loop waits in the hanging call.
+        await asyncio.sleep(0)
+
+    task.cancel()
+    with pytest.raises(asyncio.CancelledError):
+        await task
+
+    trajectory = ctx.trajectory()
+    assert trajectory.stop_reason == CANCELLED
+    assert trajectory.error_message == ""
+
+
+# The context: one per task, shared by the task's loops, with no way to choose a purpose.
+
+
+async def test_a_second_loop_adds_a_chat_and_spends_the_same_budgets() -> None:
+    llm = FakeLLM([reply(execute_sql(FAST)), reply(submit()), reply(execute_sql(FAST))])
+    ctx = context(llm, steps=3)
+
+    first = await run_agent(environment(), ctx, hooks())
+    second = await run_agent(environment(), ctx, hooks(), label="verify")
+
+    assert first == SUBMISSION
+    assert second.fallback  # The third step was the last of the task's 3.
+    trajectory = ctx.trajectory()
+    assert [chat.label for chat in trajectory.chats] == ["main", "verify"]
+    assert [step.chat for step in trajectory.steps] == [0, 0, 1]
+    assert [step.index for step in trajectory.steps] == [0, 1, 2]
+    assert trajectory.stop_reason == STEPS  # The last loop's.
+    assert sent(llm)[2] == [system(SYSTEM_PROMPT), user(TASK_PROMPT)]  # A chat of its own.
+
+
+async def test_the_wall_clock_runs_from_the_first_loop() -> None:
+    llm = FakeLLM([HANG])
+    ctx = context(llm, wall_clock_s=0.05)
+    await run_agent(environment(), ctx, hooks())
+
+    second = await run_agent(environment(), ctx, hooks(), label="again")
+
+    assert second.fallback
+    assert len(llm.requests) == 1  # The second loop found the time spent and made no call.
+    assert ctx.trajectory().stop_reason == TIME
+
+
+async def test_a_later_loop_gets_only_the_time_left() -> None:
+    llm = FakeLLM([reply(execute_sql(PAUSE)), reply(submit()), HANG])
+    ctx = context(llm, wall_clock_s=0.5)
+    await run_agent(environment(), ctx, hooks())  # Its query takes 0.3 s.
+
+    started = time.monotonic()
+    second = await run_agent(environment(), ctx, hooks(), label="again")
+
+    assert second.fallback
+    assert time.monotonic() - started < 0.4  # The 0.2 s left, not a new 0.5 s.
+    assert ctx.trajectory().stop_reason == TIME
+
+
+def test_the_model_handle_takes_no_purpose_or_model() -> None:
+    parameters = inspect.signature(ChatModel.complete).parameters
+    assert list(parameters) == ["self", "messages", "tools", "params"]
+
+
+def test_the_context_exposes_no_model_handle() -> None:
+    ctx = context(FakeLLM([]))
+
+    public = {name for name in dir(ctx) if not name.startswith("_")}
+
+    assert public == {"budgets", "trajectory"}
+    assert ctx.budgets == Budgets(steps=30, wall_clock_s=600.0)
+
+
+def test_the_context_starts_with_an_empty_trajectory() -> None:
+    assert context(FakeLLM([])).trajectory() == Trajectory()
