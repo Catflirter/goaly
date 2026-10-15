@@ -20,9 +20,7 @@ from google.protobuf.timestamp_pb2 import Timestamp
 from goaly.contracts.gen.environment_pb2 import ShellResult, SqlResult
 from goaly.contracts.gen.llm_call_pb2 import LlmCallRecord, LlmCallStatus, Usage
 from goaly.contracts.gen.task_pb2 import (
-    BirdGrade,
-    BirdTaskInput,
-    BirdTestCaseResult,
+    EffiSqlTaskInput,
     Grade,
     GradeStatus,
     SweGrade,
@@ -114,23 +112,20 @@ def test_writes_keys_in_the_order_the_proto_declares_them_whatever_is_set() -> N
         assert list(fields["swe"]) == swe_keys
 
 
-def test_writes_keys_in_declaration_order_in_lists_too_not_in_number_order() -> None:
+def test_writes_keys_in_declaration_order_not_in_number_order() -> None:
     record = LlmCallRecord(status=LlmCallStatus.LLM_CALL_STATUS_OK, seed=2, call_id="c")
-    grade = Grade(bird=BirdGrade(test_cases=[BirdTestCaseResult(passed=True, message="m")]))
 
     # seed is field 13, declared after instance_id.
     assert list(parse(to_json_line(record)))[:5] == [
         *("call_id", "run_id", "instance_id", "seed", "purpose")
     ]
-    assert list(parse(to_json_line(grade))["bird"]["test_cases"][0]) == [
-        "index",
-        "passed",
-        "message",
-    ]
 
 
-def message_with_a_map() -> type[Message]:
-    """Outer, with a map of Inner, which declares field 2 before field 1. No contract has a map."""
+def message_with_a_list_and_a_map() -> type[Message]:
+    """Outer, with a list and a map of Inner, which declares field 2 before field 1.
+
+    Built at run time, so the tests do not depend on which contracts have lists or maps.
+    """
     file = descriptor_pb2.FileDescriptorProto(
         name="goaly_tests/ordering.proto", package="goaly_tests", syntax="proto3"
     )
@@ -159,16 +154,23 @@ def message_with_a_map() -> type[Message]:
         type_name=".goaly_tests.Outer.ByKeyEntry",
         label=repeated,
     )
+    outer.field.add(
+        name="items", number=2, type=message, type_name=".goaly_tests.Inner", label=repeated
+    )
     pool = descriptor_pool.DescriptorPool()
     pool.Add(file)
     return message_factory.GetMessageClass(pool.FindMessageTypeByName("goaly_tests.Outer"))
 
 
-def test_writes_the_values_of_a_map_in_declaration_order() -> None:
-    outer = message_with_a_map()()
-    getattr(outer, "by_key")["k"].early = "e"  # noqa: B009  # The type is built at run time.
+def test_writes_the_elements_of_lists_and_the_values_of_maps_in_declaration_order() -> None:
+    outer = message_with_a_list_and_a_map()()
+    getattr(outer, "items").add().early = "e"  # noqa: B009  # The type is built at run time.
+    getattr(outer, "by_key")["k"].early = "e"  # noqa: B009
 
-    assert list(parse(to_json_line(outer))["by_key"]["k"]) == ["late", "early"]
+    fields = parse(to_json_line(outer))
+
+    assert list(fields["items"][0]) == ["late", "early"]
+    assert list(fields["by_key"]["k"]) == ["late", "early"]
 
 
 def test_writes_timestamps_in_rfc_3339() -> None:
@@ -257,18 +259,18 @@ def test_writes_a_struct_as_protobuf_does() -> None:
 
 
 def test_reads_a_line_into_the_requested_type() -> None:
-    message = from_json_line('{"instance_id":"t1","bird":{"db_id":"films"}}', TaskInput)
+    message = from_json_line('{"instance_id":"t1","effisql":{"db":"tpch"}}', TaskInput)
 
     assert_type(message, TaskInput)
-    assert message == TaskInput(instance_id="t1", bird=BirdTaskInput(db_id="films"))
+    assert message == TaskInput(instance_id="t1", effisql=EffiSqlTaskInput(db="tpch"))
 
 
 def test_ignores_unknown_fields_at_any_depth() -> None:
-    line = '{"instance_id":"t1","dropped":1,"bird":{"db_id":"films","also_dropped":[true]}}'
+    line = '{"instance_id":"t1","dropped":1,"effisql":{"db":"tpch","also_dropped":[true]}}'
 
     message = from_json_line(line, TaskInput)
 
-    assert message == TaskInput(instance_id="t1", bird=BirdTaskInput(db_id="films"))
+    assert message == TaskInput(instance_id="t1", effisql=EffiSqlTaskInput(db="tpch"))
 
 
 @pytest.mark.parametrize(
