@@ -15,6 +15,7 @@ from pathlib import Path
 import pytest
 from pydantic import SecretStr
 
+from goaly.bench.effisql.benchmark import EffiSqlBenchmark
 from goaly.bench.effisql.harness import EffiSqlPaths, EffiSqlWiring, open_host
 from goaly.bench.effisql.launcher import (
     EffiSqlLauncher,
@@ -30,6 +31,7 @@ from goaly.contracts.gen.llm_call_pb2 import LlmCallRecord
 from goaly.contracts.gen.task_pb2 import SPLIT_EXTERNAL, SPLIT_HELDOUT, SPLIT_VAL
 from goaly.contracts.jsonl import read_jsonl
 from goaly.harness.core.llm import CallRecorder
+from goaly.harness.core.registry import HostBenchmark, HostOptions
 from goaly.harness.core.runner import RunFiles
 from tests.bench.effisql.fake_run import write_inputs
 from tests.bench.effisql.synthetic import GOLD_SQL, task
@@ -246,12 +248,7 @@ def test_staging_twice_replaces_the_inputs(tmp_path: Path) -> None:
 
 
 class TestHost:
-    @dataclass(frozen=True)
-    class Options:
-        files: RunFiles
-        instances_file: Path | None
-        split: int
-        budget_phase: str | None
+    Options = HostOptions
 
     async def test_the_host_side_grades_by_the_split_and_launches_the_container(
         self, tmp_path: Path
@@ -260,8 +257,11 @@ class TestHost:
         wiring = EffiSqlWiring(paths=lambda: paths)
         options = self.Options(RunFiles(tmp_path / "run"), None, SPLIT_HELDOUT, "baseline")
 
-        async with open_host(options, wiring) as host:  # type: ignore[arg-type]
-            fields = host.benchmark.manifest_fields()
+        async with open_host(options, wiring) as opened:
+            assert isinstance(opened, HostBenchmark)
+            assert isinstance(opened.benchmark, EffiSqlBenchmark)
+            host, benchmark = opened, opened.benchmark
+            fields = benchmark.manifest_fields()
             assert fields.environment_settings["grading_mode"] == "official"
             assert fields.environment_settings["grading_priority"] == "baseline_heldout"
             assert host.cache_namespace.startswith("official-")
@@ -274,15 +274,21 @@ class TestHost:
         wiring = EffiSqlWiring(paths=lambda: paths)
         options = self.Options(RunFiles(tmp_path / "run"), organizers, SPLIT_EXTERNAL, "final")
 
-        async with open_host(options, wiring) as host:  # type: ignore[arg-type]
+        async with open_host(options, wiring) as opened:
+            assert isinstance(opened, HostBenchmark)
+            assert isinstance(opened.benchmark, EffiSqlBenchmark)
+            host, benchmark = opened, opened.benchmark
             assert host.cache_namespace == ""
-            assert host.benchmark.grade_function is None
-            assert [i.instance_id for i in host.benchmark.load_instances(SPLIT_EXTERNAL)] == ["901"]
+            assert benchmark.grade_function is None
+            assert [i.instance_id for i in benchmark.load_instances(SPLIT_EXTERNAL)] == ["901"]
 
     async def test_a_val_run_grades_in_dev_mode(self, tmp_path: Path) -> None:
         paths = write_inputs(tmp_path)
         options = self.Options(RunFiles(tmp_path / "run"), None, SPLIT_VAL, "rsi")
 
-        async with open_host(options, EffiSqlWiring(paths=lambda: paths)) as host:  # type: ignore[arg-type]
-            assert host.benchmark.mode is not None
-            assert host.benchmark.mode.value == "dev"
+        async with open_host(options, EffiSqlWiring(paths=lambda: paths)) as opened:
+            assert isinstance(opened, HostBenchmark)
+            assert isinstance(opened.benchmark, EffiSqlBenchmark)
+            benchmark = opened.benchmark
+            assert benchmark.mode is not None
+            assert benchmark.mode.value == "dev"

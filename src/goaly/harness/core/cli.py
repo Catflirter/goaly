@@ -49,11 +49,13 @@ from goaly.harness.core.manifest import (
     harness_hash,
     new_run_id,
     provenance,
+    read_manifest,
     sha256_file,
 )
 from goaly.harness.core.registry import (
-    GradingOptions,
     HarnessOptions,
+    HostOptions,
+    RegisteredHarness,
     Registry,
     RegistryError,
     RunnableHarness,
@@ -214,8 +216,7 @@ async def _run(args: argparse.Namespace, command_line: list[str], registry: Regi
         raise ValueError("--in-container runs --phase solve only, with --inputs")
     if args.inputs is not None and not args.in_container:
         raise ValueError("--inputs is for --in-container")
-    factory = registry.factory(args.bench, args.harness)  # First: the benchmark names the share.
-    harness_name = args.harness or registry.harnesses(args.bench)[0]
+    registered = registry.harness(args.bench, args.harness)  # First: the share names the bench.
     if args.budget_phase is None:
         raise ValueError(f"--phase {args.phase} needs --budget-phase, as it calls the LLM")
     share = args.budget_share or args.bench
@@ -234,8 +235,8 @@ async def _run(args: argparse.Namespace, command_line: list[str], registry: Regi
             in_container=args.in_container,
             inputs_dir=args.inputs,
         )
-        async with factory(options) as harness:
-            return await _run_harness(args, command_line, harness, harness_name, llm_shares, lock)
+        async with registered.factory(options) as harness:
+            return await _run_harness(args, command_line, registered, harness, llm_shares, lock)
 
 
 # The options a grade phase takes from the run's manifest instead.
@@ -247,7 +248,6 @@ _SOLVING_OPTIONS = (
     "seeds",
     "first_seed",
     "resume",
-    "budget_phase",
     "budget_share",
     "max_tasks",
     "task_timeout",
@@ -262,18 +262,22 @@ async def _grade(args: argparse.Namespace, registry: Registry) -> RunSummary:
     if given:
         options = ", ".join("--" + name.replace("_", "-") for name in given)
         raise ValueError(f"--phase grade takes these from the run it grades: {options}")
-    factory = registry.grading(args.bench)
+    factory = registry.host(args.bench)
     files = RunFiles(args.out)
     if not await asyncio.to_thread(files.manifest.exists):  # Before the lock creates --out.
         raise RunDirectoryError(f"{args.out} holds no run to grade")
     with await asyncio.to_thread(lock_run_dir, files) as lock:
-        async with factory(GradingOptions(files=files)) as grading:
-            if grading.benchmark_name != args.bench:
+        stored = await asyncio.to_thread(read_manifest, files.manifest)
+        opening = HostOptions(
+            files=files, instances_file=None, split=stored.split, budget_phase=args.budget_phase
+        )
+        async with factory(opening) as host:
+            if host.benchmark_name != args.bench:
                 raise RuntimeError(
-                    f"the grading registered for {args.bench!r} is of {grading.benchmark_name!r}"
+                    f"the host side registered for {args.bench!r} is of {host.benchmark_name!r}"
                 )
-            cache = _cache(args, grading.cache_namespace, f"the benchmark {args.bench!r}")
-            return await grading.grader(cache=cache).grade(files.root, lock=lock)
+            cache = _cache(args, host.cache_namespace, f"the benchmark {args.bench!r}")
+            return await host.grader(cache=cache).grade(files.root, lock=lock)
 
 
 def _cache(args: argparse.Namespace, namespace: str, owner: str) -> EvalCache | None:
@@ -287,8 +291,8 @@ def _cache(args: argparse.Namespace, namespace: str, owner: str) -> EvalCache | 
 async def _run_harness(
     args: argparse.Namespace,
     command_line: list[str],
+    registered: RegisteredHarness,
     harness: RunnableHarness,
-    harness_name: str,
     llm_shares: dict[str, int],
     lock: RunLock,
 ) -> RunSummary:
@@ -297,14 +301,14 @@ async def _run_harness(
             f"the harness registered for {args.bench!r} runs the benchmark"
             f" {harness.benchmark_name!r}"
         )
-    cache = _cache(args, harness.cache_namespace, f"the harness {harness_name!r}")
+    cache = _cache(args, harness.cache_namespace, f"the harness {registered.name!r}")
     first_seed = args.first_seed or 0
     seeds = list(range(first_seed, first_seed + (args.seeds or 1)))
     max_tasks = args.max_tasks or DEFAULT_MAX_TASKS
     # Every option that shapes the run: not where it is written, cached or logged.
     settings: dict[str, JsonValue] = {
         "benchmark": args.bench,
-        "harness": harness_name,
+        "harness": registered.name,
         "split": args.split,
         "instances_sha256": None if args.instances is None else sha256_file(args.instances),
         "only": None if args.only is None else sorted(args.only),
@@ -315,7 +319,7 @@ async def _run_harness(
         "budget_share": args.budget_share or args.bench,
         "llm_shares": dict(llm_shares),
     }
-    manifest = await asyncio.to_thread(_manifest, args, command_line, harness, settings)
+    manifest = await asyncio.to_thread(_manifest, args, command_line, registered, harness, settings)
     runner = harness.runner(cache=cache, max_tasks=max_tasks, task_timeout_s=args.task_timeout)
     return await runner.run(
         lock.files.root,
@@ -332,33 +336,24 @@ async def _run_harness(
 def _manifest(
     args: argparse.Namespace,
     command_line: list[str],
+    registered: RegisteredHarness,
     harness: RunnableHarness,
     settings: dict[str, JsonValue],
 ) -> RunManifest:
-    """The caller's part of the run's manifest; the runner adds the rest."""
+    """The caller's part of the run's manifest; the runner adds the rest, the dataset's too."""
     manifest = provenance(CORE_DIR)
     manifest.run_id = args.run_id or new_run_id()
-    pack = harness.pack_dir
+    pack = registered.pack_dir
     manifest.harness_hash = core_hash() if pack is None else harness_hash(pack)
     manifest.config_hash = config_hash(settings)
-    manifest.dataset_revision = harness.dataset.revision
-    manifest.dataset_notes[:] = harness.dataset.notes
-    manifest.gold_sha256 = harness.dataset.gold_sha256
-    # The benchmark's own fields (Benchmark.manifest_fields): it knows its task file and grader.
-    fields = harness.manifest_fields()
-    if fields.dataset_revision:
-        manifest.dataset_revision = fields.dataset_revision
-    if fields.dataset_notes:
-        manifest.dataset_notes[:] = fields.dataset_notes
-    manifest.dataset_sha256 = fields.dataset_sha256
-    manifest.environment_settings.update(fields.environment_settings)
-    manifest.models.extend(harness.models)
+    manifest.gold_sha256 = harness.gold_sha256
+    manifest.models.extend(registered.models)
     manifest.command_line[:] = command_line
     return manifest
 
 
 def _split(args: argparse.Namespace) -> Split.ValueType:
-    """The split the run's tasks come from: SPLIT_EXTERNAL for --instances."""
+    """The split of the run's tasks: SPLIT_EXTERNAL for --instances."""
     return SPLIT_EXTERNAL if args.instances is not None else _SPLITS[args.split]
 
 

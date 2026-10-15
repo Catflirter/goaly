@@ -64,6 +64,7 @@ from goaly.harness.core.atomic import write_text_atomically
 from goaly.harness.core.llm_proxy import LlmProxy
 from goaly.harness.core.logs import configure_logging
 from goaly.harness.core.manifest import harness_hash, new_run_id, provenance, write_manifest
+from goaly.harness.core.registry import HostBenchmark, HostOptions
 from goaly.harness.core.runner import RunFiles, lock_run_dir
 from goaly.harness.core.settings import load_settings
 
@@ -232,7 +233,7 @@ async def run_interim(
     with await asyncio.to_thread(lock_run_dir, files):
         if files.manifest.exists():
             raise RuntimeError(f"{request.out} holds a run already")
-        options = _HostOptions(files, None, request.split, request.budget_phase)
+        options = HostOptions(files, None, request.split, request.budget_phase)
         if launcher is None:
             launcher = EffiSqlLauncher(
                 paths=wiring.paths,
@@ -241,7 +242,11 @@ async def run_interim(
                 ),
             )
         async with open_host(options, wiring, launcher) as host:
+            if not isinstance(host, HostBenchmark):
+                raise TypeError("Effi-SQL's host side is a HostBenchmark")
             benchmark = host.benchmark
+            if not isinstance(benchmark, EffiSqlBenchmark):
+                raise TypeError("Effi-SQL's host side holds an EffiSqlBenchmark")
             wanted = set(request.only)
             instances = [
                 i for i in benchmark.load_instances(request.split) if i.instance_id in wanted
@@ -268,7 +273,7 @@ async def run_interim(
             solve.solve_dir.mkdir(parents=True, exist_ok=True)
             failure: SolveContainerError | None = None
             try:
-                await host.launcher(solve)
+                await launcher(solve)
             except SolveContainerError as error:
                 failure = error
                 _logger.exception("the solve container failed; grading what it left")
@@ -284,14 +289,6 @@ async def run_interim(
     }
     write_text_atomically(request.out / "summary.json", json.dumps(summary, indent=2) + "\n")
     return summary
-
-
-@dataclass(frozen=True)
-class _HostOptions:
-    files: RunFiles
-    instances_file: Path | None
-    split: Split.ValueType
-    budget_phase: str | None
 
 
 def _write_manifest(

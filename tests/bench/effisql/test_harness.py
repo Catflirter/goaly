@@ -34,8 +34,9 @@ from goaly.bench.effisql.harness import (  # Private helpers.
     grading_priority,
     load_pack,
     model_settings,
-    open_grading,
     open_harness,
+    open_host,
+    pack_models,
     recorded_priority,
 )
 from goaly.bench.effisql.pg_instances import SOLVING
@@ -68,7 +69,7 @@ from goaly.harness.core.llm_errors import (
 )
 from goaly.harness.core.llm_models import EXECUTOR_MODEL, ModelParams
 from goaly.harness.core.manifest import read_manifest, write_manifest
-from goaly.harness.core.registry import GradingOptions, HarnessOptions, Registry
+from goaly.harness.core.registry import HarnessOptions, HostOptions, Registry
 from goaly.harness.core.runner import RunFiles, RunIdentity
 from tests.bench.effisql.fake_run import OFFICIAL_FORM, FakeClient, FakeWiring, fake_wiring
 from tests.bench.effisql.synthetic import task
@@ -93,8 +94,14 @@ def _restore_logging() -> Iterator[None]:
 
 def registry(fakes: FakeWiring) -> Registry:
     registry = Registry()
-    registry.add("effisql", "v0", lambda options: open_harness(options, fakes.wiring))
-    registry.add_benchmark("effisql", lambda options: open_grading(options, fakes.wiring))
+    registry.add(
+        "effisql",
+        "v0",
+        lambda options: open_harness(options, fakes.wiring),
+        pack_dir=PACK_DIR,
+        models=pack_models(),
+    )
+    registry.add_benchmark("effisql", lambda options: open_host(options, fakes.wiring))
     return registry
 
 
@@ -118,8 +125,8 @@ class TestPack:
         assert config.budgets == Budgets(steps=30, wall_clock_s=600)
         assert config.pack["execute_sql"] == {
             "statement_timeout_s": 120,
-            "rows_shown": 20,
-            "value_chars": 200,
+            "rows_shown": 100,
+            "value_chars": 2000,
         }
         assert "compute its result from the tables" in prompt
 
@@ -373,15 +380,29 @@ class TestRealWiring:
 
         assert recorded_priority(manifest) is priority
 
-    async def test_grading_refuses_an_external_run(self, tmp_path: Path) -> None:
+    async def test_an_external_runs_host_side_has_no_grader(self, tmp_path: Path) -> None:
         fakes = fake_wiring(tmp_path)
         files = RunFiles(tmp_path / "run")
         files.root.mkdir()
         write_manifest(files.manifest, RunManifest(run_id="r", split=SPLIT_EXTERNAL))
+        options = HostOptions(files, None, SPLIT_EXTERNAL, None)
 
-        with pytest.raises(ValueError, match="SPLIT_EXTERNAL is not graded"):
-            async with open_grading(GradingOptions(files=files), fakes.wiring):
-                pass
+        async with open_host(options, fakes.wiring) as host:
+            assert host.cache_namespace == ""
+        assert fakes.grader.graded == []
+
+    async def test_a_grade_phase_takes_the_priority_the_manifest_recorded(
+        self, tmp_path: Path
+    ) -> None:
+        fakes = fake_wiring(tmp_path)
+        files = RunFiles(tmp_path / "run")
+        files.root.mkdir()
+        settings = {"grading_mode": "dev", "grading_priority": "baseline"}
+        write_manifest(files.manifest, RunManifest(split=SPLIT_VAL, environment_settings=settings))
+
+        async with open_host(HostOptions(files, None, SPLIT_VAL, None), fakes.wiring) as host:
+            fields = host.benchmark.manifest_fields()  # type: ignore[attr-defined]
+        assert fields.environment_settings["grading_priority"] == "baseline"
 
 
 class TestInContainer:
@@ -427,7 +448,12 @@ class TestInContainer:
 
     async def test_the_container_needs_its_inputs(self, tmp_path: Path) -> None:
         options = HarnessOptions(
-            files=RunFiles(tmp_path), instances_file=None, llm_shares={}, in_container=True
+            files=RunFiles(tmp_path),
+            instances_file=None,
+            llm_shares={},
+            split=SPLIT_TRAIN,
+            budget_phase="rsi",
+            in_container=True,
         )
 
         with pytest.raises(ValueError, match="--inputs"):

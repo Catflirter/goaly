@@ -7,6 +7,7 @@ from typing import Any
 import pytest
 from google.protobuf.struct_pb2 import ListValue
 
+from goaly.bench.effisql import sql_env
 from goaly.contracts.gen.environment_pb2 import SqlResult
 from goaly.contracts.interfaces import SqlEnvironment
 from goaly.harness.core.budgets import Budgets
@@ -54,9 +55,12 @@ class TestArguments:
             parameters = function["parameters"]
             assert parameters["required"] == ["sql"]
             assert list(parameters["properties"]) == ["sql"]
-            assert parameters["properties"]["sql"]["minLength"] == 1
+        assert schemas["execute_sql"]["parameters"]["properties"]["sql"]["minLength"] == 1
+        assert schemas["submit"]["parameters"]["properties"]["sql"]["pattern"] == r"\S"
 
-    @pytest.mark.parametrize("arguments", ["{}", '{"sql": ""}', '{"sql": 1}', "not json"])
+    @pytest.mark.parametrize(
+        "arguments", ["{}", '{"sql": ""}', '{"sql": " \\n "}', '{"sql": 1}', "not json"]
+    )
     async def test_invalid_arguments_are_an_error_and_run_nothing(self, arguments: str) -> None:
         env = FakeSqlEnvironment()
 
@@ -103,6 +107,11 @@ class TestTimeouts:
         assert "stopped at the 0.01 s statement timeout" in result.content
         assert FAKE_STATEMENT_TIMEOUT == STATEMENT_TIMEOUT
 
+    def test_the_timeout_message_is_the_real_environments(self) -> None:
+        # The pack cannot import bench, so it keeps its own copy; this keeps the copies one.
+        assert sql_env.STATEMENT_TIMEOUT == STATEMENT_TIMEOUT
+        assert FAKE_STATEMENT_TIMEOUT == STATEMENT_TIMEOUT
+
     async def test_the_backstop_cancels_a_statement_the_environment_never_ends(self) -> None:
         class Stuck(FakeSqlEnvironment):
             async def execute(self, sql: str, *, timeout_s: float) -> SqlResult:
@@ -145,6 +154,11 @@ class TestOutput:
 
         assert "Rows: 3 rows, the first 1 shown.\n1\n" in text
         assert "\n2\n" not in text
+
+    def test_a_statement_without_columns(self) -> None:
+        text = render(SqlResult(row_count=3), ExecuteSqlConfig())
+
+        assert text.startswith("Columns: (none)\nRows: 3 rows.\n")
 
     def test_a_single_row_and_no_rows(self) -> None:
         one = render(SqlResult(columns=["x"], rows=rows([7.0]), row_count=1), ExecuteSqlConfig())

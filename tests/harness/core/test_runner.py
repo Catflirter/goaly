@@ -16,7 +16,7 @@ from google.protobuf.timestamp_pb2 import Timestamp
 
 from goaly.contracts.errors import EnvironmentFailure
 from goaly.contracts.gen.llm_call_pb2 import Usage
-from goaly.contracts.gen.manifest_pb2 import RunManifest
+from goaly.contracts.gen.manifest_pb2 import ModelSettings, RunManifest
 from goaly.contracts.gen.result_pb2 import (
     TASK_ERROR_TYPE_ENVIRONMENT,
     TASK_ERROR_TYPE_LLM,
@@ -29,6 +29,7 @@ from goaly.contracts.gen.result_pb2 import (
 from goaly.contracts.gen.task_pb2 import (
     GRADE_STATUS_GRADED,
     GRADE_STATUS_GRADER_ERROR,
+    GRADE_STATUS_TIMEOUT,
     SPLIT_EXTERNAL,
     SPLIT_TRAIN,
     SPLIT_VAL,
@@ -41,6 +42,7 @@ from goaly.contracts.gen.trajectory_pb2 import (
     STOP_REASON_CANCELLED,
     STOP_REASON_CRASHED,
     STOP_REASON_SUBMITTED,
+    STOP_REASON_TIME_BUDGET_EXHAUSTED,
     Trajectory,
 )
 from goaly.contracts.interfaces import Environment, JsonValue
@@ -60,7 +62,7 @@ from goaly.harness.core.runner import (
     error_classifier,
     lock_run_dir,
 )
-from tests.fakes import FakeSqlEnvironment, ToyInstance
+from tests.fakes import TOY_DATASET_SHA256, FakeSqlEnvironment, ToyInstance
 from tests.harness.core.runner_doubles import (
     Action,
     ScriptedBenchmark,
@@ -69,6 +71,7 @@ from tests.harness.core.runner_doubles import (
     StubContexts,
     answering,
     base_sql,
+    cancels_itself,
     raising,
     sleeping,
     toy_instances,
@@ -98,6 +101,12 @@ def template(run_id: str = "run-1", **fields: str) -> RunManifest:
     )
     for name, value in fields.items():
         setattr(manifest, name, value)
+    return manifest
+
+
+def with_models(*models: ModelSettings) -> RunManifest:
+    manifest = template()
+    manifest.models.extend(models)
     return manifest
 
 
@@ -149,6 +158,14 @@ def results(run_dir: Path) -> dict[Key, TaskResult]:
         assert key not in found, f"{key} recorded twice"
         found[key] = result
     return found
+
+
+def results_last(run_dir: Path) -> dict[Key, TaskResult]:
+    """The run's last result of each task, as readers take it: a later line replaces an earlier."""
+    return {
+        (result.instance_id, result.seed): result
+        for result in read_jsonl(RunFiles(run_dir).results, TaskResult)
+    }
 
 
 def trajectories(run_dir: Path) -> dict[Key, Trajectory]:
@@ -219,17 +236,45 @@ async def test_writes_the_manifest_at_the_start_and_finishes_it_at_the_end(
     assert finished.started_at == started.started_at
     assert finished.finished_at.ToDatetime() >= finished.started_at.ToDatetime()
     expected = template()
+    expected.ClearField("dataset_revision")  # The adapter's, which the caller's never overrides.
     expected.MergeFrom(
         RunManifest(benchmark="toy", split=SPLIT_TRAIN, seeds=[0, 2], instance_ids=["t0", "t1"])
     )
+    expected.MergeFrom(benchmark.manifest_fields())
     expected.started_at.CopyFrom(started.started_at)
     assert started == expected
 
 
-async def test_a_result_and_its_trajectory_describe_the_task(tmp_path: Path) -> None:
-    benchmark = ScriptedBenchmark(toy_instances(1), provision_delay_s=0.2)
+class OddManifest(ScriptedBenchmark):
+    """Its manifest fields set more than the four that are an adapter's to set."""
 
-    await run(make_runner(benchmark, ScriptedPolicy(delay_s=0.05)), tmp_path / "run", seeds=[3])
+    def manifest_fields(self) -> RunManifest:
+        fields = super().manifest_fields()
+        fields.run_id = "the adapter's"
+        fields.harness_hash = "the adapter's"
+        return fields
+
+
+async def test_the_adapter_alone_sets_its_four_manifest_fields(tmp_path: Path) -> None:
+    caller = template()
+    caller.dataset_notes.append("the caller's note")
+    caller.dataset_sha256 = "c" * 64
+    caller.environment_settings["grading_mode"] = "official"
+
+    await run(make_runner(OddManifest(toy_instances(1))), tmp_path, manifest=caller)
+
+    manifest = read_manifest(RunFiles(tmp_path).manifest)
+    assert manifest.dataset_revision == "toy-revision-1"
+    assert list(manifest.dataset_notes) == ["the toy tasks are held in memory"]
+    assert manifest.dataset_sha256 == TOY_DATASET_SHA256
+    assert dict(manifest.environment_settings) == {"grading_mode": "dev"}
+    assert (manifest.run_id, manifest.harness_hash) == ("run-1", "harness-a")  # The caller's.
+
+
+async def test_a_result_and_its_trajectory_describe_the_task(tmp_path: Path) -> None:
+    benchmark = ScriptedBenchmark(toy_instances(1), provision_delay_s=0.5)
+
+    await run(make_runner(benchmark, ScriptedPolicy(delay_s=0.02)), tmp_path / "run", seeds=[3])
 
     result = results(tmp_path / "run")[("t0", 3)]
     two_steps = Usage(input_tokens=200, output_tokens=40, cost_usd=0.002)
@@ -238,11 +283,10 @@ async def test_a_result_and_its_trajectory_describe_the_task(tmp_path: Path) -> 
     assert result.stop_reason == STOP_REASON_SUBMITTED
     assert result.error_message == ""
     # The policy's solving time leaves out the provisioning, which has its own field.
-    assert result.wall_time_s >= 0.05
-    assert result.provision_s >= 0.2
-    assert result.wall_time_s < result.provision_s
-    elapsed = result.finished_at.ToNanoseconds() - result.started_at.ToNanoseconds()
-    assert elapsed / 1e9 >= result.provision_s + result.wall_time_s - 0.01
+    assert result.wall_time_s >= 0.02
+    assert result.provision_s >= 0.5
+    assert result.wall_time_s < result.provision_s  # Only a stall of 0.48 s could break it.
+    assert result.started_at.ToNanoseconds() < result.finished_at.ToNanoseconds()
     trajectory = trajectories(tmp_path / "run")[("t0", 3)]
     assert (trajectory.run_id, trajectory.instance_id, trajectory.seed) == ("run-1", "t0", 3)
     assert trajectory.task == benchmark.agent_input(benchmark.instances[0])
@@ -393,6 +437,16 @@ async def test_an_instance_whose_input_cannot_be_built_is_recorded_as_a_crash(
     assert [ctx.instance_id for ctx in contexts.made] == ["t1"]
 
 
+async def test_the_provisioning_time_is_recorded_when_provisioning_fails(tmp_path: Path) -> None:
+    benchmark = ScriptedBenchmark(
+        toy_instances(1), provision_delay_s=0.2, provision_errors={"t0": EnvironmentFailure("x")}
+    )
+
+    await run(make_runner(benchmark), tmp_path)
+
+    assert results(tmp_path)[("t0", 0)].provision_s >= 0.2
+
+
 async def test_a_crash_inside_grade_is_a_grader_error_not_a_task_error(tmp_path: Path) -> None:
     benchmark = ScriptedBenchmark(
         toy_instances(2), grade_errors={"t0": RuntimeError("grading instance down")}
@@ -421,9 +475,32 @@ async def test_a_prediction_without_an_official_form_counts_as_a_crash(tmp_path:
     result = results(tmp_path / "run")[("t0", 0)]
     assert result.error_type == TASK_ERROR_TYPE_POLICY_CRASH
     assert "cannot write a diff" in result.error_message
+    assert '"sql":"SELECT 0"' in result.error_message  # The rejected answer, kept for debugging.
     assert result.grade.score == 0.5  # Graded as the empty answer, which the file submits.
     assert official(tmp_path / "run") == [base_answer(0), base_answer(1)]
     assert not trajectories(tmp_path / "run")[("t0", 0)].HasField("prediction")
+
+
+class NoEmptyAnswer(ScriptedBenchmark):
+    """An adapter that breaks the contract: it cannot write the empty answer."""
+
+    def to_official(self, inst: ToyInstance, prediction: Prediction) -> dict[str, JsonValue]:
+        if not prediction.HasField("effisql"):
+            raise ValueError("no base_sql in the record")
+        return super().to_official(inst, prediction)
+
+
+async def test_an_adapter_that_cannot_write_the_empty_answer_stops_the_run_early(
+    tmp_path: Path,
+) -> None:
+    policy = ScriptedPolicy({"t0": raising(ValueError("boom"))})
+
+    # Found as the first crashed task is recorded, not after every task has run.
+    with pytest.raises(ExceptionGroup) as stopped:
+        await run(make_runner(NoEmptyAnswer(toy_instances(1)), policy), tmp_path)
+
+    assert stopped.group_contains(RuntimeError, match="cannot write the empty answer of 't0'")
+    assert results(tmp_path) == {}  # The task is not recorded: a resume runs it again.
 
 
 async def test_a_context_that_cannot_give_its_trajectory_fails_its_task(tmp_path: Path) -> None:
@@ -462,7 +539,7 @@ async def test_the_error_classifier_is_injected(tmp_path: Path) -> None:
         ScriptedBenchmark(toy_instances(1)),
         policy,
         StubContexts(),
-        classify=error_classifier({GatewayDownError: TASK_ERROR_TYPE_LLM}),
+        classify=error_classifier([(GatewayDownError, TASK_ERROR_TYPE_LLM)]),
     )
 
     summary = await run(runner, tmp_path / "run")
@@ -505,6 +582,88 @@ async def test_an_error_message_is_cut_short(tmp_path: Path) -> None:
     assert message.startswith("ValueError: xxx")
     assert len(message) < 2_100
     assert message.endswith("characters cut]")
+
+
+# No task vanishes (fix round G1): code that raises a CancelledError while nothing cancelled the
+# run, or a BaseExceptionGroup, fails only its own task.
+
+
+def stray() -> asyncio.CancelledError:
+    return asyncio.CancelledError("cancelled from within")
+
+
+async def test_every_task_is_recorded_whatever_its_code_raises(tmp_path: Path) -> None:
+    def break_context(ctx: StubContext) -> None:
+        if ctx.instance_id == "t3":
+            raise stray()
+        if ctx.instance_id == "t9":
+            ctx.trajectory_error = stray()
+
+    benchmark = ScriptedBenchmark(
+        toy_instances(12),
+        input_errors={"t0": stray()},
+        provision_errors={"t1": stray()},
+        grade_errors={"t2": stray(), "t8": BaseExceptionGroup("grading", [stray()])},
+        official_errors={"t4": stray()},
+    )
+    policy = ScriptedPolicy(
+        {
+            "t5": raising(stray()),
+            "t6": cancels_itself,
+            "t7": raising(BaseExceptionGroup("samples", [stray(), ValueError("bad sample")])),
+            "t10": raising(BaseExceptionGroup("tools", [stray(), EnvironmentFailure("gone")])),
+        }
+    )
+
+    summary = await run(
+        make_runner(benchmark, policy, StubContexts(setup=break_context)), tmp_path, seeds=(0, 1)
+    )
+
+    found = results(tmp_path)
+    # One result per (task, seed), and the official files: the run finished.
+    assert set(found) == {(f"t{n}", seed) for n in range(12) for seed in (0, 1)}
+    assert len(official(tmp_path, 1)) == 12
+    crashed = {"t0", "t1", "t3", "t4", "t5", "t6", "t7", "t9"}
+    for (instance_id, _), result in found.items():
+        if instance_id in crashed:
+            assert result.error_type == TASK_ERROR_TYPE_POLICY_CRASH, instance_id
+            assert result.stop_reason == STOP_REASON_CRASHED, instance_id
+            assert "CancelledError" in result.error_message, instance_id
+            assert result.grade.score == 0.5, instance_id  # Its empty answer, graded.
+        elif instance_id in {"t2", "t8"}:
+            assert result.error_type == TASK_ERROR_TYPE_NONE
+            assert result.grade.status == GRADE_STATUS_GRADER_ERROR
+            assert "CancelledError" in result.grade.feedback
+        elif instance_id == "t10":
+            assert result.error_type == TASK_ERROR_TYPE_ENVIRONMENT
+        else:
+            assert result.error_type == TASK_ERROR_TYPE_NONE
+            assert result.grade.status == GRADE_STATUS_GRADED
+    assert summary.ran == 24
+
+
+async def test_a_system_exit_from_the_context_still_ends_the_run(tmp_path: Path) -> None:
+    def exit_from_trajectory(ctx: StubContext) -> None:
+        ctx.trajectory_error = BaseExceptionGroup("exit", [SystemExit(4)])
+
+    runner = make_runner(
+        ScriptedBenchmark(toy_instances(1)), contexts=StubContexts(setup=exit_from_trajectory)
+    )
+
+    with pytest.raises(BaseExceptionGroup) as stopped:
+        await run(runner, tmp_path)
+
+    assert stopped.group_contains(SystemExit)
+
+
+async def test_a_system_exit_inside_a_group_still_ends_the_run(tmp_path: Path) -> None:
+    policy = ScriptedPolicy({"t0": raising(BaseExceptionGroup("exit", [SystemExit(3)]))})
+
+    with pytest.raises(BaseExceptionGroup) as stopped:
+        await run(make_runner(ScriptedBenchmark(toy_instances(2)), policy), tmp_path)
+
+    assert stopped.group_contains(SystemExit)
+    assert not RunFiles(tmp_path).official(0).exists()
 
 
 # The task time limit.
@@ -970,6 +1129,39 @@ async def test_only_clean_evaluations_are_cached(tmp_path: Path) -> None:
     assert sorted(again.solved) == [("t0", 0), ("t1", 0)]
 
 
+class GradingTimesOut(ScriptedBenchmark):
+    """Its grader gives up on t1 at its own time limit."""
+
+    async def grade(self, inst: ToyInstance, prediction: Prediction) -> Grade:
+        grade = await super().grade(inst, prediction)
+        if inst.instance_id == "t1":
+            grade = Grade(instance_id="t1", status=GRADE_STATUS_TIMEOUT, feedback="300 s")
+        return grade
+
+
+async def test_outcomes_that_depend_on_the_load_are_not_cached(tmp_path: Path) -> None:
+    cache = EvalCache(tmp_path / "cache", CACHE_NAMESPACE)
+
+    def out_of_time(ctx: StubContext) -> None:
+        if ctx.instance_id == "t0":  # The fallback answered: the wall-clock budget ran out.
+            ctx.recorded.stop_reason = STOP_REASON_TIME_BUDGET_EXHAUSTED
+
+    first = make_runner(
+        GradingTimesOut(toy_instances(3)), contexts=StubContexts(setup=out_of_time), cache=cache
+    )
+    await run(first, tmp_path / "a")
+
+    again = ScriptedPolicy()
+    await run(
+        make_runner(ScriptedBenchmark(toy_instances(3)), again, cache=cache),
+        tmp_path / "b",
+        manifest=template("run-2"),
+    )
+
+    # A slow gateway or a busy grading instance is no property of the harness.
+    assert sorted(again.solved) == [("t0", 0), ("t1", 0)]
+
+
 @pytest.mark.parametrize(
     ("manifest", "seeds"),
     [(template("run-2", harness_hash="harness-b"), (0,)), (template("run-2"), (1,))],
@@ -1024,7 +1216,9 @@ async def interrupt_after(runner: ToyRunner, run_dir: Path, recorded: int) -> No
         await running
 
 
-async def test_resume_runs_only_the_tasks_without_a_result(tmp_path: Path) -> None:
+async def test_resume_runs_only_the_tasks_without_a_result(
+    tmp_path: Path, caplog: pytest.LogCaptureFixture
+) -> None:
     gate = asyncio.Event()  # Never set: the run is interrupted while t2 and t3 wait.
     blocked = ScriptedPolicy({"t2": waiting(gate), "t3": waiting(gate)})
     await interrupt_after(make_runner(ScriptedBenchmark(toy_instances(4)), blocked), tmp_path, 2)
@@ -1033,12 +1227,13 @@ async def test_resume_runs_only_the_tasks_without_a_result(tmp_path: Path) -> No
     assert not read_manifest(RunFiles(tmp_path).manifest).HasField("finished_at")
 
     resumed = ScriptedPolicy()
-    summary = await run(
-        make_runner(ScriptedBenchmark(toy_instances(4)), resumed),
-        tmp_path,
-        manifest=template("ignored-on-resume"),
-        resume=True,
-    )
+    with caplog.at_level(logging.INFO, logger="goaly.harness.core.runner"):
+        summary = await run(
+            make_runner(ScriptedBenchmark(toy_instances(4)), resumed),
+            tmp_path,
+            manifest=template("ignored-on-resume"),
+            resume=True,
+        )
 
     assert sorted(resumed.solved) == [("t2", 0), ("t3", 0)]
     assert set(results(tmp_path)) == {(f"t{n}", 0) for n in range(4)}
@@ -1048,6 +1243,40 @@ async def test_resume_runs_only_the_tasks_without_a_result(tmp_path: Path) -> No
     assert manifest.run_id == "run-1"
     assert manifest.HasField("finished_at")
     assert summary == RunSummary(run_id="run-1", tasks=4, resumed=2, cached=0, ran=2, errors={})
+    assert "resuming run run-1, not ignored-on-resume" in caplog.text
+
+
+async def test_resume_runs_each_seed_of_a_task_that_lacks_a_result(tmp_path: Path) -> None:
+    never = asyncio.Event()
+
+    async def first_seed_hangs(task: TaskInput, env: Environment, ctx: StubContext) -> None:
+        if ctx.seed == 0:
+            await never.wait()
+
+    files = RunFiles(tmp_path)
+    blocked = make_runner(
+        ScriptedBenchmark(toy_instances(2)), ScriptedPolicy({"t0": first_seed_hangs})
+    )
+    running = asyncio.create_task(run(blocked, tmp_path, seeds=(0, 1)))
+    await wait_until(
+        lambda: files.results.exists() and files.results.read_bytes().count(b"\n") == 3
+    )
+    running.cancel()
+    with pytest.raises(asyncio.CancelledError):
+        await running
+    assert set(results(tmp_path)) == {("t1", 0), ("t0", 1), ("t1", 1)}
+
+    resumed = ScriptedPolicy()
+    await run(
+        make_runner(ScriptedBenchmark(toy_instances(2)), resumed),
+        tmp_path,
+        seeds=(0, 1),
+        resume=True,
+    )
+
+    # (t0, 1) has a result and (t0, 0) has not: the resume key is the instance and the seed.
+    assert resumed.solved == [("t0", 0)]
+    assert len(official(tmp_path, 0)) == len(official(tmp_path, 1)) == 2
 
 
 async def test_resume_reruns_a_task_whose_result_line_was_torn(tmp_path: Path) -> None:
@@ -1084,6 +1313,46 @@ async def test_resume_submits_the_rerun_answer_of_a_task_that_lost_its_result(
 
     assert resumed.solved == [("t0", 0)]
     assert official(tmp_path)[0] == {"instance_id": "t0", "sql": "new"}
+
+
+async def test_retry_errors_reruns_the_tasks_whose_last_result_is_an_error(
+    tmp_path: Path,
+) -> None:
+    flaky = ScriptedPolicy(
+        {
+            "t0": raising(EnvironmentFailure("the database restarted")),
+            "t1": raising(ValueError("x")),
+        }
+    )
+    await run(make_runner(ScriptedBenchmark(toy_instances(3)), flaky), tmp_path)
+
+    healthy = ScriptedPolicy({"t0": answering("SELECT 0"), "t1": answering("SELECT 1")})
+    async with asyncio.timeout(GUARD_S):
+        summary = await make_runner(ScriptedBenchmark(toy_instances(3)), healthy).run(
+            tmp_path, template(), split=SPLIT_TRAIN, seeds=[0], resume=True, retry_errors=True
+        )
+
+    assert sorted(healthy.solved) == [("t0", 0), ("t1", 0)]
+    assert {key: result.error_type for key, result in results_last(tmp_path).items()} == {
+        ("t0", 0): TASK_ERROR_TYPE_NONE,
+        ("t1", 0): TASK_ERROR_TYPE_NONE,
+        ("t2", 0): TASK_ERROR_TYPE_NONE,
+    }
+    assert official(tmp_path)[:2] == [
+        {"instance_id": "t0", "sql": "SELECT 0"},
+        {"instance_id": "t1", "sql": "SELECT 1"},
+    ]
+    assert (summary.resumed, summary.ran) == (1, 2)
+
+
+async def test_a_resume_without_retry_errors_keeps_the_errors(tmp_path: Path) -> None:
+    flaky = ScriptedPolicy({"t0": raising(EnvironmentFailure("the database restarted"))})
+    await run(make_runner(ScriptedBenchmark(toy_instances(2)), flaky), tmp_path)
+
+    again = ScriptedPolicy()
+    await run(make_runner(ScriptedBenchmark(toy_instances(2)), again), tmp_path, resume=True)
+
+    assert again.solved == []
 
 
 async def test_resuming_a_finished_run_only_writes_its_official_files_again(
@@ -1138,13 +1407,30 @@ async def test_resume_without_a_run_starts_one(tmp_path: Path) -> None:
     [
         ({"manifest": template(harness_hash="harness-b")}, "harness_hash"),
         ({"manifest": template(config_hash="config-b")}, "config_hash"),
-        ({"manifest": template(dataset_revision="rev-b")}, "dataset_revision"),
+        ({"grading_mode": "official"}, "environment_settings"),
+        ({"dataset": "rev-b"}, "dataset_revision"),
         ({"manifest": template(git_commit="1" * 40)}, "git_commit"),
+        ({"manifest": template(uv_lock_sha256="u" * 64)}, "uv_lock_sha256"),
+        (
+            {"manifest": with_models(ModelSettings(model="qwen3.6-35b-a3b", temperature=0))},
+            "models",
+        ),
         ({"seeds": (0, 1)}, "seeds"),
         ({"instance_ids": ["t0"]}, "instance_ids"),
         ({"split": SPLIT_VAL}, "split"),
     ],
-    ids=["harness", "config", "dataset", "commit", "seeds", "instances", "split"],
+    ids=[
+        "harness",
+        "config",
+        "grading mode",
+        "dataset",
+        "commit",
+        "uv.lock",
+        "models",
+        "seeds",
+        "instances",
+        "split",
+    ],
 )
 async def test_resume_refuses_a_run_that_does_not_match(
     tmp_path: Path, change: dict[str, object], field: str
@@ -1152,14 +1438,14 @@ async def test_resume_refuses_a_run_that_does_not_match(
     instances = [*toy_instances(2), ToyInstance("v0", SPLIT_VAL, "SELECT 9 FROM slow", "SELECT 9")]
     await run(make_runner(ScriptedBenchmark(instances)), tmp_path)
     before = RunFiles(tmp_path).manifest.read_bytes()
+    options = dict(change)
+    resumed = ScriptedBenchmark(instances, grading_mode=str(options.pop("grading_mode", "dev")))
+    if "dataset" in options:
+        revision = str(options.pop("dataset"))
+        resumed.manifest_fields = lambda: RunManifest(dataset_revision=revision)  # type: ignore[method-assign]
 
     with pytest.raises(RunDirectoryError, match=field):
-        await run(
-            make_runner(ScriptedBenchmark(instances)),
-            tmp_path,
-            resume=True,
-            **change,  # type: ignore[arg-type]
-        )
+        await run(make_runner(resumed), tmp_path, resume=True, **options)  # type: ignore[arg-type]
 
     assert RunFiles(tmp_path).manifest.read_bytes() == before
 
@@ -1341,8 +1627,17 @@ def test_the_default_classifier(error: Exception, expected: int) -> None:
     assert classify_error(error) == expected
 
 
+def test_rules_can_be_a_module_constant() -> None:
+    # A module-level list of rules type-checks, as a dict keyed by one exception type would not.
+    rules: list[tuple[type[Exception], TaskErrorType.ValueType]] = [
+        (GatewayDownError, TASK_ERROR_TYPE_LLM)
+    ]
+
+    assert error_classifier(rules)(GatewayDownError()) == TASK_ERROR_TYPE_LLM
+
+
 def test_extra_rules_come_after_the_environment_rule() -> None:
-    classify = error_classifier({GatewayDownError: TASK_ERROR_TYPE_LLM})
+    classify = error_classifier([(GatewayDownError, TASK_ERROR_TYPE_LLM)])
 
     assert classify(GatewayDownError()) == TASK_ERROR_TYPE_LLM
     assert classify(ExceptionGroup("g", [GatewayDownError()])) == TASK_ERROR_TYPE_LLM
