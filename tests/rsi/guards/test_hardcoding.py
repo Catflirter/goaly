@@ -379,3 +379,40 @@ def test_a_yaml_run_ends_at_a_line_that_is_no_item(repo: Path, gold: GoldWindows
     commit = candidate(repo, {f"{PACK}/config.yaml": f"a:\n{items}  plain\n{items}"})
 
     assert scan(repo, commit, gold)[0]
+
+
+@pytest.mark.parametrize(
+    "text",
+    [
+        "SELECT * FROM orders WHERE o_orderkey IN ("  # noqa: S608  (test data, never run)
+        + ", ".join(map(str, range(40)))
+        + ");\n",
+        "INSERT INTO t VALUES "  # noqa: S608  (test data, never run)
+        + ", ".join(f"({n}, 'x')" for n in range(40))
+        + ";\n",
+        "SELECT * FROM (VALUES "  # noqa: S608  (test data, never run)
+        + ", ".join(f"({n})" for n in range(40))
+        + ") AS v(x);\n",
+    ],
+)
+def test_a_large_list_in_a_sql_file_fails(repo: Path, gold: GoldWindows, text: str) -> None:
+    commit = candidate(repo, {f"{PACK}/skills/table.sql": text})
+
+    passed, detail = scan(repo, commit, gold)
+
+    assert not passed
+    assert "a literal collection of 40 constants" in detail
+
+
+def test_a_wide_select_in_a_sql_file_passes(repo: Path, gold: GoldWindows) -> None:
+    columns = ", ".join(f"c{n}" for n in range(40))
+    text = f"SELECT {columns} FROM t WHERE x = 'a, b, c' AND y IN (1, 2);\n"  # noqa: S608
+    commit = candidate(repo, {f"{PACK}/skills/wide.sql": text})
+
+    assert scan(repo, commit, gold)[0]
+
+
+def test_a_file_of_another_kind_is_scanned_for_gold_alone(repo: Path, gold: GoldWindows) -> None:
+    commit = candidate(repo, {f"{PACK}/notes.cfg": "".join(f"- {n}\n" for n in range(40))})
+
+    assert scan(repo, commit, gold)[0]

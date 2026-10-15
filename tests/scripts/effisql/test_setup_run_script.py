@@ -77,7 +77,7 @@ def test_writes_exclusions_after_review_with_the_manual_ones(dataset: Path, tmp_
 
 
 def test_the_stop_rule_writes_no_exclusions(dataset: Path, tmp_path: Path) -> None:
-    save_all(tmp_path, **{str(n): record(str(n), gold=gold(matched=False)) for n in (1, 2)})
+    save_all(tmp_path, **{str(n): record(str(n), gold=gold(matched=False)) for n in (1, 2, 3)})
     status, out = write(tmp_path, "--accept-failed-checks")
     assert status == script.EXIT_REFUSED
     assert not out.exists()

@@ -56,6 +56,7 @@ from goaly.bench.effisql.grader import (
     PgSession,
     QueryError,
     QueryTimeoutError,
+    ResourceError,
     ResultDigest,
     TimingError,
     time_base,
@@ -289,6 +290,17 @@ def _query_cause(error: TimingError) -> QueryError | QueryTimeoutError:
     return cause
 
 
+class _PredictionResourceError(Exception):
+    """The server ran out of resources on one of the prediction's statements."""
+
+
+def _prediction[T](step: Callable[[], T]) -> T:
+    try:
+        return step()
+    except ResourceError as error:
+        raise _PredictionResourceError from error
+
+
 class AbortedError(Exception):
     """The grading was cancelled while its worker ran; its outcome is discarded."""
 
@@ -404,8 +416,14 @@ def evaluate(
     cache: BaseCache | None,
     rng: random.Random,
     plans: list[dict[str, Any]] | None = None,
+    final_attempt: bool = True,
 ) -> Grade:
     """Grade ``sql`` for ``inst`` in ``mode``; blocking, so run it in a worker.
+
+    When the server runs out of resources (SQLSTATE class 53) on the prediction's own
+    statements, the grade is a GRADER_ERROR to retry, unless this is the ``final_attempt``: it
+    then fails the prediction with credit 0, as the official evaluator, with the same server
+    limits, would score it. Out of resources on the base's statements is always the grader's.
 
     With ``plans``, the prediction's ``EXPLAIN (FORMAT JSON)`` document is appended to it, once
     the plan was taken, for the run's audit trail.
@@ -423,6 +441,9 @@ def evaluate(
     except _BaseQueryError as error:
         status = GRADE_STATUS_TIMEOUT if error.timed_out else GRADE_STATUS_GRADER_ERROR
         details, feedback = EffiSqlGrade(), f"the base query failed, so nothing was graded: {error}"
+    except _PredictionResourceError as error:
+        status = GRADE_STATUS_PREDICTION_FAILED if final_attempt else GRADE_STATUS_GRADER_ERROR
+        details, feedback = EffiSqlGrade(), f"the prediction failed: {error.__cause__}"
     except GraderError as error:
         details, status, feedback = EffiSqlGrade(), GRADE_STATUS_GRADER_ERROR, f"grader: {error}"
     details.eval_wall_s = time.monotonic() - started
@@ -456,7 +477,7 @@ def _evaluate(
     main, base_sql = sessions.main, inst.base_sql
     entry = cache.get(inst) if mode is Mode.DEV and cache is not None else None
     try:
-        plan = main.plan(sql)
+        plan = _prediction(lambda: main.plan(sql))
         if plans is not None:
             plans.append(plan)
     except QueryError as error:
@@ -480,7 +501,9 @@ def _evaluate(
 
     details = EffiSqlGrade(base_cached=cached)
     try:
-        pred = main.digest(sql, row_limit=None if entry is None else entry.row_count)
+        pred = _prediction(
+            lambda: main.digest(sql, row_limit=None if entry is None else entry.row_count)
+        )
     except QueryError as error:
         return details, GRADE_STATUS_PREDICTION_FAILED, f"the prediction failed: {error}"
     except QueryTimeoutError as error:
@@ -500,7 +523,7 @@ def _evaluate(
         entry.alt_digest if entry is not None else _base(lambda: sessions.alt.digest(base_sql))
     )
     sessions.check_abort()
-    alt = alt_matches(sessions.alt, sql, base_alt)
+    alt = _prediction(lambda: alt_matches(sessions.alt, sql, base_alt))
     details.alt_matched = alt.matched
     sessions.check_abort()
     flags = []
@@ -535,7 +558,7 @@ def _timed(
 
     def time_pred() -> float:
         sessions.check_abort()
-        return main.execution_ms(sql)
+        return _prediction(lambda: main.execution_ms(sql))
 
     def time_the_base() -> float:
         sessions.check_abort()
@@ -690,6 +713,7 @@ class GradingSlot:
         mode: Mode,
         cache: BaseCache | None,
         plans: list[dict[str, Any]] | None = None,
+        final_attempt: bool = True,
     ) -> Grade:
         """Grade on this slot. Any failure but a cancel is a GRADER_ERROR grade and a reset.
 
@@ -697,7 +721,16 @@ class GradingSlot:
         """
         try:
             sessions = self.sessions()
-            grade = evaluate(sessions, inst, sql, mode, cache=cache, rng=self.rng, plans=plans)
+            grade = evaluate(
+                sessions,
+                inst,
+                sql,
+                mode,
+                cache=cache,
+                rng=self.rng,
+                plans=plans,
+                final_attempt=final_attempt,
+            )
         except AbortedError:
             raise
         except Exception as error:  # noqa: BLE001  # Never raise for grading trouble.

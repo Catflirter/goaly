@@ -85,6 +85,14 @@ class SolveRequest:
     runs ``goaly`` with the arguments goaly_args() gives. The launcher returns once the container
     has exited with status 0, and raises otherwise; cancelled, it stops the container and the
     proxy before it returns.
+
+    What the host's reading of the solve directory relies on of the mounts:
+    - ``solve_dir`` is a bind mount of its own, never ``<run>`` or a parent of it, so that no
+      host file shares its mount for the container to link to. The host also refuses a file
+      with more than one link. Mount it with ``nodev``, and run the container with every
+      capability dropped, so that it can plant no device node either.
+    - The checkout mounted is a clean snapshot of it, such as a ``git archive`` of its commit,
+      never a working tree, whose ``runs/`` would show the container other runs' records.
     """
 
     # The run, which the host's manifest describes.
@@ -355,14 +363,16 @@ def read_solve_records(solve_dir: Path, keys: Collection[_Key]) -> dict[_Key, So
 
 # Opening what the container wrote: never through a link, and only a regular file or directory.
 _DIRECTORY_FLAGS = os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW | os.O_CLOEXEC
-# O_NONBLOCK, so that a FIFO in a file's place cannot hang the open; fstat then refuses it.
-_FILE_FLAGS = os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK | os.O_CLOEXEC
+# O_NONBLOCK, so that a FIFO in a file's place cannot hang the open, and O_NOCTTY, so that a
+# terminal device cannot become the host's controlling terminal; fstat then refuses either.
+_FILE_FLAGS = os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK | os.O_NOCTTY | os.O_CLOEXEC
 
 
 def _open_plain(name: str, dir_fd: int | None, where: Path, *, directory: bool) -> int | None:
     """Open ``name`` in the directory ``dir_fd`` without following a link, and return its
-    descriptor if it is a directory (``directory``) or a regular file. Return None, with a
-    warning for anything but a missing one, if it is not."""
+    descriptor if it is a directory (``directory``) or a regular file with one link: a second
+    link could be a host file's. Return None, with a warning for anything but a missing one, if
+    it is not."""
     kind = "directory" if directory else "regular file"
     try:
         fd = os.open(name, _DIRECTORY_FLAGS if directory else _FILE_FLAGS, dir_fd=dir_fd)
@@ -376,8 +386,16 @@ def _open_plain(name: str, dir_fd: int | None, where: Path, *, directory: bool) 
             error.strerror or type(error).__name__,
         )
         return None
-    mode = os.fstat(fd).st_mode
-    if stat.S_ISDIR(mode) if directory else stat.S_ISREG(mode):
+    found = os.fstat(fd)
+    if not directory and stat.S_ISREG(found.st_mode) and found.st_nlink != 1:
+        os.close(fd)
+        _logger.warning(
+            "%s has %d links, so it may be another file's: it counts as no record",
+            where,
+            found.st_nlink,
+        )
+        return None
+    if stat.S_ISDIR(found.st_mode) if directory else stat.S_ISREG(found.st_mode):
         return fd
     os.close(fd)
     _logger.warning("%s is not a %s the host reads, so it counts as no record", where, kind)

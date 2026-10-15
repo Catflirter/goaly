@@ -810,3 +810,31 @@ async def test_a_solve_directory_that_is_a_link_is_no_record(tmp_path: Path) -> 
     await solve_and_grade(host(Container(after=swap)), run_dir)
 
     assert {result.grade.score for result in results(run_dir).values()} == {0.0}
+
+
+async def test_a_hard_linked_predictions_file_is_no_record(
+    tmp_path: Path, caplog: pytest.LogCaptureFixture
+) -> None:
+    # A file the container could link only if its mount shared a file system with the host's.
+    host_only = tmp_path / "host-only.jsonl"
+    winning = Prediction(instance_id="t1", effisql=EffiSqlPrediction(sql="SELECT 1"))
+    host_only.write_text(to_json_line(winning) + "\n", encoding="utf-8")
+
+    def link(request: SolveRequest) -> None:
+        path = predictions_file(request)
+        path.unlink()
+        os.link(host_only, path)
+
+    run_dir = tmp_path / "run"
+    with caplog.at_level(logging.WARNING, logger="goaly.harness.core.isolation"):
+        await solve_and_grade(host(Container(after=link)), run_dir)
+
+    assert {result.grade.score for result in results(run_dir).values()} == {0.0}
+    assert "has 2 links" in caplog.text
+
+
+def test_the_host_opens_solve_files_as_no_terminal() -> None:
+    # A device node the container planted must never become the host's controlling terminal.
+    from goaly.harness.core import isolation
+
+    assert isolation._FILE_FLAGS & os.O_NOCTTY

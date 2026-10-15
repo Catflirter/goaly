@@ -98,8 +98,13 @@ IDENTITY_TOLERANCE = (
 GOLD_MIN_SPEEDUP = 1.2  # A gold below this speedup is excluded.
 SMALL_RESULT_ROWS = 10_000  # Negative checks run on tasks with fewer base rows than this.
 NEGATIVE_SAMPLE = 10
-EXCLUSION_BOUND = 0.10  # More than this share of tasks excluded stops the setup.
-AGREEMENT_BOUND = 0.90  # Dev and official mode give the same tier on at least this share.
+# More than this share of tasks excluded stops the setup. The spec's 10% was ratified as 25% by
+# the project lead for this hardware: 34 golds gain less than 1.2x here (2026-10-15).
+EXCLUSION_BOUND = 0.25
+# Dev and official mode give the same tier on at least this share. The real setup measured 79%:
+# dev mode's base median was measured under load, and its tier noise is accepted (ruling); RSI
+# decisions rest on the sign test, the confirmation seed and the paired design (spec §8.3).
+AGREEMENT_BOUND = 0.90
 # A gold whose dev-mode speedup falls in this range is graded again in official mode, and its
 # exclusion decided on that (the controller's ruling).
 MARGINAL_GOLD = (0.8, 1.5)
@@ -480,8 +485,12 @@ async def run_phase(
     cache: BaseCache,
     *,
     val: Iterable[str] = (),
+    manual: Iterable[str] = (),
 ) -> int:
     """Run ``phase`` on every task that still needs it, on all the pool's runners at once.
+
+    ``manual`` names the reviewed exclusions, which the official phase and the negative
+    sample leave out, as the summary does.
 
     ``tasks`` carry their gold. Each record is saved as its task finishes, so a rerun resumes;
     a task whose work raises, a grader failure included, is logged and left unrecorded for the
@@ -489,6 +498,7 @@ async def run_phase(
     tasks were recorded.
     """
     records = store.load()
+    reviewed = set(manual)
     jobs: list[tuple[EffiSqlInstance, _Job]] = []
     if phase == "measure":
         pending = [t for t in tasks if _needs_measuring(records.get(t.instance_id))]
@@ -509,6 +519,7 @@ async def run_phase(
             and task.optimized_sql is not None
             and (record := records.get(task.instance_id)) is not None
             and exclusion_reason(record) is None
+            and task.instance_id not in reviewed
             and _needs_official(record)
         ]
     else:
@@ -518,7 +529,7 @@ async def run_phase(
                 "the negative sample waits for every task's record: %d missing", len(missing)
             )
             return 0
-        sample = set(negative_sample(records))
+        sample = set(negative_sample(_without(records, reviewed)))
         jobs = [
             (task, _negative_job(task))
             for task in tasks
@@ -542,6 +553,10 @@ async def run_phase(
 
     done = await asyncio.gather(*(run(task, job) for task, job in jobs))
     return sum(done)
+
+
+def _without(records: Mapping[str, SetupRecord], ids: set[str]) -> dict[str, SetupRecord]:
+    return {task: record for task, record in records.items() if task not in ids}
 
 
 def _needs_measuring(record: SetupRecord | None) -> bool:
@@ -686,7 +701,7 @@ class SetupSummary(_Model):
     exclusions_by_split: dict[str, int]
     gold_failures: list[str]  # Kept tasks whose gold check fails (should be none).
     negative_sample: list[str]  # The sample the negative checks must cover.
-    negative_tasks: list[str]  # The tasks they did cover.
+    negative_tasks: list[str]  # The tasks they did cover, earlier samples' included.
     negative_failures: dict[str, list[str]]  # Task: variants that matched, or "control".
     agreement_tasks: list[str]  # Kept val tasks graded in both modes.
     agreement_missing: list[str]  # Kept val tasks without both official grades.
@@ -707,7 +722,7 @@ class SetupSummary(_Model):
             or self.data["fail"]
             or self.identity_failures
             or self.gold_failures
-            or self.negative_tasks != self.negative_sample
+            or not set(self.negative_sample) <= set(self.negative_tasks)
             or len(self.negative_sample) < NEGATIVE_SAMPLE
             or self.negative_failures
             or self.agreement_missing
@@ -758,7 +773,7 @@ def summarize(
         check = records[task].data
         if check is not None:
             data[check.outcome].append(task)
-    sample = negative_sample({t: r for t, r in records.items() if t not in manual_ids})
+    sample = negative_sample(_without(records, manual_ids))
     negatives = [task for task in present if records[task].negatives is not None]
     negative_failures = {
         task: [

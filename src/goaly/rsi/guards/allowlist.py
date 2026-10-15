@@ -112,7 +112,7 @@ BANNED_NAMES = frozenset(
         *("attrgetter", "methodcaller", "Formatter", "get_field", "ImportString", "PyObject"),
         *("get_type_hints", "ForwardRef", "create_model", "runtime_checkable"),
         # pydantic's reads of attributes by alias.
-        *("AliasPath", "AliasChoices"),
+        *("AliasPath", "AliasChoices", "AliasGenerator", "alias_generator"),
         # The key and the model client (ruling V3).
         *("settings", "load_settings", "get_secret_value", "LlmClient", "llm_models"),
         *("llm_throttle", "llm_errors"),
@@ -138,8 +138,10 @@ BANNED_ATTRIBUTES = frozenset(
 BANNED_ATTRIBUTE_PREFIXES = ("f_", "gi_", "cr_", "ag_", "tb_")  # Frames, coroutines, tracebacks.
 # Keywords that make pydantic read an object's attributes, or unpickle data.
 BANNED_KEYWORDS = frozenset(
-    {"from_attributes", "alias", "validation_alias", "allow_pickle", "proto"}
+    {"from_attributes", "alias", "validation_alias", "alias_generator", "allow_pickle", "proto"}
 )
+# A pydantic model's config, which may only be a ConfigDict with literal keywords (P9).
+_MODEL_CONFIG = "model_config"
 # The only dunders a class body may define (spec §8.5).
 _CLASS_DUNDERS = frozenset({"__init__", "__post_init__"})
 # The forms that evaluate strings, which may only be called directly.
@@ -494,6 +496,8 @@ class _Checker(ast.NodeVisitor):
             for bound, name in _class_bindings(statement):
                 if name.startswith("_") and not name.startswith("__"):
                     self._problem(bound, f"a class binds {name}; use a mangled _{name}")
+                if name == _MODEL_CONFIG and not _literal_config(statement):
+                    self._problem(bound, "model_config must be a ConfigDict(...) of literals")
         outer = self._direct_class
         self._direct_class = node
         self._class_depth += 1
@@ -587,6 +591,9 @@ class _Checker(ast.NodeVisitor):
         self.generic_visit(node)
 
     def visit_Call(self, node: ast.Call) -> None:
+        if any(keyword.arg is None for keyword in node.keywords):
+            # A ** dict could carry any banned keyword, out of every rule's sight (P9).
+            self._problem(node, "keyword arguments unpacked with **, which no rule can check")
         form = _called_form(node.func)
         if form is not None:
             self._allowed_uses.add(id(node.func))
@@ -628,6 +635,32 @@ def _class_bindings(statement: ast.stmt) -> Iterator[tuple[ast.AST, str]]:
         for inner in ast.walk(target):
             if isinstance(inner, ast.Name):
                 yield inner, inner.id
+
+
+def _literal_config(statement: ast.stmt) -> bool:
+    """Whether a class body's model_config is a ConfigDict call whose keywords are literals."""
+    value = statement.value if isinstance(statement, ast.Assign | ast.AnnAssign) else None
+    if not isinstance(value, ast.Call) or value.args:
+        return False
+    called = value.func
+    name = called.id if isinstance(called, ast.Name) else getattr(called, "attr", "")
+    return name == "ConfigDict" and all(
+        keyword.arg is not None and _literal(keyword.value) for keyword in value.keywords
+    )
+
+
+def _literal(node: ast.expr) -> bool:
+    """A constant, or a display of constants."""
+    if isinstance(node, ast.Constant):
+        return True
+    if isinstance(node, ast.List | ast.Tuple | ast.Set):
+        return all(_literal(element) for element in node.elts)
+    if isinstance(node, ast.Dict):
+        return all(
+            key is not None and _literal(key) and _literal(value)
+            for key, value in zip(node.keys, node.values, strict=True)
+        )
+    return False
 
 
 def _called_form(called: ast.expr) -> str | None:

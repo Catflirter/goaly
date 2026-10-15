@@ -6,6 +6,7 @@ with an experiment ID of its own, so cleanup never touches anyone else's contain
 
 import os
 import secrets
+import shlex
 import subprocess
 import time
 from collections.abc import Iterator
@@ -29,6 +30,17 @@ from tests.rsi.gitrepo import git, make_repo
 pytestmark = pytest.mark.integration
 
 REPO_ROOT = Path(__file__).resolve().parents[2]
+
+# socket(2) with a family whose high bits are set and whose low 32 bits are AF_INET: the kernel
+# reads only the low bits, so the profile must refuse it (x86_64's syscall number 41).
+HIGH_BIT_SOCKET = (
+    "import ctypes, errno\n"
+    "libc = ctypes.CDLL(None, use_errno=True)\n"
+    "family = ctypes.c_long((1 << 32) | 2)\n"
+    "fd = libc.syscall(ctypes.c_long(41), family, ctypes.c_long(1), ctypes.c_long(0))\n"
+    "refused = fd == -1 and ctypes.get_errno() == errno.EPERM\n"
+    "print('high-bit family', 'refused' if refused else f'opened {fd}')\n"
+)
 
 
 @pytest.fixture(scope="module")
@@ -213,3 +225,21 @@ def test_a_file_past_the_size_limit_cannot_be_written(image: str, worktree: Work
 
     assert "status=0" not in result.output, result.output
     assert (pack / "big").stat().st_size <= 1024 * 1024
+
+
+def test_the_implementer_sandbox_cannot_open_a_tcp_socket(image: str, worktree: Worktree) -> None:
+    code = (
+        "import socket\n"
+        "try:\n"
+        "    socket.create_connection(('127.0.0.1', 13337), timeout=5)\n"
+        "    print('tcp connected')\n"
+        "except PermissionError:\n"
+        "    print('tcp refused')\n"
+    )
+
+    script = shlex.quote(code + HIGH_BIT_SOCKET)
+    result = run(image, worktree, f"python -c {script}", writable_packs=True)
+
+    assert result.exit_code == 0, result.output
+    assert "tcp refused" in result.output
+    assert "high-bit family refused" in result.output
