@@ -729,3 +729,11 @@ def test_the_negative_sample_leaves_out_reviewed_exclusions_as_the_summary_does(
     asyncio.run(run_phase("negatives", pool, tasks, store, BaseCache(tmp_path), manual=reviewed))
     assert sorted(ran, key=int) == expected
     assert "3" not in ran
+
+
+def test_negatives_on_more_tasks_than_the_sample_still_pass() -> None:
+    records = clean_records()
+    records["11"] = record("11", negatives={"control": True, "drop": False}, base=None)
+    summary = summarize(list(records), records, val=VAL)
+    assert "11" in summary.negative_tasks
+    assert summary.passed, to_markdown(summary)

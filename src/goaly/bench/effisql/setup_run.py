@@ -696,7 +696,7 @@ class SetupSummary(_Model):
     exclusions_by_split: dict[str, int]
     gold_failures: list[str]  # Kept tasks whose gold check fails (should be none).
     negative_sample: list[str]  # The sample the negative checks must cover.
-    negative_tasks: list[str]  # The tasks they did cover.
+    negative_tasks: list[str]  # The tasks they did cover, earlier samples' included.
     negative_failures: dict[str, list[str]]  # Task: variants that matched, or "control".
     agreement_tasks: list[str]  # Kept val tasks graded in both modes.
     agreement_missing: list[str]  # Kept val tasks without both official grades.
@@ -717,7 +717,7 @@ class SetupSummary(_Model):
             or self.data["fail"]
             or self.identity_failures
             or self.gold_failures
-            or self.negative_tasks != self.negative_sample
+            or not set(self.negative_sample) <= set(self.negative_tasks)
             or len(self.negative_sample) < NEGATIVE_SAMPLE
             or self.negative_failures
             or self.agreement_missing
