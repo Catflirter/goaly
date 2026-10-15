@@ -1000,6 +1000,23 @@ async def test_cancellation_propagates_at_once_and_is_recorded() -> None:
     assert len(gateway.requests) == 1
 
 
+async def test_a_callers_deadline_cancels_the_call_and_leaves_one_record() -> None:
+    recorder = Recorder()
+    gateway = Gateway(hang)
+    async with connect(gateway, recorder=recorder) as llm:
+
+        async def within_budget() -> None:  # As T05's agent loop enforces its time budget.
+            async with asyncio.timeout(0.05):
+                await llm.complete([user("hi")], model=QWEN, tags=EXEC)
+
+        with pytest.raises(TimeoutError):
+            await within_budget()
+
+    (record,) = recorder.records
+    assert attempts(record) == [(CANCELLED, 0)]
+    assert record.status == CANCELLED
+
+
 async def test_a_call_cancelled_during_its_backoff_is_not_retried() -> None:
     recorder, backing_off = Recorder(), asyncio.Event()
 
@@ -1218,6 +1235,8 @@ async def test_the_key_is_in_no_error_log_line_repr_or_record(
             *(to_json_line(record) for record in recorder.records),
         ]
 
-    assert len(caplog.records) >= 2  # Both backoffs were logged, with what the gateway said.
+    # Both backoffs were logged, with what the gateway said; httpx logs its own lines too.
+    backoffs = [entry for entry in caplog.records if getattr(entry, "event", None) == "llm_backoff"]
+    assert len(backoffs) == 2
     assert all(KEY not in text for text in texts)
     assert "Received API Key = [redacted]" in str(raised.value)
