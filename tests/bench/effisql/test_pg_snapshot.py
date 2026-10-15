@@ -82,6 +82,60 @@ def test_a_scan_just_above_the_sf3_size_is_still_native() -> None:
     assert foreign_scale_plan(_root(_scan("lineitem", int(17_996_609 * 1.15))))
 
 
+def _task_40(subplan_loops: int) -> dict[str, object]:
+    """Task 40's plan: a lineitem scan whose filter runs a subplan once per row it reads."""
+    inner = _scan(
+        "lineitem",
+        149,
+        **{"Node Type": "Index Scan", "Actual Rows": 5, "Actual Loops": subplan_loops},
+    )
+    subplan = {
+        "Node Type": "Aggregate",
+        "Parent Relationship": "SubPlan",
+        "Actual Rows": 1,
+        "Actual Loops": subplan_loops,
+        "Plan Rows": 1,
+        "Plans": [inner],
+    }
+    return _scan(
+        "lineitem", 299_959, **{"Actual Rows": 15_240_492, "Actual Loops": 1, "Plans": [subplan]}
+    )
+
+
+def test_a_filter_subplan_counts_the_rows_its_scan_read() -> None:
+    assert foreign_scale_plan(_task_40(subplan_loops=59_986_052))  # SF10's lineitem.
+    assert not foreign_scale_plan(_task_40(subplan_loops=17_996_609))  # SF3's.
+
+
+def test_rows_removed_by_the_filter_count_as_rows_read() -> None:
+    def scan(removed: int) -> dict[str, object]:
+        counts = {"Actual Rows": 1_000_000, "Actual Loops": 1, "Rows Removed by Filter": removed}
+        return _scan("lineitem", 1_000_000, **counts)
+
+    assert foreign_scale_plan(_root(scan(58_986_052)))  # 59,986,052 read: SF10.
+    assert not foreign_scale_plan(_root(scan(16_996_609)))  # 17,996,609 read: SF3.
+
+
+def test_a_parallel_scan_counts_rows_read_over_its_processes() -> None:
+    counts = {"Parallel Aware": True, "Actual Rows": 500_000, "Actual Loops": 3}
+
+    assert foreign_scale_plan(
+        _root(_scan("orders", 1, **counts, **{"Rows Removed by Filter": 4_500_000}))
+    )
+    assert not foreign_scale_plan(
+        _root(_scan("orders", 1, **counts, **{"Rows Removed by Filter": 1_000_000}))
+    )
+
+
+def test_an_inner_scan_looping_once_per_outer_row_is_no_sign_of_scale() -> None:
+    # Task 148 on SF3: a supplier lookup for each of lineitem's 17,996,609 rows.
+    inner = _scan(
+        "supplier", 1, **{"Node Type": "Index Scan", "Actual Rows": 1, "Actual Loops": 17_996_609}
+    )
+
+    assert not foreign_scale_plan(_root(inner))
+
+
 def test_only_scan_nodes_count_even_if_they_name_a_relation() -> None:
     update = {"Node Type": "ModifyTable", "Relation Name": "orders", "Plan Rows": 15_000_000}
 
