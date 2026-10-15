@@ -27,6 +27,7 @@ the next time the lane asks.
 
 import base64
 import logging
+import os
 import re
 import subprocess
 import tempfile
@@ -56,6 +57,8 @@ from goaly.contracts.gen.experiment_pb2 import (
 )
 from goaly.contracts.jsonl import to_json_line
 from goaly.harness.core.settings import load_settings
+from goaly.rsi.git import _KEPT as _KEPT_GIT  # Who commits: the only GIT_* kept.
+from goaly.rsi.git import _SETTINGS as GIT_SETTINGS  # The same hardening as run_git.
 from goaly.rsi.git import GitError, run_git
 from goaly.rsi.lanes import LaneInfo, lane_info
 from goaly.rsi.ledger import EXPERIMENTS, LANE_EVENTS, LESSONS, LESSONS_MARKDOWN, Ledger
@@ -77,12 +80,8 @@ __all__ = [
 
 RESULTS_DIR = PurePosixPath("rsi/results")
 _RESULTS_BRANCH = re.compile(r"rsi/[a-z]+/results-([1-9][0-9]*)")
-_IDENTITY = {
-    "GIT_AUTHOR_NAME": "goaly rsi",
-    "GIT_AUTHOR_EMAIL": "rsi@goaly.invalid",
-    "GIT_COMMITTER_NAME": "goaly rsi",
-    "GIT_COMMITTER_EMAIL": "rsi@goaly.invalid",
-}
+# Who the results commits are by, unless GIT_AUTHOR_* and GIT_COMMITTER_* say otherwise.
+_IDENTITY = ("goaly rsi", "rsi@goaly.invalid")
 _TRAILER = "Goaly-Experiments:"
 _MAX_BODY = 60_000  # GitHub refuses bodies over 65536 characters.
 
@@ -268,12 +267,51 @@ class HttpsRemote:
 
     def _git(self, repo: Path, args: list[str]) -> None:
         basic = base64.b64encode(f"x-access-token:{self._token()}".encode()).decode()
-        env = {
-            "GIT_CONFIG_COUNT": "1",
-            "GIT_CONFIG_KEY_0": "http.https://github.com/.extraheader",
-            "GIT_CONFIG_VALUE_0": f"Authorization: Basic {basic}",
-        }
-        run_git(args, cwd=repo, timeout_s=self._timeout_s, env=env)
+        _git_with_header(
+            args, cwd=repo, header=f"Authorization: Basic {basic}", timeout_s=self._timeout_s
+        )
+
+
+def _git_with_header(args: list[str], *, cwd: Path, header: str, timeout_s: float) -> None:
+    """Run git as goaly.rsi.git.run_git does, plus one HTTP header for github.com.
+
+    run_git takes no credentials, so this is the only git that can push. The header reaches git
+    through ``GIT_CONFIG_*`` variables, never an argument, and no output of git is kept but its
+    error text, which never holds the header.
+    """
+    environment = {
+        name: value
+        for name, value in os.environ.items()
+        if not name.startswith("GIT_") or name in _KEPT_GIT
+    }
+    environment.update(
+        GIT_CONFIG_NOSYSTEM="1",
+        GIT_CONFIG_GLOBAL="/dev/null",
+        GIT_TERMINAL_PROMPT="0",
+        GIT_ASKPASS="",
+        SSH_ASKPASS="",
+        LC_ALL="C",
+        GIT_CONFIG_COUNT="1",
+        GIT_CONFIG_KEY_0="http.https://github.com/.extraheader",
+        GIT_CONFIG_VALUE_0=header,
+    )
+    settings = [item for setting in GIT_SETTINGS for item in ("-c", setting)]
+    try:
+        done = subprocess.run(  # noqa: S603  (git, with arguments goaly.rsi builds)
+            ["git", *settings, *args],  # noqa: S607  (git from PATH)
+            cwd=cwd,
+            env=environment,
+            stdin=subprocess.DEVNULL,
+            capture_output=True,
+            timeout=timeout_s,
+            start_new_session=True,
+            check=False,
+        )
+    except subprocess.TimeoutExpired:
+        raise GitError(args, None, f"timed out after {timeout_s:g} s") from None
+    if done.returncode != 0:
+        reason = done.stderr.decode("utf-8", "replace").replace(header, "[redacted]")
+        raise GitError(args, done.returncode, reason)
 
 
 class ResultsPublisherImpl:
@@ -293,7 +331,7 @@ class ResultsPublisherImpl:
         base: str = "main",
         accepted_per_pr: int = 3,
         interval: timedelta = timedelta(hours=3),
-        identity: Mapping[str, str] = _IDENTITY,
+        identity: tuple[str, str] = _IDENTITY,
     ) -> None:
         self._ledger = ledger
         self._repo = repo
@@ -303,7 +341,7 @@ class ResultsPublisherImpl:
         self._base = base
         self._accepted_per_pr = accepted_per_pr
         self._interval = interval
-        self._identity = dict(identity)
+        self._identity = identity
 
     def due(self, lane: Lane.ValueType, now: datetime) -> bool:
         try:
@@ -385,8 +423,8 @@ class ResultsPublisherImpl:
         """Build the results commits on the base branch, in a temporary index; return the head."""
         parent = self._remote.fetch(self._repo, self._base)
         with tempfile.TemporaryDirectory(prefix="goaly-rsi-results-") as scratch:
-            env = {**self._identity, "GIT_INDEX_FILE": str(Path(scratch) / "index")}
-            git = _IndexGit(self._repo, env)
+            env = {"GIT_INDEX_FILE": str(Path(scratch) / "index")}
+            git = _IndexGit(self._repo, env, self._identity)
             git.run(["read-tree", parent])
             tree = git.run(["write-tree"])
             for record in accepted:
@@ -422,11 +460,16 @@ class ResultsPublisherImpl:
 
 
 class _IndexGit:
-    def __init__(self, repo: Path, env: Mapping[str, str]) -> None:
+    """git on a temporary index (``env``), committing as ``identity``: a name and an email."""
+
+    def __init__(self, repo: Path, env: Mapping[str, str], identity: tuple[str, str]) -> None:
         self._repo = repo
         self._env = env
+        name, email = identity
+        self._identity = ["-c", f"user.name={name}", "-c", f"user.email={email}"]
 
     def run(self, args: list[str], *, text: str | None = None) -> str:
+        args = [*self._identity, *args]
         return run_git(args, cwd=self._repo, env=self._env, input_text=text).strip()
 
     def remove(self, directory: str) -> None:
