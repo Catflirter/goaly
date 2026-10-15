@@ -262,9 +262,13 @@ def write_exclusions(path: Path, entries: object) -> Path:
     return path
 
 
-def test_the_committed_exclusion_list_is_empty_until_t10_fills_it() -> None:
-    assert EXCLUSIONS_PATH.read_text(encoding="utf-8") == "[]\n"
-    assert load_exclusions() == ()
+def test_the_committed_exclusion_list_is_t10s_and_stays_under_a_quarter_of_the_tasks() -> None:
+    # T10's setup run fills it; the run stops at 25% excluded, as ratified, so a committed list
+    # can never exclude more (238 tasks).
+    exclusions = load_exclusions(EXCLUSIONS_PATH)
+    assert exclusions
+    assert len(exclusions) <= 238 // 4
+    assert all(entry.reason.strip() for entry in exclusions)
 
 
 def test_load_exclusions_reads_each_task_with_its_reason(tmp_path: Path) -> None:
