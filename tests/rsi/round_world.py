@@ -14,7 +14,11 @@ A hypothesis's ID names its candidate's behavior, by its first word:
 - ``broken``: its evaluation raises, as when the solve container fails;
 - ``late``: like ``good``, but its confirmation raises;
 - ``short``: its validation comes back without one task's result;
-- ``graderr``: its validation has a grader error.
+- ``graderr``: its validation has a grader error;
+- ``flaky``: like ``good``, but the infrastructure fails 2 of its 8 validation tasks (25%);
+- ``wobbly``: like ``good``, but the infrastructure fails 1 of them (12.5%), under the 20% cap;
+- ``hostfail``: like ``good``, but the host counts 2 infrastructure failures in its validation;
+- ``extra``: its validation returns one result more than was asked for.
 
 The best (v0) fails train tasks 1 to 5, solves 6 to 10, and scores 0.5 on every val task.
 """
@@ -44,7 +48,7 @@ from goaly.contracts.gen.experiment_pb2 import (
     ImplementerRun,
 )
 from goaly.contracts.gen.llm_call_pb2 import LlmCallRecord
-from goaly.contracts.gen.result_pb2 import TaskResult
+from goaly.contracts.gen.result_pb2 import TASK_ERROR_TYPE_LLM, TaskResult
 from goaly.contracts.gen.task_pb2 import (
     GRADE_STATUS_GRADED,
     GRADE_STATUS_GRADER_ERROR,
@@ -75,6 +79,7 @@ TRAIN = tuple(str(n) for n in range(1, 11))
 FAILING = TRAIN[:5]
 VAL = tuple(str(n) for n in range(101, 109))
 _SPEEDUP = {0.25: 0.6, 0.5: 1.0, 0.75: 1.5, 1.0: 3.0}
+_GOODLIKE = frozenset({"flaky", "wobbly", "hostfail", "extra"})
 
 
 def hypothesis(hypothesis_id: str) -> Hypothesis:
@@ -96,10 +101,10 @@ def behavior(hypothesis_id: str) -> str:
 
 def credit(kind: str, task: str, seed: int) -> float:
     """The checked credit a version of ``kind`` gets on ``task`` in ``seed``."""
-    improves = kind in {"good", "meh", "noisy", "flag", "late", "short", "graderr"}
+    improves = kind in {"good", "meh", "noisy", "flag", "late", "short", "graderr"} | _GOODLIKE
     if task in TRAIN:
         return 1.0 if task not in FAILING or improves else 0.0
-    if kind in {"good", "flag", "late", "short", "graderr"}:
+    if kind in {"good", "flag", "late", "short", "graderr"} | _GOODLIKE:
         return 1.0
     if kind == "meh":
         return 0.75
@@ -164,9 +169,15 @@ class ToyEvaluator:
             results.pop()
         if request.phase == "validation" and kind == "graderr":
             results[0].grade.status = GRADE_STATUS_GRADER_ERROR
+        if request.phase == "validation" and kind in {"flaky", "wobbly"}:
+            for result in results[: 2 if kind == "flaky" else 1]:
+                result.error_type = TASK_ERROR_TYPE_LLM
+        if request.phase == "validation" and kind == "extra":
+            results.append(task_result(request.run_id, TRAIN[0], 0, 1.0, flagged=False))
+        infra = 2 if request.phase == "validation" and kind == "hostfail" else None
         count = len(results)
         stats = CostStats(1000.0, 0.01, 10.0, count=count)
-        return Evaluation(results, stats)
+        return Evaluation(results, stats, infra_failures=infra)
 
     def _kind(self, commit: str) -> str:
         if commit in self.kinds:

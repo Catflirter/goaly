@@ -13,6 +13,7 @@ A restarted lane calls these before its next round, and a stopping lane at its d
   resumes at its next step instead (goaly.rsi.round).
 """
 
+import asyncio
 import logging
 from collections.abc import Callable, Mapping
 from datetime import datetime
@@ -23,6 +24,7 @@ from goaly.contracts.gen.experiment_pb2 import (
     DECISION_ABORTED,
     DECISION_ACCEPTED,
     IMPLEMENTER_EXIT_INTERRUPTED,
+    REJECTION_REASON_OUTRANKED,
     ExperimentRecord,
     Lane,
 )
@@ -32,14 +34,20 @@ from goaly.rsi.ledger import Ledger
 from goaly.rsi.workspace import Workspace, WorkspaceError
 
 __all__ = [
+    "MAX_REQUEUES",
     "LaneStateError",
     "UsageSource",
     "abort_experiments",
     "abort_record",
+    "finish",
     "merge_usage",
     "reconcile_best",
     "remove_worktrees",
+    "requeue",
+    "timestamp",
 ]
+
+MAX_REQUEUES = 2  # How often a hypothesis goes back in the queue before it is dropped.
 
 _logger = logging.getLogger(__name__)
 
@@ -90,7 +98,7 @@ def reconcile_best(
     if confirmed:
         record = confirmed[-1]
         record.decision = DECISION_ACCEPTED
-        record.finished_at.CopyFrom(_timestamp(now))
+        record.finished_at.CopyFrom(timestamp(now))
         ledger.record_experiment(record)
         _logger.warning("recorded %s as accepted: the best tag was on it", record.experiment_id)
         return tag
@@ -114,6 +122,7 @@ def abort_experiments(
     now: datetime,
     uncommitted_only: bool,
     usage: UsageSource = lambda _: {},
+    max_requeues: int = MAX_REQUEUES,
 ) -> list[ExperimentRecord]:
     """Record the lane's pending experiments as aborted, or only those without a commit, and
     queue their hypotheses again; return them.
@@ -125,7 +134,15 @@ def abort_experiments(
         if not record.candidate_commit and not record.HasField("implementer"):
             # Its run was cut short and never measured (ImplementerRun.step_count).
             record.implementer.exit = IMPLEMENTER_EXIT_INTERRUPTED
-        abort_record(ledger, queue, record, reason, now=now, usage=usage(record.experiment_id))
+        abort_record(
+            ledger,
+            queue,
+            record,
+            reason,
+            now=now,
+            usage=usage(record.experiment_id),
+            max_requeues=max_requeues,
+        )
         aborted.append(record)
     return aborted
 
@@ -138,16 +155,68 @@ def abort_record(
     *,
     now: datetime,
     usage: Mapping[CallPurpose.ValueType, Usage],
+    max_requeues: int = MAX_REQUEUES,
 ) -> None:
-    """Record ``record`` as aborted, and queue its hypothesis again (spec §8.7)."""
+    """Queue ``record``'s hypothesis again, within its cap, then record it as aborted (spec
+    §8.7). The push comes first: a crash between the two leaves the hypothesis queued and the
+    experiment pending, which the restarted lane aborts again, and the queue keeps one copy.
+    """
     _logger.warning("experiment %s aborted: %s", record.experiment_id, reason)
+    requeue(ledger, queue, record, max_requeues=max_requeues)
     record.decision = DECISION_ABORTED
     del record.rejection_reasons[:]
     record.decision_reason = "; ".join(filter(None, [record.decision_reason, f"aborted: {reason}"]))
-    record.finished_at.CopyFrom(_timestamp(now))
+    record.finished_at.CopyFrom(timestamp(now))
     merge_usage(record, usage)
     ledger.record_experiment(record)
+
+
+def requeue(
+    ledger: Ledger, queue: HypothesisQueue, record: ExperimentRecord, *, max_requeues: int
+) -> bool:
+    """Queue ``record``'s hypothesis again, unless it went back ``max_requeues`` times already,
+    as earlier experiments that were aborted or outranked show; then it is dropped and logged.
+    Return whether it was queued.
+    """
+    name = record.hypothesis.hypothesis_id
+    earlier = [
+        other
+        for other in ledger.latest_experiments(record.lane).values()
+        if other.hypothesis.hypothesis_id == name
+        and other.experiment_id != record.experiment_id
+        and (
+            other.decision == DECISION_ABORTED
+            or REJECTION_REASON_OUTRANKED in other.rejection_reasons
+        )
+    ]
+    if len(earlier) >= max_requeues:
+        _logger.warning(
+            "dropped hypothesis %s: it went back in the queue %d times already",
+            name,
+            len(earlier),
+            extra={"event": "hypothesis_dropped", "hypothesis_id": name},
+        )
+        return False
     queue.push([record.hypothesis])
+    return True
+
+
+async def finish[T](work: Callable[[], T]) -> T:
+    """Run the blocking ``work`` in a thread and return its result. If the caller is cancelled
+    meanwhile, wait for the work to finish anyway, then let the cancellation through: a ledger
+    write or a tag move is never left running behind a caller that has moved on.
+    """
+    future = asyncio.ensure_future(asyncio.to_thread(work))
+    cancelled = False
+    while not future.done():
+        try:
+            await asyncio.shield(future)
+        except asyncio.CancelledError:
+            cancelled = True
+    result = future.result()  # Raises the work's own error, if it failed.
+    if cancelled:
+        raise asyncio.CancelledError
+    return result
 
 
 def merge_usage(record: ExperimentRecord, usage: Mapping[CallPurpose.ValueType, Usage]) -> None:
@@ -159,7 +228,8 @@ def merge_usage(record: ExperimentRecord, usage: Mapping[CallPurpose.ValueType, 
         entry.usage.CopyFrom(total)
 
 
-def _timestamp(moment: datetime) -> Timestamp:
+def timestamp(moment: datetime) -> Timestamp:
+    """``moment`` as a protobuf Timestamp."""
     stamp = Timestamp()
     stamp.FromDatetime(moment)
     return stamp
