@@ -1,5 +1,5 @@
 import asyncio
-from collections.abc import AsyncIterator
+from collections.abc import AsyncIterator, Mapping
 from contextlib import asynccontextmanager
 from dataclasses import dataclass, field
 from types import SimpleNamespace
@@ -485,3 +485,63 @@ async def test_the_pool_assigns_the_least_loaded_instance_and_releases_it(
     assert {o["user"] for o in opened} == {"effisql_agent"}
     assert {o["dbname"] for o in opened} == {"tpch"}
     assert all(o["autocommit"] for o in opened)
+
+
+class PreflightConn:
+    def __init__(self, row: tuple[object, ...]) -> None:
+        self.row = row
+        self.closed = False
+
+    async def execute(self, query: str) -> Any:
+        return SimpleNamespace(fetchone=lambda: _resolved(self.row))
+
+    async def close(self) -> None:
+        self.closed = True
+
+
+def _preflight_pool(monkeypatch: pytest.MonkeyPatch, answers: Mapping[int, object]) -> SolvingPool:
+    async def connect(**kwargs: object) -> Any:
+        answer = answers[int(str(kwargs["port"]))]
+        if isinstance(answer, BaseException):
+            raise answer
+        return answer
+
+    monkeypatch.setattr(psycopg.AsyncConnection, "connect", connect)
+    credentials = PgCredentials(
+        admin_password=SecretStr("a"),
+        agent_password=SecretStr("b"),
+        grader_password=SecretStr("c"),
+        _env_file=None,
+    )
+    return SolvingPool(PgEnvConfig(), credentials)
+
+
+@pytest.mark.anyio
+async def test_preflight_passes_when_every_solving_instance_is_ready(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    ready = {55432: PreflightConn(("on", True)), 55433: PreflightConn(("on", True))}
+
+    await _preflight_pool(monkeypatch, ready).preflight()
+
+    assert all(conn.closed for conn in ready.values())
+
+
+@pytest.mark.anyio
+async def test_preflight_fails_fast_naming_every_problem(monkeypatch: pytest.MonkeyPatch) -> None:
+    pool = _preflight_pool(
+        monkeypatch,
+        {
+            55432: psycopg.OperationalError("password authentication failed"),
+            55433: PreflightConn(("off", False)),
+        },
+    )
+
+    with pytest.raises(EnvironmentFailure) as caught:
+        await pool.preflight()
+
+    message = str(caught.value)
+    assert "solve-1 (port 55432): the agent role cannot log in: password" in message
+    assert "solve-2 (port 55433): the agent's transactions are not read-only by default" in message
+    assert "solve-2 (port 55433): the agent role cannot read the TPC-H tables" in message
+    assert "pgenv.py start" in message
