@@ -2,6 +2,7 @@
 
 import hashlib
 import json
+import logging
 import os
 import platform
 import re
@@ -10,7 +11,8 @@ import socket
 import subprocess
 from collections.abc import Callable, Iterator
 from datetime import UTC, datetime, timedelta, timezone
-from pathlib import Path
+from pathlib import Path, PurePath
+from typing import Any
 
 import pytest
 from google.protobuf.timestamp_pb2 import Timestamp
@@ -156,38 +158,27 @@ def test_a_content_hash_tells_trees_apart_by_label(tmp_path: Path) -> None:
     assert content_hash({"core": one}) != content_hash({"pack": one})
 
 
-def test_a_content_hash_counts_a_link_by_the_path_it_holds(tmp_path: Path) -> None:
-    outside = make_tree(tmp_path / "outside", {"a.txt": "a\n", "b.txt": "b\n"})
-    root = make_tree(tmp_path / "tree", {"a.py": "x = 1\n"})
-    (root / "linked.txt").symlink_to(outside / "a.txt")
-    with_link = content_hash({"tree": root})
+# A link's target could change while the hash stays the same, and reading it would read outside
+# the trees, so a tree that holds a link of any kind cannot be hashed.
+@pytest.mark.parametrize(
+    "link",
+    [
+        lambda root, outside: (root / "linked.txt").symlink_to(outside / "a.txt"),
+        lambda root, outside: (root / "linked").symlink_to(outside, target_is_directory=True),
+        lambda root, outside: (root / "gone").symlink_to(outside / "missing"),
+        lambda root, outside: (root / "sub" / "inner").symlink_to(root / "a.py"),
+    ],
+    ids=["to a file", "to a directory", "dangling", "inside the tree"],
+)
+def test_a_content_hash_refuses_a_link(
+    tmp_path: Path, link: Callable[[Path, Path], object]
+) -> None:
+    outside = make_tree(tmp_path / "outside", {"a.txt": "a\n"})
+    root = make_tree(tmp_path / "tree", {"a.py": "x = 1\n", "sub/b.py": "y = 2\n"})
+    link(root, outside)
 
-    # What the link points to is never read: the hash reads nothing outside the tree.
-    (outside / "a.txt").write_text("changed\n", encoding="utf-8")
-    assert content_hash({"tree": root}) == with_link
-    # The path it holds counts, and so does being a link rather than a file.
-    (root / "linked.txt").unlink()
-    (root / "linked.txt").symlink_to(outside / "b.txt")
-    assert content_hash({"tree": root}) != with_link
-    (root / "linked.txt").unlink()
-    (root / "linked.txt").write_text(str(outside / "a.txt"), encoding="utf-8")
-    assert content_hash({"tree": root}) != with_link
-
-
-def test_a_content_hash_refuses_a_link_to_a_directory(tmp_path: Path) -> None:
-    outside = make_tree(tmp_path / "outside", {"big.txt": "data\n"})
-    root = make_tree(tmp_path / "tree", {"a.py": "x = 1\n"})
-    (root / "linked_dir").symlink_to(outside, target_is_directory=True)
-
-    with pytest.raises(ValueError, match="links to a directory"):
+    with pytest.raises(ValueError, match="is a symbolic link, which cannot be hashed"):
         content_hash({"tree": root})
-
-
-def test_a_dangling_link_counts_by_the_path_it_holds(tmp_path: Path) -> None:
-    root = make_tree(tmp_path / "tree", {"a.py": "x = 1\n"})
-    (root / "gone").symlink_to(tmp_path / "missing")
-
-    assert re.fullmatch(r"[0-9a-f]{64}", content_hash({"tree": root}))
 
 
 def test_a_content_hash_needs_each_directory(tmp_path: Path) -> None:
@@ -320,13 +311,25 @@ def test_git_state_is_none_outside_a_repository_or_before_the_first_commit(
     assert git_state(plain) is None
 
 
-def test_git_state_is_none_when_git_hangs(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
-    def hung(*args: object, **kwargs: object) -> subprocess.CompletedProcess[str]:
-        raise subprocess.TimeoutExpired(cmd="git", timeout=60)
+def test_git_state_is_none_when_git_hangs(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
+) -> None:
+    run = subprocess.run
+
+    def hung(command: list[str], **kwargs: Any) -> subprocess.CompletedProcess[str]:
+        if Path(command[0]).name != "git":
+            return run(command, **kwargs)  # Such as the platform module's own uname.
+        raise subprocess.TimeoutExpired(cmd=command, timeout=60)
 
     monkeypatch.setattr(subprocess, "run", hung)
 
-    assert git_state(tmp_path) is None
+    with caplog.at_level(logging.WARNING, logger="goaly.harness.core.manifest"):
+        assert git_state(tmp_path) is None
+        found = provenance(tmp_path)
+
+    assert "git did not answer within 60 s" in caplog.text
+    assert "not in a git checkout" not in caplog.text  # It may well be in one.
+    assert not found.git_commit
 
 
 def test_git_state_is_none_without_git(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
@@ -419,7 +422,7 @@ def test_provenance_outside_a_repository_has_only_the_machine(
     found = provenance(tmp_path)
 
     assert found == RunManifest(machine=machine_info())
-    assert "not in a git checkout" in caplog.text
+    assert "found no git state for" in caplog.text
 
 
 # The manifest file.
@@ -471,6 +474,32 @@ def test_a_manifest_file_is_indented_json_in_field_order(directory: Path) -> Non
     expected = json.loads(to_json_line(full_manifest()))
     assert text == json.dumps(expected, ensure_ascii=False, indent=2) + "\n"
     assert list(json.loads(text)) == list(expected)  # Keys in the order the .proto declares.
+
+
+def test_a_manifest_is_written_by_a_rename_in_its_own_directory(
+    directory: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    # Only a rename within one directory, so one file system, replaces a file atomically.
+    path = directory / "manifest.json"
+    write_manifest(path, full_manifest())
+    renames: list[tuple[Path, Path, str]] = []
+    replace = Path.replace
+
+    def recording_replace(source: Path, target: str | PurePath) -> Path:
+        renames.append((source, Path(target), Path(target).read_text(encoding="utf-8")))
+        return replace(source, target)
+
+    monkeypatch.setattr(Path, "replace", recording_replace)
+    finished = full_manifest()
+    finished.finished_at.FromDatetime(datetime(2026, 10, 15, 10, tzinfo=UTC))
+
+    write_manifest(path, finished)
+
+    ((source, target, before),) = renames
+    assert (target, source.parent) == (path, directory)
+    assert source != target
+    assert json.loads(before) == json.loads(to_json_line(full_manifest()))  # Until the rename.
+    assert read_manifest(path) == finished
 
 
 def test_rewriting_a_manifest_replaces_it(directory: Path) -> None:

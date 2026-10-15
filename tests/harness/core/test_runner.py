@@ -58,6 +58,7 @@ from goaly.harness.core.runner import (
     Runner,
     RunSummary,
     TaskContext,
+    UsageError,
     classify_error,
     error_classifier,
     lock_run_dir,
@@ -1532,11 +1533,42 @@ async def test_a_run_can_hold_the_lock_its_caller_took(tmp_path: Path) -> None:
 async def test_a_lock_on_another_directory_is_refused(tmp_path: Path) -> None:
     with (
         lock_run_dir(RunFiles(tmp_path / "other")) as lock,
-        pytest.raises(ValueError, match="lock"),
+        pytest.raises(UsageError, match="lock"),
     ):
         await make_runner(ScriptedBenchmark(toy_instances(1))).run(
             tmp_path / "run", template(), split=SPLIT_TRAIN, seeds=[0], lock=lock
         )
+
+
+async def test_a_released_lock_is_refused(tmp_path: Path) -> None:
+    lock = lock_run_dir(RunFiles(tmp_path / "run"))
+    lock.release()
+
+    with pytest.raises(UsageError, match="released"):
+        await make_runner(ScriptedBenchmark(toy_instances(1))).run(
+            tmp_path / "run", template(), split=SPLIT_TRAIN, seeds=[0], lock=lock
+        )
+
+    assert lock.released
+    assert not RunFiles(tmp_path / "run").manifest.exists()
+
+
+def test_a_locks_directory_cannot_be_changed(tmp_path: Path) -> None:
+    with lock_run_dir(RunFiles(tmp_path)) as lock:
+        assert lock.files == RunFiles(tmp_path)
+        assert not lock.released
+        with pytest.raises(AttributeError):
+            lock.files = RunFiles(tmp_path / "other")  # type: ignore[misc]  # As this checks.
+    assert lock.released
+
+
+def test_a_file_cannot_be_a_run_directory(tmp_path: Path) -> None:
+    (tmp_path / "run").write_text("a file\n", encoding="utf-8")
+
+    with pytest.raises(RunDirectoryError, match="cannot be a run directory"):
+        lock_run_dir(RunFiles(tmp_path / "run"))
+    with pytest.raises(RunDirectoryError, match="cannot be a run directory"):
+        lock_run_dir(RunFiles(tmp_path / "run" / "inner"))
 
 
 # Arguments the runner refuses.
@@ -1545,7 +1577,7 @@ async def test_a_lock_on_another_directory_is_refused(tmp_path: Path) -> None:
 async def test_an_unknown_instance_id_is_refused_before_anything_is_written(
     tmp_path: Path,
 ) -> None:
-    with pytest.raises(ValueError, match="'t9'"):
+    with pytest.raises(UsageError, match="'t9'"):
         await run(make_runner(ScriptedBenchmark(toy_instances(2))), tmp_path, instance_ids=["t9"])
 
     assert not RunFiles(tmp_path).manifest.exists()
@@ -1554,8 +1586,10 @@ async def test_an_unknown_instance_id_is_refused_before_anything_is_written(
 async def test_duplicate_instance_ids_from_the_benchmark_are_refused(tmp_path: Path) -> None:
     twice = toy_instances(2) + toy_instances(1)
 
-    with pytest.raises(ValueError, match="'t0'"):
+    with pytest.raises(ValueError, match="'t0'") as refused:
         await run(make_runner(ScriptedBenchmark(twice)), tmp_path)
+
+    assert not isinstance(refused.value, UsageError)  # The adapter's bug, not the caller's.
 
 
 async def test_a_run_needs_its_id_and_a_cache_needs_the_harness_hash(tmp_path: Path) -> None:
@@ -1563,9 +1597,9 @@ async def test_a_run_needs_its_id_and_a_cache_needs_the_harness_hash(tmp_path: P
         ScriptedBenchmark(toy_instances(1)), cache=EvalCache(tmp_path / "c", CACHE_NAMESPACE)
     )
 
-    with pytest.raises(ValueError, match="run_id"):
+    with pytest.raises(UsageError, match="run_id"):
         await run(runner, tmp_path / "a", manifest=template(run_id=""))
-    with pytest.raises(ValueError, match="harness_hash"):
+    with pytest.raises(UsageError, match="harness_hash"):
         await run(runner, tmp_path / "b", manifest=template(harness_hash=""))
 
     assert not (tmp_path / "a").exists()
@@ -1576,7 +1610,7 @@ async def test_a_run_needs_its_id_and_a_cache_needs_the_harness_hash(tmp_path: P
 async def test_seeds_must_be_distinct_replicate_indices(
     tmp_path: Path, seeds: Sequence[int]
 ) -> None:
-    with pytest.raises(ValueError, match="seed"):
+    with pytest.raises(UsageError, match="seed"):
         await run(make_runner(ScriptedBenchmark(toy_instances(1))), tmp_path, seeds=seeds)
 
 
@@ -1585,7 +1619,7 @@ async def test_seeds_must_be_distinct_replicate_indices(
     [(0, None), (1, 0.0), (1, -1.0), (1, math.inf), (1, math.nan)],
 )
 def test_limits_must_be_positive(max_tasks: int, task_timeout_s: float | None) -> None:
-    with pytest.raises(ValueError, match="must be"):
+    with pytest.raises(UsageError, match="must be"):
         make_runner(
             ScriptedBenchmark(toy_instances(1)), max_tasks=max_tasks, task_timeout_s=task_timeout_s
         )

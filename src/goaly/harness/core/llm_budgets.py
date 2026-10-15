@@ -11,7 +11,8 @@ of is one it must not call.
 
 The budgets are config, read from a TOML file, so changing them needs no code change. The file
 lives outside harness/core/, so changing it leaves the harness hash and the evaluation cache as
-they are; the run's config hash records the share instead.
+they are. A share is not in the run's config hash either: it limits how fast a run goes, not
+what it finds, so an interrupted run may resume under another share.
 """
 
 import tomllib

@@ -71,9 +71,10 @@ def content_hash(trees: Mapping[str, Path]) -> str:
     """Return the SHA-256, in hex, of every file under the directories in ``trees``.
 
     Each file counts with its contents and its path: the tree's label, then the path within the
-    tree. A symbolic link counts with the path it holds, never what it links to, so the hash
-    reads nothing outside the trees; a link to a directory raises ValueError, as its files would
-    go uncounted. Python bytecode (``__pycache__``, ``*.pyc``, ``*.pyo``) is left out.
+    tree. Python bytecode (``__pycache__``, ``*.pyc``, ``*.pyo``) is left out. A symbolic link
+    raises ValueError: what it links to could change while the hash stayed the same, and reading
+    it could read outside the trees. It reads every file, so it blocks: run it in a worker
+    thread from the event loop.
     """
     files: list[tuple[str, str, str]] = []
     for label, root in trees.items():
@@ -85,25 +86,27 @@ def content_hash(trees: Mapping[str, Path]) -> str:
                 path = directory / name
                 if name.endswith(_BYTECODE_SUFFIXES):
                     continue
-                where = f"{label}/{path.relative_to(root).as_posix()}"
                 if path.is_symlink():
-                    if path.is_dir():
-                        raise ValueError(f"{path} links to a directory, which cannot be hashed")
-                    target = hashlib.sha256(os.fsencode(path.readlink())).hexdigest()
-                    files.append((where, "link", target))
-                else:
-                    files.append((where, "file", sha256_file(path)))
+                    raise ValueError(f"{path} is a symbolic link, which cannot be hashed")
+                where = f"{label}/{path.relative_to(root).as_posix()}"
+                files.append((where, "file", sha256_file(path)))
     listing = json.dumps(sorted(files), ensure_ascii=False, separators=(",", ":"))
     return hashlib.sha256(listing.encode("utf-8")).hexdigest()
 
 
 def harness_hash(pack_dir: Path) -> str:
-    """Return the harness hash: the content hash of core plus the pack in ``pack_dir``."""
+    """Return the harness hash: the content hash of core plus the pack in ``pack_dir``.
+
+    It reads both trees, so it blocks: run it in a worker thread from the event loop.
+    """
     return content_hash({"core": CORE_DIR, "pack": pack_dir})
 
 
 def core_hash() -> str:
-    """Return the content hash of core alone, for a harness without a pack, such as a test's."""
+    """Return the content hash of core alone, for a harness without a pack, such as a test's.
+
+    It reads core's files, so it blocks: run it in a worker thread from the event loop.
+    """
     return content_hash({"core": CORE_DIR})
 
 
@@ -164,6 +167,9 @@ def git_state(directory: Path) -> GitState | None:
                 check=False,
             )
         except subprocess.TimeoutExpired:  # A hung git, say on a locked repository.
+            _logger.warning(
+                "git did not answer within %d s in %s: no git state", _GIT_TIMEOUT_S, directory
+            )
             return None
         return completed.stdout.strip() if completed.returncode == 0 else None
 
@@ -220,7 +226,9 @@ def provenance(directory: Path) -> RunManifest:
     state = git_state(directory)
     if state is None:
         _logger.warning(
-            "%s is not in a git checkout: the manifest records no commit and no uv.lock", directory
+            "found no git state for %s (no checkout, no commit yet, or git did not answer):"
+            " the manifest records no commit and no uv.lock",
+            directory,
         )
         return found
     found.git_commit = state.commit
