@@ -1,0 +1,35 @@
+# The Effi-SQL lane (goaly rsi lane --lane effisql --config rsi/lane-effisql.toml).
+# Keys: goaly.rsi.cli.LaneSettings; [lane]: goaly.rsi.lane.LaneConfig.
+
+name = "effisql"
+repo = "."
+v0 = "baseline-v0"
+# T11's evaluator factory, "module:function", which drives `goaly run --phase all` (V27).
+# The lane exits with 3, a configuration error, until it is set.
+evaluator = ""
+# T22's stop hooks, "module:function": the final results PR and the notification.
+hooks = ""
+
+[lane]
+# The freeze (spec §13), absolute, so a restart never moves it.
+deadline = "2026-10-15T20:00:00Z"
+max_rounds_without_accept = 4
+infrastructure_backoff_s = 120
+task_concurrency = 16
+implementer_threads = 3
+
+[lane.round]
+k = 3
+screen_failures = 15
+screen_solved = 5
+screen_seed = 0
+validation_seed = 0
+confirmation_seed = 1
+
+[lane.round.decision]
+min_delta = 0.05
+sign_test_max_p = 0.1
+max_regressions = 1
+confirm_min_delta = 0.03
+cost_guardrail_ratio = 1.5
+efficiency_cap_ratio = 3.0
