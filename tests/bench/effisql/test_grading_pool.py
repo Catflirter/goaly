@@ -3,6 +3,7 @@
 import asyncio
 import functools
 import multiprocessing
+import random
 import threading
 import time
 from collections.abc import Callable, Coroutine
@@ -14,7 +15,7 @@ import pytest
 
 from goaly.bench.effisql import grading, grading_service
 from goaly.bench.effisql.data import EffiSqlInstance
-from goaly.bench.effisql.grader import GraderError, PgSession
+from goaly.bench.effisql.grader import GraderError, PgSession, QueryError
 from goaly.bench.effisql.grading import BaseCache, GradingSlot, Mode
 from goaly.bench.effisql.grading_pool import (
     GRADING_INSTANCES,
@@ -32,7 +33,7 @@ from goaly.contracts.gen.task_pb2 import (
     Grade,
     Prediction,
 )
-from tests.bench.effisql import worker_helpers
+from tests.bench.effisql import grading_fakes, worker_helpers
 from tests.bench.effisql.grading_fakes import BASE_SQL, INST, FakeSession, entry
 
 
@@ -460,3 +461,63 @@ class TestProcessRunner:
         with pytest.raises(asyncio.CancelledError):
             await task
         assert await runner.call(worker_helpers.was_aborted) is False
+
+
+class TestRulingAdditions:
+    @run_async
+    async def test_a_lease_can_wait_for_one_particular_resource(self) -> None:
+        pool = GradingPool(["a", "b"])
+        order: list[str] = []
+
+        async def want(name: str, which: str) -> None:
+            async with pool.lease(Priority.RSI, which=lambda r: r == which) as got:
+                order.append(f"{name}:{got}")
+
+        async with pool.lease(Priority.RSI, which=lambda r: r == "a"):
+            waiting_for_a = asyncio.create_task(want("probe", "a"))
+            await asyncio.sleep(0)
+            async with pool.lease(Priority.RSI) as other:
+                assert other == "b", "a waiter for a does not hold up b"
+        await waiting_for_a
+        assert order == ["probe:a"]
+        assert pool.free_count == 2
+
+    @run_async
+    async def test_a_grader_failure_is_retried_once(self, tmp_path: Path) -> None:
+        outcomes = [Grade(status=GRADE_STATUS_GRADER_ERROR), Grade(status=GRADE_STATUS_GRADED)]
+        slot = FakeSlot(lambda: outcomes.pop(0))
+        grade = await grader_on(slot, tmp_path).grade(INST, answer("SELECT 1"), Mode.OFFICIAL)
+        assert grade.status == GRADE_STATUS_GRADED
+        assert len(slot.calls) == 2
+
+    @run_async
+    async def test_a_second_grader_failure_is_returned(self, tmp_path: Path) -> None:
+        slot = FakeSlot(lambda: Grade(status=GRADE_STATUS_GRADER_ERROR))
+        grade = await grader_on(slot, tmp_path).grade(INST, answer("SELECT 1"), Mode.OFFICIAL)
+        assert grade.status == GRADE_STATUS_GRADER_ERROR
+        assert len(slot.calls) == 2
+
+    @run_async
+    async def test_identity_probe_times_the_base_against_itself_on_the_instance(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        main = FakeSession(times={BASE_SQL: [100.0, 100.0, 120.0, 100.0, 100.0, 80.0]})
+        slot = FakeSlot()
+        slot.sessions = lambda: grading_fakes.sessions(main)  # type: ignore[attr-defined]  # The fake's.
+        slot.rng = random.Random(0)  # type: ignore[attr-defined]  # noqa: S311  # Reproducible.
+        grader = grader_on(slot, tmp_path)
+        tau = await grader.identity_probe(INST, instance=slot.instance)
+        assert 0.8 <= tau <= 1.25
+        assert main.kinds(BASE_SQL) == ["time"] * 6
+        assert grader.identity_reference(INST) is None
+        grader.dev_cache.put(entry())
+        assert grader.identity_reference(INST) == 1.02
+
+    def test_a_failed_probe_is_a_grader_error_and_resets_the_slot(self) -> None:
+        main = FakeSession(times={BASE_SQL: [QueryError("boom")]})
+        slot = FakeSlot()
+        slot.sessions = lambda: grading_fakes.sessions(main)  # type: ignore[attr-defined]  # The fake's.
+        slot.rng = random.Random(0)  # type: ignore[attr-defined]  # noqa: S311  # Reproducible.
+        with pytest.raises(GraderError, match="identity probe failed"):
+            grading_service.probe_identity(slot, INST)  # type: ignore[arg-type]  # A fake.
+        assert slot.resets == 1

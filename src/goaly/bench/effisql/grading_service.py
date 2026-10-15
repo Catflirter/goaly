@@ -36,7 +36,7 @@ from pathlib import Path
 from typing import IO, TYPE_CHECKING, Any, Protocol, Self
 
 from goaly.bench.effisql.data import EffiSqlInstance
-from goaly.bench.effisql.grader import GraderError
+from goaly.bench.effisql.grader import GraderError, TimingError, time_interleaved
 from goaly.bench.effisql.grading import (
     BaseCache,
     GradingSlot,
@@ -49,7 +49,7 @@ from goaly.bench.effisql.grading import (
 from goaly.bench.effisql.grading_pool import GradingInstance, GradingPool, Priority
 from goaly.bench.effisql.pg_build import Connect, connector
 from goaly.bench.effisql.pg_settings import GRADER_ROLE, load_credentials
-from goaly.contracts.gen.task_pb2 import Grade, Prediction
+from goaly.contracts.gen.task_pb2 import GRADE_STATUS_GRADER_ERROR, Grade, Prediction
 
 __all__ = [
     "EffiSqlGrader",
@@ -59,6 +59,7 @@ __all__ = [
     "WorkerSpec",
     "default_lock_dir",
     "grade_on_slot",
+    "probe_identity",
 ]
 
 if TYPE_CHECKING:  # Generic only to type checkers; a plain class at run time.
@@ -70,6 +71,7 @@ _BACKOFF_AFTER = 2  # A worker's deaths in a row before its instance is held bac
 _BACKOFF_STEP_S = 30.0  # Each further death in a row holds the instance back this much more.
 _BACKOFF_MAX_S = 600.0
 _CLOSE_JOIN_S = 30.0  # How long close() waits for a worker before it terminates it.
+_GRADER_ERROR_ATTEMPTS = 2  # A grader failure is retried once (the controller's ruling).
 
 
 class SlotRunner(Protocol):
@@ -283,6 +285,23 @@ async def _finish[T](future: asyncio.Future[T]) -> None:
             break
 
 
+def probe_identity(slot: GradingSlot, inst: EffiSqlInstance) -> float:
+    """Time ``inst``'s base against itself on ``slot``; the work of an identity probe."""
+    try:
+        sessions = slot.sessions()
+
+        def time_base() -> float:
+            return sessions.main.execution_ms(inst.base_sql)
+
+        return time_interleaved(time_base, time_base, rng=slot.rng).speedup
+    except TimingError as error:
+        slot.reset()
+        raise GraderError(f"the identity probe failed: {error}") from None
+    except BaseException:
+        slot.reset()
+        raise
+
+
 def grade_on_slot(
     slot: GradingSlot, inst: EffiSqlInstance, sql: str | None, mode: Mode, cache: BaseCache | None
 ) -> Grade:
@@ -344,11 +363,37 @@ class EffiSqlGrader:
             quick = quick_grade(inst, sql, mode, cache)
             if quick is not None:
                 return quick
-            async with self._pool.lease(priority) as runner:
-                return await runner.call(grade_on_slot, inst, sql, mode, cache)
+            for attempt in range(1, _GRADER_ERROR_ATTEMPTS + 1):
+                async with self._pool.lease(priority) as runner:
+                    grade = await runner.call(grade_on_slot, inst, sql, mode, cache)
+                if grade.status != GRADE_STATUS_GRADER_ERROR or attempt == _GRADER_ERROR_ATTEMPTS:
+                    return grade
+                _log.warning(
+                    "retrying a grader failure",
+                    extra={"instance_id": inst.instance_id, "feedback": grade.feedback},
+                )
         except Exception as error:  # noqa: BLE001  # Never raise for grading trouble.
             _log.exception("grading failed", extra={"instance_id": inst.instance_id})
             return grader_error(inst, f"grader: {type(error).__name__}: {error}")
+        raise AssertionError("unreachable")  # pragma: no cover
+
+    async def identity_probe(
+        self, inst: EffiSqlInstance, *, instance: GradingInstance, priority: Priority = Priority.RSI
+    ) -> float:
+        """Measure ``inst``'s identity τ on ``instance`` now: its base against itself, with the
+        interleaved protocol, as the setup measured it (§6.2's periodic identity probes).
+
+        It holds that grading instance for about 6 base runs (4 for a base of 60 s or more).
+        Compare the result with :meth:`identity_reference`. Raises GraderError if the probe
+        could not run.
+        """
+        async with self._pool.lease(priority, which=lambda r: r.instance == instance) as runner:
+            return await runner.call(probe_identity, inst)
+
+    def identity_reference(self, inst: EffiSqlInstance) -> float | None:
+        """Return the identity τ the setup measured for ``inst``, if the base cache has it."""
+        entry = self._dev_cache.get(inst)
+        return None if entry is None else entry.identity_speedup
 
     def benchmark_grade(
         self, mode: Mode, *, priority: Priority = Priority.RSI
