@@ -98,8 +98,13 @@ IDENTITY_TOLERANCE = (
 GOLD_MIN_SPEEDUP = 1.2  # A gold below this speedup is excluded.
 SMALL_RESULT_ROWS = 10_000  # Negative checks run on tasks with fewer base rows than this.
 NEGATIVE_SAMPLE = 10
-EXCLUSION_BOUND = 0.10  # More than this share of tasks excluded stops the setup.
-AGREEMENT_BOUND = 0.90  # Dev and official mode give the same tier on at least this share.
+# More than this share of tasks excluded stops the setup. The spec's 10% was ratified as 25% by
+# the project lead for this hardware: 34 golds gain less than 1.2x here (2026-10-15).
+EXCLUSION_BOUND = 0.25
+# Dev and official mode give the same tier on at least this share. The real setup measured 79%:
+# dev mode's base median was measured under load, and its tier noise is accepted (ruling); RSI
+# decisions rest on the sign test, the confirmation seed and the paired design (spec §8.3).
+AGREEMENT_BOUND = 0.90
 # A gold whose dev-mode speedup falls in this range is graded again in official mode, and its
 # exclusion decided on that (the controller's ruling).
 MARGINAL_GOLD = (0.8, 1.5)
