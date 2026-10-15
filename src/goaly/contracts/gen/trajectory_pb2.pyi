@@ -135,8 +135,7 @@ Global___ToolCallSource: _TypeAlias = ToolCallSource  # noqa: Y015
 @_typing.final
 class Trajectory(_message.Message):
     """Everything the agent did on one task, one seed, in one run (spec §5.1): one line of the run's
-    trajectories file. If several lines share run_id, instance_id and seed, the last one wins, so
-    a late grade is appended as a new line.
+    trajectories file. If several lines share run_id, instance_id and seed, the last one wins.
     """
 
     DESCRIPTOR: _descriptor.Descriptor
@@ -187,8 +186,9 @@ class Trajectory(_message.Message):
 
     @_builtins.property
     def grade(self) -> _task_pb2.Grade:
-        """How the prediction was graded, as in the task's TaskResult; absent until it is graded, and
-        in a run that is not graded.
+        """How the prediction was graded, as in the task's TaskResult. Only the one-process mode fills
+        it. A two-phase run's trajectory carries no grade: readers take grades from the results
+        file, results.jsonl (spec §5.1, §6.1). Also absent in a run that is not graded.
         """
 
     @_builtins.property
@@ -249,9 +249,10 @@ class Chat(_message.Message):
     tool results and injected messages, and it comes before initial_messages.
     """
     keep_turns: _builtins.int
-    """Set on every executor chat, from the run's context configuration: how many of the latest
-    steps in a prompt keep their assistant message's reasoning_content (the rule is in Step's
-    comment). Unset on a chat whose reasoning is replayed unchanged, as GLM's is (spec §5.1).
+    """The replay window, from the run's context configuration (spec §5.1; the rule is in Step's
+    comment). More than 0 on every executor chat: how many of the latest steps in a prompt keep
+    their assistant message's reasoning_content, 8 for baseline v0. Unset or 0: not an executor
+    chat, so its messages are replayed unchanged, as GLM's are.
     """
     @_builtins.property
     def initial_messages(self) -> _containers.RepeatedCompositeFieldContainer[Global___ChatMessage]:
@@ -291,19 +292,19 @@ class Step(_message.Message):
       2. the chat's initial_messages;
       3. each earlier step of the same chat: its assistant message, its tool results as tool
          messages, and its injected messages.
-    Then three rules apply to that whole prompt, forked context included:
-      - Folds: every fold in effect at the step replaces the content of the tool message it names.
-      - XML calls: an assistant message whose tool calls were parsed from Qwen3-Coder XML
-        (TOOL_CALL_SOURCE_REASONING_XML or CONTENT_XML) carries them only as tool_calls. Its
-        content loses each <tool_call> block, or, if it has none, each bare <function=...> block;
-        its reasoning_content loses each <tool_call> block. A block ends at its closing tag, at the
-        next block or at the end of the text. A message whose calls came from the standard field
-        is replayed as written.
-      - Reasoning: in a chat with keep_turns set, an executor chat, an assistant message keeps its
-        reasoning_content only while its step is among the last keep_turns steps whose assistant
-        messages the prompt holds, counted back from the newest and through the forked context.
-        Older assistant messages are sent without reasoning. A chat without keep_turns replays
-        reasoning unchanged, as GLM's is (spec §5.1).
+    Then every fold in effect at the step replaces the content of the tool message it names. In an
+    executor chat, one whose keep_turns is more than 0, two replay rules also apply to the whole
+    prompt, forked context included (spec §5.1):
+      - XML markup: every replayed assistant message loses all Qwen3-Coder tool-call markup from
+        its content and its reasoning_content: each <tool_call> block, then each bare
+        <function=...> block. A block ends at its closing tag, at the next block of its kind or at
+        the end of the text. This holds whether or not a call was parsed from the markup, and
+        whatever the source of the message's tool_calls, which it keeps.
+      - Reasoning: an assistant message keeps its reasoning_content only while its step is among
+        the last keep_turns steps whose assistant messages the prompt holds, counted back from the
+        newest and through the forked context. Older assistant messages keep their content and are
+        sent without reasoning.
+    Any other chat, as GLM's, replays its messages unchanged.
     """
 
     DESCRIPTOR: _descriptor.Descriptor
