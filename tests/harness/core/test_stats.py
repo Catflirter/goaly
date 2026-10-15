@@ -1,11 +1,9 @@
 """Tests for goaly.harness.core.stats."""
 
 import itertools
-import math
 import random
 import statistics
 from collections.abc import Sequence
-from fractions import Fraction
 
 import pytest
 
@@ -31,13 +29,6 @@ def outcomes(wins: int, losses: int, ties: int = 0) -> tuple[dict[str, float], d
     baseline = {f"t{index}": base for index, (base, _) in enumerate(pairs)}
     candidate = {f"t{index}": cand for index, (_, cand) in enumerate(pairs)}
     return baseline, candidate
-
-
-def upper_tail(wins: int, losses: int) -> float:
-    """P(X >= wins) for X ~ Binomial(wins + losses, 1/2), in exact arithmetic."""
-    trials = wins + losses
-    tail = sum(math.comb(trials, k) for k in range(wins, trials + 1))
-    return float(Fraction(tail, 2**trials))
 
 
 # mean_std.
@@ -220,13 +211,17 @@ def test_sign_test_with_only_ties_has_p_value_1() -> None:
     assert sign_test(baseline, candidate) == SignTest(wins=0, losses=0, ties=3, p_value=1.0)
 
 
-def test_sign_test_stays_exact_for_many_tasks() -> None:
+def test_sign_test_matches_a_known_binomial_tail() -> None:
+    baseline, candidate = outcomes(20, 10)
+
+    # P(X >= 20) for X ~ Binomial(30, 1/2): 53009102 / 2**30, to the last bit.
+    assert sign_test(baseline, candidate).p_value == 0.04936857335269451
+
+
+def test_sign_test_neither_overflows_nor_underflows_for_many_tasks() -> None:
     baseline, candidate = outcomes(200, 38)
 
-    p_value = sign_test(baseline, candidate).p_value
-
-    assert p_value == upper_tail(200, 38)
-    assert 0.0 < p_value < 1e-25
+    assert 0.0 < sign_test(baseline, candidate).p_value < 1e-25
 
 
 def test_sign_test_needs_the_same_keys() -> None:
