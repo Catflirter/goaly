@@ -172,7 +172,7 @@ class TestTimeInterleaved:
         timing = time_interleaved(
             RecordingTimer("pred", log, [10.0, 30.0, 20.0]),
             RecordingTimer("base", log, [100.0, 300.0, 200.0]),
-            rng=random.Random(1),
+            rng=random.Random(1),  # noqa: S311  # A reproducible order, not a secret.
         )
         assert (timing.pred_ms, timing.base_ms, timing.runs) == (20.0, 200.0, 3)
         assert timing.speedup == 10.0
@@ -185,7 +185,8 @@ class TestTimeInterleaved:
         for seed in range(20):
             log: list[str] = []
             pred = RecordingTimer("pred", log, [1.0] * 3)
-            time_interleaved(pred, RecordingTimer("base", log, [1.0] * 3), rng=random.Random(seed))
+            rng = random.Random(seed)  # noqa: S311  # A reproducible order, not a secret.
+            time_interleaved(pred, RecordingTimer("base", log, [1.0] * 3), rng=rng)
             orders.add(log[0])
         assert orders == {"pred", "base"}
 
@@ -197,7 +198,7 @@ class TestTimeInterleaved:
         timing = time_interleaved(
             RecordingTimer("pred", log, long if long_side == "pred" else short),
             RecordingTimer("base", log, long if long_side == "base" else short),
-            rng=random.Random(0),
+            rng=random.Random(0),  # noqa: S311  # A reproducible order, not a secret.
         )
         assert timing.runs == 2
         assert len(log) == 4
@@ -209,7 +210,7 @@ class TestTimeInterleaved:
         timing = time_interleaved(
             RecordingTimer("pred", log, [LONG_RUN_MS, 1.0, 1.0]),
             RecordingTimer("base", log, [1.0, 1.0, 1.0]),
-            rng=random.Random(0),
+            rng=random.Random(0),  # noqa: S311  # A reproducible order, not a secret.
         )
         assert timing.runs == 3
 
@@ -218,7 +219,7 @@ class TestTimeInterleaved:
         timing = time_interleaved(
             RecordingTimer("pred", log, [LONG_RUN_MS - 1] * 3),
             RecordingTimer("base", log, [1.0] * 3),
-            rng=random.Random(0),
+            rng=random.Random(0),  # noqa: S311  # A reproducible order, not a secret.
         )
         assert timing.runs == 3
 
@@ -231,7 +232,7 @@ class TestTimeInterleaved:
             time_interleaved(
                 RecordingTimer("pred", log, failing if side == "pred" else [1.0] * 3),
                 RecordingTimer("base", log, failing if side == "base" else [1.0] * 3),
-                rng=random.Random(0),
+                rng=random.Random(0),  # noqa: S311  # A reproducible order, not a secret.
             )
         assert caught.value.side == side
         assert caught.value.timed_out is isinstance(error, QueryTimeoutError)
@@ -243,7 +244,7 @@ class TestTimeInterleaved:
             time_interleaved(
                 RecordingTimer("pred", log, [GraderError("lost")]),
                 RecordingTimer("base", log, [GraderError("lost")]),
-                rng=random.Random(0),
+                rng=random.Random(0),  # noqa: S311  # A reproducible order, not a secret.
             )
 
 

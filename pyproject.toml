@@ -50,7 +50,7 @@ select = [
 ]
 
 [tool.ruff.lint.per-file-ignores]
-"tests/**" = ["S101", "S311"] # S311: tests seed random.Random on purpose, for reproducible orders.
+"tests/**" = ["S101"]
 
 [tool.mypy]
 strict = true
