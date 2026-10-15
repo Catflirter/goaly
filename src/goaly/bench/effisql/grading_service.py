@@ -248,12 +248,14 @@ class ProcessRunner:
 
 def _lock_instance(lock_dir: Path, instance: GradingInstance) -> IO[str]:
     lock_dir.mkdir(parents=True, exist_ok=True)
-    handle = (lock_dir / f"{instance.name}.lock").open("w", encoding="utf-8")
+    # Opened without truncating: a grader that is refused must not blank the holder's PID.
+    handle = (lock_dir / f"{instance.name}.lock").open("a", encoding="utf-8")
     try:
         fcntl.flock(handle, fcntl.LOCK_EX | fcntl.LOCK_NB)
     except BlockingIOError:
         handle.close()
         raise GraderError(f"another grader process is grading on {instance.name}") from None
+    handle.truncate(0)  # Ours now: the file holds this process's PID alone.
     handle.write(f"{os.getpid()}\n")
     handle.flush()
     return handle
