@@ -78,6 +78,7 @@ class FakeLLM:
         *,
         tools: Sequence[Mapping[str, JsonValue]] = (),
         params: ModelParams | None = None,
+        attempt_timeout_s: float | None = None,  # BoundLlm's, since T03 part (c); unused here.
     ) -> LlmReply:
         self.requests.append(Request(tuple(map(_copy, messages)), tuple(tools), params))
         item = next(self._script, None)

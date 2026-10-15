@@ -10,8 +10,11 @@ requires-python = ">=3.12,<3.13"
 dependencies = [
     "httpx>=0.28", # Pre-1.0, so a minor release may break: 0.28 is the one the client is tested on
     "protobuf>=7.35.1", # The generated code rejects a runtime older than its gencode, 7.35.1
+    "psycopg-pool>=3.2", # The grading instances' connection pools
+    "psycopg[binary]>=3.2", # 3.2 added cancel_safe() and chunked-rows streaming
     "pydantic>=2.4", # 2.4 added ValidationError.errors(include_input=...)
     "pydantic-settings>=2",
+    "python-dotenv>=1", # Parses ~/.config/goaly/pg.env, as pydantic-settings does
 ]
 
 [project.scripts]
@@ -28,6 +31,7 @@ dev = [
     "pytest>=9",
     "pytest-cov>=7",
     "ruff>=0.17", # ruff is pre-1.0: its minor releases are its breaking releases
+    "sqlparse==0.5.2", # The official Effi-SQL runner's pin; the extractor parity tests use it
     "types-protobuf>=7",
 ]
 # RSI only (spec §8.8, §11): `make setup` and CI install it, a plain `uv sync` leaves it out.
@@ -79,6 +83,11 @@ plugins = ["pydantic.mypy"]
 # Every `type: ignore` needs an error code, plus a comment giving the reason.
 enable_error_code = ["ignore-without-code"]
 warn_unreachable = true
+
+[[tool.mypy.overrides]]
+# sqlparse 0.5.2, the official runner's pin, ships no type information; only the tests use it.
+module = ["sqlparse", "sqlparse.*"]
+ignore_missing_imports = true
 
 [tool.pydantic-mypy]
 init_forbid_extra = true
