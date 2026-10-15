@@ -26,6 +26,26 @@ class RunManifest(_message.Message):
 
     DESCRIPTOR: _descriptor.Descriptor
 
+    @_typing.final
+    class EnvironmentSettingsEntry(_message.Message):
+        DESCRIPTOR: _descriptor.Descriptor
+
+        KEY_FIELD_NUMBER: _builtins.int
+        VALUE_FIELD_NUMBER: _builtins.int
+        key: _builtins.str
+        value: _builtins.str
+        def __init__(
+            self,
+            *,
+            key: _builtins.str = ...,
+            value: _builtins.str = ...,
+        ) -> None: ...
+        _HasFieldArgType: _TypeAlias = _Never  # noqa: Y015
+        def HasField(self, field_name: _HasFieldArgType) -> _builtins.bool: ...
+        _ClearFieldArgType: _TypeAlias = _typing.Literal["key", b"key", "value", b"value"]  # noqa: Y015
+        def ClearField(self, field_name: _ClearFieldArgType) -> None: ...
+        def WhichOneof(self, oneof_group: _Never) -> None: ...
+
     RUN_ID_FIELD_NUMBER: _builtins.int
     BENCHMARK_FIELD_NUMBER: _builtins.int
     SPLIT_FIELD_NUMBER: _builtins.int
@@ -35,6 +55,7 @@ class RunManifest(_message.Message):
     CONFIG_HASH_FIELD_NUMBER: _builtins.int
     DATASET_REVISION_FIELD_NUMBER: _builtins.int
     DATASET_NOTES_FIELD_NUMBER: _builtins.int
+    DATASET_SHA256_FIELD_NUMBER: _builtins.int
     GOLD_SHA256_FIELD_NUMBER: _builtins.int
     MODELS_FIELD_NUMBER: _builtins.int
     SEEDS_FIELD_NUMBER: _builtins.int
@@ -43,6 +64,7 @@ class RunManifest(_message.Message):
     STARTED_AT_FIELD_NUMBER: _builtins.int
     FINISHED_AT_FIELD_NUMBER: _builtins.int
     MACHINE_FIELD_NUMBER: _builtins.int
+    ENVIRONMENT_SETTINGS_FIELD_NUMBER: _builtins.int
     UV_LOCK_SHA256_FIELD_NUMBER: _builtins.int
     run_id: _builtins.str
     """A unique ID for the run."""
@@ -69,6 +91,11 @@ class RunManifest(_message.Message):
     """
     dataset_revision: _builtins.str
     """The revision of the dataset the tasks came from: the commit hash of its Hugging Face repo."""
+    dataset_sha256: _builtins.str
+    """The SHA-256, in hex, of the task file the tasks came from, in the official format: the
+    dataset's effi-sql-pg.jsonl for our splits, or the organizers' --instances file. It is not
+    the hash of any file derived from it, such as the gold-free runtime file.
+    """
     gold_sha256: _builtins.str
     """The SHA-256 of the gold-answer files the grader used that are not part of the dataset, in
     hex; empty if there were none, as when the gold answers ship with the dataset.
@@ -112,6 +139,17 @@ class RunManifest(_message.Message):
     def machine(self) -> Global___MachineInfo:
         """The machine the run ran on."""
 
+    @_builtins.property
+    def environment_settings(self) -> _containers.ScalarMap[_builtins.str, _builtins.str]:
+        """The settings of the benchmark's environment that can change results, keyed by the
+        adapter's name for each setting; empty if the benchmark has none. For Effi-SQL: the
+        PostgreSQL image digest; the server settings shared_buffers, work_mem, jit and the
+        parallel-worker settings; the dbgen build; the generated data's checksums; and each
+        instance's cpuset. Its key "grading_mode" names the grader's mode, such as Effi-SQL's "dev"
+        or "official". The benchmark's adapter fills it, through Benchmark.manifest_fields, and the
+        runner writes it.
+        """
+
     def __init__(
         self,
         *,
@@ -124,6 +162,7 @@ class RunManifest(_message.Message):
         config_hash: _builtins.str = ...,
         dataset_revision: _builtins.str = ...,
         dataset_notes: _abc.Iterable[_builtins.str] | None = ...,
+        dataset_sha256: _builtins.str = ...,
         gold_sha256: _builtins.str = ...,
         models: _abc.Iterable[Global___ModelSettings] | None = ...,
         seeds: _abc.Iterable[_builtins.int] | None = ...,
@@ -132,11 +171,12 @@ class RunManifest(_message.Message):
         started_at: _timestamp_pb2.Timestamp | None = ...,
         finished_at: _timestamp_pb2.Timestamp | None = ...,
         machine: Global___MachineInfo | None = ...,
+        environment_settings: _abc.Mapping[_builtins.str, _builtins.str] | None = ...,
         uv_lock_sha256: _builtins.str = ...,
     ) -> None: ...
     _HasFieldArgType: _TypeAlias = _typing.Literal["finished_at", b"finished_at", "machine", b"machine", "started_at", b"started_at"]  # noqa: Y015
     def HasField(self, field_name: _HasFieldArgType) -> _builtins.bool: ...
-    _ClearFieldArgType: _TypeAlias = _typing.Literal["benchmark", b"benchmark", "command_line", b"command_line", "config_hash", b"config_hash", "dataset_notes", b"dataset_notes", "dataset_revision", b"dataset_revision", "finished_at", b"finished_at", "git_commit", b"git_commit", "git_dirty", b"git_dirty", "gold_sha256", b"gold_sha256", "harness_hash", b"harness_hash", "instance_ids", b"instance_ids", "machine", b"machine", "models", b"models", "run_id", b"run_id", "seeds", b"seeds", "split", b"split", "started_at", b"started_at", "uv_lock_sha256", b"uv_lock_sha256"]  # noqa: Y015
+    _ClearFieldArgType: _TypeAlias = _typing.Literal["benchmark", b"benchmark", "command_line", b"command_line", "config_hash", b"config_hash", "dataset_notes", b"dataset_notes", "dataset_revision", b"dataset_revision", "dataset_sha256", b"dataset_sha256", "environment_settings", b"environment_settings", "finished_at", b"finished_at", "git_commit", b"git_commit", "git_dirty", b"git_dirty", "gold_sha256", b"gold_sha256", "harness_hash", b"harness_hash", "instance_ids", b"instance_ids", "machine", b"machine", "models", b"models", "run_id", b"run_id", "seeds", b"seeds", "split", b"split", "started_at", b"started_at", "uv_lock_sha256", b"uv_lock_sha256"]  # noqa: Y015
     def ClearField(self, field_name: _ClearFieldArgType) -> None: ...
     def WhichOneof(self, oneof_group: _Never) -> None: ...
 

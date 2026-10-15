@@ -47,6 +47,7 @@ from goaly.contracts.gen.result_pb2 import (
 )
 from goaly.contracts.gen.task_pb2 import (
     GRADE_STATUS_GRADER_ERROR,
+    GRADE_STATUS_TIMEOUT,
     SPLIT_EXTERNAL,
     Grade,
     Prediction,
@@ -56,12 +57,13 @@ from goaly.contracts.gen.task_pb2 import (
 from goaly.contracts.gen.trajectory_pb2 import (
     STOP_REASON_CANCELLED,
     STOP_REASON_CRASHED,
+    STOP_REASON_TIME_BUDGET_EXHAUSTED,
     STOP_REASON_UNSPECIFIED,
     StopReason,
     Trajectory,
 )
 from goaly.contracts.interfaces import Benchmark, Environment, Instance, Policy
-from goaly.contracts.jsonl import read_jsonl
+from goaly.contracts.jsonl import read_jsonl, to_json_line
 from goaly.harness.core.atomic import write_text_atomically
 from goaly.harness.core.eval_cache import CachedEvaluation, CacheKey, EvalCache, task_digest
 from goaly.harness.core.jsonl_writer import JsonlWriter
@@ -89,7 +91,10 @@ _logger = logging.getLogger(__name__)
 DEFAULT_MAX_TASKS = 16
 # How much of an error message a record keeps.
 _MESSAGE_LIMIT = 2_000
-# What a resumed run must share with the run it resumes: anything that changes its results.
+# The manifest's fields only the benchmark's adapter knows (Benchmark.manifest_fields).
+_ADAPTER_FIELDS = ("dataset_revision", "dataset_notes", "environment_settings", "dataset_sha256")
+# What a resumed run must share with the run it resumes: anything that changes its results, so
+# it never resumes on another dataset or in another grading mode.
 _MUST_MATCH = (
     "benchmark",
     "split",
@@ -97,9 +102,11 @@ _MUST_MATCH = (
     "instance_ids",
     "harness_hash",
     "config_hash",
-    "dataset_revision",
+    *_ADAPTER_FIELDS,
     "gold_sha256",
     "git_commit",
+    "uv_lock_sha256",
+    "models",
 )
 
 type _Key = tuple[str, int]  # (instance ID, seed)
@@ -214,16 +221,17 @@ type ErrorClassifier = Callable[[Exception], TaskErrorType.ValueType]
 
 
 def error_classifier(
-    rules: Mapping[type[Exception], TaskErrorType.ValueType] | None = None,
+    rules: Sequence[tuple[type[Exception], TaskErrorType.ValueType]] = (),
 ) -> ErrorClassifier:
     """Return a classifier that says what kind of error an exception is, by its type.
 
-    An EnvironmentFailure is TASK_ERROR_TYPE_ENVIRONMENT. Then ``rules`` apply, in order, and
-    anything else is TASK_ERROR_TYPE_POLICY_CRASH, the only other crash result.proto has. A rule
-    matches the exception itself or, in an exception group, any exception at any depth: a pack's
-    own TaskGroup can wrap an EnvironmentFailure. The wiring adds, say, the LLM client's error.
+    An EnvironmentFailure is TASK_ERROR_TYPE_ENVIRONMENT. Then ``rules``, pairs of an exception
+    type and its error type, apply in order, and anything else is TASK_ERROR_TYPE_POLICY_CRASH,
+    the only other crash result.proto has. A rule matches the exception itself or, in an
+    exception group, any exception at any depth: a pack's own TaskGroup can wrap an
+    EnvironmentFailure. The wiring adds, say, the LLM client's error.
     """
-    ordered = [(EnvironmentFailure, TASK_ERROR_TYPE_ENVIRONMENT), *(rules or {}).items()]
+    ordered = [(EnvironmentFailure, TASK_ERROR_TYPE_ENVIRONMENT), *rules]
 
     def classify(error: Exception) -> TaskErrorType.ValueType:
         for kind, error_type in ordered:
@@ -301,19 +309,26 @@ class Runner[InstanceT: Instance, EnvT: Environment, CtxT: TaskContext]:
         seeds: Sequence[int],
         instance_ids: Collection[str] | None = None,
         resume: bool = False,
+        retry_errors: bool = False,
         lock: RunLock | None = None,
     ) -> RunSummary:
         """Run each instance of ``split`` once per seed, in ``run_dir``, and record every task.
 
         ``manifest`` holds the caller's part of the run's manifest: its run_id, the hashes, the
         provenance, the models and the command line. The runner adds the benchmark, the split,
-        the seeds, the instance IDs and the times, and writes it to the run directory.
+        the seeds, the instance IDs and the times, takes the dataset's fields and the
+        environment's settings from the benchmark's manifest_fields(), which alone sets them, and
+        writes the manifest to the run directory.
         ``instance_ids`` restricts the run to those instances.
 
         With ``resume``, a run directory that holds an interrupted run continues it: the tasks
         without a result run, under the stored manifest, which must match this one in all that
-        changes results. A directory with no run starts one. Without ``resume``, a directory
-        that holds a run raises RunDirectoryError, as does one another process runs in.
+        changes results. The run keeps its stored run_id, which the summary and every task's
+        RunIdentity carry; the caller's is ignored. With ``retry_errors`` too, a task whose last
+        result is an error, such as a transient environment or LLM failure, runs again, and its
+        new records supersede the old ones. A directory with no run starts one. Without
+        ``resume``, a directory that holds a run raises RunDirectoryError, as does one another
+        process runs in.
 
         The run holds the directory's lock throughout. A caller that holds it already, as
         `goaly run` does from before it opens the harness, passes it as ``lock``.
@@ -329,7 +344,7 @@ class Runner[InstanceT: Instance, EnvT: Environment, CtxT: TaskContext]:
         own_lock = None if lock is not None else await asyncio.to_thread(lock_run_dir, files)
         try:
             plan = await asyncio.to_thread(
-                self._plan, files, manifest, split, seeds, instance_ids, resume
+                self._plan, files, manifest, split, seeds, instance_ids, resume, retry_errors
             )
             run = await self._run_tasks(files, plan)
             await asyncio.to_thread(self._finish, files, plan)
@@ -357,10 +372,12 @@ class Runner[InstanceT: Instance, EnvT: Environment, CtxT: TaskContext]:
         seeds: list[int],
         instance_ids: Collection[str] | None,
         resume: bool,
+        retry_errors: bool,
     ) -> "_Plan[InstanceT]":
         instances = self._instances(split, instance_ids)
         manifest = RunManifest()
         manifest.CopyFrom(template)
+        _take_adapter_fields(manifest, self._benchmark.manifest_fields())
         manifest.benchmark = self._benchmark.name
         manifest.split = split
         manifest.seeds[:] = seeds
@@ -383,7 +400,18 @@ class Runner[InstanceT: Instance, EnvT: Environment, CtxT: TaskContext]:
                     f"the run {stored.run_id} in {files.root} does not match this one in:"
                     f" {', '.join(different)}"
                 )
-            done = _recorded(files, keys)
+            recorded = _recorded(files, keys)
+            done = {
+                key
+                for key, result in recorded.items()
+                if not (retry_errors and result.error_type != TASK_ERROR_TYPE_NONE)
+            }
+            if template.run_id != stored.run_id:
+                _logger.info(
+                    "resuming run %s, not %s: a resumed run keeps its run ID",
+                    stored.run_id,
+                    template.run_id,
+                )
             _logger.info(
                 "resuming run %s: %d of %d tasks recorded", stored.run_id, len(done), len(keys)
             )
@@ -466,7 +494,8 @@ class Runner[InstanceT: Instance, EnvT: Environment, CtxT: TaskContext]:
         task: TaskInput | None = None
         try:
             task = self._benchmark.agent_input(inst)
-        except Exception as error:  # noqa: BLE001 - The adapter's failure ends only this task.
+        except BaseException as error:  # noqa: BLE001 - The adapter's failure ends only this task.
+            _reraise_unless_the_tasks_own(error, _cancel_requests(), "building the agent's input")
             attempt = _Attempt()
             self._fail(attempt, error, inst, seed)
         else:
@@ -496,7 +525,7 @@ class Runner[InstanceT: Instance, EnvT: Environment, CtxT: TaskContext]:
         outer cancellation from a task's own failure.
         """
         async with run.slots:
-            attempt = _Attempt(started_at=_now())
+            attempt = _Attempt(started_at=_now(), slot_taken=time.monotonic())
             cancel_requests = _cancel_requests()
             deadline = asyncio.timeout(self._task_timeout_s)
             try:
@@ -504,8 +533,10 @@ class Runner[InstanceT: Instance, EnvT: Environment, CtxT: TaskContext]:
                     await asyncio.create_task(
                         self._provision_and_solve(attempt, run, inst, seed, task)
                     )
-            except Exception as error:  # noqa: BLE001 - The task's failure; see _fail.
-                _propagate_cancellation(cancel_requests, error, "solving the task")
+            except BaseException as error:  # noqa: BLE001 - The task's own failures; see _fail.
+                _reraise_unless_the_tasks_own(error, cancel_requests, "solving the task")
+                if attempt.solve_started_at is None:  # Provisioning took this long, and failed.
+                    attempt.provision_s = time.monotonic() - attempt.slot_taken
                 if deadline.expired():
                     self._time_out(attempt, inst, seed)
                 else:
@@ -519,12 +550,11 @@ class Runner[InstanceT: Instance, EnvT: Environment, CtxT: TaskContext]:
     async def _provision_and_solve(
         self, attempt: "_Attempt", run: "_Run", inst: InstanceT, seed: int, task: TaskInput
     ) -> None:
-        start = time.monotonic()
         async with (
             self._benchmark.provision(inst) as env,
             self._contexts(inst, seed, run.identity) as ctx,
         ):
-            attempt.provision_s = time.monotonic() - start
+            attempt.provision_s = time.monotonic() - attempt.slot_taken
             await self._solve(attempt, task, env, ctx)
 
     async def _solve(self, attempt: "_Attempt", task: TaskInput, env: EnvT, ctx: CtxT) -> None:
@@ -544,26 +574,42 @@ class Runner[InstanceT: Instance, EnvT: Environment, CtxT: TaskContext]:
 
     def _submission(self, attempt: "_Attempt", inst: InstanceT, seed: int) -> Prediction:
         """The prediction the task submits, named for its instance: the policy's, or the
-        benchmark's empty answer if there is none or the adapter cannot write it."""
+        benchmark's empty answer if there is none or the adapter cannot write it.
+
+        The empty answer's official form is written here too, task by task, so that an adapter
+        that breaks that contract stops the run at its first such task, not after the last one.
+        """
         if attempt.prediction is not None:
             prediction = Prediction()
             prediction.CopyFrom(attempt.prediction)
             prediction.instance_id = inst.instance_id
             try:
                 self._benchmark.to_official(inst, prediction)
-            except Exception as error:  # noqa: BLE001 - It ends only this task, logged in _fail.
-                self._fail(attempt, error, inst, seed, "the prediction has no official form: ")
+            except BaseException as error:  # noqa: BLE001 - It ends only this task; see _fail.
+                _reraise_unless_the_tasks_own(error, _cancel_requests(), "writing the prediction")
+                rejected = f"; it was {to_json_line(prediction)}"  # Kept, for debugging.
+                self._fail(
+                    attempt, error, inst, seed, "the prediction has no official form: ", rejected
+                )
             else:
                 return prediction
-        return Prediction(instance_id=inst.instance_id)
+        empty = Prediction(instance_id=inst.instance_id)
+        try:
+            self._benchmark.to_official(inst, empty)
+        except Exception as error:
+            raise RuntimeError(
+                f"the benchmark cannot write the empty answer of {inst.instance_id!r},"
+                f" which every task needs: {_describe(error)}"
+            ) from error
+        return empty
 
     async def _grade(self, inst: InstanceT, prediction: Prediction) -> Grade:
         cancel_requests = _cancel_requests()
         try:
             # In a task of its own, as solving is: see _attempt.
             grade = await asyncio.create_task(self._benchmark.grade(inst, prediction))
-        except Exception as error:
-            _propagate_cancellation(cancel_requests, error, "grading")
+        except BaseException as error:
+            _reraise_unless_the_tasks_own(error, cancel_requests, "grading")
             _logger.warning(
                 "grading %s raised an exception",
                 inst.instance_id,
@@ -623,14 +669,16 @@ class Runner[InstanceT: Instance, EnvT: Environment, CtxT: TaskContext]:
     # Failures.
 
     def _fail(
-        self, attempt: "_Attempt", error: Exception, inst: InstanceT, seed: int, context: str = ""
+        self,
+        attempt: "_Attempt",
+        error: BaseException,
+        inst: InstanceT,
+        seed: int,
+        context: str = "",
+        detail: str = "",
     ) -> None:
-        try:
-            error_type = self._classify(error)
-        except Exception:
-            _logger.exception("the error classifier raised; recording a policy crash")
-            error_type = TASK_ERROR_TYPE_POLICY_CRASH
-        attempt.fail(error_type, _cut(context + _describe(error)), STOP_REASON_CRASHED)
+        error_type = self._classify_own(error)
+        attempt.fail(error_type, _cut(context + _describe(error) + detail), STOP_REASON_CRASHED)
         _logger.warning(
             "task %s, seed %d, failed: %s",
             inst.instance_id,
@@ -639,6 +687,18 @@ class Runner[InstanceT: Instance, EnvT: Environment, CtxT: TaskContext]:
             exc_info=error,
             extra={"instance_id": inst.instance_id, "seed": seed},
         )
+
+    def _classify_own(self, error: BaseException) -> TaskErrorType.ValueType:
+        """Classify an error of the task's own code, which may be a stray CancelledError, raised
+        though nothing cancelled the run, or a BaseExceptionGroup holding one."""
+        exception = error.subgroup(Exception) if isinstance(error, BaseExceptionGroup) else error
+        if not isinstance(exception, Exception):
+            return TASK_ERROR_TYPE_POLICY_CRASH  # Only cancellations, from within the task.
+        try:
+            return self._classify(exception)
+        except Exception:
+            _logger.exception("the error classifier raised; recording a policy crash")
+            return TASK_ERROR_TYPE_POLICY_CRASH
 
     def _time_out(self, attempt: "_Attempt", inst: InstanceT, seed: int) -> None:
         message = f"the task ran past its time limit of {self._task_timeout_s:g} s"
@@ -742,6 +802,8 @@ class _Attempt:
     finished_at: Timestamp | None = None
     provision_s: float = 0.0
     wall_time_s: float = 0.0
+    # When the task got its slot, as time.monotonic() counts.
+    slot_taken: float = 0.0
 
     def fail(
         self, error_type: TaskErrorType.ValueType, message: str, stop_reason: StopReason.ValueType
@@ -762,39 +824,66 @@ def _checked_seeds(seeds: Sequence[int]) -> list[int]:
     return list(seeds)
 
 
-def _recorded(files: RunFiles, keys: set[_Key]) -> set[_Key]:
-    """The tasks of ``keys`` that the run's results file records. A torn last line is skipped,
-    and the next write cuts it off. A run directory holds one run, so every line is the run's."""
+def _take_adapter_fields(manifest: RunManifest, fields: RunManifest) -> None:
+    """Set ``manifest``'s adapter fields from ``fields``, the adapter's partial manifest, and
+    nothing else from it: whatever the caller set for them, the adapter alone sets them."""
+    for name in _ADAPTER_FIELDS:
+        manifest.ClearField(name)  # type: ignore[arg-type]  # The names are the manifest's fields.
+    manifest.dataset_revision = fields.dataset_revision
+    manifest.dataset_notes.extend(fields.dataset_notes)
+    manifest.environment_settings.update(fields.environment_settings)
+    manifest.dataset_sha256 = fields.dataset_sha256
+
+
+def _recorded(files: RunFiles, keys: set[_Key]) -> dict[_Key, TaskResult]:
+    """The last result of each task of ``keys`` the run's results file records. A torn last line
+    is skipped, and the next write cuts it off. A run directory holds one run, so every line is
+    the run's."""
     if not files.results.exists():  # Interrupted before its records files were created.
-        return set()
-    return {
-        (result.instance_id, result.seed) for result in read_jsonl(files.results, TaskResult)
-    } & keys
+        return {}
+    last = {
+        (result.instance_id, result.seed): result
+        for result in read_jsonl(files.results, TaskResult)
+    }
+    return {key: result for key, result in last.items() if key in keys}
 
 
 def _predictions(files: RunFiles) -> dict[_Key, Prediction]:
-    """Each task's submitted prediction, from its last trajectory line; empty if it had none."""
-    return {
-        (trajectory.instance_id, trajectory.seed): trajectory.prediction
-        for trajectory in read_jsonl(files.trajectories, Trajectory)
-    }
+    """Each task's submitted prediction, from its last trajectory line; empty if it had none.
+
+    Each is a copy: a sub-message of a trajectory would keep the whole trajectory in memory.
+    """
+    predictions: dict[_Key, Prediction] = {}
+    for trajectory in read_jsonl(files.trajectories, Trajectory):
+        prediction = Prediction()
+        prediction.CopyFrom(trajectory.prediction)
+        predictions[(trajectory.instance_id, trajectory.seed)] = prediction
+    return predictions
 
 
 def _clean(result: TaskResult) -> bool:
-    """Whether the result is worth caching: no error, and a grade that means something."""
+    """Whether a result is worth caching: a final outcome of the harness itself.
+
+    That is no error, and a grade that means something. An outcome that depends on the load is
+    not final either: the wall-clock budget running out, whose time includes the gateway's waits
+    and backoffs, or the grader's own time limit.
+    """
     return (
         result.error_type == TASK_ERROR_TYPE_NONE
+        and result.stop_reason != STOP_REASON_TIME_BUDGET_EXHAUSTED
         and result.HasField("grade")
-        and result.grade.status != GRADE_STATUS_GRADER_ERROR
+        and result.grade.status not in (GRADE_STATUS_GRADER_ERROR, GRADE_STATUS_TIMEOUT)
     )
 
 
-def _trajectory_of(ctx: TaskContext) -> tuple[Trajectory, Exception | None]:
+def _trajectory_of(ctx: TaskContext) -> tuple[Trajectory, BaseException | None]:
     """A copy of ``ctx``'s trajectory or, if it cannot give one, an empty one and the error."""
     trajectory = Trajectory()
     try:
         trajectory.CopyFrom(ctx.trajectory())
-    except Exception as error:  # noqa: BLE001 - The caller records it as the task's error.
+    except BaseException as error:
+        if _ends_the_process(error):
+            raise
         return Trajectory(), error
     return trajectory, None
 
@@ -844,7 +933,28 @@ def _cancel_requests() -> int:
     return 0 if task is None else task.cancelling()
 
 
-def _propagate_cancellation(before: int, error: Exception | None, what: str) -> None:
+def _reraise_unless_the_tasks_own(error: BaseException, before: int, what: str) -> None:
+    """Re-raise ``error``, caught from the task's code, unless it is the task's own failure.
+
+    An outer cancellation, which raised the current task's cancel requests above ``before``,
+    propagates as a cancellation, even if the code turned it into ``error``; so does a
+    KeyboardInterrupt or a SystemExit, alone or in a group. Anything else is the task's own: an
+    exception, a CancelledError the code raised while nothing cancelled the run, or a
+    BaseExceptionGroup of those. It fails that task alone, never the run.
+    """
+    _propagate_cancellation(before, error, what)
+    if _ends_the_process(error):
+        raise error
+
+
+def _ends_the_process(error: BaseException) -> bool:
+    """Whether ``error`` is, or holds at any depth, a KeyboardInterrupt or a SystemExit."""
+    if isinstance(error, BaseExceptionGroup):
+        return error.subgroup((KeyboardInterrupt, SystemExit)) is not None
+    return isinstance(error, (KeyboardInterrupt, SystemExit))
+
+
+def _propagate_cancellation(before: int, error: BaseException | None, what: str) -> None:
     """Raise CancelledError if the current task was cancelled since it had ``before`` requests.
 
     Adapter, wiring or pack code ``what`` ran turned that cancellation into ``error``, or

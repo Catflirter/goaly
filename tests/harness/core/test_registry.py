@@ -44,7 +44,7 @@ def toy_harness(policy: ScriptedPolicy | None = None) -> ToyHarness:
         benchmark=ScriptedBenchmark(toy_instances(2)),
         policy=ScriptedPolicy() if policy is None else policy,
         contexts=StubContexts(),
-        classify=error_classifier({GatewayDownError: TASK_ERROR_TYPE_LLM}),
+        classify=error_classifier([(GatewayDownError, TASK_ERROR_TYPE_LLM)]),
         models=(ModelSettings(model="qwen3.6-35b-a3b", temperature=0.6),),
         dataset=Dataset(revision="rev-a", notes=("dropped 1 task",), gold_sha256="g" * 64),
     )

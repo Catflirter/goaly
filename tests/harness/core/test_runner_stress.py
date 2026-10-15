@@ -1,143 +1,50 @@
 """The runner's stress test (spec §6.2): 500 simulated tasks, with failures and latency injected.
 
 Every task must be recorded exactly once, with the error it was scripted to end with, and no
-more than the limit of tasks may run at once, whether the run goes through in one go or is
-interrupted and resumed.
+more than the limit of tasks may run at once, whether the run goes through in one go, is
+interrupted and resumed, is killed with SIGKILL and resumed, or leaves torn lines. Each official
+file must list every instance once, in order, with the answer its last trajectory submitted.
 """
 
 import asyncio
-import random
-from collections.abc import Callable
-from dataclasses import dataclass
+import json
+import os
+import signal
+import subprocess
+import sys
 from pathlib import Path
 
 import pytest
 
-from goaly.contracts.errors import EnvironmentFailure
-from goaly.contracts.gen.manifest_pb2 import RunManifest
-from goaly.contracts.gen.result_pb2 import (
-    TASK_ERROR_TYPE_ENVIRONMENT,
-    TASK_ERROR_TYPE_NONE,
-    TASK_ERROR_TYPE_POLICY_CRASH,
-    TASK_ERROR_TYPE_TIMEOUT,
-    TaskErrorType,
-    TaskResult,
-)
-from goaly.contracts.gen.task_pb2 import (
-    GRADE_STATUS_GRADED,
-    GRADE_STATUS_GRADER_ERROR,
-    SPLIT_TRAIN,
-    GradeStatus,
-)
+from goaly.contracts.gen.result_pb2 import TASK_ERROR_TYPE_NONE, TaskResult
+from goaly.contracts.gen.task_pb2 import Prediction
 from goaly.contracts.gen.trajectory_pb2 import Trajectory
 from goaly.contracts.jsonl import read_jsonl
-from goaly.harness.core.runner import RunFiles, Runner, RunSummary
-from tests.fakes import FakeSqlEnvironment, ToyInstance
-from tests.harness.core.runner_doubles import (
-    Action,
-    ScriptedBenchmark,
-    ScriptedPolicy,
-    StubContext,
-    StubContexts,
-    raising,
-    sleeping,
-    toy_instances,
+from goaly.harness.core.runner import RunFiles
+from tests.harness.core.runner_doubles import toy_instances
+from tests.harness.core.stress_script import (
+    GUARD_S,
+    INSTANCES,
+    MAX_TASKS,
+    SEEDS,
+    Script,
+    make_runner,
+    run,
+    stress_script,
 )
 
 pytestmark = pytest.mark.anyio
 
-INSTANCES = 250
-SEEDS = (0, 1)  # 500 tasks.
-MAX_TASKS = 16
-# Far above any ordinary task's few milliseconds, so that a slow CI machine's stalls never
-# time one out; the scripted time-outs sleep ten times as long.
-TIME_LIMIT_S = 0.5
-GUARD_S = 60
-
-
-@dataclass(frozen=True)
-class Fate:
-    """What a scripted instance does, and what its records must then say."""
-
-    error_type: TaskErrorType.ValueType
-    grade_status: GradeStatus.ValueType
-
-
-@dataclass
-class Script:
-    """The failures and latencies of one stress run, drawn from a seeded generator."""
-
-    provision_errors: dict[str, Exception]
-    grade_errors: dict[str, Exception]
-    official_errors: dict[str, Exception]
-    actions: dict[str, Action]
-    fates: dict[str, Fate]
-
-    def benchmark(self) -> ScriptedBenchmark:
-        return ScriptedBenchmark(
-            toy_instances(INSTANCES),
-            provision_errors=self.provision_errors,
-            provision_delay_s=0.0005,
-            grade_errors=self.grade_errors,
-            official_errors=self.official_errors,
-        )
-
-    def policy(self) -> ScriptedPolicy:
-        return ScriptedPolicy(self.actions)
-
-
-def draw_script(rng: random.Random) -> Script:
-    script = Script({}, {}, {}, {}, {})
-    graded, failed = GRADE_STATUS_GRADED, GRADE_STATUS_GRADER_ERROR
-    for n in range(INSTANCES):
-        name = f"t{n}"
-        roll = rng.random()
-        if roll < 0.08:
-            script.provision_errors[name] = EnvironmentFailure("no solving instance")
-            script.fates[name] = Fate(TASK_ERROR_TYPE_ENVIRONMENT, graded)
-        elif roll < 0.16:
-            script.actions[name] = raising(ValueError("the policy broke"))
-            script.fates[name] = Fate(TASK_ERROR_TYPE_POLICY_CRASH, graded)
-        elif roll < 0.22:
-            group = ExceptionGroup("samples", [EnvironmentFailure("the session died")])
-            script.actions[name] = raising(group)
-            script.fates[name] = Fate(TASK_ERROR_TYPE_ENVIRONMENT, graded)
-        elif roll < 0.28:
-            script.grade_errors[name] = RuntimeError("a grading instance went away")
-            script.actions[name] = sleeping(rng.uniform(0, 0.003))
-            script.fates[name] = Fate(TASK_ERROR_TYPE_NONE, failed)
-        elif roll < 0.32:
-            script.actions[name] = sleeping(10 * TIME_LIMIT_S)
-            script.fates[name] = Fate(TASK_ERROR_TYPE_TIMEOUT, graded)
-        elif roll < 0.36:
-            script.official_errors[name] = ValueError("no official form")
-            script.fates[name] = Fate(TASK_ERROR_TYPE_POLICY_CRASH, graded)
-        else:
-            script.actions[name] = sleeping(rng.uniform(0, 0.003))
-            script.fates[name] = Fate(TASK_ERROR_TYPE_NONE, graded)
-    return script
+REPO_ROOT = Path(__file__).resolve().parents[3]
 
 
 @pytest.fixture
 def script() -> Script:
-    return draw_script(random.Random(20261015))  # noqa: S311 - Test data, not cryptography.
+    return stress_script()
 
 
-def make_runner(
-    benchmark: ScriptedBenchmark, policy: ScriptedPolicy
-) -> Runner[ToyInstance, FakeSqlEnvironment, StubContext]:
-    return Runner(
-        benchmark, policy, StubContexts(), max_tasks=MAX_TASKS, task_timeout_s=TIME_LIMIT_S
-    )
-
-
-async def run(
-    runner: Runner[ToyInstance, FakeSqlEnvironment, StubContext], run_dir: Path, *, resume: bool
-) -> RunSummary:
-    async with asyncio.timeout(GUARD_S):
-        return await runner.run(
-            run_dir, RunManifest(run_id="stress"), split=SPLIT_TRAIN, seeds=SEEDS, resume=resume
-        )
+def recorded(files: RunFiles) -> int:
+    return len(files.results.read_bytes().splitlines()) if files.results.exists() else 0
 
 
 def assert_recorded_exactly_once(run_dir: Path, script: Script) -> None:
@@ -151,14 +58,26 @@ def assert_recorded_exactly_once(run_dir: Path, script: Script) -> None:
         assert (result.error_type, result.grade.status) == (fate.error_type, fate.grade_status), (
             result.instance_id
         )
-    traced = {
-        (trajectory.instance_id, trajectory.seed)
+    last = {
+        (trajectory.instance_id, trajectory.seed): trajectory
         for trajectory in read_jsonl(files.trajectories, Trajectory)
     }
-    assert traced == expected
+    assert set(last) == expected
+    # Each official file: every instance once, in order, with what its last trajectory submitted.
+    benchmark = script.benchmark()
     for seed in SEEDS:
         lines = files.official(seed).read_text(encoding="utf-8").splitlines()
-        assert len(lines) == INSTANCES
+        assert [json.loads(line) for line in lines] == [
+            benchmark.to_official(inst, submitted(last[(inst.instance_id, seed)]))
+            for inst in toy_instances(INSTANCES)
+        ]
+
+
+def submitted(trajectory: Trajectory) -> Prediction:
+    prediction = Prediction()
+    prediction.CopyFrom(trajectory.prediction)
+    prediction.instance_id = trajectory.instance_id
+    return prediction
 
 
 async def test_every_one_of_500_tasks_is_recorded_once_within_the_limit(
@@ -182,11 +101,8 @@ async def test_an_interrupted_stress_run_resumes_to_exactly_once(
     files = RunFiles(tmp_path)
     first, second = script.benchmark(), script.benchmark()
     running = asyncio.create_task(run(make_runner(first, script.policy()), tmp_path, resume=False))
-    recorded: Callable[[], int] = lambda: (  # noqa: E731 - A one-line probe.
-        len(files.results.read_bytes().splitlines()) if files.results.exists() else 0
-    )
     async with asyncio.timeout(GUARD_S):
-        while recorded() < 200:
+        while recorded(files) < 200:
             await asyncio.sleep(0.005)
     running.cancel()
     with pytest.raises(asyncio.CancelledError):
@@ -203,3 +119,56 @@ async def test_an_interrupted_stress_run_resumes_to_exactly_once(
     assert summary.resumed == len(interrupted)
     assert max(first.most_running, second.most_running) <= MAX_TASKS
     assert all(env.closed for env in first.environments + second.environments)
+
+
+async def test_a_stress_run_killed_with_sigkill_resumes_to_exactly_once(
+    tmp_path: Path, script: Script
+) -> None:
+    files = RunFiles(tmp_path)
+    env = {**os.environ, "PYTHONPATH": str(REPO_ROOT)}
+    # The child runs the same script; its arguments are fixed paths, not untrusted input.
+    child = subprocess.Popen(  # noqa: S603
+        [sys.executable, "-m", "tests.harness.core.stress_script", str(tmp_path)],
+        cwd=REPO_ROOT,
+        env=env,
+    )
+    try:
+        async with asyncio.timeout(GUARD_S):
+            while recorded(files) < 150:
+                assert child.poll() is None, "the child finished before it could be killed"
+                await asyncio.sleep(0.005)
+        child.send_signal(signal.SIGKILL)  # No cleanup at all: whatever was half-written stays.
+    finally:
+        child.wait(timeout=GUARD_S)
+    assert child.returncode == -signal.SIGKILL
+
+    summary = await run(make_runner(script.benchmark(), script.policy()), tmp_path, resume=True)
+
+    assert_recorded_exactly_once(tmp_path, script)
+    assert summary.resumed >= 150
+
+
+async def test_torn_lines_left_by_a_crash_resume_to_exactly_once(
+    tmp_path: Path, script: Script
+) -> None:
+    files = RunFiles(tmp_path)
+    running = asyncio.create_task(
+        run(make_runner(script.benchmark(), script.policy()), tmp_path, resume=False)
+    )
+    async with asyncio.timeout(GUARD_S):
+        while recorded(files) < 120:
+            await asyncio.sleep(0.005)
+    running.cancel()
+    with pytest.raises(asyncio.CancelledError):
+        await running
+    whole_lines = recorded(files)  # The writers drained what was queued as the run stopped.
+    # As a crash mid-write leaves them: the last result cut short, a partial trajectory line.
+    whole = files.results.read_bytes()
+    files.results.write_bytes(whole[: len(whole) - 25])
+    with files.trajectories.open("ab") as trajectories:
+        trajectories.write(b'{"run_id":"stress","instance_id":"t')
+
+    summary = await run(make_runner(script.benchmark(), script.policy()), tmp_path, resume=True)
+
+    assert_recorded_exactly_once(tmp_path, script)
+    assert summary.resumed == whole_lines - 1  # The torn result does not count.
