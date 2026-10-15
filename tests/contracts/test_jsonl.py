@@ -19,6 +19,7 @@ from google.protobuf.timestamp_pb2 import Timestamp
 
 from goaly.contracts.gen.environment_pb2 import ShellResult, SqlResult
 from goaly.contracts.gen.llm_call_pb2 import LlmCallAttempt, LlmCallRecord, LlmCallStatus, Usage
+from goaly.contracts.gen.manifest_pb2 import RunManifest
 from goaly.contracts.gen.task_pb2 import (
     EffiSqlGrade,
     EffiSqlPrediction,
@@ -173,6 +174,29 @@ def test_writes_the_elements_of_lists_and_the_values_of_maps_in_declaration_orde
 
     assert list(fields["items"][0]) == ["late", "early"]
     assert list(fields["by_key"]["k"]) == ["late", "early"]
+
+
+def test_writes_map_keys_sorted_whatever_order_they_were_set_in() -> None:
+    # A map's order is not part of the message, so the same settings must give the same line in
+    # every process, or the manifest's lines would differ for no reason.
+    settings = {"work_mem": "64MB", "jit": "off", "shared_buffers": "4GB", "cpuset": "2-3"}
+    forward = RunManifest(environment_settings=settings)
+    backward = RunManifest(environment_settings=dict(reversed(settings.items())))
+
+    line = to_json_line(forward)
+
+    assert line == to_json_line(backward)
+    assert list(parse(line)["environment_settings"]) == sorted(settings)
+
+
+def test_sorts_the_keys_of_a_map_of_messages() -> None:
+    outer = message_with_a_list_and_a_map()()
+    by_key = getattr(outer, "by_key")  # noqa: B009  # The type is built at run time.
+    keys = ["work_mem", "jit", "shared_buffers", "cpuset", "max_parallel_workers"]
+    for key in keys:
+        by_key[key].early = key
+
+    assert list(parse(to_json_line(outer))["by_key"]) == sorted(keys)
 
 
 def test_writes_each_attempt_of_a_call_and_only_the_retry_after_it_was_sent() -> None:

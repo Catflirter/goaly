@@ -20,6 +20,7 @@ from pydantic import BaseModel
 
 from goaly.contracts.errors import EnvironmentFailure
 from goaly.contracts.gen.environment_pb2 import ShellResult, SqlResult
+from goaly.contracts.gen.manifest_pb2 import RunManifest
 from goaly.contracts.gen.task_pb2 import (
     GRADE_STATUS_GRADED,
     SPLIT_EXTERNAL,
@@ -242,6 +243,9 @@ TOY_INSTANCES = (
     ),
 )
 
+# The toy dataset's stand-in SHA-256, as Benchmark.manifest_fields reports a dataset file's hash.
+TOY_DATASET_SHA256 = "0123456789abcdef" * 4
+
 
 class ToyBenchmark:
     """A Benchmark of Effi-SQL-style tasks held in memory, each solved in a FakeSqlEnvironment.
@@ -252,8 +256,9 @@ class ToyBenchmark:
     which only ``grade`` uses. ``grade`` times nothing: the gold rewrite earns R-VES's top credit
     of 1, the base query unchanged earns 0.5, as a speedup of 1 does, and any other query does
     not match. A prediction with no branch set, as after a crash, stands for the empty answer,
-    the base query unchanged, in both ``grade`` and ``to_official``. ``environments`` records
-    each environment provisioned.
+    the base query unchanged, in both ``grade`` and ``to_official``. Its manifest fields name a
+    fixed dataset revision and hash and the "dev" grading mode. ``environments`` records each
+    environment provisioned.
     """
 
     name = "toy"
@@ -303,6 +308,13 @@ class ToyBenchmark:
             correct=matched,
             status=GRADE_STATUS_GRADED,
             effisql=EffiSqlGrade(matched=matched, credit=credit),
+        )
+
+    def manifest_fields(self) -> RunManifest:
+        return RunManifest(
+            dataset_revision="toy-revision-1",
+            dataset_sha256=TOY_DATASET_SHA256,
+            environment_settings={"grading_mode": "dev"},
         )
 
     def to_official(self, inst: ToyInstance, prediction: Prediction) -> dict[str, JsonValue]:

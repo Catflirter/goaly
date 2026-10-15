@@ -24,9 +24,9 @@ message TaskResult {
   // seed's result.
   int32 seed = 3;
   // How the benchmark's grader graded the task. Effi-SQL compares the prediction's result with
-  // base_sql's and needs no gold answer; SWE runs the task's PASS_TO_PASS tests and compares the
-  // workload's speedup with the expert patch's. A task with no prediction, after a crash or an
-  // error, is graded as the benchmark's empty answer, the same one Benchmark.to_official writes:
+  // base_sql's and needs no gold answer; SWE runs the task's tests and compares the workload's
+  // speedup with the expert patch's. A task with no prediction, after a crash or an error, is
+  // graded as the benchmark's empty answer, the same one Benchmark.to_official writes:
   // Effi-SQL's base_sql unchanged, with the identity credit, and SWE an empty patch, which scores
   // 1/gold speedup without an evaluation run (spec §4.2). Absent only in a run that is not
   // graded, such as an organizers' run on SPLIT_EXTERNAL.
