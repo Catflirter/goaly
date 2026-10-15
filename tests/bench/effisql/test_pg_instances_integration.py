@@ -39,7 +39,8 @@ WRITES = [
     "CREATE TABLE itest_t (x int)",
     "CREATE TEMP TABLE itest_tmp (x int)",
     "SELECT lo_create(0)",
-    "SELECT pg_terminate_backend(pg_backend_pid())",
+    "SELECT pg_cancel_backend(pg_backend_pid())",
+    "DO $$ BEGIN PERFORM 1; END $$",
 ]
 
 
@@ -154,6 +155,23 @@ def test_the_agent_reaches_tpch_on_solving_instances_and_nothing_on_grading_ones
                 continue
             with pytest.raises(psycopg.OperationalError, match="permission denied for database"):
                 pg_env.connect(instance, AGENT_ROLE, db)
+
+
+def test_only_the_agent_may_end_sessions_and_only_its_own_roles(pg_env: PgEnv) -> None:
+    solving = pg_env.instance("solving")
+    with (
+        pg_env.connect(solving, AGENT_ROLE, "tpch", autocommit=True) as agent,
+        pg_env.connect(solving, AGENT_ROLE, "tpch", autocommit=True) as other,
+        pg_env.connect(solving, GRADER_ROLE, "tpch", autocommit=True) as grader,
+    ):
+        # The agent may end another agent session: SolvingPool stops a stuck statement so.
+        ended = agent.execute("SELECT pg_terminate_backend(%s)", [other.info.backend_pid])
+        assert ended.fetchone() == (True,)
+        with pytest.raises(errors.InsufficientPrivilege, match="terminate process"):
+            agent.execute("SELECT pg_terminate_backend(%s)", [grader.info.backend_pid])
+        with pytest.raises(errors.InsufficientPrivilege):  # The grader may end no session.
+            grader.execute("SELECT pg_terminate_backend(%s)", [agent.info.backend_pid])
+        assert grader.execute("SELECT 1").fetchone() == (1,)
 
 
 def test_the_grader_reads_both_databases_read_only_by_default(pg_env: PgEnv) -> None:

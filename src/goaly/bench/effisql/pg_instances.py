@@ -24,8 +24,13 @@ and the role defaults only add defense in depth:
 - the grader role connects to both databases on every instance, with SELECT on their tables;
 - both default to read-only transactions;
 - PUBLIC loses CONNECT and TEMPORARY on every database and CREATE on the public schema. It
-  also loses pg_stat_activity, and the functions that let one session stop another, read
-  another's query text or write large objects.
+  also loses pg_stat_activity, the functions that let one session stop another, read
+  another's query text or write large objects, and PL/pgSQL, so no statement is a DO block
+  that runs many;
+- on the solving instances, the agent role alone may end sessions of its own role
+  (``pg_terminate_backend``): SolvingPool needs that to stop a statement that ignores its
+  cancel, with no superuser at run time. Every task shares the role, so a task's statement
+  could end another task's session there; it still reads nothing it could not before.
 
 Each server also listens on a Unix socket, in a directory bind-mounted from the host
 (``~/data/effisql/sockets/<instance>/``; see :func:`socket_dirs`). A sandbox that may not use
@@ -88,6 +93,7 @@ __all__ = [
     "ROLE_DEFAULTS",
     "SERVER_SETTINGS",
     "SOLVING",
+    "TERMINATE_FUNCTION",
     "Instance",
     "InstanceError",
     "InstanceStatus",
@@ -206,9 +212,10 @@ ROLE_DEFAULTS: Mapping[str, Mapping[str, str]] = {
 _CONNECTION_LIMITS = {AGENT_ROLE: 64, GRADER_ROLE: -1}  # Per instance; -1 means no limit.
 # Functions PUBLIC may call by default that let a session stop another one, read the text of
 # another session's query, or write data.
+TERMINATE_FUNCTION = "pg_catalog.pg_terminate_backend(integer, bigint)"
 _REVOKED_FUNCTIONS = (
     "pg_catalog.pg_cancel_backend(integer)",
-    "pg_catalog.pg_terminate_backend(integer, bigint)",
+    TERMINATE_FUNCTION,
     "pg_catalog.pg_stat_get_activity(integer)",
     "pg_catalog.pg_stat_get_backend_activity(integer)",
     "pg_catalog.lo_creat(integer)",
@@ -295,7 +302,16 @@ def database_statements(db: str, kind: Kind) -> list[sql.Composed]:
         sql.SQL("REVOKE EXECUTE ON FUNCTION {} FROM PUBLIC, {}").format(functions, _names(_ROLES)),
         # Every task shares the agent role, which would see its own sessions' query text here.
         sql.SQL("REVOKE ALL ON {} FROM PUBLIC, {}").format(_STAT_ACTIVITY, _names(_ROLES)),
+        # A DO block could run many queries in one statement, after raising work_mem for them.
+        sql.SQL("REVOKE USAGE ON LANGUAGE plpgsql FROM PUBLIC, {}").format(_names(_ROLES)),
     ]
+    if AGENT_ROLE in readers(kind, db):
+        # SolvingPool ends a statement that ignored its cancel from another agent session.
+        statements.append(
+            sql.SQL("GRANT EXECUTE ON FUNCTION {} TO {}").format(
+                sql.SQL(TERMINATE_FUNCTION), sql.Identifier(AGENT_ROLE)
+            )
+        )
     return statements
 
 

@@ -31,7 +31,14 @@ from pydantic import BaseModel, ConfigDict, SecretStr, ValidationError
 
 from goaly.bench.effisql import pg_containers
 from goaly.bench.effisql.pg_containers import ContainerSpec, Mount
-from goaly.bench.effisql.pg_settings import ADMIN_ROLE, ALT_DB, MAIN_DB, PgEnvConfig, write_private
+from goaly.bench.effisql.pg_settings import (
+    ADMIN_ROLE,
+    ALT_DB,
+    MAIN_DB,
+    PgEnvConfig,
+    connection_kwargs,
+    write_private,
+)
 
 __all__ = [
     "DATASETS",
@@ -533,15 +540,7 @@ def connector(host: str, port: int, password: SecretStr, *, user: str = ADMIN_RO
     """Return a Connect that opens autocommit connections as ``user`` to the server at ``port``."""
 
     def connect(dbname: str) -> psycopg.Connection[Any]:
-        return psycopg.connect(
-            host=host,
-            port=port,
-            user=user,
-            password=password.get_secret_value(),
-            dbname=dbname,
-            autocommit=True,
-            connect_timeout=10,
-        )
+        return psycopg.connect(**connection_kwargs(host, port, user, password, dbname))
 
     return connect
 
