@@ -617,13 +617,18 @@ async def test_every_kind_of_error_counts_toward_the_streak() -> None:
 
 
 async def test_a_reply_whose_parallel_calls_all_failed_is_one_error() -> None:
-    llm = FakeLLM([reply(*(tool_call("explain_query") for _ in range(5))), reply(submit())])
+    parallel = reply(*(tool_call("explain_query") for _ in range(5)))
+    error = reply(tool_call("explain_query"))
+    llm = FakeLLM([parallel, error, error, reply(submit())])
     ctx = context(llm)
 
     prediction = await run_agent(environment(), ctx, hooks())
 
-    assert prediction == SUBMISSION  # One failed reply: no stop,
-    assert injected(ctx.trajectory()) == [[], []]  # and no reminder either.
+    assert prediction == SUBMISSION  # Five failed calls in one reply did not stop the chat:
+    trajectory = ctx.trajectory()
+    assert [result.is_error for result in trajectory.steps[0].tool_results] == [True] * 5
+    # they made one failed reply, so the streak reached 3, and the reminder, at the third.
+    assert [bool(texts) for texts in injected(trajectory)] == [False, False, True, False]
 
 
 async def test_a_reply_with_one_call_that_worked_ends_the_streak() -> None:
