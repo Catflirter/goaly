@@ -33,6 +33,8 @@ DEFAULT_TIMEOUT_S = 60.0
 _CONTENT_KEEP = 4_000
 # The model sees this many characters at each end of an exception's message.
 _MESSAGE_KEEP = 250
+# The model sees this many characters at each end of arguments that are not valid JSON.
+_EXCERPT_KEEP = 100
 
 _logger = logging.getLogger(__name__)
 
@@ -125,7 +127,8 @@ class _Binding[A: BaseModel, E: Environment](BoundTool[E]):
         try:
             args = self.tool.args_model.model_validate_json(arguments_json)
         except ValidationError as error:
-            return _result(self.name, _invalid_arguments(self.name, error), is_error=True)
+            content = _invalid_arguments(self.name, arguments_json, error)
+            return _result(self.name, content, is_error=True)
         timeout = asyncio.timeout(self.timeout_s)
         try:
             async with timeout:
@@ -201,9 +204,14 @@ def _result(
     )
 
 
-def _invalid_arguments(name: str, error: ValidationError) -> str:
+def _invalid_arguments(name: str, arguments_json: str, error: ValidationError) -> str:
+    details = error.errors(include_url=False, include_context=False, include_input=False)
+    if details[0]["type"] == "json_invalid":  # Invalid JSON is the only error pydantic reports.
+        reason = details[0]["msg"].removeprefix("Invalid JSON: ")
+        excerpt, _ = _truncate(arguments_json, _EXCERPT_KEEP)
+        return f"Error: the arguments for {name} are not valid JSON ({reason}):\n{excerpt}"
     lines = [f"Error: invalid arguments for {name}:"]
-    for detail in error.errors(include_url=False, include_context=False, include_input=False):
+    for detail in details:
         where = ".".join(str(part) for part in detail["loc"])
         lines.append(f"- {where}: {detail['msg']}" if where else f"- {detail['msg']}")
     return "\n".join(lines)

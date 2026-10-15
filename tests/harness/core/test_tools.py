@@ -332,21 +332,32 @@ async def test_the_error_names_each_invalid_argument_with_pydantics_message() ->
     )
 
 
+async def test_arguments_that_are_not_a_json_object_give_an_error_result() -> None:
+    result = await bind(EchoTool()).invoke('["hi"]', FakeSqlEnvironment())
+
+    assert without_elapsed(result) == ToolResult(
+        name="echo",
+        is_error=True,
+        content="Error: invalid arguments for echo:\n- Input should be an object",
+    )
+
+
 @pytest.mark.parametrize(
-    ("arguments_json", "problem"),
+    ("arguments_json", "reason"),
     [
-        ('{"text": "hi"', "Invalid JSON: EOF while parsing an object at line 1 column 13"),
-        ("", "Invalid JSON: EOF while parsing a value at line 1 column 0"),
-        ('["hi"]', "Input should be an object"),
+        ('{"text": "hi"', "EOF while parsing an object at line 1 column 13"),
+        ("", "EOF while parsing a value at line 1 column 0"),
     ],
 )
-async def test_arguments_that_are_not_a_json_object_give_an_error_result(
-    arguments_json: str, problem: str
+async def test_arguments_that_are_not_valid_json_give_an_error_result_that_quotes_them(
+    arguments_json: str, reason: str
 ) -> None:
     result = await bind(EchoTool()).invoke(arguments_json, FakeSqlEnvironment())
 
     assert without_elapsed(result) == ToolResult(
-        name="echo", is_error=True, content=f"Error: invalid arguments for echo:\n- {problem}"
+        name="echo",
+        is_error=True,
+        content=f"Error: the arguments for echo are not valid JSON ({reason}):\n{arguments_json}",
     )
 
 
