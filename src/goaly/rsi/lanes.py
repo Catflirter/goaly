@@ -37,6 +37,11 @@ class LaneInfo:
             PurePosixPath("tests/harness/packs") / self.benchmark,
         )
 
+    @property
+    def tests_dir(self) -> PurePosixPath:
+        """The pack's tests, the second of its directories."""
+        return self.pack_dirs[1]
+
 
 _LANES = {
     LANE_EFFISQL: LaneInfo(LANE_EFFISQL, name="effisql", benchmark="effisql", title="Effi-SQL"),

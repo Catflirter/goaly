@@ -10,6 +10,7 @@ import contextlib
 import gzip
 import json
 import logging
+import os
 import socket
 import stat
 import struct
@@ -284,6 +285,16 @@ async def test_refuses_a_key_the_client_never_writes(
             b'{"model": "qwen3.6-35b-a3b", "messages": [], "temperature": NaN}',
             "the body holds NaN, which is not JSON",
             id="nan",
+        ),
+        pytest.param(
+            b'{"model": "qwen3.6-35b-a3b", "messages": [], "temperature": 1e999}',
+            "the body holds 1e999, which is not a finite number",
+            id="overflowing-number",
+        ),
+        pytest.param(
+            b'{"model": "qwen3.6-35b-a3b", "messages": [{"role": "user", "x": -1e400}]}',
+            "the body holds -1e400, which is not a finite number",
+            id="inner-overflowing-number",
         ),
         pytest.param(
             b'{"model": "qwen3.6-35b-a3b", "messages": [], "chat_template_kwargs": []}',
@@ -1135,6 +1146,29 @@ async def test_refuses_a_wrong_token_over_the_unix_socket_too(short_dir: Path) -
 
     assert response.status_code == 401
     assert gateway.requests == []
+
+
+async def test_refuses_a_socket_directory_that_is_not_its_users(
+    short_dir: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    directory = short_dir / "llm"
+    directory.mkdir(mode=0o700)
+    uid = os.getuid()
+    monkeypatch.setattr(os, "getuid", lambda: uid + 1)  # As if another user had made it.
+
+    with pytest.raises(PermissionError, match="mode 0700"):
+        await enter_and_leave(LlmProxy(settings(), Recorder(), uds=directory / "proxy.sock"))
+
+
+async def test_makes_its_socket_directory_0700_whatever_the_umask(short_dir: Path) -> None:
+    path = short_dir / "llm" / "proxy.sock"
+    umask = os.umask(0o277)  # mkdir alone would make the directory 0500.
+    try:
+        await enter_and_leave(LlmProxy(settings(), Recorder(), uds=path))
+    finally:
+        os.umask(umask)
+
+    assert stat.S_IMODE(path.parent.stat().st_mode) == 0o700
 
 
 async def test_refuses_a_socket_directory_that_others_may_enter(short_dir: Path) -> None:
