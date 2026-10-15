@@ -183,6 +183,15 @@ async def test_params_are_sent_with_every_attempt() -> None:
     assert [body["max_tokens"] for body in gateway.bodies] == [777, 777]
 
 
+async def test_the_attempt_timeout_goes_with_every_attempt() -> None:
+    gateway = FakeGlm("nope", VALID)
+    await ask(gateway, attempt_timeout_s=42.0)
+    assert gateway.read_timeouts == [42.0, 42.0]
+    default = FakeGlm(VALID)
+    await ask(default)
+    assert default.read_timeouts == [300.0]
+
+
 async def test_many_problems_are_quoted_in_part() -> None:
     class Wide(BaseModel):
         values: list[int]
