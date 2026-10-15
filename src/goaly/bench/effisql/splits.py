@@ -4,6 +4,9 @@
   scripts/effisql/make_splits.py writes it to src/goaly/bench/splits/effisql.json, which is
   committed, so every run uses the same split.
 - load_splits reads that file, and EffiSqlSplits.ids gives a split's task IDs.
+- load_exclusions reads the committed exclusion list, effisql_exclusions.json next to it, which
+  T10's exclusion run fills (spec §4.1). EffiSqlSplits.without drops the excluded tasks from
+  their splits after splitting, so the split itself stays reproducible (spec §7).
 """
 
 import json
@@ -14,21 +17,24 @@ from collections.abc import Iterable, Sequence
 from fractions import Fraction
 from itertools import combinations, product
 from pathlib import Path
-from typing import Self
+from typing import Annotated, Self
 
-from pydantic import BaseModel, ConfigDict, model_validator
+from pydantic import AfterValidator, BaseModel, ConfigDict, TypeAdapter, model_validator
 
-from goaly.bench.effisql.data import EffiSqlInstance
+from goaly.bench.effisql.data import EffiSqlInstance, NonBlankStr
 from goaly.contracts.gen.task_pb2 import SPLIT_HELDOUT, SPLIT_TRAIN, SPLIT_VAL, Split
 
 __all__ = [
+    "EXCLUSIONS_PATH",
     "HELDOUT_SIZE",
     "SPLITS_PATH",
     "SPLIT_DB",
     "SPLIT_SEED",
     "VAL_SIZE",
     "EffiSqlSplits",
+    "Exclusion",
     "dump_splits",
+    "load_exclusions",
     "load_splits",
     "split_tasks",
 ]
@@ -37,8 +43,29 @@ SPLIT_SEED = 20261014
 SPLIT_DB = "tpch"  # Our splits use only the TPC-H tasks (spec §1.4, §4.1).
 VAL_SIZE = 30
 HELDOUT_SIZE = 60
-# The committed split: src/goaly/bench/splits/effisql.json.
+# The committed split, src/goaly/bench/splits/effisql.json, and the committed exclusion list.
 SPLITS_PATH = Path(__file__).resolve().parents[1] / "splits" / "effisql.json"
+EXCLUSIONS_PATH = SPLITS_PATH.with_name("effisql_exclusions.json")
+
+
+class Exclusion(BaseModel):
+    """A task left out of our splits, and why (spec §4.1): an entry of the exclusion list."""
+
+    model_config = ConfigDict(frozen=True, extra="forbid", strict=True)
+
+    instance_id: NonBlankStr
+    reason: NonBlankStr
+
+
+def _each_task_once(exclusions: tuple[Exclusion, ...]) -> tuple[Exclusion, ...]:
+    listed = Counter(exclusion.instance_id for exclusion in exclusions)
+    repeated = sorted((name for name, count in listed.items() if count > 1), key=_id_order)
+    if repeated:
+        raise ValueError(f"excluded more than once: {', '.join(repeated)}")
+    return exclusions
+
+
+_EXCLUSIONS = TypeAdapter(Annotated[tuple[Exclusion, ...], AfterValidator(_each_task_once)])
 
 
 class EffiSqlSplits(BaseModel):
@@ -74,6 +101,23 @@ class EffiSqlSplits(BaseModel):
             return self.heldout
         raise ValueError(f"{Split.Name(split)} is not one of our splits")
 
+    def without(self, exclusions: Iterable[Exclusion]) -> Self:
+        """Return this split with the excluded tasks dropped from their splits (spec §7).
+
+        The other tasks keep their splits and their order; this split itself is unchanged. Raises
+        ValueError if an excluded task is in no split, which would mean the list is wrong.
+        """
+        excluded = {exclusion.instance_id for exclusion in exclusions}
+        unknown = excluded.difference(self.train, self.val, self.heldout)
+        if unknown:
+            raise ValueError(f"excluded tasks in no split: {', '.join(_in_order(unknown))}")
+        return self.model_copy(
+            update={
+                name: tuple(i for i in getattr(self, name) if i not in excluded)
+                for name in ("train", "val", "heldout")
+            }
+        )
+
 
 def load_splits(path: Path = SPLITS_PATH) -> EffiSqlSplits:
     """Read the split in the file at ``path``, by default the committed one.
@@ -81,6 +125,16 @@ def load_splits(path: Path = SPLITS_PATH) -> EffiSqlSplits:
     Raises pydantic's ValidationError, a ValueError, if the file does not hold a valid split.
     """
     return EffiSqlSplits.model_validate_json(path.read_bytes())
+
+
+def load_exclusions(path: Path = EXCLUSIONS_PATH) -> tuple[Exclusion, ...]:
+    """Read the exclusion list in the file at ``path``, by default the committed one.
+
+    The file holds a JSON array of ``{"instance_id": ..., "reason": ...}`` objects, with string
+    IDs. Raises pydantic's ValidationError, a ValueError, if an entry is invalid or a task is
+    listed twice.
+    """
+    return _EXCLUSIONS.validate_json(path.read_bytes())
 
 
 def dump_splits(splits: EffiSqlSplits) -> str:

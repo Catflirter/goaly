@@ -51,6 +51,7 @@ __all__ = [
     "DatasetError",
     "Difficulty",
     "EffiSqlInstance",
+    "NonBlankStr",
     "TaskFileError",
     "default_cache_dir",
     "fetch_dataset",
@@ -177,7 +178,8 @@ def _no_empty_plan(value: object) -> object:
 
 
 _TaskId = Annotated[str, BeforeValidator(_task_id)]
-_Text = Annotated[str, AfterValidator(_not_blank)]
+# A string that is not empty or only whitespace.
+NonBlankStr = Annotated[str, AfterValidator(_not_blank)]
 _Millis = Annotated[float, Field(ge=0, allow_inf_nan=False)]  # A time in milliseconds.
 # A query plan's root node, as a JSON object (spec §4.1), or None for no plan.
 _Plan = Annotated[dict[str, JsonValue] | None, BeforeValidator(_no_empty_plan)]
@@ -207,8 +209,8 @@ class EffiSqlInstance(BaseModel):
     model_config = ConfigDict(frozen=True, extra="ignore", strict=True)
 
     instance_id: _TaskId = Field(validation_alias="id")
-    db: _Text
-    base_sql: _Text
+    db: NonBlankStr
+    base_sql: NonBlankStr
     base_time: _Millis | None = None
     base_explain_analyze: _Plan = Field(default=None, repr=False)
     difficulty: Difficulty | None = None

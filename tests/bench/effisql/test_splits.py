@@ -16,10 +16,13 @@ from pydantic import ValidationError
 
 from goaly.bench.effisql.data import DATASET_SHA256, Difficulty, EffiSqlInstance
 from goaly.bench.effisql.splits import (
+    EXCLUSIONS_PATH,
     SPLIT_SEED,
     SPLITS_PATH,
     EffiSqlSplits,
+    Exclusion,
     dump_splits,
+    load_exclusions,
     load_splits,
     split_tasks,
 )
@@ -238,3 +241,95 @@ def test_ids_refuses_a_split_that_is_not_ours(split: Split.ValueType) -> None:
 
     with pytest.raises(ValueError, match=f"^{Split.Name(split)} is not one of our splits$"):
         splits.ids(split)
+
+
+# Exclusions.
+
+
+def write_exclusions(path: Path, entries: object) -> Path:
+    path.write_text(json.dumps(entries), encoding="utf-8")
+    return path
+
+
+def test_the_committed_exclusion_list_is_empty_until_t10_fills_it() -> None:
+    assert EXCLUSIONS_PATH.read_text(encoding="utf-8") == "[]\n"
+    assert load_exclusions() == ()
+
+
+def test_load_exclusions_reads_each_task_with_its_reason(tmp_path: Path) -> None:
+    path = write_exclusions(
+        tmp_path / "exclusions.json",
+        [
+            {"instance_id": "57", "reason": "the base query took over 300 s"},
+            {"instance_id": "8", "reason": "the gold answer is not 1.2x faster"},
+        ],
+    )
+
+    assert load_exclusions(path) == (
+        Exclusion(instance_id="57", reason="the base query took over 300 s"),
+        Exclusion(instance_id="8", reason="the gold answer is not 1.2x faster"),
+    )
+
+
+@pytest.mark.parametrize(
+    "entries",
+    [
+        [{"instance_id": "57", "reason": "slow"}, {"instance_id": "57", "reason": "again"}],
+        [{"instance_id": "57", "reason": " "}],
+        [{"instance_id": "", "reason": "slow"}],
+        [{"instance_id": "57"}],
+        [{"instance_id": 57, "reason": "slow"}],
+        [{"instance_id": "57", "reason": "slow", "by": "T10"}],
+        {"instance_id": "57", "reason": "slow"},
+    ],
+    ids=[
+        "repeated",
+        "blank-reason",
+        "blank-id",
+        "no-reason",
+        "integer-id",
+        "unknown-key",
+        "object",
+    ],
+)
+def test_load_exclusions_rejects_an_invalid_list(tmp_path: Path, entries: object) -> None:
+    path = write_exclusions(tmp_path / "exclusions.json", entries)
+
+    with pytest.raises(ValidationError):
+        load_exclusions(path)
+
+
+def test_the_fixture_exclusions_drop_exactly_the_listed_tasks(tmp_path: Path) -> None:
+    committed = SPLITS_PATH.read_bytes()
+    splits = load_splits()
+    listed = {splits.train[0], splits.train[-1], splits.val[3], splits.heldout[10]}
+    path = write_exclusions(
+        tmp_path / "exclusions.json",
+        [{"instance_id": instance_id, "reason": "fixture"} for instance_id in sorted(listed)],
+    )
+
+    kept = splits.without(load_exclusions(path))
+
+    for name in ("train", "val", "heldout"):
+        ids = getattr(splits, name)
+        assert getattr(kept, name) == tuple(i for i in ids if i not in listed)
+    assert len(kept.train) + len(kept.val) + len(kept.heldout) == 238 - 4
+    assert (kept.seed, kept.source_sha256) == (splits.seed, splits.source_sha256)
+    assert load_splits() == splits  # The split ID lists stay as they are.
+    assert SPLITS_PATH.read_bytes() == committed
+
+
+def test_no_exclusions_leave_the_split_as_it_is() -> None:
+    splits = load_splits()
+
+    assert splits.without(()) == splits
+
+
+def test_an_exclusion_of_a_task_in_no_split_is_refused() -> None:
+    exclusions = [
+        Exclusion(instance_id="1001", reason="x"),
+        Exclusion(instance_id="99x", reason="y"),
+    ]
+
+    with pytest.raises(ValueError, match=r"^excluded tasks in no split: 99x, 1001$"):
+        load_splits().without(exclusions)
