@@ -60,6 +60,9 @@ __all__ = [
     "LedgerError",
     "LedgerFiles",
     "default_ledger_dir",
+    "durable_replace",
+    "fsync_path",
+    "make_directory",
 ]
 
 EXPERIMENTS = "experiments.jsonl"
@@ -127,9 +130,9 @@ class LedgerFiles:
         path = self._directory / name
         created = not path.exists()
         append_jsonl(path, message)
-        _fsync(path)
+        fsync_path(path)
         if created:  # Make the new file's directory entry durable too.
-            _fsync(self._directory)
+            fsync_path(self._directory)
 
     def replace_text(self, name: str, text: str) -> None:
         """Replace the generated page ``name`` with ``text``, durably: readers see the old page
@@ -138,19 +141,7 @@ class LedgerFiles:
         self._check_writable()
         if name != LESSONS_MARKDOWN:
             raise ValueError(f"{name} is not a ledger file to generate")
-        path = self._directory / name
-        for stale in self._directory.glob(f".{name}.*.tmp"):
-            stale.unlink(missing_ok=True)
-        temporary = path.with_name(f".{name}.{secrets.token_hex(8)}.tmp")
-        try:
-            with temporary.open("w", encoding="utf-8") as file:
-                file.write(text)
-                file.flush()
-                os.fsync(file.fileno())
-            temporary.replace(path)
-            _fsync(self._directory)
-        finally:
-            temporary.unlink(missing_ok=True)  # Already gone once it has replaced path.
+        durable_replace(self._directory / name, text)
 
     def _check_writable(self) -> None:
         if not self._writable:
@@ -179,7 +170,7 @@ class Ledger:
             yield LedgerFiles(self.directory, writable=False, present=False)  # Nothing to read.
             return
         if write:
-            _make_directory(self.directory)
+            make_directory(self.directory)
         lock = self.directory / _LOCK
         with ExitStack() as held:
             try:
@@ -347,7 +338,29 @@ def _check_lesson(lesson: Lesson) -> None:
         check_id(experiment_id, "experiment_id")
 
 
-def _make_directory(directory: Path) -> None:
+def durable_replace(path: Path, text: str) -> None:
+    """Replace the file at ``path`` with ``text``, durably: readers see the old file or the new.
+
+    The text goes to a temporary file in the same directory, which is synced and renamed over
+    ``path``, and the directory is synced too. Temporary files of ``path`` that a crash left
+    behind are removed first. The caller holds whatever lock keeps writers apart.
+    """
+    directory = path.parent
+    for stale in directory.glob(f".{path.name}.*.tmp"):
+        stale.unlink(missing_ok=True)
+    temporary = path.with_name(f".{path.name}.{secrets.token_hex(8)}.tmp")
+    try:
+        with temporary.open("x", encoding="utf-8") as file:
+            file.write(text)
+            file.flush()
+            os.fsync(file.fileno())
+        temporary.replace(path)
+        fsync_path(directory)
+    finally:
+        temporary.unlink(missing_ok=True)  # Already gone once it has replaced path.
+
+
+def make_directory(directory: Path) -> None:
     """Create ``directory`` and its missing parents, making each new entry durable."""
     missing = []
     current = directory
@@ -356,10 +369,11 @@ def _make_directory(directory: Path) -> None:
         current = current.parent
     directory.mkdir(parents=True, exist_ok=True)
     for created in reversed(missing):
-        _fsync(created.parent)
+        fsync_path(created.parent)
 
 
-def _fsync(path: Path) -> None:
+def fsync_path(path: Path) -> None:
+    """Sync the file or directory at ``path`` to disk."""
     descriptor = os.open(path, os.O_RDONLY | os.O_CLOEXEC)
     try:
         os.fsync(descriptor)
