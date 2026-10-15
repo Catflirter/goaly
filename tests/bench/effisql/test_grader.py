@@ -392,6 +392,13 @@ class FakeCursor:
     def fetchone(self) -> Row | None:
         return self._row
 
+    @property
+    def description(self) -> list[Any] | None:
+        if self._row is None:
+            return None
+        oids = [psycopg.adapters.types[name].oid for name in self._row]
+        return [type("Column", (), {"type_code": oid})() for oid in [*oids, 1]]
+
 
 class FakeConn:
     """Enough of psycopg.Connection for PgSession: canned results and errors per query."""
@@ -708,3 +715,11 @@ def test_timing_needs_a_run(runs: int) -> None:
         time_prediction(lambda: 1.0, base_ms=1.0, runs=runs)
     with pytest.raises(ValueError, match="at least 1 run"):
         time_base(lambda: 1.0, runs=runs)
+
+
+def test_column_types_names_each_column_without_fetching() -> None:
+    conn = FakeConn(explain=lambda _: ("numeric", "date", "bpchar"))
+    with session_on(conn) as session:
+        types = session.column_types("SELECT 1;")
+    assert types == ["numeric", "date", "bpchar", "unknown"]
+    assert conn.statements[1] == "SELECT * FROM (SELECT 1) AS q LIMIT 0"

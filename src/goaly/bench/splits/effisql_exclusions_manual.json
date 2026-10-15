@@ -1,0 +1,10 @@
+[
+  {
+    "instance_id": "93",
+    "reason": "review: the gold fails the robustness check and is at fault: it subtracts only prices strictly below the maximum, while the base subtracts every other row's price, ties at the maximum included; tpch_alt has such a tie"
+  },
+  {
+    "instance_id": "94",
+    "reason": "review: the identity τ is unstable on this machine: 1.23 measured idle, 0.60 under load, outside the ±10% tolerance"
+  }
+]
