@@ -30,7 +30,7 @@ message Trajectory {
   // What the policy returned; absent if it returned nothing, as when it crashed.
   Prediction prediction = 7;
   // How the prediction was graded, as in the task's TaskResult; absent until it is graded, and
-  // in a run without gold answers.
+  // in a run that is not graded.
   Grade grade = 8;
   // Why the agent stopped.
   StopReason stop_reason = 9;
