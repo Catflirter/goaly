@@ -18,6 +18,8 @@ from goaly.bench.effisql.pg_instances import (
     confine_to_python_cpus,
     count_problems,
     database_statements,
+    environment_settings,
+    fetch_server_settings,
     instance_spec,
     instance_status,
     logical_cpus,
@@ -27,7 +29,8 @@ from goaly.bench.effisql.pg_instances import (
     table_counts,
 )
 from goaly.bench.effisql.pg_settings import PgCredentials, PgEnvConfig
-from tests.bench.effisql.pg_fakes import FakeServer, as_text
+from goaly.contracts.gen.manifest_pb2 import RunManifest
+from tests.bench.effisql.pg_fakes import AsyncFakeConnection, FakeServer, as_text
 
 
 def test_a_physical_core_is_both_of_its_smt_siblings() -> None:
@@ -279,3 +282,31 @@ def test_count_problems_names_each_table_that_differs() -> None:
     problems = count_problems({"grade-2": _counts(orders=4_499_999)}, _record())
 
     assert problems == ["grade-2: tpch.orders has 4499999 rows, not 4500000"]
+
+
+def test_the_environment_settings_record_what_can_change_results(tmp_path: Path) -> None:
+    config = PgEnvConfig(data_root=tmp_path)
+    server = {"work_mem": "4MB", "jit": "on"}
+
+    settings = environment_settings(config, _record(), server)
+
+    assert settings["postgres.image"] == config.image
+    assert settings["postgres.shm_size"] == "64m"
+    assert settings["postgres.work_mem"] == "4MB"
+    assert settings["dbgen.commit"] == "c"
+    assert settings["data.tpch.scale_factor"] == "3"
+    assert settings["data.tpch.lineitem.sha256"] == TPCH.files["lineitem"].sha256
+    assert settings["data.tpch_alt.lineitem.sha256"] == TPCH_ALT.files["lineitem"].sha256
+    assert settings["cpuset.grade-3"] == "10,11,22,23"
+    assert settings["cpuset.python"] == "0,1,12,13"
+    manifest = RunManifest(environment_settings=settings)
+    assert (
+        dict(RunManifest.FromString(manifest.SerializeToString()).environment_settings) == settings
+    )
+
+
+@pytest.mark.anyio
+async def test_server_settings_are_read_as_show_prints_them() -> None:
+    conn = AsyncFakeConnection("tpch", [("current_setting", [("work_mem", "4MB"), ("jit", "on")])])
+
+    assert await fetch_server_settings(conn) == {"work_mem": "4MB", "jit": "on"}  # type: ignore[arg-type]

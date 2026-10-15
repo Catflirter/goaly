@@ -46,7 +46,7 @@ from goaly.bench.effisql.pg_build import (
     read_golden_record,
     wait_until_ready,
 )
-from goaly.bench.effisql.pg_containers import CONTAINER_PREFIX, ContainerSpec
+from goaly.bench.effisql.pg_containers import CONTAINER_PREFIX, SHM_SIZE, ContainerSpec
 from goaly.bench.effisql.pg_settings import (
     AGENT_ROLE,
     ALT_DB,
@@ -70,6 +70,8 @@ __all__ = [
     "connect_statements",
     "count_problems",
     "database_statements",
+    "environment_settings",
+    "fetch_server_settings",
     "instance_spec",
     "instance_status",
     "logical_cpus",
@@ -322,6 +324,63 @@ def count_problems(
         if same != ["nation", "region"]:
             problems.append(f"{ALT_DB} has the same row counts as {MAIN_DB} in {same}")
     return problems
+
+
+# The server settings that change plans and timings; all stay the postgres:16 defaults, as in
+# the official TPC-H container.
+SERVER_SETTINGS = (
+    "server_version",
+    "shared_buffers",
+    "work_mem",
+    "hash_mem_multiplier",
+    "maintenance_work_mem",
+    "effective_cache_size",
+    "jit",
+    "max_worker_processes",
+    "max_parallel_workers",
+    "max_parallel_workers_per_gather",
+    "random_page_cost",
+    "default_statistics_target",
+)
+
+
+async def fetch_server_settings(conn: psycopg.AsyncConnection[Any]) -> dict[str, str]:
+    """Read :data:`SERVER_SETTINGS` from a running instance, as SHOW prints them."""
+    cursor = await conn.execute(
+        "SELECT name, current_setting(name) FROM unnest(%s::text[]) AS name",
+        [list(SERVER_SETTINGS)],
+    )
+    return dict(await cursor.fetchall())
+
+
+def environment_settings(
+    config: PgEnvConfig,
+    record: GoldenRecord,
+    server: Mapping[str, str],
+    instances: Sequence[Instance] = INSTANCES,
+) -> dict[str, str]:
+    """The settings that can change Effi-SQL results, for ``RunManifest.environment_settings``.
+
+    They are the image, the server settings (from :func:`fetch_server_settings`), the dbgen
+    build, every data file's checksum and the CPU pinning.
+    """
+    settings = {"postgres.image": config.image, "postgres.shm_size": SHM_SIZE}
+    settings |= {f"postgres.{name}": value for name, value in sorted(server.items())}
+    dbgen = record.dbgen
+    settings |= {
+        "dbgen.repository": dbgen.repository,
+        "dbgen.commit": dbgen.commit,
+        "dbgen.version": dbgen.version,
+        "dbgen.binary_sha256": dbgen.binary_sha256,
+    }
+    for db, build in sorted(record.databases.items()):
+        settings[f"data.{db}.scale_factor"] = build.scale_factor
+        for table, entry in sorted(build.tables.items()):
+            settings[f"data.{db}.{table}.sha256"] = entry.sha256
+    for instance in instances:
+        settings[f"cpuset.{instance.name}"] = ",".join(str(cpu) for cpu in instance.cpus)
+    settings["cpuset.python"] = ",".join(str(cpu) for cpu in PYTHON_CPUS)
+    return settings
 
 
 def _instance_dir(config: PgEnvConfig, instance: Instance) -> Path:

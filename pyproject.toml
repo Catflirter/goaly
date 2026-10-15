@@ -16,6 +16,7 @@ dependencies = [
 
 [dependency-groups]
 dev = [
+    "anyio>=4", # Its pytest plugin runs the async tests (tests/conftest.py)
     "grpcio-tools>=1.84", # Bundles protoc 35.1; after changing its version, run `make proto`
     "import-linter>=2.14", # 2.14 added --no-logo
     "mypy>=2",

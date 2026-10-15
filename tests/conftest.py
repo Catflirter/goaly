@@ -5,6 +5,8 @@
 - Every other test runs with a fresh, empty ``HOME`` and no ``GOALY_*`` environment variables
   (in any case, as pydantic-settings matches names case-insensitively), so it can never read
   ``~/.config/goaly/.env`` or a real API key.
+- Async tests are marked ``anyio``, and anyio's pytest plugin runs them on asyncio, the event
+  loop goaly runs on.
 """
 
 import os
@@ -22,6 +24,12 @@ def pytest_addoption(parser: pytest.Parser) -> None:
         default=False,
         help="run the tests marked integration (Docker, a database or the real model API)",
     )
+
+
+@pytest.fixture(scope="session")
+def anyio_backend() -> str:
+    # The plugin's default runs each test once on every installed backend.
+    return "asyncio"
 
 
 def pytest_collection_modifyitems(config: pytest.Config, items: list[pytest.Item]) -> None:
