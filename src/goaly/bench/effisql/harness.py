@@ -4,8 +4,8 @@
   one-process mode: it loads the tasks and the agent's inputs, the pack (its config.yaml and
   prompt.md, and its policy, imported here and nowhere else), the LLM client with the run's call
   log, the solving pool, and a grader it starts only if the run grades.
-- :func:`open_grading` is the grading factory of the grade phase: the same tasks and the grader,
-  and no pack code at all.
+- :func:`open_host` is the trusted host side (core's HostBenchmark): the same tasks and the
+  grader, and no pack code at all.
 
 The executor model is bound per task (:func:`context_factory`): the pack never sees the client,
 the settings or a key, only the AgentContext core's loop calls through. :func:`classify_error`
@@ -48,7 +48,7 @@ from goaly.bench.effisql.grading_service import EffiSqlGrader
 from goaly.bench.effisql.inputs import load_plans, load_schema_snapshot
 from goaly.bench.effisql.pg_settings import MAIN_DB, PgEnvConfig, load_credentials
 from goaly.bench.effisql.splits import load_exclusions, load_splits
-from goaly.bench.effisql.sql_env import SolvingPool
+from goaly.bench.effisql.sql_env import SolvingPool, SqlEnvOptions
 from goaly.contracts.gen.llm_call_pb2 import CALL_PURPOSE_EXEC, LlmCallRecord
 from goaly.contracts.gen.manifest_pb2 import ModelSettings, RunManifest
 from goaly.contracts.gen.result_pb2 import TASK_ERROR_TYPE_LLM
@@ -63,21 +63,24 @@ from goaly.harness.core.llm_errors import ConnectionFailed, RateLimited, ServerE
 from goaly.harness.core.llm_models import EXECUTOR_MODEL, QWEN_PROFILE, ModelParams
 from goaly.harness.core.manifest import content_hash, read_manifest, sha256_file
 from goaly.harness.core.registry import (
-    Grading,
-    GradingOptions,
     Harness,
     HarnessOptions,
-    RunnableGrading,
+    HostBenchmark,
+    HostOptions,
     RunnableHarness,
+    RunnableHost,
 )
 from goaly.harness.core.runner import ContextFactory, RunIdentity, error_classifier
 from goaly.harness.core.settings import load_settings
 
 __all__ = [
     "PACK_DIR",
+    "SOLVING_STATEMENT_TIMEOUT_S",
     "BindsLlm",
     "EffiSqlPaths",
     "EffiSqlWiring",
+    "LazyGrader",
+    "LoadedTasks",
     "PackRunConfig",
     "RunCallLog",
     "SolvesTasks",
@@ -85,8 +88,13 @@ __all__ = [
     "context_factory",
     "grading_priority",
     "load_pack",
-    "open_grading",
+    "load_tasks",
+    "model_settings",
     "open_harness",
+    "open_host",
+    "pack_models",
+    "recorded_priority",
+    "with_parts",
 ]
 
 _logger = logging.getLogger(__name__)
@@ -100,7 +108,7 @@ _BENCH_DIR = Path(goaly.bench.effisql.__file__).resolve().parent
 # context overflow, an invalid response or a refused request, ends the task as a crash, as
 # ImplementerExit does for the implementer (experiment.proto).
 _GATEWAY_OUTAGES = (RateLimited, ServerError, TimedOut, ConnectionFailed)
-classify_error = error_classifier(dict.fromkeys(_GATEWAY_OUTAGES, TASK_ERROR_TYPE_LLM))
+classify_error = error_classifier([(outage, TASK_ERROR_TYPE_LLM) for outage in _GATEWAY_OUTAGES])
 
 
 class PackRunConfig(BaseModel):
@@ -183,9 +191,16 @@ def _full_shares(shares: Mapping[str, int]) -> dict[str, int]:
     return {EXECUTOR_MODEL: 1, "glm-5.3": 1, **shares}
 
 
+# The agent's statement timeout, a capacity rule of the shared solving instances (spec §6.2): the
+# trusted environment caps every statement at it, whatever the pack asks (T09).
+SOLVING_STATEMENT_TIMEOUT_S = 120.0
+
+
 async def _real_solving() -> SolvingPool:
     credentials = await asyncio.to_thread(load_credentials)
-    return SolvingPool(PgEnvConfig(), credentials)
+    return SolvingPool(
+        PgEnvConfig(), credentials, SqlEnvOptions(timeout_s=SOLVING_STATEMENT_TIMEOUT_S)
+    )
 
 
 def _real_grader(cache_root: Path, check: InstanceCheck | None) -> EffiSqlGrader:
@@ -256,19 +271,19 @@ def grading_priority(split: Split.ValueType | None, budget_phase: str | None) ->
 
 
 @dataclass(frozen=True)
-class _Tasks:
+class LoadedTasks:
     """What both factories load: the tasks, their splits and the agent's inputs."""
 
     benchmark: EffiSqlBenchmark
     namespace: str
 
 
-def _load_tasks(
+def load_tasks(
     paths: EffiSqlPaths,
     instances_file: Path | None,
     mode: Mode | None,
     environment_settings: Mapping[str, str],
-) -> _Tasks:
+) -> LoadedTasks:
     tasks = load_instances(paths.tasks_file)
     external = None if instances_file is None else load_instances(instances_file)
     if instances_file is None:
@@ -294,10 +309,10 @@ def _load_tasks(
     )
     fingerprint = content_hash({"bench/effisql": _BENCH_DIR})[:16]
     namespace = "" if mode is None else f"{mode.value}-{fingerprint}"
-    return _Tasks(benchmark, namespace)
+    return LoadedTasks(benchmark, namespace)
 
 
-class _LazyGrader:
+class LazyGrader:
     """Starts the grader's workers on the first grading only: a solve phase grades nothing."""
 
     def __init__(self, start: Callable[[], GradesPredictions], mode: Mode, priority: Priority):
@@ -336,13 +351,13 @@ async def open_harness(
     priority = grading_priority(split, options.budget_phase)
     paths = wiring.paths()
     settings = {"grading_priority": priority.name.lower()}
-    loaded = await asyncio.to_thread(_load_tasks, paths, options.instances_file, mode, settings)
+    loaded = await asyncio.to_thread(load_tasks, paths, options.instances_file, mode, settings)
     solving = await wiring.solving()
     await solving.preflight()
     async with AsyncExitStack() as stack:
         grader = None
         if mode is not None and split != SPLIT_EXTERNAL:
-            grader = _LazyGrader(
+            grader = LazyGrader(
                 lambda: wiring.grader(paths.grading_cache_root, wiring.instance_check),
                 mode,
                 priority,
@@ -352,51 +367,66 @@ async def open_harness(
         client = await stack.enter_async_context(
             await wiring.llm(RunCallLog(calls), options.llm_shares)
         )
-        benchmark = _with(loaded.benchmark, solving.environment, grader)
+        benchmark = with_parts(loaded.benchmark, solving.environment, grader)
         yield Harness(
             benchmark=benchmark,
             policy=policy,
             contexts=context_factory(client, config),
             classify=classify_error,
-            pack_dir=wiring.pack_dir,
-            models=(_model_settings(config.model),),
             cache_namespace=loaded.namespace,
         )
 
 
 @asynccontextmanager
-async def open_grading(
-    options: GradingOptions, wiring: EffiSqlWiring | None = None
-) -> AsyncIterator[RunnableGrading]:
-    """Effi-SQL's grading for a grade phase; it imports no pack code (spec V24).
+async def open_host(
+    options: HostOptions, wiring: EffiSqlWiring | None = None
+) -> AsyncIterator[RunnableHost]:
+    """Effi-SQL's trusted host side for one run: its benchmark, which grades on the host and
+    imports no pack code (spec V24, V27).
 
-    The mode follows the run's split, whatever the solve phase wrote: its records are
-    untrusted, and a manifest that names another mode is refused.
+    The mode follows the split core gives: held-out official, train and val dev. The grading
+    instances' priority follows the budget phase or, for a grade phase without one, what the
+    run's host-written manifest recorded; a manifest that names another mode is refused.
     """
     wiring = EffiSqlWiring() if wiring is None else wiring
-    manifest = await asyncio.to_thread(read_manifest, options.files.manifest)
-    mode = grading_mode(manifest.split)
-    if mode is None:
-        raise ValueError("a run on SPLIT_EXTERNAL is not graded")
-    recorded = manifest.environment_settings.get("grading_mode")
-    if recorded not in (None, mode.value):
+    mode = grading_mode(options.split)
+    manifest = (
+        await asyncio.to_thread(read_manifest, options.files.manifest)
+        if await asyncio.to_thread(options.files.manifest.exists)
+        else None
+    )
+    recorded = None if manifest is None else manifest.environment_settings.get("grading_mode")
+    if recorded not in (None, _mode_name(mode)):
         raise ValueError(
             f"the run's manifest names grading mode {recorded!r}, but its split grades in"
-            f" {mode.value!r} mode"
+            f" {_mode_name(mode)!r} mode"
         )
-    priority = _recorded_priority(manifest)
+    if options.budget_phase is None and manifest is not None:
+        priority = recorded_priority(manifest)
+    else:
+        priority = grading_priority(options.split, options.budget_phase)
     paths = wiring.paths()
-    loaded = await asyncio.to_thread(_load_tasks, paths, None, mode, {})
-    grader = _LazyGrader(
-        lambda: wiring.grader(paths.grading_cache_root, wiring.instance_check), mode, priority
-    )
+    settings = {"grading_priority": priority.name.lower()}
+    loaded = await asyncio.to_thread(load_tasks, paths, options.instances_file, mode, settings)
+    grader = None
+    if mode is not None:
+        grader = LazyGrader(
+            lambda: wiring.grader(paths.grading_cache_root, wiring.instance_check), mode, priority
+        )
     try:
-        yield Grading(_with(loaded.benchmark, None, grader), cache_namespace=loaded.namespace)
+        yield HostBenchmark(
+            with_parts(loaded.benchmark, None, grader), cache_namespace=loaded.namespace
+        )
     finally:
-        await grader.close()
+        if grader is not None:
+            await grader.close()
 
 
-def _recorded_priority(manifest: RunManifest) -> Priority:
+def _mode_name(mode: Mode | None) -> str:
+    return "none" if mode is None else mode.value
+
+
+def recorded_priority(manifest: RunManifest) -> Priority:
     """The priority the solve phase recorded; RSI's if it recorded none it may use."""
     name = manifest.environment_settings.get("grading_priority", "").upper()
     if name in Priority.__members__ and Priority[name] != Priority.SETUP:
@@ -404,15 +434,21 @@ def _recorded_priority(manifest: RunManifest) -> Priority:
     return Priority.RSI
 
 
-def _with(
+def with_parts(
     benchmark: EffiSqlBenchmark,
     provision: Callable[[], AbstractAsyncContextManager[SqlEnvironment]] | None,
-    grader: _LazyGrader | None,
+    grader: LazyGrader | None,
 ) -> EffiSqlBenchmark:
     return dataclasses.replace(benchmark, provision_environment=provision, grade_function=grader)
 
 
-def _model_settings(params: ModelParams) -> ModelSettings:
+def pack_models(pack_dir: Path = PACK_DIR) -> tuple[ModelSettings, ...]:
+    """The settings of the models the pack calls, from its config.yaml, for Registry.add."""
+    config, _ = load_pack(pack_dir)
+    return (model_settings(config.model),)
+
+
+def model_settings(params: ModelParams) -> ModelSettings:
     profile = QWEN_PROFILE.with_overrides(params)
     settings = ModelSettings(model=profile.model, thinking=bool(profile.params.enable_thinking))
     if profile.params.temperature is not None:

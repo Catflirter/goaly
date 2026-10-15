@@ -11,7 +11,7 @@ from pathlib import Path
 import pytest
 
 from goaly import cli
-from goaly.bench.effisql.harness import open_grading, open_harness
+from goaly.bench.effisql.harness import PACK_DIR, open_harness, open_host
 from goaly.harness.core.llm_budgets import load_budgets
 from goaly.harness.core.manifest import CORE_DIR
 
@@ -68,8 +68,11 @@ def test_effisql_is_registered_with_its_v0_pack_and_its_grading() -> None:
 
     assert registry.benchmarks() == ["effisql"]
     assert registry.harnesses("effisql") == ["v0"]
-    assert registry.factory("effisql", None) is open_harness
-    assert registry.grading("effisql") is open_grading
+    registered = registry.harness("effisql", None)
+    assert registered.factory is open_harness
+    assert registered.pack_dir == PACK_DIR
+    assert [model.model for model in registered.models] == ["qwen3.6-35b-a3b"]
+    assert registry.host("effisql") is open_host
 
 
 def test_the_budgets_shipped_are_the_specs() -> None:

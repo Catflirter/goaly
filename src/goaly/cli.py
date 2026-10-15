@@ -2,16 +2,15 @@
 §3.1).
 
 It wires the layers together. It registers each benchmark with the harnesses that solve it, which
-`goaly run` can then run: Effi-SQL, with its v0 pack as the harness "v0", and its grading for the
-grade phase. Neither factory imports pack code until a harness opens, so a grade phase loads
-none (spec V24).
+`goaly run` can then run: Effi-SQL, with its v0 pack as the harness "v0", and its trusted host
+side. Neither imports pack code until a harness opens, so the host loads none (spec V24, V27).
 """
 
 import sys
 from pathlib import Path
 
 from goaly.bench.effisql.benchmark import BENCHMARK_NAME as EFFISQL
-from goaly.bench.effisql.harness import open_grading, open_harness
+from goaly.bench.effisql.harness import PACK_DIR, open_harness, open_host, pack_models
 from goaly.bench.effisql.pg_instances import confine_to_python_cpus
 from goaly.harness.core import cli
 from goaly.harness.core.registry import Registry
@@ -25,8 +24,8 @@ BUDGETS_FILE = Path(__file__).resolve().parent / "config" / "llm_budgets.toml"
 def registry() -> Registry:
     """Every benchmark `goaly run` can run, with the harnesses that solve it."""
     registry = Registry()
-    registry.add(EFFISQL, "v0", open_harness)
-    registry.add_benchmark(EFFISQL, open_grading)
+    registry.add(EFFISQL, "v0", open_harness, pack_dir=PACK_DIR, models=pack_models())
+    registry.add_benchmark(EFFISQL, open_host)
     return registry
 
 
