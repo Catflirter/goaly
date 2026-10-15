@@ -49,6 +49,7 @@ from goaly.contracts.jsonl import to_json_line
 from tests.fakes import (
     COMMAND_NOT_FOUND,
     STATEMENT_TIMEOUT,
+    TOY_BASE_RESULT,
     TOY_INSTANCES,
     DoNothingPolicy,
     EchoArgs,
@@ -427,7 +428,7 @@ def test_toy_benchmark_shows_the_agent_no_gold_answer() -> None:
     assert inst.gold_sql not in to_json_line(task)
 
 
-def test_toy_benchmark_closes_the_environment_it_provisions() -> None:
+def test_toy_benchmark_solves_in_an_environment_that_reveals_no_gold() -> None:
     fake = ToyBenchmark()
     benchmark: Benchmark[ToyInstance, SqlEnvironment] = fake
     inst = TOY_INSTANCES[0]
@@ -435,14 +436,16 @@ def test_toy_benchmark_closes_the_environment_it_provisions() -> None:
     async def scenario() -> tuple[SqlResult, SqlResult]:
         async with benchmark.provision(inst) as env:
             return (
-                await env.execute(inst.gold_sql, timeout_s=1.0),
                 await env.execute(inst.issue_sql, timeout_s=1.0),
+                await env.execute(inst.gold_sql, timeout_s=1.0),
             )
 
-    gold, issue = asyncio.run(scenario())
+    base, gold = asyncio.run(scenario())
 
-    assert gold == SqlResult()
-    assert issue.error
+    assert base == TOY_BASE_RESULT
+    # The gold answer gets what any query the environment does not know gets.
+    assert gold == SqlResult(error=f"no canned result for {inst.gold_sql!r}")
+    assert list(fake.environments[0].results) == [inst.issue_sql]
     assert [env.closed for env in fake.environments] == [True]
 
 

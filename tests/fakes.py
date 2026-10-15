@@ -14,6 +14,7 @@ from collections.abc import AsyncIterator, Mapping, Sequence
 from contextlib import asynccontextmanager
 from dataclasses import dataclass
 
+from google.protobuf.struct_pb2 import ListValue, Value
 from pydantic import BaseModel
 
 from goaly.contracts.errors import EnvironmentFailure
@@ -184,6 +185,10 @@ class ToyInstance:
     gold_sql: str
 
 
+# What a toy task's base query returns in its solving environment: one row, one column.
+TOY_BASE_RESULT = SqlResult(
+    columns=["n"], rows=[ListValue(values=[Value(number_value=3)])], row_count=1
+)
 TOY_INSTANCES = (
     ToyInstance(
         instance_id="toy-1",
@@ -212,9 +217,10 @@ TOY_INSTANCES = (
 class ToyBenchmark:
     """A Benchmark of BIRD-style SQL tasks held in memory, each solved in a FakeSqlEnvironment.
 
-    A task's environment runs only the task's gold SQL, which returns no rows. A prediction is
-    correct if its last statement is the gold SQL. ``environments`` records each environment
-    provisioned.
+    A task's solving environment answers only the task's base query (its issue SQL), with
+    TOY_BASE_RESULT, so it reveals nothing of the gold answer, which only ``grade`` uses. A
+    prediction is correct if its last statement is the gold SQL. ``environments`` records each
+    environment provisioned.
     """
 
     name = "toy"
@@ -228,7 +234,7 @@ class ToyBenchmark:
 
     @asynccontextmanager
     async def provision(self, inst: ToyInstance) -> AsyncIterator[FakeSqlEnvironment]:
-        env = FakeSqlEnvironment({inst.gold_sql: SqlResult()})
+        env = FakeSqlEnvironment({inst.issue_sql: TOY_BASE_RESULT})
         self.environments.append(env)
         try:
             yield env
