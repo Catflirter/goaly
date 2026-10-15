@@ -16,11 +16,18 @@ GRADE_2_PORT = 55435
 
 
 def real_session(
-    port: int = GRADE_1_PORT, db: str = MAIN_DB, *, timeout_s: float = STATEMENT_TIMEOUT_S
+    port: int = GRADE_1_PORT,
+    db: str = MAIN_DB,
+    *,
+    timeout_s: float = STATEMENT_TIMEOUT_S,
+    hard_cap_s: float | None = None,
 ) -> PgSession:
     """Open a grading session as the grader's role, or skip the test without the real instances."""
     if os.environ.get("GOALY_EFFISQL_ITEST_REAL") != "1":
         pytest.skip("needs the real instances: set GOALY_EFFISQL_ITEST_REAL=1")
     password = load_credentials().grader_password
     connect = connector("127.0.0.1", port, password, user=GRADER_ROLE)
-    return PgSession.open(connect, db, timeout_s=timeout_s)
+    session = PgSession.open(connect, db, timeout_s=timeout_s)
+    if hard_cap_s is not None:
+        session._hard_cap_s = hard_cap_s
+    return session

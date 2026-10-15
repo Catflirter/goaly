@@ -366,16 +366,18 @@ class TestOutcomes:
             (QueryError("out of memory"), GRADE_STATUS_PREDICTION_FAILED),
         ],
     )
-    def test_a_failed_timing_stays_matched_with_no_speedup(
+    def test_a_failed_timing_stays_matched_with_tau_zero(
         self, grade: Any, error: Exception, status: int
     ) -> None:
         result = grade(main_session(pred_times=[250.0, error]))
         details = result.effisql
         assert result.status == status
         assert details.matched
-        assert not details.HasField("speedup")
+        assert details.HasField("speedup")
+        assert details.speedup == 0.0
         assert details.credit == 0
         assert not result.correct
+        assert "τ = 0" in result.feedback
 
     @pytest.mark.parametrize(
         ("pred_ms", "credit"),

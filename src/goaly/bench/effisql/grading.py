@@ -12,7 +12,8 @@ One evaluation (:func:`evaluate`, run in a worker thread) goes:
    alternate database (goaly.bench.effisql.checks). An unmatched prediction leaves both unset.
 4. **Timing**, even when a check flags it: dev mode times only the prediction against the
    cached base median, official mode runs the interleaved protocol. A timing that fails
-   leaves the prediction matched, with no speedup and credit 0.
+   leaves the prediction matched, with τ = 0 and credit 0, as the official evaluator scores it;
+   the status and feedback say why.
 
 ``credit`` is the checked credit: g(τ) for a matched prediction no check flagged, else 0.
 
@@ -479,8 +480,11 @@ def _timed(
         if error.side == "base":
             assert isinstance(cause, QueryError | QueryTimeoutError)  # noqa: S101  # TimingError's contract.
             raise _BaseQueryError(cause) from error
+        # The evaluator's rule: the prediction stays matched, with τ = 0 and credit g(0) = 0.
+        details.speedup = 0.0
+        details.credit = tier_credit(0.0)
         status = GRADE_STATUS_TIMEOUT if error.timed_out else GRADE_STATUS_PREDICTION_FAILED
-        return details, status, f"matched, but timing the prediction failed: {cause}"
+        return details, status, f"matched, but timing the prediction failed, so τ = 0: {cause}"
     details.base_time_s = timing.base_ms / 1000
     details.pred_time_s = timing.pred_ms / 1000
     details.timing_runs = timing.runs
