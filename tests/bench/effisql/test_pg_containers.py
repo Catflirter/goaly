@@ -267,3 +267,43 @@ def test_no_command_touches_a_container_outside_our_namespace(
         call("postgres")  # type: ignore[operator]  # A lambda from parametrize.
 
     assert docker.calls == []
+
+
+def test_ensure_leaves_a_restarting_container_to_docker(docker: FakeDocker) -> None:
+    docker.status = "restarting"  # Its restart policy is already bringing it back.
+
+    assert ensure(_spec()) == "running"
+    assert _verbs(docker) == []
+
+
+def test_ensure_unpauses_a_matching_paused_container(docker: FakeDocker) -> None:
+    docker.status = "paused"
+
+    assert ensure(_spec()) == "started"
+    assert _verbs(docker) == ["unpause"]
+
+
+def test_ensure_replaces_a_stopped_container_whose_spec_changed(docker: FakeDocker) -> None:
+    docker.status = "exited"
+    docker.digest = "stale"
+
+    assert ensure(_spec()) == "replaced"
+    assert [call for call in docker.calls if call[0] in ("rm", "stop")] == [["rm", "--force", NAME]]
+
+
+def test_ensure_refuses_to_replace_a_server_that_did_not_shut_down_cleanly(
+    docker: FakeDocker,
+) -> None:
+    docker.digest = "stale"
+    docker.exit_code = "137"
+
+    with pytest.raises(ContainerError, match="exited with code 137"):
+        ensure(_spec())
+    assert "rm" not in _verbs(docker)
+
+
+def test_the_spec_label_comes_before_the_image_whatever_the_server_options() -> None:
+    args = run_args(_spec())
+    image_at = args.index(IMAGE)
+
+    assert f"{SPEC_LABEL}={spec_digest(_spec())}" in args[:image_at]
