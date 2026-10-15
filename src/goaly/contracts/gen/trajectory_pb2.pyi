@@ -479,8 +479,7 @@ Global___ToolCall: _TypeAlias = ToolCall  # noqa: Y015
 @_typing.final
 class ToolResult(_message.Message):
     """The result of one tool call. The model sees it as a tool message: tool_call_id and content.
-    The tool fills content, is_error and submission; core's executor fills the rest, and writes
-    the error itself when the arguments are invalid, the call times out or the tool raises.
+    The tool fills content and submission; core's executor fills the rest, including is_error.
     """
 
     DESCRIPTOR: _descriptor.Descriptor
