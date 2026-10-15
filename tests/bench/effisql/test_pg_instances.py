@@ -16,7 +16,7 @@ from goaly.bench.effisql.pg_build import (
     DbgenBuild,
     GoldenRecord,
 )
-from goaly.bench.effisql.pg_containers import CONTAINER_PREFIX, ContainerSpec
+from goaly.bench.effisql.pg_containers import CONTAINER_PREFIX, ContainerSpec, Mount, run_args
 from goaly.bench.effisql.pg_instances import (
     INSTANCES,
     PYTHON_CPUS,
@@ -37,6 +37,7 @@ from goaly.bench.effisql.pg_instances import (
     logical_cpus,
     require_golden_record,
     role_statements,
+    socket_dirs,
     start_instances,
     stop_instances,
     table_counts,
@@ -77,6 +78,23 @@ def test_an_instance_runs_from_its_own_copy_pinned_and_restarted_by_docker(
     assert spec.restart == "unless-stopped"
     assert spec.user == f"{os.getuid()}:{os.getgid()}"
     assert dict(spec.env) == {}  # The data directory is initialized: no secret is needed.
+    # Its server's socket directory is the instance's own directory on the host.
+    assert spec.mounts == (Mount(tmp_path / "sockets" / "grade-1", "/var/run/postgresql"),)
+    assert "type=bind,source=" + str(tmp_path / "sockets" / "grade-1") + (
+        ",target=/var/run/postgresql"
+    ) in run_args(spec)
+
+
+def test_every_instance_has_its_own_socket_directory(tmp_path: Path) -> None:
+    config = PgEnvConfig(data_root=tmp_path, socket_root=Path("/run/pg"))
+
+    assert socket_dirs(config, INSTANCES[:2]) == {
+        "solve-1": Path("/run/pg/solve-1"),
+        "solve-2": Path("/run/pg/solve-2"),
+    }
+    assert (
+        socket_dirs(PgEnvConfig(data_root=tmp_path))["grade-3"] == tmp_path / "sockets" / "grade-3"
+    )
 
 
 def test_instance_names_must_stay_in_our_container_namespace() -> None:
@@ -312,6 +330,23 @@ def test_start_copies_the_golden_build_once_and_again_only_for_a_new_build(
     assert third == {"solve-1": "created, data copied"}
     assert copy.read_text() == "16\n"  # The new build replaced the old copy.
     assert lifecycle.ready.count("goaly-effisql-grade-3") == 2
+    for instance in INSTANCES:  # Each server's socket directory exists before it starts.
+        directory = tmp_path / "sockets" / instance.name
+        assert directory.is_dir()
+        assert directory.stat().st_mode & 0o777 == 0o755
+
+
+def test_start_refuses_a_socket_path_too_long_for_unix_sockets(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    config = PgEnvConfig(data_root=tmp_path, socket_root=tmp_path / ("d" * 100))
+    _golden(config, "2026-10-15T05:00:00Z")
+    lifecycle = FakeLifecycle(monkeypatch, tmp_path)
+
+    with pytest.raises(InstanceError, match="longer than 107 bytes"):
+        start_instances(config, CREDENTIALS, INSTANCES[:1])
+    assert lifecycle.events == []  # Refused before any container or copy was touched.
+    assert not (tmp_path / "instances").exists()
 
 
 def test_a_corrupt_copy_marker_means_copy_again(
@@ -399,20 +434,29 @@ def test_status_reports_container_cpus_and_readiness(
     lifecycle.cpusets = {"goaly-effisql-solve-1": "2,3,14,15", "goaly-effisql-solve-2": "2,3"}
     pings: list[str] = []
 
-    def accepts(conninfo: str) -> bool:
+    def ping(conninfo: str) -> bool:
         pings.append(conninfo)
-        return "port=55432" in conninfo
+        socket = "/" in conninfo
+        return "port=55432" in conninfo or ("port=55434" in conninfo and not socket)
 
-    monkeypatch.setattr(pg_instances, "_accepts", accepts)
+    monkeypatch.setattr(pg_instances, "_ping", ping)
 
     statuses = instance_status(PgEnvConfig(data_root=tmp_path), INSTANCES[:3])
 
-    assert [(s.instance.name, s.state, s.cpuset, s.accepting, s.healthy) for s in statuses] == [
-        ("solve-1", "running", "2,3,14,15", True, True),
-        ("solve-2", "running", "2,3", False, False),  # Not accepting, and pinned wrongly.
-        ("grade-1", None, None, False, False),  # No container at all.
+    assert [
+        (s.instance.name, s.state, s.cpuset, s.accepting, s.socket_accepting, s.healthy)
+        for s in statuses
+    ] == [
+        ("solve-1", "running", "2,3,14,15", True, True, True),
+        ("solve-2", "running", "2,3", False, False, False),  # Not accepting, pinned wrongly.
+        ("grade-1", None, None, True, False, False),  # Not through its socket; no container.
     ]
     assert not statuses[1].pinned
+    assert statuses[0].socket_dir == tmp_path / "sockets" / "solve-1"
+    assert pings[:2] == [
+        "host=127.0.0.1 port=55432 dbname=postgres connect_timeout=3",
+        f"host={tmp_path}/sockets/solve-1 port=55432 dbname=postgres connect_timeout=3",
+    ]
     assert "password" not in " ".join(pings)  # Readiness needs no credentials.
 
 

@@ -27,6 +27,11 @@ and the role defaults only add defense in depth:
   also loses pg_stat_activity, and the functions that let one session stop another, read
   another's query text or write large objects.
 
+Each server also listens on a Unix socket, in a directory bind-mounted from the host
+(``~/data/effisql/sockets/<instance>/``; see :func:`socket_dirs`). A sandbox that may not use
+IP at all, such as the solve container, mounts the solving instances' directories read-only and
+connects with ``host=<directory>``; pg_hba.conf asks for scram there as well (spec §6.1, V28).
+
 The servers listen on ports 55432-55436, inside Linux's ephemeral port range (32768-60999):
 a client socket can briefly hold one while its server starts, and Docker's restart policy then
 retries. Reserving the ports (``sysctl net.ipv4.ip_local_reserved_ports=55432-55439``) removes
@@ -45,6 +50,7 @@ from typing import Any, Literal
 
 import psycopg
 from psycopg import sql
+from psycopg.conninfo import make_conninfo
 from pydantic import SecretStr
 
 from goaly.bench.effisql import pg_containers
@@ -58,7 +64,13 @@ from goaly.bench.effisql.pg_build import (
     read_golden_record,
     wait_until_ready,
 )
-from goaly.bench.effisql.pg_containers import CONTAINER_PREFIX, SHM_SIZE, ContainerSpec
+from goaly.bench.effisql.pg_containers import (
+    CONTAINER_PREFIX,
+    SHM_SIZE,
+    SOCKET_DIR,
+    ContainerSpec,
+    Mount,
+)
 from goaly.bench.effisql.pg_settings import (
     AGENT_ROLE,
     ALT_DB,
@@ -94,6 +106,7 @@ __all__ = [
     "readers",
     "require_golden_record",
     "role_statements",
+    "socket_dirs",
     "start_instances",
     "stop_instances",
     "table_counts",
@@ -154,7 +167,11 @@ def confine_to_python_cpus() -> None:
 
 
 def instance_spec(config: PgEnvConfig, instance: Instance) -> ContainerSpec:
-    """The container of ``instance``. Docker restarts it with the daemon unless we stopped it."""
+    """The container of ``instance``. Docker restarts it with the daemon unless we stopped it.
+
+    Its server's Unix-socket directory is a bind mount of the instance's socket directory on
+    the host (:meth:`PgEnvConfig.socket_dir`), so a sandbox with no network can still reach it.
+    """
     return ContainerSpec(
         name=instance.container,
         image=config.image,
@@ -163,7 +180,17 @@ def instance_spec(config: PgEnvConfig, instance: Instance) -> ContainerSpec:
         user=f"{os.getuid()}:{os.getgid()}",
         cpuset=",".join(str(cpu) for cpu in instance.cpus),
         restart="unless-stopped",
+        mounts=(Mount(config.socket_dir(instance.name), SOCKET_DIR),),
     )
+
+
+def socket_dirs(config: PgEnvConfig, instances: Sequence[Instance] = INSTANCES) -> dict[str, Path]:
+    """Each instance's Unix-socket directory on the host, by instance name.
+
+    libpq connects through one with ``host=<directory>`` and the instance's port, which names
+    the socket file. The solve container mounts only the solving instances' directories.
+    """
+    return {instance.name: config.socket_dir(instance.name) for instance in instances}
 
 
 type Kind = Literal["solving", "grading"]
@@ -312,6 +339,8 @@ def start_instances(
     record = require_golden_record(config)
     if not instances:
         return {}
+    for instance in instances:
+        _check_socket_path(config, instance)
     with ThreadPoolExecutor(max_workers=len(instances)) as pool:  # Copying is disk-bound.
         copied = dict(
             zip(
@@ -326,6 +355,7 @@ def start_instances(
         problems = hba_problems(hba.read_text(encoding="utf-8"))
         if problems:  # Each server shares the host network: no rule may skip scram.
             raise InstanceError(f"{hba} lets in without a password: {problems}")
+        _make_socket_dir(config, instance)
         action = pg_containers.ensure(instance_spec(config, instance))
         actions[instance.name] = f"{action}, data copied" if copied[instance] else action
     for instance in instances:
@@ -336,6 +366,26 @@ def start_instances(
             raise InstanceError(f"{instance.name} did not start: {error}") from None
         apply_roles(connect, credentials, instance.kind)
     return actions
+
+
+# The longest path a Unix socket may have (sun_path holds 108 bytes, with its terminator).
+_MAX_SOCKET_PATH = 107
+
+
+def _check_socket_path(config: PgEnvConfig, instance: Instance) -> None:
+    socket = config.socket_dir(instance.name) / f".s.PGSQL.{instance.port}"
+    if len(os.fsencode(socket)) > _MAX_SOCKET_PATH:
+        raise InstanceError(
+            f"the socket path {socket} is longer than {_MAX_SOCKET_PATH} bytes: "
+            "choose a shorter socket_root"
+        )
+
+
+def _make_socket_dir(config: PgEnvConfig, instance: Instance) -> None:
+    """Create the instance's socket directory: its server writes there, anyone may look up."""
+    directory = config.socket_dir(instance.name)
+    directory.mkdir(parents=True, exist_ok=True)
+    directory.chmod(0o755)  # Clients only need to reach the socket; scram still guards it.
 
 
 def stop_instances(instances: Sequence[Instance] = INSTANCES) -> dict[str, str]:
@@ -352,10 +402,14 @@ def stop_instances(instances: Sequence[Instance] = INSTANCES) -> dict[str, str]:
 
 @dataclass(frozen=True)
 class InstanceStatus:
+    """What :func:`instance_status` found of one instance."""
+
     instance: Instance
     state: str | None  # The container's state, or None if there is no container.
     cpuset: str | None  # The CPUs Docker pins it to.
-    accepting: bool  # True if the server accepts connections.
+    accepting: bool  # True if the server accepts connections over TCP.
+    socket_dir: Path  # The host directory of its Unix socket.
+    socket_accepting: bool  # True if the server accepts connections through that socket.
 
     @property
     def pinned(self) -> bool:
@@ -364,24 +418,40 @@ class InstanceStatus:
 
     @property
     def healthy(self) -> bool:
-        return self.state == "running" and self.accepting and self.pinned
+        return self.state == "running" and self.accepting and self.socket_accepting and self.pinned
 
 
 def instance_status(
     config: PgEnvConfig, instances: Sequence[Instance] = INSTANCES
 ) -> list[InstanceStatus]:
-    """Report each instance's container, pinning and readiness. It needs no credentials."""
+    """Report each instance's container, pinning and readiness, over TCP and through its
+    socket. It needs no credentials."""
     statuses = []
     for instance in instances:
         current = pg_containers.state(instance.container)
         cpuset = pg_containers.inspect(instance.container, "{{.HostConfig.CpusetCpus}}")
-        conninfo = f"host={config.host} port={instance.port} dbname=postgres connect_timeout=3"
-        statuses.append(InstanceStatus(instance, current, cpuset, _accepts(conninfo)))
+        sockets = config.socket_dir(instance.name)
+        statuses.append(
+            InstanceStatus(
+                instance,
+                current,
+                cpuset,
+                accepting=_accepts(config.host, instance.port),
+                socket_dir=sockets,
+                socket_accepting=_accepts(str(sockets), instance.port),
+            )
+        )
     return statuses
 
 
-def _accepts(conninfo: str) -> bool:
-    """libpq's PQping, as pg_isready uses it: whether the server accepts connections."""
+def _accepts(host: str, port: int) -> bool:
+    """Whether the server accepts connections. A ``host`` that is a directory means the Unix
+    socket in it."""
+    return _ping(make_conninfo(host=host, port=port, dbname="postgres", connect_timeout=3))
+
+
+def _ping(conninfo: str) -> bool:
+    """libpq's PQping, as pg_isready uses it."""
     return psycopg.pq.PGconn.ping(conninfo.encode()) == psycopg.pq.Ping.OK
 
 

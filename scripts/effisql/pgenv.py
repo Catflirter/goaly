@@ -10,9 +10,10 @@ idempotent, and this process keeps to CPUs 0, 1, 12 and 13.
         Start the 5 instances from the golden build, or shut them down cleanly. A restart
         reuses their data; start also reapplies the roles and privileges.
     uv run python scripts/effisql/pgenv.py status [--check]
-        Show each instance's container, CPUs and readiness, and fail if one is down or pinned
-        to the wrong CPUs. --check also compares every instance's row counts with the golden
-        build's: it scans every table on every instance, so never run it during timed grading.
+        Show each instance's container, CPUs, socket directory and readiness, and fail if one
+        is down, unreachable through its socket or pinned to the wrong CPUs. --check also
+        compares every instance's row counts with the golden build's: it scans every table on
+        every instance, so never run it during timed grading.
     uv run python scripts/effisql/pgenv.py snapshot [--port PORT]
         Rewrite the schema snapshots from a running server (default: solve-1).
     uv run python scripts/effisql/pgenv.py plans --tasks FILE [--port PORT] [--out PATH]
@@ -27,6 +28,9 @@ Runbook notes:
 - Every goaly process keeps to CPUs 0, 1, 12 and 13 by calling
   ``goaly.bench.effisql.pg_instances.confine_to_python_cpus()`` at startup (T06's CLI does);
   any other command runs under ``taskset -c 0,1,12,13``.
+- Each instance's Unix socket is in ~/data/effisql/sockets/<instance>/, which start creates
+  and bind-mounts into its container. The solve container, which may not use IP, mounts the
+  solving instances' directories read-only and connects through them (V28).
 - The instances' ports 55432-55436 lie in Linux's ephemeral range. Reserving them, with
   ``sysctl net.ipv4.ip_local_reserved_ports=55432-55439``, stops a client socket from briefly
   holding one while its server starts; without it, Docker's restart policy retries.
@@ -153,13 +157,14 @@ def _status(config: PgEnvConfig, *, check: bool) -> int:
     for status in instance_status(config):
         instance = status.instance
         ready = "accepting connections" if status.accepting else "NOT accepting connections"
+        socket = "" if status.socket_accepting else " (NOT accepting connections there)"
         pinning = (
             "" if status.pinned else f" (WRONG: should be {','.join(map(str, instance.cpus))})"
         )
         healthy &= status.healthy
         _write(
             f"{instance.name:8} {instance.kind:8} port {instance.port}  cpus {status.cpuset}"
-            f"{pinning}  {status.state or 'absent'}, {ready}"
+            f"{pinning}  {status.state or 'absent'}, {ready}  socket {status.socket_dir}{socket}"
         )
     if check:
         record = require_golden_record(config)
