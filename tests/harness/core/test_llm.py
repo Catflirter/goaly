@@ -901,6 +901,61 @@ async def test_retries_an_attempt_that_timed_out() -> None:
     assert attempts(reply.record) == [(TIMEOUT, 0), (OK, 200)]
 
 
+def request_timeouts(gateway: Gateway) -> list[float]:
+    """The timeout httpx gave each request, the same for connecting, reading and writing."""
+    timeouts = [request.extensions["timeout"] for request in gateway.requests]
+    assert all(len(set(timeout.values())) == 1 for timeout in timeouts)
+    return [timeout["read"] for timeout in timeouts]
+
+
+async def test_a_call_may_give_its_attempts_longer() -> None:
+    gateway = Gateway(hang)
+    async with connect(gateway, retry=RetryPolicy(timeout_s=0.05, max_retries=0)) as llm:
+        with pytest.raises(TimedOut, match=r"no response within 0\.2 s \(1 attempt\)"):
+            await llm.complete([user("hi")], model=QWEN, tags=EXEC, attempt_timeout_s=0.2)
+
+    assert request_timeouts(gateway) == [0.2]
+
+
+async def test_a_longer_attempt_timeout_lets_a_slow_reply_arrive() -> None:
+    async def slow(request: httpx.Request) -> httpx.Response:
+        await asyncio.sleep(0.1)  # Past the default 0.05 s, within the call's own 0.5 s.
+        return completion()
+
+    gateway = Gateway(slow)
+    async with connect(gateway, retry=RetryPolicy(timeout_s=0.05, max_retries=0)) as llm:
+        reply = await llm.complete([user("hi")], model=QWEN, tags=EXEC, attempt_timeout_s=0.5)
+
+    assert attempts(reply.record) == [(OK, 200)]
+
+
+async def test_a_longer_attempt_timeout_holds_for_every_retry_of_that_call_only() -> None:
+    gateway = Gateway(failure(503), completion(), completion())
+    async with connect(gateway, retry=RetryPolicy(timeout_s=30)) as llm:
+        await llm.complete([user("hi")], model=GLM, tags=ANALYST, attempt_timeout_s=900)
+        await llm.complete([user("hi")], model=GLM, tags=ANALYST)
+
+    assert request_timeouts(gateway) == [900, 900, 30]
+
+
+@pytest.mark.parametrize(
+    "timeout_s",
+    [
+        pytest.param(0.0, id="zero"),
+        pytest.param(-1.0, id="negative"),
+        pytest.param(math.inf, id="infinite"),
+        pytest.param(math.nan, id="nan"),
+    ],
+)
+async def test_refuses_an_attempt_timeout_that_is_not_a_positive_time(timeout_s: float) -> None:
+    gateway, recorder = Gateway(), Recorder()
+    async with connect(gateway, recorder=recorder) as llm:
+        with pytest.raises(ValueError, match="attempt_timeout_s must be a positive"):
+            await llm.complete([user("hi")], model=QWEN, tags=EXEC, attempt_timeout_s=timeout_s)
+
+    assert (gateway.requests, recorder.records) == ([], [])
+
+
 async def test_cancellation_propagates_at_once_and_is_recorded() -> None:
     recorder, arrived = Recorder(), asyncio.Event()
 
@@ -920,6 +975,23 @@ async def test_cancellation_propagates_at_once_and_is_recorded() -> None:
     assert attempts(record) == [(CANCELLED, 0)]
     assert (record.status, record.http_status) == (CANCELLED, 0)
     assert len(gateway.requests) == 1
+
+
+async def test_a_call_stops_retrying_once_its_client_closes() -> None:
+    recorder = Recorder()
+
+    class ClosingClock(FakeClock):
+        async def sleep(self, seconds: float) -> None:
+            await llm.aclose()  # The client closes while the call backs off.
+
+    gateway = Gateway(failure(503), completion())
+    llm = connect(gateway, recorder=recorder, clock=ClosingClock())
+    with pytest.raises(RuntimeError, match="closed during the call"):
+        await llm.complete([user("hi")], model=QWEN, tags=EXEC)
+
+    assert len(gateway.requests) == 1
+    (record,) = recorder.records
+    assert attempts(record) == [(SERVER_ERROR, 503), (CANCELLED, 0)]  # None without a status.
 
 
 async def test_a_callers_deadline_cancels_the_call_and_leaves_one_record() -> None:
@@ -986,7 +1058,16 @@ def test_a_bound_client_offers_no_way_to_choose_its_purpose_or_model() -> None:
     parameters = list(inspect.signature(BoundLlmClient.complete).parameters)
 
     assert public == ["complete"]
-    assert parameters == ["self", "messages", "tools", "params"]
+    assert parameters == ["self", "messages", "tools", "params", "attempt_timeout_s"]
+
+
+async def test_a_bound_client_passes_a_longer_attempt_timeout_on() -> None:
+    gateway = Gateway(completion())
+    async with connect(gateway) as llm:
+        bound: BoundLlm = llm.bind(model=GLM, tags=ANALYST)
+        await bound.complete([user("hi")], attempt_timeout_s=900)
+
+    assert request_timeouts(gateway) == [900]
 
 
 @pytest.mark.parametrize(
@@ -1013,11 +1094,13 @@ async def test_bound_clients_call_through_the_one_client_that_bound_them() -> No
     await first.complete([user("hi")])
     await second.complete([user("hi")])
 
-    await llm.aclose()  # Its connections are theirs too: neither has any of its own.
+    await llm.aclose()  # It is theirs to share: neither has a client of its own.
     with pytest.raises(RuntimeError, match="closed"):
         await first.complete([user("hi")])
 
-    assert [record.instance_id for record in recorder.records] == ["task-7", "x", "task-7"]
+    # Two calls, each recorded once; the call after the close was refused before it began.
+    assert [record.instance_id for record in recorder.records] == ["task-7", "x"]
+    assert len(gateway.requests) == 2
 
 
 # The model allowlist.
