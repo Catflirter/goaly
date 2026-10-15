@@ -63,7 +63,7 @@ class _LlmCallStatusEnumTypeWrapper(_enum_type_wrapper._EnumTypeWrapper[_LlmCall
     LLM_CALL_STATUS_OK: _LlmCallStatus.ValueType  # 1
     """The call returned a usable response."""
     LLM_CALL_STATUS_TIMEOUT: _LlmCallStatus.ValueType  # 2
-    """The request timed out."""
+    """The request timed out, at our client or at the gateway (HTTP 408)."""
     LLM_CALL_STATUS_RATE_LIMITED: _LlmCallStatus.ValueType  # 3
     """The gateway answered 429 Too Many Requests."""
     LLM_CALL_STATUS_SERVER_ERROR: _LlmCallStatus.ValueType  # 4
@@ -75,7 +75,9 @@ class _LlmCallStatusEnumTypeWrapper(_enum_type_wrapper._EnumTypeWrapper[_LlmCall
     LLM_CALL_STATUS_INVALID_RESPONSE: _LlmCallStatus.ValueType  # 7
     """A response arrived but could not be used, for example because it was malformed."""
     LLM_CALL_STATUS_CLIENT_ERROR: _LlmCallStatus.ValueType  # 8
-    """Any other 4xx: not 429 and not a context overflow, which LiteLLM also reports as a 400."""
+    """Any other 4xx: not 408, not 429 and not a context overflow, which LiteLLM also reports as a
+    400.
+    """
     LLM_CALL_STATUS_CANCELLED: _LlmCallStatus.ValueType  # 9
     """Our own code cancelled this one call, for example when a task's wall-clock budget ran out;
     the gateway may still have billed it. A whole task that the runner cancels is
@@ -90,7 +92,7 @@ LLM_CALL_STATUS_UNSPECIFIED: LlmCallStatus.ValueType  # 0
 LLM_CALL_STATUS_OK: LlmCallStatus.ValueType  # 1
 """The call returned a usable response."""
 LLM_CALL_STATUS_TIMEOUT: LlmCallStatus.ValueType  # 2
-"""The request timed out."""
+"""The request timed out, at our client or at the gateway (HTTP 408)."""
 LLM_CALL_STATUS_RATE_LIMITED: LlmCallStatus.ValueType  # 3
 """The gateway answered 429 Too Many Requests."""
 LLM_CALL_STATUS_SERVER_ERROR: LlmCallStatus.ValueType  # 4
@@ -102,7 +104,9 @@ LLM_CALL_STATUS_CONTEXT_OVERFLOW: LlmCallStatus.ValueType  # 6
 LLM_CALL_STATUS_INVALID_RESPONSE: LlmCallStatus.ValueType  # 7
 """A response arrived but could not be used, for example because it was malformed."""
 LLM_CALL_STATUS_CLIENT_ERROR: LlmCallStatus.ValueType  # 8
-"""Any other 4xx: not 429 and not a context overflow, which LiteLLM also reports as a 400."""
+"""Any other 4xx: not 408, not 429 and not a context overflow, which LiteLLM also reports as a
+400.
+"""
 LLM_CALL_STATUS_CANCELLED: LlmCallStatus.ValueType  # 9
 """Our own code cancelled this one call, for example when a task's wall-clock budget ran out;
 the gateway may still have billed it. A whole task that the runner cancels is
