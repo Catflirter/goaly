@@ -10,10 +10,11 @@ import "google/protobuf/timestamp.proto";
 
 // How one task, one seed, went in one run (spec §6.1): one line of the run's results file. Its
 // score and correctness are in its grade, and in a graded run every task gets one.
-// If several lines share run_id, instance_id and seed, the last one wins, so a late SWE grade is
-// appended as a new line. Breakdowns, by difficulty for Effi-SQL or by repository for SWE, join
-// on instance_id with the task's TaskInput, as its Trajectory records it: TaskInput itself
-// carries no ID.
+// If several lines share run_id, instance_id and seed, the last one wins, so a grade written
+// later, by the grade phase of a two-phase run (spec §6.1) or as a late SWE grade, is appended as
+// a new line. Breakdowns, by difficulty for Effi-SQL or by repository for SWE, join on
+// instance_id with the task's TaskInput, as its Trajectory records it: TaskInput itself carries
+// no ID.
 message TaskResult {
   // The run it belongs to.
   string run_id = 1;
