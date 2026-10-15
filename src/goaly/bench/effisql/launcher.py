@@ -17,6 +17,7 @@ Cancelled, it removes the container before the proxy stops and the cancellation 
 
 import asyncio
 import fcntl
+import json
 import logging
 import math
 import os
@@ -24,6 +25,7 @@ import shutil
 import subprocess
 import tarfile
 import tempfile
+import time
 from collections.abc import AsyncIterator, Callable, Iterator, Sequence
 from contextlib import AbstractAsyncContextManager, asynccontextmanager, contextmanager
 from dataclasses import dataclass
@@ -52,10 +54,12 @@ from goaly.harness.core.llm_proxy import LlmProxy
 from goaly.harness.core.settings import load_settings
 
 __all__ = [
+    "SOLVE_RUNS",
     "DockerSandbox",
     "EffiSqlLauncher",
     "SolveContainerError",
     "SolveRequestLike",
+    "SolveRun",
     "checkout_of",
     "container_argv",
     "hold_solving_instances",
@@ -70,6 +74,41 @@ _logger = logging.getLogger(__name__)
 _TASK_WALL_S = 600.0
 # How long a container may run beyond its tasks' budgets: start-up, the image, the last writes.
 _SLACK_S = 600.0
+
+
+# The host-only record of every solve run of a run, one JSON line each, beside solve/.
+SOLVE_RUNS = "solve-runs.jsonl"
+
+
+@dataclass(frozen=True)
+class SolveRun:
+    """One solve container's run, as the host saw it: the tasks it was sent, the host's clock
+    around it, the task concurrency it ran with, and how it ended.
+
+    Cost and time decisions rest on this and on the proxy's records, never on what the
+    container claims (spec §8.3): the tasks a run was not sent came from the cache.
+    """
+
+    started_at: float
+    wall_s: float
+    tasks: tuple[tuple[str, int], ...]
+    max_tasks: int
+    exit_code: int
+    timed_out: bool
+
+    def append(self, path: Path) -> None:
+        line = json.dumps(
+            {
+                "started_at": self.started_at,
+                "wall_s": self.wall_s,
+                "tasks": [list(task) for task in self.tasks],
+                "max_tasks": self.max_tasks,
+                "exit_code": self.exit_code,
+                "timed_out": self.timed_out,
+            }
+        )
+        with path.open("a", encoding="utf-8") as file:
+            file.write(line + "\n")
 
 
 class SolveContainerError(RuntimeError):
@@ -293,6 +332,7 @@ class EffiSqlLauncher:
                 run_id=request.run_id,
             )
             with hold_solving_instances(self.lock_dir(), [i.name for i in SOLVING]):
+                started = time.time()  # The host's clock around the solve (spec §8.3).
                 try:
                     result = await sandbox.run(
                         checkout, request, argv, staged, environment, timeout_s
@@ -300,7 +340,17 @@ class EffiSqlLauncher:
                 except asyncio.CancelledError:
                     await asyncio.shield(sandbox.stop(request.run_id))
                     raise
+                finished = time.time()
         await asyncio.to_thread(_write_log, log, result)
+        record = SolveRun(
+            started_at=started,
+            wall_s=finished - started,
+            tasks=tuple(request.tasks),
+            max_tasks=request.max_tasks,
+            exit_code=result.exit_code,
+            timed_out=result.timed_out,
+        )
+        await asyncio.to_thread(record.append, request.solve_dir.parent / SOLVE_RUNS)
         _logger.info(
             "the solve container exited",
             extra={"run_id": request.run_id, "exit_code": result.exit_code},
