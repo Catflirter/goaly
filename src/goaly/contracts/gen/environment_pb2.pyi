@@ -51,8 +51,8 @@ class SqlResult(_message.Message):
     def rows(self) -> _containers.RepeatedCompositeFieldContainer[_struct_pb2.ListValue]:
         """The rows, in order, each a list of one value per column; only the first rows if truncated.
         SQL NULL is a null value, so it stays distinct from the string "NULL". Integers beyond
-        ±2^53 and numeric values are strings, so no precision is lost. So are NaN and infinite
-        floats, which protobuf's JSON mapping cannot write as numbers.
+        ±2^53 and values of the SQL type numeric are strings, so no precision is lost. So are NaN
+        and infinite floats, which protobuf's JSON mapping cannot write as numbers.
         """
 
     def __init__(

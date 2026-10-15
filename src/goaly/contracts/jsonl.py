@@ -137,8 +137,9 @@ def append_jsonl(path: Path, message: Message) -> None:
     The message is serialized first, so an error leaves the file as it was. Every line these
     helpers write ends in a line feed, so a last line without one is the tail of an interrupted
     write. If it does not parse, it is cut off, as read_jsonl skips it; if it does, it lost only
-    its line feed, which is put back. Nothing locks the file: a caller with concurrent writers
-    must hold its lock across the call.
+    its line feed, which is put back. ``path`` must be a regular, seekable file, as it is opened
+    with ``a+b`` to read back from its end. Nothing locks the file: a caller with concurrent
+    writers must hold its lock across the call.
     """
     line = (to_json_line(message) + "\n").encode("utf-8")
     with path.open("a+b") as file:  # Every write goes to the end; closing the file flushes it.

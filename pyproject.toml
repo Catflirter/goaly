@@ -5,7 +5,7 @@ build-backend = "hatchling.build"
 [project]
 name = "goaly"
 version = "0.1.0"
-description = "Self-evolving harness: GLM-5.3 improves the agent harness Qwen uses on SWE-fficiency and BIRD-CRITIC."
+description = "Self-evolving harness: GLM-5.3 improves the agent harness Qwen uses on Effi-SQL and SWE-fficiency."
 requires-python = ">=3.12,<3.13"
 dependencies = [
     "protobuf>=7.35.1", # The generated code rejects a runtime older than its gencode, 7.35.1

@@ -1,5 +1,6 @@
 // The task contracts (spec §3.3): what a policy is given, what it returns, and how the result is
-// graded. Each has one variant per benchmark, in a oneof named benchmark.
+// graded. Each has one variant per benchmark, in a oneof named benchmark: effisql for the
+// "effisql" benchmark, and swe for "swefficiency".
 syntax = "proto3";
 
 package goaly.v1;
@@ -10,44 +11,40 @@ enum Split {
   SPLIT_UNSPECIFIED = 0;
   // The analyst may see its trajectories, grader feedback and gold answers.
   SPLIT_TRAIN = 1;
-  // Only the decision step sees its results.
+  // Its results go to the decision step and to the final report; the analyst never sees them.
   SPLIT_VAL = 2;
-  // Used only by the final evaluation and by v0's baseline runs.
+  // Used only for baseline v0's runs and for the final runs.
   SPLIT_HELDOUT = 3;
   // A task file outside our splits, such as the organizers' --instances file.
   SPLIT_EXTERNAL = 4;
 }
 
 // What the agent may see of a task (spec §3.3, §4): nothing gold, and nothing that gives it away.
+// Not even the task's ID: an SWE ID names the upstream pull request whose diff is the gold patch.
 message TaskInput {
-  // The benchmark's ID for the task.
-  string instance_id = 1;
-
   // The benchmark-specific fields.
   oneof benchmark {
-    // A BIRD-CRITIC task.
-    BirdTaskInput bird = 2;
+    // An Effi-SQL task.
+    EffiSqlTaskInput effisql = 1;
     // A SWE-fficiency task.
-    SweTaskInput swe = 3;
+    SweTaskInput swe = 2;
   }
 }
 
-// A BIRD-CRITIC task (spec §4.1): SQL that does not do what its user wants, to be fixed.
-message BirdTaskInput {
-  // The database the task runs against.
-  string db_id = 1;
-  // The user's question: what they want their SQL to do.
-  string query = 2;
-  // The user's SQL statements, which fail or do the wrong thing.
-  repeated string issue_sql = 3;
-  // Statements that set up the task's database copy before anything else runs on it.
-  repeated string preprocess_sql = 4;
-  // Statements that undo the task's changes to the database once its test cases have run.
-  repeated string clean_up_sql = 5;
-  // The task's category as the dataset names it; spec §4.1 lists the four.
-  string category = 6;
-  // The database schema, as text.
-  string schema = 7;
+// An Effi-SQL task (spec §4.1): rewrite a slow PostgreSQL query into an equivalent, faster one.
+// The agent never sees the gold optimized_sql, nor its fast_time or optimized_explain_analyze.
+message EffiSqlTaskInput {
+  // The database the task runs against, such as "tpch".
+  string db = 1;
+  // The original, slow query.
+  string base_sql = 2;
+  // The database's DDL, row counts and indexes, as text.
+  string schema = 3;
+  // The base query's plan, as JSON text: the task file's base_explain_analyze when it has one,
+  // otherwise our own EXPLAIN (FORMAT JSON).
+  string base_plan = 4;
+  // The dataset's difficulty label: easy, medium or hard.
+  string difficulty = 5;
 }
 
 // A SWE-fficiency task (spec §4.2): make the workload faster without breaking the tests. The
@@ -70,24 +67,24 @@ message SweTaskInput {
 
 // What a policy returns for a task.
 message Prediction {
-  // The task this answers.
+  // The task this answers. The runner sets it after solve, since TaskInput does not carry it.
   string instance_id = 1;
   // True if the policy's budget fallback produced this prediction instead of a submit (spec §5.4).
   bool fallback = 2;
 
   // The benchmark-specific answer.
   oneof benchmark {
-    // A BIRD-CRITIC answer.
-    BirdPrediction bird = 3;
+    // An Effi-SQL answer.
+    EffiSqlPrediction effisql = 3;
     // A SWE-fficiency answer.
     SwePrediction swe = 4;
   }
 }
 
-// A BIRD-CRITIC answer.
-message BirdPrediction {
-  // The fixed SQL statements, in order. The adapter writes them out as the official pred_sqls.
-  repeated string sqls = 1;
+// An Effi-SQL answer.
+message EffiSqlPrediction {
+  // The optimized query. The adapter maps it to the official record.
+  string sql = 1;
 }
 
 // A SWE-fficiency answer.
@@ -100,10 +97,12 @@ message SwePrediction {
 message Grade {
   // The task graded.
   string instance_id = 1;
-  // The score: BIRD 1 or 0; SWE SR_i (spec §4.2), already floored at 0.001.
+  // The score: Effi-SQL the R-VES credit (EffiSqlGrade.credit); SWE SR_i (spec §4.2), already
+  // floored at 0.001.
   double score = 2;
-  // BIRD: the prediction passed every test case. SWE: the patch applied and the tests passed;
-  // never true for an empty patch.
+  // Effi-SQL: the prediction matched the base query (EffiSqlGrade.matched). SWE: the patch
+  // applied and the tests passed, never for an empty patch. Never true unless status is
+  // GRADE_STATUS_GRADED.
   bool correct = 3;
   // How grading went.
   GradeStatus status = 4;
@@ -112,8 +111,8 @@ message Grade {
 
   // The benchmark-specific details.
   oneof benchmark {
-    // BIRD-CRITIC details.
-    BirdGrade bird = 6;
+    // Effi-SQL details.
+    EffiSqlGrade effisql = 6;
     // SWE-fficiency details.
     SweGrade swe = 7;
   }
@@ -125,7 +124,7 @@ enum GradeStatus {
   GRADE_STATUS_UNSPECIFIED = 0;
   // The grader evaluated the prediction.
   GRADE_STATUS_GRADED = 1;
-  // The prediction failed to run (BIRD: a statement raised an error) or to apply (SWE).
+  // The prediction failed to run (Effi-SQL: the query raised an error) or to apply (SWE).
   GRADE_STATUS_PREDICTION_FAILED = 2;
   // The prediction ran past the grader's time limit.
   GRADE_STATUS_TIMEOUT = 3;
@@ -134,25 +133,35 @@ enum GradeStatus {
   GRADE_STATUS_GRADER_ERROR = 4;
 }
 
-// The BIRD-CRITIC details of a grade.
-message BirdGrade {
-  // One result per test case, in the order the grader ran them.
-  repeated BirdTestCaseResult test_cases = 1;
-  // The error the predicted SQL raised, or empty if it raised none.
-  string execution_error = 2;
+// The Effi-SQL details of a grade, following the official evaluator's algorithm (spec §4.1). The
+// grade's score is credit, and its correct is matched, which is never true unless the status is
+// GRADE_STATUS_GRADED.
+message EffiSqlGrade {
+  // True if the prediction ran without an error or a timeout and its result equals the base
+  // query's: the same row count and the same multiset of row hashes.
+  bool matched = 1;
+  // The base query's median EXPLAIN ANALYZE execution time, in seconds; unset if not measured.
+  optional double base_time_s = 2;
+  // The prediction's median EXPLAIN ANALYZE execution time, in seconds; unset if not measured.
+  optional double pred_time_s = 3;
+  // τ = base_time_s / pred_time_s, capped at 1000. Set only when matched and both sides were
+  // timed.
+  optional double speedup = 4;
+  // The R-VES tier credit g(τ): 1 for τ ≥ 2, 0.75 for τ ≥ 1.2, 0.5 for τ ≥ 1, 0.25 for τ ≥ 0.5,
+  // and 0 otherwise. 0 when not matched.
+  double credit = 5;
+  // How many timed runs the times come from.
+  int32 timing_runs = 6;
+  // How many rows the prediction returned.
+  int32 pred_row_count = 7;
+  // How many rows the base query returned.
+  int32 base_row_count = 8;
+  // True if dev mode reused the base query's cached result signature and timing.
+  bool base_cached = 9;
 }
 
-// The result of one BIRD-CRITIC test case.
-message BirdTestCaseResult {
-  // The test case's position in the task's list of test cases, from 0.
-  int32 index = 1;
-  // True if the prediction passed the test case.
-  bool passed = 2;
-  // What the test case reported, such as why it failed; may be empty.
-  string message = 3;
-}
-
-// The SWE-fficiency details of a grade, as spec §4.2 scores it.
+// The SWE-fficiency details of a grade, as spec §4.2 scores it. For metrics, an SWE task counts as
+// solved when the grade is correct and sr > 1 / gold_speedup: a real speedup.
 message SweGrade {
   // True if the patch applied to base_commit.
   bool patch_applied = 1;
@@ -163,10 +172,10 @@ message SweGrade {
   bool empty_patch = 3;
   // The agent's speedup, T_pre / T_post. A patch that is empty, does not apply or fails the
   // tests counts as 1: no speedup.
-  double speedup = 4;
+  double agent_speedup = 4;
   // The expert patch's speedup on this machine, T_pre / T_post_gold.
   double gold_speedup = 5;
-  // SR_i = speedup / gold_speedup, before the grade's score floors it at 0.001.
+  // SR_i = agent_speedup / gold_speedup, before the grade's score floors it at 0.001.
   double sr = 6;
   // How long the workload ran before the patch (T_pre), in seconds.
   double t_pre_s = 7;
@@ -178,7 +187,7 @@ message SweGrade {
   // How much CPU time the evaluation run used, in seconds (spec §9). 0 for an empty patch, which
   // is never evaluated; a cached grade keeps the original run's times.
   double eval_cpu_s = 11;
-  // True if the result came from the evaluation cache, keyed by patch hash and task, instead of
-  // a new evaluation run.
+  // True if the result came from the grading cache, keyed by (patch hash, task), instead of a
+  // new evaluation run.
   bool cached = 9;
 }

@@ -18,11 +18,10 @@ from google.protobuf.struct_pb2 import ListValue, Struct, Value
 from google.protobuf.timestamp_pb2 import Timestamp
 
 from goaly.contracts.gen.environment_pb2 import ShellResult, SqlResult
-from goaly.contracts.gen.llm_call_pb2 import LlmCallRecord, LlmCallStatus, Usage
+from goaly.contracts.gen.llm_call_pb2 import LlmCallAttempt, LlmCallRecord, LlmCallStatus, Usage
 from goaly.contracts.gen.task_pb2 import (
-    BirdGrade,
-    BirdTaskInput,
-    BirdTestCaseResult,
+    EffiSqlPrediction,
+    EffiSqlTaskInput,
     Grade,
     GradeStatus,
     SweGrade,
@@ -92,7 +91,7 @@ def test_writes_keys_in_the_order_the_proto_declares_them_whatever_is_set() -> N
         swe=SweGrade(
             patch_applied=True,
             tests_passed=True,
-            speedup=2.0,
+            agent_speedup=2.0,
             gold_speedup=4.0,
             sr=0.5,
             t_pre_s=4.0,
@@ -103,7 +102,7 @@ def test_writes_keys_in_the_order_the_proto_declares_them_whatever_is_set() -> N
         ),
     )
     swe_keys = [
-        *("patch_applied", "tests_passed", "empty_patch", "speedup", "gold_speedup", "sr"),
+        *("patch_applied", "tests_passed", "empty_patch", "agent_speedup", "gold_speedup", "sr"),
         *("t_pre_s", "t_post_s", "eval_wall_s", "eval_cpu_s", "cached"),
     ]
 
@@ -114,23 +113,20 @@ def test_writes_keys_in_the_order_the_proto_declares_them_whatever_is_set() -> N
         assert list(fields["swe"]) == swe_keys
 
 
-def test_writes_keys_in_declaration_order_in_lists_too_not_in_number_order() -> None:
+def test_writes_keys_in_declaration_order_not_in_number_order() -> None:
     record = LlmCallRecord(status=LlmCallStatus.LLM_CALL_STATUS_OK, seed=2, call_id="c")
-    grade = Grade(bird=BirdGrade(test_cases=[BirdTestCaseResult(passed=True, message="m")]))
 
     # seed is field 13, declared after instance_id.
     assert list(parse(to_json_line(record)))[:5] == [
         *("call_id", "run_id", "instance_id", "seed", "purpose")
     ]
-    assert list(parse(to_json_line(grade))["bird"]["test_cases"][0]) == [
-        "index",
-        "passed",
-        "message",
-    ]
 
 
-def message_with_a_map() -> type[Message]:
-    """Outer, with a map of Inner, which declares field 2 before field 1. No contract has a map."""
+def message_with_a_list_and_a_map() -> type[Message]:
+    """Outer, with a list and a map of Inner, which declares field 2 before field 1.
+
+    Built at run time, so the tests do not depend on which contracts have lists or maps.
+    """
     file = descriptor_pb2.FileDescriptorProto(
         name="goaly_tests/ordering.proto", package="goaly_tests", syntax="proto3"
     )
@@ -159,16 +155,56 @@ def message_with_a_map() -> type[Message]:
         type_name=".goaly_tests.Outer.ByKeyEntry",
         label=repeated,
     )
+    outer.field.add(
+        name="items", number=2, type=message, type_name=".goaly_tests.Inner", label=repeated
+    )
     pool = descriptor_pool.DescriptorPool()
     pool.Add(file)
     return message_factory.GetMessageClass(pool.FindMessageTypeByName("goaly_tests.Outer"))
 
 
-def test_writes_the_values_of_a_map_in_declaration_order() -> None:
-    outer = message_with_a_map()()
-    getattr(outer, "by_key")["k"].early = "e"  # noqa: B009  # The type is built at run time.
+def test_writes_the_elements_of_lists_and_the_values_of_maps_in_declaration_order() -> None:
+    outer = message_with_a_list_and_a_map()()
+    getattr(outer, "items").add().early = "e"  # noqa: B009  # The type is built at run time.
+    getattr(outer, "by_key")["k"].early = "e"  # noqa: B009
 
-    assert list(parse(to_json_line(outer))["by_key"]["k"]) == ["late", "early"]
+    fields = parse(to_json_line(outer))
+
+    assert list(fields["items"][0]) == ["late", "early"]
+    assert list(fields["by_key"]["k"]) == ["late", "early"]
+
+
+def test_writes_each_attempt_of_a_call_and_only_the_retry_after_it_was_sent() -> None:
+    throttled = LlmCallAttempt(
+        wait_s=0.5,
+        latency_s=0.2,
+        status=LlmCallStatus.LLM_CALL_STATUS_RATE_LIMITED,
+        http_status=429,
+        retry_after_s=2.0,
+    )
+    answered = LlmCallAttempt(
+        wait_s=2.0, latency_s=3.1, status=LlmCallStatus.LLM_CALL_STATUS_OK, http_status=200
+    )
+    record = LlmCallRecord(attempts=[throttled, answered], wait_s=2.5, latency_s=5.8)
+
+    line = to_json_line(record)
+
+    attempts = parse(line)["attempts"]
+    assert [attempt["http_status"] for attempt in attempts] == [429, 200]
+    assert [attempt.get("retry_after_s") for attempt in attempts] == [2.0, None]
+    assert from_json_line(line, LlmCallRecord) == record
+
+
+def test_leaves_out_usage_the_gateway_did_not_report() -> None:
+    # Not reported, as when a failed call has no cost header, is not the same as zero.
+    unreported = parse(to_json_line(Usage(input_tokens=10, output_tokens=5)))
+    reported = parse(
+        to_json_line(Usage(input_tokens=10, output_tokens=5, reasoning_tokens=0, cost_usd=0.0))
+    )
+
+    assert "reasoning_tokens" not in unreported
+    assert "cost_usd" not in unreported
+    assert (reported["reasoning_tokens"], reported["cost_usd"]) == ("0", 0.0)
 
 
 def test_writes_timestamps_in_rfc_3339() -> None:
@@ -257,18 +293,19 @@ def test_writes_a_struct_as_protobuf_does() -> None:
 
 
 def test_reads_a_line_into_the_requested_type() -> None:
-    message = from_json_line('{"instance_id":"t1","bird":{"db_id":"films"}}', TaskInput)
+    message = from_json_line('{"effisql":{"db":"tpch"}}', TaskInput)
 
     assert_type(message, TaskInput)
-    assert message == TaskInput(instance_id="t1", bird=BirdTaskInput(db_id="films"))
+    assert message == TaskInput(effisql=EffiSqlTaskInput(db="tpch"))
 
 
 def test_ignores_unknown_fields_at_any_depth() -> None:
-    line = '{"instance_id":"t1","dropped":1,"bird":{"db_id":"films","also_dropped":[true]}}'
+    # TaskInput once had an instance_id: lines written before it was removed still read.
+    line = '{"dropped":1,"instance_id":"t1","effisql":{"db":"tpch","also_dropped":[true]}}'
 
     message = from_json_line(line, TaskInput)
 
-    assert message == TaskInput(instance_id="t1", bird=BirdTaskInput(db_id="films"))
+    assert message == TaskInput(effisql=EffiSqlTaskInput(db="tpch"))
 
 
 @pytest.mark.parametrize(
@@ -281,12 +318,12 @@ def test_ignores_unknown_fields_at_any_depth() -> None:
         "7",
         "null",
         "{not json",
-        '{"instance_id":7}',
+        '{"sql":7}',
     ],
 )
 def test_rejects_a_line_that_is_not_a_valid_message(line: str) -> None:
     with pytest.raises(ParseError):
-        from_json_line(line, TaskInput)
+        from_json_line(line, EffiSqlPrediction)
 
 
 # read_jsonl.
@@ -294,42 +331,44 @@ def test_rejects_a_line_that_is_not_a_valid_message(line: str) -> None:
 
 def test_reads_every_message_in_order_and_skips_blank_lines(tmp_path: Path) -> None:
     path = tmp_path / "tasks.jsonl"
-    path.write_bytes(b'{"instance_id":"a"}\n\n{"instance_id":"b"}\r\n  \n{"instance_id":"c"}')
+    path.write_bytes(b'{"sql":"a"}\n\n{"sql":"b"}\r\n  \n{"sql":"c"}')
 
-    messages = read_jsonl(path, TaskInput)
+    messages = read_jsonl(path, EffiSqlPrediction)
 
-    assert_type(messages, Iterator[TaskInput])
-    assert list(messages) == [TaskInput(instance_id=name) for name in "abc"]
+    assert_type(messages, Iterator[EffiSqlPrediction])
+    assert list(messages) == [EffiSqlPrediction(sql=name) for name in "abc"]
 
 
 def test_splits_records_on_newlines_only(tmp_path: Path) -> None:
     # str.splitlines() would also split at U+2028, U+2029 and U+0085, all valid inside JSON text.
     path = tmp_path / "tasks.jsonl"
-    path.write_text('{"instance_id":"a\u2028b\u2029c\x85d"}\n', encoding="utf-8")
+    path.write_text('{"sql":"a\u2028b\u2029c\x85d"}\n', encoding="utf-8")
 
-    assert list(read_jsonl(path, TaskInput)) == [TaskInput(instance_id="a\u2028b\u2029c\x85d")]
+    assert list(read_jsonl(path, EffiSqlPrediction)) == [
+        EffiSqlPrediction(sql="a\u2028b\u2029c\x85d")
+    ]
 
 
 def test_names_the_file_and_line_of_a_malformed_record(tmp_path: Path) -> None:
     path = tmp_path / "tasks.jsonl"
-    path.write_text('{"instance_id":"a"}\n\n{"instance_id": oops}\n{"instance_id":"c"}\n', "utf-8")
-    read: list[TaskInput] = []
+    path.write_text('{"sql":"a"}\n\n{"sql": oops}\n{"sql":"c"}\n', "utf-8")
+    read: list[EffiSqlPrediction] = []
 
     with pytest.raises(JsonlError) as raised:
-        read.extend(read_jsonl(path, TaskInput))
+        read.extend(read_jsonl(path, EffiSqlPrediction))
 
-    assert read == [TaskInput(instance_id="a")]
-    assert str(raised.value).startswith(f"{path}:3: not a valid goaly.v1.TaskInput: ")
+    assert read == [EffiSqlPrediction(sql="a")]
+    assert str(raised.value).startswith(f"{path}:3: not a valid goaly.v1.EffiSqlPrediction: ")
     assert (raised.value.path, raised.value.line_number) == (path, 3)
     assert isinstance(raised.value.__cause__, ParseError)
 
 
 def test_names_the_file_and_line_of_text_that_is_not_utf8(tmp_path: Path) -> None:
     path = tmp_path / "tasks.jsonl"
-    path.write_bytes(b'{"instance_id":"a"}\n{"instance_id":"\xff"}\n')
+    path.write_bytes(b'{"sql":"a"}\n{"sql":"\xff"}\n')
 
-    with pytest.raises(JsonlError, match=r":2: not valid UTF-8 at byte 16$") as raised:
-        list(read_jsonl(path, TaskInput))
+    with pytest.raises(JsonlError, match=r":2: not valid UTF-8 at byte 8$") as raised:
+        list(read_jsonl(path, EffiSqlPrediction))
 
     assert (raised.value.path, raised.value.line_number) == (path, 2)
 
@@ -363,14 +402,14 @@ def directory(tmp_path: Path) -> Path:
 def test_writes_one_line_per_message(tmp_path: Path) -> None:
     path = tmp_path / "tasks.jsonl"
 
-    write_jsonl(path, [TaskInput(instance_id="a"), TaskInput(instance_id="b")])
+    write_jsonl(path, [EffiSqlPrediction(sql="a"), EffiSqlPrediction(sql="b")])
 
-    assert path.read_text(encoding="utf-8") == '{"instance_id":"a"}\n{"instance_id":"b"}\n'
+    assert path.read_text(encoding="utf-8") == '{"sql":"a"}\n{"sql":"b"}\n'
 
 
 def test_write_replaces_the_whole_file(directory: Path) -> None:
     path = directory / "tasks.jsonl"
-    path.write_text('{"instance_id":"old"}\n' * 3, encoding="utf-8")
+    path.write_text('{"sql":"old"}\n' * 3, encoding="utf-8")
 
     write_jsonl(path, [])
 
@@ -380,16 +419,16 @@ def test_write_replaces_the_whole_file(directory: Path) -> None:
 
 def test_a_failed_write_leaves_the_file_as_it_was(directory: Path) -> None:
     path = directory / "tasks.jsonl"
-    path.write_text('{"instance_id":"old"}\n', encoding="utf-8")
+    path.write_text('{"sql":"old"}\n', encoding="utf-8")
 
-    def messages() -> Iterator[TaskInput]:
-        yield TaskInput(instance_id="new")
+    def messages() -> Iterator[EffiSqlPrediction]:
+        yield EffiSqlPrediction(sql="new")
         raise RuntimeError("the producer failed")
 
     with pytest.raises(RuntimeError, match="the producer failed"):
         write_jsonl(path, messages())
 
-    assert path.read_text(encoding="utf-8") == '{"instance_id":"old"}\n'
+    assert path.read_text(encoding="utf-8") == '{"sql":"old"}\n'
     assert list(directory.iterdir()) == [path]  # No temporary file is left behind.
 
 
@@ -407,19 +446,19 @@ def test_write_renames_a_file_from_the_same_directory(
     monkeypatch.setattr(Path, "replace", recording_replace)
     path = directory / "tasks.jsonl"
 
-    write_jsonl(path, [TaskInput(instance_id="a")])
+    write_jsonl(path, [EffiSqlPrediction(sql="a")])
 
     ((source, target),) = renames
     assert target == path
     assert source.parent == target.parent
-    assert path.read_text(encoding="utf-8") == '{"instance_id":"a"}\n'
+    assert path.read_text(encoding="utf-8") == '{"sql":"a"}\n'
 
 
 def test_a_written_file_gets_the_permissions_of_any_new_file(tmp_path: Path) -> None:
     path, reference = tmp_path / "tasks.jsonl", tmp_path / "reference"
     reference.touch()
 
-    write_jsonl(path, [TaskInput(instance_id="a")])
+    write_jsonl(path, [EffiSqlPrediction(sql="a")])
 
     assert stat.S_IMODE(path.stat().st_mode) == stat.S_IMODE(reference.stat().st_mode)
 
@@ -427,55 +466,57 @@ def test_a_written_file_gets_the_permissions_of_any_new_file(tmp_path: Path) -> 
 def test_appends_one_line_per_call(tmp_path: Path) -> None:
     path = tmp_path / "calls.jsonl"
 
-    append_jsonl(path, TaskInput(instance_id="a"))
-    append_jsonl(path, TaskInput(instance_id="b"))
+    append_jsonl(path, EffiSqlPrediction(sql="a"))
+    append_jsonl(path, EffiSqlPrediction(sql="b"))
 
-    assert path.read_text(encoding="utf-8") == '{"instance_id":"a"}\n{"instance_id":"b"}\n'
+    assert path.read_text(encoding="utf-8") == '{"sql":"a"}\n{"sql":"b"}\n'
 
 
 # Torn tails: a crash loses at most the line being written (spec §6.2).
 
-A_THEN_TORN = b'{"instance_id":"a"}\n{"instance_id":'
+A_THEN_TORN = b'{"sql":"a"}\n{"sql":'
 
 
 def test_append_cuts_off_a_torn_last_line(directory: Path) -> None:
     path = directory / "tasks.jsonl"
     path.write_bytes(A_THEN_TORN)
 
-    append_jsonl(path, TaskInput(instance_id="b"))
-    append_jsonl(path, TaskInput(instance_id="c"))
+    append_jsonl(path, EffiSqlPrediction(sql="b"))
+    append_jsonl(path, EffiSqlPrediction(sql="c"))
 
-    assert path.read_bytes() == b'{"instance_id":"a"}\n{"instance_id":"b"}\n{"instance_id":"c"}\n'
-    assert list(read_jsonl(path, TaskInput)) == [TaskInput(instance_id=name) for name in "abc"]
+    assert path.read_bytes() == b'{"sql":"a"}\n{"sql":"b"}\n{"sql":"c"}\n'
+    assert list(read_jsonl(path, EffiSqlPrediction)) == [
+        EffiSqlPrediction(sql=name) for name in "abc"
+    ]
 
 
 def test_append_cuts_off_a_file_that_is_one_torn_line(directory: Path) -> None:
     path = directory / "tasks.jsonl"
-    path.write_bytes(b'{"instance_id":"a')
+    path.write_bytes(b'{"sql":"a')
 
-    append_jsonl(path, TaskInput(instance_id="b"))
+    append_jsonl(path, EffiSqlPrediction(sql="b"))
 
-    assert path.read_bytes() == b'{"instance_id":"b"}\n'
+    assert path.read_bytes() == b'{"sql":"b"}\n'
 
 
 def test_append_cuts_off_a_torn_line_longer_than_a_read(directory: Path) -> None:
     path = directory / "tasks.jsonl"
-    path.write_bytes(b'{"instance_id":"a"}\n{"instance_id":"' + b"x" * 200_000)
+    path.write_bytes(b'{"sql":"a"}\n{"sql":"' + b"x" * 200_000)
 
-    append_jsonl(path, TaskInput(instance_id="b"))
+    append_jsonl(path, EffiSqlPrediction(sql="b"))
 
-    assert path.read_bytes() == b'{"instance_id":"a"}\n{"instance_id":"b"}\n'
+    assert path.read_bytes() == b'{"sql":"a"}\n{"sql":"b"}\n'
 
 
 def test_append_keeps_a_last_record_that_lost_only_its_line_feed(directory: Path) -> None:
     # The write stopped just before the line feed. read_jsonl returns this record, so the next
     # append must keep it too.
     path = directory / "tasks.jsonl"
-    path.write_bytes(b'{"instance_id":"a"}\n{"instance_id":"b"}')
+    path.write_bytes(b'{"sql":"a"}\n{"sql":"b"}')
 
-    append_jsonl(path, TaskInput(instance_id="c"))
+    append_jsonl(path, EffiSqlPrediction(sql="c"))
 
-    assert path.read_bytes() == b'{"instance_id":"a"}\n{"instance_id":"b"}\n{"instance_id":"c"}\n'
+    assert path.read_bytes() == b'{"sql":"a"}\n{"sql":"b"}\n{"sql":"c"}\n'
 
 
 def test_a_message_that_cannot_be_written_leaves_the_file_untouched(directory: Path) -> None:
@@ -491,18 +532,18 @@ def test_a_message_that_cannot_be_written_leaves_the_file_untouched(directory: P
 
 
 @pytest.mark.parametrize(
-    "torn", [b'{"instance_id":', b'{"instance_id":"\xe6\x97'], ids=["in-the-json", "in-a-character"]
+    "torn", [b'{"sql":', b'{"sql":"\xe6\x97'], ids=["in-the-json", "in-a-character"]
 )
 def test_read_skips_a_torn_last_line_with_a_warning(
     directory: Path, caplog: pytest.LogCaptureFixture, torn: bytes
 ) -> None:
     path = directory / "tasks.jsonl"
-    path.write_bytes(b'{"instance_id":"a"}\n' + torn)
+    path.write_bytes(b'{"sql":"a"}\n' + torn)
 
     with caplog.at_level(logging.WARNING, logger="goaly.contracts.jsonl"):
-        messages = list(read_jsonl(path, TaskInput))
+        messages = list(read_jsonl(path, EffiSqlPrediction))
 
-    assert messages == [TaskInput(instance_id="a")]
+    assert messages == [EffiSqlPrediction(sql="a")]
     (warning,) = caplog.records
     assert warning.levelno == logging.WARNING
     assert warning.getMessage().startswith(f"{path}:2: ")
@@ -514,5 +555,5 @@ def test_read_still_rejects_a_malformed_last_line_that_ends_in_a_line_feed(
     path = directory / "tasks.jsonl"
     path.write_bytes(A_THEN_TORN + b"\n")
 
-    with pytest.raises(JsonlError, match=r":2: not a valid goaly\.v1\.TaskInput: "):
-        list(read_jsonl(path, TaskInput))
+    with pytest.raises(JsonlError, match=r":2: not a valid goaly\.v1\.EffiSqlPrediction: "):
+        list(read_jsonl(path, EffiSqlPrediction))
