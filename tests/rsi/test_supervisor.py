@@ -50,7 +50,8 @@ action = json.loads(plan.read_text())[n]
 if action == "hang":
     time.sleep(120)
 while action == "beat":
-    beat.write_text(str(time.time()))
+    beat.with_suffix(".tmp").write_text(str(time.time()))
+    beat.with_suffix(".tmp").replace(beat)  # Atomic, as goaly.rsi.heartbeat.beat writes it.
     time.sleep(0.02)
 sys.exit(int(action))
 """
@@ -205,11 +206,14 @@ def test_a_lane_killed_with_sigkill_is_restarted(lab: Lab) -> None:
     thread.start()
     pid_file = lab.state / "effisql.pid"
     deadline = time.monotonic() + 10
-    while not pid_file.exists() and time.monotonic() < deadline:
+    while lab.runs() < 1 and time.monotonic() < deadline:  # The lane has begun its first run.
         time.sleep(0.01)
     os.kill(int(pid_file.read_text()), signal.SIGKILL)
     thread.join(20)
-    assert not thread.is_alive()
+    if thread.is_alive():  # pragma: no cover  (keep a stuck supervisor from outliving the test)
+        supervisor.stop()
+        thread.join(10)
+        raise AssertionError("the supervisor did not finish")
     assert lab.events()[:2] == [
         ("crashed", "the lane process killed by signal 9"),
         ("restarted", "after a backoff of 0.05 s"),
