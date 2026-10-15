@@ -81,20 +81,21 @@ class ContainerSpec:
 
 def run_args(spec: ContainerSpec) -> list[str]:
     """Return the ``docker run`` command line that starts the server ``spec`` describes."""
-    args = _run_args(spec)
-    return [*args[:-5], "--label", f"{SPEC_LABEL}={spec_digest(spec)}", *args[-5:]]
+    return _run_args(spec, spec_digest(spec))
 
 
 def spec_digest(spec: ContainerSpec) -> str:
     """A short digest of everything in ``spec`` that shapes the server."""
-    encoded = json.dumps(_run_args(spec)).encode()
+    encoded = json.dumps(_run_args(spec, digest=None)).encode()
     return hashlib.sha256(encoded).hexdigest()[:16]
 
 
-def _run_args(spec: ContainerSpec) -> list[str]:
+def _run_args(spec: ContainerSpec, digest: str | None) -> list[str]:
     _check_name(spec.name)
     args = ["docker", "run", "--detach", "--name", spec.name, "--network=host"]
     args += ["--shm-size", SHM_SIZE, "--user", spec.user, "--label", LABEL]
+    if digest is not None:
+        args += ["--label", f"{SPEC_LABEL}={digest}"]
     if spec.cpuset is not None:
         args += ["--cpuset-cpus", spec.cpuset]
     if spec.restart is not None:
@@ -119,9 +120,10 @@ def ensure(
 ) -> Literal["created", "started", "running", "replaced"]:
     """Make the container ``spec`` describes run, and say what that took. Idempotent.
 
-    A matching container that runs is left alone, and one that stopped is started again, so
-    its data directory is reused. A container whose spec changed is shut down cleanly and
-    replaced; the data directory, a bind mount, survives.
+    A matching container that runs, or that Docker is restarting, is left alone; one that
+    stopped is started again and a paused one unpaused, so its data directory is reused. A
+    container whose spec changed is shut down cleanly and replaced; the data directory, a bind
+    mount, survives. Raise ContainerError if the old server does not shut down cleanly.
     """
     current = state(spec.name)
     if current is None:
@@ -137,13 +139,17 @@ def ensure(
         ]
     )
     if inspected.stdout.strip() == spec_digest(spec):
-        if current == "running":
+        if current in ("running", "restarting"):
             return "running"
-        _docker(["start", spec.name])
+        _docker(["unpause" if current == "paused" else "start", spec.name])
         return "started"
-    if current == "running":
-        _docker(["stop", "--timeout", str(stop_timeout_s), spec.name])
-    _docker(["rm", spec.name])
+    if current in ("running", "restarting", "paused"):
+        code = stop(spec.name, timeout_s=stop_timeout_s)
+        if code != 0:
+            raise ContainerError(
+                f"{spec.name} exited with code {code} while being replaced; check its log"
+            )
+    _docker(["rm", "--force", spec.name])
     start(spec)
     return "replaced"
 

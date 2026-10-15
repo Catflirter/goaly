@@ -212,7 +212,7 @@ async def test_preflight_names_an_agent_role_that_is_not_read_only(writable_env:
                 writable_env.config, writable_env.credentials, None, [instance]
             ).preflight()
     finally:
-        apply_roles(admin, writable_env.credentials)
+        apply_roles(admin, writable_env.credentials, instance.kind)
 
 
 async def test_a_failing_statement_is_a_result_and_the_session_lives_on(

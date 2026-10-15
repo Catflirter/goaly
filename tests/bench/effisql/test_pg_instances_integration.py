@@ -1,12 +1,14 @@
 """The instances, their pinning and their roles, on real PostgreSQL servers.
 
-Run with ``pytest --integration``. Every write here is an attempt that must fail, so with
-``GOALY_EFFISQL_ITEST_REAL=1`` these checks also run against the real instances.
+Run with ``pytest --integration``. Every write here is an attempt that must fail, and each runs
+in a transaction that is always rolled back, so with ``GOALY_EFFISQL_ITEST_REAL=1`` these checks
+also run against the real instances: even a privilege that regressed could commit nothing.
 """
 
 import os
 import subprocess
 import sys
+from typing import Any
 
 import psycopg
 import pytest
@@ -103,45 +105,67 @@ def test_all_instances_hold_the_same_rows_and_the_alternate_database_differs(
     assert [table for table in main if main[table] == alt[table]] == ["region", "nation"]
 
 
+# Who tries, where: the agent on its solving instances, the grader on both of its databases.
+ATTEMPTERS = [
+    (AGENT_ROLE, "solving", "tpch"),
+    (GRADER_ROLE, "grading", "tpch"),
+    (GRADER_ROLE, "grading", "tpch_alt"),
+]
+
+
 @pytest.mark.parametrize("statement", WRITES)
-def test_the_agent_can_neither_write_nor_create_even_after_lifting_read_only(
-    pg_env: PgEnv, statement: str
+@pytest.mark.parametrize(("role", "kind", "db"), ATTEMPTERS)
+def test_neither_role_can_write_or_create_even_after_lifting_read_only(
+    pg_env: PgEnv, role: str, kind: str, db: str, statement: str
 ) -> None:
-    with pg_env.connect(pg_env.instance("solving"), AGENT_ROLE, "tpch", autocommit=True) as conn:
+    # Each attempt runs in a transaction that is always rolled back, so even a privilege that
+    # regressed could not commit a change to the data the scores come from.
+    instance = pg_env.instance(kind)
+    with pg_env.connect(instance, role, db, autocommit=True) as conn:
         assert conn.execute("SHOW default_transaction_read_only").fetchone() == ("on",)
         with pytest.raises(psycopg.Error):
-            conn.execute(statement)
+            _attempt(conn, statement)  # Refused by the read-only default, or by privileges.
         conn.execute("SET default_transaction_read_only = off")  # The first bypass attempt.
         with pytest.raises(errors.InsufficientPrivilege):
-            conn.execute(statement)
-    with pg_env.connect(pg_env.instance("solving"), AGENT_ROLE, "tpch", autocommit=True) as conn:
-        conn.execute("BEGIN READ WRITE")  # The second attempt: an explicitly writable transaction.
-        assert conn.execute("SHOW transaction_read_only").fetchone() == ("off",)
+            _attempt(conn, statement)
+        conn.execute("RESET default_transaction_read_only")
         with pytest.raises(errors.InsufficientPrivilege):
-            conn.execute(statement)
+            _attempt(conn, statement, writable=True)  # The second: a writable transaction.
 
 
-def test_the_agent_reads_tpch_but_cannot_connect_to_the_alternate_database(
+def _attempt(conn: psycopg.Connection[Any], statement: str, *, writable: bool = False) -> None:
+    """Try ``statement`` in a transaction that is always rolled back."""
+    with conn.transaction(force_rollback=True):
+        if writable:
+            conn.execute("SET TRANSACTION READ WRITE")
+            assert conn.execute("SHOW transaction_read_only").fetchone() == ("off",)
+        conn.execute(statement)
+
+
+def test_the_agent_reaches_tpch_on_solving_instances_and_nothing_on_grading_ones(
     pg_env: PgEnv,
 ) -> None:
     for instance in pg_env.instances:
-        with pg_env.connect(instance, AGENT_ROLE, "tpch") as conn:
-            assert conn.execute("SELECT count(*) FROM region").fetchone() == (5,)
-        for db in ("tpch_alt", "postgres"):
+        allowed = ("tpch",) if instance.kind == "solving" else ()
+        for db in ("tpch", "tpch_alt", "postgres"):
+            if db in allowed:
+                with pg_env.connect(instance, AGENT_ROLE, db) as conn:
+                    assert conn.execute("SELECT count(*) FROM region").fetchone() == (5,)
+                continue
             with pytest.raises(psycopg.OperationalError, match="permission denied for database"):
                 pg_env.connect(instance, AGENT_ROLE, db)
 
 
-def test_the_grader_reads_both_databases_and_its_writes_fail(pg_env: PgEnv) -> None:
+def test_the_grader_reads_both_databases_read_only_by_default(pg_env: PgEnv) -> None:
     grading = pg_env.instance("grading")
     for db in ("tpch", "tpch_alt"):
         with pg_env.connect(grading, GRADER_ROLE, db, autocommit=True) as conn:
             assert conn.execute("SELECT count(*) FROM nation").fetchone() == (25,)
             assert conn.execute("SHOW default_transaction_read_only").fetchone() == ("on",)
-            with pytest.raises(errors.ReadOnlySqlTransaction):
-                conn.execute("WITH d AS (DELETE FROM region RETURNING *) SELECT count(*) FROM d")
-            conn.execute("SET default_transaction_read_only = off")
-            with pytest.raises(errors.InsufficientPrivilege):
+            with (
+                pytest.raises(errors.ReadOnlySqlTransaction),
+                conn.transaction(force_rollback=True),
+            ):
                 conn.execute("WITH d AS (DELETE FROM region RETURNING *) SELECT count(*) FROM d")
 
 

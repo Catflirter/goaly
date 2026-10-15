@@ -13,15 +13,24 @@ inherit that; any other command runs under ``taskset -c 0,1,12,13``.
 
 :func:`start_instances`, :func:`stop_instances` and :func:`instance_status` are idempotent. A
 restart reuses each instance's data directory; only a new golden build makes it copy again.
-Every start reapplies the roles and privileges. Read-only comes from the privileges, and the
-role defaults only add defense in depth:
+Every start reapplies the roles and privileges, revoking everything from both roles before it
+grants anything, so no stray grant survives a restart. Read-only comes from the privileges,
+and the role defaults only add defense in depth:
 
-- the agent role connects to ``tpch`` only, with SELECT on its tables;
-- the grader role connects to both databases, with SELECT on their tables;
+- the agent role connects only to ``tpch`` on the solving instances, with SELECT on its tables;
+  on the grading instances its CONNECT is revoked outright (spec §6.2: solving and grading
+  never share an instance). Its temp files are capped at 5 GB, so one runaway sort cannot fill
+  the disk the grading instances share, and its connections per instance are capped;
+- the grader role connects to both databases on every instance, with SELECT on their tables;
 - both default to read-only transactions;
 - PUBLIC loses CONNECT and TEMPORARY on every database and CREATE on the public schema. It
   also loses pg_stat_activity, and the functions that let one session stop another, read
   another's query text or write large objects.
+
+The servers listen on ports 55432-55436, inside Linux's ephemeral port range (32768-60999):
+a client socket can briefly hold one while its server starts, and Docker's restart policy then
+retries. Reserving the ports (``sysctl net.ipv4.ip_local_reserved_ports=55432-55439``) removes
+that race.
 """
 
 import json
@@ -41,6 +50,7 @@ from pydantic import SecretStr
 from goaly.bench.effisql import pg_containers
 from goaly.bench.effisql.pg_build import (
     TPCH_TABLES,
+    BuildError,
     Connect,
     GoldenRecord,
     connector,
@@ -63,10 +73,13 @@ __all__ = [
     "GRADING",
     "INSTANCES",
     "PYTHON_CPUS",
+    "ROLE_DEFAULTS",
+    "SERVER_SETTINGS",
     "SOLVING",
     "Instance",
     "InstanceError",
     "InstanceStatus",
+    "Kind",
     "apply_roles",
     "confine_to_python_cpus",
     "connect_statements",
@@ -74,9 +87,12 @@ __all__ = [
     "database_statements",
     "environment_settings",
     "fetch_server_settings",
+    "fetch_server_settings_sync",
     "instance_spec",
     "instance_status",
     "logical_cpus",
+    "readers",
+    "require_golden_record",
     "role_statements",
     "start_instances",
     "stop_instances",
@@ -86,6 +102,7 @@ __all__ = [
 _SMT_OFFSET = 12  # Physical core N is logical CPUs N and N + 12 (spec §6.2).
 _NAME = re.compile(r"[a-z0-9][a-z0-9-]*")
 _STOP_TIMEOUT_S = 600
+_UP = frozenset({"running", "restarting", "paused"})  # States a stop must still shut down.
 
 
 class InstanceError(Exception):
@@ -99,6 +116,8 @@ def logical_cpus(cores: Sequence[int]) -> tuple[int, ...]:
 
 @dataclass(frozen=True)
 class Instance:
+    """One PostgreSQL server: its name, what it is for, its port and the CPUs it is pinned to."""
+
     name: str
     kind: Literal["solving", "grading"]
     port: int
@@ -107,6 +126,10 @@ class Instance:
     def __post_init__(self) -> None:
         if not _NAME.fullmatch(self.name):
             raise ValueError(f"instance name {self.name!r} must match {_NAME.pattern}")
+        if not 1024 <= self.port <= 65535:
+            raise ValueError(f"instance {self.name} has port {self.port}, outside 1024-65535")
+        if not self.cpus or any(cpu < 0 for cpu in self.cpus):
+            raise ValueError(f"instance {self.name} needs at least one CPU, none negative")
 
     @property
     def container(self) -> str:
@@ -143,7 +166,17 @@ def instance_spec(config: PgEnvConfig, instance: Instance) -> ContainerSpec:
     )
 
 
-_READERS = {MAIN_DB: (AGENT_ROLE, GRADER_ROLE), ALT_DB: (GRADER_ROLE,)}
+type Kind = Literal["solving", "grading"]
+
+_ROLES = (AGENT_ROLE, GRADER_ROLE)
+# Databases a role's per-database defaults may live in; a reapply clears them all.
+_DATABASES = (MAIN_DB, ALT_DB, "postgres", "template1")
+# Role-wide defaults. temp_file_limit is superuser-only, so the agent cannot lift its cap.
+ROLE_DEFAULTS: Mapping[str, Mapping[str, str]] = {
+    AGENT_ROLE: {"default_transaction_read_only": "on", "temp_file_limit": "5GB"},
+    GRADER_ROLE: {"default_transaction_read_only": "on"},
+}
+_CONNECTION_LIMITS = {AGENT_ROLE: 64, GRADER_ROLE: -1}  # Per instance; -1 means no limit.
 # Functions PUBLIC may call by default that let a session stop another one, read the text of
 # another session's query, or write data.
 _REVOKED_FUNCTIONS = (
@@ -157,64 +190,91 @@ _REVOKED_FUNCTIONS = (
     "pg_catalog.lo_import(text)",
     "pg_catalog.lo_import(text, oid)",
 )
+_STAT_ACTIVITY = sql.Identifier("pg_catalog", "pg_stat_activity")
+
+
+def readers(kind: Kind, db: str) -> tuple[str, ...]:
+    """The roles that may connect to ``db`` on an instance of ``kind`` and read its tables."""
+    if db == MAIN_DB:
+        return (AGENT_ROLE, GRADER_ROLE) if kind == "solving" else (GRADER_ROLE,)
+    if db == ALT_DB:
+        return (GRADER_ROLE,)
+    return ()
 
 
 def role_statements(verifiers: Mapping[str, str]) -> list[sql.Composed]:
-    """Statements that give each role login with its SCRAM verifier and read-only defaults.
-
-    Any default the role set for itself (a role may ALTER ROLE itself) is removed first.
-    """
+    """Statements that give each role login with its SCRAM verifier, its connection limit and
+    exactly :data:`ROLE_DEFAULTS`: any other default, such as one a role set itself, is removed."""
     statements = []
     for role, verifier in verifiers.items():
         name = sql.Identifier(role)
         attributes = "LOGIN NOSUPERUSER NOCREATEDB NOCREATEROLE NOREPLICATION NOBYPASSRLS"
         statements += [
-            sql.SQL(f"ALTER ROLE {{}} WITH {attributes} PASSWORD {{}}").format(
-                name, sql.Literal(verifier)
-            ),
+            # The limit is our own integer, written as is: a negative Literal gets a space.
+            sql.SQL(
+                f"ALTER ROLE {{}} WITH {attributes} "
+                f"CONNECTION LIMIT {int(_CONNECTION_LIMITS[role])} PASSWORD {{}}"
+            ).format(name, sql.Literal(verifier)),
             sql.SQL("ALTER ROLE {} RESET ALL").format(name),
             *(
                 sql.SQL("ALTER ROLE {} IN DATABASE {} RESET ALL").format(name, sql.Identifier(db))
-                for db in (MAIN_DB, ALT_DB)
+                for db in _DATABASES
             ),
-            sql.SQL("ALTER ROLE {} SET default_transaction_read_only = on").format(name),
+            *(
+                sql.SQL("ALTER ROLE {} SET {} = {}").format(
+                    name, sql.Identifier(setting), sql.Literal(value)
+                )
+                for setting, value in ROLE_DEFAULTS[role].items()
+            ),
         ]
     return statements
 
 
-def connect_statements() -> list[sql.Composed]:
-    """Statements that let only our roles connect, each to the databases it may use."""
+def connect_statements(kind: Kind) -> list[sql.Composed]:
+    """Statements that let only our roles connect, each to the databases it may use here.
+
+    Every right is revoked first, from PUBLIC and from both roles, so that a right granted
+    before, such as the agent's CONNECT in a copy taken from a solving instance, never survives.
+    """
     revoke = [
-        sql.SQL("REVOKE ALL ON DATABASE {} FROM PUBLIC").format(sql.Identifier(db))
-        for db in (MAIN_DB, ALT_DB, "postgres", "template1")
+        sql.SQL("REVOKE ALL ON DATABASE {} FROM PUBLIC, {}").format(
+            sql.Identifier(db), _names(_ROLES)
+        )
+        for db in _DATABASES
     ]
     grant = [
         sql.SQL("GRANT CONNECT ON DATABASE {} TO {}").format(sql.Identifier(db), _names(roles))
-        for db, roles in _READERS.items()
+        for db in (MAIN_DB, ALT_DB)
+        if (roles := readers(kind, db))
     ]
     return revoke + grant
 
 
-def database_statements(db: str) -> list[sql.Composed]:
-    """Statements, run in ``db``, that grant SELECT on its tables and nothing that writes."""
+def database_statements(db: str, kind: Kind) -> list[sql.Composed]:
+    """Statements, run in ``db``, that grant SELECT on its tables to its readers, nothing that
+    writes, and nothing to anyone else."""
     public = sql.Identifier("public")
     functions = sql.SQL(", ").join(sql.SQL(function) for function in _REVOKED_FUNCTIONS)
-    return [
-        sql.SQL("REVOKE ALL ON SCHEMA {} FROM PUBLIC").format(public),
-        sql.SQL("GRANT USAGE ON SCHEMA {} TO {}").format(public, _names(_READERS[db])),
-        sql.SQL("GRANT SELECT ON ALL TABLES IN SCHEMA {} TO {}").format(
-            public, _names(_READERS[db])
-        ),
-        sql.SQL("REVOKE EXECUTE ON FUNCTION {} FROM PUBLIC").format(functions),
-        # Every task shares the agent role, which sees its own sessions' query text here.
-        sql.SQL("REVOKE SELECT ON {} FROM PUBLIC").format(
-            sql.Identifier("pg_catalog", "pg_stat_activity")
-        ),
+    statements = [
+        sql.SQL("REVOKE ALL ON SCHEMA {} FROM PUBLIC, {}").format(public, _names(_ROLES)),
+        sql.SQL("REVOKE ALL ON ALL TABLES IN SCHEMA {} FROM {}").format(public, _names(_ROLES)),
     ]
+    if roles := readers(kind, db):
+        statements += [
+            sql.SQL("GRANT USAGE ON SCHEMA {} TO {}").format(public, _names(roles)),
+            sql.SQL("GRANT SELECT ON ALL TABLES IN SCHEMA {} TO {}").format(public, _names(roles)),
+        ]
+    statements += [
+        sql.SQL("REVOKE EXECUTE ON FUNCTION {} FROM PUBLIC, {}").format(functions, _names(_ROLES)),
+        # Every task shares the agent role, which would see its own sessions' query text here.
+        sql.SQL("REVOKE ALL ON {} FROM PUBLIC, {}").format(_STAT_ACTIVITY, _names(_ROLES)),
+    ]
+    return statements
 
 
-def apply_roles(connect: Connect, credentials: PgCredentials) -> None:
-    """Create the agent and grader roles if needed and (re)apply their passwords and grants.
+def apply_roles(connect: Connect, credentials: PgCredentials, kind: Kind) -> None:
+    """Create the agent and grader roles if needed and (re)apply their passwords and rights on
+    an instance of ``kind``.
 
     Passwords reach the server only as SCRAM verifiers computed here by libpq, so no
     statement, and no server log line, ever holds one.
@@ -229,21 +289,29 @@ def apply_roles(connect: Connect, credentials: PgCredentials) -> None:
             if role not in existing:
                 conn.execute(sql.SQL("CREATE ROLE {}").format(sql.Identifier(role)))
         verifiers = {role: _verifier(conn, role, password) for role, password in passwords.items()}
-        for statement in role_statements(verifiers) + connect_statements():
+        for statement in role_statements(verifiers) + connect_statements(kind):
             conn.execute(statement)
-    for db in _READERS:
+    for db in (MAIN_DB, ALT_DB):
         with connect(db) as conn, conn.transaction():
-            for statement in database_statements(db):
+            for statement in database_statements(db, kind):
                 conn.execute(statement)
+
+
+def require_golden_record(config: PgEnvConfig) -> GoldenRecord:
+    """The golden build's record; raise InstanceError if there is no complete build yet."""
+    record = read_golden_record(config.golden_record)
+    if record is None:
+        raise InstanceError("there is no golden build yet: run `pgenv.py build` first")
+    return record
 
 
 def start_instances(
     config: PgEnvConfig, credentials: PgCredentials, instances: Sequence[Instance] = INSTANCES
 ) -> dict[str, str]:
     """Bring every instance up from the golden build, and say what each took. Idempotent."""
-    record = read_golden_record(config.golden_record)
-    if record is None:
-        raise InstanceError("there is no golden build yet: run `pgenv.py build` first")
+    record = require_golden_record(config)
+    if not instances:
+        return {}
     with ThreadPoolExecutor(max_workers=len(instances)) as pool:  # Copying is disk-bound.
         copied = dict(
             zip(
@@ -262,8 +330,11 @@ def start_instances(
         actions[instance.name] = f"{action}, data copied" if copied[instance] else action
     for instance in instances:
         connect = connector(config.host, instance.port, credentials.admin_password)
-        wait_until_ready(connect, instance.container)
-        apply_roles(connect, credentials)
+        try:
+            wait_until_ready(connect, instance.container)
+        except BuildError as error:
+            raise InstanceError(f"{instance.name} did not start: {error}") from None
+        apply_roles(connect, credentials, instance.kind)
     return actions
 
 
@@ -271,7 +342,7 @@ def stop_instances(instances: Sequence[Instance] = INSTANCES) -> dict[str, str]:
     """Shut every running instance down cleanly; its container and data stay for a restart."""
     results: dict[str, str] = {}
     for instance in instances:
-        if pg_containers.state(instance.container) != "running":
+        if pg_containers.state(instance.container) not in _UP:
             results[instance.name] = "not running"
             continue
         code = pg_containers.stop(instance.container, timeout_s=_STOP_TIMEOUT_S)
@@ -285,6 +356,15 @@ class InstanceStatus:
     state: str | None  # The container's state, or None if there is no container.
     cpuset: str | None  # The CPUs Docker pins it to.
     accepting: bool  # True if the server accepts connections.
+
+    @property
+    def pinned(self) -> bool:
+        """Whether Docker pins the container to exactly the instance's CPUs."""
+        return self.cpuset == ",".join(str(cpu) for cpu in self.instance.cpus)
+
+    @property
+    def healthy(self) -> bool:
+        return self.state == "running" and self.accepting and self.pinned
 
 
 def instance_status(
@@ -315,7 +395,9 @@ def table_counts(connect: Connect) -> dict[str, dict[str, int]]:
                 row = conn.execute(
                     sql.SQL("SELECT count(*) FROM {}").format(sql.Identifier(table))
                 ).fetchone()
-                counts[db][table] = int(row[0]) if row else -1
+                if row is None:
+                    raise InstanceError(f"count(*) of {db}.{table} returned no row")
+                counts[db][table] = int(row[0])
     return counts
 
 
@@ -335,12 +417,16 @@ def count_problems(
     if main is not None and alt is not None:
         same = sorted(t for t, e in alt.tables.items() if main.tables[t].rows == e.rows)
         if same != ["nation", "region"]:
-            problems.append(f"{ALT_DB} has the same row counts as {MAIN_DB} in {same}")
+            problems.append(
+                f"{ALT_DB} should differ from {MAIN_DB} in every table but nation and region, "
+                f"but their row counts are equal in {same}"
+            )
     return problems
 
 
 # The server settings that change plans and timings; all stay the postgres:16 defaults, as in
-# the official TPC-H container.
+# the official TPC-H container. The settings read also hold every enable_* planner switch and
+# whatever the image's configuration file sets, such as DateStyle, TimeZone and the locales.
 SERVER_SETTINGS = (
     "server_version",
     "shared_buffers",
@@ -348,22 +434,52 @@ SERVER_SETTINGS = (
     "hash_mem_multiplier",
     "maintenance_work_mem",
     "effective_cache_size",
+    "effective_io_concurrency",
     "jit",
     "max_worker_processes",
     "max_parallel_workers",
     "max_parallel_workers_per_gather",
+    "parallel_setup_cost",
+    "parallel_tuple_cost",
+    "min_parallel_table_scan_size",
+    "min_parallel_index_scan_size",
+    "seq_page_cost",
     "random_page_cost",
+    "cpu_tuple_cost",
+    "cpu_index_tuple_cost",
+    "cpu_operator_cost",
     "default_statistics_target",
+    "from_collapse_limit",
+    "join_collapse_limit",
+    "geqo_threshold",
+)
+_SETTINGS_SQL = (
+    "SELECT name, current_setting(name) FROM pg_settings WHERE name = ANY(%s) "
+    "OR name LIKE 'enable\\_%%' OR source = 'configuration file' ORDER BY name"
 )
 
 
 async def fetch_server_settings(conn: psycopg.AsyncConnection[Any]) -> dict[str, str]:
-    """Read :data:`SERVER_SETTINGS` from a running instance, as SHOW prints them."""
-    cursor = await conn.execute(
-        "SELECT name, current_setting(name) FROM unnest(%s::text[]) AS name",
-        [list(SERVER_SETTINGS)],
-    )
-    return dict(await cursor.fetchall())
+    """Read the settings that change plans and timings from an instance, as SHOW prints them.
+
+    They are :data:`SERVER_SETTINGS`, every ``enable_*`` planner switch and each setting the
+    image's configuration file sets. Any role can read them. The five containers share one image
+    and one command line, so one instance speaks for all; comparing them is the caller's job.
+    """
+    cursor = await conn.execute(_SETTINGS_SQL, [list(SERVER_SETTINGS)])
+    return _server_settings(await cursor.fetchall())
+
+
+def fetch_server_settings_sync(conn: psycopg.Connection[Any]) -> dict[str, str]:
+    """:func:`fetch_server_settings` over a sync connection."""
+    return _server_settings(conn.execute(_SETTINGS_SQL, [list(SERVER_SETTINGS)]).fetchall())
+
+
+def _server_settings(rows: Sequence[Sequence[Any]]) -> dict[str, str]:
+    settings = {str(name): str(value) for name, value in rows}
+    if missing := [name for name in SERVER_SETTINGS if name not in settings]:
+        raise InstanceError(f"the server does not report the settings {missing}")
+    return settings
 
 
 def environment_settings(
@@ -374,11 +490,21 @@ def environment_settings(
 ) -> dict[str, str]:
     """The settings that can change Effi-SQL results, for ``RunManifest.environment_settings``.
 
-    They are the image, the server settings (from :func:`fetch_server_settings`), the dbgen
-    build, every data file's checksum and the CPU pinning.
+    They are the image the instances run, the server settings (from
+    :func:`fetch_server_settings`), what the golden build ran in and made of the cluster, the
+    dbgen build, every data file's checksum and the CPU pinning.
     """
     settings = {"postgres.image": config.image, "postgres.shm_size": SHM_SIZE}
     settings |= {f"postgres.{name}": value for name, value in sorted(server.items())}
+    golden = {
+        "image": record.image,
+        "server_version": record.server_version,
+        "encoding": record.encoding,
+        "collation": record.collation,
+        "built_at": record.built_at.isoformat(),
+    }
+    # A record from before the build kept the cluster's details lacks them.
+    settings |= {f"golden.{name}": value for name, value in golden.items() if value is not None}
     dbgen = record.dbgen
     settings |= {
         "dbgen.repository": dbgen.repository,
@@ -405,19 +531,25 @@ def _ensure_copy(config: PgEnvConfig, instance: Instance, record: GoldenRecord) 
     directory = _instance_dir(config, instance)
     marker = directory / "golden.json"
     built_at = record.built_at.isoformat()
-    if (
-        (directory / "pgdata").is_dir()
-        and marker.is_file()
-        and json.loads(marker.read_text(encoding="utf-8")).get("built_at") == built_at
-    ):
+    if (directory / "pgdata").is_dir() and _copied_at(marker) == built_at:
         return False
     pg_containers.remove(instance.container, force=True)  # It holds an older copy.
+    marker.unlink(missing_ok=True)  # Gone before the data, so a crash midway copies again.
     if (directory / "pgdata").exists():
         shutil.rmtree(directory / "pgdata")
     directory.mkdir(parents=True, exist_ok=True)
     shutil.copytree(config.golden_pgdata, directory / "pgdata", symlinks=True)
     write_private(marker, json.dumps({"built_at": built_at}) + "\n")
     return True
+
+
+def _copied_at(marker: Path) -> str | None:
+    """The build the copy came from, or None if the marker is missing or unreadable."""
+    try:
+        value = json.loads(marker.read_text(encoding="utf-8")).get("built_at")
+    except (OSError, ValueError, AttributeError):
+        return None
+    return value if isinstance(value, str) else None
 
 
 def _names(roles: Sequence[str]) -> sql.Composed:

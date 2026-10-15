@@ -86,7 +86,9 @@ class PgEnv:
                 return instance
         pytest.skip(f"no {kind} instance in GOALY_EFFISQL_ITEST_INSTANCES")
 
-    def connect(self, instance: Instance, role: str, db: str, **kwargs: Any) -> Any:
+    def connect(
+        self, instance: Instance, role: str, db: str, **kwargs: Any
+    ) -> psycopg.Connection[Any]:
         passwords = {
             ADMIN_ROLE: self.credentials.admin_password,
             AGENT_ROLE: self.credentials.agent_password,
