@@ -20,6 +20,7 @@ from typing import Protocol
 from pydantic import BaseModel
 
 from goaly.contracts.gen.environment_pb2 import ShellResult, SqlResult
+from goaly.contracts.gen.manifest_pb2 import RunManifest
 from goaly.contracts.gen.task_pb2 import Grade, Prediction, Split, TaskInput
 from goaly.contracts.gen.trajectory_pb2 import ToolResult
 
@@ -76,6 +77,10 @@ class SqlEnvironment(Environment, Protocol):
         ``sql`` holds one statement or more; the result is the last statement's. A statement
         that fails or times out gives a result with ``error`` set, not an exception. Only a
         failure of the environment itself raises EnvironmentFailure.
+
+        ``timeout_s`` bounds the execution only, not the wait for a statement slot (spec §6.2).
+        The result reports that wait as ``queue_wait_s``, apart from ``elapsed_s``, and the
+        task's wall budget is what bounds it.
         """
 
 
@@ -200,8 +205,8 @@ class Benchmark[InstanceT: Instance, EnvT: Environment](Protocol):
     bounds how many tasks run at once (spec §6.2).
 
     The organizers' task file (``goaly run --instances``) reaches an adapter when it is
-    constructed, and SPLIT_EXTERNAL then selects its tasks. Those tasks have no gold answers, so
-    runs on SPLIT_EXTERNAL are not graded; they still get one official record per task.
+    constructed, and SPLIT_EXTERNAL then selects its tasks. Runs on SPLIT_EXTERNAL are not
+    graded; they still get one official record per task.
     """
 
     @property
@@ -228,17 +233,33 @@ class Benchmark[InstanceT: Instance, EnvT: Environment](Protocol):
         """Copy out what the agent may see of ``inst``, which is never a gold answer."""
 
     async def grade(self, inst: InstanceT, prediction: Prediction) -> Grade:
-        """Grade ``prediction`` against ``inst``'s gold answers.
+        """Grade ``prediction`` for ``inst`` with the benchmark's grader.
 
-        Grading uses its own environment, never the one the task was solved in (spec §4.1).
-        Grading trouble does not raise: the returned Grade's ``status`` says what went wrong,
-        such as a prediction that failed to run, a timeout, or the grader's own failure. Runs on
-        SPLIT_EXTERNAL have no gold answers, so callers skip ``grade`` for them.
+        Effi-SQL compares the prediction's result with ``base_sql``'s and needs no gold answer;
+        SWE runs the task's tests and compares the workload's speedup with the expert patch's.
+        Grading uses its own environment, never the one the task was solved in (spec §4.1). In
+        every real run it is the grade phase: a separate process on the host that never imports
+        pack code (spec §6.1).
+        Grading trouble does not raise: the returned Grade's ``status`` says what went wrong, such
+        as a prediction that failed to run, a timeout, or the grader's own failure.
+        Runs on SPLIT_EXTERNAL are not graded, so callers never call ``grade`` for them.
 
         A prediction with no benchmark branch set, as after a crash, is graded as the
         benchmark's empty answer, the one :meth:`to_official` writes for it: Effi-SQL's
-        ``base_sql`` unchanged, which gets the identity credit (that of a speedup of 1), or an
-        empty SWE patch, scored 1/gold.
+        ``base_sql`` unchanged, which gets the credit of its measured identity τ, or an empty SWE
+        patch, scored 1/gold.
+        """
+
+    def manifest_fields(self) -> RunManifest:
+        """Return the run manifest's fields that only the adapter knows, for the runner to merge.
+
+        The partial manifest sets at most ``dataset_revision``, ``dataset_notes``,
+        ``environment_settings`` and ``dataset_sha256``. The runner sets none of these four
+        itself: it fills every other field and merges this manifest in, so each of the four,
+        ``dataset_notes`` included, comes only from here. A resumed run must match all four, so a
+        run never resumes on another dataset or in another grading mode.
+        ``environment_settings["grading_mode"]`` names the grader's mode, such as Effi-SQL's
+        "dev" or "official".
         """
 
     def to_official(self, inst: InstanceT, prediction: Prediction) -> dict[str, JsonValue]:

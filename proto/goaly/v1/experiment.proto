@@ -1,5 +1,5 @@
-// The RSI ledger contracts (spec §3.3, §8.2, §8.3, §8.6): the experiments and the lessons
-// learned from them.
+// The RSI ledger contracts (spec §3.3, §8.2, §8.3, §8.6-§8.8): the experiments with their
+// implementer runs, the lessons learned from them, and the lanes' events.
 syntax = "proto3";
 
 package goaly.v1;
@@ -87,6 +87,9 @@ message ExperimentRecord {
   string candidate_commit = 5;
   // What the candidate tries.
   Hypothesis hypothesis = 6;
+  // How the implementer agent built the candidate (spec §8.8); absent until the agent's run
+  // ends, and absent if it never started.
+  ImplementerRun implementer = 19;
   // The size of the candidate's diff against parent_version.
   DiffStats diff_stats = 7;
   // The guards' outcomes, in the order they ran.
@@ -117,6 +120,88 @@ message ExperimentRecord {
   google.protobuf.Timestamp finished_at = 18;
 }
 
+// How the implementer agent built a candidate (spec §8.2 step 2, §8.6, §8.8): one run of
+// mini-swe-agent's DefaultAgent in a Docker sandbox. Its model calls are recorded as
+// LlmCallRecords with purpose CALL_PURPOSE_RSI_IMPL and the experiment ID as run_id, and their
+// tokens and cost are in the experiment's usage_by_purpose.
+message ImplementerRun {
+  // Renamed step_count before any ledger used it.
+  reserved "steps";
+
+  // How the run ended.
+  ImplementerExit exit = 1;
+  // How many steps the agent took, one model call each; unset if the run was never measured, as
+  // for an IMPLEMENTER_EXIT_INTERRUPTED run that the restarted lane found after a crash.
+  optional int32 step_count = 2;
+  // From the agent's start to its end, in seconds; unset if the run was never measured.
+  optional double wall_time_s = 3;
+  // Where the agent's trajectory is, relative to the runs directory:
+  // rsi/<lane>/<experiment_id>/implementer.traj.json. The file stays in mini-swe-agent's own
+  // format, which it names in its trajectory_format key; it is not converted to a Trajectory.
+  // Empty if the agent saved none.
+  string trajectory_path = 4;
+  // The agent's goaly-smoke calls, in order.
+  repeated SmokeTest smoke_tests = 5;
+  // The agent's closing summary, which it submitted with COMPLETE_TASK_AND_SUBMIT_FINAL_OUTPUT:
+  // what it changed and what it checked. Empty unless the agent finished.
+  string summary = 6;
+}
+
+// How an implementer run ended (spec §8.2 step 2, §8.8). Only IMPLEMENTER_EXIT_SUBMITTED leads to
+// a commit. Every other ending makes none, and the candidate is rejected as not implemented
+// (REJECTION_REASON_IMPLEMENTATION_FAILED), except after IMPLEMENTER_EXIT_INFRASTRUCTURE or
+// IMPLEMENTER_EXIT_INTERRUPTED: neither says anything about the hypothesis, so the experiment is
+// aborted instead. A model call that fails ends the run as follows. IMPLEMENTER_EXIT_INFRASTRUCTURE
+// is a gateway outage that outlasted its retries (LLM_CALL_STATUS_RATE_LIMITED, SERVER_ERROR,
+// TIMEOUT or CONNECTION_ERROR) or an open breaker. IMPLEMENTER_EXIT_CRASHED is
+// LLM_CALL_STATUS_CONTEXT_OVERFLOW, INVALID_RESPONSE or CLIENT_ERROR. IMPLEMENTER_EXIT_INTERRUPTED
+// is LLM_CALL_STATUS_CANCELLED: our code cancelled the call.
+enum ImplementerExit {
+  // Not set.
+  IMPLEMENTER_EXIT_UNSPECIFIED = 0;
+  // The agent finished and changed its pack; goaly.rsi then commits the change on the host.
+  IMPLEMENTER_EXIT_SUBMITTED = 1;
+  // The agent finished without changing anything.
+  IMPLEMENTER_EXIT_NO_CHANGES = 2;
+  // The agent reached its step limit.
+  IMPLEMENTER_EXIT_STEP_LIMIT = 3;
+  // The agent reached its cost limit, which counts each call's cost as the gateway reports it.
+  IMPLEMENTER_EXIT_COST_LIMIT = 4;
+  // The agent reached its wall-time limit.
+  IMPLEMENTER_EXIT_TIME_LIMIT = 5;
+  // The agent stopped after too many model responses in a row that it could not parse.
+  IMPLEMENTER_EXIT_FORMAT_ERRORS = 6;
+  // The gateway or Docker failed.
+  IMPLEMENTER_EXIT_INFRASTRUCTURE = 7;
+  // The run was cut short: goaly.rsi stopped it, as when the lane's time budget ran out, or the
+  // lane crashed, and the restarted lane found the run unfinished (spec §8.7). It has a value of
+  // its own because such an experiment is aborted, while a crash of the run itself rejects the
+  // candidate.
+  IMPLEMENTER_EXIT_INTERRUPTED = 8;
+  // Any other error ended the run.
+  IMPLEMENTER_EXIT_CRASHED = 9;
+}
+
+// One goaly-smoke call by the implementer agent (spec §8.8). The host refuses any task that is
+// not in train, and any call after the second; otherwise it runs the step-3 guards on the
+// worktree as it stands, then the candidate on the task through the isolated two-phase path
+// (spec §6.1), with one seed. The smoke run's model calls count toward the experiment's
+// usage_by_purpose (spec §9).
+message SmokeTest {
+  // The task the agent asked for.
+  string instance_id = 1;
+  // The smoke run that holds the task's result and trajectory; empty if the candidate never ran.
+  string run_id = 2;
+  // The task's score, as its benchmark defines it: for Effi-SQL, the credit. Unset if the
+  // candidate never ran, because the host refused the call or a guard failed, and also if it ran
+  // but grading failed. It is optional so that such a call stays distinct from a run that scored
+  // 0.
+  optional double score = 3;
+  // What goaly-smoke told the agent besides the score: the stop reason, the step count, the cost
+  // and the last tool error; or why the host refused the call, or which guard failed.
+  string detail = 4;
+}
+
 // The size of a diff, as git diff --shortstat counts it.
 message DiffStats {
   // How many files it changes.
@@ -137,7 +222,9 @@ message GuardResult {
   string detail = 3;
 }
 
-// A check that a candidate must pass before it is evaluated (spec §8.2, §8.5).
+// A check that a candidate must pass before it is evaluated (spec §8.2, §8.5). The values are
+// declared by number. The guards run in the order of spec §8.2 step 3: ALLOWED_PATHS, CHECKSUMS,
+// HARD_CODING_SCAN, PACK_CODE_ALLOWLIST, then UNIT_TESTS.
 enum Guard {
   // Not set.
   GUARD_UNSPECIFIED = 0;
@@ -146,12 +233,20 @@ enum Guard {
   // The bench/, harness/core/ and contracts/ checksums are unchanged.
   GUARD_CHECKSUMS = 2;
   // The hard-coding scan finds nothing task-specific in the diff (spec §8.5). For Effi-SQL it
-  // rejects any fragment of a gold optimized_sql 40 or more characters long after
-  // normalization, and pack changes that embed large literal lists. For SWE (on hold) it also
-  // rejects any instance_id from any split.
+  // scans only gold-only windows: windows of any split's gold optimized_sql, 40 or more
+  // characters long after normalization, that occur in no base_sql and not in the schema DDL.
+  // It also rejects pack changes that embed large literal lists, above a size set in config.
+  // For SWE (on hold) it applies the same gold-only-fragment rule to the gold patches, with
+  // windows 40 or more characters long after normalization, and also rejects any instance_id
+  // from any split.
   GUARD_HARD_CODING_SCAN = 3;
   // The pack's unit tests pass.
   GUARD_UNIT_TESTS = 4;
+  // The static AST allowlist passes on the candidate's pack code. Spec §8.5 is the authority on
+  // its rules: the imports it allows and the names, attributes and calls it bans. It is a static
+  // defense in depth; the candidate's code itself is isolated in the keyless solve container
+  // (spec §6.1).
+  GUARD_PACK_CODE_ALLOWLIST = 5;
 }
 
 // How a candidate did against the best in one phase: screen, validate or confirm (spec §8.2,
@@ -185,6 +280,14 @@ message PhaseResult {
   optional double gain_probability = 11;
   // How many tasks regressed, as spec §8.3 defines a regression for the lane.
   optional int32 regressions = 12;
+  // The tasks on which the candidate made a matched prediction that a check flagged, in any
+  // seed, each listed once (spec §4.1). The checks are those against hard-coded results, and the
+  // flags are hard_coded, which is EffiSqlGrade.alt_matched false, and literal_result. An
+  // unmatched prediction is never checked, so it is never listed. Each task's grade, in the runs
+  // candidate_run_ids names, says which check flagged it. One flagged task fails the candidate
+  // outright, as REJECTION_REASON_HARD_CODED. On the validation and the confirmation these are
+  // per-task val IDs, so the analyst's ledger summary strips them (spec §7).
+  repeated string flagged_instance_ids = 20;
   // The candidate's mean tokens per task over the best's, which the cost guardrail checks.
   optional double token_ratio_vs_best = 13;
   // Its mean wall time per task over the best's, which the cost guardrail checks.
@@ -217,7 +320,11 @@ enum Decision {
   DECISION_ABORTED = 4;
 }
 
-// A rule that rejects a candidate: one value for each way spec §8.2 and §8.3 reject one.
+// A rule that rejects a candidate: one value for each way spec §8.2 and §8.3 reject one. The
+// values are declared by number. Roughly in evaluation order, they are: IMPLEMENTATION_FAILED,
+// GUARD_FAILED, HARD_CODED, NO_SCREEN_GAIN, EFFICIENCY_CAP, INSUFFICIENT_GAIN, COST_GUARDRAIL,
+// NOT_SIGNIFICANT, REGRESSION, OUTRANKED and NOT_CONFIRMED. HARD_CODED can also come up in the
+// validation or the confirmation. The decision code (T21) owns the exact order.
 enum RejectionReason {
   // Not set; never written.
   REJECTION_REASON_UNSPECIFIED = 0;
@@ -243,6 +350,11 @@ enum RejectionReason {
   // Effi-SQL: its gain over the validation seeds plus the confirmation seed fell below the
   // confirmation threshold.
   REJECTION_REASON_NOT_CONFIRMED = 10;
+  // It made a matched prediction that a check flagged, in the screen, the validation or the
+  // confirmation (spec §4.1, §8.2 step 4). The checks are those against hard-coded results, and
+  // this covers both flags: hard_coded, which is EffiSqlGrade.alt_matched false, and
+  // literal_result. That phase's flagged_instance_ids lists the flagged tasks.
+  REJECTION_REASON_HARD_CODED = 11;
 }
 
 // The decision thresholds, as config set them (spec §8.3: every decision records the thresholds
@@ -300,7 +412,8 @@ message PurposeUsage {
 }
 
 // A lesson the RSI system learned (spec §8.6): one entry of lessons.jsonl, from which lessons.md
-// is generated.
+// is generated. The store appends a lesson's full state on every change, and the last line for a
+// lesson_id wins.
 message Lesson {
   // A unique ID.
   string lesson_id = 1;
@@ -320,4 +433,71 @@ message Lesson {
   google.protobuf.Timestamp created_at = 7;
   // When it last changed, as when an experiment was added to helped_by or hurt_by.
   google.protobuf.Timestamp updated_at = 8;
+  // When the lesson was deleted; absent while it stands. Readers and lessons.md skip a deleted
+  // lesson. Its earlier lines stay in the file, so nothing is lost by accident.
+  google.protobuf.Timestamp deleted_at = 9;
+}
+
+// Something that happened to a lane outside any one experiment (spec §8.6, §8.7): one line of
+// lane_events.jsonl. The supervisor and the lanes append these; a restarted lane and the report
+// read them back.
+message LaneEvent {
+  // The lane.
+  Lane lane = 1;
+  // When it happened.
+  google.protobuf.Timestamp occurred_at = 2;
+  // What happened.
+  LaneEventKind kind = 3;
+  // Details in words, such as how the lane crashed, the rule that stopped it, or why a
+  // notification could not be delivered; may be empty.
+  string detail = 4;
+  // For LANE_EVENT_KIND_RESULTS_PR: the PR's number, which the ledger keeps so that a restarted
+  // lane never opens a duplicate (spec §8.7); 0 for other kinds.
+  int32 pr_number = 5;
+  // For LANE_EVENT_KIND_RESULTS_PR: the PR's URL; empty for other kinds.
+  string pr_url = 6;
+  // For LANE_EVENT_KIND_RESULTS_PR: the commit at the head of the PR's rsi/<lane>/results-<n>
+  // branch; empty for other kinds.
+  string head_commit = 7;
+  // For LANE_EVENT_KIND_RESULTS_PR: the accepted experiments whose changes the PR carries;
+  // empty for other kinds.
+  repeated string experiment_ids = 8;
+  // For LANE_EVENT_KIND_NOTIFIED and LANE_EVENT_KIND_NOTIFY_FAILED: the text of the
+  // notification, which never carries a secret or task data; empty for other kinds. It is kept
+  // apart from detail, which holds a failed delivery's error, because the next results PR lists
+  // every notification, delivered or not (spec §8.7).
+  string notification = 9;
+  // For LANE_EVENT_KIND_NOTIFIED and LANE_EVENT_KIND_NOTIFY_FAILED: the notification's ID, which
+  // ties a NOTIFY_FAILED to the NOTIFIED of its later delivery; empty for other kinds.
+  string notification_id = 10;
+  // For LANE_EVENT_KIND_STARTED: the lane's deadline, an absolute time from config that a restart
+  // never moves (spec §8.4); absent for other kinds.
+  google.protobuf.Timestamp deadline_at = 11;
+}
+
+// What happened to a lane (spec §8.4, §8.7).
+enum LaneEventKind {
+  // Not set.
+  LANE_EVENT_KIND_UNSPECIFIED = 0;
+  // The lane started: the first time, or when a new goaly rsi run resumed it from the ledger,
+  // as after the workspace stopped. deadline_at records the lane's deadline.
+  LANE_EVENT_KIND_STARTED = 1;
+  // The supervisor restarted the lane after a LANE_EVENT_KIND_CRASHED; detail gives only the
+  // backoff it waited, since the crash event holds the cause.
+  LANE_EVENT_KIND_RESTARTED = 2;
+  // Automatic recovery failed, at 5 LANE_EVENT_KIND_CRASHED events within an hour (spec §8.7), so
+  // the supervisor stopped the lane and notified the project lead.
+  LANE_EVENT_KIND_RECOVERY_FAILED = 3;
+  // The lane stopped by a stopping rule (spec §8.4); detail names the rule.
+  LANE_EVENT_KIND_STOPPED = 4;
+  // The lane opened a results PR.
+  LANE_EVENT_KIND_RESULTS_PR = 5;
+  // A notification was delivered to the ntfy topic.
+  LANE_EVENT_KIND_NOTIFIED = 6;
+  // A notification could not be delivered; it is retried.
+  LANE_EVENT_KIND_NOTIFY_FAILED = 7;
+  // The supervisor counted the lane as crashed (spec §8.7): its process died, its heartbeat was 10
+  // minutes old so it was killed, or a start failed the preflight checks. The supervisor writes
+  // it, since a killed lane cannot, and detail gives the cause. Recovery counts these events.
+  LANE_EVENT_KIND_CRASHED = 8;
 }
