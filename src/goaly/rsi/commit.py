@@ -4,19 +4,31 @@ The sandbox cannot commit, so goaly.rsi commits on the host once the agent's run
 its container is gone. It checks that every change lies inside the lane's two pack directories,
 stages only those directories, and commits once, as ``rsi(<lane>): <summary>`` with
 ``Experiment-Id`` and ``Hypothesis-Id`` trailers. It never pushes: the results PRs do (spec §8.7).
+
+What the sandbox wrote is checked before git runs in the worktree, and what git staged is
+checked again before the commit: a pack holds only regular files and directories.
 """
 
 from pathlib import PurePosixPath
 
-from goaly.rsi.git import run_git
-from goaly.rsi.lanes import lane_info
+from goaly.rsi.git import run_git, run_git_unless_no
+from goaly.rsi.lanes import LaneInfo, lane_info
 from goaly.rsi.ledger import check_id
-from goaly.rsi.workspace import Workspace, Worktree
+from goaly.rsi.workspace import (
+    GIT_FILES,
+    UnsafePackError,
+    Workspace,
+    WorkspaceError,
+    Worktree,
+    check_pack_files,
+)
 
 __all__ = ["OutsidePackError", "commit_candidate"]
 
 _SUBJECT_LIMIT = 72  # Characters, as git's own tools expect of a subject line.
 _BODY_LIMIT = 4000
+_REGULAR = frozenset({"100644", "100755"})  # git's modes for a file; 120000 is a symlink, 160000
+# a gitlink.
 
 
 class OutsidePackError(Exception):
@@ -34,15 +46,28 @@ def commit_candidate(
 
     ``summary`` is the agent's closing summary: its first line, cleaned and shortened, becomes
     the subject, and the whole of it the body. Returns None, committing nothing, if nothing
-    changed. Raises OutsidePackError, committing nothing, if any tracked or untracked path
-    outside the pack directories changed, and ValueError for an invalid hypothesis ID. Ignored
-    files are never committed. Call it only once the sandbox has stopped, so that nothing changes
-    the worktree meanwhile.
+    changed. Nothing is committed when it raises:
+
+    - WorkspaceError if ``worktree`` is not the registered worktree of its experiment, or is not
+      on its experiment's branch;
+    - UnsafePackError if a pack holds anything but regular files and directories (see
+      goaly.rsi.workspace.check_pack_files), or if its best version did; this rejects the
+      candidate;
+    - OutsidePackError if any tracked or untracked path outside the pack directories changed;
+    - ValueError for an invalid experiment or hypothesis ID.
+
+    Ignored files are never committed. Call it only once the sandbox has stopped, so that
+    nothing changes the worktree meanwhile.
     """
+    check_id(worktree.experiment_id, "experiment_id")
     check_id(hypothesis_id, "hypothesis_id")
     info = lane_info(worktree.lane)
     message = _message(info.name, summary, worktree.experiment_id, hypothesis_id)
     with workspace.lock():
+        workspace.check_registered(worktree)
+        check_pack_files(worktree)  # Before any git command runs in the worktree.
+        _check_modes(_tracked(worktree, info), "in its best version")
+        _check_branch(worktree)
         changed = [PurePosixPath(path) for path in _changed_paths(worktree)]
         outside = sorted(
             str(path)
@@ -51,8 +76,6 @@ def commit_candidate(
         )
         if outside:
             raise OutsidePackError(outside)
-        if not changed:
-            return None
         # git add fails on a pathspec that matches nothing, so stage only the pack directories
         # that exist or hold a change, such as a deleted file.
         staged = [
@@ -61,6 +84,13 @@ def commit_candidate(
             if (worktree.path / pack).exists() or any(path.is_relative_to(pack) for path in changed)
         ]
         run_git(["add", "--all", "--", *staged], cwd=worktree.path)
+        try:
+            _check_modes(_staged(worktree, info), "staged")
+        except UnsafePackError:
+            run_git(["reset", "--quiet", "--", *staged], cwd=worktree.path)
+            raise
+        if not _anything_staged(worktree):
+            return None
         run_git(
             ["commit", "--quiet", "--no-verify", "--cleanup=verbatim", "--file=-"],
             cwd=worktree.path,
@@ -69,10 +99,61 @@ def commit_candidate(
     return workspace.head(worktree)
 
 
+def _check_branch(worktree: Worktree) -> None:
+    output = run_git_unless_no(["symbolic-ref", "--quiet", "HEAD"], cwd=worktree.path)
+    head = "no branch" if output is None else output.strip()  # None: a detached HEAD.
+    if head != f"refs/heads/{worktree.branch}":
+        raise WorkspaceError(f"{worktree.path} is on {head}, not on {worktree.branch}")
+
+
+def _tracked(worktree: Worktree, info: LaneInfo) -> dict[str, str]:
+    """The mode of every path the packs hold in HEAD; ls-tree reads no file of the worktree."""
+    output = run_git(
+        ["ls-tree", "-r", "-z", "HEAD", "--", *map(str, info.pack_dirs)], cwd=worktree.path
+    )
+    entries = (entry.partition("\t") for entry in output.split("\0") if entry)
+    return {path: meta.split(" ")[0] for meta, _, path in entries}  # "<mode> <type> <object>"
+
+
+def _staged(worktree: Worktree, info: LaneInfo) -> dict[str, str]:
+    """The mode of every path of the packs in the index."""
+    output = run_git(
+        ["ls-files", "--stage", "-z", "--", *map(str, info.pack_dirs)], cwd=worktree.path
+    )
+    entries = (entry.partition("\t") for entry in output.split("\0") if entry)
+    return {path: meta.split(" ")[0] for meta, _, path in entries}  # "<mode> <object> <stage>"
+
+
+def _check_modes(modes: dict[str, str], where: str) -> None:
+    problems = []
+    for path, mode in sorted(modes.items()):
+        if mode == "160000":
+            problems.append(f"{path}: a gitlink {where}")
+        elif mode not in _REGULAR:
+            problems.append(f"{path}: mode {mode} {where}")
+        elif PurePosixPath(path).name in GIT_FILES:
+            problems.append(f"{path}: git's own file {where}")
+    if problems:
+        raise UnsafePackError(problems)
+
+
+def _anything_staged(worktree: Worktree) -> bool:
+    # diff --quiet exits with 1 when the index differs from HEAD, so its "no" is a yes here.
+    quiet = ["diff", "--cached", "--quiet", "--ignore-submodules=all"]
+    return run_git_unless_no(quiet, cwd=worktree.path) is None
+
+
 def _changed_paths(worktree: Worktree) -> list[str]:
     """The paths that differ from HEAD: changed, deleted or untracked, but not ignored."""
     output = run_git(
-        ["status", "--porcelain=v1", "-z", "--untracked-files=all", "--no-renames"],
+        [
+            "status",
+            "--porcelain=v1",
+            "-z",
+            "--untracked-files=all",
+            "--no-renames",
+            "--ignore-submodules=all",
+        ],
         cwd=worktree.path,
     )
     # Each entry is "XY <path>"; with --no-renames, none is followed by a rename's source.
@@ -92,10 +173,14 @@ def _message(lane: str, summary: str, experiment_id: str, hypothesis_id: str) ->
 
 
 def _clean(text: str) -> str:
-    """Keep printable characters and line breaks, and drop trailing spaces and blank edges."""
-    lines = text.replace("\r\n", "\n").replace("\r", "\n").split("\n")
+    """Keep printable characters and line breaks, with tabs as spaces, and drop trailing spaces
+    and blank edges. A line that starts with ``---`` gets a space before it, so that tools that
+    read a commit as a patch never take it for the end of the message.
+    """
+    lines = text.replace("\r\n", "\n").replace("\r", "\n").replace("\t", " ").split("\n")
     printable = ("".join(char for char in line if char.isprintable()).rstrip() for line in lines)
-    return "\n".join(printable).strip()[:_BODY_LIMIT]
+    kept = "\n".join(printable).strip()[:_BODY_LIMIT].split("\n")
+    return "\n".join(f" {line}" if line.startswith("---") else line for line in kept)
 
 
 def _shorten(line: str, limit: int) -> str:

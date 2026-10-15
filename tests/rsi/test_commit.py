@@ -6,7 +6,7 @@ import pytest
 
 from goaly.contracts.gen.experiment_pb2 import LANE_EFFISQL
 from goaly.rsi.commit import OutsidePackError, commit_candidate
-from goaly.rsi.workspace import Workspace, Worktree
+from goaly.rsi.workspace import Workspace, WorkspaceError, Worktree
 from tests.rsi.gitrepo import git, make_repo, write
 
 PACK = "src/goaly/harness/packs/effisql"
@@ -179,3 +179,98 @@ def test_long_subjects_are_shortened_to_72_characters(
 
     assert git(worktree.path, "log", "-1", "--format=%s").strip() == subject
     assert len(subject) <= 72
+
+
+# The pack's boundary.
+
+
+@pytest.mark.parametrize(
+    "path",
+    [
+        "src/goaly/harness/packs/swefficiency/x.py",
+        "src/goaly/harness/packs/effisql2/x.py",
+        "src/goaly/harness/packs/README.md",
+        "tests/harness/packs/effisql-extra/x.py",
+    ],
+)
+def test_a_path_just_outside_the_pack_is_outside_it(
+    workspace: Workspace, worktree: Worktree, path: str
+) -> None:
+    write(worktree.path, {path: "x = 1\n", f"{PACK}/prompt.md": "Be faster.\n"})
+
+    with pytest.raises(OutsidePackError) as caught:
+        commit_candidate(workspace, worktree, hypothesis_id="hyp-3", summary="x")
+
+    assert caught.value.paths == [path]
+
+
+# The worktree must be the one it claims to be.
+
+
+def test_a_directory_that_is_not_a_registered_worktree_is_refused(
+    workspace: Workspace, tmp_path: Path
+) -> None:
+    stray = tmp_path / "worktrees" / "effisql" / "exp-9"
+    stray.mkdir(parents=True)
+
+    with pytest.raises(WorkspaceError, match="not a registered worktree"):
+        commit_candidate(
+            workspace, Worktree(stray, LANE_EFFISQL, "exp-9"), hypothesis_id="h", summary="x"
+        )
+
+
+def test_a_worktree_claiming_another_experiment_is_refused(
+    workspace: Workspace, worktree: Worktree
+) -> None:
+    impostor = Worktree(worktree.path, LANE_EFFISQL, "exp-2")
+
+    with pytest.raises(WorkspaceError, match="not a registered worktree"):
+        commit_candidate(workspace, impostor, hypothesis_id="h", summary="x")
+
+
+def test_a_worktree_on_another_branch_is_refused(workspace: Workspace, worktree: Worktree) -> None:
+    git(worktree.path, "checkout", "--quiet", "-b", "elsewhere")
+    write(worktree.path, {f"{PACK}/prompt.md": "Be faster.\n"})
+
+    with pytest.raises(WorkspaceError, match="refs/heads/elsewhere"):
+        commit_candidate(workspace, worktree, hypothesis_id="h", summary="x")
+
+
+def test_an_invalid_experiment_id_is_refused(workspace: Workspace, worktree: Worktree) -> None:
+    with pytest.raises(ValueError, match="experiment_id"):
+        commit_candidate(
+            workspace,
+            Worktree(worktree.path, LANE_EFFISQL, "bad id"),
+            hypothesis_id="h",
+            summary="x",
+        )
+
+
+# The message.
+
+
+def test_tabs_become_spaces_and_a_line_of_dashes_cannot_end_the_message(
+    workspace: Workspace, worktree: Worktree
+) -> None:
+    write(worktree.path, {f"{PACK}/prompt.md": "Be faster.\n"})
+
+    commit_candidate(
+        workspace,
+        worktree,
+        hypothesis_id="hyp-3",
+        summary="Read\tthe plan\n---\n--- diff --git a/x b/x\nend",
+    )
+
+    message = git(worktree.path, "log", "-1", "--format=%B")
+    assert message.startswith("rsi(effisql): Read the plan\n\n")
+    assert "\n ---\n --- diff --git a/x b/x\nend\n" in message
+    assert "\n---" not in message
+
+
+def test_a_worktree_with_a_detached_head_is_refused(
+    workspace: Workspace, worktree: Worktree
+) -> None:
+    git(worktree.path, "checkout", "--quiet", "--detach")
+
+    with pytest.raises(WorkspaceError, match="no branch"):
+        commit_candidate(workspace, worktree, hypothesis_id="h", summary="x")

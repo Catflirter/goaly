@@ -1,11 +1,12 @@
 """Tests for goaly.rsi.git: how goaly.rsi runs git."""
 
+import os
 import time
 from pathlib import Path
 
 import pytest
 
-from goaly.rsi.git import GitError, run_git
+from goaly.rsi.git import GitError, run_git, run_git_unless_no
 from tests.rsi.gitrepo import git, make_repo
 
 
@@ -72,3 +73,52 @@ def test_hooks_never_run(tmp_path: Path) -> None:
     run_git(["commit", "--quiet", "--allow-empty", "--message=x"], cwd=repo)
 
     assert not marker.exists()
+
+
+def test_a_failure_that_says_nothing_on_stderr_reports_its_stdout(tmp_path: Path) -> None:
+    repo = make_repo(tmp_path / "repo")
+    (repo / "README.md").write_text("changed\n", encoding="utf-8")
+
+    with pytest.raises(GitError, match=r"\+changed") as caught:
+        run_git(["diff", "--exit-code"], cwd=repo)
+
+    assert caught.value.returncode == 1
+
+
+def test_a_timed_out_command_that_already_exited_is_still_a_timeout(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    repo = make_repo(tmp_path / "repo")
+    git(repo, "config", "alias.slow", "!sleep 1")
+
+    def gone(group: int, signal_number: int) -> None:
+        raise ProcessLookupError(group)
+
+    monkeypatch.setattr(os, "killpg", gone)
+
+    with pytest.raises(GitError, match="timed out"):
+        run_git(["slow"], cwd=repo, timeout_s=0.2)
+
+
+def test_the_users_and_the_systems_git_config_are_ignored(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    repo = make_repo(tmp_path / "repo")
+    user_config = tmp_path / "user.gitconfig"
+    user_config.write_text("[alias]\n\tshow-me = !echo from-the-user-config\n", encoding="utf-8")
+    monkeypatch.setenv("GIT_CONFIG_GLOBAL", str(user_config))
+
+    with pytest.raises(GitError, match="show-me"):
+        run_git(["show-me"], cwd=repo)
+
+
+def test_run_git_unless_no_tells_no_apart_from_a_failure(tmp_path: Path) -> None:
+    repo = make_repo(tmp_path / "repo")
+    head = git(repo, "rev-parse", "HEAD").strip()
+
+    assert run_git_unless_no(["merge-base", "--is-ancestor", head, head], cwd=repo) == ""
+    git(repo, "commit", "--quiet", "--allow-empty", "--message=later")
+    assert run_git_unless_no(["merge-base", "--is-ancestor", "HEAD", head], cwd=repo) is None
+    with pytest.raises(GitError) as caught:
+        run_git_unless_no(["merge-base", "--is-ancestor", "no-such-ref", head], cwd=repo)
+    assert caught.value.returncode == 128
