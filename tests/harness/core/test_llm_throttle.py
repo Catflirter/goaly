@@ -15,7 +15,7 @@ import pytest
 from pydantic import ValidationError
 
 from goaly.contracts.gen.llm_call_pb2 import CallPurpose, LlmCallRecord, LlmCallStatus
-from goaly.harness.core.llm import LlmClient, LlmReply, RetryPolicy
+from goaly.harness.core.llm import CallTags, LlmClient, LlmReply, RetryPolicy
 from goaly.harness.core.llm_errors import LlmError, ServerError
 from goaly.harness.core.llm_throttle import DEFAULT_SHARES, ModelThrottle, ThrottlePolicy
 from tests.harness.core.llm_fakes import (
@@ -569,6 +569,33 @@ async def test_an_open_breaker_holds_back_new_calls_and_counts_as_their_wait() -
     assert clock.sleeps == [60.0]
     assert held_back.record.attempts[0].wait_s == 60.0
     assert free.record.wait_s == 0.0  # Each model has its own breaker.
+
+
+async def test_bound_clients_share_the_limit_of_the_client_that_bound_them() -> None:
+    in_flight, peak = 0, 0
+
+    async def answer(request: httpx.Request) -> httpx.Response:
+        nonlocal in_flight, peak
+        in_flight += 1
+        peak = max(peak, in_flight)
+        await asyncio.sleep(0.01)
+        in_flight -= 1
+        return completion()
+
+    gateway = Gateway(*(answer for _ in range(6)))
+    async with LlmClient(
+        settings(), Recorder(), shares={QWEN: 2}, transport=httpx.MockTransport(gateway.handle)
+    ) as llm:
+        tasks = [
+            llm.bind(model=QWEN, tags=CallTags(CallPurpose.CALL_PURPOSE_EXEC, instance_id=f"t{n}"))
+            for n in range(3)
+        ]
+        replies = await asyncio.gather(
+            *(task.complete([user("hi")]) for task in tasks for _ in range(2))
+        )
+
+    assert len(replies) == 6
+    assert peak == 2  # Three tasks under one limit of 2: not 2 each.
 
 
 async def test_each_model_has_its_own_limit(caplog: pytest.LogCaptureFixture) -> None:
