@@ -1,9 +1,172 @@
 """Tests for the run and experiment records: trajectory, result, manifest and experiment."""
 
 import json
+from collections.abc import Sequence
 
 from goaly.contracts.gen.experiment_pb2 import PhaseResult
+from goaly.contracts.gen.trajectory_pb2 import (
+    Chat,
+    ChatMessage,
+    ChatRole,
+    ContextFold,
+    Step,
+    ToolCall,
+    ToolResult,
+    Trajectory,
+)
 from goaly.contracts.jsonl import from_json_line, to_json_line
+
+# Rebuilding the prompt a step's model call was sent, by the rule in Step's comment
+# (proto/goaly/v1/trajectory.proto). These helpers are that rule's reference implementation.
+
+type Origin = tuple[int, str] | None  # For a tool message: its step's index and tool_call_id.
+type Located = tuple[Origin, ChatMessage]
+
+
+def tool_message(tool_call_id: str, content: str) -> ChatMessage:
+    return ChatMessage(role=ChatRole.CHAT_ROLE_TOOL, tool_call_id=tool_call_id, content=content)
+
+
+def added_by(step: Step) -> list[Located]:
+    """What ``step`` adds to its chat: its assistant message, tool messages and injected ones."""
+    added: list[Located] = [(None, step.assistant)]
+    added += [
+        ((step.index, result.tool_call_id), tool_message(result.tool_call_id, result.content))
+        for result in step.tool_results
+    ]
+    added += [(None, message) for message in step.injected]
+    return added
+
+
+def unfolded(trajectory: Trajectory, step: Step) -> tuple[list[Located], list[ContextFold]]:
+    """The messages of ``step``'s prompt before folding, and the folds in effect at it."""
+    chat = trajectory.chats[step.chat]
+    messages: list[Located] = []
+    folds: list[ContextFold] = []
+    if chat.HasField("forked_from_step"):
+        forked_from = trajectory.steps[chat.forked_from_step]
+        messages, folds = unfolded(trajectory, forked_from)
+        messages += added_by(forked_from)
+    messages += [(None, message) for message in chat.initial_messages]
+    for earlier in trajectory.steps[: step.index]:
+        if earlier.chat == step.chat:
+            messages += added_by(earlier)
+            folds += earlier.folds
+    return messages, [*folds, *step.folds]
+
+
+def prompt(trajectory: Trajectory, index: int) -> list[ChatMessage]:
+    """The messages the model was sent at step ``index``, folds applied."""
+    messages, folds = unfolded(trajectory, trajectory.steps[index])
+    replacements: dict[Origin, str] = {
+        (fold.step, fold.tool_call_id): fold.replacement for fold in folds
+    }
+    return [
+        tool_message(message.tool_call_id, replacements[origin])
+        if origin in replacements
+        else message
+        for origin, message in messages
+    ]
+
+
+SYSTEM = ChatMessage(role=ChatRole.CHAT_ROLE_SYSTEM, content="You fix PostgreSQL queries.")
+TASK = ChatMessage(role=ChatRole.CHAT_ROLE_USER, content="Return each region's top 3 sales.")
+
+
+def make_step(
+    index: int,
+    chat: int,
+    *calls: str,
+    injected: Sequence[ChatMessage] = (),
+    folds: Sequence[ContextFold] = (),
+) -> Step:
+    """Step ``index``, in chat ``chat``, whose model calls a tool once per ID in ``calls``."""
+    return Step(
+        index=index,
+        chat=chat,
+        call_id=f"call-{index}",
+        assistant=ChatMessage(
+            role=ChatRole.CHAT_ROLE_ASSISTANT,
+            content=f"answer {index}",
+            tool_calls=[
+                ToolCall(id=call, name="execute_sql", arguments_json="{}") for call in calls
+            ],
+        ),
+        tool_results=[
+            ToolResult(tool_call_id=call, name="execute_sql", content=f"rows for {call}")
+            for call in calls
+        ],
+        injected=injected,
+        folds=folds,
+    )
+
+
+def tool(call: str) -> ChatMessage:
+    """The unfolded tool message that answers ``call`` in a step built by make_step."""
+    return tool_message(call, f"rows for {call}")
+
+
+def test_a_step_sees_only_its_own_chat() -> None:
+    verify = ChatMessage(role=ChatRole.CHAT_ROLE_USER, content="Check this answer: answer 0")
+    hint = ChatMessage(role=ChatRole.CHAT_ROLE_USER, content="Inspect the schema first.")
+    trajectory = Trajectory(
+        chats=[
+            Chat(label="main", initial_messages=[SYSTEM, TASK]),
+            Chat(label="verify", initial_messages=[verify]),
+        ],
+        steps=[
+            make_step(0, 0, "t1", injected=[hint]),
+            make_step(1, 1, "v1"),
+            make_step(2, 0, "t2"),
+            make_step(3, 1),
+        ],
+    )
+    steps = trajectory.steps
+
+    assert prompt(trajectory, 0) == [SYSTEM, TASK]
+    assert prompt(trajectory, 1) == [verify]
+    assert prompt(trajectory, 2) == [SYSTEM, TASK, steps[0].assistant, tool("t1"), hint]
+    assert prompt(trajectory, 3) == [verify, steps[1].assistant, tool("v1")]
+
+
+def test_chats_forked_from_a_step_continue_its_context() -> None:
+    # Self-consistency: three samples drawn from step 1's context, in which t1 was folded.
+    nudge = ChatMessage(role=ChatRole.CHAT_ROLE_USER, content="Try another approach.")
+    fold_t1 = ContextFold(step=0, tool_call_id="t1", replacement="3 rows")
+    fold_t2 = ContextFold(step=1, tool_call_id="t2", replacement="9 rows")
+    trajectory = Trajectory(
+        chats=[
+            Chat(label="main", initial_messages=[SYSTEM, TASK]),
+            Chat(label="sample-1", forked_from_step=1),
+            Chat(label="sample-2", forked_from_step=1),
+            Chat(label="sample-3", forked_from_step=1, initial_messages=[nudge]),
+        ],
+        steps=[
+            make_step(0, 0, "t1"),
+            make_step(1, 0, "t2", folds=[fold_t1]),
+            make_step(2, 1, "s1"),
+            make_step(3, 2),
+            make_step(4, 3),
+            make_step(5, 1, folds=[fold_t2]),
+            make_step(6, 0),
+        ],
+    )
+    steps = trajectory.steps
+    folded_t1 = tool_message("t1", "3 rows")
+    at_fork = [SYSTEM, TASK, steps[0].assistant, folded_t1, steps[1].assistant, tool("t2")]
+
+    assert prompt(trajectory, 1) == [SYSTEM, TASK, steps[0].assistant, folded_t1]
+    assert prompt(trajectory, 2) == at_fork
+    assert prompt(trajectory, 3) == at_fork
+    assert prompt(trajectory, 4) == [*at_fork, nudge]
+    # sample-1's own fold applies to sample-1 alone.
+    assert prompt(trajectory, 5) == [
+        *at_fork[:5],
+        tool_message("t2", "9 rows"),
+        steps[2].assistant,
+        tool("s1"),
+    ]
+    assert prompt(trajectory, 6) == at_fork  # The main chat sees none of the samples.
 
 
 def test_an_optional_statistic_keeps_its_presence_through_jsonl() -> None:
