@@ -715,6 +715,34 @@ async def test_a_call_whose_slot_came_just_before_a_halving_waits_again_first_in
     await asyncio.gather(*tasks)
 
 
+async def test_calls_that_give_their_slots_back_keep_the_order_they_came_in() -> None:
+    clock = FakeClock()
+    limiter = new_throttle(share=4, clock=clock)
+    held = [AsyncExitStack() for _ in range(4)]
+    for stack in held:
+        await stack.enter_async_context(limiter.slot(RECORD))
+    dones = [asyncio.Event() for _ in range(3)]
+    entered: list[int] = []
+    tasks = [asyncio.create_task(hold(limiter, dones[n], entered, n)) for n in range(3)]
+    await settle()
+
+    await held[0].aclose()
+    await held[1].aclose()  # Their slots go to 0 and 1, which have not resumed yet...
+    observe(limiter, RATE_LIMITED, 429, clock.now)  # ...when the limit halves to 2.
+    await settle()
+    assert (entered, limiter.in_flight) == ([], 2)  # Both gave their slots back.
+
+    await held[2].aclose()
+    await settle()
+    assert entered == [0]
+    await held[3].aclose()
+    await settle()
+    assert entered == [0, 1]  # In the order they came, not the order they gave slots back.
+    for done in dones:
+        done.set()
+    await asyncio.gather(*tasks)
+
+
 async def test_a_call_whose_slot_came_just_before_the_breaker_opened_waits_it_out() -> None:
     clock = FakeClock()
     limiter = new_throttle(share=1, clock=clock)
