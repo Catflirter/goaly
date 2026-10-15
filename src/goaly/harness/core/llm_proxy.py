@@ -10,7 +10,8 @@ real key:
 - it serves only ``POST /chat/completions``, the client's one request: any other path gets 404,
   and any other method 405;
 - it rebuilds the body from the keys core's client writes (``llm.REQUEST_KEYS``). Any other key
-  gets 400, logged as ``llm_proxy_refused``, and so does a key given twice. It sets ``stream`` to
+  gets 400, logged as ``llm_proxy_refused``; so do a key given twice and a number that is not
+  finite (NaN, or one too large for a float, which would go on as Infinity). It sets ``stream`` to
   false and ``n`` to 1, and caps ``max_tokens`` at Qwen's profile, so pack code can ask for no
   fallback model, no second reply and no longer one;
 - it forwards only the executor model: any other gets 403, logged the same way;
@@ -52,6 +53,7 @@ import http
 import itertools
 import json
 import logging
+import math
 import os
 import secrets
 import stat
@@ -650,7 +652,9 @@ def _read_tags(raw: bytes | None) -> tuple[str, str, int] | None:
 def _parse(body: bytes) -> dict[str, object]:
     """Return the JSON object in ``body``; refuse anything else, a key given twice included."""
     try:
-        payload = json.loads(body, object_pairs_hook=_object, parse_constant=_constant)
+        payload = json.loads(
+            body, object_pairs_hook=_object, parse_constant=_constant, parse_float=_finite
+        )
     except (ValueError, RecursionError):
         raise _Refusal(400, "the body is not JSON") from None
     if not isinstance(payload, dict):
@@ -669,6 +673,14 @@ def _object(pairs: list[tuple[str, object]]) -> dict[str, object]:
 def _constant(name: str) -> object:
     """Refuse NaN and Infinity, which Python reads but JSON does not allow."""
     raise _Refusal(400, f"the body holds {name}, which is not JSON")
+
+
+def _finite(text: str) -> float:
+    """Read a number, refusing one too large for a float: it would go on as Infinity."""
+    number = float(text)
+    if not math.isfinite(number):
+        raise _Refusal(400, f"the body holds {text[:20]}, which is not a finite number")
+    return number
 
 
 async def _hang_up(reader: asyncio.StreamReader) -> None:
