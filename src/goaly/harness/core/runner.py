@@ -89,7 +89,10 @@ _logger = logging.getLogger(__name__)
 DEFAULT_MAX_TASKS = 16
 # How much of an error message a record keeps.
 _MESSAGE_LIMIT = 2_000
-# What a resumed run must share with the run it resumes: anything that changes its results.
+# The manifest's fields only the benchmark's adapter knows (Benchmark.manifest_fields).
+_ADAPTER_FIELDS = ("dataset_revision", "dataset_notes", "environment_settings", "dataset_sha256")
+# What a resumed run must share with the run it resumes: anything that changes its results, so
+# it never resumes on another dataset or in another grading mode.
 _MUST_MATCH = (
     "benchmark",
     "split",
@@ -97,7 +100,7 @@ _MUST_MATCH = (
     "instance_ids",
     "harness_hash",
     "config_hash",
-    "dataset_revision",
+    *_ADAPTER_FIELDS,
     "gold_sha256",
     "git_commit",
     "uv_lock_sha256",
@@ -272,7 +275,9 @@ class Runner[InstanceT: Instance, EnvT: Environment, CtxT: TaskContext]:
 
         ``manifest`` holds the caller's part of the run's manifest: its run_id, the hashes, the
         provenance, the models and the command line. The runner adds the benchmark, the split,
-        the seeds, the instance IDs and the times, and writes it to the run directory.
+        the seeds, the instance IDs and the times, takes the dataset's fields and the
+        environment's settings from the benchmark's manifest_fields(), which alone sets them, and
+        writes the manifest to the run directory.
         ``instance_ids`` restricts the run to those instances.
 
         With ``resume``, a run directory that holds an interrupted run continues it: the tasks
@@ -325,6 +330,7 @@ class Runner[InstanceT: Instance, EnvT: Environment, CtxT: TaskContext]:
         instances = self._instances(split, instance_ids)
         manifest = RunManifest()
         manifest.CopyFrom(template)
+        _take_adapter_fields(manifest, self._benchmark.manifest_fields())
         manifest.benchmark = self._benchmark.name
         manifest.split = split
         manifest.seeds[:] = seeds
@@ -781,6 +787,17 @@ def _checked_seeds(seeds: Sequence[int]) -> list[int]:
     if any(seed < 0 for seed in seeds) or len(set(seeds)) != len(seeds):
         raise ValueError(f"the seeds must be distinct replicate indices, 0 or more: {list(seeds)}")
     return list(seeds)
+
+
+def _take_adapter_fields(manifest: RunManifest, fields: RunManifest) -> None:
+    """Set ``manifest``'s adapter fields from ``fields``, the adapter's partial manifest, and
+    nothing else from it: whatever the caller set for them, the adapter alone sets them."""
+    for name in _ADAPTER_FIELDS:
+        manifest.ClearField(name)  # type: ignore[arg-type]  # The names are the manifest's fields.
+    manifest.dataset_revision = fields.dataset_revision
+    manifest.dataset_notes.extend(fields.dataset_notes)
+    manifest.environment_settings.update(fields.environment_settings)
+    manifest.dataset_sha256 = fields.dataset_sha256
 
 
 def _recorded(files: RunFiles, keys: set[_Key]) -> dict[_Key, TaskResult]:

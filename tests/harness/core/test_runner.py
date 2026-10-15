@@ -61,7 +61,7 @@ from goaly.harness.core.runner import (
     classify_error,
     error_classifier,
 )
-from tests.fakes import FakeSqlEnvironment, ToyInstance
+from tests.fakes import TOY_DATASET_SHA256, FakeSqlEnvironment, ToyInstance
 from tests.harness.core.runner_doubles import (
     Action,
     ScriptedBenchmark,
@@ -235,11 +235,39 @@ async def test_writes_the_manifest_at_the_start_and_finishes_it_at_the_end(
     assert finished.started_at == started.started_at
     assert finished.finished_at.ToDatetime() >= finished.started_at.ToDatetime()
     expected = template()
+    expected.ClearField("dataset_revision")  # The adapter's, which the caller's never overrides.
     expected.MergeFrom(
         RunManifest(benchmark="toy", split=SPLIT_TRAIN, seeds=[0, 2], instance_ids=["t0", "t1"])
     )
+    expected.MergeFrom(benchmark.manifest_fields())
     expected.started_at.CopyFrom(started.started_at)
     assert started == expected
+
+
+class OddManifest(ScriptedBenchmark):
+    """Its manifest fields set more than the four that are an adapter's to set."""
+
+    def manifest_fields(self) -> RunManifest:
+        fields = super().manifest_fields()
+        fields.run_id = "the adapter's"
+        fields.harness_hash = "the adapter's"
+        return fields
+
+
+async def test_the_adapter_alone_sets_its_four_manifest_fields(tmp_path: Path) -> None:
+    caller = template()
+    caller.dataset_notes.append("the caller's note")
+    caller.dataset_sha256 = "c" * 64
+    caller.environment_settings["grading_mode"] = "official"
+
+    await run(make_runner(OddManifest(toy_instances(1))), tmp_path, manifest=caller)
+
+    manifest = read_manifest(RunFiles(tmp_path).manifest)
+    assert manifest.dataset_revision == "toy-revision-1"
+    assert list(manifest.dataset_notes) == ["the toy tasks are held in memory"]
+    assert manifest.dataset_sha256 == TOY_DATASET_SHA256
+    assert dict(manifest.environment_settings) == {"grading_mode": "dev"}
+    assert (manifest.run_id, manifest.harness_hash) == ("run-1", "harness-a")  # The caller's.
 
 
 async def test_a_result_and_its_trajectory_describe_the_task(tmp_path: Path) -> None:
@@ -611,6 +639,20 @@ async def test_every_task_is_recorded_whatever_its_code_raises(tmp_path: Path) -
             assert result.error_type == TASK_ERROR_TYPE_NONE
             assert result.grade.status == GRADE_STATUS_GRADED
     assert summary.ran == 24
+
+
+async def test_a_system_exit_from_the_context_still_ends_the_run(tmp_path: Path) -> None:
+    def exit_from_trajectory(ctx: StubContext) -> None:
+        ctx.trajectory_error = BaseExceptionGroup("exit", [SystemExit(4)])
+
+    runner = make_runner(
+        ScriptedBenchmark(toy_instances(1)), contexts=StubContexts(setup=exit_from_trajectory)
+    )
+
+    with pytest.raises(BaseExceptionGroup) as stopped:
+        await run(runner, tmp_path)
+
+    assert stopped.group_contains(SystemExit)
 
 
 async def test_a_system_exit_inside_a_group_still_ends_the_run(tmp_path: Path) -> None:
@@ -1273,7 +1315,8 @@ async def test_resume_without_a_run_starts_one(tmp_path: Path) -> None:
     [
         ({"manifest": template(harness_hash="harness-b")}, "harness_hash"),
         ({"manifest": template(config_hash="config-b")}, "config_hash"),
-        ({"manifest": template(dataset_revision="rev-b")}, "dataset_revision"),
+        ({"grading_mode": "official"}, "environment_settings"),
+        ({"dataset": "rev-b"}, "dataset_revision"),
         ({"manifest": template(git_commit="1" * 40)}, "git_commit"),
         ({"manifest": template(uv_lock_sha256="u" * 64)}, "uv_lock_sha256"),
         (
@@ -1287,6 +1330,7 @@ async def test_resume_without_a_run_starts_one(tmp_path: Path) -> None:
     ids=[
         "harness",
         "config",
+        "grading mode",
         "dataset",
         "commit",
         "uv.lock",
@@ -1302,14 +1346,14 @@ async def test_resume_refuses_a_run_that_does_not_match(
     instances = [*toy_instances(2), ToyInstance("v0", SPLIT_VAL, "SELECT 9 FROM slow", "SELECT 9")]
     await run(make_runner(ScriptedBenchmark(instances)), tmp_path)
     before = RunFiles(tmp_path).manifest.read_bytes()
+    options = dict(change)
+    resumed = ScriptedBenchmark(instances, grading_mode=str(options.pop("grading_mode", "dev")))
+    if "dataset" in options:
+        revision = str(options.pop("dataset"))
+        resumed.manifest_fields = lambda: RunManifest(dataset_revision=revision)  # type: ignore[method-assign]
 
     with pytest.raises(RunDirectoryError, match=field):
-        await run(
-            make_runner(ScriptedBenchmark(instances)),
-            tmp_path,
-            resume=True,
-            **change,  # type: ignore[arg-type]
-        )
+        await run(make_runner(resumed), tmp_path, resume=True, **options)  # type: ignore[arg-type]
 
     assert RunFiles(tmp_path).manifest.read_bytes() == before
 

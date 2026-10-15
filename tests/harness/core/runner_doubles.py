@@ -54,6 +54,7 @@ class ScriptedBenchmark(ToyBenchmark):
         instances: Sequence[ToyInstance],
         *,
         external: Sequence[ToyInstance] | None = None,
+        grading_mode: str = "dev",
         input_errors: Mapping[str, BaseException] | None = None,
         provision_errors: Mapping[str, BaseException] | None = None,
         provision_delay_s: float = 0.0,
@@ -62,7 +63,7 @@ class ScriptedBenchmark(ToyBenchmark):
         grade_waits: dict[str, asyncio.Event] | None = None,
         official_errors: Mapping[str, BaseException] | None = None,
     ) -> None:
-        super().__init__(instances, external=external)
+        super().__init__(instances, external=external, grading_mode=grading_mode)
         self.input_errors = dict(input_errors or {})
         self.provision_errors = dict(provision_errors or {})
         self.provision_delay_s = provision_delay_s
