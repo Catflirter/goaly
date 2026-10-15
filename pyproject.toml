@@ -10,9 +10,15 @@ requires-python = ">=3.12,<3.13"
 dependencies = [
     "httpx>=0.28", # Pre-1.0, so a minor release may break: 0.28 is the one the client is tested on
     "protobuf>=7.35.1", # The generated code rejects a runtime older than its gencode, 7.35.1
+    "psycopg-pool>=3.2", # The grading instances' connection pools
+    "psycopg[binary]>=3.2", # 3.2 added cancel_safe() and chunked-rows streaming
     "pydantic>=2.4", # 2.4 added ValidationError.errors(include_input=...)
     "pydantic-settings>=2",
+    "python-dotenv>=1", # Parses ~/.config/goaly/pg.env, as pydantic-settings does
 ]
+
+[project.scripts]
+goaly = "goaly.cli:main"
 
 [dependency-groups]
 dev = [
@@ -119,11 +125,11 @@ root_package = "goaly"
 # Lets the contracts name third-party packages, such as minisweagent.
 include_external_packages = true
 
-# T06 adds goaly.cli above goaly.rsi.
+# goaly.cli is the composition root (spec §3.1): the one module that may import every layer.
 [[tool.importlinter.contracts]]
-name = "Layers: rsi > bench > harness > contracts"
+name = "Layers: cli > rsi > bench > harness > contracts"
 type = "layers"
-layers = ["goaly.rsi", "goaly.bench", "goaly.harness", "goaly.contracts"]
+layers = ["goaly.cli", "goaly.rsi", "goaly.bench", "goaly.harness", "goaly.contracts"]
 
 [[tool.importlinter.contracts]]
 name = "Only goaly.rsi may import mini-swe-agent"

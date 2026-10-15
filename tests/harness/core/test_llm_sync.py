@@ -1,6 +1,7 @@
 """Tests for LlmClient.complete_sync: calls from worker threads, on the client's own event loop."""
 
 import asyncio
+import math
 import threading
 
 import httpx
@@ -176,11 +177,32 @@ async def test_a_call_past_its_timeout_is_cancelled_and_recorded() -> None:
             await asyncio.to_thread(
                 llm.complete_sync, [user("hi")], model=GLM, tags=IMPL, timeout_s=0.05
             )
-        while not recorder.records:  # The loop takes in the cancellation after the thread.
-            await asyncio.sleep(0.01)
+        async with asyncio.timeout(5):  # A watchdog: were the cancel gone, this would fail.
+            while not recorder.records:  # The loop takes in the cancellation after the thread.
+                await asyncio.sleep(0.01)
 
     (record,) = recorder.records
     assert record.status == LlmCallStatus.LLM_CALL_STATUS_CANCELLED
+
+
+@pytest.mark.parametrize(
+    "timeout_s",
+    [
+        pytest.param(0.0, id="zero"),
+        pytest.param(-1.0, id="negative"),
+        pytest.param(math.inf, id="infinite"),
+        pytest.param(math.nan, id="nan"),
+    ],
+)
+async def test_refuses_a_wait_that_is_not_a_positive_time(timeout_s: float) -> None:
+    gateway, recorder = Gateway(), Recorder()
+    async with connect(gateway, recorder=recorder) as llm:
+        with pytest.raises(ValueError, match="timeout_s must be a positive time"):
+            await asyncio.to_thread(
+                llm.complete_sync, [user("hi")], model=GLM, tags=IMPL, timeout_s=timeout_s
+            )
+
+    assert (gateway.requests, recorder.records) == ([], [])  # Refused before it was sent.
 
 
 async def test_a_call_the_loop_cancels_reaches_the_thread_as_a_cancellation() -> None:
