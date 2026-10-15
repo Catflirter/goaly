@@ -17,9 +17,9 @@ from goaly.contracts.gen.task_pb2 import SPLIT_EXTERNAL, SPLIT_TRAIN, SPLIT_VAL
 from goaly.contracts.jsonl import read_jsonl
 from goaly.harness.core import cli
 from goaly.harness.core.manifest import CORE_DIR, git_state, harness_hash, read_manifest
-from goaly.harness.core.registry import Dataset, Harness, HarnessOptions, Registry
+from goaly.harness.core.registry import Harness, HarnessOptions, Registry
 from goaly.harness.core.runner import RunFiles, lock_run_dir
-from tests.fakes import FakeSqlEnvironment, ToyInstance
+from tests.fakes import TOY_DATASET_SHA256, FakeSqlEnvironment, ToyInstance
 from tests.harness.core.runner_doubles import (
     ScriptedBenchmark,
     ScriptedPolicy,
@@ -79,7 +79,7 @@ class ToyFactory:
                 contexts=StubContexts(),
                 pack_dir=self.pack_dir,
                 models=(ModelSettings(model="qwen3.6-35b-a3b", temperature=0.6, thinking=True),),
-                dataset=Dataset(revision="rev-1", notes=("toy data",), gold_sha256="g" * 64),
+                gold_sha256="g" * 64,
                 cache_namespace=self.cache_namespace,
             )
         finally:
@@ -213,8 +213,11 @@ def test_runs_the_toy_benchmark_end_to_end(
     assert manifest.harness_hash == harness_hash(pack)
     assert len(manifest.config_hash) == 64
     assert list(manifest.command_line) == ["goaly", "run", *argv]
-    assert manifest.dataset_revision == "rev-1"
-    assert list(manifest.dataset_notes) == ["toy data"]
+    # The benchmark's manifest_fields() alone gives the dataset's and the environment's fields.
+    assert manifest.dataset_revision == "toy-revision-1"
+    assert list(manifest.dataset_notes) == ["the toy tasks are held in memory"]
+    assert manifest.dataset_sha256 == TOY_DATASET_SHA256
+    assert dict(manifest.environment_settings) == {"grading_mode": "dev"}
     assert manifest.gold_sha256 == "g" * 64
     assert [model.model for model in manifest.models] == ["qwen3.6-35b-a3b"]
     assert manifest.machine.hostname

@@ -237,15 +237,13 @@ def _manifest(
     harness: RunnableHarness,
     settings: dict[str, JsonValue],
 ) -> RunManifest:
-    """The caller's part of the run's manifest; the runner adds the rest."""
+    """The caller's part of the run's manifest; the runner adds the rest, the dataset's too."""
     manifest = provenance(CORE_DIR)
     manifest.run_id = args.run_id or new_run_id()
     pack = harness.pack_dir
     manifest.harness_hash = core_hash() if pack is None else harness_hash(pack)
     manifest.config_hash = config_hash(settings)
-    manifest.dataset_revision = harness.dataset.revision
-    manifest.dataset_notes[:] = harness.dataset.notes
-    manifest.gold_sha256 = harness.dataset.gold_sha256
+    manifest.gold_sha256 = harness.gold_sha256
     manifest.models.extend(harness.models)
     manifest.command_line[:] = command_line
     return manifest

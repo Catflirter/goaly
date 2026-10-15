@@ -33,7 +33,6 @@ from goaly.harness.core.runner import (
 )
 
 __all__ = [
-    "Dataset",
     "Harness",
     "HarnessFactory",
     "HarnessOptions",
@@ -46,18 +45,6 @@ __all__ = [
 
 class RegistryError(LookupError):
     """No benchmark or harness is registered under a name; the message lists those there are."""
-
-
-@dataclass(frozen=True)
-class Dataset:
-    """Where a benchmark's tasks came from, as the run manifest records it."""
-
-    # The revision of the dataset, such as the commit of its Hugging Face repository.
-    revision: str = ""
-    # How the loader changed the dataset; empty if it changed nothing.
-    notes: tuple[str, ...] = ()
-    # The SHA-256 of gold-answer files outside the dataset, in hex; empty if there are none.
-    gold_sha256: str = ""
 
 
 @dataclass(frozen=True)
@@ -106,8 +93,8 @@ class RunnableHarness(Protocol):
         """The settings of every model the pack calls."""
 
     @property
-    def dataset(self) -> Dataset:
-        """Where the benchmark's tasks came from."""
+    def gold_sha256(self) -> str:
+        """The SHA-256 of the gold-answer files outside the dataset; empty if there are none."""
 
     @property
     def cache_namespace(self) -> str:
@@ -131,7 +118,10 @@ class Harness[InstanceT: Instance, EnvT: Environment, CtxT: TaskContext]:
     pack_dir: Path | None = None
     # The settings of every model the pack calls, for the manifest.
     models: tuple[ModelSettings, ...] = ()
-    dataset: Dataset = Dataset()
+    # The SHA-256, in hex, of the gold-answer files its grader uses that are not part of the
+    # dataset, for the manifest; empty if there are none. The dataset's own fields come from the
+    # benchmark's manifest_fields() alone.
+    gold_sha256: str = ""
     # The grading identity of its runs, which keys its evaluation cache (EvalCache's namespace),
     # such as f"{mode}-{bench_fingerprint}"; empty if it cannot use a cache.
     cache_namespace: str = ""

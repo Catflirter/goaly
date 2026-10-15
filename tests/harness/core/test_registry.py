@@ -12,7 +12,6 @@ from goaly.contracts.gen.task_pb2 import SPLIT_TRAIN
 from goaly.contracts.jsonl import read_jsonl
 from goaly.harness.core.eval_cache import EvalCache
 from goaly.harness.core.registry import (
-    Dataset,
     Harness,
     HarnessOptions,
     Registry,
@@ -46,7 +45,7 @@ def toy_harness(policy: ScriptedPolicy | None = None) -> ToyHarness:
         contexts=StubContexts(),
         classify=error_classifier([(GatewayDownError, TASK_ERROR_TYPE_LLM)]),
         models=(ModelSettings(model="qwen3.6-35b-a3b", temperature=0.6),),
-        dataset=Dataset(revision="rev-a", notes=("dropped 1 task",), gold_sha256="g" * 64),
+        gold_sha256="g" * 64,
     )
 
 
@@ -149,12 +148,16 @@ async def test_a_factory_yields_a_runnable_harness(tmp_path: Path) -> None:
     async with toy(options(tmp_path)) as harness:
         runnable: RunnableHarness = harness
 
-    assert runnable.dataset == Dataset(
-        revision="rev-a", notes=("dropped 1 task",), gold_sha256="g" * 64
-    )
+    assert runnable.gold_sha256 == "g" * 64
     assert list(runnable.models) == [ModelSettings(model="qwen3.6-35b-a3b", temperature=0.6)]
     assert runnable.pack_dir is None
 
 
-def test_a_dataset_records_nothing_by_default() -> None:
-    assert Dataset() == Dataset(revision="", notes=(), gold_sha256="")
+def test_a_harness_without_gold_files_outside_the_dataset_has_no_gold_hash() -> None:
+    harness: ToyHarness = Harness(
+        benchmark=ScriptedBenchmark(toy_instances(1)),
+        policy=ScriptedPolicy(),
+        contexts=StubContexts(),
+    )
+
+    assert harness.gold_sha256 == ""
