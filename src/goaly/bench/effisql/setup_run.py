@@ -362,8 +362,9 @@ async def run_phase(
 ) -> int:
     """Run ``phase`` on every task that still needs it, on all the pool's runners at once.
 
-    ``tasks`` carry their gold. Each record is saved as its task finishes, so a rerun resumes.
-    Return how many tasks ran.
+    ``tasks`` carry their gold. Each record is saved as its task finishes, so a rerun resumes;
+    a task whose work raises is logged and left unrecorded for the rerun. Return how many tasks
+    were recorded.
     """
     records = store.load()
     jobs: list[tuple[EffiSqlInstance, _Job]] = []
@@ -390,15 +391,20 @@ async def run_phase(
         ]
     _log.info("setup phase starts", extra={"phase": phase, "tasks": len(jobs)})
 
-    async def run(task: EffiSqlInstance, job: _Job) -> None:
-        async with pool.lease(Priority.SETUP) as runner:
-            record = await job(runner, records.get(task.instance_id))
+    async def run(task: EffiSqlInstance, job: _Job) -> bool:
+        try:
+            async with pool.lease(Priority.SETUP) as runner:
+                record = await job(runner, records.get(task.instance_id))
+        except Exception:  # noqa: BLE001  # The task stays unrecorded; a rerun retries it.
+            _log.exception("setup task failed", extra={"phase": phase, "id": task.instance_id})
+            return False
         records[task.instance_id] = record
         store.save(record)
         _log.info("setup task done", extra={"phase": phase, "instance_id": task.instance_id})
+        return True
 
-    await asyncio.gather(*(run(task, job) for task, job in jobs))
-    return len(jobs)
+    done = await asyncio.gather(*(run(task, job) for task, job in jobs))
+    return sum(done)
 
 
 def _needs_measuring(record: SetupRecord | None) -> bool:

@@ -9,7 +9,7 @@ from typing import Any
 import pytest
 
 from goaly.bench.effisql.data import EffiSqlInstance
-from goaly.bench.effisql.grader import QueryTimeoutError
+from goaly.bench.effisql.grader import GraderError, QueryTimeoutError
 from goaly.bench.effisql.grading import BaseCache
 from goaly.bench.effisql.grading_pool import GradingInstance, GradingPool
 from goaly.bench.effisql.grading_service import SlotRunner, ThreadRunner
@@ -400,3 +400,16 @@ class TestRunPhase:
         asyncio.run(run_phase("negatives", pool, [instance("7")], store, cache))
         assert calls == ["7"]
         assert store.load()["7"].negatives == {"control": True, "drop": False}
+
+
+def test_a_failing_task_is_logged_and_left_for_a_rerun(
+    tmp_path: Path, caplog: pytest.LogCaptureFixture
+) -> None:
+    store = RecordStore(tmp_path)
+    main = fake_main()
+    main.results[BASE_SQL] = GraderError("the connection failed")
+    pool = pool_of(FakeSlot(main, fake_alt()))
+    tasks = [instance("7")]
+    assert asyncio.run(run_phase("measure", pool, tasks, store, BaseCache(tmp_path / "c"))) == 0
+    assert store.load() == {}
+    assert "setup task failed" in caplog.text
