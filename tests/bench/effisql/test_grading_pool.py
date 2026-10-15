@@ -3,6 +3,7 @@
 import asyncio
 import functools
 import multiprocessing
+import os
 import random
 import threading
 import time
@@ -431,6 +432,8 @@ class TestProcessRunner:
             grading_service.ProcessRunner(
                 WorkerSpec(GradingInstance("fake-1", 1)), lock_dir=tmp_path
             )
+        # The refused grader leaves the holder's PID in the lock file (it once blanked it).
+        assert (tmp_path / "fake-1.lock").read_text() == f"{os.getpid()}\n"
 
     def test_the_lock_is_released_on_close(self, tmp_path: Path) -> None:
         spec = WorkerSpec(GradingInstance("fake-2", 1))
