@@ -46,18 +46,17 @@ class TrajectoryRecorder:
     def start_chat(self, label: str, messages: Sequence[ChatMessage], *, keep_turns: int) -> int:
         """Start a chat named ``label`` that begins with ``messages``, and return its index.
 
-        The chat is an executor chat, whose prompts keep the reasoning of their last
-        ``keep_turns`` replies (Chat.keep_turns). Raise ValueError for a blank label, one that
-        another chat of the task has, or ``keep_turns`` below 1.
+        ``keep_turns`` is the chat's replay window (Chat.keep_turns): more than 0 for an
+        executor chat, whose prompts keep the reasoning of their last ``keep_turns`` replies; 0
+        for a chat whose replies replay unchanged. Raise ValueError for a blank label, one that
+        another chat of the task has, or a negative ``keep_turns``.
         """
         if not label.strip():
             raise ValueError("a chat needs a label, such as 'main'")
         if any(chat.label == label for chat in self._trajectory.chats):
             raise ValueError(f"the task already has a chat named {label!r}")
-        if keep_turns < 1:
-            raise ValueError(
-                f"an executor chat keeps at least one turn, not keep_turns={keep_turns}"
-            )
+        if keep_turns < 0:
+            raise ValueError(f"a replay window cannot be negative, as keep_turns={keep_turns} is")
         self._trajectory.chats.add(label=label, initial_messages=messages, keep_turns=keep_turns)
         return len(self._trajectory.chats) - 1
 
