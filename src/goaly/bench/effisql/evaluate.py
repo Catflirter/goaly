@@ -40,15 +40,14 @@ from goaly.contracts.gen.result_pb2 import TaskResult
 from goaly.contracts.gen.task_pb2 import SPLIT_TRAIN, Split
 from goaly.contracts.gen.trajectory_pb2 import Trajectory
 from goaly.contracts.jsonl import from_json_line
-from goaly.harness.core.manifest import content_hash, read_manifest
+from goaly.harness.core.manifest import checkout_harness_hash, read_manifest
 
 __all__ = ["EffiSqlEvaluator", "TaskBudget", "make_evaluator"]
 
 _logger = logging.getLogger(__name__)
 
-# The pack's and core's places in a checkout, which T06's host hashes for --harness-checkout.
+# The pack's place in a checkout, which T06's host hashes, with core, for --harness-checkout.
 _PACK = Path("src/goaly/harness/packs/effisql")
-_CORE = Path("src/goaly/harness/core")
 # The host CLI's option naming the checkout whose pack the solve container runs (T06).
 _CHECKOUT_OPTION = "--harness-checkout"
 # How far the per-task usage may drift from the proxy's total before it is flagged.
@@ -265,7 +264,7 @@ class EffiSqlEvaluator:
                 snapshot = self.snapshot(commit, tree)
             except (RuntimeError, OSError):
                 return [], []
-        wanted = content_hash({"core": snapshot / _CORE, "pack": snapshot / _PACK})
+        wanted = checkout_harness_hash(snapshot, _PACK)  # As the host hashes --harness-checkout.
         results: dict[tuple[str, int], TaskResult] = {}
         trajectories: dict[tuple[str, int], Trajectory] = {}
         for manifest_path in sorted(self.runs_dir.glob("*/manifest.json")):
