@@ -12,8 +12,8 @@ checked again before the commit: a pack holds only regular files and directories
 from pathlib import PurePosixPath
 
 from goaly.rsi.git import run_git, run_git_unless_no
+from goaly.rsi.ids import check_id
 from goaly.rsi.lanes import LaneInfo, lane_info
-from goaly.rsi.ledger import check_id
 from goaly.rsi.workspace import (
     GIT_FILES,
     UnsafePackError,
