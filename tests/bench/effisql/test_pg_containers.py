@@ -157,7 +157,7 @@ def test_stop_returns_the_servers_exit_code(docker: FakeDocker) -> None:
     docker.exit_code = "0"
 
     assert stop(NAME, timeout_s=60) == 0
-    assert ["stop", "--time", "60", NAME] in docker.calls
+    assert ["stop", "--timeout", "60", NAME] in docker.calls
 
 
 def test_remove_skips_an_absent_container_and_can_force(docker: FakeDocker) -> None:
@@ -192,3 +192,22 @@ def test_a_missing_docker_binary_is_reported(monkeypatch: pytest.MonkeyPatch) ->
 
     with pytest.raises(ContainerError, match="not on PATH"):
         state(NAME)
+
+
+@pytest.mark.parametrize(
+    "call",
+    [
+        lambda name: state(name),
+        lambda name: stop(name, timeout_s=1),
+        lambda name: remove(name, force=True),
+        lambda name: logs(name),
+    ],
+    ids=["state", "stop", "remove", "logs"],
+)
+def test_no_command_touches_a_container_outside_our_namespace(
+    docker: FakeDocker, call: object
+) -> None:
+    with pytest.raises(ContainerError, match="outside our namespace"):
+        call("postgres")  # type: ignore[operator]  # A lambda from parametrize.
+
+    assert docker.calls == []
