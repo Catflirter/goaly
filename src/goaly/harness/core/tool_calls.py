@@ -16,6 +16,7 @@ import hashlib
 import json
 import re
 from collections.abc import Iterable, Mapping
+from typing import NoReturn
 
 from goaly.contracts.gen.trajectory_pb2 import (
     TOOL_CALL_SOURCE_CONTENT_XML,
@@ -101,10 +102,10 @@ def repair_arguments(text: str) -> str | None:
     if not stripped:
         return "{}"
     try:
-        value = json.loads(_close(stripped), strict=False)
-    except (ValueError, RecursionError):  # RecursionError: nested too deep to parse.
+        value = _loads(_close(stripped), strict=False)
+        return _to_json(value) if isinstance(value, dict) else None
+    except (ValueError, RecursionError):  # RecursionError: nested too deep to parse or write.
         return None
-    return json.dumps(value, ensure_ascii=False) if isinstance(value, dict) else None
 
 
 def _standard(call: ToolCall) -> ToolCall:
@@ -134,7 +135,7 @@ def _xml_calls(
             for written_key, value in _PARAMETER.findall(body):
                 key = written_key.strip()
                 values[key] = _coerce(_trim(value), _types(parameters, key))
-            arguments_json = json.dumps(values, ensure_ascii=False)
+            arguments_json = _to_json(values)  # Each value was checked as it was coerced.
             calls.append(ToolCall(name=name, arguments_json=arguments_json, source=source))
     return calls
 
@@ -192,7 +193,8 @@ def _coerce(value: str, types: frozenset[str]) -> JsonValue:
     if "boolean" in types and text.lower() in ("true", "false"):
         return text.lower() == "true"
     try:
-        parsed: JsonValue = json.loads(text)  # A number, an object or an array.
+        parsed = _loads(text)  # A number, an object or an array.
+        _to_json([parsed])  # Writable inside the arguments, a level deeper, or kept as written.
     except (ValueError, RecursionError):
         return value
     return parsed
@@ -211,9 +213,37 @@ def _call_id(index: int, call: ToolCall) -> str:
 
 def _is_json_object(text: str) -> bool:
     try:
-        return isinstance(json.loads(text), dict)
+        return isinstance(_loads(text), dict)
     except (ValueError, RecursionError):
         return False
+
+
+def _loads(text: str, *, strict: bool = True) -> JsonValue:
+    """Parse ``text`` as JSON, refusing NaN and the infinities, which JSON has no token for.
+
+    Raise ValueError if it is not JSON, and RecursionError if it nests too deep to parse.
+    """
+    parsed: JsonValue = json.loads(text, strict=strict, parse_constant=_refuse)
+    return parsed
+
+
+def _refuse(constant: str) -> NoReturn:
+    raise ValueError(f"{constant} is not a JSON number")
+
+
+def _to_json(value: JsonValue) -> str:
+    """Write ``value`` as JSON text that a protobuf string can hold.
+
+    Text UTF-8 cannot encode, such as the lone surrogate that a \\ud800 escape decodes to, is
+    written in ASCII, with \\u escapes. Raise ValueError for a number JSON has no token for, such
+    as the infinity that 1e999 parses to, and RecursionError for a value nested too deep.
+    """
+    text = json.dumps(value, ensure_ascii=False, allow_nan=False)
+    try:
+        text.encode()
+    except UnicodeEncodeError:
+        return json.dumps(value, allow_nan=False)
+    return text
 
 
 def _strip_fence(text: str) -> str:

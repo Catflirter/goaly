@@ -8,7 +8,7 @@ import enum
 import json
 import re
 import time
-from collections.abc import Sequence
+from collections.abc import Callable, Sequence
 from pathlib import Path
 
 import pytest
@@ -747,3 +747,129 @@ def test_after_strip_no_call_is_left_in_a_qwen_reply(name: str) -> None:
     reasoning = strip_tool_call_markup(reply["reasoning_content"])
 
     assert parse_tool_calls(assistant(content=content, reasoning=reasoning), OFFERED) == []
+
+
+def deepest(fits: Callable[[int], bool]) -> int:
+    """The largest depth, below 100,000, at which nesting still ``fits``."""
+    low, high = 1, 100_000
+    while low < high:
+        middle = (low + high + 1) // 2
+        low, high = (middle, high) if fits(middle) else (low, middle - 1)
+    return low
+
+
+def nested(depth: int) -> str:
+    return "[" * depth + "]" * depth
+
+
+def loads_fits(depth: int) -> bool:
+    try:
+        json.loads(nested(depth))
+    except RecursionError:
+        return False
+    return True
+
+
+def dumps_one_deeper_fits(depth: int) -> bool:
+    try:
+        json.dumps([json.loads(nested(depth))])
+    except RecursionError:
+        return False
+    return True
+
+
+def json_limits() -> tuple[int, int]:
+    """The deepest lists json.loads parses, and the deepest it parses that json.dumps can still
+    write one level deeper, as inside a call's arguments.
+
+    They depend on how much C stack the caller has used, so a test measures them where it calls
+    the parser: about 9,997 and 9,996 on CPython 3.12.
+    """
+    return deepest(loads_fits), deepest(
+        lambda depth: loads_fits(depth) and dumps_one_deeper_fits(depth)
+    )
+
+
+@pytest.mark.parametrize(
+    "where",
+    ["writable", "parses but is unwritable one level deeper", "deepest parsed", "too deep"],
+)
+def test_an_xml_value_at_the_json_depth_limits_is_typed_or_kept_and_never_raises(
+    where: str,
+) -> None:
+    loads_limit, write_limit = json_limits()
+    assert write_limit < loads_limit  # Else this test would not reach the boundary.
+    depth = {
+        "writable": write_limit,
+        "parses but is unwritable one level deeper": write_limit + 1,
+        "deepest parsed": loads_limit,
+        "too deep": loads_limit + 1,
+    }[where]
+    message = assistant(content=xml_call("configure", tags=nested(depth)))
+
+    [call] = parse_tool_calls(message, OFFERED)
+
+    if depth <= write_limit:
+        assert call.arguments_json == '{"tags": ' + nested(depth) + "}"
+    else:
+        assert call.arguments_json == '{"tags": "' + nested(depth) + '"}'
+
+
+@pytest.mark.parametrize("where", ["one below the limit", "at the limit", "past the limit"])
+def test_repair_at_the_json_depth_limit_repairs_or_gives_up_and_never_raises(where: str) -> None:
+    loads_limit, _ = json_limits()
+    depth = loads_limit + {"one below the limit": -1, "at the limit": 0, "past the limit": 1}[where]
+    text = '{"tags": ' + nested(depth - 1) + ",}"  # The object is one level of the depth.
+
+    repaired = repair_arguments(text)
+
+    if depth <= loads_limit:
+        assert repaired == '{"tags": ' + nested(depth - 1) + "}"
+    else:
+        assert repaired is None
+
+
+def test_a_repaired_lone_surrogate_is_escaped_so_the_call_can_hold_it() -> None:
+    written = '{"sql": "SELECT \'\\ud800\'",}'  # A \ud800 escape: a lone surrogate.
+    message = assistant(calls=[ToolCall(id="call_a", name="execute_sql", arguments_json=written)])
+
+    [call] = parse_tool_calls(message, OFFERED)
+
+    assert call.repaired_arguments_json == '{"sql": "SELECT \'\\ud800\'"}'
+    assert json.loads(call.repaired_arguments_json) == {"sql": "SELECT '\ud800'"}
+
+
+def test_an_xml_value_with_a_lone_surrogate_is_escaped_so_the_call_can_hold_it() -> None:
+    message = assistant(content=xml_call("configure", tags='["caf\\u00e9", "\\ud800"]'))
+
+    [call] = parse_tool_calls(message, OFFERED)
+
+    assert call.arguments_json == '{"tags": ["caf\\u00e9", "\\ud800"]}'
+    assert arguments(call) == {"tags": ["café", "\ud800"]}
+
+
+@pytest.mark.parametrize("number", ["NaN", "Infinity", "-Infinity", "1e999"])
+def test_a_non_finite_xml_number_stays_a_string(number: str) -> None:
+    message = assistant(content=xml_call("configure", ratio=number, tags=f"[{number}]"))
+
+    [call] = parse_tool_calls(message, OFFERED)
+
+    assert call.arguments_json == json.dumps({"ratio": number, "tags": f"[{number}]"})
+
+
+@pytest.mark.parametrize(
+    "text",
+    ['{"limit": NaN,}', '{"limit": Infinity', '{"limit": -Infinity,}', '{"limit": 1e999,}'],
+)
+def test_repair_gives_up_on_non_finite_numbers(text: str) -> None:
+    assert repair_arguments(text) is None
+
+
+def test_a_standard_call_with_a_non_finite_number_gets_no_repaired_arguments() -> None:
+    message = assistant(
+        calls=[ToolCall(id="call_a", name="execute_sql", arguments_json='{"limit": NaN}')]
+    )
+
+    [call] = parse_tool_calls(message, OFFERED)
+
+    assert call.repaired_arguments_json == ""
