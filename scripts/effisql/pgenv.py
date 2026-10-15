@@ -15,7 +15,7 @@ idempotent, and this process keeps to CPUs 0, 1, 12 and 13.
     uv run python scripts/effisql/pgenv.py snapshot [--port PORT]
         Rewrite the schema snapshots from a running server (default: solve-1).
     uv run python scripts/effisql/pgenv.py plans --tasks FILE [--port PORT] [--out PATH]
-        Write the plan cache: our EXPLAIN (FORMAT JSON) plan, as the agent role on a solving
+        Write the plan cache: our EXPLAIN (FORMAT JSON) plan, as the grader role on a solving
         instance, for each task in FILE that has no plan or one recorded on another scale.
 
 The data lives under ~/data/effisql/ and the passwords in ~/.config/goaly/pg.env (mode 0600);
@@ -51,7 +51,7 @@ from goaly.bench.effisql.pg_instances import (
     table_counts,
 )
 from goaly.bench.effisql.pg_settings import (
-    AGENT_ROLE,
+    GRADER_ROLE,
     MAIN_DB,
     PgEnvConfig,
     PgSettingsError,
@@ -88,9 +88,9 @@ def main(argv: Sequence[str] | None = None) -> int:
     args = parser.parse_args(argv)
 
     confine_to_python_cpus()
-    configure_logging()
-    config = PgEnvConfig()
     try:
+        configure_logging()
+        config = PgEnvConfig()
         return _run(args, config)
     except (BuildError, ContainerError, InstanceError, PgSettingsError, psycopg.Error) as error:
         _log.error("pgenv %s failed: %s", args.command, error)
@@ -99,7 +99,7 @@ def main(argv: Sequence[str] | None = None) -> int:
 
 def _run(args: argparse.Namespace, config: PgEnvConfig) -> int:
     if args.command in {"setup", "build"}:
-        ensure_credentials()
+        ensure_credentials(golden_pgdata=config.golden_pgdata)
         password = load_credentials().admin_password
         record = build_golden(
             config, password, after_load=lambda connect: write_snapshots(connect, config, _DBS)
@@ -151,18 +151,29 @@ def _status(config: PgEnvConfig, *, check: bool) -> int:
 
 def _plans(config: PgEnvConfig, tasks: Path, port: int, out: Path) -> int:
     requests = plan_requests(tasks, db=MAIN_DB)
-    password = load_credentials().agent_password
-    with connector(config.host, port, password, user=AGENT_ROLE)(MAIN_DB) as conn:
+    # The grader role: read-only by privilege and by default, like every planned query here.
+    password = load_credentials().grader_password
+    with connector(config.host, port, password, user=GRADER_ROLE)(MAIN_DB) as conn:
         plans, errors = explain_plans(conn, requests)
-    write_json(out, dict(plans))
     by_reason = {
         reason: sum(1 for request in requests if request.reason == reason)
         for reason in ("no plan", "foreign scale")
     }
+    if errors:
+        # A partial cache would leave tasks on a plan from another scale: keep the old one.
+        for request in requests:
+            if request.instance_id in errors:
+                _log.error(
+                    "task %s (%s) has no plan: EXPLAIN failed: %s",
+                    request.instance_id,
+                    request.reason,
+                    errors[request.instance_id],
+                )
+        sys.stderr.write(f"{len(errors)} of {len(requests)} EXPLAINs failed; {out} is unchanged\n")
+        return 1
+    write_json(out, dict(plans))
     _write(f"{len(plans)} plans written to {out}: {by_reason}")
-    for instance_id, message in sorted(errors.items()):
-        sys.stderr.write(f"task {instance_id}: EXPLAIN failed: {message}\n")
-    return 1 if errors else 0
+    return 0
 
 
 def _write(line: str) -> None:
