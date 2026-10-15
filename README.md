@@ -42,3 +42,22 @@ make proto             # regenerate src/goaly/contracts/gen/ after editing proto
 ```
 
 Run `make` to list every target.
+
+## Final evaluation
+
+These need Docker, PostgreSQL 16 with TPC-H SF3 (which `make prepare` builds) and the executor
+API's key. Every run takes the isolated pipeline: the LLM proxy, the solve container, then
+grading on the host.
+
+```sh
+make freeze                 # print the plan to tag main, holding best/effisql's pack, as final
+make freeze FREEZE_ARGS=--yes   # create the tag and push only the tag; it never merges
+git checkout final
+make final-plan             # print what make final would run; runs nothing
+make final                  # prepare, then held-out x3 (official) and val x3 (dev), then the report
+make baseline V0_REF=<v0>   # rerun v0 at its commit: train x1, val x2, then held-out x1
+make report REPORT_ARGS=--allow-partial   # draft docs/results/final-report.md while runs grade
+```
+
+Rerunning `make final` or `make baseline` continues where it stopped. Each phase's log is in
+`runs/<final|baseline>/logs/`.
