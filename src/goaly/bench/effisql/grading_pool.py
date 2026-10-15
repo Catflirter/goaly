@@ -68,9 +68,15 @@ class GradingPool[R]:
     def __init__(self, resources: Sequence[R]) -> None:
         if not resources:
             raise ValueError("a grading pool needs at least one resource")
+        self._resources = tuple(resources)
         self._free = list(resources)
         self._waiting: list[tuple[int, int, asyncio.Future[R]]] = []
         self._arrivals = itertools.count()
+
+    @property
+    def resources(self) -> tuple[R, ...]:
+        """Every resource, lent out or not."""
+        return self._resources
 
     @property
     def free_count(self) -> int:

@@ -5,14 +5,17 @@ Run with ``GOALY_EFFISQL_ITEST_REAL=1 pytest --integration``; without the variab
 
 import asyncio
 import os
+import time
+from collections.abc import Iterator
 from pathlib import Path
 
 import pytest
 
 from goaly.bench.effisql.data import EffiSqlInstance
-from goaly.bench.effisql.grading import EffiSqlGrader, Mode
-from goaly.bench.effisql.grading_pool import GRADING_INSTANCES, GradingInstance, Priority
-from goaly.bench.effisql.pg_build import Connect, connector
+from goaly.bench.effisql.grading import Mode
+from goaly.bench.effisql.grading_pool import GRADING_INSTANCES, Priority
+from goaly.bench.effisql.grading_service import EffiSqlGrader
+from goaly.bench.effisql.pg_build import connector
 from goaly.bench.effisql.pg_settings import GRADER_ROLE, load_credentials
 from goaly.contracts.gen.task_pb2 import (
     GRADE_STATUS_GRADED,
@@ -29,23 +32,20 @@ FROM lineitem WHERE l_orderkey < 200000 GROUP BY l_returnflag, l_linestatus"""
 INST = EffiSqlInstance.model_validate({"id": "itest-1", "db": "tpch", "base_sql": BASE})
 
 
-def grader(tmp_path: Path) -> EffiSqlGrader:
+@pytest.fixture
+def effisql(tmp_path: Path) -> Iterator[EffiSqlGrader]:
     if os.environ.get("GOALY_EFFISQL_ITEST_REAL") != "1":
         pytest.skip("needs the real instances: set GOALY_EFFISQL_ITEST_REAL=1")
-    password = load_credentials().grader_password
-
-    def connect(instance: GradingInstance) -> Connect:
-        return connector("127.0.0.1", instance.port, password, user=GRADER_ROLE)
-
-    return EffiSqlGrader.on_instances(GRADING_INSTANCES[:1], connect, cache_root=tmp_path)
+    grader = EffiSqlGrader.on_instances(GRADING_INSTANCES[:1], cache_root=tmp_path)
+    yield grader
+    grader.close()
 
 
 def answer(sql: str) -> Prediction:
     return Prediction(instance_id=INST.instance_id, effisql=EffiSqlPrediction(sql=sql))
 
 
-def test_grading_in_both_modes(tmp_path: Path) -> None:
-    effisql = grader(tmp_path)
+def test_grading_in_both_modes(effisql: EffiSqlGrader) -> None:
 
     async def grade(sql: str | None, mode: Mode) -> Grade:
         prediction = Prediction() if sql is None else answer(sql)
@@ -97,8 +97,7 @@ def test_grading_in_both_modes(tmp_path: Path) -> None:
     assert 0.5 < official.speedup < 2
 
 
-def test_hard_coded_answers_get_no_credit(tmp_path: Path) -> None:
-    effisql = grader(tmp_path)
+def test_hard_coded_answers_get_no_credit(effisql: EffiSqlGrader) -> None:
     password = load_credentials().grader_password
     with connector("127.0.0.1", GRADING_INSTANCES[0].port, password, user=GRADER_ROLE)(
         "tpch"
@@ -121,3 +120,26 @@ def test_hard_coded_answers_get_no_credit(tmp_path: Path) -> None:
         assert grade.effisql.credit == 0
         assert grade.effisql.speedup > 10, "timed even though flagged"
         assert not grade.correct
+
+
+def test_a_cancelled_grading_stops_its_statement(effisql: EffiSqlGrader) -> None:
+    async def scenario() -> float:
+        await effisql.grade(INST, answer(BASE), Mode.DEV)  # Measures and caches the base.
+        task = asyncio.create_task(effisql.grade(INST, answer("SELECT pg_sleep(60)"), Mode.DEV))
+        await asyncio.sleep(2)
+        started = time.monotonic()
+        task.cancel()
+        with pytest.raises(asyncio.CancelledError):
+            await task
+        return time.monotonic() - started
+
+    assert asyncio.run(scenario()) < 15
+    password = load_credentials().grader_password
+    with connector("127.0.0.1", GRADING_INSTANCES[0].port, password, user=GRADER_ROLE)(
+        "tpch"
+    ) as conn:
+        row = conn.execute(
+            "SELECT count(*) FROM pg_stat_activity WHERE usename = current_user"
+            " AND state = 'active' AND pid <> pg_backend_pid()"
+        ).fetchone()
+    assert row == (0,)

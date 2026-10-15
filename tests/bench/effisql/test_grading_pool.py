@@ -3,16 +3,17 @@
 import asyncio
 import functools
 import threading
+import time
 from collections.abc import Callable, Coroutine
 from pathlib import Path
 from typing import Any
 
 import pytest
 
-from goaly.bench.effisql import grading
+from goaly.bench.effisql import grading, grading_service
 from goaly.bench.effisql.data import EffiSqlInstance
 from goaly.bench.effisql.grader import GraderError, PgSession
-from goaly.bench.effisql.grading import BaseCache, EffiSqlGrader, GradingSlot, Mode
+from goaly.bench.effisql.grading import BaseCache, GradingSlot, Mode
 from goaly.bench.effisql.grading_pool import (
     GRADING_INSTANCES,
     SETUP_INSTANCES,
@@ -20,6 +21,7 @@ from goaly.bench.effisql.grading_pool import (
     GradingPool,
     Priority,
 )
+from goaly.bench.effisql.grading_service import EffiSqlGrader, ThreadRunner, WorkerSpec
 from goaly.contracts.gen.task_pb2 import (
     GRADE_STATUS_GRADED,
     GRADE_STATUS_GRADER_ERROR,
@@ -105,7 +107,10 @@ class TestGradingPool:
 
 
 class FakeSlot:
+    instance = GradingInstance("fake", 1)
+
     def __init__(self, work: Any = None) -> None:
+        self.resets = 0
         self.calls: list[tuple[str, str | None, Mode, BaseCache | None]] = []
         self.work = work
         self.open_sessions: Any = None
@@ -118,9 +123,13 @@ class FakeSlot:
             return self.work()  # type: ignore[no-any-return]  # The test's own work.
         return Grade(instance_id=inst.instance_id, status=GRADE_STATUS_GRADED)
 
+    def reset(self) -> None:
+        self.resets += 1
+
 
 def grader_on(slot: FakeSlot, tmp_path: Path) -> EffiSqlGrader:
-    return EffiSqlGrader(GradingPool([slot]), cache_root=tmp_path)  # type: ignore[list-item]  # A fake slot.
+    runner = ThreadRunner(slot)  # type: ignore[arg-type]  # A fake slot.
+    return EffiSqlGrader(GradingPool([runner]), cache_root=tmp_path)
 
 
 class TestEffiSqlGrader:
@@ -188,7 +197,9 @@ class TestEffiSqlGrader:
         with pytest.raises(asyncio.CancelledError):
             await task
         assert slot.open_sessions.aborted
-        assert grader._pool.free_count == 1
+        assert grader.pool.free_count == 1
+        grader.close()
+        assert slot.resets == 1
 
 
 class TestGradingSlot:
@@ -264,3 +275,46 @@ class TestGradingSlot:
         assert [s.connection.cancels for s in opened] == [1, 1]
         with pytest.raises(grading._AbortedError):
             sessions.check_abort()
+
+
+class TestWorkerPlumbing:
+    def test_the_abort_watcher_cancels_each_time_the_flag_is_set(self) -> None:
+        aborted = threading.Event()
+
+        class Sessions:
+            aborts = 0
+
+            def abort(self) -> None:
+                self.aborts += 1
+
+        class Slot:
+            open_sessions = Sessions()
+
+        slot = Slot()
+        threading.Thread(
+            target=grading_service._watch_aborts, args=(slot, aborted), daemon=True
+        ).start()
+        for expected in (1, 2):
+            aborted.set()
+            deadline = time.monotonic() + 5
+            while slot.open_sessions.aborts < expected and time.monotonic() < deadline:
+                time.sleep(0.01)
+            assert slot.open_sessions.aborts == expected
+            aborted.clear()
+            time.sleep(3 * grading_service._ABORT_POLL_S)
+
+    def test_running_work_needs_a_started_worker(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        monkeypatch.setattr(grading_service, "_worker_slot", None)
+        with pytest.raises(RuntimeError, match="not started"):
+            grading_service._run_in_worker(lambda slot: slot, ())
+
+    def test_a_started_worker_runs_work_on_its_slot(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        monkeypatch.setattr(WorkerSpec, "connect", lambda _self: lambda _db: None)
+        monkeypatch.setattr(grading_service, "_worker_slot", None)
+        grading_service._start_worker(WorkerSpec(GRADING_INSTANCES[0]), threading.Event())
+        assert grading_service._run_in_worker(lambda slot: slot.instance.name, ()) == "grade-1"
+
+    def test_grade_on_slot_evaluates(self) -> None:
+        slot = FakeSlot()
+        grade = grading_service.grade_on_slot(slot, INST, "SELECT 1", Mode.DEV, None)  # type: ignore[arg-type]  # A fake.
+        assert grade.status == GRADE_STATUS_GRADED

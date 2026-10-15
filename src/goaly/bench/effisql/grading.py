@@ -22,23 +22,22 @@ gets the setup's identity τ and its credit, with no timing at all. **Official m
 everything every time and never reads or writes a cache, so no dev measurement can reach an
 official grade. Each mode has its own directory under the grader's cache root.
 
-:class:`EffiSqlGrader` is the async face that the Benchmark adapter's ``grade`` calls. It never
-raises for grading trouble: the Grade's status says what went wrong.
+goaly.bench.effisql.grading_service is the async face that the Benchmark adapter's ``grade``
+calls.
 """
 
-import asyncio
 import contextlib
 import enum
 import hashlib
 import logging
+import multiprocessing.synchronize
 import random
 import re
 import threading
 import time
-from collections.abc import Awaitable, Callable, Sequence
+from collections.abc import Callable
 from datetime import UTC, datetime
 from pathlib import Path
-from typing import Self
 
 from pydantic import BaseModel, ConfigDict, ValidationError
 
@@ -55,7 +54,7 @@ from goaly.bench.effisql.grader import (
     time_interleaved,
     time_prediction,
 )
-from goaly.bench.effisql.grading_pool import GradingInstance, GradingPool, Priority
+from goaly.bench.effisql.grading_pool import GradingInstance
 from goaly.bench.effisql.metrics import tier_credit
 from goaly.bench.effisql.pg_build import Connect
 from goaly.bench.effisql.pg_settings import ALT_DB, MAIN_DB, write_private
@@ -71,13 +70,15 @@ from goaly.contracts.gen.task_pb2 import (
 )
 
 __all__ = [
+    "AbortFlag",
     "BaseCache",
     "BaseEntry",
-    "EffiSqlGrader",
     "GradingSessions",
     "GradingSlot",
+    "InstanceCheck",
     "Mode",
     "evaluate",
+    "grader_error",
     "measure_base",
     "normalize_sql",
     "prediction_sql",
@@ -258,14 +259,20 @@ class _AbortedError(Exception):
     """The grading was cancelled while its worker thread ran."""
 
 
+# Set to stop a running evaluation: a thread's Event, or a process-shared one.
+type AbortFlag = threading.Event | multiprocessing.synchronize.Event
+
+
 class GradingSessions:
     """A grading instance's two sessions, on the main and the alternate database."""
 
-    def __init__(self, main: PgSession, alt: PgSession, *, instance: str) -> None:
+    def __init__(
+        self, main: PgSession, alt: PgSession, *, instance: str, aborted: AbortFlag | None = None
+    ) -> None:
         self.main = main
         self.alt = alt
         self.instance = instance
-        self.aborted = threading.Event()
+        self.aborted: AbortFlag = threading.Event() if aborted is None else aborted
 
     def check_abort(self) -> None:
         if self.aborted.is_set():
@@ -507,7 +514,8 @@ type InstanceCheck = Callable[[GradingSessions], None]
 class GradingSlot:
     """One grading instance's sessions, opened on first use and reopened after a failure.
 
-    Every evaluation on it runs in a worker thread, one at a time (the pool sees to that).
+    Its evaluations run one at a time, in one worker thread or one worker process: each
+    grading instance has its own (goaly.bench.effisql.grading_service).
     """
 
     def __init__(
@@ -516,10 +524,12 @@ class GradingSlot:
         connect: Callable[[GradingInstance], Connect],
         *,
         check: InstanceCheck | None = None,
+        aborted: AbortFlag | None = None,
     ) -> None:
         self.instance = instance
         self._connect = connect
         self._check = check
+        self._aborted = aborted
         self._sessions: GradingSessions | None = None
         self.rng = random.Random()  # noqa: S311  # Shuffles timing order; not a secret.
 
@@ -533,7 +543,8 @@ class GradingSlot:
             except GraderError:
                 main.close()
                 raise
-            sessions = GradingSessions(main, alt, instance=self.instance.name)
+            name = self.instance.name
+            sessions = GradingSessions(main, alt, instance=name, aborted=self._aborted)
             problems = [
                 f"{db}: {problem}"
                 for db, session in ((MAIN_DB, main), (ALT_DB, alt))
@@ -565,95 +576,17 @@ class GradingSlot:
             grade = evaluate(self.sessions(), inst, sql, mode, cache=cache, rng=self.rng)
         except GraderError as error:  # Opening or checking the instance failed.
             self.reset()
-            return _grader_error(inst, f"grader: {error}")
+            return grader_error(inst, f"grader: {error}")
         if grade.status == GRADE_STATUS_GRADER_ERROR:
             self.reset()  # A failed connection is reopened for the next evaluation.
         return grade
 
 
-def _grader_error(inst: EffiSqlInstance, feedback: str) -> Grade:
+def grader_error(inst: EffiSqlInstance, feedback: str) -> Grade:
+    """Return the grade of an evaluation the grader itself could not carry out."""
     return Grade(
         instance_id=inst.instance_id,
         status=GRADE_STATUS_GRADER_ERROR,
         feedback=feedback,
         effisql=EffiSqlGrade(),
     )
-
-
-class EffiSqlGrader:
-    """Grades predictions on a pool of grading slots, in dev or official mode.
-
-    Each mode has its own directory under ``cache_root``: dev mode's holds the base cache it
-    reads, and official mode reads and writes none.
-    """
-
-    def __init__(self, pool: GradingPool[GradingSlot], *, cache_root: Path) -> None:
-        self._pool = pool
-        self._caches = {mode: BaseCache(cache_root / mode.value) for mode in Mode}
-
-    @classmethod
-    def on_instances(
-        cls,
-        instances: Sequence[GradingInstance],
-        connect: Callable[[GradingInstance], Connect],
-        *,
-        cache_root: Path,
-        check: InstanceCheck | None = None,
-    ) -> Self:
-        slots = [GradingSlot(instance, connect, check=check) for instance in instances]
-        return cls(GradingPool(slots), cache_root=cache_root)
-
-    def cache(self, mode: Mode) -> BaseCache:
-        return self._caches[mode]
-
-    async def grade(
-        self,
-        inst: EffiSqlInstance,
-        prediction: Prediction,
-        mode: Mode,
-        *,
-        priority: Priority = Priority.RSI,
-    ) -> Grade:
-        """Grade ``prediction`` for ``inst``. Grading trouble sets the status; it never raises."""
-        sql = prediction_sql(inst, prediction)
-        cache = self._caches[Mode.DEV] if mode is Mode.DEV else None
-        try:
-            async with self._pool.lease(priority) as slot:
-                return await _in_thread(slot, lambda: slot.evaluate(inst, sql, mode, cache))
-        except asyncio.CancelledError:
-            raise
-        except Exception as error:  # noqa: BLE001  # Never raise for grading trouble.
-            _log.exception("grading failed", extra={"instance_id": inst.instance_id})
-            return _grader_error(inst, f"grader: {type(error).__name__}: {error}")
-
-    def benchmark_grade(
-        self, mode: Mode, *, priority: Priority = Priority.RSI
-    ) -> Callable[[EffiSqlInstance, Prediction], Awaitable[Grade]]:
-        """Return ``Benchmark.grade`` for the adapter: this grader in one mode and priority."""
-
-        async def grade(inst: EffiSqlInstance, prediction: Prediction) -> Grade:
-            return await self.grade(inst, prediction, mode, priority=priority)
-
-        return grade
-
-
-async def _in_thread(slot: GradingSlot, work: Callable[[], Grade]) -> Grade:
-    """Run ``work`` in a worker thread; on cancellation, stop it before giving up the slot."""
-    future = asyncio.get_running_loop().run_in_executor(None, work)
-    try:
-        return await asyncio.shield(future)
-    except asyncio.CancelledError:
-        sessions = slot.open_sessions
-        if sessions is not None:
-            await _finish(asyncio.get_running_loop().run_in_executor(None, sessions.abort))
-        await _finish(future)
-        raise
-
-
-async def _finish[T](future: asyncio.Future[T]) -> None:
-    """Wait for ``future`` however often the waiting task is cancelled meanwhile."""
-    while not future.done():
-        with contextlib.suppress(asyncio.CancelledError):
-            await asyncio.shield(future)
-    with contextlib.suppress(Exception):  # The cancelled grading's result is discarded.
-        future.result()
