@@ -54,11 +54,11 @@ def main(argv: Sequence[str] | None = None) -> int:
     plans.add_argument("--out", type=Path, help="default: ~/data/effisql/plans.json")
     args = parser.parse_args(argv)
 
-    configure_logging()
-    config = PgEnvConfig()
     try:
+        configure_logging()
+        config = PgEnvConfig()
         if args.command == "build":
-            ensure_credentials()
+            ensure_credentials(golden_pgdata=config.golden_pgdata)
             password = load_credentials().admin_password
             dbs = [dataset.db for dataset in DATASETS]
             record = build_golden(
