@@ -28,8 +28,9 @@ message TaskResult {
   // run (spec §4.2). Absent only in a run without gold answers, such as an organizers' run.
   Grade grade = 4;
   // The policy's solving time, in seconds: from receiving its provisioned environment to
-  // returning the prediction. Slot waits, provisioning and grading are left out, so this is the
-  // time the efficiency rules compare (spec §8.3).
+  // returning the prediction. It leaves out the wait for the task's slot, provisioning and
+  // grading, but includes the LLM concurrency waits and backoffs during solving, which
+  // Step.latency_s counts. This is the time the efficiency rules compare (spec §8.3).
   double wall_time_s = 5;
   // How long provisioning the task's environment took, in seconds: from started_at until the
   // policy received the environment.
@@ -46,8 +47,8 @@ message TaskResult {
   string error_message = 11;
   // When the task got its slot, after any queueing.
   google.protobuf.Timestamp started_at = 12;
-  // When the policy returned its prediction, or the task failed. Grading has its own timing,
-  // such as SweGrade.eval_wall_s.
+  // When the policy returned its prediction, or the task failed. Grading has its own timing:
+  // eval_wall_s in the grade's EffiSqlGrade or SweGrade.
   google.protobuf.Timestamp finished_at = 13;
 }
 

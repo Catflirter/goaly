@@ -100,9 +100,8 @@ message Grade {
   // The score: Effi-SQL the R-VES credit (EffiSqlGrade.credit); SWE SR_i (spec §4.2), already
   // floored at 0.001.
   double score = 2;
-  // Effi-SQL: the prediction matched the base query (EffiSqlGrade.matched). SWE: the patch
-  // applied and the tests passed, never for an empty patch. Never true unless status is
-  // GRADE_STATUS_GRADED.
+  // Effi-SQL: EffiSqlGrade.matched AND (alt_matched unset or true). SWE: the patch applied and
+  // the tests passed, never for an empty patch. Never true unless status is GRADE_STATUS_GRADED.
   bool correct = 3;
   // How grading went.
   GradeStatus status = 4;
@@ -134,12 +133,18 @@ enum GradeStatus {
 }
 
 // The Effi-SQL details of a grade, following the official evaluator's algorithm (spec §4.1). The
-// grade's score is credit, and its correct is matched, which is never true unless the status is
-// GRADE_STATUS_GRADED.
+// grade's score is credit. Its correct is matched AND (alt_matched unset or true), and is never
+// true unless the status is GRADE_STATUS_GRADED.
 message EffiSqlGrade {
   // True if the prediction ran without an error or a timeout and its result equals the base
   // query's: the same row count and the same multiset of row hashes.
   bool matched = 1;
+  // The robustness check against hard-coded results: whether the prediction also returns the
+  // base query's result on an alternate TPC-H database with different data. Set when the check
+  // ran (dev mode and RSI, and our checked R-VES); unset when it did not, as for the
+  // official-protocol numbers. False flags the task as hard-coded: credit is then 0 and the
+  // grade's correct is false. The final report gives both the official and the checked R-VES.
+  optional bool alt_matched = 10;
   // The base query's median EXPLAIN ANALYZE execution time, in seconds; unset if not measured.
   optional double base_time_s = 2;
   // The prediction's median EXPLAIN ANALYZE execution time, in seconds; unset if not measured.
@@ -148,7 +153,7 @@ message EffiSqlGrade {
   // timed.
   optional double speedup = 4;
   // The R-VES tier credit g(τ): 1 for τ ≥ 2, 0.75 for τ ≥ 1.2, 0.5 for τ ≥ 1, 0.25 for τ ≥ 0.5,
-  // and 0 otherwise. 0 when not matched.
+  // and 0 otherwise. 0 when not matched, or when alt_matched is false.
   double credit = 5;
   // How many timed runs the times come from.
   int32 timing_runs = 6;
@@ -156,6 +161,9 @@ message EffiSqlGrade {
   int32 pred_row_count = 7;
   // How many rows the base query returned.
   int32 base_row_count = 8;
+  // How long the evaluation held its grading instance, in seconds of wall time (spec §9); unset
+  // if the grade was not measured.
+  optional double eval_wall_s = 11;
   // True if dev mode reused the base query's cached result signature and timing.
   bool base_cached = 9;
 }

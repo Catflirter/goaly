@@ -145,7 +145,10 @@ enum Guard {
   GUARD_ALLOWED_PATHS = 1;
   // The bench/, harness/core/ and contracts/ checksums are unchanged.
   GUARD_CHECKSUMS = 2;
-  // The hard-coding scan finds no fragment of a gold answer in the diff (spec §8.5).
+  // The hard-coding scan finds nothing task-specific in the diff (spec §8.5). For Effi-SQL it
+  // rejects any fragment of a gold optimized_sql 40 or more characters long after
+  // normalization, and pack changes that embed large literal lists. For SWE (on hold) it also
+  // rejects any instance_id from any split.
   GUARD_HARD_CODING_SCAN = 3;
   // The pack's unit tests pass.
   GUARD_UNIT_TESTS = 4;
@@ -168,8 +171,8 @@ message PhaseResult {
   double best_score = 5;
   // candidate_score - best_score.
   double delta = 6;
-  // The smallest delta the phase accepted. For the validation: Effi-SQL's min_delta, or SWE's
-  // min_relative_gain times best_score, doubled if the cost guardrail tripped. For the
+  // The smallest delta the phase accepted, doubled if the cost guardrail tripped. For the
+  // validation: Effi-SQL's min_delta, or SWE's min_relative_gain times best_score. For the
   // confirmation: confirm_min_delta. Absent for the screen, which needs only a delta above 0.
   optional double effective_min_delta = 7;
   // How many tasks the candidate beat the best on, by each task's score averaged over seeds.
@@ -245,8 +248,9 @@ enum RejectionReason {
 // The decision thresholds, as config set them (spec §8.3: every decision records the thresholds
 // it used). Gains are fractions, and a task's tokens are counted, as in PhaseResult.
 message DecisionThresholds {
-  // The cost guardrail: above this multiple of the best's mean tokens or wall time per task, the
-  // gain threshold doubles.
+  // The cost guardrail: above this multiple of the best's mean tokens or wall time per task,
+  // every gain threshold doubles. For Effi-SQL, min_delta 0.05 becomes 0.10 and
+  // confirm_min_delta 0.03 becomes 0.06; for SWE, min_relative_gain doubles.
   double cost_guardrail_ratio = 1;
   // The efficiency cap: above this multiple of v0's mean cost or wall time per task, a candidate
   // is rejected whatever its gain.
