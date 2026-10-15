@@ -25,6 +25,7 @@ dev = [
     "pytest>=9",
     "pytest-cov>=7",
     "ruff>=0.17", # ruff is pre-1.0: its minor releases are its breaking releases
+    "sqlparse==0.5.2", # The official Effi-SQL runner's pin; the extractor parity tests use it
     "types-protobuf>=7",
 ]
 
@@ -65,6 +66,11 @@ plugins = ["pydantic.mypy"]
 # Every `type: ignore` needs an error code, plus a comment giving the reason.
 enable_error_code = ["ignore-without-code"]
 warn_unreachable = true
+
+[[tool.mypy.overrides]]
+# sqlparse 0.5.2, the official runner's pin, ships no type information; only the tests use it.
+module = ["sqlparse", "sqlparse.*"]
+ignore_missing_imports = true
 
 [tool.pydantic-mypy]
 init_forbid_extra = true
