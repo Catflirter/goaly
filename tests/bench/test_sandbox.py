@@ -39,6 +39,7 @@ class Layout:
     checkout: Path
     run_dir: Path
     solve_dir: Path
+    inputs_dir: Path
     instances: Path
     proxy_dir: Path
     pg_dirs: tuple[Path, Path]
@@ -63,6 +64,10 @@ def layout(tmp_path: Path) -> Iterator[Layout]:
     solve_dir.mkdir(parents=True)
     for name in ("results.jsonl", "manifest.json", "llm_calls.jsonl"):
         (run_dir / name).write_text("{}\n", encoding="utf-8")  # Host-only, beside solve/.
+    inputs_dir = run_dir / "inputs"
+    inputs_dir.mkdir()
+    for name in ("tasks.jsonl", "schema_snapshot.json", "plans.json"):
+        (inputs_dir / name).write_text("{}\n", encoding="utf-8")
     instances = root / "data" / "effi-sql-pg.runtime.jsonl"
     instances.parent.mkdir()
     instances.write_text('{"id": 1}\n', encoding="utf-8")
@@ -75,7 +80,7 @@ def layout(tmp_path: Path) -> Iterator[Layout]:
     for directory, port in zip(pg_dirs, (55432, 55433), strict=True):
         sockets.append(unix_socket(directory / f".s.PGSQL.{port}"))
         (directory / f".s.PGSQL.{port}.lock").write_text("123\n", encoding="utf-8")
-    yield Layout(checkout, run_dir, solve_dir, instances, proxy_dir, pg_dirs)
+    yield Layout(checkout, run_dir, solve_dir, inputs_dir, instances, proxy_dir, pg_dirs)
     for listener in sockets:
         listener.close()
 
@@ -97,6 +102,7 @@ def options(layout: Layout, **changes: object) -> list[str]:
         "checkout": layout.checkout,
         "solve_dir": layout.solve_dir,
         "instances_file": layout.instances,
+        "inputs_dir": layout.inputs_dir,
         "socket_dirs": layout.socket_dirs(),
     }
     arguments.update(changes)
@@ -104,6 +110,7 @@ def options(layout: Layout, **changes: object) -> list[str]:
         arguments["checkout"],  # type: ignore[arg-type]
         arguments["solve_dir"],  # type: ignore[arg-type]
         arguments["instances_file"],  # type: ignore[arg-type]
+        inputs_dir=arguments["inputs_dir"],  # type: ignore[arg-type]
         socket_dirs=arguments["socket_dirs"],  # type: ignore[arg-type]
         run_id="val-1",
         uid=1001,
@@ -115,7 +122,12 @@ def options(layout: Layout, **changes: object) -> list[str]:
 
 
 def test_the_solve_container_can_write_only_its_solve_directory(layout: Layout) -> None:
-    checkout, solve, data = layout.checkout, layout.solve_dir, layout.instances
+    checkout, solve, data, inputs = (
+        layout.checkout,
+        layout.solve_dir,
+        layout.instances,
+        layout.inputs_dir,
+    )
 
     assert options(layout) == [
         "--init",
@@ -141,6 +153,7 @@ def test_the_solve_container_can_write_only_its_solve_directory(layout: Layout) 
         f"--env=PYTHONPATH={checkout}/src",
         f"--mount=type=bind,source={checkout},target={checkout},readonly",
         f"--mount=type=bind,source={data},target={data},readonly",
+        f"--mount=type=bind,source={inputs},target={inputs},readonly",
         *(
             f"--mount=type=bind,source={directory},target={directory},readonly"
             for directory in layout.socket_dirs()
@@ -149,10 +162,34 @@ def test_the_solve_container_can_write_only_its_solve_directory(layout: Layout) 
     ]
 
 
-def test_without_an_instances_file_none_is_mounted(layout: Layout) -> None:
-    mounts = [option for option in options(layout, instances_file=None) if "--mount" in option]
+def test_without_an_instances_file_or_inputs_neither_is_mounted(layout: Layout) -> None:
+    found = options(layout, instances_file=None, inputs_dir=None)
 
+    mounts = [option for option in found if "--mount" in option]
     assert len(mounts) == 1 + 3 + 1  # The checkout, the socket directories and solve/.
+
+
+@pytest.mark.parametrize("plant", ["directory", "symlink", "git"])
+def test_an_inputs_directory_holding_anything_but_files_is_refused(
+    layout: Layout, plant: str
+) -> None:
+    if plant == "directory":
+        (layout.inputs_dir / "nested").mkdir()
+    elif plant == "symlink":
+        (layout.inputs_dir / "gold.jsonl").symlink_to(layout.run_dir / "results.jsonl")
+    else:
+        (layout.inputs_dir / ".git").write_text("gitdir: /elsewhere\n", encoding="utf-8")
+
+    with pytest.raises(ValueError, match="not a file"):
+        options(layout)
+
+
+def test_an_inputs_directory_inside_solve_is_refused(layout: Layout) -> None:
+    inside = layout.solve_dir / "inputs"
+    inside.mkdir()
+
+    with pytest.raises(ValueError, match="overlap"):
+        options(layout, inputs_dir=inside)
 
 
 def test_the_profile_ships_with_the_package() -> None:
@@ -348,6 +385,7 @@ def solve(config: SandboxConfig, layout: Layout, timeout_s: float = 3600) -> San
         layout.checkout,
         layout.solve_dir,
         layout.instances,
+        inputs_dir=layout.inputs_dir,
         environment=environment(layout),
         argv=ARGV,
         timeout_s=timeout_s,
