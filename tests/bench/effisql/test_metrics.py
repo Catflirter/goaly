@@ -5,8 +5,9 @@ import json
 import math
 import os
 import statistics
-from collections.abc import Mapping, Sequence
+from collections.abc import Callable, Mapping, Sequence
 from pathlib import Path
+from typing import Any
 
 import pytest
 
@@ -16,6 +17,7 @@ from goaly.bench.effisql.metrics import (
     GradeTable,
     Metrics,
     Scoring,
+    _score,
     by_difficulty,
     compare,
     delta_rves_ci,
@@ -191,6 +193,7 @@ def test_tier_credit_rejects_a_speedup_that_cannot_be(speedup: float) -> None:
         pytest.param(timed(4.0, literal_result=True), True, id="literal_result"),
         pytest.param(timed(4.0, alt_matched=True, literal_result=True), True, id="robust literal"),
         pytest.param(timed(4.0, alt_matched=False, literal_result=True), True, id="both flags"),
+        pytest.param(grade(0.0, alt_matched=False), False, id="unmatched, not hard_coded"),
     ],
 )
 def test_is_flagged(graded: EffiSqlGrade, flagged: bool) -> None:
@@ -257,7 +260,7 @@ def test_from_results_rejects_a_grade_that_means_nothing(
 
 
 def test_from_results_rejects_a_result_without_a_grade() -> None:
-    with pytest.raises(ValueError, match="task 'a', seed 0, has no grade"):
+    with pytest.raises(ValueError, match="task 'a', seed 0, has no grade: metrics need a graded"):
         GradeTable.from_results([TaskResult(run_id="run-1", instance_id="a", seed=0)])
 
 
@@ -303,6 +306,39 @@ def test_a_table_rejects_credit_for_an_unmatched_task() -> None:
 def test_a_table_rejects_a_match_with_a_speedup_that_cannot_be(speedup: float) -> None:
     with pytest.raises(ValueError, match="task 'a', seed 0, has speedup"):
         GradeTable({"a": {0: grade(1.0, speedup=speedup)}})
+
+
+def test_a_table_keeps_read_only_copies_of_its_input() -> None:
+    graded = timed(4.0)
+    source = {"a": {0: graded}}
+    table = GradeTable(source)
+
+    source["b"] = {0: timed(1.0)}
+    source["a"][1] = timed(1.0)
+    graded.credit = 0.5
+
+    assert (table.tasks, table.seeds) == (("a",), (0,))
+    assert table.grades["a"][0].credit == 1.0
+    grades: Any = table.grades
+    with pytest.raises(TypeError):
+        grades["b"] = {0: timed(1.0)}
+    with pytest.raises(TypeError):
+        grades["a"][1] = timed(1.0)
+
+
+def test_subset_keeps_the_given_tasks_in_the_tables_order() -> None:
+    table = seeded({"a": [1.0, 0.5], "b": [0.25, 0.25], "c": [0.0, 0.75]})
+
+    part = table.subset(["c", "a"])
+
+    assert (part.tasks, part.seeds) == (("a", "c"), (0, 1))
+    assert part.grades == {"a": table.grades["a"], "c": table.grades["c"]}
+    assert part.grades["a"] is not table.grades["a"]
+
+
+def test_subset_needs_tasks_the_table_has() -> None:
+    with pytest.raises(ValueError, match="the table lacks 'x', 'y'"):
+        seeded({"a": [1.0]}).subset(["y", "a", "x"])
 
 
 # The metrics of one seed (spec §4.1).
@@ -363,6 +399,42 @@ def test_gms_is_none_without_a_matched_task_with_a_speedup() -> None:
 
 
 # Official and checked numbers.
+
+STRING_BEST = GradeTable({"a": {0: timed(1.0)}, "b": {0: timed(4.0)}})
+STRING_CANDIDATE = GradeTable({"a": {0: hard_coded()}, "b": {0: literal()}})
+EVERY_SCORED_CALL: list[Callable[[Any], object]] = [
+    lambda scoring: seed_metrics(STRING_CANDIDATE, scoring=scoring),
+    lambda scoring: task_credits(STRING_CANDIDATE, scoring=scoring),
+    lambda scoring: solved(STRING_CANDIDATE, scoring=scoring),
+    lambda scoring: stably_solved(STRING_CANDIDATE, scoring=scoring),
+    lambda scoring: summarize(STRING_CANDIDATE, scoring=scoring, bootstrap_seed=0, resamples=10),
+    lambda scoring: compare(STRING_BEST, STRING_CANDIDATE, scoring=scoring),
+    lambda scoring: delta_rves_ci(
+        STRING_BEST, STRING_CANDIDATE, scoring=scoring, bootstrap_seed=0, resamples=10
+    ),
+]
+
+
+@pytest.mark.parametrize("call", EVERY_SCORED_CALL)
+@pytest.mark.parametrize("scoring", [OFFICIAL, CHECKED])
+def test_a_scoring_given_as_a_string_is_that_scoring(
+    call: Callable[[Any], object], scoring: Scoring
+) -> None:
+    # An untyped caller may pass "official" or "checked": never a mix of the two.
+    assert call(str(scoring)) == call(scoring)
+
+
+@pytest.mark.parametrize("call", EVERY_SCORED_CALL)
+def test_an_unknown_scoring_is_an_error(call: Callable[[Any], object]) -> None:
+    with pytest.raises(ValueError, match="'both' is not a valid Scoring"):
+        call("both")
+
+
+def test_scoring_a_grade_takes_no_unknown_scoring_either() -> None:
+    unknown: Any = "both"  # Past the public functions, which convert the scoring first.
+
+    with pytest.raises(ValueError, match="'both' is not a valid Scoring"):
+        _score(timed(1.0), unknown)
 
 
 @pytest.mark.parametrize("flagged", [hard_coded(), literal()], ids=["hard_coded", "literal"])
@@ -500,6 +572,24 @@ def test_summary_rves_ci_resamples_tasks_by_their_seed_mean_credit() -> None:
     assert point.rves_ci == Interval(75.0, 75.0)
 
 
+def test_bootstrap_cis_do_not_depend_on_the_order_of_the_tasks() -> None:
+    credits = {"t1": [1.0], "t2": [0.25], "t3": [0.5], "t4": [0.0], "t5": [0.75]}
+    backward = dict(reversed(credits.items()))
+
+    def rves_ci(table: GradeTable) -> Interval:
+        return summarize(table, scoring=CHECKED, bootstrap_seed=3, resamples=200).rves_ci
+
+    def gain_ci(best: GradeTable, candidate: GradeTable) -> Interval:
+        return delta_rves_ci(best, candidate, scoring=CHECKED, bootstrap_seed=3, resamples=200)
+
+    assert rves_ci(seeded(credits)) == rves_ci(seeded(backward))
+    best = {task: [0.25] for task in credits}
+    best_backward = {task: [0.25] for task in backward}
+    assert gain_ci(seeded(best), seeded(credits)) == gain_ci(
+        seeded(best_backward), seeded(backward)
+    )
+
+
 # Comparing two versions (spec §8.3).
 
 
@@ -510,6 +600,7 @@ def test_compare_counts_wins_and_losses_on_seed_mean_credit() -> None:
     comparison = compare(best, candidate, scoring=OFFICIAL)
 
     # a: 0.75 > 0.5; b: 0.75 < 1; c ties; d: 0.875 > 0.75.
+    assert comparison.task_count == 4
     assert comparison.sign == SignTest(wins=2, losses=1, ties=1, p_value=0.5)
     assert comparison.best_score == 2.5 / 4
     assert comparison.candidate_score == 2.625 / 4
@@ -554,6 +645,7 @@ def test_compare_with_itself() -> None:
     table = seeded({"a": [1.0], "b": [0.25]})
 
     assert compare(table, table, scoring=CHECKED) == Comparison(
+        task_count=2,
         best_score=0.625,
         candidate_score=0.625,
         delta=0.0,
@@ -562,9 +654,21 @@ def test_compare_with_itself() -> None:
     )
 
 
-def test_compare_needs_the_same_tasks() -> None:
-    with pytest.raises(ValueError, match="the same tasks"):
-        compare(seeded({"a": [1.0]}), seeded({"b": [1.0]}), scoring=CHECKED)
+def test_compare_needs_the_same_tasks_and_names_those_that_differ() -> None:
+    best = seeded({"a": [1.0], "b": [1.0]})
+    candidate = seeded({"a": [1.0], "d": [1.0], "c": [1.0]})
+
+    with pytest.raises(
+        ValueError, match=r"same tasks, but only the best has 'b'; only the candidate has 'c', 'd'$"
+    ):
+        compare(best, candidate, scoring=CHECKED)
+
+
+def test_compare_names_at_most_five_tasks_of_each() -> None:
+    best = seeded({f"t{index:02}": [1.0] for index in range(12)})
+
+    with pytest.raises(ValueError, match=r"'t03', 't04' and 7 more; only the candidate has 'x'$"):
+        compare(best, seeded({"x": [1.0]}), scoring=CHECKED)
 
 
 def test_delta_rves_ci_resamples_paired_tasks() -> None:
@@ -603,6 +707,7 @@ def test_by_difficulty_splits_the_tasks_in_a_fixed_order() -> None:
         "extreme": ("4",),
     }
     assert groups["hard"].grades["1"] == table.grades["1"]
+    assert groups["hard"].grades["1"] is not table.grades["1"]
 
 
 def test_by_difficulty_needs_every_tasks_label() -> None:

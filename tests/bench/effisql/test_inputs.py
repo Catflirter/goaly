@@ -247,6 +247,40 @@ def test_an_index_whose_name_starts_another_in_the_ddl_is_still_listed() -> None
     assert text.endswith(f"-- Indexes:\n{LINEITEM_INDEX};\n{LINEITEM_PKEY};\n{ORDERS_PKEY};\n")
 
 
+def test_an_index_behind_a_constraint_in_the_ddl_is_not_listed() -> None:
+    # pg_dump declares a primary key as a constraint, which creates the index of its name.
+    key = (
+        "ALTER TABLE ONLY public.lineitem\n"
+        "    ADD CONSTRAINT lineitem_pkey PRIMARY KEY (l_orderkey, l_linenumber);"
+    )
+
+    text = render_schema(snapshot(ddl=f"{ORDERS_DDL}\n\n{LINEITEM_DDL}\n\n{key}\n"))
+
+    assert text.endswith(f"-- Indexes:\n{LINEITEM_INDEX};\n{ORDERS_PKEY};\n")
+
+
+def test_a_quoted_constraint_inside_a_table_counts_too() -> None:
+    ddl = (
+        "CREATE TABLE orders (\n"
+        "    o_orderkey integer,\n"
+        '    constraint "orders_pkey" PRIMARY KEY (o_orderkey)\n'
+        ");"
+    )
+
+    text = render_schema(snapshot(ddl=ddl))
+
+    assert text.endswith(f"-- Indexes:\n{LINEITEM_INDEX};\n{LINEITEM_PKEY};\n")
+
+
+def test_a_constraint_whose_name_only_starts_with_the_index_name_does_not_count() -> None:
+    other = "ALTER TABLE public.orders ADD CONSTRAINT orders_pkey_old UNIQUE (o_comment);"
+    ddl = f"{ORDERS_DDL}\n\n{other}"
+
+    text = render_schema(snapshot(ddl=ddl))
+
+    assert text.endswith(f"-- Indexes:\n{LINEITEM_INDEX};\n{LINEITEM_PKEY};\n{ORDERS_PKEY};\n")
+
+
 def test_when_the_ddl_creates_every_index_the_list_says_so() -> None:
     ddl = f"{ORDERS_DDL}\n\n{ORDERS_PKEY};\n{LINEITEM_PKEY};\n{LINEITEM_INDEX};\n"
 
