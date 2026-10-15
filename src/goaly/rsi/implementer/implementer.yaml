@@ -5,7 +5,7 @@
 # the sandbox stops each command after its timeout; goaly-smoke refuses calls after its limit.
 limits:
   step_limit: 60
-  cost_limit_usd: 3.0
+  cost_limit_usd: 10.0
   wall_time_limit_s: 1800
   max_consecutive_format_errors: 3
   command_timeout_s: 120
