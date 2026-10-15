@@ -107,6 +107,7 @@ class LlmCallRecord(_message.Message):
     CALL_ID_FIELD_NUMBER: _builtins.int
     RUN_ID_FIELD_NUMBER: _builtins.int
     INSTANCE_ID_FIELD_NUMBER: _builtins.int
+    SEED_FIELD_NUMBER: _builtins.int
     PURPOSE_FIELD_NUMBER: _builtins.int
     MODEL_FIELD_NUMBER: _builtins.int
     USAGE_FIELD_NUMBER: _builtins.int
@@ -122,6 +123,10 @@ class LlmCallRecord(_message.Message):
     """The run the call belongs to, or empty if it belongs to none."""
     instance_id: _builtins.str
     """The task the call works on, or empty if none, as for an RSI analyst call."""
+    seed: _builtins.int
+    """The replicate index, as in Trajectory.seed. Calls join to trajectories on run_id,
+    instance_id and seed.
+    """
     purpose: Global___CallPurpose.ValueType
     """Why the call was made."""
     model: _builtins.str
@@ -150,6 +155,7 @@ class LlmCallRecord(_message.Message):
         call_id: _builtins.str = ...,
         run_id: _builtins.str = ...,
         instance_id: _builtins.str = ...,
+        seed: _builtins.int = ...,
         purpose: Global___CallPurpose.ValueType = ...,
         model: _builtins.str = ...,
         usage: Global___Usage | None = ...,
@@ -162,7 +168,7 @@ class LlmCallRecord(_message.Message):
     ) -> None: ...
     _HasFieldArgType: _TypeAlias = _typing.Literal["started_at", b"started_at", "usage", b"usage"]  # noqa: Y015
     def HasField(self, field_name: _HasFieldArgType) -> _builtins.bool: ...
-    _ClearFieldArgType: _TypeAlias = _typing.Literal["attempts", b"attempts", "call_id", b"call_id", "http_status", b"http_status", "instance_id", b"instance_id", "latency_s", b"latency_s", "model", b"model", "purpose", b"purpose", "run_id", b"run_id", "started_at", b"started_at", "status", b"status", "usage", b"usage", "wait_s", b"wait_s"]  # noqa: Y015
+    _ClearFieldArgType: _TypeAlias = _typing.Literal["attempts", b"attempts", "call_id", b"call_id", "http_status", b"http_status", "instance_id", b"instance_id", "latency_s", b"latency_s", "model", b"model", "purpose", b"purpose", "run_id", b"run_id", "seed", b"seed", "started_at", b"started_at", "status", b"status", "usage", b"usage", "wait_s", b"wait_s"]  # noqa: Y015
     def ClearField(self, field_name: _ClearFieldArgType) -> None: ...
     def WhichOneof(self, oneof_group: _Never) -> None: ...
 

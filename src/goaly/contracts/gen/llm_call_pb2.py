@@ -25,19 +25,19 @@ _sym_db = _symbol_database.Default()
 from google.protobuf import timestamp_pb2 as google_dot_protobuf_dot_timestamp__pb2
 
 
-DESCRIPTOR = _descriptor_pool.Default().AddSerializedFile(b'\n\x17goaly/v1/llm_call.proto\x12\x08goaly.v1\x1a\x1fgoogle/protobuf/timestamp.proto\"\xbf\x02\n\rLlmCallRecord\x12\x0f\n\x07\x63\x61ll_id\x18\x01 \x01(\t\x12\x0e\n\x06run_id\x18\x02 \x01(\t\x12\x13\n\x0binstance_id\x18\x03 \x01(\t\x12&\n\x07purpose\x18\x04 \x01(\x0e\x32\x15.goaly.v1.CallPurpose\x12\r\n\x05model\x18\x05 \x01(\t\x12\x1e\n\x05usage\x18\x06 \x01(\x0b\x32\x0f.goaly.v1.Usage\x12\x11\n\tlatency_s\x18\x07 \x01(\x01\x12\x0e\n\x06wait_s\x18\x08 \x01(\x01\x12\x10\n\x08\x61ttempts\x18\t \x01(\x05\x12\'\n\x06status\x18\n \x01(\x0e\x32\x17.goaly.v1.LlmCallStatus\x12\x13\n\x0bhttp_status\x18\x0b \x01(\x05\x12.\n\nstarted_at\x18\x0c \x01(\x0b\x32\x1a.google.protobuf.Timestamp\"`\n\x05Usage\x12\x14\n\x0cinput_tokens\x18\x01 \x01(\x03\x12\x15\n\routput_tokens\x18\x02 \x01(\x03\x12\x18\n\x10reasoning_tokens\x18\x03 \x01(\x03\x12\x10\n\x08\x63ost_usd\x18\x04 \x01(\x01*\x98\x01\n\x0b\x43\x61llPurpose\x12\x1c\n\x18\x43\x41LL_PURPOSE_UNSPECIFIED\x10\x00\x12\x15\n\x11\x43\x41LL_PURPOSE_EXEC\x10\x01\x12\x1c\n\x18\x43\x41LL_PURPOSE_RSI_ANALYST\x10\x02\x12\x19\n\x15\x43\x41LL_PURPOSE_RSI_IMPL\x10\x03\x12\x1b\n\x17\x43\x41LL_PURPOSE_RSI_LESSON\x10\x04*\xbd\x02\n\rLlmCallStatus\x12\x1f\n\x1bLLM_CALL_STATUS_UNSPECIFIED\x10\x00\x12\x16\n\x12LLM_CALL_STATUS_OK\x10\x01\x12\x1b\n\x17LLM_CALL_STATUS_TIMEOUT\x10\x02\x12 \n\x1cLLM_CALL_STATUS_RATE_LIMITED\x10\x03\x12 \n\x1cLLM_CALL_STATUS_SERVER_ERROR\x10\x04\x12$\n LLM_CALL_STATUS_CONNECTION_ERROR\x10\x05\x12$\n LLM_CALL_STATUS_CONTEXT_OVERFLOW\x10\x06\x12$\n LLM_CALL_STATUS_INVALID_RESPONSE\x10\x07\x12 \n\x1cLLM_CALL_STATUS_CLIENT_ERROR\x10\x08\x62\x06proto3')
+DESCRIPTOR = _descriptor_pool.Default().AddSerializedFile(b'\n\x17goaly/v1/llm_call.proto\x12\x08goaly.v1\x1a\x1fgoogle/protobuf/timestamp.proto\"\xcd\x02\n\rLlmCallRecord\x12\x0f\n\x07\x63\x61ll_id\x18\x01 \x01(\t\x12\x0e\n\x06run_id\x18\x02 \x01(\t\x12\x13\n\x0binstance_id\x18\x03 \x01(\t\x12\x0c\n\x04seed\x18\r \x01(\x05\x12&\n\x07purpose\x18\x04 \x01(\x0e\x32\x15.goaly.v1.CallPurpose\x12\r\n\x05model\x18\x05 \x01(\t\x12\x1e\n\x05usage\x18\x06 \x01(\x0b\x32\x0f.goaly.v1.Usage\x12\x11\n\tlatency_s\x18\x07 \x01(\x01\x12\x0e\n\x06wait_s\x18\x08 \x01(\x01\x12\x10\n\x08\x61ttempts\x18\t \x01(\x05\x12\'\n\x06status\x18\n \x01(\x0e\x32\x17.goaly.v1.LlmCallStatus\x12\x13\n\x0bhttp_status\x18\x0b \x01(\x05\x12.\n\nstarted_at\x18\x0c \x01(\x0b\x32\x1a.google.protobuf.Timestamp\"`\n\x05Usage\x12\x14\n\x0cinput_tokens\x18\x01 \x01(\x03\x12\x15\n\routput_tokens\x18\x02 \x01(\x03\x12\x18\n\x10reasoning_tokens\x18\x03 \x01(\x03\x12\x10\n\x08\x63ost_usd\x18\x04 \x01(\x01*\x98\x01\n\x0b\x43\x61llPurpose\x12\x1c\n\x18\x43\x41LL_PURPOSE_UNSPECIFIED\x10\x00\x12\x15\n\x11\x43\x41LL_PURPOSE_EXEC\x10\x01\x12\x1c\n\x18\x43\x41LL_PURPOSE_RSI_ANALYST\x10\x02\x12\x19\n\x15\x43\x41LL_PURPOSE_RSI_IMPL\x10\x03\x12\x1b\n\x17\x43\x41LL_PURPOSE_RSI_LESSON\x10\x04*\xbd\x02\n\rLlmCallStatus\x12\x1f\n\x1bLLM_CALL_STATUS_UNSPECIFIED\x10\x00\x12\x16\n\x12LLM_CALL_STATUS_OK\x10\x01\x12\x1b\n\x17LLM_CALL_STATUS_TIMEOUT\x10\x02\x12 \n\x1cLLM_CALL_STATUS_RATE_LIMITED\x10\x03\x12 \n\x1cLLM_CALL_STATUS_SERVER_ERROR\x10\x04\x12$\n LLM_CALL_STATUS_CONNECTION_ERROR\x10\x05\x12$\n LLM_CALL_STATUS_CONTEXT_OVERFLOW\x10\x06\x12$\n LLM_CALL_STATUS_INVALID_RESPONSE\x10\x07\x12 \n\x1cLLM_CALL_STATUS_CLIENT_ERROR\x10\x08\x62\x06proto3')
 
 _globals = globals()
 _builder.BuildMessageAndEnumDescriptors(DESCRIPTOR, _globals)
 _builder.BuildTopDescriptorsAndMessages(DESCRIPTOR, 'goaly.contracts.gen.llm_call_pb2', _globals)
 if not _descriptor._USE_C_DESCRIPTORS:
   DESCRIPTOR._loaded_options = None
-  _globals['_CALLPURPOSE']._serialized_start=491
-  _globals['_CALLPURPOSE']._serialized_end=643
-  _globals['_LLMCALLSTATUS']._serialized_start=646
-  _globals['_LLMCALLSTATUS']._serialized_end=963
+  _globals['_CALLPURPOSE']._serialized_start=505
+  _globals['_CALLPURPOSE']._serialized_end=657
+  _globals['_LLMCALLSTATUS']._serialized_start=660
+  _globals['_LLMCALLSTATUS']._serialized_end=977
   _globals['_LLMCALLRECORD']._serialized_start=71
-  _globals['_LLMCALLRECORD']._serialized_end=390
-  _globals['_USAGE']._serialized_start=392
-  _globals['_USAGE']._serialized_end=488
+  _globals['_LLMCALLRECORD']._serialized_end=404
+  _globals['_USAGE']._serialized_start=406
+  _globals['_USAGE']._serialized_end=502
 # @@protoc_insertion_point(module_scope)
