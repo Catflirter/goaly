@@ -21,8 +21,9 @@ command = " ".join(args[:2]) if args[:1] == ["image"] else args[0]
 context = None
 if command == "build":
     context = sorted(p.name for p in Path(args[-1]).iterdir())
+record = {{"command": command, "args": args, "env": dict(os.environ), "context": context}}
 with (here / "calls.jsonl").open("a") as calls:
-    calls.write(json.dumps({{"args": args, "env": dict(os.environ), "context": context}}) + "\\n")
+    calls.write(json.dumps(record) + "\\n")
 answer = json.loads((here / "script.json").read_text()).get(command, {{}})
 time.sleep(answer.get("sleep", 0))
 sys.stdout.write(answer.get("stdout", ""))
@@ -57,7 +58,4 @@ class FakeDocker:
 
     def commands(self) -> list[str]:
         """The subcommand of each call so far, as ``run``, ``wait`` or ``image ls``."""
-        return [
-            " ".join(call["args"][:2]) if call["args"][:1] == ["image"] else call["args"][0]
-            for call in self.calls()
-        ]
+        return [call["command"] for call in self.calls()]
