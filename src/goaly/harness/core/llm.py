@@ -600,16 +600,23 @@ def _wire_message(message: ChatMessage) -> dict[str, object]:
 def _wire_arguments(call: ToolCall) -> str:
     """Return the arguments to send back for ``call``: those its tool ran with, a JSON object.
 
-    The gateway answers 400 to a history whose tool arguments are not JSON (seen 2026-10-15). So
-    arguments that neither parse nor were repaired go back as {}, and the tool result that
-    answers the call tells the model what was wrong with them.
+    That is the repaired arguments if there are any, since the original was malformed, and
+    otherwise the arguments as the model wrote them. The gateway answers 400 to a history whose
+    tool arguments are not JSON (seen 2026-10-15), so arguments that are not a JSON object go
+    back as {}, with a warning. The tool result that answers the call tells the model why.
     """
     arguments = call.repaired_arguments_json or call.arguments_json
     try:
         parsed = json.loads(arguments)
-    except ValueError:
-        return "{}"
-    return arguments if isinstance(parsed, dict) else "{}"
+    except (ValueError, RecursionError):  # RecursionError: nested too deep to parse.
+        parsed = None
+    if isinstance(parsed, dict):
+        return arguments
+    _logger.warning(
+        "sent a tool call's arguments back as {}: they are not a JSON object",
+        extra={"event": "llm_arguments_replaced", "tool_call_id": call.id, "tool": call.name},
+    )
+    return "{}"
 
 
 def _assistant_message(message: _WireMessage) -> ChatMessage:

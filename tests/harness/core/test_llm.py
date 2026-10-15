@@ -403,10 +403,14 @@ async def test_converts_each_kind_of_message() -> None:
         ),
         pytest.param('{"sql": "SELECT', "", "{}", id="unrepaired"),
         pytest.param("[1, 2]", "", "{}", id="not-an-object"),
+        pytest.param("", "", "{}", id="empty"),
+        # A repair stands in for a malformed original, so the original never goes back.
+        pytest.param('{"sql": "SELECT', '{"sql": "SELECT', "{}", id="repair-unparsable"),
+        pytest.param('{"sql": "SELECT', "[1]", "{}", id="repair-not-an-object"),
     ],
 )
 async def test_sends_back_tool_arguments_the_gateway_accepts(
-    written: str, repaired: str, sent: str
+    written: str, repaired: str, sent: str, caplog: pytest.LogCaptureFixture
 ) -> None:
     # The gateway answers 400 to a history holding arguments that are not JSON (2026-10-15).
     call = ToolCall(
@@ -418,6 +422,13 @@ async def test_sends_back_tool_arguments_the_gateway_accepts(
         await llm.complete(history, model=QWEN, tags=EXEC)
 
     assert gateway.bodies[0]["messages"][1]["tool_calls"][0]["function"]["arguments"] == sent
+    warnings = [
+        {key: getattr(entry, key) for key in ("event", "tool_call_id", "tool")}
+        for entry in caplog.records
+        if entry.levelno == logging.WARNING
+    ]
+    replaced = {"event": "llm_arguments_replaced", "tool_call_id": "c1", "tool": "execute_sql"}
+    assert warnings == ([replaced] if sent == "{}" else [])
 
 
 async def test_refuses_a_message_without_a_role_before_any_io() -> None:
