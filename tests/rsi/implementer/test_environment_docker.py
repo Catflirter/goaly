@@ -15,7 +15,7 @@ import pytest
 
 from goaly.contracts.gen.experiment_pb2 import LANE_EFFISQL, Hypothesis, ImplementerExit
 from goaly.rsi.implementer import msa
-from goaly.rsi.implementer.environment import SandboxEnvironment
+from goaly.rsi.implementer.environment import SandboxEnvironment, SandboxStoppedError
 from goaly.rsi.implementer.run import Implementer
 from goaly.rsi.sandbox import LABEL_EXPERIMENT, ensure_image
 from goaly.rsi.workspace import Workspace, Worktree
@@ -59,7 +59,9 @@ def containers_of(worktree: Worktree) -> list[str]:
 def test_a_write_outside_the_pack_fails_and_no_key_is_inside(
     image: str, worktree: Worktree
 ) -> None:
-    with SandboxEnvironment(image=image, worktree=worktree, command_timeout_s=60) as sandbox:
+    with SandboxEnvironment(
+        image=image, worktree=worktree, command_timeout_s=60, lifetime_s=600
+    ) as sandbox:
         outside = sandbox.execute({"command": "touch src/goaly/bench/evil.py"})
         inside = sandbox.execute({"command": "touch src/goaly/harness/packs/effisql/ok.md"})
         tests = sandbox.execute({"command": "touch tests/harness/packs/effisql/test_ok.py"})
@@ -81,13 +83,37 @@ def test_a_write_outside_the_pack_fails_and_no_key_is_inside(
 def test_a_command_is_stopped_inside_the_container_at_its_timeout(
     image: str, worktree: Worktree
 ) -> None:
-    with SandboxEnvironment(image=image, worktree=worktree, command_timeout_s=1) as sandbox:
+    with SandboxEnvironment(
+        image=image, worktree=worktree, command_timeout_s=1, lifetime_s=600
+    ) as sandbox:
         slow = sandbox.execute({"command": "sleep 30"})
         after = sandbox.execute({"command": "echo still here"})
 
     assert slow["returncode"] == 124
     assert "timed out" in slow["exception_info"]
     assert after == {"output": "still here\n", "returncode": 0, "exception_info": ""}
+
+
+def test_a_sandbox_the_agent_stops_is_the_candidates_fault(image: str, worktree: Worktree) -> None:
+    sandbox = SandboxEnvironment(
+        image=image, worktree=worktree, command_timeout_s=10, lifetime_s=600
+    )
+    try:
+        with pytest.raises(SandboxStoppedError):
+            sandbox.execute({"command": "kill 1; sleep 5"})
+    finally:
+        sandbox.cleanup()
+
+
+def test_huge_output_is_read_as_it_comes_and_cut(image: str, worktree: Worktree) -> None:
+    with SandboxEnvironment(
+        image=image, worktree=worktree, command_timeout_s=60, lifetime_s=600
+    ) as sandbox:
+        output = sandbox.execute({"command": "head -c 300000000 /dev/zero | tr '\\0' a; echo"})
+
+    assert output["returncode"] == 0
+    assert output["output"].startswith("[... 299934")
+    assert len(output["output"]) < 70_000
 
 
 def test_a_scripted_run_in_the_sandbox_ends_as_one_commit(

@@ -35,10 +35,7 @@ from goaly.contracts.gen.experiment_pb2 import (
     ImplementerRun,
 )
 from goaly.harness.core.llm_errors import (
-    ClientError,
     ConnectionFailed,
-    ContextOverflow,
-    InvalidResponse,
     LlmError,
     RateLimited,
     ServerError,
@@ -59,7 +56,7 @@ from goaly.rsi.implementer.model import (
     SyncLlm,
 )
 from goaly.rsi.lanes import lane_info
-from goaly.rsi.sandbox import SandboxConfig, SandboxError
+from goaly.rsi.sandbox import SandboxConfig, SandboxError, remove_containers
 from goaly.rsi.workspace import UnsafePackError, Workspace, WorkspaceError, Worktree
 
 __all__ = [
@@ -74,6 +71,10 @@ __all__ = [
 ]
 
 TRAJECTORY_NAME: Final = "implementer.traj.json"
+# How long a sandbox may outlive its run's wall-time limit: a model call in flight and the
+# finishing commands. A sandbox a crashed lane left behind ends by itself after that.
+_LIFETIME_MARGIN_S: Final = 900.0
+_SUMMARY_LIMIT: Final = 4000  # Characters of the agent's summary kept, as in the commit body.
 
 _E = ImplementerExit
 # How the agent's exit message names the ending, for each ending that is not an error.
@@ -91,8 +92,6 @@ _INFRASTRUCTURE_ERRORS: Final = (
     *(RateLimited, ServerError, TimedOut, ConnectionFailed),
     *(SandboxError, WorkspaceError, GitError),
 )
-# The run's own request failed: its context overflowed, or the gateway refused or garbled it.
-_CRASH_ERRORS: Final = (ContextOverflow, InvalidResponse, ClientError)
 
 _logger = logging.getLogger(__name__)
 
@@ -168,14 +167,16 @@ class Implementer:
         self._pool = pool
         self._config = load_config() if config is None else config
         self._sandbox = sandbox
+        self._sandboxed = make_environment is None  # Real sandboxes, which docker can remove.
         self._make_environment = make_environment or self._sandbox_environment
         self._make_model = make_model or self._glm_model
 
     async def implement(self, hypothesis: Hypothesis, worktree: Worktree) -> Implementation:
         """Build ``hypothesis`` in the experiment's ``worktree``, on the implementer pool.
 
-        Cancelling it tells the run to stop at its next step, where it ends as INTERRUPTED and
-        commits nothing; the run's thread then removes its sandbox on its own.
+        Cancelling it tells the run to stop, and removes the experiment's sandbox containers, so
+        that a command in flight ends at once; the run then ends as INTERRUPTED and commits
+        nothing. A model call in flight still runs to its end.
         """
         stop = threading.Event()
         loop = asyncio.get_running_loop()
@@ -183,7 +184,19 @@ class Implementer:
             return await loop.run_in_executor(self._pool, self.run, hypothesis, worktree, stop)
         except asyncio.CancelledError:
             stop.set()
+            if self._sandboxed:
+                # In a thread of its own: the loop is cancelling, and must not wait for docker.
+                threading.Thread(target=self._abandon, args=(worktree,), daemon=True).start()
             raise
+
+    def _abandon(self, worktree: Worktree) -> None:
+        try:
+            remove_containers(experiment_id=worktree.experiment_id, config=self._sandbox)
+        except SandboxError:
+            _logger.warning(
+                "could not remove a stopped run's sandbox",
+                extra={"experiment_id": worktree.experiment_id},
+            )
 
     def run(
         self, hypothesis: Hypothesis, worktree: Worktree, stop: threading.Event
@@ -212,10 +225,8 @@ class Implementer:
             # The sandbox is gone: nothing changes the worktree any more.
             record.exit = exit_for_status(result.get("exit_status", ""))
             if record.exit == _E.IMPLEMENTER_EXIT_SUBMITTED:
-                record.summary = result.get("submission", "").strip()
-                if stop.is_set():
-                    record.exit = _E.IMPLEMENTER_EXIT_INTERRUPTED
-                else:
+                record.summary = _summary(result.get("submission", ""))
+                if not stop.is_set():
                     commit = commit_candidate(
                         self._workspace,
                         worktree,
@@ -225,12 +236,15 @@ class Implementer:
                     if commit is None:
                         record.exit = _E.IMPLEMENTER_EXIT_NO_CHANGES
         except (OutsidePackError, UnsafePackError) as error:
-            # The sandbox should make both impossible; the candidate is rejected all the same.
+            # What the agent left in its pack cannot be committed: the candidate is rejected.
             record.exit = _E.IMPLEMENTER_EXIT_CRASHED
             _log_error(worktree, error)
         except Exception as error:  # noqa: BLE001  (every ending is mapped and recorded)
             record.exit = exit_for_error(error)
             _log_error(worktree, error)
+        if stop.is_set() and commit is None:
+            # goaly.rsi stopped it, whatever the run then saw, such as its removed sandbox.
+            record.exit = _E.IMPLEMENTER_EXIT_INTERRUPTED
         if agent is not None:
             record.step_count = _steps(agent.messages)
             record.trajectory_path = str(relative) if output_path.exists() else ""
@@ -271,6 +285,7 @@ class Implementer:
             image=self._image,
             worktree=worktree,
             command_timeout_s=self._config.limits.command_timeout_s,
+            lifetime_s=self._config.limits.wall_time_limit_s + _LIFETIME_MARGIN_S,
             sandbox=self._sandbox,
         )
 
@@ -292,6 +307,15 @@ def _steps(messages: list[dict[str, Any]]) -> int:
         if "actions" in message.get("extra", {})
         or message.get("extra", {}).get("interrupt_type") == "FormatError"
     )
+
+
+def _summary(submission: str) -> str:
+    """The agent's closing summary as the ledger keeps it: printable text and line breaks, with
+    tabs as spaces, at most _SUMMARY_LIMIT characters.
+    """
+    lines = submission.replace("\r\n", "\n").replace("\r", "\n").replace("\t", " ").split("\n")
+    printable = "\n".join("".join(c for c in line if c.isprintable()).rstrip() for line in lines)
+    return printable.strip()[:_SUMMARY_LIMIT]
 
 
 def _log_error(worktree: Worktree, error: BaseException) -> None:
