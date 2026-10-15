@@ -38,14 +38,11 @@ from goaly.bench.effisql.data import EffiSqlInstance
 from goaly.bench.effisql.grading import BaseCache, Mode
 from goaly.bench.effisql.grading_pool import GradingInstance, Priority
 from goaly.bench.effisql.grading_service import EffiSqlGrader
+from goaly.bench.effisql.launcher import SOLVE_RUNS
 from goaly.bench.effisql.pg_settings import PgEnvConfig
 from goaly.contracts.gen.llm_call_pb2 import LlmCallRecord
 from goaly.contracts.gen.manifest_pb2 import RunManifest
-from goaly.contracts.gen.result_pb2 import (
-    TASK_ERROR_TYPE_ENVIRONMENT,
-    TASK_ERROR_TYPE_LLM,
-    TaskResult,
-)
+from goaly.contracts.gen.result_pb2 import TASK_ERROR_TYPE_POLICY_CRASH, TaskResult
 from goaly.contracts.gen.task_pb2 import GRADE_STATUS_GRADER_ERROR, SPLIT_TRAIN, Split
 from goaly.contracts.gen.trajectory_pb2 import Trajectory
 from goaly.contracts.jsonl import from_json_line
@@ -53,6 +50,7 @@ from goaly.harness.core.manifest import checkout_harness_hash, read_manifest
 
 __all__ = [
     "EffiSqlEvaluator",
+    "HostSolves",
     "ProbeGrader",
     "ProxyTotals",
     "TaskBudget",
@@ -167,18 +165,73 @@ def _proxy_totals(usage_file: Path, calls: Sequence[LlmCallRecord]) -> ProxyTota
         return ProxyTotals(tokens, sum(c.usage.cost_usd for c in calls))
 
 
-# The host's error types that are the infrastructure's, not the candidate's (T21's ruling).
-_INFRA_ERRORS = frozenset({TASK_ERROR_TYPE_LLM, TASK_ERROR_TYPE_ENVIRONMENT})
+# Gateway answers the proxy records that are the gateway's failure, not the candidate's: no
+# reply (0, a timeout or a dropped connection), rate limiting and server errors.
+_GATEWAY_FAILURES = frozenset({0, 429})
 
 
-def infra_failed(results: Sequence[TaskResult]) -> frozenset[tuple[str, int]]:
-    """The (task, seed) pairs the infrastructure failed, by the host's graded results: an LLM
-    gateway outage after the retries, an environment failure, or a grader error."""
-    return frozenset(
-        (r.instance_id, r.seed)
-        for r in results
-        if r.error_type in _INFRA_ERRORS or r.grade.status == GRADE_STATUS_GRADER_ERROR
-    )
+def _gateway_failed(status: int) -> bool:
+    return status in _GATEWAY_FAILURES or status >= 500
+
+
+def infra_failed(
+    results: Sequence[TaskResult],
+    calls: Sequence[LlmCallRecord],
+    *,
+    container_failed: bool = False,
+) -> frozenset[tuple[str, int]]:
+    """The (task, seed) pairs the infrastructure failed, on host evidence alone (T21, B-M7).
+
+    A result's error_type is the container's claim, so it never counts by itself:
+    - an LLM failure is a task whose last call, as the proxy recorded it on the host, failed at
+      the gateway (no reply, 429 or 5xx): the client gave up on an outage;
+    - an environment failure is a task left without a solve record by a container that the
+      launcher saw fail (its host-side log);
+    - a grader error is the host's own grade status.
+    A container that claims errors with no such evidence gets the normal failed grade.
+    """
+    last: dict[tuple[str, int], LlmCallRecord] = {}
+    for call in sorted(calls, key=lambda c: c.started_at.ToNanoseconds()):
+        last[call.instance_id, call.seed] = call
+    failed = {key for key, call in last.items() if _gateway_failed(call.http_status)}
+    for r in results:
+        key = (r.instance_id, r.seed)
+        if r.grade.status == GRADE_STATUS_GRADER_ERROR:
+            failed.add(key)
+        elif container_failed and r.error_type == TASK_ERROR_TYPE_POLICY_CRASH:
+            failed.add(key)  # No solve record from a container the host saw fail.
+    wanted = {(r.instance_id, r.seed) for r in results}
+    return frozenset(failed & wanted)
+
+
+@dataclass(frozen=True)
+class HostSolves:
+    """What the host's launcher recorded of a run's solve containers (SOLVE_RUNS)."""
+
+    sent: frozenset[tuple[str, int]]
+    wall_s: float
+    concurrency: int
+    container_failed: bool
+
+
+def _host_solves(path: Path) -> HostSolves:
+    """Read the host-only solve-run record; a run that solved nothing has none."""
+    sent: set[tuple[str, int]] = set()
+    wall, concurrency, failed = 0.0, 1, False
+    try:
+        lines = path.read_text(encoding="utf-8").splitlines()
+    except FileNotFoundError:
+        lines = []
+    for line in lines:
+        try:
+            run = json.loads(line)
+            sent.update((str(task[0]), int(task[1])) for task in run["tasks"])
+            wall += float(run["wall_s"])
+            concurrency = max(concurrency, int(run["max_tasks"]))
+            failed = failed or int(run["exit_code"]) != 0 or bool(run["timed_out"])
+        except (ValueError, KeyError, TypeError, IndexError):
+            _logger.warning("a solve-run record is unreadable", extra={"path": str(path)})
+    return HostSolves(frozenset(sent), wall, concurrency, failed)
 
 
 class ProbeGrader:
@@ -247,8 +300,10 @@ class EffiSqlEvaluator:
         calls = await asyncio.to_thread(_records, run_dir / "llm_calls.jsonl", LlmCallRecord)
         mine = [c for c in calls if c.run_id == request.run_id]
         totals = await asyncio.to_thread(_proxy_totals, run_dir / "usage.json", mine)
-        stats = self.cost_stats(chosen, mine, totals)
-        return self.evaluation_type(results=chosen, stats=stats, infra_failed=infra_failed(chosen))
+        host = await asyncio.to_thread(_host_solves, run_dir / SOLVE_RUNS)
+        stats = self.cost_stats(chosen, totals, host)
+        failed = infra_failed(chosen, mine, container_failed=host.container_failed)
+        return self.evaluation_type(results=chosen, stats=stats, infra_failed=failed)
 
     def command(
         self, request: EvaluationRequestLike, snapshot: Path, run_dir: Path, max_tasks: int
@@ -269,39 +324,34 @@ class EffiSqlEvaluator:
         ]  # fmt: skip
 
     def cost_stats(
-        self,
-        results: Sequence[TaskResult],
-        calls: Sequence[LlmCallRecord],
-        totals: ProxyTotals,
+        self, results: Sequence[TaskResult], totals: ProxyTotals, host: HostSolves
     ) -> Any:
-        """The means per (task, seed), host-verified (the controller's ruling for T21).
+        """The means per (task, seed), on host-verified numbers only (spec §8.3).
 
-        Tokens and cost are the proxy's own totals for the run (usage.json), which cover every
-        task solved now; a task the cache answered, which made no call, brings the host numbers
-        stored with it. Wall time is the host's, per task. The container's own counts are never
-        used. A per-task sum that differs from the proxy's total by more than 1% is a WARNING.
+        The tasks the host sent to a solve container, as its launcher recorded them, share the
+        proxy's run totals for tokens and cost, and the host's clock around the solve runs,
+        divided by their count and multiplied by the runs' task concurrency (capped at that
+        count). A task the host took from the cache, which it never sent, keeps the numbers
+        stored with its cached result. No per-task tag or count from the container is used.
         """
         count = len(results)
         if not count:
             return self.cost_stats_type(
                 mean_tokens=0.0, mean_cost_usd=None, mean_wall_time_s=0.0, count=0
             )
-        solved = {(c.instance_id, c.seed) for c in calls}
-        cached = [r for r in results if (r.instance_id, r.seed) not in solved]
-        fresh = [r for r in results if (r.instance_id, r.seed) in solved]
+        sent = [r for r in results if (r.instance_id, r.seed) in host.sent]
+        cached = [r for r in results if (r.instance_id, r.seed) not in host.sent]
         tokens = totals.tokens + sum(r.usage.input_tokens + r.usage.output_tokens for r in cached)
         cost = totals.cost_usd + sum(r.usage.cost_usd for r in cached)
-        attributed = sum(r.usage.input_tokens + r.usage.output_tokens for r in fresh)
-        if totals.tokens and abs(attributed - totals.tokens) > _DRIFT * totals.tokens:
-            _logger.warning(
-                "the tasks' tokens differ from the proxy's total by more than 1%%",
-                extra={"tasks": attributed, "proxy": totals.tokens},
-            )
+        wall = sum(r.wall_time_s for r in cached)
+        if sent:
+            per_task = host.wall_s / len(sent) * min(host.concurrency, len(sent))
+            wall += per_task * len(sent)
         priced = totals.cost_usd > 0 or any(r.usage.cost_usd for r in cached)
         return self.cost_stats_type(
             mean_tokens=tokens / count,
             mean_cost_usd=cost / count if priced else None,
-            mean_wall_time_s=sum(r.wall_time_s for r in results) / count,
+            mean_wall_time_s=wall / count,
             count=count,
         )
 
