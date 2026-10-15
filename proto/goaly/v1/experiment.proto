@@ -125,12 +125,16 @@ message ExperimentRecord {
 // LlmCallRecords with purpose CALL_PURPOSE_RSI_IMPL and the experiment ID as run_id, and their
 // tokens and cost are in the experiment's usage_by_purpose.
 message ImplementerRun {
+  // Renamed step_count before any ledger used it.
+  reserved "steps";
+
   // How the run ended.
   ImplementerExit exit = 1;
-  // How many steps the agent took, one model call each.
-  int32 steps = 2;
-  // From the agent's start to its end, in seconds.
-  double wall_time_s = 3;
+  // How many steps the agent took, one model call each; unset if the run was never measured, as
+  // for an IMPLEMENTER_EXIT_INTERRUPTED run that the restarted lane found after a crash.
+  optional int32 step_count = 2;
+  // From the agent's start to its end, in seconds; unset if the run was never measured.
+  optional double wall_time_s = 3;
   // Where the agent's trajectory is, relative to the runs directory:
   // rsi/<lane>/<experiment_id>/implementer.traj.json. The file stays in mini-swe-agent's own
   // format, which it names in its trajectory_format key; it is not converted to a Trajectory.
@@ -147,7 +151,11 @@ message ImplementerRun {
 // a commit. Every other ending makes none, and the candidate is rejected as not implemented
 // (REJECTION_REASON_IMPLEMENTATION_FAILED), except after IMPLEMENTER_EXIT_INFRASTRUCTURE or
 // IMPLEMENTER_EXIT_INTERRUPTED: neither says anything about the hypothesis, so the experiment is
-// aborted instead.
+// aborted instead. A model call that fails ends the run as follows. IMPLEMENTER_EXIT_INFRASTRUCTURE
+// is a gateway outage that outlasted its retries (LLM_CALL_STATUS_RATE_LIMITED, SERVER_ERROR,
+// TIMEOUT or CONNECTION_ERROR) or an open breaker. IMPLEMENTER_EXIT_CRASHED is
+// LLM_CALL_STATUS_CONTEXT_OVERFLOW, INVALID_RESPONSE or CLIENT_ERROR. IMPLEMENTER_EXIT_INTERRUPTED
+// is LLM_CALL_STATUS_CANCELLED: our code cancelled the call.
 enum ImplementerExit {
   // Not set.
   IMPLEMENTER_EXIT_UNSPECIFIED = 0;
@@ -176,16 +184,18 @@ enum ImplementerExit {
 
 // One goaly-smoke call by the implementer agent (spec §8.8). The host refuses any task that is
 // not in train, and any call after the second; otherwise it runs the step-3 guards on the
-// worktree as it stands, then the candidate on the task with the bench runner and one seed. The
-// smoke run's model calls count toward the experiment's usage_by_purpose (spec §9).
+// worktree as it stands, then the candidate on the task through the isolated two-phase path
+// (spec §6.1), with one seed. The smoke run's model calls count toward the experiment's
+// usage_by_purpose (spec §9).
 message SmokeTest {
   // The task the agent asked for.
   string instance_id = 1;
   // The smoke run that holds the task's result and trajectory; empty if the candidate never ran.
   string run_id = 2;
   // The task's score, as its benchmark defines it: for Effi-SQL, the credit. Unset if the
-  // candidate never ran, because the host refused the call or a guard failed. It is optional so
-  // that such a call stays distinct from a run that scored 0.
+  // candidate never ran, because the host refused the call or a guard failed, and also if it ran
+  // but grading failed. It is optional so that such a call stays distinct from a run that scored
+  // 0.
   optional double score = 3;
   // What goaly-smoke told the agent besides the score: the stop reason, the step count, the cost
   // and the last tool error; or why the host refused the call, or which guard failed.
@@ -212,7 +222,9 @@ message GuardResult {
   string detail = 3;
 }
 
-// A check that a candidate must pass before it is evaluated (spec §8.2, §8.5).
+// A check that a candidate must pass before it is evaluated (spec §8.2, §8.5). The values are
+// declared by number. The guards run in the order of spec §8.2 step 3: ALLOWED_PATHS, CHECKSUMS,
+// HARD_CODING_SCAN, PACK_CODE_ALLOWLIST, then UNIT_TESTS.
 enum Guard {
   // Not set.
   GUARD_UNSPECIFIED = 0;
@@ -224,18 +236,17 @@ enum Guard {
   // scans only gold-only windows: windows of any split's gold optimized_sql, 40 or more
   // characters long after normalization, that occur in no base_sql and not in the schema DDL.
   // It also rejects pack changes that embed large literal lists, above a size set in config.
-  // For SWE (on hold) it rejects any fragment of a gold patch 40 or more characters long after
-  // normalization, and any instance_id from any split.
+  // For SWE (on hold) it applies the same gold-only-fragment rule to the gold patches, with
+  // windows 40 or more characters long after normalization, and also rejects any instance_id
+  // from any split.
   GUARD_HARD_CODING_SCAN = 3;
-  // The static AST allowlist passes on the candidate's pack code, which runs on the host during
-  // smoke tests, screening and validation (spec §8.5). Imports may come only from
-  // goaly.contracts, goaly.harness.core, pydantic and pure stdlib modules, such as json, re and
-  // typing. The builtins open, eval, exec, compile and __import__ are banned; so are the modules
-  // importlib, subprocess, os, sys, socket, pathlib, shutil and ctypes, and attribute access to
-  // dunder internals.
-  GUARD_PACK_CODE_ALLOWLIST = 5;
   // The pack's unit tests pass.
   GUARD_UNIT_TESTS = 4;
+  // The static AST allowlist passes on the candidate's pack code. Spec §8.5 is the authority on
+  // its rules: the imports it allows and the names, attributes and calls it bans. It is a static
+  // defense in depth; the candidate's code itself is isolated in the keyless solve container
+  // (spec §6.1).
+  GUARD_PACK_CODE_ALLOWLIST = 5;
 }
 
 // How a candidate did against the best in one phase: screen, validate or confirm (spec §8.2,
@@ -269,10 +280,13 @@ message PhaseResult {
   optional double gain_probability = 11;
   // How many tasks regressed, as spec §8.3 defines a regression for the lane.
   optional int32 regressions = 12;
-  // The tasks on which a check against hard-coded results flagged the candidate's prediction, in
-  // any seed, each listed once (spec §4.1): hard_coded, which is EffiSqlGrade.alt_matched false,
-  // or literal_result. Each task's grade, in the runs candidate_run_ids names, says which check
-  // flagged it. One flagged task fails the candidate outright, as REJECTION_REASON_HARD_CODED.
+  // The tasks on which the candidate made a matched prediction that a check flagged, in any
+  // seed, each listed once (spec §4.1). The checks are those against hard-coded results, and the
+  // flags are hard_coded, which is EffiSqlGrade.alt_matched false, and literal_result. An
+  // unmatched prediction is never checked, so it is never listed. Each task's grade, in the runs
+  // candidate_run_ids names, says which check flagged it. One flagged task fails the candidate
+  // outright, as REJECTION_REASON_HARD_CODED. On the validation and the confirmation these are
+  // per-task val IDs, so the analyst's ledger summary strips them (spec §7).
   repeated string flagged_instance_ids = 20;
   // The candidate's mean tokens per task over the best's, which the cost guardrail checks.
   optional double token_ratio_vs_best = 13;
@@ -306,7 +320,11 @@ enum Decision {
   DECISION_ABORTED = 4;
 }
 
-// A rule that rejects a candidate: one value for each way spec §8.2 and §8.3 reject one.
+// A rule that rejects a candidate: one value for each way spec §8.2 and §8.3 reject one. The
+// values are declared by number. Roughly in evaluation order, they are: IMPLEMENTATION_FAILED,
+// GUARD_FAILED, HARD_CODED, NO_SCREEN_GAIN, EFFICIENCY_CAP, INSUFFICIENT_GAIN, COST_GUARDRAIL,
+// NOT_SIGNIFICANT, REGRESSION, OUTRANKED and NOT_CONFIRMED. HARD_CODED can also come up in the
+// validation or the confirmation. The decision code (T21) owns the exact order.
 enum RejectionReason {
   // Not set; never written.
   REJECTION_REASON_UNSPECIFIED = 0;
@@ -314,11 +332,6 @@ enum RejectionReason {
   REJECTION_REASON_IMPLEMENTATION_FAILED = 1;
   // A guard failed; guards says which.
   REJECTION_REASON_GUARD_FAILED = 2;
-  // A check against hard-coded results flagged one of its predictions in the screen, the
-  // validation or the confirmation (spec §4.1, §8.2 step 4). This covers both flags: hard_coded,
-  // which is EffiSqlGrade.alt_matched false, and literal_result. That phase's
-  // flagged_instance_ids lists the flagged tasks.
-  REJECTION_REASON_HARD_CODED = 11;
   // The screen showed no net gain over the best.
   REJECTION_REASON_NO_SCREEN_GAIN = 3;
   // Its mean cost or wall time per task exceeded the efficiency cap.
@@ -337,6 +350,11 @@ enum RejectionReason {
   // Effi-SQL: its gain over the validation seeds plus the confirmation seed fell below the
   // confirmation threshold.
   REJECTION_REASON_NOT_CONFIRMED = 10;
+  // It made a matched prediction that a check flagged, in the screen, the validation or the
+  // confirmation (spec §4.1, §8.2 step 4). The checks are those against hard-coded results, and
+  // this covers both flags: hard_coded, which is EffiSqlGrade.alt_matched false, and
+  // literal_result. That phase's flagged_instance_ids lists the flagged tasks.
+  REJECTION_REASON_HARD_CODED = 11;
 }
 
 // The decision thresholds, as config set them (spec §8.3: every decision records the thresholds
@@ -449,6 +467,12 @@ message LaneEvent {
   // apart from detail, which holds a failed delivery's error, because the next results PR lists
   // every notification, delivered or not (spec §8.7).
   string notification = 9;
+  // For LANE_EVENT_KIND_NOTIFIED and LANE_EVENT_KIND_NOTIFY_FAILED: the notification's ID, which
+  // ties a NOTIFY_FAILED to the NOTIFIED of its later delivery; empty for other kinds.
+  string notification_id = 10;
+  // For LANE_EVENT_KIND_STARTED: the lane's deadline, an absolute time from config that a restart
+  // never moves (spec §8.4); absent for other kinds.
+  google.protobuf.Timestamp deadline_at = 11;
 }
 
 // What happened to a lane (spec §8.4, §8.7).
@@ -456,12 +480,13 @@ enum LaneEventKind {
   // Not set.
   LANE_EVENT_KIND_UNSPECIFIED = 0;
   // The lane started: the first time, or when a new goaly rsi run resumed it from the ledger,
-  // as after the workspace stopped. The lane's time budget counts from its first start.
+  // as after the workspace stopped. deadline_at records the lane's deadline.
   LANE_EVENT_KIND_STARTED = 1;
-  // The supervisor restarted the lane after it crashed; detail says how it crashed.
+  // The supervisor restarted the lane after a LANE_EVENT_KIND_CRASHED; detail gives only the
+  // backoff it waited, since the crash event holds the cause.
   LANE_EVENT_KIND_RESTARTED = 2;
-  // The lane crashed too often for automatic recovery, so the supervisor stopped it and notified
-  // the project lead.
+  // Automatic recovery failed, at 5 LANE_EVENT_KIND_CRASHED events within an hour (spec §8.7), so
+  // the supervisor stopped the lane and notified the project lead.
   LANE_EVENT_KIND_RECOVERY_FAILED = 3;
   // The lane stopped by a stopping rule (spec §8.4); detail names the rule.
   LANE_EVENT_KIND_STOPPED = 4;
@@ -471,4 +496,8 @@ enum LaneEventKind {
   LANE_EVENT_KIND_NOTIFIED = 6;
   // A notification could not be delivered; it is retried.
   LANE_EVENT_KIND_NOTIFY_FAILED = 7;
+  // The supervisor counted the lane as crashed (spec §8.7): its process died, its heartbeat was 10
+  // minutes old so it was killed, or a start failed the preflight checks. The supervisor writes
+  // it, since a killed lane cannot, and detail gives the cause. Recovery counts these events.
+  LANE_EVENT_KIND_CRASHED = 8;
 }

@@ -1,4 +1,4 @@
-"""Process settings: the model gateway's API key and base URL.
+"""Process settings: the model gateway's API key and base URL, and the socket to reach it by.
 
 Each value comes from the first of these that provides it: explicit arguments, ``GOALY_*``
 environment variables, the env file (``~/.config/goaly/.env`` by default), the field default.
@@ -17,6 +17,7 @@ __all__ = ["Settings", "SettingsError", "default_env_file", "load_settings"]
 
 _ENV_PREFIX = "GOALY_"
 _NOT_AN_HTTP_URL = "must be an absolute http or https URL with a host"
+_NOT_A_HEADER_VALUE = "must be printable ASCII, with no whitespace or control characters"
 
 
 class SettingsError(Exception):
@@ -31,10 +32,14 @@ class Settings(BaseSettings):
         env_file_encoding="utf-8",  # Not the locale's encoding.
         extra="ignore",
         frozen=True,
+        hide_input_in_errors=True,  # A ValidationError would quote the key otherwise.
     )
 
     api_key: SecretStr
     base_url: str = "https://api.goaly.ai/inference/v1"
+    # A Unix socket to reach the gateway through instead of TCP, as the solve container reaches
+    # the host's LLM proxy (spec §6.1). The base URL then only names the host in each request.
+    llm_uds: Path | None = None
 
     @classmethod
     def settings_customise_sources(
@@ -52,13 +57,17 @@ class Settings(BaseSettings):
 
     @field_validator("api_key", mode="before")
     @classmethod
-    def _strip_api_key(cls, value: object) -> object:
+    def _check_api_key(cls, value: object) -> object:
         if isinstance(value, SecretStr):
             value = value.get_secret_value()
         if isinstance(value, str):
             value = value.strip()
             if not value:
                 raise PydanticKnownError("missing")  # A blank key argument counts as missing.
+            # The key goes in the Authorization header. httpx refuses any other character, and
+            # quotes the whole header, key and all, in its error.
+            if not all("!" <= char <= "~" for char in value):
+                raise PydanticCustomError("invalid_key", _NOT_A_HEADER_VALUE)
         return value
 
     @field_validator("base_url")
@@ -69,6 +78,13 @@ class Settings(BaseSettings):
         if problem is not None:
             raise PydanticCustomError("invalid_url", problem)
         return url.rstrip("/")
+
+    @field_validator("llm_uds")
+    @classmethod
+    def _check_llm_uds(cls, value: Path | None) -> Path | None:
+        if value is not None and not value.is_absolute():
+            raise PydanticCustomError("invalid_path", "must be an absolute path")
+        return value
 
 
 def default_env_file() -> Path:
