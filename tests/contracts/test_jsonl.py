@@ -7,7 +7,7 @@ import pickle
 import stat
 from collections.abc import Iterator
 from datetime import UTC, datetime
-from pathlib import Path
+from pathlib import Path, PurePath
 from typing import Any, assert_type
 
 import pytest
@@ -391,6 +391,28 @@ def test_a_failed_write_leaves_the_file_as_it_was(directory: Path) -> None:
 
     assert path.read_text(encoding="utf-8") == '{"instance_id":"old"}\n'
     assert list(directory.iterdir()) == [path]  # No temporary file is left behind.
+
+
+def test_write_renames_a_file_from_the_same_directory(
+    directory: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    # A rename replaces the file atomically only within one file system.
+    renames: list[tuple[Path, Path]] = []
+    replace = Path.replace
+
+    def recording_replace(source: Path, target: str | PurePath) -> Path:
+        renames.append((source, Path(target)))
+        return replace(source, target)
+
+    monkeypatch.setattr(Path, "replace", recording_replace)
+    path = directory / "tasks.jsonl"
+
+    write_jsonl(path, [TaskInput(instance_id="a")])
+
+    ((source, target),) = renames
+    assert target == path
+    assert source.parent == target.parent
+    assert path.read_text(encoding="utf-8") == '{"instance_id":"a"}\n'
 
 
 def test_a_written_file_gets_the_permissions_of_any_new_file(tmp_path: Path) -> None:
