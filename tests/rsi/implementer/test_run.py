@@ -159,7 +159,7 @@ def test_the_prompt_gives_the_hypothesis_paths_rules_and_limits(lane: Lane) -> N
     lane.run(submit())
 
     system, task = (message["content"] for message in lane.trajectory()["messages"][:2])
-    assert "at most 60 steps, $3.0 of model calls and 30 minutes" in system
+    assert "at most 60 steps, $10.0 of model calls and 30 minutes" in system
     assert "stopped after 120 s" in system
     assert str(lane.worktree.path) in system
     assert "Add a skill on decorrelating subqueries." in task
