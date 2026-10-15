@@ -22,6 +22,7 @@ import sys
 import tomllib
 from collections.abc import Callable, Sequence
 from contextlib import AbstractAsyncContextManager
+from datetime import UTC, datetime
 from pathlib import Path
 from typing import Final, Literal, cast
 
@@ -66,7 +67,7 @@ class LaneSettings(BaseModel):
     # The real wiring's "module:function" for T11's evaluator and T22's hooks.
     evaluator: str = ""
     hooks: str = ""
-    log_level: str = "INFO"
+    log_level: Literal["DEBUG", "INFO", "WARNING", "ERROR"] = "INFO"
     lane: LaneConfig
 
     def ledger(self) -> Path:
@@ -124,7 +125,14 @@ def main(argv: Sequence[str] | None = None) -> int:
 
 
 async def _run_lane(settings: LaneSettings) -> int:
-    wiring = cast("Wiring", import_object(settings.wiring, "wiring"))
+    # Past the deadline the lane only stops, so it needs none of what a round needs: a restart
+    # after the freeze writes its stop record and calls the final results PR whatever is down.
+    if datetime.now(UTC) >= settings.lane.deadline:
+        from goaly.rsi.wiring import build_stopped  # Here: goaly.rsi.wiring imports this module.
+
+        wiring: Wiring = build_stopped
+    else:
+        wiring = cast("Wiring", import_object(settings.wiring, "wiring"))
     async with wiring(settings) as (deps, hooks):
         return await LaneRunner(deps, settings.lane, hooks=hooks).run()
 

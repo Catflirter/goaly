@@ -17,11 +17,14 @@ from goaly.contracts.gen.experiment_pb2 import (
     DECISION_ABORTED,
     DECISION_ACCEPTED,
     DECISION_PENDING,
+    IMPLEMENTER_EXIT_INFRASTRUCTURE,
     LANE_EFFISQL,
     LANE_EVENT_KIND_STARTED,
     LANE_EVENT_KIND_STOPPED,
 )
+from goaly.rsi import lane as lane_module
 from goaly.rsi.cli import LaneSettings, load_settings
+from goaly.rsi.hypothesis_queue import HypothesisQueue
 from goaly.rsi.lane import (
     DEADLINE,
     NO_ACCEPTED_CHANGE,
@@ -32,7 +35,7 @@ from goaly.rsi.lane import (
     StopInfo,
 )
 from goaly.rsi.ledger import Ledger
-from goaly.rsi.round import RoundOutcome
+from goaly.rsi.round import RoundOutcome, RoundRunner
 from tests.rsi.dry_run import DryRun, dry_run, write_config
 from tests.rsi.gitrepo import git
 
@@ -259,3 +262,47 @@ async def test_the_lane_wires_its_task_and_implementer_limits(tmp_path: Path) ->
         assert parts.agents.most == 2
         # 8 val tasks x 2 seeds per reference, on at most 4 at once: the cap is reached.
         assert parts.evaluator.most_in_flight == 4
+
+
+async def test_smoke_infrastructure_failures_abort_and_requeue(tmp_path: Path) -> None:
+    _, config = write_config(tmp_path, datetime.now(UTC) + timedelta(hours=1), "smoke-error")
+    settings = load_settings(config)
+    async with dry_run(settings) as parts:
+        outcome = await RoundRunner(parts.deps, settings.lane.round).run(1)
+    assert (outcome.decided, outcome.aborted) == (0, 3)  # Nothing counts toward the stop.
+    latest = Ledger(settings.ledger()).latest_experiments(LANE_EFFISQL).values()
+    assert {r.decision for r in latest} == {DECISION_ABORTED}
+    assert {r.implementer.exit for r in latest} == {IMPLEMENTER_EXIT_INFRASTRUCTURE}
+    queued = HypothesisQueue(settings.ledger(), LANE_EFFISQL).pending()
+    assert sorted(h.hypothesis_id for h in queued) == ["bad-1", "good-1", "meh-1"]
+
+
+async def test_a_hung_hook_times_out_and_a_failing_settle_still_stops(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    _, settings = settings_for(tmp_path, -1)
+    seen: list[str] = []
+
+    async def hung(info: StopInfo) -> None:
+        await asyncio.sleep(3600)  # GitHub stalls.
+
+    async def notify(info: StopInfo) -> None:
+        seen.append(info.rule)
+
+    def broken(*args: object, **kwargs: object) -> object:
+        raise RuntimeError("git is gone")
+
+    monkeypatch.setattr(lane_module, "reconcile_best", broken)
+    async with dry_run(settings) as parts:
+        hooks = replace(parts.hooks, results_pr=hung, notify=notify)
+        config = settings.lane.model_copy(update={"hook_timeout_s": 0.2})
+        runner = LaneRunner(parts.deps, config, hooks=hooks)
+        runner._resume = _no_resume  # type: ignore[method-assign]  # Skip the start's reconcile.
+        assert await runner.run() == 0
+    assert seen == [DEADLINE]
+    events = Ledger(settings.ledger()).lane_events(LANE_EFFISQL)
+    assert events[-1].kind == LANE_EVENT_KIND_STOPPED
+
+
+async def _no_resume() -> None:
+    return None

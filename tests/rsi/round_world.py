@@ -143,6 +143,8 @@ class ToyEvaluator:
     gate: asyncio.Event | None = None  # When set, validations wait for it.
     train_known: bool = True  # Whether v0's train results exist.
     kind_of: Callable[[str], str] | None = None  # The behavior of a commit not in ``kinds``.
+    smoke_gate: asyncio.Event | None = None  # When set, goaly-smoke's evaluations wait for it.
+    smoke_error: bool = False  # Whether goaly-smoke's evaluations fail, as a dead container.
 
     def __post_init__(self) -> None:
         self._limit = asyncio.Semaphore(self.concurrency)
@@ -154,6 +156,10 @@ class ToyEvaluator:
             raise RuntimeError("the solve container exited with 137")
         if self.gate is not None and request.phase == "validation":
             await self.gate.wait()
+        if request.phase == "smoke" and self.smoke_error:
+            raise RuntimeError("the smoke run's solve container exited with 137")
+        if request.phase == "smoke" and self.smoke_gate is not None:
+            await self.smoke_gate.wait()
         pairs = [(task, seed) for task in request.instance_ids for seed in request.seeds]
         await asyncio.gather(*(self._solve() for _ in pairs))  # The tasks run concurrently.
         results = [
@@ -271,6 +277,7 @@ class ScriptedGlm:
     analyst_ids: list[list[str]] = field(default_factory=list)
     invalid: bool = False
     fail: bool = False
+    hang_tools: bool = False  # Whether an implementer's call (one with tools) never returns.
     bodies: list[dict[str, Any]] = field(default_factory=list)
     records: list[LlmCallRecord] = field(default_factory=list)
 
@@ -280,6 +287,8 @@ class ScriptedGlm:
     async def handle(self, request: httpx.Request) -> httpx.Response:
         body = json.loads(request.content)
         self.bodies.append(body)
+        if self.hang_tools and body.get("tools"):
+            await asyncio.sleep(3600)
         if self.fail:
             return httpx.Response(400, json={"error": {"message": "refused"}})
         prompt = body["messages"][-1]["content"]
