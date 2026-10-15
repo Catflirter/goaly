@@ -20,8 +20,14 @@ from goaly.contracts.gen.experiment_pb2 import (
 )
 from goaly.contracts.gen.llm_call_pb2 import CallPurpose
 from goaly.contracts.gen.trajectory_pb2 import ChatMessage, ChatRole
-from goaly.rsi.analyst import Analysis, AnalysisSkipped, AnalystInput, analyze
-from tests.rsi.fake_llm import COST_PER_CALL, FakeGlm
+from goaly.rsi.analyst import (
+    ANALYST_MAX_TOKENS,
+    Analysis,
+    AnalysisSkipped,
+    AnalystInput,
+    analyze,
+)
+from tests.rsi.fake_llm import COST_PER_CALL, FakeGlm, GlmReply
 
 pytestmark = pytest.mark.anyio
 
@@ -96,6 +102,7 @@ async def test_a_valid_answer_becomes_hypotheses() -> None:
     assert analysis.usage.cost_usd == COST_PER_CALL
     [body] = gateway.bodies
     assert body["model"] == "glm-5.3"
+    assert body["max_tokens"] == ANALYST_MAX_TOKENS == 24_000
     assert "tools" not in body
     assert [message["role"] for message in body["messages"]] == ["system", "user"]
 
@@ -163,6 +170,15 @@ async def test_an_invalid_answer_is_retried_then_accepted(invalid: str, says: st
     assert len(analysis.call_ids) == 2
     assert analysis.usage.cost_usd == 2 * COST_PER_CALL
     assert says in gateway.bodies[1]["messages"][-1]["content"]
+
+
+async def test_a_cut_off_answer_is_retried_at_the_same_max_tokens() -> None:
+    cut = GlmReply("", reasoning="A long think.", finish_reason="length")
+    gateway = FakeGlm(cut, answer())
+    analysis = await run(gateway)
+    assert isinstance(analysis, Analysis)
+    assert [body["max_tokens"] for body in gateway.bodies] == [ANALYST_MAX_TOKENS] * 2
+    assert gateway.bodies[1]["messages"][2]["reasoning_content"] == "A long think."
 
 
 async def test_three_invalid_answers_skip_the_round(

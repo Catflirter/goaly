@@ -44,11 +44,12 @@ from goaly.contracts.gen.experiment_pb2 import (
 from goaly.contracts.gen.llm_call_pb2 import CallPurpose, Usage
 from goaly.contracts.gen.trajectory_pb2 import ChatMessage, ChatRole
 from goaly.harness.core.llm import CallTags, LlmClient
-from goaly.harness.core.llm_models import IMPROVEMENT_MODEL
+from goaly.harness.core.llm_models import IMPROVEMENT_MODEL, ModelParams
 from goaly.rsi.ids import check_id
 from goaly.rsi.structured import StructuredOutputError, complete_structured
 
 __all__ = [
+    "ANALYST_MAX_TOKENS",
     "HYPOTHESIS_COUNT",
     "Analysis",
     "AnalysisSkipped",
@@ -60,6 +61,9 @@ __all__ = [
 ]
 
 HYPOTHESIS_COUNT: Final = 3
+# GLM may think past GLM_PROFILE's 12K tokens on this prompt: a 2026-10-15 smoke run spent all 12K
+# on reasoning. A reply cut off anyway is retried, its reasoning replayed (goaly.rsi.structured).
+ANALYST_MAX_TOKENS: Final = 24_000
 
 _logger = logging.getLogger(__name__)
 
@@ -213,7 +217,8 @@ async def analyze(
     """Ask GLM for the round's hypotheses: one structured call, retried while invalid.
 
     The calls are recorded with purpose CALL_PURPOSE_RSI_ANALYST and ``round_id`` as run ID.
-    With no failed train task there is nothing to analyze, and no call is made. A gateway
+    Each call may use ANALYST_MAX_TOKENS. With no failed train task there is nothing to
+    analyze, and no call is made. A gateway
     failure that outlasted the client's retries raises its LlmError.
     """
     check_id(round_id, "round_id")
@@ -227,7 +232,11 @@ async def analyze(
     }
     try:
         reply = await complete_structured(
-            llm, analyst_input.messages(), AnalystAnswer, context=context
+            llm,
+            analyst_input.messages(),
+            AnalystAnswer,
+            context=context,
+            params=ModelParams(max_tokens=ANALYST_MAX_TOKENS),
         )
     except StructuredOutputError as error:
         cost = error.usage.cost_usd if error.usage.HasField("cost_usd") else None
