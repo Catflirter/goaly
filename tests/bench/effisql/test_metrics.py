@@ -194,7 +194,6 @@ def test_tier_credit_rejects_a_speedup_that_cannot_be(speedup: float) -> None:
         pytest.param(timed(4.0, alt_matched=True, literal_result=True), True, id="robust literal"),
         pytest.param(timed(4.0, alt_matched=False, literal_result=True), True, id="both flags"),
         pytest.param(grade(0.0, alt_matched=False), False, id="unmatched, not hard_coded"),
-        pytest.param(grade(0.0, literal_result=True), True, id="unmatched literal_result"),
     ],
 )
 def test_is_flagged(graded: EffiSqlGrade, flagged: bool) -> None:

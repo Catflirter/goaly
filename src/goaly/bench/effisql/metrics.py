@@ -214,9 +214,10 @@ def tier_credit(speedup: float) -> float:
 def is_flagged(grade: EffiSqlGrade) -> bool:
     """Return whether a hard-coding check flagged the prediction (spec §4.1).
 
-    hard_coded is a match whose alt_matched is false: a prediction that matched nowhere is wrong,
-    not hard-coded. literal_result true describes the plan, so it flags the prediction whether
-    it matched or not. A check that did not run leaves its field unset, which flags nothing.
+    Both checks run only on a matched prediction, and not on an identity-cached grade, so their
+    fields are set only on a match: alt_matched false is the hard_coded flag, and literal_result
+    true the literal_result flag. A field left unset, by a check that did not run, flags nothing.
+    hard_coded also requires the match itself, in case an unmatched grade has alt_matched false.
     """
     hard_coded = grade.matched and grade.HasField("alt_matched") and not grade.alt_matched
     return hard_coded or grade.literal_result
