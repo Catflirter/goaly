@@ -16,6 +16,8 @@
   T11's two-phase pipeline provides it, driving a host run of ``goaly run --phase all`` for
   the tasks, seeds and split each request names (V27), with at most ``task_concurrency``
   tasks at once (spec §6.2);
+- the identity probes (spec §6.2), on the grading instances through the evaluator's own
+  grader, its ``grader`` attribute, with the train task whose base takes about 10 s;
 - the stop hooks, from config's ``hooks``: ``module:function``, called with the settings and
   returning LaneHooks. T22 provides them; without them the lane stops with no results PR and
   no notification, which is logged.
@@ -25,12 +27,14 @@ import asyncio
 import concurrent.futures
 import functools
 import logging
+import threading
 from collections.abc import AsyncIterator, Callable, Sequence
 from contextlib import asynccontextmanager
 from dataclasses import replace
 from typing import cast
 
 from goaly.bench.effisql.data import default_cache_dir, fetch_dataset, load_instances
+from goaly.bench.effisql.grading_pool import GRADING_INSTANCES
 from goaly.bench.effisql.splits import load_exclusions, load_splits
 from goaly.contracts.gen.experiment_pb2 import LANE_EFFISQL, GuardResult, Hypothesis
 from goaly.contracts.gen.result_pb2 import TaskResult
@@ -51,15 +55,105 @@ from goaly.rsi.implementer.run import Implementer
 from goaly.rsi.lane import LaneHooks
 from goaly.rsi.ledger import Ledger
 from goaly.rsi.lessons import LessonStore
+from goaly.rsi.probe import pick_task, probe
 from goaly.rsi.round import Evaluation, Evaluator, RoundDeps
 from goaly.rsi.sandbox import ensure_image, remove_containers
 from goaly.rsi.smoke import EvaluatorSmokeRunner
 from goaly.rsi.usage import CallTally
 from goaly.rsi.workspace import Workspace
 
-__all__ = ["build"]
+__all__ = ["ImplementerPool", "build", "build_stopped"]
 
 _logger = logging.getLogger(__name__)
+
+
+class ImplementerPool:
+    """The lane's implementer threads, which a stopping lane never waits on for long.
+
+    Leaving the context runs the ``on_stop`` callbacks, such as cancelling goaly-smoke's
+    evaluations, cancels the runs not started, and waits at most ``timeout_s`` for the running
+    ones, on a thread of its own while the event loop goes on serving them. A run still busy then
+    is left behind: the lane exits anyway (goaly.rsi.__main__), and the next start removes its
+    sandbox.
+    """
+
+    def __init__(self, threads: int, *, timeout_s: float) -> None:
+        self.executor = concurrent.futures.ThreadPoolExecutor(
+            max_workers=threads, thread_name_prefix="implementer"
+        )
+        self._timeout_s = timeout_s
+        self._on_stop: list[Callable[[], object]] = []
+
+    def on_stop(self, callback: Callable[[], object]) -> None:
+        self._on_stop.append(callback)
+
+    async def __aenter__(self) -> "ImplementerPool":
+        return self
+
+    async def __aexit__(self, *exc_info: object) -> None:
+        for callback in self._on_stop:
+            try:
+                callback()
+            except Exception:
+                _logger.exception("an implementer stop callback failed")
+        self.executor.shutdown(wait=False, cancel_futures=True)
+        joiner = threading.Thread(target=self.executor.shutdown, kwargs={"wait": True}, daemon=True)
+        joiner.start()
+        waited = 0.0
+        while joiner.is_alive() and waited < self._timeout_s:
+            await asyncio.sleep(0.05)
+            waited += 0.05
+        if joiner.is_alive():
+            _logger.warning(
+                "implementer runs still busy after %.0f s; the lane exits without them",
+                self._timeout_s,
+            )
+
+
+@asynccontextmanager
+async def build_stopped(settings: LaneSettings) -> AsyncIterator[tuple[RoundDeps, LaneHooks]]:
+    """The wiring of a lane past its deadline, which only stops: the ledger, the worktrees
+    and the stop hooks, with no Docker, dataset, gateway or evaluator, so a restart after the
+    freeze always writes its stop record and calls the final results PR.
+    """
+    repo = settings.repo.resolve()
+    ledger = Ledger(settings.ledger())
+    v0 = run_git(["rev-parse", f"{settings.v0}^{{commit}}"], cwd=repo).strip()
+    unavailable = _Unavailable()
+    deps = RoundDeps(
+        lane=LANE_EFFISQL,
+        ledger=ledger,
+        lessons=LessonStore(ledger),
+        queue=HypothesisQueue(settings.ledger(), LANE_EFFISQL),
+        workspace=Workspace(repo, root=settings.worktree_root),
+        llm=cast(LlmClient, unavailable),
+        implementer=cast(Implementer, unavailable),
+        guards=cast(Callable[[str, str, str], list[GuardResult]], unavailable),
+        evaluator=cast(Evaluator, unavailable),
+        analyst_input=cast(Callable[..., AnalystInput], unavailable),
+        train_ids=(),
+        val_ids=(),
+        v0_commit=v0,
+    )
+    yield deps, _hooks(settings)
+
+
+class _Unavailable:
+    """Stands in for what a stopped lane never uses."""
+
+    def __getattr__(self, name: str) -> object:
+        raise RuntimeError(f"a lane past its deadline has no {name}")
+
+    def __call__(self, *args: object, **kwargs: object) -> object:
+        raise RuntimeError("a lane past its deadline runs nothing")
+
+
+def _hooks(settings: LaneSettings) -> LaneHooks:
+    if settings.hooks:
+        factory = import_object(settings.hooks, "hooks")
+        return cast(Callable[[LaneSettings], LaneHooks], factory)(settings)
+    _logger.warning("no stop hooks: the lane will open no results PR and send no notification")
+    return LaneHooks()
 
 
 @asynccontextmanager
@@ -68,13 +162,7 @@ async def build(settings: LaneSettings) -> AsyncIterator[tuple[RoundDeps, LaneHo
     if not settings.evaluator:
         raise ConfigError("evaluator must name T11's evaluator factory, as 'module:function'")
     make_evaluator = cast(Callable[..., Evaluator], import_object(settings.evaluator, "evaluator"))
-    hooks = LaneHooks()
-    if settings.hooks:
-        hooks = cast(Callable[[LaneSettings], LaneHooks], import_object(settings.hooks, "hooks"))(
-            settings
-        )
-    else:
-        _logger.warning("no stop hooks: the lane will open no results PR and send no notification")
+    hooks = _hooks(settings)
     try:
         gateway = load_settings()
     except SettingsError as error:
@@ -125,42 +213,60 @@ async def build(settings: LaneSettings) -> AsyncIterator[tuple[RoundDeps, LaneHo
 
     train_ids = splits.ids(SPLIT_TRAIN)
     loop = asyncio.get_running_loop()
-    with concurrent.futures.ThreadPoolExecutor(
-        max_workers=settings.lane.implementer_threads, thread_name_prefix="implementer"
-    ) as pool:
-        async with LlmClient(gateway, tally) as llm:
-            evaluator = make_evaluator(
-                repo=repo,
-                runs_dir=runs,
-                task_concurrency=settings.lane.task_concurrency,
-                evaluation_type=Evaluation,
-                cost_stats_type=CostStats,
-            )
-            implementer = Implementer(
-                llm,
-                workspace,
-                image=image,
-                runs_dir=runs,
-                pool=pool,
-                sandbox=guard_config.sandbox,
-                smoke=EvaluatorSmokeRunner(evaluator, guards, repo, loop),
-                train_ids=train_ids,
-            )
-            deps = RoundDeps(
-                lane=lane,
-                ledger=ledger,
-                lessons=LessonStore(ledger),
-                queue=HypothesisQueue(settings.ledger(), lane),
-                workspace=workspace,
-                llm=llm,
-                implementer=implementer,
-                guards=guards,
-                evaluator=evaluator,
-                analyst_input=analyst_input,
-                train_ids=train_ids,
-                val_ids=splits.ids(SPLIT_VAL),
-                v0_commit=v0,
-                usage=tally.usage,
-            )
-            cleanup = functools.partial(remove_containers, lane=lane, config=guard_config.sandbox)
-            yield deps, replace(hooks, remove_containers=cleanup)
+    async with (
+        LlmClient(gateway, tally) as llm,
+        ImplementerPool(
+            settings.lane.implementer_threads, timeout_s=settings.lane.shutdown_timeout_s
+        ) as pool,
+    ):
+        evaluator = make_evaluator(
+            repo=repo,
+            runs_dir=runs,
+            task_concurrency=settings.lane.task_concurrency,
+            evaluation_type=Evaluation,
+            cost_stats_type=CostStats,
+        )
+        smoke = EvaluatorSmokeRunner(evaluator, guards, repo, loop, train_ids=train_ids)
+        pool.on_stop(smoke.cancel_all)
+        closing = getattr(evaluator, "aclose", None)  # T11 may hold pools to release.
+        implementer = Implementer(
+            llm,
+            workspace,
+            image=image,
+            runs_dir=runs,
+            pool=pool.executor,
+            sandbox=guard_config.sandbox,
+            smoke=smoke,
+            train_ids=train_ids,
+        )
+        deps = RoundDeps(
+            lane=lane,
+            ledger=ledger,
+            lessons=LessonStore(ledger),
+            queue=HypothesisQueue(settings.ledger(), lane),
+            workspace=workspace,
+            llm=llm,
+            implementer=implementer,
+            guards=guards,
+            evaluator=evaluator,
+            analyst_input=analyst_input,
+            train_ids=train_ids,
+            val_ids=splits.ids(SPLIT_VAL),
+            v0_commit=v0,
+            usage=tally.usage,
+        )
+        cleanup = functools.partial(remove_containers, lane=lane, config=guard_config.sandbox)
+        hooks = replace(hooks, remove_containers=cleanup)
+        grader = getattr(evaluator, "grader", None)  # The evaluator's own, shared (T10).
+        if grader is None:
+            _logger.warning("no identity probes: the evaluator exposes no grader")
+        else:
+            train = set(train_ids)
+            task = pick_task([inst for inst in instances if inst.instance_id in train])
+            identity = functools.partial(probe, grader, task, GRADING_INSTANCES)
+            hooks = replace(hooks, identity_probe=identity)
+        try:
+            yield deps, hooks
+        finally:
+            if closing is not None:
+                await closing()

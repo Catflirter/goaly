@@ -15,7 +15,11 @@ pytestmark = pytest.mark.anyio
 
 def settings(tmp_path: Path, **lines: str) -> object:
     _, config = write_config(tmp_path, datetime.now(UTC) + timedelta(hours=1))
-    text = config.read_text().replace('wiring = "tests.rsi.dry_run:build"\n', "")
+    text = "".join(
+        line
+        for line in config.read_text().splitlines(keepends=True)
+        if not line.startswith(("wiring =", "hooks =", "evaluator ="))
+    )
     extra = "".join(f'{key} = "{value}"\n' for key, value in lines.items())
     config.write_text(extra + text, encoding="utf-8")
     return load_settings(config)

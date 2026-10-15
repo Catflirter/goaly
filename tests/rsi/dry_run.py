@@ -13,16 +13,20 @@
 
 The analyst proposes good, meh and bad in round 1, and only bad ones afterwards, so the lane
 accepts once and then stops after 4 rounds without an accepted change.
+
+Config's ``evaluator`` picks a variant: "hang" makes good's goaly-smoke wait forever and meh's
+implementer run on T20's real GlmModel, whose GLM call never returns, so the deadline comes
+while both are in flight; "smoke-error" makes every goaly-smoke evaluation fail.
 """
 
 import asyncio
-import concurrent.futures
+import functools
 import json
 import threading
 import time
 from collections.abc import AsyncIterator, Awaitable, Callable, Iterator
 from contextlib import asynccontextmanager, contextmanager
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from datetime import datetime
 from pathlib import Path
 from typing import Any
@@ -30,21 +34,26 @@ from typing import Any
 import httpx
 from pydantic import SecretStr
 
+from goaly.bench.effisql.data import EffiSqlInstance
+from goaly.bench.effisql.grading_pool import GRADING_INSTANCES, GradingInstance, Priority
 from goaly.contracts.gen.experiment_pb2 import LANE_EFFISQL, GuardResult, LaneEventKind
 from goaly.harness.core.llm import LlmClient
 from goaly.harness.core.settings import Settings
 from goaly.rsi.git import GitError, run_git
 from goaly.rsi.guards.paths import check_allowed_paths
 from goaly.rsi.hypothesis_queue import HypothesisQueue
+from goaly.rsi.implementer.config import load_config
 from goaly.rsi.implementer.environment import HostCommand
+from goaly.rsi.implementer.model import GlmModel
 from goaly.rsi.implementer.run import Implementer
-from goaly.rsi.implementer.smoke import mentions_smoke
 from goaly.rsi.lane import LaneHooks, StopInfo
 from goaly.rsi.ledger import Ledger
 from goaly.rsi.lessons import LessonStore
+from goaly.rsi.probe import probe
 from goaly.rsi.round import RoundDeps
 from goaly.rsi.smoke import EvaluatorSmokeRunner
 from goaly.rsi.usage import CallTally
+from goaly.rsi.wiring import ImplementerPool
 from goaly.rsi.workspace import Workspace, Worktree
 from tests.rsi.gitrepo import git, make_repo
 from tests.rsi.implementer.fakes import FakeEnvironment, NoLlm, ScriptedModel, shell, submit
@@ -108,18 +117,29 @@ async def dry_run(settings: Any) -> AsyncIterator[DryRun]:
     evaluator = ToyEvaluator(
         kind_of=lambda commit: _kind_of(repo, commit),
         concurrency=settings.lane.task_concurrency,
+        smoke_gate=asyncio.Event() if settings.evaluator == "hang" else None,
+        smoke_error=settings.evaluator == "smoke-error",
     )
+    glm.hang_tools = settings.evaluator == "hang"
     v0 = run_git(["rev-parse", f"{settings.v0}^{{commit}}"], cwd=repo).strip()
 
     def guards(experiment_id: str, parent: str, candidate: str) -> list[GuardResult]:
         del experiment_id
         return [check_allowed_paths(repo, LANE_EFFISQL, parent=parent, candidate=candidate)]
 
-    def model(experiment_id: str, stop: object) -> ScriptedModel:
-        del stop
+    def model(experiment_id: str, stop: threading.Event) -> Any:
         kind = behavior(
             ledger.latest_experiments(LANE_EFFISQL)[experiment_id].hypothesis.hypothesis_id
         )
+        if settings.evaluator == "hang" and kind == "meh":
+            config = load_config()
+            return GlmModel(
+                llm_holder[0],
+                experiment_id=experiment_id,
+                limits=config.limits,
+                templates=config.model,
+                stop=stop,
+            )
         return ScriptedModel(
             f"printf '%s\\n' {kind} > {KIND_FILE}",
             f"goaly-smoke {TRAIN[0]}",
@@ -133,56 +153,80 @@ async def dry_run(settings: Any) -> AsyncIterator[DryRun]:
         local = shell(worktree.path)
 
         def handle(command: str) -> dict[str, Any]:
-            if host is not None and mentions_smoke(command):
-                return host(command)
             time.sleep(0.05)  # Long enough for the runs to overlap.
             return local(command)
 
+        sandbox = FakeEnvironment(handle)
+        sandbox.smoke = host  # goaly-smoke's host side, as the sandbox hands it on.
         agents.enter()
         try:
-            yield FakeEnvironment(handle)
+            yield sandbox
         finally:
             agents.leave()
 
     loop = asyncio.get_running_loop()
-    with concurrent.futures.ThreadPoolExecutor(
-        max_workers=settings.lane.implementer_threads, thread_name_prefix="implementer"
-    ) as pool:
-        async with LlmClient(gateway, tally, transport=httpx.MockTransport(glm.handle)) as llm:
-            implementer = Implementer(
-                NoLlm(),
-                workspace,
-                image="dry-run",
-                runs_dir=runs,
-                pool=pool,
-                make_environment=environment,
-                make_model=model,
-                smoke=EvaluatorSmokeRunner(evaluator, guards, repo, loop),
-                train_ids=TRAIN,
-            )
-            deps = RoundDeps(
-                lane=LANE_EFFISQL,
-                ledger=ledger,
-                lessons=LessonStore(ledger),
-                queue=queue,
-                workspace=workspace,
-                llm=llm,
-                implementer=implementer,
-                guards=guards,
-                evaluator=evaluator,
-                analyst_input=analyst_input,
-                train_ids=TRAIN,
-                val_ids=VAL,
-                v0_commit=v0,
-                usage=tally.usage,
-            )
-            hooks = LaneHooks(
-                results_pr=_hook(repo, "results_pr", ledger), notify=_hook(repo, "notify", ledger)
-            )
-            yield DryRun(deps, hooks, evaluator, glm, agents)
+    llm_holder: list[LlmClient] = []
+    async with (
+        LlmClient(gateway, tally, transport=httpx.MockTransport(glm.handle)) as llm,
+        ImplementerPool(
+            settings.lane.implementer_threads, timeout_s=settings.lane.shutdown_timeout_s
+        ) as pool,
+    ):
+        llm_holder.append(llm)
+        smoke = EvaluatorSmokeRunner(evaluator, guards, repo, loop, train_ids=TRAIN)
+        pool.on_stop(smoke.cancel_all)
+        implementer = Implementer(
+            NoLlm(),
+            workspace,
+            image="dry-run",
+            runs_dir=runs,
+            pool=pool.executor,
+            make_environment=environment,
+            make_model=model,
+            smoke=smoke,
+            train_ids=TRAIN,
+        )
+        deps = RoundDeps(
+            lane=LANE_EFFISQL,
+            ledger=ledger,
+            lessons=LessonStore(ledger),
+            queue=queue,
+            workspace=workspace,
+            llm=llm,
+            implementer=implementer,
+            guards=guards,
+            evaluator=evaluator,
+            analyst_input=analyst_input,
+            train_ids=TRAIN,
+            val_ids=VAL,
+            v0_commit=v0,
+            usage=tally.usage,
+        )
+        hooks = replace(
+            stop_hooks(settings),
+            identity_probe=functools.partial(probe, FakeGrader(), PROBE_TASK, GRADING_INSTANCES),
+        )
+        yield DryRun(deps, hooks, evaluator, glm, agents)
 
 
-def write_config(tmp_path: Path, deadline: datetime) -> tuple[Path, Path]:
+PROBE_TASK = EffiSqlInstance.model_validate(
+    {"id": TRAIN[5], "db": "tpch", "base_sql": "SELECT 1", "base_time": 10_000}
+)
+
+
+class FakeGrader:
+    """T10's identity probe, on instances that time as at setup, except grade-3, 20% off."""
+
+    async def identity_probe(
+        self, inst: EffiSqlInstance, *, instance: GradingInstance, priority: Priority = Priority.RSI
+    ) -> float:
+        return 1.2 if instance.name == "grade-3" else 1.0
+
+    def identity_reference(self, inst: EffiSqlInstance) -> float | None:
+        return 1.0
+
+
+def write_config(tmp_path: Path, deadline: datetime, variant: str = "") -> tuple[Path, Path]:
     """A repository tagged baseline-v0 and best/effisql, and a dry-run config for it."""
     repo = make_repo(tmp_path / "repo")
     git(repo, "tag", "baseline-v0")
@@ -193,15 +237,27 @@ repo = "{repo}"
 ledger_dir = "{tmp_path / "ledger"}"
 worktree_root = "{tmp_path / "worktrees"}"
 wiring = "tests.rsi.dry_run:build"
+hooks = "tests.rsi.dry_run:stop_hooks"
+evaluator = "{variant}"
 log_level = "WARNING"
 
 [lane]
 deadline = "{deadline.isoformat()}"
 infrastructure_backoff_s = 0
+shutdown_timeout_s = 2
 """,
         encoding="utf-8",
     )
     return repo, config
+
+
+def stop_hooks(settings: Any) -> LaneHooks:
+    """The dry run's stop hooks, also its config's ``hooks`` for a lane past its deadline."""
+    repo = Path(settings.repo).resolve()
+    ledger = Ledger(settings.ledger())
+    return LaneHooks(
+        results_pr=_hook(repo, "results_pr", ledger), notify=_hook(repo, "notify", ledger)
+    )
 
 
 def _kind_of(repo: Path, commit: str) -> str:

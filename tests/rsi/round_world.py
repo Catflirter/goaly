@@ -17,7 +17,8 @@ A hypothesis's ID names its candidate's behavior, by its first word:
 - ``graderr``: its validation has a grader error;
 - ``flaky``: like ``good``, but the infrastructure fails 2 of its 8 validation tasks (25%);
 - ``wobbly``: like ``good``, but the infrastructure fails 1 of them (12.5%), under the 20% cap;
-- ``hostfail``: like ``good``, but the host counts 2 infrastructure failures in its validation;
+- ``hostfail``: like ``good``, but the host names 2 infrastructure failures in its validation;
+- ``trainonly``: solves the failing train tasks, but scores on val as the best does.
 - ``extra``: its validation returns one result more than was asked for.
 
 The best (v0) fails train tasks 1 to 5, solves 6 to 10, and scores 0.5 on every val task.
@@ -52,6 +53,7 @@ from goaly.contracts.gen.result_pb2 import TASK_ERROR_TYPE_LLM, TaskResult
 from goaly.contracts.gen.task_pb2 import (
     GRADE_STATUS_GRADED,
     GRADE_STATUS_GRADER_ERROR,
+    SPLIT_VAL,
     EffiSqlGrade,
     Grade,
 )
@@ -80,6 +82,7 @@ FAILING = TRAIN[:5]
 VAL = tuple(str(n) for n in range(101, 109))
 _SPEEDUP = {0.25: 0.6, 0.5: 1.0, 0.75: 1.5, 1.0: 3.0}
 _GOODLIKE = frozenset({"flaky", "wobbly", "hostfail", "extra"})
+_TRAIN_ONLY = frozenset({"trainonly"})
 
 
 def hypothesis(hypothesis_id: str) -> Hypothesis:
@@ -101,7 +104,9 @@ def behavior(hypothesis_id: str) -> str:
 
 def credit(kind: str, task: str, seed: int) -> float:
     """The checked credit a version of ``kind`` gets on ``task`` in ``seed``."""
-    improves = kind in {"good", "meh", "noisy", "flag", "late", "short", "graderr"} | _GOODLIKE
+    improves = kind in {"good", "meh", "noisy", "flag", "late", "short", "graderr"} | (
+        _GOODLIKE | _TRAIN_ONLY
+    )
     if task in TRAIN:
         return 1.0 if task not in FAILING or improves else 0.0
     if kind in {"good", "flag", "late", "short", "graderr"} | _GOODLIKE:
@@ -143,6 +148,9 @@ class ToyEvaluator:
     gate: asyncio.Event | None = None  # When set, validations wait for it.
     train_known: bool = True  # Whether v0's train results exist.
     kind_of: Callable[[str], str] | None = None  # The behavior of a commit not in ``kinds``.
+    smoke_gate: asyncio.Event | None = None  # When set, goaly-smoke's evaluations wait for it.
+    smoke_error: bool = False  # Whether goaly-smoke's evaluations fail, as a dead container.
+    reference_infra: int = 0  # How many val tasks the infrastructure fails in references.
 
     def __post_init__(self) -> None:
         self._limit = asyncio.Semaphore(self.concurrency)
@@ -154,6 +162,10 @@ class ToyEvaluator:
             raise RuntimeError("the solve container exited with 137")
         if self.gate is not None and request.phase == "validation":
             await self.gate.wait()
+        if request.phase == "smoke" and self.smoke_error:
+            raise RuntimeError("the smoke run's solve container exited with 137")
+        if request.phase == "smoke" and self.smoke_gate is not None:
+            await self.smoke_gate.wait()
         pairs = [(task, seed) for task in request.instance_ids for seed in request.seeds]
         await asyncio.gather(*(self._solve() for _ in pairs))  # The tasks run concurrently.
         results = [
@@ -175,10 +187,17 @@ class ToyEvaluator:
                 result.error_type = TASK_ERROR_TYPE_LLM
         if request.phase == "validation" and kind == "extra":
             results.append(task_result(request.run_id, TRAIN[0], 0, 1.0, flagged=False))
-        infra = 2 if request.phase == "validation" and kind == "hostfail" else None
+        infra: set[tuple[str, int]] | None = None
+        if request.phase == "validation" and kind == "hostfail":
+            infra = {(VAL[0], 0), (VAL[1], 0)}
+        if request.phase == "reference" and request.split == SPLIT_VAL and self.reference_infra:
+            # The best's reference loses its first tasks to the infrastructure, at credit 0.
+            for result in results[: self.reference_infra * len(request.seeds)]:
+                result.error_type = TASK_ERROR_TYPE_LLM
+                result.grade.effisql.CopyFrom(EffiSqlGrade(credit=0.0, matched=False))
         count = len(results)
         stats = CostStats(1000.0, 0.01, 10.0, count=count)
-        return Evaluation(results, stats, infra_failures=infra)
+        return Evaluation(results, stats, infra_failed=infra)
 
     async def _solve(self) -> None:
         async with self._limit:
@@ -271,6 +290,7 @@ class ScriptedGlm:
     analyst_ids: list[list[str]] = field(default_factory=list)
     invalid: bool = False
     fail: bool = False
+    hang_tools: bool = False  # Whether an implementer's call (one with tools) never returns.
     bodies: list[dict[str, Any]] = field(default_factory=list)
     records: list[LlmCallRecord] = field(default_factory=list)
 
@@ -280,6 +300,8 @@ class ScriptedGlm:
     async def handle(self, request: httpx.Request) -> httpx.Response:
         body = json.loads(request.content)
         self.bodies.append(body)
+        if self.hang_tools and body.get("tools"):
+            await asyncio.sleep(3600)
         if self.fail:
             return httpx.Response(400, json={"error": {"message": "refused"}})
         prompt = body["messages"][-1]["content"]

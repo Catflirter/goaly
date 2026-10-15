@@ -1,5 +1,6 @@
 """Tests for goaly.rsi.lessons: the lessons store and the generated lessons.md."""
 
+import errno
 import os
 import re
 import subprocess
@@ -13,6 +14,7 @@ from google.protobuf import json_format
 from google.protobuf.timestamp_pb2 import Timestamp
 
 from goaly.contracts.gen.experiment_pb2 import (
+    DECISION_ABORTED,
     DECISION_PENDING,
     LANE_EFFISQL,
     LANE_SWE,
@@ -23,7 +25,7 @@ from goaly.contracts.gen.experiment_pb2 import (
     Lesson,
 )
 from goaly.rsi import lessons
-from goaly.rsi.ledger import Ledger
+from goaly.rsi.ledger import Ledger, LedgerFiles
 from goaly.rsi.lessons import LessonNotFoundError, LessonStore, render_markdown
 
 START = datetime(2026, 10, 15, 12, 0, tzinfo=UTC)
@@ -145,13 +147,42 @@ def test_an_invalid_lesson_is_refused_and_nothing_is_written(
     assert not (ledger.directory / "lessons.jsonl").exists()
 
 
-def test_a_lesson_id_is_never_reused(store: LessonStore, ledger: Ledger) -> None:
-    store.add("l1", LANE_EFFISQL, "first")
+@pytest.mark.parametrize(
+    ("lane", "text", "evidence"),
+    [
+        (LANE_EFFISQL, "second", ["e1"]),
+        (LANE_EFFISQL, "first", ["e2"]),
+        (LANE_EFFISQL, "first", []),
+        (LANE_SWE, "first", ["s0"]),
+    ],
+)
+def test_a_lesson_id_is_never_reused(
+    store: LessonStore, ledger: Ledger, lane: Lane.ValueType, text: str, evidence: list[str]
+) -> None:
+    store.add("l1", LANE_EFFISQL, "first", ["e1"])
 
     with pytest.raises(ValueError, match="l1"):
-        store.add("l1", LANE_EFFISQL, "second")
+        store.add("l1", lane, text, evidence)
 
     assert jsonl_lines(ledger) == 1
+
+
+def test_an_add_whose_page_write_failed_can_be_retried(
+    store: LessonStore, ledger: Ledger, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    def disk_full(self: LedgerFiles, name: str, text: str) -> None:
+        raise OSError(errno.ENOSPC, os.strerror(errno.ENOSPC))
+
+    with monkeypatch.context() as patched:
+        patched.setattr(LedgerFiles, "replace_text", disk_full)
+        with pytest.raises(OSError, match="No space left"):
+            store.add("l1", LANE_EFFISQL, "text", ["e1"])  # Stored, but its page was not.
+
+    retried = store.add("l1", LANE_EFFISQL, " text ", ["e1", "e1"])  # The same lesson again.
+
+    assert retried == store.get("l1")
+    assert jsonl_lines(ledger) == 1
+    assert "text" in markdown(ledger)
 
 
 def test_repeated_evidence_is_kept_once(store: LessonStore) -> None:
@@ -218,6 +249,28 @@ def test_an_experiment_cannot_both_help_and_hurt_a_lesson(store: LessonStore) ->
 
     with pytest.raises(ValueError, match="e2"):
         store.mark_hurt("l1", "e2")
+
+
+@pytest.mark.parametrize("helped", [True, False])
+def test_an_aborted_experiment_can_neither_help_nor_hurt_a_lesson(
+    store: LessonStore, ledger: Ledger, helped: bool
+) -> None:
+    store.add("l1", LANE_EFFISQL, "text")
+    ledger.record_experiment(
+        ExperimentRecord(
+            experiment_id="e2",
+            lane=LANE_EFFISQL,
+            round=1,
+            decision=DECISION_ABORTED,
+            hypothesis=Hypothesis(hypothesis_id="h-e2"),
+        )
+    )
+    mark = store.mark_helped if helped else store.mark_hurt
+
+    with pytest.raises(ValueError, match="e2 was aborted"):
+        mark("l1", "e2")
+
+    assert jsonl_lines(ledger) == 1
 
 
 def test_marking_an_unknown_lesson_is_an_error(store: LessonStore) -> None:

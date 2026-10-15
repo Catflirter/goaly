@@ -4,7 +4,7 @@ A restarted lane calls these before its next round, and a stopping lane at its d
 
 - :func:`remove_worktrees` removes the lane's leftover worktrees; their branches keep any commit.
 - :func:`reconcile_best` makes the ledger's best version and the ``best/<lane>`` tag agree. The
-  round moves the tag before it records the acceptance (goaly.rsi.round.shielded_accept), so a
+  round moves the tag before it records the acceptance (goaly.rsi.round's accept step), so a
   crash in between leaves the tag on a pending experiment whose confirmation passed: that
   experiment is recorded as accepted.
 - :func:`abort_experiments` records pending experiments as aborted and queues their hypotheses
@@ -24,7 +24,6 @@ from goaly.contracts.gen.experiment_pb2 import (
     DECISION_ABORTED,
     DECISION_ACCEPTED,
     IMPLEMENTER_EXIT_INTERRUPTED,
-    REJECTION_REASON_OUTRANKED,
     ExperimentRecord,
     Lane,
 )
@@ -90,6 +89,9 @@ def reconcile_best(
         workspace.set_best(lane, recorded, expected=None)
         _logger.warning("set the missing best tag to %s", recorded)
         return recorded
+    # The tag is the truth: a pending experiment it marks passed its confirmation and became the
+    # best, its acceptance unrecorded. The round never aborts an experiment once the tag is on it,
+    # and a decided record never changes (the ledger), so no other record can be under the tag.
     confirmed = [
         record
         for record in ledger.pending_experiments(lane)
@@ -98,6 +100,7 @@ def reconcile_best(
     if confirmed:
         record = confirmed[-1]
         record.decision = DECISION_ACCEPTED
+        del record.rejection_reasons[:]
         record.finished_at.CopyFrom(timestamp(now))
         ledger.record_experiment(record)
         _logger.warning("recorded %s as accepted: the best tag was on it", record.experiment_id)
@@ -174,9 +177,10 @@ def abort_record(
 def requeue(
     ledger: Ledger, queue: HypothesisQueue, record: ExperimentRecord, *, max_requeues: int
 ) -> bool:
-    """Queue ``record``'s hypothesis again, unless it went back ``max_requeues`` times already,
-    as earlier experiments that were aborted or outranked show; then it is dropped and logged.
-    Return whether it was queued.
+    """Queue ``record``'s hypothesis again, unless it went back ``max_requeues`` times already
+    after an abort, as the earlier aborted experiments show; then it is dropped and logged.
+    Outranks do not count: an outranked hypothesis is always rebuilt on the new best (R3), and
+    the round queues it directly. Return whether it was queued.
     """
     name = record.hypothesis.hypothesis_id
     earlier = [
@@ -184,10 +188,7 @@ def requeue(
         for other in ledger.latest_experiments(record.lane).values()
         if other.hypothesis.hypothesis_id == name
         and other.experiment_id != record.experiment_id
-        and (
-            other.decision == DECISION_ABORTED
-            or REJECTION_REASON_OUTRANKED in other.rejection_reasons
-        )
+        and other.decision == DECISION_ABORTED
     ]
     if len(earlier) >= max_requeues:
         _logger.warning(

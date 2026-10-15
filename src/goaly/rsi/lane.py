@@ -43,6 +43,7 @@ from goaly.contracts.gen.experiment_pb2 import (
 )
 from goaly.rsi.lanes import lane_info
 from goaly.rsi.locks import file_lock
+from goaly.rsi.probe import ProbeReading
 from goaly.rsi.resume import abort_experiments, reconcile_best, remove_worktrees
 from goaly.rsi.round import RoundConfig, RoundDeps, RoundOutcome, RoundRunner
 
@@ -74,6 +75,9 @@ class LaneConfig(BaseModel):
     infrastructure_backoff_s: float = Field(default=120.0, ge=0)
     task_concurrency: int = Field(default=16, ge=1)  # Tasks the evaluator runs at once.
     implementer_threads: int = Field(default=3, ge=1)  # The implementer pool, k threads.
+    hook_timeout_s: float = Field(default=300.0, gt=0)  # Each stop hook's limit (spec §8.0).
+    # How long a stopping lane waits for its implementer threads before it exits anyway.
+    shutdown_timeout_s: float = Field(default=60.0, ge=0)
     round: RoundConfig = RoundConfig()
 
 
@@ -100,6 +104,10 @@ async def _after_nothing(_: RoundOutcome) -> None:
     return None
 
 
+async def _no_probe() -> list[ProbeReading]:
+    return []
+
+
 @dataclass(frozen=True)
 class LaneHooks:
     """What the lane calls besides its rounds (T22). A stopping lane calls the final results PR,
@@ -110,6 +118,8 @@ class LaneHooks:
 
     results_pr: Hook = _nothing
     notify: Hook = _nothing
+    # The identity probes of the grading instances, once per round before its validations.
+    identity_probe: Callable[[], Awaitable[Sequence[ProbeReading]]] = _no_probe
     after_round: Callable[[RoundOutcome], Awaitable[None]] = _after_nothing
     running: Callable[[], AbstractAsyncContextManager[None]] = contextlib.nullcontext
     remove_containers: Callable[[], object] = lambda: 0  # Leftover sandboxes, at a start.
@@ -127,6 +137,7 @@ class RoundEntry(BaseModel):
     aborted: int = 0
     skipped: str = ""
     infrastructure: bool = False
+    probes: tuple[ProbeReading, ...] = ()  # A started round's identity probes (spec §6.2).
     at: AwareDatetime
 
 
@@ -177,9 +188,10 @@ class RoundLog:
 
     def state(self, ledger_rounds: Sequence[int]) -> LaneState:
         """The lane's state, from the log and the rounds the ledger's experiments ran in."""
+        entries = self.entries()  # One read, so that one state comes of it.
         started: dict[int, RoundEntry] = {}
         streak = 0
-        for entry in self.entries():
+        for entry in entries:
             if entry.status == "started":
                 started[entry.round] = entry
                 continue
@@ -188,7 +200,7 @@ class RoundLog:
                 streak = 0
             elif (entry.skipped and not entry.infrastructure) or entry.decided:
                 streak += 1
-        last = max([*ledger_rounds, *(e.round for e in self.entries())], default=0)
+        last = max([*ledger_rounds, *(e.round for e in entries)], default=0)
         unfinished = max(started) if started else None
         return LaneState(next_round=last + 1, unfinished=unfinished, without_accept=streak)
 
@@ -232,12 +244,15 @@ class LaneRunner:
             return await self._stop(DEADLINE, "the deadline had passed when the lane started")
         await self._record_event(LANE_EVENT_KIND_STARTED, "", deadline=True)
         while True:
+            if self._past_deadline():  # A round that ended past the deadline starts no other.
+                return await self._stop(DEADLINE, "the deadline came as a round ended")
             state = await asyncio.to_thread(self._state)
             limit = self._config.max_rounds_without_accept
             if state.without_accept >= limit:
                 detail = f"{state.without_accept} rounds in a row accepted no change"
                 return await self._stop(NO_ACCEPTED_CHANGE, detail)
-            round_no, resume = await asyncio.to_thread(self._next_round, state)
+            probes = await self._probe() if state.unfinished is None else []
+            round_no, resume = await asyncio.to_thread(self._next_round, state, probes)
             outcome = await self._until_deadline(self._rounds.run(round_no, resume=resume))
             if outcome is None:
                 return await self._stop(DEADLINE, f"the deadline came during round {round_no}")
@@ -290,7 +305,9 @@ class LaneRunner:
         rounds = [r.round for r in self._deps.ledger.latest_experiments(self._deps.lane).values()]
         return self._log.state(rounds)
 
-    def _next_round(self, state: LaneState) -> tuple[int, list[ExperimentRecord]]:
+    def _next_round(
+        self, state: LaneState, probes: Sequence[ProbeReading]
+    ) -> tuple[int, list[ExperimentRecord]]:
         if state.unfinished is not None:
             records = [
                 record
@@ -300,7 +317,12 @@ class LaneRunner:
             _logger.warning("resuming round %d with %d experiments", state.unfinished, len(records))
             return state.unfinished, records
         self._log.append(
-            RoundEntry(round=state.next_round, status="started", at=self._deps.clock())
+            RoundEntry(
+                round=state.next_round,
+                status="started",
+                probes=tuple(probes),
+                at=self._deps.clock(),
+            )
         )
         return state.next_round, []
 
@@ -316,6 +338,14 @@ class LaneRunner:
             at=self._deps.clock(),
         )
 
+    async def _probe(self) -> list[ProbeReading]:
+        """The round's identity probes (goaly.rsi.probe); a failing hook gives none."""
+        try:
+            return list(await self._until_deadline(self._hooks.identity_probe()) or [])
+        except Exception:
+            _logger.exception("the identity probes failed")
+            return []
+
     # The deadline.
 
     def _past_deadline(self) -> bool:
@@ -324,36 +354,49 @@ class LaneRunner:
     async def _until_deadline[T](self, work: Awaitable[T]) -> T | None:
         """Await ``work`` until the deadline; at the deadline cancel it and return None."""
         task = asyncio.ensure_future(work)
-        remaining = (self._config.deadline - self._deps.clock()).total_seconds()
-        done, _ = await asyncio.wait({task}, timeout=max(remaining, 0.0))
-        if task in done:
-            return task.result()
-        task.cancel()
-        with contextlib.suppress(asyncio.CancelledError):
-            await task
-        return None
+        try:
+            remaining = (self._config.deadline - self._deps.clock()).total_seconds()
+            done, _ = await asyncio.wait({task}, timeout=max(remaining, 0.0))
+            if task in done:
+                return task.result()
+            task.cancel()
+            with contextlib.suppress(asyncio.CancelledError):
+                await task
+            return None
+        finally:
+            if not task.done():  # The lane itself was cancelled: the work goes with it.
+                task.cancel()
 
     # Stopping.
 
     async def _stop(self, rule: str, detail: str) -> int:
         deps = self._deps
         aborted: list[ExperimentRecord] = []
+        # The stop record and the final results PR are the deliverables, so a failing step
+        # before them is logged and the stop goes on.
         if rule == DEADLINE:
-            # A round cancelled between moving the tag and recording it left the tag ahead.
-            await asyncio.to_thread(self._reconcile)
-            aborted = await asyncio.to_thread(
-                abort_experiments,
-                deps.ledger,
-                deps.queue,
-                deps.lane,
-                "the lane's deadline came first",
-                now=deps.clock(),
-                uncommitted_only=False,
-                usage=deps.usage,
-                max_requeues=self._config.round.max_requeues,
-            )
-        best = await asyncio.to_thread(deps.workspace.best_commit, deps.lane)
-        await self._record_event(LANE_EVENT_KIND_STOPPED, f"{rule}: {detail}")
+            try:
+                # A round cancelled between moving the tag and recording it left the tag ahead.
+                await asyncio.to_thread(self._reconcile)
+                aborted = await asyncio.to_thread(
+                    abort_experiments,
+                    deps.ledger,
+                    deps.queue,
+                    deps.lane,
+                    "the lane's deadline came first",
+                    now=deps.clock(),
+                    uncommitted_only=False,
+                    usage=deps.usage,
+                    max_requeues=self._config.round.max_requeues,
+                )
+            except Exception:
+                _logger.exception("could not settle the experiments at the deadline")
+        best = None
+        try:
+            best = await asyncio.to_thread(deps.workspace.best_commit, deps.lane)
+            await self._record_event(LANE_EVENT_KIND_STOPPED, f"{rule}: {detail}")
+        except Exception:
+            _logger.exception("could not write the stop record")
         info = StopInfo(
             lane=deps.lane,
             rule=rule,
@@ -368,8 +411,9 @@ class LaneRunner:
             ("notifier", self._hooks.notify),
         ):
             try:
-                await hook(info)
-            except Exception:
+                async with asyncio.timeout(self._config.hook_timeout_s):
+                    await hook(info)
+            except Exception:  # A timeout too: TimeoutError is an Exception.
                 _logger.exception("the %s hook failed", name)
         return 0
 

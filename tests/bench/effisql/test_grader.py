@@ -26,6 +26,7 @@ from goaly.bench.effisql.grader import (
     Psycopg2Timestamptz,
     QueryError,
     QueryTimeoutError,
+    ResourceError,
     ResultDigest,
     TimingError,
     Watchdog,
@@ -533,6 +534,16 @@ class TestPgSession:
                 session.digest("SELECT 1")
             assert conn.statements[-2:] == RESET
             assert isinstance(expected("x"), GradingFailure)
+
+    def test_running_out_of_resources_is_the_graders(self) -> None:
+        error = psycopg.errors.OutOfMemory("could not resize shared memory segment")
+        conn = FakeConn(rows=raising(error))
+        with (
+            session_on(conn) as session,
+            pytest.raises(ResourceError, match="ran out of resources"),
+        ):
+            session.digest("SELECT 1")
+        assert issubclass(ResourceError, GraderError)
 
     def test_a_dead_connection_is_a_grader_error_every_time(self) -> None:
         conn = FakeConn()
