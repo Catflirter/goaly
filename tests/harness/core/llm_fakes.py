@@ -22,7 +22,13 @@ from pydantic import SecretStr
 
 from goaly.contracts.gen.llm_call_pb2 import CallPurpose, LlmCallRecord
 from goaly.contracts.gen.trajectory_pb2 import ChatMessage, ChatRole
-from goaly.harness.core.llm import CallRecorder, CallTags, LlmClient, RetryPolicy
+from goaly.harness.core.llm import (
+    CallRecorder,
+    CallTags,
+    LlmClient,
+    MemoryCallRecorder,
+    RetryPolicy,
+)
 from goaly.harness.core.llm_models import EXECUTOR_MODEL, IMPROVEMENT_MODEL, ModelProfile
 from goaly.harness.core.settings import Settings
 
@@ -124,14 +130,7 @@ async def hang(request: httpx.Request) -> httpx.Response:
     raise AssertionError("unreachable")
 
 
-class Recorder:
-    """A CallRecorder that keeps the records it gets."""
-
-    def __init__(self) -> None:
-        self.records: list[LlmCallRecord] = []
-
-    def record(self, record: LlmCallRecord) -> None:
-        self.records.append(record)
+Recorder = MemoryCallRecorder  # The tests' short name for it.
 
 
 class FakeClock:

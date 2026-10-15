@@ -89,6 +89,7 @@ __all__ = [
     "JsonlCallRecorder",
     "LlmClient",
     "LlmReply",
+    "MemoryCallRecorder",
     "RetryPolicy",
 ]
 
@@ -178,6 +179,16 @@ class CallRecorder(Protocol):
         does, the client logs the lost record and goes on, so a call never loses its reply or
         its own error to its recorder.
         """
+
+
+class MemoryCallRecorder:
+    """A CallRecorder that keeps the records it gets, in order, for scripts and tests."""
+
+    def __init__(self) -> None:
+        self.records: list[LlmCallRecord] = []
+
+    def record(self, record: LlmCallRecord) -> None:
+        self.records.append(record)
 
 
 class JsonlCallRecorder:
