@@ -35,10 +35,10 @@ def main(argv: Sequence[str] | None = None) -> int:
     commands.add_parser("build", help="build the golden data directory")
     args = parser.parse_args(argv)
 
-    configure_logging()
-    config = PgEnvConfig()
     try:
-        ensure_credentials()
+        configure_logging()
+        config = PgEnvConfig()
+        ensure_credentials(golden_pgdata=config.golden_pgdata)
         record = build_golden(config, load_credentials().admin_password)
         sys.stdout.write(f"golden data directory {config.golden_pgdata}, built {record.built_at}\n")
     except (BuildError, ContainerError, PgSettingsError, psycopg.Error) as error:

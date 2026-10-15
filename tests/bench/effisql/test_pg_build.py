@@ -1,3 +1,4 @@
+import fcntl
 import hashlib
 import io
 import stat
@@ -37,7 +38,7 @@ from goaly.bench.effisql.pg_build import (
 )
 from goaly.bench.effisql.pg_containers import ContainerSpec
 from goaly.bench.effisql.pg_settings import PgEnvConfig
-from tests.bench.effisql.pg_fakes import FakeServer
+from tests.bench.effisql.pg_fakes import Answer, FakeServer
 
 # The official schema (Diff-SQL docker/tpch/postgresql/schema.sql): every column in order, with
 # its type, plus each table's primary and foreign keys.
@@ -215,6 +216,7 @@ class FakeRunner:
             assert cwd is not None
             assert env is not None
             assert env["DSS_PATH"] == str(cwd)
+            assert env["DSS_CONFIG"] == str(Path(args[0]).parent)  # Where dists.dss lives.
             for name, content in self.tables.items():
                 (cwd / f"{name}.tbl").write_bytes(content)
         return ""
@@ -303,6 +305,23 @@ def test_ensure_generated_skips_dbgen_when_the_files_already_match(tmp_path: Pat
 
     assert ensure_generated(dataset, tmp_path / "dbgen", tmp_path, run=runner) == dataset.files
     assert runner.calls == []
+
+
+def test_stale_files_make_dbgen_run_again(tmp_path: Path) -> None:
+    dataset = _synthetic_dataset(CONTENTS)
+    for name, content in CONTENTS.items():
+        (tmp_path / f"{name}.tbl").write_bytes(content)
+    (tmp_path / "lineitem.tbl").write_bytes(b"cut short by a crash")
+    runner = FakeRunner(tables=CONTENTS)
+
+    assert ensure_generated(dataset, tmp_path / "dbgen", tmp_path, run=runner) == dataset.files
+    assert runner.calls == [[str(tmp_path / "dbgen"), "-s", "0.01", "-f", "-q"]]
+
+
+def test_commands_are_named_by_program_and_subcommand() -> None:
+    assert pg_build._command(["git", "-C", "/data/tpch-kit", "fetch", "-q"]) == "git fetch"
+    assert pg_build._command(["/usr/bin/make", "-C", "/data", "dbgen"]) == "make"
+    assert pg_build._command(["/data/dbgen/dbgen", "-s", "3"]) == "dbgen"
 
 
 def test_ensure_generated_rejects_output_that_differs_from_the_pinned_build(
@@ -407,6 +426,9 @@ def test_run_command_reports_a_missing_program() -> None:
         run_command(["goaly-no-such-program"])
 
 
+CLUSTER: tuple[str, Answer] = ("pg_encoding_to_char", [("16.15", "UTF8", "en_US.utf8")])
+
+
 class FakeContainers:
     """Stands in for pg_containers: records the build server's lifecycle."""
 
@@ -456,7 +478,7 @@ def test_build_golden_builds_loads_and_records_from_scratch(
 ) -> None:
     config = PgEnvConfig(data_root=tmp_path)
     dataset = _synthetic_dataset({**CONTENTS, "lineitem": b"1|2|\n3|4|\n"})
-    server = FakeServer([("SELECT count(*)", lambda params: [(1,)])])
+    server = FakeServer([("SELECT count(*)", lambda params: [(1,)]), CLUSTER])
     server.responses.insert(0, ('SELECT count(*) FROM "lineitem"', [(2,)]))
     containers = FakeContainers()
     _install_server(monkeypatch, server, containers)
@@ -502,6 +524,22 @@ def test_build_golden_builds_loads_and_records_from_scratch(
     assert read_golden_record(config.golden_record) == record
     assert stat.S_IMODE(config.golden_record.stat().st_mode) == 0o600
     assert record.databases == {"tpch_test": dataset.record()}
+    assert (record.server_version, record.encoding, record.collation) == (
+        "16.15",
+        "UTF8",
+        "en_US.utf8",
+    )
+
+
+def test_two_builds_never_run_at_once(tmp_path: Path) -> None:
+    config = PgEnvConfig(data_root=tmp_path)
+    lock = config.golden_record.parent / ".lock"
+    lock.parent.mkdir(parents=True)
+    with lock.open("a") as held:
+        fcntl.flock(held, fcntl.LOCK_EX)
+
+        with pytest.raises(BuildError, match="another golden build"):
+            build_golden(config, SecretStr("pw"), run=_refuse)
 
 
 def test_a_table_that_loads_short_fails_the_build(
@@ -527,7 +565,7 @@ def test_an_unclean_shutdown_fails_the_build(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     containers = FakeContainers(exit_code=137)
-    _install_server(monkeypatch, FakeServer([("SELECT count(*)", [(1,)])]), containers)
+    _install_server(monkeypatch, FakeServer([("SELECT count(*)", [(1,)]), CLUSTER]), containers)
 
     with pytest.raises(BuildError, match="exited with code 137"):
         build_golden(
