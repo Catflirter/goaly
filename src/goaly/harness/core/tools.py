@@ -55,7 +55,13 @@ class BoundTool[E: Environment](ABC):
 
     @abstractmethod
     def json_schema(self) -> dict[str, JsonValue]:
-        """Return the tool's entry in the OpenAI ``tools`` list, a fresh copy each time."""
+        """Return the tool's entry in the OpenAI ``tools`` list, a fresh copy each time.
+
+        The entry holds the tool's name, its description and its arguments' JSON Schema as
+        pydantic writes it, and the model reads all of it as written: the args model's
+        docstring, its field descriptions and its titles. Nothing is stripped, so whoever writes
+        a tool, RSI's implementer included, writes that text for the model.
+        """
 
     @abstractmethod
     async def invoke(self, arguments_json: str, env: E) -> ToolResult:
@@ -71,7 +77,7 @@ class BoundTool[E: Environment](ABC):
         - ``is_error`` is set when the call itself failed, and only then:
           - arguments that fail validation get pydantic's first 10 errors listed, or the type
             and message of what a validator raised, and the tool does not run;
-          - a call that runs past ``timeout_s`` is stopped;
+          - a call that runs past ``timeout_s`` is cancelled;
           - a tool that raised, or returned something other than a ToolResult, gets the
             exception's type and message, and an exception group each of its leaves', never a
             traceback; the traceback goes to the log, at WARNING.
@@ -81,6 +87,10 @@ class BoundTool[E: Environment](ABC):
           an exception group holds one, as a TaskGroup raises, the first is raised from the
           group (:func:`environment_failure_in`), so that ``except EnvironmentFailure`` catches
           it. Cancellation propagates too.
+        - The tool runs in a task of its own. It must let CancelledError propagate; one that
+          does not still cannot change the outcome. A cancellation of the caller that it
+          swallowed, or turned into another exception, still propagates, and a call that ran
+          past its timeout gets the timeout error, whatever the tool returned.
         """
 
 
@@ -89,9 +99,19 @@ def bind[A: BaseModel, E: Environment](
 ) -> BoundTool[E]:
     """Bind ``tool`` for a registry; each of its calls may run for ``timeout_s`` seconds.
 
-    ``timeout_s`` is the timeout the pack's config gives the tool, and DEFAULT_TIMEOUT_S if it
-    gives none; one that is not a positive, finite number raises ValueError. The tool's name,
-    description and JSON Schema are read once, here: a tool whose arguments have no JSON Schema
+    ``timeout_s`` bounds the whole call, including any time the environment queues the work.
+    It is the timeout the pack's config gives the tool, or DEFAULT_TIMEOUT_S, which suits a
+    fast tool; one that is not a positive, finite number raises ValueError.
+
+    A tool that enforces its own timeout needs a ``timeout_s`` that is a backstop, not the
+    limit. Otherwise the executor cancels the tool first, and what would have been an ordinary
+    timeout result becomes an error result, which counts toward the agent loop's stop after 5
+    consecutive errors (spec §5.1). Effi-SQL's execute_sql is one: it stops a statement after
+    120 s, with up to 2 statements in flight per solving instance and a queue in front of them,
+    so its pack binds it with the task's wall-clock budget, 600 s in v0, as the backstop.
+
+    The tool's name, description and JSON Schema are read once, here, and the model reads them
+    as written (see :meth:`BoundTool.json_schema`). A tool whose arguments have no JSON Schema
     fails now, with pydantic's PydanticInvalidForJsonSchema, rather than at the first model
     call.
     """
@@ -188,7 +208,10 @@ class ToolRegistry[E: Environment]:
 
     It lists them for the LLM client in the order they were registered. A tool that works in
     any environment fits a registry for a narrower one: ``bind(EchoTool())`` fits a
-    ``ToolRegistry[SqlEnvironment]``.
+    ``ToolRegistry[SqlEnvironment]``. A registry or a list that mixes tools for different
+    environments must state its type, because mypy joins their bound tools' types to
+    ``object``: ``registry: ToolRegistry[SqlEnvironment] = ToolRegistry([...])``, or
+    ``tools: list[BoundTool[SqlEnvironment]] = [...]``.
     """
 
     def __init__(self, tools: Iterable[BoundTool[E]] = ()) -> None:

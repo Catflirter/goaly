@@ -316,12 +316,24 @@ def test_the_registry_lists_its_tools_for_the_model_in_registration_order() -> N
 
 def test_a_registry_takes_tools_that_run_in_a_wider_environment() -> None:
     # A bound tool is contravariant in its environment: echo runs in any environment, so it
-    # fits a registry for SQL tools. make typecheck proves it.
+    # fits a registry for SQL tools. make typecheck proves it: echo's type is inferred on its
+    # own, as BoundTool[Environment], so an invariant BoundTool would fail to register.
     registry: ToolRegistry[SqlEnvironment] = ToolRegistry([bind(QueryTool())])
+    echo = bind(EchoTool())
 
-    registry.register(bind(EchoTool()))
+    registry.register(echo)
 
     assert [tool.name for tool in registry] == ["query", "echo"]
+
+
+def test_a_list_or_registry_that_mixes_environments_states_its_type() -> None:
+    # mypy joins BoundTool[SqlEnvironment] and BoundTool[Environment] to object, so each mixed
+    # collection names its environment. make typecheck proves both forms.
+    tools: list[BoundTool[SqlEnvironment]] = [bind(QueryTool()), bind(EchoTool())]
+    registry: ToolRegistry[SqlEnvironment] = ToolRegistry([bind(EchoTool()), bind(QueryTool())])
+
+    assert [tool.name for tool in tools] == ["query", "echo"]
+    assert [tool.name for tool in registry] == ["echo", "query"]
 
 
 def test_registering_a_second_tool_with_a_taken_name_fails() -> None:
