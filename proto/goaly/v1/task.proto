@@ -160,6 +160,9 @@ message EffiSqlGrade {
   int32 pred_row_count = 7;
   // How many rows the base query returned.
   int32 base_row_count = 8;
+  // How long the evaluation held its grading instance, in seconds of wall time (spec §9); unset
+  // if the grade was not measured.
+  optional double eval_wall_s = 11;
   // True if dev mode reused the base query's cached result signature and timing.
   bool base_cached = 9;
 }

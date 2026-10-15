@@ -368,6 +368,7 @@ class EffiSqlGrade(_message.Message):
     TIMING_RUNS_FIELD_NUMBER: _builtins.int
     PRED_ROW_COUNT_FIELD_NUMBER: _builtins.int
     BASE_ROW_COUNT_FIELD_NUMBER: _builtins.int
+    EVAL_WALL_S_FIELD_NUMBER: _builtins.int
     BASE_CACHED_FIELD_NUMBER: _builtins.int
     matched: _builtins.bool
     """True if the prediction ran without an error or a timeout and its result equals the base
@@ -398,6 +399,10 @@ class EffiSqlGrade(_message.Message):
     """How many rows the prediction returned."""
     base_row_count: _builtins.int
     """How many rows the base query returned."""
+    eval_wall_s: _builtins.float
+    """How long the evaluation held its grading instance, in seconds of wall time (spec §9); unset
+    if the grade was not measured.
+    """
     base_cached: _builtins.bool
     """True if dev mode reused the base query's cached result signature and timing."""
     def __init__(
@@ -412,16 +417,19 @@ class EffiSqlGrade(_message.Message):
         timing_runs: _builtins.int = ...,
         pred_row_count: _builtins.int = ...,
         base_row_count: _builtins.int = ...,
+        eval_wall_s: _builtins.float | None = ...,
         base_cached: _builtins.bool = ...,
     ) -> None: ...
-    _HasFieldArgType: _TypeAlias = _typing.Literal["_alt_matched", b"_alt_matched", "_base_time_s", b"_base_time_s", "_pred_time_s", b"_pred_time_s", "_speedup", b"_speedup", "alt_matched", b"alt_matched", "base_time_s", b"base_time_s", "pred_time_s", b"pred_time_s", "speedup", b"speedup"]  # noqa: Y015
+    _HasFieldArgType: _TypeAlias = _typing.Literal["_alt_matched", b"_alt_matched", "_base_time_s", b"_base_time_s", "_eval_wall_s", b"_eval_wall_s", "_pred_time_s", b"_pred_time_s", "_speedup", b"_speedup", "alt_matched", b"alt_matched", "base_time_s", b"base_time_s", "eval_wall_s", b"eval_wall_s", "pred_time_s", b"pred_time_s", "speedup", b"speedup"]  # noqa: Y015
     def HasField(self, field_name: _HasFieldArgType) -> _builtins.bool: ...
-    _ClearFieldArgType: _TypeAlias = _typing.Literal["_alt_matched", b"_alt_matched", "_base_time_s", b"_base_time_s", "_pred_time_s", b"_pred_time_s", "_speedup", b"_speedup", "alt_matched", b"alt_matched", "base_cached", b"base_cached", "base_row_count", b"base_row_count", "base_time_s", b"base_time_s", "credit", b"credit", "matched", b"matched", "pred_row_count", b"pred_row_count", "pred_time_s", b"pred_time_s", "speedup", b"speedup", "timing_runs", b"timing_runs"]  # noqa: Y015
+    _ClearFieldArgType: _TypeAlias = _typing.Literal["_alt_matched", b"_alt_matched", "_base_time_s", b"_base_time_s", "_eval_wall_s", b"_eval_wall_s", "_pred_time_s", b"_pred_time_s", "_speedup", b"_speedup", "alt_matched", b"alt_matched", "base_cached", b"base_cached", "base_row_count", b"base_row_count", "base_time_s", b"base_time_s", "credit", b"credit", "eval_wall_s", b"eval_wall_s", "matched", b"matched", "pred_row_count", b"pred_row_count", "pred_time_s", b"pred_time_s", "speedup", b"speedup", "timing_runs", b"timing_runs"]  # noqa: Y015
     def ClearField(self, field_name: _ClearFieldArgType) -> None: ...
     _WhichOneofReturnType__alt_matched: _TypeAlias = _typing.Literal["alt_matched"]  # noqa: Y015
     _WhichOneofArgType__alt_matched: _TypeAlias = _typing.Literal["_alt_matched", b"_alt_matched"]  # noqa: Y015
     _WhichOneofReturnType__base_time_s: _TypeAlias = _typing.Literal["base_time_s"]  # noqa: Y015
     _WhichOneofArgType__base_time_s: _TypeAlias = _typing.Literal["_base_time_s", b"_base_time_s"]  # noqa: Y015
+    _WhichOneofReturnType__eval_wall_s: _TypeAlias = _typing.Literal["eval_wall_s"]  # noqa: Y015
+    _WhichOneofArgType__eval_wall_s: _TypeAlias = _typing.Literal["_eval_wall_s", b"_eval_wall_s"]  # noqa: Y015
     _WhichOneofReturnType__pred_time_s: _TypeAlias = _typing.Literal["pred_time_s"]  # noqa: Y015
     _WhichOneofArgType__pred_time_s: _TypeAlias = _typing.Literal["_pred_time_s", b"_pred_time_s"]  # noqa: Y015
     _WhichOneofReturnType__speedup: _TypeAlias = _typing.Literal["speedup"]  # noqa: Y015
@@ -430,6 +438,8 @@ class EffiSqlGrade(_message.Message):
     def WhichOneof(self, oneof_group: _WhichOneofArgType__alt_matched) -> _WhichOneofReturnType__alt_matched | None: ...
     @_typing.overload
     def WhichOneof(self, oneof_group: _WhichOneofArgType__base_time_s) -> _WhichOneofReturnType__base_time_s | None: ...
+    @_typing.overload
+    def WhichOneof(self, oneof_group: _WhichOneofArgType__eval_wall_s) -> _WhichOneofReturnType__eval_wall_s | None: ...
     @_typing.overload
     def WhichOneof(self, oneof_group: _WhichOneofArgType__pred_time_s) -> _WhichOneofReturnType__pred_time_s | None: ...
     @_typing.overload
