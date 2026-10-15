@@ -1,6 +1,7 @@
 """Tests for goaly.contracts.jsonl."""
 
 import json
+import logging
 import math
 import stat
 from collections.abc import Iterator
@@ -9,10 +10,11 @@ from pathlib import Path
 from typing import Any, assert_type
 
 import pytest
-from google.protobuf.json_format import ParseError
+from google.protobuf.json_format import ParseError, SerializeToJsonError
+from google.protobuf.struct_pb2 import ListValue
 from google.protobuf.timestamp_pb2 import Timestamp
 
-from goaly.contracts.gen.environment_pb2 import ShellResult
+from goaly.contracts.gen.environment_pb2 import ShellResult, SqlResult
 from goaly.contracts.gen.llm_call_pb2 import LlmCallRecord, Usage
 from goaly.contracts.gen.task_pb2 import BirdTaskInput, Grade, GradeStatus, TaskInput
 from goaly.contracts.jsonl import (
@@ -248,3 +250,88 @@ def test_appends_one_line_per_call(tmp_path: Path) -> None:
     append_jsonl(path, TaskInput(instance_id="b"))
 
     assert path.read_text(encoding="utf-8") == '{"instance_id":"a"}\n{"instance_id":"b"}\n'
+
+
+# Torn tails: a crash loses at most the line being written (spec §6.2).
+
+A_THEN_TORN = b'{"instance_id":"a"}\n{"instance_id":'
+
+
+def test_append_cuts_off_a_torn_last_line(directory: Path) -> None:
+    path = directory / "tasks.jsonl"
+    path.write_bytes(A_THEN_TORN)
+
+    append_jsonl(path, TaskInput(instance_id="b"))
+    append_jsonl(path, TaskInput(instance_id="c"))
+
+    assert path.read_bytes() == b'{"instance_id":"a"}\n{"instance_id":"b"}\n{"instance_id":"c"}\n'
+    assert list(read_jsonl(path, TaskInput)) == [TaskInput(instance_id=name) for name in "abc"]
+
+
+def test_append_cuts_off_a_file_that_is_one_torn_line(directory: Path) -> None:
+    path = directory / "tasks.jsonl"
+    path.write_bytes(b'{"instance_id":"a')
+
+    append_jsonl(path, TaskInput(instance_id="b"))
+
+    assert path.read_bytes() == b'{"instance_id":"b"}\n'
+
+
+def test_append_cuts_off_a_torn_line_longer_than_a_read(directory: Path) -> None:
+    path = directory / "tasks.jsonl"
+    path.write_bytes(b'{"instance_id":"a"}\n{"instance_id":"' + b"x" * 200_000)
+
+    append_jsonl(path, TaskInput(instance_id="b"))
+
+    assert path.read_bytes() == b'{"instance_id":"a"}\n{"instance_id":"b"}\n'
+
+
+def test_append_keeps_a_last_record_that_lost_only_its_line_feed(directory: Path) -> None:
+    # The write stopped just before the line feed. read_jsonl returns this record, so the next
+    # append must keep it too.
+    path = directory / "tasks.jsonl"
+    path.write_bytes(b'{"instance_id":"a"}\n{"instance_id":"b"}')
+
+    append_jsonl(path, TaskInput(instance_id="c"))
+
+    assert path.read_bytes() == b'{"instance_id":"a"}\n{"instance_id":"b"}\n{"instance_id":"c"}\n'
+
+
+def test_a_message_that_cannot_be_written_leaves_the_file_untouched(directory: Path) -> None:
+    path = directory / "results.jsonl"
+    path.write_bytes(b'{"columns":["x"]}\n{"colu')
+    row = ListValue()
+    row.append(math.nan)
+
+    with pytest.raises(SerializeToJsonError):
+        append_jsonl(path, SqlResult(rows=[row]))
+
+    assert path.read_bytes() == b'{"columns":["x"]}\n{"colu'  # Not even the torn tail is cut.
+
+
+@pytest.mark.parametrize(
+    "torn", [b'{"instance_id":', b'{"instance_id":"\xe6\x97'], ids=["in-the-json", "in-a-character"]
+)
+def test_read_skips_a_torn_last_line_with_a_warning(
+    directory: Path, caplog: pytest.LogCaptureFixture, torn: bytes
+) -> None:
+    path = directory / "tasks.jsonl"
+    path.write_bytes(b'{"instance_id":"a"}\n' + torn)
+
+    with caplog.at_level(logging.WARNING, logger="goaly.contracts.jsonl"):
+        messages = list(read_jsonl(path, TaskInput))
+
+    assert messages == [TaskInput(instance_id="a")]
+    (warning,) = caplog.records
+    assert warning.levelno == logging.WARNING
+    assert warning.getMessage().startswith(f"{path}:2: ")
+
+
+def test_read_still_rejects_a_malformed_last_line_that_ends_in_a_line_feed(
+    directory: Path,
+) -> None:
+    path = directory / "tasks.jsonl"
+    path.write_bytes(A_THEN_TORN + b"\n")
+
+    with pytest.raises(JsonlError, match=r":2: not a valid goaly\.v1\.TaskInput: "):
+        list(read_jsonl(path, TaskInput))
