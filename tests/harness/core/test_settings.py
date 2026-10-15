@@ -269,6 +269,34 @@ def test_strips_whitespace_around_the_key(monkeypatch: pytest.MonkeyPatch) -> No
     assert load_settings().api_key.get_secret_value() == "env-key"
 
 
+NOT_A_HEADER_VALUE = "must be printable ASCII, with no whitespace or control characters"
+
+
+@pytest.mark.parametrize(
+    "key",
+    ["canary\nkey", "canary key", "canary\tkey", "canary\rkey", "canary\x7fkey", "canary-kéy"],
+)
+def test_rejects_a_key_that_cannot_go_in_a_header_without_quoting_it(
+    key: str, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    # httpx would refuse such a header, and quote it, key and all, in its error.
+    monkeypatch.setenv("GOALY_API_KEY", key)
+
+    with pytest.raises(SettingsError) as raised:
+        load_settings()
+
+    assert str(raised.value) == f"GOALY_API_KEY is invalid: {NOT_A_HEADER_VALUE}."
+
+
+def test_a_settings_validation_error_quotes_no_input() -> None:
+    # Building Settings directly bypasses load_settings, which drops the inputs itself.
+    with pytest.raises(ValidationError) as raised:
+        Settings.model_validate({"api_key": "canary\x00key", "base_url": "ftp://canary.test"})
+
+    assert NOT_A_HEADER_VALUE in str(raised.value)
+    assert "canary" not in str(raised.value)
+
+
 @pytest.mark.parametrize(
     ("base_url", "expected"),
     [
@@ -379,3 +407,28 @@ def test_settings_are_immutable(monkeypatch: pytest.MonkeyPatch) -> None:
 
     with pytest.raises(ValidationError, match="frozen"):
         settings.base_url = "https://other.test/v1"  # type: ignore[misc]  # Tests the runtime check.
+
+
+# The Unix socket to the host's LLM proxy (spec §6.1, V28).
+
+
+def test_reads_the_llm_socket_from_the_environment(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setenv("GOALY_API_KEY", "env-key")
+    monkeypatch.setenv("GOALY_LLM_UDS", "/run/goaly/llm/proxy.sock")
+
+    assert load_settings().llm_uds == Path("/run/goaly/llm/proxy.sock")
+
+
+def test_has_no_llm_socket_unless_one_is_set(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setenv("GOALY_API_KEY", "env-key")
+    monkeypatch.setenv("GOALY_LLM_UDS", "  ")  # Blank counts as absent.
+
+    assert load_settings().llm_uds is None
+
+
+def test_rejects_an_llm_socket_given_as_a_relative_path(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setenv("GOALY_API_KEY", "env-key")
+    monkeypatch.setenv("GOALY_LLM_UDS", "proxy.sock")
+
+    with pytest.raises(SettingsError, match="GOALY_LLM_UDS is invalid: must be an absolute path"):
+        load_settings()

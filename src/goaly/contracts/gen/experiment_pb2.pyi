@@ -151,7 +151,11 @@ class ImplementerExit(_ImplementerExit, metaclass=_ImplementerExitEnumTypeWrappe
     a commit. Every other ending makes none, and the candidate is rejected as not implemented
     (REJECTION_REASON_IMPLEMENTATION_FAILED), except after IMPLEMENTER_EXIT_INFRASTRUCTURE or
     IMPLEMENTER_EXIT_INTERRUPTED: neither says anything about the hypothesis, so the experiment is
-    aborted instead.
+    aborted instead. A model call that fails ends the run as follows. IMPLEMENTER_EXIT_INFRASTRUCTURE
+    is a gateway outage that outlasted its retries (LLM_CALL_STATUS_RATE_LIMITED, SERVER_ERROR,
+    TIMEOUT or CONNECTION_ERROR) or an open breaker. IMPLEMENTER_EXIT_CRASHED is
+    LLM_CALL_STATUS_CONTEXT_OVERFLOW, INVALID_RESPONSE or CLIENT_ERROR. IMPLEMENTER_EXIT_INTERRUPTED
+    is LLM_CALL_STATUS_CANCELLED: our code cancelled the call.
     """
 
 IMPLEMENTER_EXIT_UNSPECIFIED: ImplementerExit.ValueType  # 0
@@ -197,22 +201,24 @@ class _GuardEnumTypeWrapper(_enum_type_wrapper._EnumTypeWrapper[_Guard.ValueType
     scans only gold-only windows: windows of any split's gold optimized_sql, 40 or more
     characters long after normalization, that occur in no base_sql and not in the schema DDL.
     It also rejects pack changes that embed large literal lists, above a size set in config.
-    For SWE (on hold) it rejects any fragment of a gold patch 40 or more characters long after
-    normalization, and any instance_id from any split.
-    """
-    GUARD_PACK_CODE_ALLOWLIST: _Guard.ValueType  # 5
-    """The static AST allowlist passes on the candidate's pack code, which runs on the host during
-    smoke tests, screening and validation (spec §8.5). Imports may come only from
-    goaly.contracts, goaly.harness.core, pydantic and pure stdlib modules, such as json, re and
-    typing. The builtins open, eval, exec, compile and __import__ are banned; so are the modules
-    importlib, subprocess, os, sys, socket, pathlib, shutil and ctypes, and attribute access to
-    dunder internals.
+    For SWE (on hold) it applies the same gold-only-fragment rule to the gold patches, with
+    windows 40 or more characters long after normalization, and also rejects any instance_id
+    from any split.
     """
     GUARD_UNIT_TESTS: _Guard.ValueType  # 4
     """The pack's unit tests pass."""
+    GUARD_PACK_CODE_ALLOWLIST: _Guard.ValueType  # 5
+    """The static AST allowlist passes on the candidate's pack code. Spec §8.5 is the authority on
+    its rules: the imports it allows and the names, attributes and calls it bans. It is a static
+    defense in depth; the candidate's code itself is isolated in the keyless solve container
+    (spec §6.1).
+    """
 
 class Guard(_Guard, metaclass=_GuardEnumTypeWrapper):
-    """A check that a candidate must pass before it is evaluated (spec §8.2, §8.5)."""
+    """A check that a candidate must pass before it is evaluated (spec §8.2, §8.5). The values are
+    declared by number. The guards run in the order of spec §8.2 step 3: ALLOWED_PATHS, CHECKSUMS,
+    HARD_CODING_SCAN, PACK_CODE_ALLOWLIST, then UNIT_TESTS.
+    """
 
 GUARD_UNSPECIFIED: Guard.ValueType  # 0
 """Not set."""
@@ -225,19 +231,18 @@ GUARD_HARD_CODING_SCAN: Guard.ValueType  # 3
 scans only gold-only windows: windows of any split's gold optimized_sql, 40 or more
 characters long after normalization, that occur in no base_sql and not in the schema DDL.
 It also rejects pack changes that embed large literal lists, above a size set in config.
-For SWE (on hold) it rejects any fragment of a gold patch 40 or more characters long after
-normalization, and any instance_id from any split.
-"""
-GUARD_PACK_CODE_ALLOWLIST: Guard.ValueType  # 5
-"""The static AST allowlist passes on the candidate's pack code, which runs on the host during
-smoke tests, screening and validation (spec §8.5). Imports may come only from
-goaly.contracts, goaly.harness.core, pydantic and pure stdlib modules, such as json, re and
-typing. The builtins open, eval, exec, compile and __import__ are banned; so are the modules
-importlib, subprocess, os, sys, socket, pathlib, shutil and ctypes, and attribute access to
-dunder internals.
+For SWE (on hold) it applies the same gold-only-fragment rule to the gold patches, with
+windows 40 or more characters long after normalization, and also rejects any instance_id
+from any split.
 """
 GUARD_UNIT_TESTS: Guard.ValueType  # 4
 """The pack's unit tests pass."""
+GUARD_PACK_CODE_ALLOWLIST: Guard.ValueType  # 5
+"""The static AST allowlist passes on the candidate's pack code. Spec §8.5 is the authority on
+its rules: the imports it allows and the names, attributes and calls it bans. It is a static
+defense in depth; the candidate's code itself is isolated in the keyless solve container
+(spec §6.1).
+"""
 Global___Guard: _TypeAlias = Guard  # noqa: Y015
 
 class _Decision:
@@ -292,12 +297,6 @@ class _RejectionReasonEnumTypeWrapper(_enum_type_wrapper._EnumTypeWrapper[_Rejec
     """The implementer made no commit for the hypothesis."""
     REJECTION_REASON_GUARD_FAILED: _RejectionReason.ValueType  # 2
     """A guard failed; guards says which."""
-    REJECTION_REASON_HARD_CODED: _RejectionReason.ValueType  # 11
-    """A check against hard-coded results flagged one of its predictions in the screen, the
-    validation or the confirmation (spec §4.1, §8.2 step 4). This covers both flags: hard_coded,
-    which is EffiSqlGrade.alt_matched false, and literal_result. That phase's
-    flagged_instance_ids lists the flagged tasks.
-    """
     REJECTION_REASON_NO_SCREEN_GAIN: _RejectionReason.ValueType  # 3
     """The screen showed no net gain over the best."""
     REJECTION_REASON_EFFICIENCY_CAP: _RejectionReason.ValueType  # 4
@@ -318,9 +317,20 @@ class _RejectionReasonEnumTypeWrapper(_enum_type_wrapper._EnumTypeWrapper[_Rejec
     """Effi-SQL: its gain over the validation seeds plus the confirmation seed fell below the
     confirmation threshold.
     """
+    REJECTION_REASON_HARD_CODED: _RejectionReason.ValueType  # 11
+    """It made a matched prediction that a check flagged, in the screen, the validation or the
+    confirmation (spec §4.1, §8.2 step 4). The checks are those against hard-coded results, and
+    this covers both flags: hard_coded, which is EffiSqlGrade.alt_matched false, and
+    literal_result. That phase's flagged_instance_ids lists the flagged tasks.
+    """
 
 class RejectionReason(_RejectionReason, metaclass=_RejectionReasonEnumTypeWrapper):
-    """A rule that rejects a candidate: one value for each way spec §8.2 and §8.3 reject one."""
+    """A rule that rejects a candidate: one value for each way spec §8.2 and §8.3 reject one. The
+    values are declared by number. Roughly in evaluation order, they are: IMPLEMENTATION_FAILED,
+    GUARD_FAILED, HARD_CODED, NO_SCREEN_GAIN, EFFICIENCY_CAP, INSUFFICIENT_GAIN, COST_GUARDRAIL,
+    NOT_SIGNIFICANT, REGRESSION, OUTRANKED and NOT_CONFIRMED. HARD_CODED can also come up in the
+    validation or the confirmation. The decision code (T21) owns the exact order.
+    """
 
 REJECTION_REASON_UNSPECIFIED: RejectionReason.ValueType  # 0
 """Not set; never written."""
@@ -328,12 +338,6 @@ REJECTION_REASON_IMPLEMENTATION_FAILED: RejectionReason.ValueType  # 1
 """The implementer made no commit for the hypothesis."""
 REJECTION_REASON_GUARD_FAILED: RejectionReason.ValueType  # 2
 """A guard failed; guards says which."""
-REJECTION_REASON_HARD_CODED: RejectionReason.ValueType  # 11
-"""A check against hard-coded results flagged one of its predictions in the screen, the
-validation or the confirmation (spec §4.1, §8.2 step 4). This covers both flags: hard_coded,
-which is EffiSqlGrade.alt_matched false, and literal_result. That phase's
-flagged_instance_ids lists the flagged tasks.
-"""
 REJECTION_REASON_NO_SCREEN_GAIN: RejectionReason.ValueType  # 3
 """The screen showed no net gain over the best."""
 REJECTION_REASON_EFFICIENCY_CAP: RejectionReason.ValueType  # 4
@@ -354,6 +358,12 @@ REJECTION_REASON_NOT_CONFIRMED: RejectionReason.ValueType  # 10
 """Effi-SQL: its gain over the validation seeds plus the confirmation seed fell below the
 confirmation threshold.
 """
+REJECTION_REASON_HARD_CODED: RejectionReason.ValueType  # 11
+"""It made a matched prediction that a check flagged, in the screen, the validation or the
+confirmation (spec §4.1, §8.2 step 4). The checks are those against hard-coded results, and
+this covers both flags: hard_coded, which is EffiSqlGrade.alt_matched false, and
+literal_result. That phase's flagged_instance_ids lists the flagged tasks.
+"""
 Global___RejectionReason: _TypeAlias = RejectionReason  # noqa: Y015
 
 class _LaneEventKind:
@@ -366,13 +376,15 @@ class _LaneEventKindEnumTypeWrapper(_enum_type_wrapper._EnumTypeWrapper[_LaneEve
     """Not set."""
     LANE_EVENT_KIND_STARTED: _LaneEventKind.ValueType  # 1
     """The lane started: the first time, or when a new goaly rsi run resumed it from the ledger,
-    as after the workspace stopped. The lane's time budget counts from its first start.
+    as after the workspace stopped. deadline_at records the lane's deadline.
     """
     LANE_EVENT_KIND_RESTARTED: _LaneEventKind.ValueType  # 2
-    """The supervisor restarted the lane after it crashed; detail says how it crashed."""
+    """The supervisor restarted the lane after a LANE_EVENT_KIND_CRASHED; detail gives only the
+    backoff it waited, since the crash event holds the cause.
+    """
     LANE_EVENT_KIND_RECOVERY_FAILED: _LaneEventKind.ValueType  # 3
-    """The lane crashed too often for automatic recovery, so the supervisor stopped it and notified
-    the project lead.
+    """Automatic recovery failed, at 5 LANE_EVENT_KIND_CRASHED events within an hour (spec §8.7), so
+    the supervisor stopped the lane and notified the project lead.
     """
     LANE_EVENT_KIND_STOPPED: _LaneEventKind.ValueType  # 4
     """The lane stopped by a stopping rule (spec §8.4); detail names the rule."""
@@ -382,6 +394,11 @@ class _LaneEventKindEnumTypeWrapper(_enum_type_wrapper._EnumTypeWrapper[_LaneEve
     """A notification was delivered to the ntfy topic."""
     LANE_EVENT_KIND_NOTIFY_FAILED: _LaneEventKind.ValueType  # 7
     """A notification could not be delivered; it is retried."""
+    LANE_EVENT_KIND_CRASHED: _LaneEventKind.ValueType  # 8
+    """The supervisor counted the lane as crashed (spec §8.7): its process died, its heartbeat was 10
+    minutes old so it was killed, or a start failed the preflight checks. The supervisor writes
+    it, since a killed lane cannot, and detail gives the cause. Recovery counts these events.
+    """
 
 class LaneEventKind(_LaneEventKind, metaclass=_LaneEventKindEnumTypeWrapper):
     """What happened to a lane (spec §8.4, §8.7)."""
@@ -390,13 +407,15 @@ LANE_EVENT_KIND_UNSPECIFIED: LaneEventKind.ValueType  # 0
 """Not set."""
 LANE_EVENT_KIND_STARTED: LaneEventKind.ValueType  # 1
 """The lane started: the first time, or when a new goaly rsi run resumed it from the ledger,
-as after the workspace stopped. The lane's time budget counts from its first start.
+as after the workspace stopped. deadline_at records the lane's deadline.
 """
 LANE_EVENT_KIND_RESTARTED: LaneEventKind.ValueType  # 2
-"""The supervisor restarted the lane after it crashed; detail says how it crashed."""
+"""The supervisor restarted the lane after a LANE_EVENT_KIND_CRASHED; detail gives only the
+backoff it waited, since the crash event holds the cause.
+"""
 LANE_EVENT_KIND_RECOVERY_FAILED: LaneEventKind.ValueType  # 3
-"""The lane crashed too often for automatic recovery, so the supervisor stopped it and notified
-the project lead.
+"""Automatic recovery failed, at 5 LANE_EVENT_KIND_CRASHED events within an hour (spec §8.7), so
+the supervisor stopped the lane and notified the project lead.
 """
 LANE_EVENT_KIND_STOPPED: LaneEventKind.ValueType  # 4
 """The lane stopped by a stopping rule (spec §8.4); detail names the rule."""
@@ -406,6 +425,11 @@ LANE_EVENT_KIND_NOTIFIED: LaneEventKind.ValueType  # 6
 """A notification was delivered to the ntfy topic."""
 LANE_EVENT_KIND_NOTIFY_FAILED: LaneEventKind.ValueType  # 7
 """A notification could not be delivered; it is retried."""
+LANE_EVENT_KIND_CRASHED: LaneEventKind.ValueType  # 8
+"""The supervisor counted the lane as crashed (spec §8.7): its process died, its heartbeat was 10
+minutes old so it was killed, or a start failed the preflight checks. The supervisor writes
+it, since a killed lane cannot, and detail gives the cause. Recovery counts these events.
+"""
 Global___LaneEventKind: _TypeAlias = LaneEventKind  # noqa: Y015
 
 @_typing.final
@@ -606,17 +630,19 @@ class ImplementerRun(_message.Message):
     DESCRIPTOR: _descriptor.Descriptor
 
     EXIT_FIELD_NUMBER: _builtins.int
-    STEPS_FIELD_NUMBER: _builtins.int
+    STEP_COUNT_FIELD_NUMBER: _builtins.int
     WALL_TIME_S_FIELD_NUMBER: _builtins.int
     TRAJECTORY_PATH_FIELD_NUMBER: _builtins.int
     SMOKE_TESTS_FIELD_NUMBER: _builtins.int
     SUMMARY_FIELD_NUMBER: _builtins.int
     exit: Global___ImplementerExit.ValueType
     """How the run ended."""
-    steps: _builtins.int
-    """How many steps the agent took, one model call each."""
+    step_count: _builtins.int
+    """How many steps the agent took, one model call each; unset if the run was never measured, as
+    for an IMPLEMENTER_EXIT_INTERRUPTED run that the restarted lane found after a crash.
+    """
     wall_time_s: _builtins.float
-    """From the agent's start to its end, in seconds."""
+    """From the agent's start to its end, in seconds; unset if the run was never measured."""
     trajectory_path: _builtins.str
     """Where the agent's trajectory is, relative to the runs directory:
     rsi/<lane>/<experiment_id>/implementer.traj.json. The file stays in mini-swe-agent's own
@@ -635,17 +661,24 @@ class ImplementerRun(_message.Message):
         self,
         *,
         exit: Global___ImplementerExit.ValueType = ...,
-        steps: _builtins.int = ...,
-        wall_time_s: _builtins.float = ...,
+        step_count: _builtins.int | None = ...,
+        wall_time_s: _builtins.float | None = ...,
         trajectory_path: _builtins.str = ...,
         smoke_tests: _abc.Iterable[Global___SmokeTest] | None = ...,
         summary: _builtins.str = ...,
     ) -> None: ...
-    _HasFieldArgType: _TypeAlias = _Never  # noqa: Y015
+    _HasFieldArgType: _TypeAlias = _typing.Literal["_step_count", b"_step_count", "_wall_time_s", b"_wall_time_s", "step_count", b"step_count", "wall_time_s", b"wall_time_s"]  # noqa: Y015
     def HasField(self, field_name: _HasFieldArgType) -> _builtins.bool: ...
-    _ClearFieldArgType: _TypeAlias = _typing.Literal["exit", b"exit", "smoke_tests", b"smoke_tests", "steps", b"steps", "summary", b"summary", "trajectory_path", b"trajectory_path", "wall_time_s", b"wall_time_s"]  # noqa: Y015
+    _ClearFieldArgType: _TypeAlias = _typing.Literal["_step_count", b"_step_count", "_wall_time_s", b"_wall_time_s", "exit", b"exit", "smoke_tests", b"smoke_tests", "step_count", b"step_count", "summary", b"summary", "trajectory_path", b"trajectory_path", "wall_time_s", b"wall_time_s"]  # noqa: Y015
     def ClearField(self, field_name: _ClearFieldArgType) -> None: ...
-    def WhichOneof(self, oneof_group: _Never) -> None: ...
+    _WhichOneofReturnType__step_count: _TypeAlias = _typing.Literal["step_count"]  # noqa: Y015
+    _WhichOneofArgType__step_count: _TypeAlias = _typing.Literal["_step_count", b"_step_count"]  # noqa: Y015
+    _WhichOneofReturnType__wall_time_s: _TypeAlias = _typing.Literal["wall_time_s"]  # noqa: Y015
+    _WhichOneofArgType__wall_time_s: _TypeAlias = _typing.Literal["_wall_time_s", b"_wall_time_s"]  # noqa: Y015
+    @_typing.overload
+    def WhichOneof(self, oneof_group: _WhichOneofArgType__step_count) -> _WhichOneofReturnType__step_count | None: ...
+    @_typing.overload
+    def WhichOneof(self, oneof_group: _WhichOneofArgType__wall_time_s) -> _WhichOneofReturnType__wall_time_s | None: ...
 
 Global___ImplementerRun: _TypeAlias = ImplementerRun  # noqa: Y015
 
@@ -653,8 +686,9 @@ Global___ImplementerRun: _TypeAlias = ImplementerRun  # noqa: Y015
 class SmokeTest(_message.Message):
     """One goaly-smoke call by the implementer agent (spec §8.8). The host refuses any task that is
     not in train, and any call after the second; otherwise it runs the step-3 guards on the
-    worktree as it stands, then the candidate on the task with the bench runner and one seed. The
-    smoke run's model calls count toward the experiment's usage_by_purpose (spec §9).
+    worktree as it stands, then the candidate on the task through the isolated two-phase path
+    (spec §6.1), with one seed. The smoke run's model calls count toward the experiment's
+    usage_by_purpose (spec §9).
     """
 
     DESCRIPTOR: _descriptor.Descriptor
@@ -669,8 +703,9 @@ class SmokeTest(_message.Message):
     """The smoke run that holds the task's result and trajectory; empty if the candidate never ran."""
     score: _builtins.float
     """The task's score, as its benchmark defines it: for Effi-SQL, the credit. Unset if the
-    candidate never ran, because the host refused the call or a guard failed. It is optional so
-    that such a call stays distinct from a run that scored 0.
+    candidate never ran, because the host refused the call or a guard failed, and also if it ran
+    but grading failed. It is optional so that such a call stays distinct from a run that scored
+    0.
     """
     detail: _builtins.str
     """What goaly-smoke told the agent besides the score: the stop reason, the step count, the cost
@@ -821,10 +856,13 @@ class PhaseResult(_message.Message):
     """Its mean wall time per task over v0's on the same split, which the efficiency cap checks."""
     @_builtins.property
     def flagged_instance_ids(self) -> _containers.RepeatedScalarFieldContainer[_builtins.str]:
-        """The tasks on which a check against hard-coded results flagged the candidate's prediction, in
-        any seed, each listed once (spec §4.1): hard_coded, which is EffiSqlGrade.alt_matched false,
-        or literal_result. Each task's grade, in the runs candidate_run_ids names, says which check
-        flagged it. One flagged task fails the candidate outright, as REJECTION_REASON_HARD_CODED.
+        """The tasks on which the candidate made a matched prediction that a check flagged, in any
+        seed, each listed once (spec §4.1). The checks are those against hard-coded results, and the
+        flags are hard_coded, which is EffiSqlGrade.alt_matched false, and literal_result. An
+        unmatched prediction is never checked, so it is never listed. Each task's grade, in the runs
+        candidate_run_ids names, says which check flagged it. One flagged task fails the candidate
+        outright, as REJECTION_REASON_HARD_CODED. On the validation and the confirmation these are
+        per-task val IDs, so the analyst's ledger summary strips them (spec §7).
         """
 
     @_builtins.property
@@ -1149,6 +1187,8 @@ class LaneEvent(_message.Message):
     HEAD_COMMIT_FIELD_NUMBER: _builtins.int
     EXPERIMENT_IDS_FIELD_NUMBER: _builtins.int
     NOTIFICATION_FIELD_NUMBER: _builtins.int
+    NOTIFICATION_ID_FIELD_NUMBER: _builtins.int
+    DEADLINE_AT_FIELD_NUMBER: _builtins.int
     lane: Global___Lane.ValueType
     """The lane."""
     kind: Global___LaneEventKind.ValueType
@@ -1173,6 +1213,10 @@ class LaneEvent(_message.Message):
     apart from detail, which holds a failed delivery's error, because the next results PR lists
     every notification, delivered or not (spec §8.7).
     """
+    notification_id: _builtins.str
+    """For LANE_EVENT_KIND_NOTIFIED and LANE_EVENT_KIND_NOTIFY_FAILED: the notification's ID, which
+    ties a NOTIFY_FAILED to the NOTIFIED of its later delivery; empty for other kinds.
+    """
     @_builtins.property
     def occurred_at(self) -> _timestamp_pb2.Timestamp:
         """When it happened."""
@@ -1181,6 +1225,12 @@ class LaneEvent(_message.Message):
     def experiment_ids(self) -> _containers.RepeatedScalarFieldContainer[_builtins.str]:
         """For LANE_EVENT_KIND_RESULTS_PR: the accepted experiments whose changes the PR carries;
         empty for other kinds.
+        """
+
+    @_builtins.property
+    def deadline_at(self) -> _timestamp_pb2.Timestamp:
+        """For LANE_EVENT_KIND_STARTED: the lane's deadline, an absolute time from config that a restart
+        never moves (spec §8.4); absent for other kinds.
         """
 
     def __init__(
@@ -1195,10 +1245,12 @@ class LaneEvent(_message.Message):
         head_commit: _builtins.str = ...,
         experiment_ids: _abc.Iterable[_builtins.str] | None = ...,
         notification: _builtins.str = ...,
+        notification_id: _builtins.str = ...,
+        deadline_at: _timestamp_pb2.Timestamp | None = ...,
     ) -> None: ...
-    _HasFieldArgType: _TypeAlias = _typing.Literal["occurred_at", b"occurred_at"]  # noqa: Y015
+    _HasFieldArgType: _TypeAlias = _typing.Literal["deadline_at", b"deadline_at", "occurred_at", b"occurred_at"]  # noqa: Y015
     def HasField(self, field_name: _HasFieldArgType) -> _builtins.bool: ...
-    _ClearFieldArgType: _TypeAlias = _typing.Literal["detail", b"detail", "experiment_ids", b"experiment_ids", "head_commit", b"head_commit", "kind", b"kind", "lane", b"lane", "notification", b"notification", "occurred_at", b"occurred_at", "pr_number", b"pr_number", "pr_url", b"pr_url"]  # noqa: Y015
+    _ClearFieldArgType: _TypeAlias = _typing.Literal["deadline_at", b"deadline_at", "detail", b"detail", "experiment_ids", b"experiment_ids", "head_commit", b"head_commit", "kind", b"kind", "lane", b"lane", "notification", b"notification", "notification_id", b"notification_id", "occurred_at", b"occurred_at", "pr_number", b"pr_number", "pr_url", b"pr_url"]  # noqa: Y015
     def ClearField(self, field_name: _ClearFieldArgType) -> None: ...
     def WhichOneof(self, oneof_group: _Never) -> None: ...
 
