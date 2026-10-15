@@ -4,10 +4,13 @@ bench implements the environments and the benchmark adapters, and the capability
 the policies and the tools. core and the runner call them only through these Protocols, so
 harness unit tests can use fakes, with no database or container.
 
-gRPC-ready: every method takes and returns only contract messages (``goaly.contracts.gen``) or
-plain values, never framework objects. A gRPC-backed implementation could then replace an
-in-process one without changing any caller. The one exception is a tool's arguments, which stay
-pydantic models (see Tool). tests/contracts/test_interfaces.py enforces the rule.
+gRPC-ready: every annotation that is not a type parameter is a contract message
+(``goaly.contracts.gen``) or a plain value, never a framework object, so a gRPC-backed
+implementation could replace an in-process one without changing any caller. The type parameters
+stand for types the implementers choose: ``EnvT`` is always one of the environment Protocols,
+while ``CtxT`` (core's AgentContext) and ``InstanceT`` (a benchmark's own record) are in-process
+types. Among the concrete annotations, a tool's pydantic arguments are the one documented
+exception (see Tool). tests/contracts/test_interfaces.py enforces the rule.
 """
 
 from collections.abc import Sequence
@@ -31,7 +34,9 @@ __all__ = [
     "Tool",
 ]
 
-# A JSON value, as json.loads returns it.
+# A JSON value, as json.loads returns it. It is built from dict and list, which are invariant, so
+# build an official record inline, e.g. with list(...) inside the dict literal: a list[str] built
+# beforehand is not a list[JsonValue].
 type JsonValue = dict[str, JsonValue] | list[JsonValue] | str | int | float | bool | None
 
 
@@ -112,8 +117,13 @@ class Tool[ArgsT: BaseModel, EnvT: Environment](Protocol):
     the environment it needs, and a tool that works in any environment fits every pack.
     ``name``, ``description`` and ``args_model`` are read-only: a class attribute can provide each.
 
-    The arguments are a pydantic model: the one exception to the rule that interfaces take only
-    contract messages and plain values (spec §3.3). The OpenAI tools API takes JSON Schema, which
+    ``ArgsT`` is invariant, so a list of different tools is a ``Sequence[Tool[Any, E]]``, with an
+    explicit ``E``. core registers each one through a generic
+    ``bind[A: BaseModel, E: Environment](tool: Tool[A, E]) -> BoundTool[E]``, which erases the
+    argument type but validates the model's JSON and runs the tool while ``A`` is still concrete.
+
+    The arguments are a pydantic model: among the concrete annotations, the one documented
+    exception to the gRPC-ready rule (spec §3.3). The OpenAI tools API takes JSON Schema, which
     pydantic generates, and GLM edits tools during RSI with no protobuf code to regenerate.
     """
 
