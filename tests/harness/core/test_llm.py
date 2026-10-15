@@ -922,6 +922,23 @@ async def test_cancellation_propagates_at_once_and_is_recorded() -> None:
     assert len(gateway.requests) == 1
 
 
+async def test_a_call_stops_retrying_once_its_client_closes() -> None:
+    recorder = Recorder()
+
+    class ClosingClock(FakeClock):
+        async def sleep(self, seconds: float) -> None:
+            await llm.aclose()  # The client closes while the call backs off.
+
+    gateway = Gateway(failure(503), completion())
+    llm = connect(gateway, recorder=recorder, clock=ClosingClock())
+    with pytest.raises(RuntimeError, match="closed during the call"):
+        await llm.complete([user("hi")], model=QWEN, tags=EXEC)
+
+    assert len(gateway.requests) == 1
+    (record,) = recorder.records
+    assert attempts(record) == [(SERVER_ERROR, 503), (CANCELLED, 0)]  # None without a status.
+
+
 async def test_a_callers_deadline_cancels_the_call_and_leaves_one_record() -> None:
     recorder = Recorder()
     gateway = Gateway(hang)
@@ -1013,11 +1030,13 @@ async def test_bound_clients_call_through_the_one_client_that_bound_them() -> No
     await first.complete([user("hi")])
     await second.complete([user("hi")])
 
-    await llm.aclose()  # Its connections are theirs too: neither has any of its own.
+    await llm.aclose()  # It is theirs to share: neither has a client of its own.
     with pytest.raises(RuntimeError, match="closed"):
         await first.complete([user("hi")])
 
-    assert [record.instance_id for record in recorder.records] == ["task-7", "x", "task-7"]
+    # Two calls, each recorded once; the call after the close was refused before it began.
+    assert [record.instance_id for record in recorder.records] == ["task-7", "x"]
+    assert len(gateway.requests) == 2
 
 
 # The model allowlist.

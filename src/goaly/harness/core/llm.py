@@ -34,6 +34,7 @@ record holds it, and the client removes it from any text it quotes from the gate
 """
 
 import asyncio
+import concurrent.futures
 import contextlib
 import json
 import logging
@@ -310,6 +311,7 @@ class LlmClient:
             for model, share in shares.items()
         }
         self._loop: asyncio.AbstractEventLoop | None = None  # Set by the first async use.
+        self._closed = False
         self._api_key = settings.api_key
         headers = {"Authorization": f"Bearer {settings.api_key.get_secret_value()}"}
         self._http = {  # One connection pool per model, as large as its share.
@@ -336,10 +338,12 @@ class LlmClient:
         await self.aclose()
 
     async def aclose(self) -> None:
-        """Close the client's connections; it cannot make calls after.
+        """Close the client's connections. A call made after raises RuntimeError, with no record.
 
-        Every model's pool is closed, even when closing another fails.
+        Every model's pool is closed, even when closing another fails. A call in flight ends with
+        RuntimeError too, its attempt recorded as cancelled, since this client cut it off.
         """
+        self._closed = True
         async with contextlib.AsyncExitStack() as pools:
             for http in self._http.values():
                 pools.push_async_callback(http.aclose)
@@ -364,6 +368,7 @@ class LlmClient:
         asyncio.CancelledError goes through at once, with no retry.
         """
         self._bind_loop()
+        self._check_open()
         if allowed_model(tags.purpose) != model:
             raise self._refuse(model, tags)
         body = _request_body(self._profiles[model].with_overrides(params), messages, tools)
@@ -393,6 +398,7 @@ class LlmClient:
         tags: CallTags,
         tools: Sequence[Mapping[str, JsonValue]] = (),
         params: ModelParams | None = None,
+        timeout_s: float | None = None,
     ) -> LlmReply:
         """Make a call from a worker thread: run complete() on the client's loop and wait for it.
 
@@ -404,9 +410,15 @@ class LlmClient:
             async with LlmClient(settings, recorder) as llm:
                 await asyncio.to_thread(run_agent, llm)  # The agent's model calls complete_sync.
 
-        It returns or raises as complete() does. It raises RuntimeError if the client's loop is
-        not running, or if called in the loop's own thread, where waiting would deadlock. If the
-        loop cancels the call, at shutdown say, it raises concurrent.futures.CancelledError.
+        Cancelling that ``asyncio.to_thread`` does not stop the worker thread. Stop the agents and
+        join them before leaving ``async with``: a call after the client closes raises
+        RuntimeError.
+
+        It returns or raises as complete() does. It raises RuntimeError if the client is closed,
+        if its loop is not running, or if called in the loop's own thread, where waiting would
+        deadlock. If the loop cancels the call, at shutdown say, it raises
+        asyncio.CancelledError, which ``except Exception`` does not catch. If ``timeout_s`` passes
+        first, it cancels the call and raises TimeoutError.
         """
         loop = self._loop
         if loop is None:
@@ -419,8 +431,20 @@ class LlmClient:
             running = None
         if running is loop:
             raise RuntimeError("complete_sync would block the loop it needs: await complete()")
+        self._check_open()
         call = self.complete(messages, model=model, tags=tags, tools=tools, params=params)
-        return asyncio.run_coroutine_threadsafe(call, loop).result()
+        try:
+            future = asyncio.run_coroutine_threadsafe(call, loop)
+        except RuntimeError:  # The loop closed since the check above.
+            call.close()
+            raise
+        try:
+            return future.result(timeout_s)
+        except concurrent.futures.TimeoutError:
+            future.cancel()  # Its record says the call was cancelled.
+            raise TimeoutError(f"{model}: no reply within {timeout_s:g} s") from None
+        except concurrent.futures.CancelledError:
+            raise asyncio.CancelledError from None
 
     def bind(self, *, model: str, tags: CallTags) -> "BoundLlmClient":
         """Return a client whose calls all go to ``model``, tagged ``tags``.
@@ -432,6 +456,10 @@ class LlmClient:
         if allowed_model(tags.purpose) != model:
             raise self._refuse(model, tags)
         return BoundLlmClient(self, model, tags)
+
+    def _check_open(self) -> None:
+        if self._closed:
+            raise RuntimeError("the LlmClient is closed; it makes no more calls")
 
     def _bind_loop(self) -> None:
         """Make the running loop the client's own, the one its connections and limits live on."""
@@ -470,6 +498,8 @@ class LlmClient:
                 record.usage.cost_usd += outcome.cost_usd  # Every attempt the gateway billed.
             if outcome.response is not None:
                 return outcome.response
+            if outcome.status == _S.LLM_CALL_STATUS_CANCELLED:
+                raise RuntimeError(f"{record.model}: the LlmClient closed during the call")
             retries = len(record.attempts) - 1
             if outcome.status not in TRANSIENT_FAILURES or retries >= self._retry.max_retries:
                 count = f"{retries + 1} attempt{'s' if retries else ''}"
@@ -513,6 +543,8 @@ class LlmClient:
         self, http: httpx.AsyncClient, body: bytes, record: LlmCallRecord
     ) -> _Outcome:
         """Send the request and say how it went. Only cancellation and bugs raise."""
+        if self._closed:  # It closed while this attempt waited: send nothing.
+            return _Outcome(_S.LLM_CALL_STATUS_CANCELLED)
         try:
             async with asyncio.timeout(self._retry.timeout_s):
                 response = await http.post("/chat/completions", content=body, headers=_JSON_HEADERS)
