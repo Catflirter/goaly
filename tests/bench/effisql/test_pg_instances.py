@@ -142,7 +142,12 @@ def test_roles_get_login_a_limit_a_verifier_and_exactly_their_defaults() -> None
         "effisql_agent",
         64,
         "SCRAM-SHA-256$v1",
-        ["\"default_transaction_read_only\" = 'on'", "\"temp_file_limit\" = '5GB'"],
+        [
+            "\"default_transaction_read_only\" = 'on'",
+            "\"temp_file_limit\" = '5GB'",
+            "\"statement_timeout\" = '130s'",  # The backstop behind the client-side stop,
+            "\"client_connection_check_interval\" = '5s'",  # which an abandon relies on.
+        ],
     ) + expected(
         "effisql_grader", -1, "SCRAM-SHA-256$v2", ["\"default_transaction_read_only\" = 'on'"]
     )

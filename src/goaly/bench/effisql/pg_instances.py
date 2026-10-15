@@ -20,7 +20,12 @@ and the role defaults only add defense in depth:
 - the agent role connects only to ``tpch`` on the solving instances, with SELECT on its tables;
   on the grading instances its CONNECT is revoked outright (spec §6.2: solving and grading
   never share an instance). Its temp files are capped at 5 GB, so one runaway sort cannot fill
-  the disk the grading instances share, and its connections per instance are capped;
+  the disk the grading instances share, and its connections per instance are capped. As a
+  backstop behind the SQL environment's own client-side stop, its statements default to a
+  130 s statement_timeout (the 120 s cap plus a margin), and a backend checks every 5 s that
+  its client is still there (client_connection_check_interval), so an abandoned statement
+  stops soon after its socket closes. A session can lift both for itself; they catch what the
+  environment lets slip, not what a hostile client does;
 - the grader role connects to both databases on every instance, with SELECT on their tables;
 - both default to read-only transactions;
 - PUBLIC loses CONNECT and TEMPORARY on every database and CREATE on the public schema. It
@@ -75,6 +80,7 @@ from goaly.bench.effisql.pg_settings import (
 )
 
 __all__ = [
+    "AGENT_STATEMENT_TIMEOUT_S",
     "GRADING",
     "INSTANCES",
     "PYTHON_CPUS",
@@ -187,9 +193,17 @@ type Kind = Literal["solving", "grading"]
 _ROLES = (AGENT_ROLE, GRADER_ROLE)
 # Databases a role's per-database defaults may live in; a reapply clears them all.
 _DATABASES = (MAIN_DB, ALT_DB, "postgres", "template1")
-# Role-wide defaults. temp_file_limit is superuser-only, so the agent cannot lift its cap.
+# The server-side backstop on an agent statement's run time, above the 120 s client-side cap.
+AGENT_STATEMENT_TIMEOUT_S = 130
+# Role-wide defaults, each written as SHOW prints it. temp_file_limit is superuser-only, so the
+# agent cannot lift its cap; the others a session may change for itself.
 ROLE_DEFAULTS: Mapping[str, Mapping[str, str]] = {
-    AGENT_ROLE: {"default_transaction_read_only": "on", "temp_file_limit": "5GB"},
+    AGENT_ROLE: {
+        "default_transaction_read_only": "on",
+        "temp_file_limit": "5GB",
+        "statement_timeout": f"{AGENT_STATEMENT_TIMEOUT_S}s",
+        "client_connection_check_interval": "5s",
+    },
     GRADER_ROLE: {"default_transaction_read_only": "on"},
 }
 _CONNECTION_LIMITS = {AGENT_ROLE: 64, GRADER_ROLE: -1}  # Per instance; -1 means no limit.
