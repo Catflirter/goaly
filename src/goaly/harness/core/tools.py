@@ -86,9 +86,11 @@ class BoundTool[E: Environment](ABC):
 
           A statement or command that ran and failed is a normal result.
         - EnvironmentFailure propagates, from a validator too, and never becomes a result. When
-          an exception group holds one, as a TaskGroup raises, the first is raised from the
-          group (:func:`environment_failure_in`), so that ``except EnvironmentFailure`` catches
-          it. Cancellation propagates too.
+          an exception group holds one, as a TaskGroup raises, the first is raised by itself
+          (:func:`environment_failure_in`), so that ``except EnvironmentFailure`` catches it:
+          from the group, unless it has a cause of its own, which it keeps. Cancellation
+          propagates too, and wins: when the caller is being cancelled, an EnvironmentFailure
+          the tool raised meanwhile becomes the CancelledError's cause.
         - The tool runs in a task of its own. It must let CancelledError propagate; one that
           does not still cannot change the outcome. A cancellation of the caller that it
           swallowed, or turned into another exception, still propagates, and a call that ran
@@ -277,12 +279,16 @@ def environment_failure_in(error: BaseException) -> EnvironmentFailure | None:
 def _reraise_environment_failure(error: Exception) -> None:
     """Raise the EnvironmentFailure that ``error`` is or holds, if there is one.
 
-    A failure inside a group is raised from the group, so that a caller's ``except
-    EnvironmentFailure`` catches it, as the contract asks, and the group stays its __cause__.
+    A failure inside a group is raised by itself, so that a caller's ``except
+    EnvironmentFailure`` catches it, as the contract asks. The group stays reachable: as its
+    __cause__, or as its __context__ when the failure already has a cause of its own, such as
+    the connection error it was raised from, which it keeps.
     """
     failure = environment_failure_in(error)
     if failure is error:
         raise error
+    if failure is not None and failure.__cause__ is not None:
+        raise failure  # The group, being handled, becomes its __context__.
     if failure is not None:
         raise failure from error
 
