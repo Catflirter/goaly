@@ -2,11 +2,15 @@
 
 A sandbox container mounts one worktree read-only, at its own path, and with ``writable_packs``
 the lane's two pack directories read-write; nothing else from the host is mounted. No git
-metadata is mounted, so nothing inside can commit. The container runs as the host user with a
-read-only root, a tmpfs ``/tmp``, no capabilities, ``no-new-privileges``, and process, memory and
-CPU limits (spec §6.2). It gets no host environment variable, so no key, and the docker CLI
-itself gets none but its own. Host networking is the only mode that works on this machine
-(spec §1.3).
+metadata is mounted, so nothing inside can commit; a main repository, whose ``.git`` is a
+directory, is refused. A worktree's ``.git`` file stays visible and names the main repository's
+path, which is harmless, since that path is not mounted. The container runs as the host user with
+a read-only root, a tmpfs ``/tmp``, no capabilities, ``no-new-privileges``, and process, memory,
+CPU, file-size and open-file limits (spec §6.2). Every limit must be above 0, since docker reads
+0 as no limit. The file-size limit bounds each file the packs can hold, not their total, which
+the guards bound. It gets no host environment variable, so no key, and the docker CLI itself gets
+none but its own. Host networking is the only mode that works on this machine (spec §1.3), so the
+container can reach every port on localhost.
 
 Every command runs under ``timeout`` inside the container, because stopping ``docker exec`` on
 the host leaves the command running. Containers carry labels, so leftovers of a crashed lane can
@@ -15,6 +19,7 @@ be found and removed, and a one-shot run removes its container before it returns
 
 import hashlib
 import logging
+import math
 import os
 import re
 import secrets
@@ -41,6 +46,7 @@ __all__ = [
     "SandboxConfig",
     "SandboxError",
     "SandboxResult",
+    "containers",
     "ensure_image",
     "image_tag",
     "remove_containers",
@@ -58,7 +64,7 @@ LABEL_PURPOSE = "goaly.rsi.purpose"  # Such as "implementer" or "unit-tests".
 _LABEL_DOCKERFILE = "goaly.rsi.dockerfile-sha256"  # On the image: the Dockerfile it came from.
 
 _CPUSET = re.compile(r"\d+(-\d+)?(,\d+(-\d+)?)*")
-_SIZE = re.compile(r"\d+[bkmg]")
+_SIZE = re.compile(r"[1-9]\d*[bkmg]")  # Never 0, which docker and tmpfs read as no limit.
 _TIMED_OUT = 124  # timeout's exit status once it has stopped the command.
 _KILLED = 137  # 128 + SIGKILL: after --kill-after, or when the kernel killed the command.
 
@@ -81,7 +87,10 @@ class SandboxConfig(BaseModel):
     memory: str = "4g"
     tmp_size: str = "1g"
     pids_limit: int = Field(default=512, gt=0)
-    kill_after_s: float = Field(default=5, ge=0)  # From timeout's TERM to its KILL.
+    max_file_bytes: int = Field(default=64 * 1024 * 1024, gt=0)  # The largest file it can write.
+    max_open_files: int = Field(default=1024, gt=0)
+    # From timeout's TERM to its KILL; never 0, which would turn the KILL off.
+    kill_after_s: float = Field(default=5, gt=0)
     docker_timeout_s: float = Field(default=120, gt=0)  # For each docker call but the command.
     build_timeout_s: float = Field(default=1800, gt=0)
     output_limit: int = Field(default=64 * 1024, gt=0)  # The characters of output kept: the end.
@@ -128,12 +137,14 @@ def run_options(
     The worktree, a candidate's or a snapshot of one, is mounted read-only at its own path; with
     ``writable_packs`` the lane's two pack directories are mounted read-write over it, and they
     must exist. The image and the command follow these options. Raises ValueError for a worktree
-    path docker could misread, or an invalid label.
+    path docker could misread, a main repository, or an invalid label.
     """
     check_id(experiment_id, "experiment_id")
     check_id(purpose, "purpose")
     info = lane_info(lane)
     root = _mount_path(worktree)
+    if (worktree / ".git").is_dir():
+        raise ValueError(f"{worktree} is a main repository; mounting it would expose its .git")
     options = [
         "--init",  # Reaps zombies and passes signals on.
         "--network=host",
@@ -143,6 +154,8 @@ def run_options(
         "--cap-drop=ALL",
         "--security-opt=no-new-privileges",
         f"--pids-limit={config.pids_limit}",
+        f"--ulimit=fsize={config.max_file_bytes}:{config.max_file_bytes}",
+        f"--ulimit=nofile={config.max_open_files}:{config.max_open_files}",
         f"--memory={config.memory}",
         f"--memory-swap={config.memory}",  # No swap beyond the memory limit.
         f"--cpuset-cpus={config.cpus}",
@@ -169,7 +182,12 @@ def run_options(
 def timed_shell(timeout_s: float, config: SandboxConfig = SandboxConfig()) -> list[str]:  # noqa: B008
     """Return the in-container command prefix that runs a bash command for at most
     ``timeout_s``: timeout sends TERM, then KILL ``config.kill_after_s`` later.
+
+    Raises ValueError unless ``timeout_s`` is a finite number of seconds above 0: timeout reads 0
+    as no limit.
     """
+    if not math.isfinite(timeout_s) or timeout_s <= 0:
+        raise ValueError(f"the timeout must be finite and above 0 s; got {timeout_s!r}")
     return ["timeout", f"--kill-after={config.kill_after_s:g}s", f"{timeout_s:g}s", "bash", "-c"]
 
 
@@ -186,10 +204,15 @@ def run_once(
     config: SandboxConfig = SandboxConfig(),  # noqa: B008
 ) -> SandboxResult:
     """Run the bash ``command`` in a fresh sandbox on ``worktree``, as the host user, and return
-    how it ended. The container is removed before this returns, whatever happens.
+    how it ended.
 
-    Raises SandboxError if docker fails or hangs. A command that fails or times out is a result,
-    not an error.
+    The container is removed before this returns. If removing it fails while another error is
+    already on its way, that failure is only logged, and :func:`remove_containers`, which a lane
+    runs when it starts, is the backstop. A run with ``writable_packs`` is the implementer's; any
+    other run that evaluates a candidate takes a snapshot of its commit, never the live worktree
+    (goaly.rsi.workspace.Workspace.snapshot). Raises SandboxError if docker fails or hangs, and
+    ValueError for a timeout that would not stop the command. A command that fails or times out is
+    a result, not an error.
     """
     options = run_options(
         worktree,
@@ -203,9 +226,9 @@ def run_once(
     )
     name = f"goaly-rsi-{lane_info(lane).name}-{experiment_id}-{purpose}-{secrets.token_hex(4)}"
     shell = [*timed_shell(timeout_s, config), f"exec 2>&1\n{command}"]
-    started = time.monotonic()
     try:
         _docker(config, ["run", "--detach", f"--name={name}", *options, image, *shell])
+        started = time.monotonic()  # The container, and its timeout, have started.
         status = _docker(
             config,
             ["wait", name],
@@ -213,7 +236,8 @@ def run_once(
         )
         elapsed = time.monotonic() - started
         exit_code = _exit_code(status)
-        output = _docker(config, ["logs", name])
+        # The command's stderr goes to its stdout; timeout's and the init's messages do not.
+        output = _docker(config, ["logs", name], merge_stderr=True)
     except BaseException:
         _remove_quietly(config, name)
         raise
@@ -231,22 +255,46 @@ def remove_containers(
     """Remove every sandbox container, or a lane's or an experiment's, running or not, and
     return how many there were. Containers without the sandbox label are never touched.
     """
+    found = containers(lane=lane, experiment_id=experiment_id, config=config)
+    if found:
+        _docker(config, ["rm", "--force", *found])
+    return len(found)
+
+
+def containers(
+    *,
+    lane: Lane.ValueType | None = None,
+    experiment_id: str | None = None,
+    purpose: str | None = None,
+    config: SandboxConfig = SandboxConfig(),  # noqa: B008
+) -> list[str]:
+    """Return the IDs of every sandbox container, running or not, or of those a lane, an
+    experiment or a purpose has. An experiment's implementer has stopped for good once this
+    lists none of its containers.
+    """
     filters = [f"--filter=label={LABEL_SANDBOX}=1"]
     if lane is not None:
         filters.append(f"--filter=label={LABEL_LANE}={lane_info(lane).name}")
     if experiment_id is not None:
         check_id(experiment_id, "experiment_id")
         filters.append(f"--filter=label={LABEL_EXPERIMENT}={experiment_id}")
-    containers = _docker(config, ["ps", "--all", "--quiet", *filters]).split()
-    if containers:
-        _docker(config, ["rm", "--force", *containers])
-    return len(containers)
+    if purpose is not None:
+        check_id(purpose, "purpose")
+        filters.append(f"--filter=label={LABEL_PURPOSE}={purpose}")
+    return _docker(config, ["ps", "--all", "--quiet", *filters]).split()
 
 
 def image_tag(repo: Path) -> str:
-    """Return the sandbox image's tag for ``repo``: ``goaly-rsi-sandbox:<sha256 of uv.lock>``."""
-    lock = hashlib.sha256((repo / "uv.lock").read_bytes()).hexdigest()
-    return f"{IMAGE_REPOSITORY}:{lock}"
+    """Return the sandbox image's tag for ``repo``: ``goaly-rsi-sandbox:<hash>``, where the hash
+    covers uv.lock and the Dockerfile, so that the tag names what the image was built from.
+
+    The apt packages, git and ripgrep, are not pinned, so two builds with one tag can differ by
+    Debian's updates to them. Raises SandboxError if either file cannot be read.
+    """
+    lock = _sha256(repo / "uv.lock")
+    recipe = _sha256(repo / DOCKERFILE)
+    both = hashlib.sha256(f"uv.lock {lock}\nDockerfile {recipe}\n".encode()).hexdigest()
+    return f"{IMAGE_REPOSITORY}:{both}"
 
 
 def ensure_image(
@@ -258,16 +306,19 @@ def ensure_image(
     and came from the current Dockerfile.
 
     The build context holds only pyproject.toml and uv.lock. Raises SandboxError if the build
-    fails.
+    fails, or if a file it needs cannot be read.
     """
     tag = image_tag(repo)
     dockerfile = repo / DOCKERFILE
-    recipe = hashlib.sha256(dockerfile.read_bytes()).hexdigest()
+    recipe = _sha256(dockerfile)
     if _image_recipe(config, tag) == recipe:
         return tag
     with tempfile.TemporaryDirectory(prefix="goaly-rsi-sandbox-") as context:
         for name in ("pyproject.toml", "uv.lock"):
-            shutil.copyfile(repo / name, Path(context) / name)
+            try:
+                shutil.copyfile(repo / name, Path(context) / name)
+            except OSError as error:
+                raise SandboxError(f"cannot read {repo / name}: {error}") from error
         _docker(
             config,
             [
@@ -292,23 +343,44 @@ def _image_recipe(config: SandboxConfig, tag: str) -> str | None:
     return _docker(config, ["image", "inspect", f"--format={label}", tag]).strip()
 
 
+def _sha256(path: Path) -> str:
+    try:
+        return hashlib.sha256(path.read_bytes()).hexdigest()
+    except OSError as error:
+        raise SandboxError(f"cannot read {path}: {error}") from error
+
+
 def _mount_path(worktree: Path) -> str:
-    """``worktree`` as a --mount value, refusing anything docker's CSV parsing could misread."""
+    """``worktree`` as a --mount value, refusing anything docker's CSV parsing could misread, a
+    ``..`` that docker would resolve, and a ``:``, which would split PYTHONPATH.
+    """
     path = str(worktree)
-    if not worktree.is_absolute() or any(char in ',"' or not char.isprintable() for char in path):
-        raise ValueError(f"the worktree path must be absolute, without commas or quotes: {path!r}")
+    misread = any(char in ',":' or not char.isprintable() for char in path)
+    if not worktree.is_absolute() or misread or ".." in worktree.parts:
+        raise ValueError(
+            f"the worktree path must be absolute, without .., commas, colons or quotes: {path!r}"
+        )
     return path
 
 
-def _docker(config: SandboxConfig, args: list[str], *, timeout_s: float | None = None) -> str:
-    """Run the docker CLI and return its output; raise SandboxError if it fails or hangs."""
+def _docker(
+    config: SandboxConfig,
+    args: list[str],
+    *,
+    timeout_s: float | None = None,
+    merge_stderr: bool = False,
+) -> str:
+    """Run the docker CLI and return its output, with its stderr if ``merge_stderr``; raise
+    SandboxError if it fails or hangs.
+    """
     limit = config.docker_timeout_s if timeout_s is None else timeout_s
     try:
         completed = subprocess.run(  # noqa: S603  (the docker CLI, with arguments built here)
             [config.docker, *args],
             env=_docker_environment(),
             stdin=subprocess.DEVNULL,
-            capture_output=True,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.STDOUT if merge_stderr else subprocess.PIPE,
             timeout=limit,
             check=False,
         )
@@ -317,7 +389,7 @@ def _docker(config: SandboxConfig, args: list[str], *, timeout_s: float | None =
     except OSError as error:
         raise SandboxError(f"cannot run {config.docker}: {error}") from error
     if completed.returncode != 0:
-        reason = completed.stderr.decode("utf-8", "replace").strip()
+        reason = (completed.stderr or completed.stdout).decode("utf-8", "replace").strip()
         raise SandboxError(f"docker {args[0]} failed ({completed.returncode}): {reason}")
     return completed.stdout.decode("utf-8", "replace")
 

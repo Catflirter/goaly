@@ -1,5 +1,6 @@
 """Tests for Workspace.snapshot and Workspace.pin: what candidates are evaluated from."""
 
+import shutil
 from pathlib import Path
 
 import pytest
@@ -166,3 +167,112 @@ def test_a_symlink_that_stays_inside_the_snapshot_is_kept(
     with workspace.snapshot(commit) as root:
         assert (root / "docs" / "readme.md").is_symlink()
         assert (root / "docs" / "readme.md").read_text(encoding="utf-8") == "# goaly\n"
+
+
+def test_a_snapshot_is_the_commit_whatever_its_attributes_say(
+    workspace: Workspace, worktree: Worktree
+) -> None:
+    write(
+        workspace.repo,
+        {
+            ".gitattributes": "notes.md export-ignore\nstamp.txt export-subst\n",
+            "notes.md": "kept\n",
+            "stamp.txt": "$Format:%H$\n",
+        },
+    )
+    git(workspace.repo, "add", "--all")
+    git(workspace.repo, "commit", "--quiet", "--message=export attributes")
+
+    with workspace.snapshot("HEAD") as tree:
+        assert (tree / "notes.md").read_text(encoding="utf-8") == "kept\n"
+        assert (tree / "stamp.txt").read_text(encoding="utf-8") == "$Format:%H$\n"
+
+
+def test_a_snapshot_keeps_the_executable_bit_and_drops_every_write_bit(
+    workspace: Workspace,
+) -> None:
+    script = workspace.repo / "run.sh"
+    script.write_text("#!/bin/sh\n", encoding="utf-8")
+    script.chmod(0o755)
+    git(workspace.repo, "add", "--all")
+    git(workspace.repo, "commit", "--quiet", "--message=a script")
+
+    with workspace.snapshot("HEAD") as tree:
+        assert (tree / "run.sh").stat().st_mode & 0o777 == 0o555
+        assert (tree / "README.md").stat().st_mode & 0o777 == 0o444
+        assert tree.stat().st_mode & 0o777 == 0o555
+
+
+def test_a_snapshot_holds_binary_files_byte_for_byte(workspace: Workspace) -> None:
+    data = bytes(range(256)) * 3
+    (workspace.repo / "blob.bin").write_bytes(data)
+    git(workspace.repo, "add", "--all")
+    git(workspace.repo, "commit", "--quiet", "--message=binary")
+
+    with workspace.snapshot("HEAD") as tree:
+        assert (tree / "blob.bin").read_bytes() == data
+
+
+def test_a_snapshot_larger_than_any_repository_is_refused(
+    workspace: Workspace, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setattr(workspace_module, "_SNAPSHOT_LIMIT", 10)
+
+    with pytest.raises(WorkspaceError, match="larger"), workspace.snapshot("HEAD"):
+        pytest.fail("the snapshot was made")
+
+
+@pytest.mark.parametrize("name", ["/etc/passwd", "a/../b", "./a", "a//b", ".git/config", "a/.git"])
+def test_a_tree_path_that_could_leave_the_snapshot_is_refused(name: str) -> None:
+    with pytest.raises(WorkspaceError, match="holds the path"):
+        workspace_module._inside(name, "c0ffee")
+
+
+def test_pin_refuses_while_the_sandbox_still_exists(workspace: Workspace) -> None:
+    asked: list[str] = []
+
+    def probe(experiment_id: str) -> list[str]:
+        asked.append(experiment_id)
+        return ["c1"]
+
+    guarded = Workspace(workspace.repo, root=workspace.root, sandbox_probe=probe)
+    worktree = guarded.create(LANE_EFFISQL, "exp-9")
+
+    with pytest.raises(WorkspaceError, match="not stopped and removed: 1 container left"):
+        guarded.pin(worktree)
+
+    assert asked == ["exp-9"]
+
+
+def test_pin_with_neither_pack_directory_adds_nothing(
+    workspace: Workspace, worktree: Worktree
+) -> None:
+    for pack in worktree.pack_dirs:
+        shutil.rmtree(pack)
+    write(worktree.path, {"stray.md": "outside the pack\n"})
+
+    pinned = workspace.pin(worktree)
+
+    head_tree = git(worktree.path, "rev-parse", "HEAD^{tree}").strip()
+    assert git(worktree.path, "rev-parse", f"{pinned}^{{tree}}").strip() == head_tree
+
+
+def test_pin_refuses_a_worktree_it_does_not_know(workspace: Workspace, tmp_path: Path) -> None:
+    stray = Worktree(tmp_path / "elsewhere", LANE_EFFISQL, "exp-1")
+
+    with pytest.raises(WorkspaceError, match="not a registered worktree"):
+        workspace.pin(stray)
+
+
+def test_a_gitlink_becomes_an_empty_directory(workspace: Workspace) -> None:
+    head = git(workspace.repo, "rev-parse", "HEAD").strip()
+    git(workspace.repo, "update-index", "--add", "--cacheinfo", f"160000,{head},vendor/lib")
+    git(workspace.repo, "commit", "--quiet", "--message=a submodule")
+
+    with workspace.snapshot("HEAD") as tree:
+        assert (tree / "vendor" / "lib").is_dir()
+        assert list((tree / "vendor" / "lib").iterdir()) == []
+
+
+def test_a_tree_without_files_needs_no_blob(workspace: Workspace) -> None:
+    assert workspace._blobs([], "c0ffee") == {}

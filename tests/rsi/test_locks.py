@@ -1,5 +1,6 @@
 """Tests for goaly.rsi.locks: advisory file locks between RSI processes."""
 
+import os
 import re
 import subprocess
 import sys
@@ -130,3 +131,23 @@ def test_the_lock_file_is_created_and_kept(tmp_path: Path) -> None:
 def test_a_missing_directory_is_an_error(tmp_path: Path) -> None:
     with pytest.raises(FileNotFoundError), file_lock(tmp_path / "missing" / "lock"):
         pass
+
+
+@pytest.mark.parametrize(("shared", "access"), [(True, os.O_RDONLY), (False, os.O_RDWR)])
+def test_an_exclusive_lock_opens_its_file_for_writing(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, shared: bool, access: int
+) -> None:
+    """NFS emulates flock with POSIX locks, and an exclusive one needs a writable descriptor."""
+    opened: list[int] = []
+    real_open = os.open
+
+    def spy(path: str | os.PathLike[str], flags: int, mode: int = 0o777) -> int:
+        opened.append(flags)
+        return real_open(path, flags, mode)
+
+    monkeypatch.setattr(os, "open", spy)
+
+    with file_lock(tmp_path / "lock", shared=shared):
+        pass
+
+    assert [flags & os.O_ACCMODE for flags in opened] == [access]
