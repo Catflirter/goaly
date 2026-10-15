@@ -5,6 +5,7 @@ HTTP server, which also takes the client through httpx's real transport.
 """
 
 import json
+import logging
 import threading
 from collections.abc import Iterator, Set
 from contextlib import contextmanager
@@ -15,7 +16,9 @@ import httpx
 import pytest
 
 from goaly.contracts.gen.llm_call_pb2 import CallPurpose, LlmCallRecord, LlmCallStatus, Usage
-from scripts.llm_smoke import TOOLS, Records, describe, main, smoke
+from goaly.harness.core.llm import MemoryCallRecorder
+from scripts import llm_smoke
+from scripts.llm_smoke import TOOLS, describe, main, smoke
 from tests.harness.core.llm_fakes import GLM, KEY, QWEN, Gateway, completion, connect, failure
 
 pytestmark = pytest.mark.anyio
@@ -32,7 +35,7 @@ LINE = "tokens 26 in, 309 out (304 reasoning); cost $0.000313"
 type Seen = list[tuple[str, str, str]]  # Each request's path, Authorization header and model.
 
 
-def tool_call() -> httpx.Response:
+def tool_call(reasoning: str = REASONING) -> httpx.Response:
     """Qwen's first tool turn, as the gateway answers it: its reasoning and one tool call."""
     call = {
         "index": 0,
@@ -40,16 +43,33 @@ def tool_call() -> httpx.Response:
         "id": "call_1",
         "type": "function",
     }
-    return completion("\n\n", reasoning=REASONING, tool_calls=[call], finish_reason="tool_calls")
+    return completion("\n\n", reasoning=reasoning, tool_calls=[call], finish_reason="tool_calls")
+
+
+@pytest.fixture(autouse=True)
+def _restore_logging() -> Iterator[None]:
+    """main() configures logging for the process; undo it, so later tests log as before."""
+    root = logging.getLogger()
+    level, handlers = root.level, list(root.handlers)
+    yield
+    for handler in list(root.handlers):
+        if handler not in handlers:
+            root.removeHandler(handler)
+    root.setLevel(level)
 
 
 @contextmanager
 def stand_in_gateway(
-    failing: Set[str] = frozenset(), *, calls_tools: bool = True
+    failing: Set[str] = frozenset(),
+    *,
+    calls_tools: bool = True,
+    reasons: bool = True,
+    cost: str | None = None,
 ) -> Iterator[tuple[str, Seen]]:
     """Serve chat completions on a local port, answering 400 for the ``failing`` models.
 
-    A request with tools whose last message is the user's gets a tool call, if ``calls_tools``.
+    A request with tools whose last message is the user's gets a tool call, if ``calls_tools``,
+    with Qwen's reasoning, if ``reasons``. Every reply says it cost ``cost``, if given.
     Yields the base URL and the list of requests it saw.
     """
     seen: Seen = []
@@ -61,12 +81,13 @@ def stand_in_gateway(
             if body["model"] in failing:
                 reply = failure(400, "refused")
             elif calls_tools and "tools" in body and body["messages"][-1]["role"] == "user":
-                reply = tool_call()
+                reply = tool_call(REASONING if reasons else "")
             else:
                 reply = completion(REPLY)
             self.send_response(reply.status_code)
-            for name in ("content-type", "x-litellm-response-cost"):
-                self.send_header(name, reply.headers[name])
+            self.send_header("content-type", reply.headers["content-type"])
+            own_cost = reply.headers["x-litellm-response-cost"]
+            self.send_header("x-litellm-response-cost", own_cost if cost is None else cost)
             self.send_header("content-length", str(len(reply.content)))
             self.end_headers()
             self.wfile.write(reply.content)
@@ -85,25 +106,39 @@ def stand_in_gateway(
         thread.join()
 
 
-async def test_calls_qwen_plainly_then_through_a_tool_turn_then_glm_from_a_thread() -> None:
-    gateway, records = Gateway(completion(), tool_call(), completion(), completion()), Records()
+async def test_calls_qwen_plainly_then_through_a_tool_turn_then_glm_from_a_thread(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    gateway = Gateway(completion(), tool_call(), completion(), completion())
+    records = MemoryCallRecorder()
     async with connect(gateway, recorder=records) as llm:
-        tool_turn_ran = await smoke(llm)
+        callers: list[int] = []
+        complete_sync = llm.complete_sync
 
-    assert tool_turn_ran
+        def spy(*args: Any, **kwargs: Any) -> Any:
+            callers.append(threading.get_ident())
+            return complete_sync(*args, **kwargs)
+
+        monkeypatch.setattr(llm, "complete_sync", spy)
+        problems = await smoke(llm)
+
+    assert problems == []
+    assert callers  # GLM's call went through complete_sync,
+    assert threading.get_ident() not in callers  # from a worker thread.
     plain, first, second, glm = gateway.bodies
     assert [body["model"] for body in (plain, first, second, glm)] == [QWEN, QWEN, QWEN, GLM]
     assert "tools" not in plain
-    assert first["tools"] == second["tools"] == TOOLS
-    # The default Qwen body: the profile's own sampling and thinking switch, no overrides.
-    defaults: dict[str, Any] = {
+    # The whole default Qwen body: the profile's own sampling and thinking switch, no overrides.
+    assert {key: value for key, value in first.items() if key != "messages"} == {
+        "model": QWEN,
         "temperature": 0.6,
         "top_p": 0.95,
         "top_k": 20,
         "max_tokens": 16384,
         "chat_template_kwargs": {"enable_thinking": True},
+        "tools": TOOLS,
     }
-    assert {key: first[key] for key in defaults} == defaults
+    assert second["tools"] == TOOLS
     # The second turn: Qwen's reasoning and tool call replayed, then the tool's result.
     assert second["messages"][1:] == [
         {
@@ -128,31 +163,53 @@ async def test_calls_qwen_plainly_then_through_a_tool_turn_then_glm_from_a_threa
     ]
 
 
-async def test_skips_the_second_tool_turn_if_qwen_calls_no_tool() -> None:
-    gateway, records = Gateway(completion(), completion(), completion()), Records()
-    async with connect(gateway, recorder=records) as llm:
-        tool_turn_ran = await smoke(llm)
+async def test_reports_a_tool_turn_with_no_tool_call() -> None:
+    gateway = Gateway(completion(), completion(), completion())
+    async with connect(gateway) as llm:
+        problems = await smoke(llm)
 
-    assert not tool_turn_ran
+    assert problems == ["Qwen called no tool, so its second tool turn did not run"]
     assert [body["model"] for body in gateway.bodies] == [QWEN, QWEN, GLM]
+
+
+async def test_reports_a_tool_turn_with_no_reasoning_to_replay() -> None:
+    gateway = Gateway(completion(), tool_call(reasoning=""), completion(), completion())
+    async with connect(gateway) as llm:
+        problems = await smoke(llm)
+
+    assert problems == ["Qwen returned no reasoning_content, so none was replayed"]
+    assert len(gateway.requests) == 4  # The tool turn still ran: only the replay is missing.
+
+
+async def test_reports_a_call_refused_before_it_began(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setattr(llm_smoke, "IMPROVEMENT_MODEL", QWEN)  # RSI may not call Qwen.
+    gateway, records = Gateway(completion(), tool_call(), completion()), MemoryCallRecorder()
+    async with connect(gateway, recorder=records) as llm:
+        problems = await smoke(llm)
+
+    assert problems == [
+        "a call was refused before it began: "
+        f"CALL_PURPOSE_RSI_IMPL may not call {QWEN}: it may call only {GLM}"
+    ]
+    assert len(records.records) == 3
 
 
 async def test_a_failed_call_does_not_stop_the_others() -> None:
     gateway = Gateway(failure(400), tool_call(), failure(400), completion())
-    records = Records()
+    records = MemoryCallRecorder()
     async with connect(gateway, recorder=records) as llm:
-        tool_turn_ran = await smoke(llm)
+        problems = await smoke(llm)
 
-    assert tool_turn_ran
+    assert problems == []  # The failures are in the records.
     assert [record.status for record in records.records] == [CLIENT_ERROR, OK, CLIENT_ERROR, OK]
 
 
 async def test_a_failed_first_tool_turn_has_no_second() -> None:
-    gateway, records = Gateway(completion(), failure(400), completion()), Records()
+    gateway, records = Gateway(completion(), failure(400), completion()), MemoryCallRecorder()
     async with connect(gateway, recorder=records) as llm:
-        tool_turn_ran = await smoke(llm)
+        problems = await smoke(llm)
 
-    assert not tool_turn_ran
+    assert problems == []
     assert [record.status for record in records.records] == [OK, CLIENT_ERROR, OK]
 
 
@@ -206,18 +263,58 @@ async def test_exits_1_when_a_call_fails(
     assert printed.err == ""
 
 
-async def test_exits_1_when_qwen_calls_no_tool(
-    monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+@pytest.mark.parametrize(
+    ("calls_tools", "reasons", "note", "lines"),
+    [
+        pytest.param(
+            False,
+            True,
+            "Qwen called no tool, so its second tool turn did not run",
+            3,
+            id="no-tool-call",
+        ),
+        pytest.param(
+            True,
+            False,
+            "Qwen returned no reasoning_content, so none was replayed",
+            4,
+            id="no-reasoning",
+        ),
+    ],
+)
+async def test_exits_1_and_says_why_when_the_replay_was_not_proved(
+    calls_tools: bool,
+    reasons: bool,
+    note: str,
+    lines: int,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
 ) -> None:
-    with stand_in_gateway(calls_tools=False) as (base_url, _):
+    with stand_in_gateway(calls_tools=calls_tools, reasons=reasons) as (base_url, _):
         monkeypatch.setenv("GOALY_API_KEY", KEY)
         monkeypatch.setenv("GOALY_BASE_URL", base_url)
         status = await main()
 
     printed = capsys.readouterr()
     assert status == 1
-    assert len(printed.out.splitlines()) == 3
-    assert printed.err == "llm_smoke: Qwen called no tool, so its second tool turn did not run\n"
+    assert len(printed.out.splitlines()) == lines
+    assert printed.err == f"llm_smoke: {note}\n"
+
+
+async def test_logs_warnings_to_stderr_as_json_lines(
+    monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    with stand_in_gateway(cost="n/a") as (base_url, _):
+        monkeypatch.setenv("GOALY_API_KEY", KEY)
+        monkeypatch.setenv("GOALY_BASE_URL", base_url)
+        status = await main()
+
+    printed = capsys.readouterr()
+    assert status == 0  # A cost the gateway did not report fails no call.
+    warnings = [json.loads(line) for line in printed.err.splitlines()]
+    assert [(entry["level"], entry["event"]) for entry in warnings] == [
+        ("WARNING", "llm_bad_cost")
+    ] * 4
 
 
 async def test_without_a_key_says_what_to_set_and_exits_2(
