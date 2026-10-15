@@ -254,9 +254,12 @@ class Benchmark[InstanceT: Instance, EnvT: Environment](Protocol):
         """Return the run manifest's fields that only the adapter knows, for the runner to merge.
 
         The partial manifest sets at most ``dataset_revision``, ``dataset_notes``,
-        ``environment_settings`` and ``dataset_sha256``; the runner fills every other field and
-        merges this one in. ``environment_settings["grading_mode"]`` names the grader's mode, such
-        as Effi-SQL's "dev" or "official".
+        ``environment_settings`` and ``dataset_sha256``. The runner sets none of these four
+        itself: it fills every other field and merges this manifest in, so each of the four,
+        ``dataset_notes`` included, comes only from here. A resumed run must match all four, so a
+        run never resumes on another dataset or in another grading mode.
+        ``environment_settings["grading_mode"]`` names the grader's mode, such as Effi-SQL's
+        "dev" or "official".
         """
 
     def to_official(self, inst: InstanceT, prediction: Prediction) -> dict[str, JsonValue]:
