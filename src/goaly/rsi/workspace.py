@@ -15,6 +15,12 @@ symlink included, and git on the host must never act on that: :func:`check_pack_
 the packs before any git command runs in a candidate's worktree, and :meth:`Workspace.remove`
 deletes a worktree's files itself before git forgets the worktree.
 
+A candidate is evaluated only from a snapshot of a commit, never from its live worktree: the
+guards, the unit-test guard, goaly-smoke and screening all see the same immutable files. Host
+git reads a worktree only once its sandbox has stopped and been removed (spec §8.8):
+:meth:`Workspace.pin`, for goaly-smoke, and the commit helper both check that no container of
+the experiment exists before they run git there.
+
 For T22: best/<lane> can move to a commit that does not descend from the remote's tag, so
 pushing it must force the tag.
 """
@@ -23,32 +29,45 @@ import logging
 import os
 import shutil
 import stat
-from collections.abc import Iterator
+import tempfile
+from collections.abc import Callable, Iterator, Mapping, Sequence
 from contextlib import contextmanager
 from dataclasses import dataclass
 from functools import cached_property
-from pathlib import Path
+from pathlib import Path, PurePosixPath
 
 from goaly.contracts.gen.experiment_pb2 import Lane
 from goaly.rsi.git import GitError, run_git, run_git_unless_no
 from goaly.rsi.ids import check_id
 from goaly.rsi.lanes import lane_info
 from goaly.rsi.locks import file_lock
+from goaly.rsi.sandbox import containers
 
 __all__ = [
     "DEFAULT_ROOT",
     "GIT_FILES",
+    "REGULAR_MODES",
+    "SandboxProbe",
     "UnsafePackError",
     "Workspace",
     "WorkspaceError",
     "Worktree",
+    "check_modes",
     "check_pack_files",
+    "mode_problem",
+    "pack_modes",
 ]
 
 DEFAULT_ROOT = Path("~/goaly-rsi-worktrees")
 _LOCK = "goaly-rsi.lock"  # In the main repository's git directory, shared by all its worktrees.
 # Files that tell git how to treat a tree; a pack may hold none of them.
 GIT_FILES = frozenset({".git", ".gitattributes", ".gitmodules", ".gitignore"})
+# git's modes for a file; 120000 is a symlink and 160000 a gitlink.
+REGULAR_MODES = frozenset({"100644", "100755"})
+_SNAPSHOT_LIMIT = 2 * 1024**3  # The most bytes a snapshot extracts: far more than the repository.
+
+# The containers of an experiment, running or not; the default asks docker.
+type SandboxProbe = Callable[[str], Sequence[str]]
 
 _logger = logging.getLogger(__name__)
 
@@ -92,7 +111,8 @@ class Workspace:
 
     ``root`` defaults to DEFAULT_ROOT and must lie outside the repository. Operations that
     change worktrees, branches or tags wait at most ``lock_timeout_s`` for the repository lock,
-    then raise goaly.rsi.locks.LockTimeoutError.
+    then raise goaly.rsi.locks.LockTimeoutError. ``sandbox_probe`` lists an experiment's
+    containers, running or not; it defaults to goaly.rsi.sandbox.containers.
     """
 
     def __init__(
@@ -102,6 +122,7 @@ class Workspace:
         root: Path | None = None,
         lock_timeout_s: float = 120.0,
         git_timeout_s: float = 120.0,
+        sandbox_probe: SandboxProbe | None = None,
     ) -> None:
         self.repo = repo.resolve()
         self.root = (DEFAULT_ROOT if root is None else root).expanduser().resolve()
@@ -109,6 +130,7 @@ class Workspace:
             raise ValueError(f"the worktree root {self.root} must lie outside {self.repo}")
         self.lock_timeout_s = lock_timeout_s
         self.git_timeout_s = git_timeout_s
+        self._sandbox_probe = sandbox_probe
 
     @contextmanager
     def lock(self) -> Iterator[None]:
@@ -156,6 +178,82 @@ class Workspace:
     def head(self, worktree: Worktree) -> str:
         """Return the commit the worktree has checked out."""
         return self._git(["rev-parse", "--verify", "HEAD^{commit}"], cwd=worktree.path).strip()
+
+    @contextmanager
+    def snapshot(self, commit: str) -> Iterator[Path]:
+        """Yield a read-only copy of ``commit``'s files, in a new temporary directory that is
+        removed afterwards.
+
+        It is written from the commit's tree objects, so it holds exactly what the commit holds:
+        no attribute such as export-ignore or export-subst changes it, nothing untracked or
+        ignored is in it, and nothing the live worktree gains later. File modes are kept, less
+        their write bits. Raises WorkspaceError if ``commit`` is not a commit, its tree holds a
+        path or link that leads out of it, or it is larger than any repository should be.
+        """
+        sha = self._commit_of(commit)
+        with tempfile.TemporaryDirectory(prefix=f"goaly-rsi-snapshot-{sha[:12]}-") as scratch:
+            root = Path(scratch) / "tree"
+            root.mkdir()
+            self._extract(sha, root)
+            _set_writable(root, writable=False)
+            try:
+                yield root
+            finally:
+                _set_writable(root, writable=True)  # So that the directory can be removed.
+
+    def pin(self, worktree: Worktree) -> str:
+        """Commit the worktree's pack directories as they stand, on top of its HEAD, and return
+        the commit, which no branch holds.
+
+        Call it only once the worktree's sandbox has stopped and been removed (spec §8.8): it
+        checks that no container of the experiment exists before any git command runs in the
+        worktree, and then walks the packs with lstat. Ignored files are left out, and so is any
+        change outside the pack. The worktree, its index and its branch stay as they are. Raises
+        WorkspaceError for a worktree that is not registered or whose sandbox still exists, and
+        UnsafePackError, pinning nothing, if a pack holds anything but regular files and
+        directories, as the commit helper does.
+        """
+        with self.lock():
+            self.check_registered(worktree)
+            self.check_stopped(worktree)
+            check_pack_files(worktree)  # Before any git command runs in the worktree.
+            head = self._git(
+                ["rev-parse", "--verify", "--end-of-options", "HEAD^{commit}"], cwd=worktree.path
+            ).strip()
+            with tempfile.TemporaryDirectory(prefix="goaly-rsi-pin-") as scratch:
+                index = {"GIT_INDEX_FILE": str(Path(scratch) / "index")}  # Never the worktree's.
+                self._git(["read-tree", head], cwd=worktree.path, env=index)
+                packs = [
+                    str(relative)
+                    for relative, directory in zip(
+                        lane_info(worktree.lane).pack_dirs, worktree.pack_dirs, strict=True
+                    )
+                    if directory.exists()
+                ]
+                if packs:  # git add without a path would add the whole worktree.
+                    self._git(["add", "--all", "--", *packs], cwd=worktree.path, env=index)
+                staged = pack_modes(worktree, staged=True, env=index, timeout_s=self.git_timeout_s)
+                check_modes(staged, "staged")
+                tree = self._git(["write-tree"], cwd=worktree.path, env=index).strip()
+            message = f"goaly-smoke: {worktree.experiment_id} as it stands"
+            return self._git(
+                ["commit-tree", tree, "-p", head, f"-m{message}"], cwd=worktree.path
+            ).strip()
+
+    def check_stopped(self, worktree: Worktree) -> None:
+        """Raise WorkspaceError while any container of the worktree's experiment exists, running
+        or not, since host git must never read a worktree that a sandbox could still change.
+        Raises goaly.rsi.sandbox.SandboxError if docker cannot tell.
+        """
+        if self._sandbox_probe is None:
+            found = containers(experiment_id=worktree.experiment_id)
+        else:
+            found = list(self._sandbox_probe(worktree.experiment_id))
+        if found:
+            raise WorkspaceError(
+                f"the sandbox of experiment {worktree.experiment_id} is not stopped and removed: "
+                f"{len(found)} container{'' if len(found) == 1 else 's'} left"
+            )
 
     def worktrees(self, lane: Lane.ValueType) -> list[Worktree]:
         """Return the worktrees git knows of in the lane's directory, by directory, including any
@@ -247,13 +345,80 @@ class Workspace:
         output = self._git(["rev-parse", "--path-format=absolute", "--git-common-dir"])
         return Path(output.strip())
 
-    def _git(self, args: list[str], *, cwd: Path | None = None) -> str:
-        return run_git(args, cwd=self.repo if cwd is None else cwd, timeout_s=self.git_timeout_s)
+    def _git(
+        self,
+        args: list[str],
+        *,
+        cwd: Path | None = None,
+        env: Mapping[str, str] | None = None,
+        input_text: str | None = None,
+    ) -> str:
+        return run_git(
+            args,
+            cwd=self.repo if cwd is None else cwd,
+            timeout_s=self.git_timeout_s,
+            env=env,
+            input_text=input_text,
+        )
 
     def _resolve(self, revision: str) -> str | None:
         """Return the object ``revision`` names, or None if it names nothing."""
-        output = self._git_unless_no(["rev-parse", "--verify", "--quiet", revision])
+        output = self._git_unless_no(
+            ["rev-parse", "--verify", "--quiet", "--end-of-options", revision]
+        )
         return None if output is None else output.strip()
+
+    def _extract(self, commit: str, root: Path) -> None:
+        """Write the files of ``commit``'s tree under ``root``, from git's objects."""
+        listing = self._git(["ls-tree", "-r", "-z", "--full-tree", commit])
+        entries: list[tuple[str, str, str, PurePosixPath]] = []  # (mode, kind, object, path)
+        for entry in listing.split("\0"):
+            if entry:
+                meta, _, listed = entry.partition("\t")
+                mode, kind, obj = meta.split(" ")
+                entries.append((mode, kind, obj, _inside(listed, commit)))
+        contents = self._blobs([obj for _, kind, obj, _ in entries if kind == "blob"], commit)
+        links: list[tuple[Path, bytes, PurePosixPath]] = []
+        for mode, kind, obj, relative in entries:
+            target = root.joinpath(*relative.parts)
+            if kind == "commit":  # A gitlink: git archive gives an empty directory too.
+                target.mkdir(parents=True, exist_ok=True)
+            elif mode == "120000":
+                links.append((target, contents[obj], relative))
+            else:
+                target.parent.mkdir(parents=True, exist_ok=True)
+                flags = os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW | os.O_CLOEXEC
+                with os.fdopen(os.open(target, flags, 0o600), "wb") as file:
+                    file.write(contents[obj])
+                target.chmod(0o755 if mode == "100755" else 0o644)
+        for target, data, relative in links:  # Last, so that no file is written through one.
+            link = data.decode("utf-8", "surrogateescape")
+            resolved = os.path.normpath((relative.parent / link).as_posix())
+            if link.startswith("/") or resolved.split("/")[0] == "..":
+                raise WorkspaceError(f"cannot snapshot {commit}: {relative} links out of the tree")
+            target.parent.mkdir(parents=True, exist_ok=True)
+            target.symlink_to(link)
+
+    def _blobs(self, objects: list[str], commit: str) -> dict[str, bytes]:
+        """The contents of git's blob ``objects``, read in one batch."""
+        if not objects:
+            return {}
+        listed = "\n".join(objects) + "\n"
+        sizes = self._git(["cat-file", "--batch-check=%(objectsize)"], input_text=listed)
+        if sum(int(size) for size in sizes.split()) > _SNAPSHOT_LIMIT:
+            raise WorkspaceError(f"cannot snapshot {commit}: it is larger than any repository")
+        raw = self._git(["cat-file", "--batch"], input_text=listed).encode(
+            "utf-8", "surrogateescape"
+        )  # git's output, byte for byte.
+        contents: dict[str, bytes] = {}
+        offset = 0
+        for _ in objects:  # Each is "<object> blob <size>\n<content>\n".
+            header_end = raw.index(b"\n", offset)
+            obj, _kind, size = raw[offset:header_end].decode().split(" ")
+            start = header_end + 1
+            contents[obj] = raw[start : start + int(size)]
+            offset = start + int(size) + 1
+        return contents
 
     def _commit_of(self, revision: str) -> str:
         commit = self._resolve(f"{revision}^{{commit}}")
@@ -338,6 +503,60 @@ def check_pack_files(worktree: Worktree) -> None:
         raise UnsafePackError(list(problems))
 
 
+def pack_modes(
+    worktree: Worktree,
+    *,
+    staged: bool = False,
+    env: Mapping[str, str] | None = None,
+    timeout_s: float = 120.0,
+) -> dict[str, str]:
+    """Return the git mode of every path in the worktree's packs: as HEAD holds it, or as the
+    index does with ``staged``. ``env`` can name another index. Neither reads a file of the
+    worktree.
+    """
+    packs = [str(pack) for pack in lane_info(worktree.lane).pack_dirs]
+    if staged:  # Each entry is "<mode> <object> <stage>\t<path>".
+        command = ["ls-files", "--stage", "-z", "--", *packs]
+    else:  # Each entry is "<mode> <type> <object>\t<path>".
+        command = ["ls-tree", "-r", "-z", "HEAD", "--", *packs]
+    output = run_git(command, cwd=worktree.path, env=env, timeout_s=timeout_s)
+    entries = (entry.partition("\t") for entry in output.split("\0") if entry)
+    return {path: meta.split(" ")[0] for meta, _, path in entries}
+
+
+def check_modes(modes: Mapping[str, str], where: str) -> None:
+    """Raise UnsafePackError for every path in ``modes`` that is not a regular file, or that is
+    one of git's own files, saying ``where`` it was found.
+    """
+    problems = [
+        f"{path}: {problem} {where}"
+        for path, mode in sorted(modes.items())
+        if (problem := mode_problem(path, mode))
+    ]
+    if problems:
+        raise UnsafePackError(problems)
+
+
+def mode_problem(path: str, mode: str) -> str | None:
+    """Why a tree entry at ``path`` with git's ``mode`` may not be in a pack, or None: a
+    gitlink, anything but a regular file, or one of git's own files in any component.
+    """
+    if mode == "160000":
+        return "a gitlink"
+    if mode not in REGULAR_MODES:
+        return f"mode {mode}"
+    if GIT_FILES.intersection(PurePosixPath(path).parts):
+        return "git's own file"
+    return None
+
+
+def _inside(name: str, commit: str) -> PurePosixPath:
+    """A tree path, refused if it could lead out of the snapshot or into git's own files."""
+    if name.startswith("/") or any(part in ("", ".", "..", ".git") for part in name.split("/")):
+        raise WorkspaceError(f"cannot snapshot {commit}: its tree holds the path {name!r}")
+    return PurePosixPath(name)
+
+
 _UNREADABLE = "cannot be read"
 
 
@@ -375,6 +594,19 @@ def _remove_tree(root: Path) -> None:
         shutil.rmtree(root)
     except OSError as error:
         raise WorkspaceError(f"cannot remove {root}: {error}") from error
+
+
+def _set_writable(root: Path, *, writable: bool) -> None:
+    """Give every file and directory under ``root`` its owner's write bit, or take every write
+    bit away, keeping the other bits, such as an executable's.
+    """
+    for directory, _, names in os.walk(root, topdown=False):
+        for path in [*(Path(directory) / name for name in names), Path(directory)]:
+            mode = path.lstat().st_mode
+            if stat.S_ISLNK(mode):  # chmod would follow it.
+                continue
+            bits = stat.S_IMODE(mode)
+            path.chmod(bits | stat.S_IWUSR if writable else bits & ~0o222)
 
 
 def _make_pack_dirs(worktree: Worktree) -> None:

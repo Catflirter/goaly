@@ -15,7 +15,7 @@ import contextlib
 import os
 import signal
 import subprocess
-from collections.abc import Sequence
+from collections.abc import Mapping, Sequence
 from pathlib import Path
 
 __all__ = ["GitError", "run_git", "run_git_unless_no"]
@@ -38,6 +38,8 @@ _SETTINGS = (
 _KEPT = frozenset(
     {"GIT_AUTHOR_NAME", "GIT_AUTHOR_EMAIL", "GIT_COMMITTER_NAME", "GIT_COMMITTER_EMAIL"}
 )
+# The only variable a caller may add: an index of its own, as Workspace.pin uses.
+_CALLER_VARIABLES = frozenset({"GIT_INDEX_FILE"})
 _REAP_S = 10.0  # How long to wait for a killed command's pipes to close.
 
 
@@ -55,19 +57,27 @@ def run_git(
     cwd: Path,
     timeout_s: float = 120.0,
     input_text: str | None = None,
+    env: Mapping[str, str] | None = None,
 ) -> str:
     """Run ``git <args>`` in ``cwd`` and return its standard output.
 
-    Bytes that are not UTF-8, as in a path, come back as surrogate escapes. Raises GitError if
-    git fails, or after ``timeout_s``, when git and every process it started are killed.
+    ``env`` adds variables once the environment is cleaned; only a GIT_INDEX_FILE of the
+    caller's own is allowed, and the hardened variables are applied after it. Bytes that are not
+    UTF-8, as in a path, come back as surrogate escapes. Raises ValueError for any other variable
+    in ``env``, and GitError if git fails, or after ``timeout_s``, when git and every process it
+    started are killed.
     """
+    refused = sorted(set(env or {}) - _CALLER_VARIABLES)
+    if refused:
+        raise ValueError(f"run_git cannot set {', '.join(refused)}")
     settings = [item for setting in _SETTINGS for item in ("-c", setting)]
     environment = {
         name: value
         for name, value in os.environ.items()
         if not name.startswith("GIT_") or name in _KEPT
     }
-    environment.update(
+    environment.update(env or {})
+    environment.update(  # Last, so that nothing can undo them.
         GIT_CONFIG_NOSYSTEM="1",  # Neither the system's config nor the user's applies.
         GIT_CONFIG_GLOBAL="/dev/null",
         GIT_TERMINAL_PROMPT="0",
