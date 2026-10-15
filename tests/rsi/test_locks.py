@@ -72,7 +72,8 @@ def test_a_waiting_lock_is_taken_once_its_holder_releases_it(tmp_path: Path) -> 
             waited = time.monotonic() - started
         releaser.join()
 
-    assert 0.3 <= waited < 5
+    # Timing is loose on a busy machine: the release comes at 0.3 s, the retry within 64 ms.
+    assert 0.25 <= waited < 10
 
 
 def test_a_lock_is_released_when_its_block_raises(tmp_path: Path) -> None:

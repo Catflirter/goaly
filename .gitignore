@@ -7,7 +7,8 @@
 # Run artifacts, at the top level only.
 /runs/
 
-# The RSI ledger the lanes write (spec §8.6); results PRs carry copies of it.
+# The RSI ledger the lanes write (spec §8.6). T22 copies its entries to a tracked path such as
+# rsi/results/<lane>/ for results PRs, and never adds this live directory with -f.
 /rsi/ledger/
 
 # Python and packaging.
