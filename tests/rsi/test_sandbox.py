@@ -12,6 +12,7 @@ from typing import Any
 import pytest
 
 from goaly.bench import sandbox
+from goaly.bench.sandbox import SECCOMP_PROFILE
 from goaly.contracts.gen.experiment_pb2 import LANE_EFFISQL, LANE_SWE
 from goaly.rsi.sandbox import (
     SandboxConfig,
@@ -39,6 +40,7 @@ READ_ONLY_OPTIONS = [
     "--tmpfs=/tmp:rw,nosuid,nodev,noexec,size=1g",
     "--cap-drop=ALL",
     "--security-opt=no-new-privileges",
+    f"--security-opt=seccomp={SECCOMP_PROFILE}",
     "--pids-limit=512",
     "--ulimit=fsize=67108864:67108864",
     "--ulimit=nofile=1024:1024",

@@ -1,7 +1,8 @@
 """A fake docker CLI for the sandbox unit tests, which run without Docker.
 
 It records each call, with its environment, as one JSON line in ``calls.jsonl``, and answers from
-``script.json``: for each subcommand, what to print, how long to take and how to exit.
+``script.json``: for each subcommand, what to print, how long to take, which other subcommand to
+wait for, and how to exit.
 """
 
 import json
@@ -37,6 +38,13 @@ with (here / "calls.jsonl").open("a") as calls:
     calls.write(json.dumps(record) + "\\n")
 answer = json.loads((here / "script.json").read_text()).get(command, {{}})
 time.sleep(answer.get("sleep", 0))
+if "until" in answer:  # Wait for another call, as docker wait does for a docker rm.
+    deadline = time.monotonic() + 30
+    while time.monotonic() < deadline:
+        calls = (here / "calls.jsonl").read_text().splitlines()
+        if any(json.loads(line)["command"] == answer["until"] for line in calls):
+            break
+        time.sleep(0.05)
 sys.stdout.write(answer.get("stdout", ""))
 sys.stderr.write(answer.get("stderr", ""))
 sys.exit(answer.get("exit", 0))
