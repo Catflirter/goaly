@@ -3,9 +3,11 @@
 isort:skip_file
 The record of one LLM call (spec §5.1, §6.2, §9), and the Usage that other records reuse."""
 
+from collections import abc as _abc
 from google.protobuf import descriptor as _descriptor
 from google.protobuf import message as _message
 from google.protobuf import timestamp_pb2 as _timestamp_pb2
+from google.protobuf.internal import containers as _containers
 from google.protobuf.internal import enum_type_wrapper as _enum_type_wrapper
 import builtins as _builtins
 import sys
@@ -73,10 +75,15 @@ class _LlmCallStatusEnumTypeWrapper(_enum_type_wrapper._EnumTypeWrapper[_LlmCall
     LLM_CALL_STATUS_INVALID_RESPONSE: _LlmCallStatus.ValueType  # 7
     """A response arrived but could not be used, for example because it was malformed."""
     LLM_CALL_STATUS_CLIENT_ERROR: _LlmCallStatus.ValueType  # 8
-    """The gateway refused the request with another 4xx status, such as for a parameter it rejects."""
+    """Any other 4xx: not 429 and not a context overflow, which LiteLLM also reports as a 400."""
+    LLM_CALL_STATUS_CANCELLED: _LlmCallStatus.ValueType  # 9
+    """Our own code cancelled this one call, for example when a task's wall-clock budget ran out;
+    the gateway may still have billed it. A whole task that the runner cancels is
+    TASK_ERROR_TYPE_TIMEOUT.
+    """
 
 class LlmCallStatus(_LlmCallStatus, metaclass=_LlmCallStatusEnumTypeWrapper):
-    """How an LLM call ended. A failed call reports the error of its last attempt."""
+    """How an LLM call, or one attempt of it, ended. A call reports its last attempt's status."""
 
 LLM_CALL_STATUS_UNSPECIFIED: LlmCallStatus.ValueType  # 0
 """Not set."""
@@ -95,7 +102,12 @@ LLM_CALL_STATUS_CONTEXT_OVERFLOW: LlmCallStatus.ValueType  # 6
 LLM_CALL_STATUS_INVALID_RESPONSE: LlmCallStatus.ValueType  # 7
 """A response arrived but could not be used, for example because it was malformed."""
 LLM_CALL_STATUS_CLIENT_ERROR: LlmCallStatus.ValueType  # 8
-"""The gateway refused the request with another 4xx status, such as for a parameter it rejects."""
+"""Any other 4xx: not 429 and not a context overflow, which LiteLLM also reports as a 400."""
+LLM_CALL_STATUS_CANCELLED: LlmCallStatus.ValueType  # 9
+"""Our own code cancelled this one call, for example when a task's wall-clock budget ran out;
+the gateway may still have billed it. A whole task that the runner cancels is
+TASK_ERROR_TYPE_TIMEOUT.
+"""
 Global___LlmCallStatus: _TypeAlias = LlmCallStatus  # noqa: Y015
 
 @_typing.final
@@ -107,6 +119,7 @@ class LlmCallRecord(_message.Message):
     CALL_ID_FIELD_NUMBER: _builtins.int
     RUN_ID_FIELD_NUMBER: _builtins.int
     INSTANCE_ID_FIELD_NUMBER: _builtins.int
+    SEED_FIELD_NUMBER: _builtins.int
     PURPOSE_FIELD_NUMBER: _builtins.int
     MODEL_FIELD_NUMBER: _builtins.int
     USAGE_FIELD_NUMBER: _builtins.int
@@ -122,27 +135,35 @@ class LlmCallRecord(_message.Message):
     """The run the call belongs to, or empty if it belongs to none."""
     instance_id: _builtins.str
     """The task the call works on, or empty if none, as for an RSI analyst call."""
+    seed: _builtins.int
+    """The replicate index, as in Trajectory.seed. Calls join to trajectories on run_id,
+    instance_id and seed.
+    """
     purpose: Global___CallPurpose.ValueType
     """Why the call was made."""
     model: _builtins.str
     """The model called, such as "qwen3.6-35b-a3b"."""
     latency_s: _builtins.float
-    """From the start of the call to its end, in seconds, every attempt and every wait included."""
+    """The whole call, from its start to its end, in seconds: every attempt and every wait included."""
     wait_s: _builtins.float
-    """The part of latency_s spent waiting for a concurrency slot or a retry backoff (spec §6.2)."""
-    attempts: _builtins.int
-    """How many requests the call sent: 1, plus one per retry."""
+    """The part of latency_s spent waiting for a concurrency slot or a retry backoff: the sum of the
+    attempts' wait_s (spec §6.2).
+    """
     status: Global___LlmCallStatus.ValueType
-    """How the call ended."""
+    """How the call ended: the status of its last attempt."""
     http_status: _builtins.int
-    """The HTTP status of the last response, or 0 if no response arrived."""
+    """The HTTP status of the last attempt's response, or 0 if no response arrived."""
     @_builtins.property
     def usage(self) -> Global___Usage:
         """The tokens and cost the gateway reported for the call."""
 
     @_builtins.property
+    def attempts(self) -> _containers.RepeatedCompositeFieldContainer[Global___LlmCallAttempt]:
+        """Every request the call sent, in order: the first attempt, then each retry."""
+
+    @_builtins.property
     def started_at(self) -> _timestamp_pb2.Timestamp:
-        """When the call started."""
+        """When the call began, before any wait for a concurrency slot."""
 
     def __init__(
         self,
@@ -150,27 +171,80 @@ class LlmCallRecord(_message.Message):
         call_id: _builtins.str = ...,
         run_id: _builtins.str = ...,
         instance_id: _builtins.str = ...,
+        seed: _builtins.int = ...,
         purpose: Global___CallPurpose.ValueType = ...,
         model: _builtins.str = ...,
         usage: Global___Usage | None = ...,
         latency_s: _builtins.float = ...,
         wait_s: _builtins.float = ...,
-        attempts: _builtins.int = ...,
+        attempts: _abc.Iterable[Global___LlmCallAttempt] | None = ...,
         status: Global___LlmCallStatus.ValueType = ...,
         http_status: _builtins.int = ...,
         started_at: _timestamp_pb2.Timestamp | None = ...,
     ) -> None: ...
     _HasFieldArgType: _TypeAlias = _typing.Literal["started_at", b"started_at", "usage", b"usage"]  # noqa: Y015
     def HasField(self, field_name: _HasFieldArgType) -> _builtins.bool: ...
-    _ClearFieldArgType: _TypeAlias = _typing.Literal["attempts", b"attempts", "call_id", b"call_id", "http_status", b"http_status", "instance_id", b"instance_id", "latency_s", b"latency_s", "model", b"model", "purpose", b"purpose", "run_id", b"run_id", "started_at", b"started_at", "status", b"status", "usage", b"usage", "wait_s", b"wait_s"]  # noqa: Y015
+    _ClearFieldArgType: _TypeAlias = _typing.Literal["attempts", b"attempts", "call_id", b"call_id", "http_status", b"http_status", "instance_id", b"instance_id", "latency_s", b"latency_s", "model", b"model", "purpose", b"purpose", "run_id", b"run_id", "seed", b"seed", "started_at", b"started_at", "status", b"status", "usage", b"usage", "wait_s", b"wait_s"]  # noqa: Y015
     def ClearField(self, field_name: _ClearFieldArgType) -> None: ...
     def WhichOneof(self, oneof_group: _Never) -> None: ...
 
 Global___LlmCallRecord: _TypeAlias = LlmCallRecord  # noqa: Y015
 
 @_typing.final
+class LlmCallAttempt(_message.Message):
+    """One request of an LLM call: its first attempt, or a retry. Every 429 or 503 response and every
+    backoff is on record here (spec §6.2).
+    """
+
+    DESCRIPTOR: _descriptor.Descriptor
+
+    STARTED_AT_FIELD_NUMBER: _builtins.int
+    WAIT_S_FIELD_NUMBER: _builtins.int
+    LATENCY_S_FIELD_NUMBER: _builtins.int
+    STATUS_FIELD_NUMBER: _builtins.int
+    HTTP_STATUS_FIELD_NUMBER: _builtins.int
+    RETRY_AFTER_S_FIELD_NUMBER: _builtins.int
+    wait_s: _builtins.float
+    """The time waited before this attempt's request was sent: for a concurrency slot and, for a
+    retry, the backoff.
+    """
+    latency_s: _builtins.float
+    """From sending the request to its response or its failure, in seconds."""
+    status: Global___LlmCallStatus.ValueType
+    """How the attempt ended."""
+    http_status: _builtins.int
+    """The HTTP status of the response, or 0 if no response arrived."""
+    retry_after_s: _builtins.float
+    """The server's Retry-After value, in seconds, when it sent one."""
+    @_builtins.property
+    def started_at(self) -> _timestamp_pb2.Timestamp:
+        """When the attempt began, before its wait."""
+
+    def __init__(
+        self,
+        *,
+        started_at: _timestamp_pb2.Timestamp | None = ...,
+        wait_s: _builtins.float = ...,
+        latency_s: _builtins.float = ...,
+        status: Global___LlmCallStatus.ValueType = ...,
+        http_status: _builtins.int = ...,
+        retry_after_s: _builtins.float | None = ...,
+    ) -> None: ...
+    _HasFieldArgType: _TypeAlias = _typing.Literal["_retry_after_s", b"_retry_after_s", "retry_after_s", b"retry_after_s", "started_at", b"started_at"]  # noqa: Y015
+    def HasField(self, field_name: _HasFieldArgType) -> _builtins.bool: ...
+    _ClearFieldArgType: _TypeAlias = _typing.Literal["_retry_after_s", b"_retry_after_s", "http_status", b"http_status", "latency_s", b"latency_s", "retry_after_s", b"retry_after_s", "started_at", b"started_at", "status", b"status", "wait_s", b"wait_s"]  # noqa: Y015
+    def ClearField(self, field_name: _ClearFieldArgType) -> None: ...
+    _WhichOneofReturnType__retry_after_s: _TypeAlias = _typing.Literal["retry_after_s"]  # noqa: Y015
+    _WhichOneofArgType__retry_after_s: _TypeAlias = _typing.Literal["_retry_after_s", b"_retry_after_s"]  # noqa: Y015
+    def WhichOneof(self, oneof_group: _WhichOneofArgType__retry_after_s) -> _WhichOneofReturnType__retry_after_s | None: ...
+
+Global___LlmCallAttempt: _TypeAlias = LlmCallAttempt  # noqa: Y015
+
+@_typing.final
 class Usage(_message.Message):
-    """Tokens and cost, of one call or summed over many."""
+    """Tokens and cost, of one call or summed over many. output_tokens includes the reasoning tokens,
+    so "tokens per task" in the decision rules (spec §8.3) means input_tokens + output_tokens.
+    """
 
     DESCRIPTOR: _descriptor.Descriptor
 
@@ -183,21 +257,32 @@ class Usage(_message.Message):
     output_tokens: _builtins.int
     """Completion tokens, reasoning tokens included."""
     reasoning_tokens: _builtins.int
-    """How many of output_tokens the model spent reasoning."""
+    """How many of output_tokens the model spent reasoning; unset if the gateway reported no
+    reasoning breakdown.
+    """
     cost_usd: _builtins.float
-    """The cost in US dollars, as the gateway reports it in the x-litellm-response-cost header."""
+    """The cost in US dollars, as the gateway reports it in the x-litellm-response-cost header;
+    unset if it reported none, as for a failed or cancelled call without the header.
+    """
     def __init__(
         self,
         *,
         input_tokens: _builtins.int = ...,
         output_tokens: _builtins.int = ...,
-        reasoning_tokens: _builtins.int = ...,
-        cost_usd: _builtins.float = ...,
+        reasoning_tokens: _builtins.int | None = ...,
+        cost_usd: _builtins.float | None = ...,
     ) -> None: ...
-    _HasFieldArgType: _TypeAlias = _Never  # noqa: Y015
+    _HasFieldArgType: _TypeAlias = _typing.Literal["_cost_usd", b"_cost_usd", "_reasoning_tokens", b"_reasoning_tokens", "cost_usd", b"cost_usd", "reasoning_tokens", b"reasoning_tokens"]  # noqa: Y015
     def HasField(self, field_name: _HasFieldArgType) -> _builtins.bool: ...
-    _ClearFieldArgType: _TypeAlias = _typing.Literal["cost_usd", b"cost_usd", "input_tokens", b"input_tokens", "output_tokens", b"output_tokens", "reasoning_tokens", b"reasoning_tokens"]  # noqa: Y015
+    _ClearFieldArgType: _TypeAlias = _typing.Literal["_cost_usd", b"_cost_usd", "_reasoning_tokens", b"_reasoning_tokens", "cost_usd", b"cost_usd", "input_tokens", b"input_tokens", "output_tokens", b"output_tokens", "reasoning_tokens", b"reasoning_tokens"]  # noqa: Y015
     def ClearField(self, field_name: _ClearFieldArgType) -> None: ...
-    def WhichOneof(self, oneof_group: _Never) -> None: ...
+    _WhichOneofReturnType__cost_usd: _TypeAlias = _typing.Literal["cost_usd"]  # noqa: Y015
+    _WhichOneofArgType__cost_usd: _TypeAlias = _typing.Literal["_cost_usd", b"_cost_usd"]  # noqa: Y015
+    _WhichOneofReturnType__reasoning_tokens: _TypeAlias = _typing.Literal["reasoning_tokens"]  # noqa: Y015
+    _WhichOneofArgType__reasoning_tokens: _TypeAlias = _typing.Literal["_reasoning_tokens", b"_reasoning_tokens"]  # noqa: Y015
+    @_typing.overload
+    def WhichOneof(self, oneof_group: _WhichOneofArgType__cost_usd) -> _WhichOneofReturnType__cost_usd | None: ...
+    @_typing.overload
+    def WhichOneof(self, oneof_group: _WhichOneofArgType__reasoning_tokens) -> _WhichOneofReturnType__reasoning_tokens | None: ...
 
 Global___Usage: _TypeAlias = Usage  # noqa: Y015

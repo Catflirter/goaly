@@ -9,36 +9,36 @@ import "goaly/v1/task.proto";
 import "google/protobuf/timestamp.proto";
 
 // An RSI lane (spec §8.1): one benchmark's improvement loop, which edits only that benchmark's
-// pack.
+// pack. LANE_EFFISQL is the benchmark whose adapter is named "effisql", and LANE_SWE the one
+// named "swefficiency". The SWE lane is on hold (2026-10-15).
 enum Lane {
   // Not set.
   LANE_UNSPECIFIED = 0;
-  // The BIRD-CRITIC lane.
-  LANE_BIRD = 1;
-  // The SWE-fficiency lane.
+  // The Effi-SQL lane.
+  LANE_EFFISQL = 1;
+  // The SWE-fficiency lane, on hold since 2026-10-15.
   LANE_SWE = 2;
 }
 
-// A change the analyst proposes to a lane's pack (spec §8.2).
+// A change the analyst proposes to a lane's pack (spec §8.2). Its lane is that of the
+// experiment that tries it, and hypothesis queues are kept per lane.
 message Hypothesis {
   // A unique ID. A hypothesis rebuilt in a later round keeps it.
   string hypothesis_id = 1;
-  // The lane whose pack it changes.
-  Lane lane = 2;
   // The failure pattern it targets, as the analyst grouped the failures.
-  string failure_pattern = 3;
+  string failure_pattern = 2;
   // The train tasks that fail in that pattern, which the screen draws on (spec §8.2).
-  repeated string target_instance_ids = 4;
+  repeated string target_instance_ids = 3;
   // The kind of change.
-  ChangeKind change_kind = 5;
+  ChangeKind change_kind = 4;
   // Exactly what to change.
-  string change = 6;
+  string change = 5;
   // The effect the analyst expects.
-  string expected_effect = 7;
+  string expected_effect = 6;
   // What could go wrong.
-  string risk = 8;
+  string risk = 7;
   // Where the idea came from.
-  HypothesisSource source = 9;
+  HypothesisSource source = 8;
 }
 
 // The kind of change a hypothesis makes to a pack (spec §5.2, §8.2).
@@ -70,13 +70,15 @@ enum HypothesisSource {
 }
 
 // One candidate's experiment, from hypothesis to decision (spec §8.2, §8.6): one line of
-// experiments.jsonl. The fields of a step that has not run yet stay unset.
+// experiments.jsonl. A lane writes the record as the experiment goes (spec §8.7), and the last
+// line for an experiment_id wins. Until the decision, decision is DECISION_PENDING and the
+// fields of the steps that have not run stay unset.
 message ExperimentRecord {
-  // A unique ID, which lessons cite.
+  // A unique ID, which lessons cite in Lesson.experiment_ids.
   string experiment_id = 1;
   // The lane.
   Lane lane = 2;
-  // The lane's round the experiment ran in.
+  // The lane's round the experiment ran in, counting from 1.
   int32 round = 3;
   // The best version the candidate was built on (spec §8.1): its commit, or a fixed tag such as
   // baseline-v0.
@@ -93,25 +95,26 @@ message ExperimentRecord {
   PhaseResult screening = 9;
   // The validation's results; absent if it did not run.
   PhaseResult validation = 10;
-  // BIRD only: the confirmation's results, over the validation seeds and the extra one; absent
-  // if it did not run.
+  // Effi-SQL only: the confirmation's results, over the validation seeds plus the
+  // confirmation seed; absent if it did not run.
   PhaseResult confirmation = 11;
   // What became of the candidate.
   Decision decision = 12;
-  // Why it was rejected, if it was.
-  RejectionReason rejection_reason = 13;
+  // Every rule the candidate failed, in the order the decision code checked them; empty unless
+  // decision is DECISION_REJECTED.
+  repeated RejectionReason rejection_reasons = 13;
   // The reasoning behind the decision, in words.
   string decision_reason = 14;
   // The thresholds the decision used.
   DecisionThresholds thresholds = 15;
-  // The experiment's tokens and cost, one entry per call purpose (spec §9).
+  // The experiment's tokens and cost, one entry per call purpose (spec §9). The round's single
+  // CALL_PURPOSE_RSI_ANALYST usage is split evenly across the experiments it proposed, any
+  // token remainder going to the first, so summing over experiments gives the exact total.
   repeated PurposeUsage usage_by_purpose = 16;
   // When the experiment started.
   google.protobuf.Timestamp started_at = 17;
-  // When it was decided; absent until then.
+  // When it was decided or aborted; absent until then.
   google.protobuf.Timestamp finished_at = 18;
-  // The lessons written about it.
-  repeated string lesson_ids = 19;
 }
 
 // The size of a diff, as git diff --shortstat counts it.
@@ -142,14 +145,16 @@ enum Guard {
   GUARD_ALLOWED_PATHS = 1;
   // The bench/, harness/core/ and contracts/ checksums are unchanged.
   GUARD_CHECKSUMS = 2;
-  // The hard-coding scan finds no instance_id, gold fragment or full db_id in the diff.
+  // The hard-coding scan finds no fragment of a gold answer in the diff (spec §8.5).
   GUARD_HARD_CODING_SCAN = 3;
   // The pack's unit tests pass.
   GUARD_UNIT_TESTS = 4;
 }
 
 // How a candidate did against the best in one phase: screen, validate or confirm (spec §8.2,
-// §8.3). Scores and deltas are fractions, not percentages: 3pp is 0.03.
+// §8.3). Scores and deltas are fractions, not percentages: 5 R-VES points is 0.05. A task's
+// tokens are its input plus output tokens, output including reasoning. A statistic the phase
+// did not compute is absent.
 message PhaseResult {
   // The split the phase ran on.
   Split split = 1;
@@ -157,50 +162,61 @@ message PhaseResult {
   int32 task_count = 2;
   // How many seeds it compared per task.
   int32 seed_count = 3;
-  // The candidate's score: BIRD mean success rate; SWE harmonic-mean SR.
+  // The candidate's score: Effi-SQL's mean credit (R-VES / 100); SWE's harmonic-mean SR.
   double candidate_score = 4;
   // The best's score on the same tasks and seeds.
   double best_score = 5;
-  // candidate_score - best_score. SWE's gain rule takes it relative to best_score.
+  // candidate_score - best_score.
   double delta = 6;
+  // The smallest delta the phase accepted. For the validation: Effi-SQL's min_delta, or SWE's
+  // min_relative_gain times best_score, doubled if the cost guardrail tripped. For the
+  // confirmation: confirm_min_delta. Absent for the screen, which needs only a delta above 0.
+  optional double effective_min_delta = 7;
   // How many tasks the candidate beat the best on, by each task's score averaged over seeds.
-  int32 wins = 7;
+  optional int32 wins = 8;
   // How many tasks the best beat the candidate on.
-  int32 losses = 8;
-  // The one-sided sign test's p-value for wins against losses; absent if not computed.
-  optional double sign_test_p = 9;
-  // P(Δ>0), the probability of a gain, by paired bootstrap; absent if not computed.
-  optional double gain_probability = 10;
+  optional int32 losses = 9;
+  // The one-sided sign test's p-value for wins against losses.
+  optional double sign_test_p = 10;
+  // P(Δ>0), the probability of a gain, by paired bootstrap.
+  optional double gain_probability = 11;
   // How many tasks regressed, as spec §8.3 defines a regression for the lane.
-  int32 regressions = 11;
+  optional int32 regressions = 12;
   // The candidate's mean tokens per task over the best's, which the cost guardrail checks.
-  double token_ratio_vs_best = 12;
-  // Its mean cost per task over the best's.
-  double cost_ratio_vs_best = 13;
+  optional double token_ratio_vs_best = 13;
   // Its mean wall time per task over the best's, which the cost guardrail checks.
-  double time_ratio_vs_best = 14;
+  optional double time_ratio_vs_best = 14;
   // Its mean cost per task over v0's on the same split, which the efficiency cap checks.
-  double cost_ratio_vs_v0 = 15;
+  optional double cost_ratio_vs_v0 = 15;
   // Its mean wall time per task over v0's on the same split, which the efficiency cap checks.
-  double time_ratio_vs_v0 = 16;
-  // The runs whose results the phase compared, the candidate's and the best's.
-  repeated string run_ids = 17;
+  optional double time_ratio_vs_v0 = 16;
+  // The candidate's runs whose results the phase compared.
+  repeated string candidate_run_ids = 17;
+  // The best's runs whose results the phase compared.
+  repeated string best_run_ids = 18;
+  // The v0 runs whose cost and wall time the ratios against v0 used.
+  repeated string v0_run_ids = 19;
 }
 
 // What became of a candidate (spec §8.2).
 enum Decision {
-  // Not decided yet.
+  // Not set.
   DECISION_UNSPECIFIED = 0;
+  // Not decided yet. A lane writes this before the decision, so that after a crash it knows
+  // where it stopped (spec §8.7).
+  DECISION_PENDING = 1;
   // It became the lane's new best.
-  DECISION_ACCEPTED = 1;
-  // It was rejected; rejection_reason says why.
-  DECISION_REJECTED = 2;
+  DECISION_ACCEPTED = 2;
+  // It was rejected; rejection_reasons says why.
+  DECISION_REJECTED = 3;
+  // It could not be evaluated, as when the lane's time budget ran out or the infrastructure
+  // failed. That says nothing about the hypothesis, so no lesson may blame it.
+  DECISION_ABORTED = 4;
 }
 
-// Why a candidate was rejected: one value for each way spec §8.2 and §8.3 reject one, in the
-// order a candidate meets them. A candidate that fails several decision rules gets the first.
+// A rule that rejects a candidate: one value for each way spec §8.2 and §8.3 reject one.
 enum RejectionReason {
-  // Not rejected.
+  // Not set; never written.
   REJECTION_REASON_UNSPECIFIED = 0;
   // The implementer made no commit for the hypothesis.
   REJECTION_REASON_IMPLEMENTATION_FAILED = 1;
@@ -214,54 +230,61 @@ enum RejectionReason {
   REJECTION_REASON_INSUFFICIENT_GAIN = 5;
   // Its gain reached the threshold, but not the doubled one that the cost guardrail set.
   REJECTION_REASON_COST_GUARDRAIL = 6;
-  // Its gain was not significant: BIRD's win count or sign test, or SWE's bootstrap, failed.
+  // Its gain was not significant: Effi-SQL's sign test or SWE's bootstrap failed.
   REJECTION_REASON_NOT_SIGNIFICANT = 7;
   // It caused more regressions than allowed.
   REJECTION_REASON_REGRESSION = 8;
   // It passed, but another candidate in the round gained more; its hypothesis goes back in the
   // queue.
   REJECTION_REASON_OUTRANKED = 9;
-  // BIRD: its gain over all 3 seeds fell below the confirmation threshold.
+  // Effi-SQL: its gain over the validation seeds plus the confirmation seed fell below the
+  // confirmation threshold.
   REJECTION_REASON_NOT_CONFIRMED = 10;
 }
 
 // The decision thresholds, as config set them (spec §8.3: every decision records the thresholds
-// it used). Gains are fractions, as in PhaseResult.
+// it used). Gains are fractions, and a task's tokens are counted, as in PhaseResult.
 message DecisionThresholds {
-  // The most regressions a candidate may cause.
-  int32 max_regressions = 1;
   // The cost guardrail: above this multiple of the best's mean tokens or wall time per task, the
   // gain threshold doubles.
-  double cost_guardrail_ratio = 2;
+  double cost_guardrail_ratio = 1;
   // The efficiency cap: above this multiple of v0's mean cost or wall time per task, a candidate
   // is rejected whatever its gain.
-  double efficiency_cap_ratio = 3;
+  double efficiency_cap_ratio = 2;
 
-  // The lane's own gain and significance thresholds.
+  // The lane's own gain, significance and regression thresholds.
   oneof benchmark {
-    // The BIRD-CRITIC lane's.
-    BirdThresholds bird = 4;
+    // The Effi-SQL lane's.
+    EffiSqlThresholds effisql = 3;
     // The SWE-fficiency lane's.
-    SweThresholds swe = 5;
+    SweThresholds swe = 4;
   }
 }
 
-// The BIRD-CRITIC lane's gain and significance thresholds.
-message BirdThresholds {
-  // The smallest gain in mean success rate accepted.
-  double min_gain = 1;
-  // The largest sign-test p-value accepted.
-  double max_sign_test_p = 2;
-  // The smallest gain over all 3 seeds that the confirmation accepts.
-  double min_confirmed_gain = 3;
+// The Effi-SQL lane's thresholds (spec §8.3). The defaults named here are config's.
+message EffiSqlThresholds {
+  // The smallest gain in R-VES accepted, as a fraction: by default 0.05, i.e. 5 points.
+  double min_delta = 1;
+  // The largest p-value accepted from the one-sided sign test on per-task credit: by default
+  // 0.1.
+  double sign_test_max_p = 2;
+  // The most regressions accepted, by default 1. A task regresses if its credit is at least
+  // 0.75 under the best and at most 0.25 under the candidate.
+  int32 max_regressions = 3;
+  // The smallest gain in R-VES over both seeds, the validation seed plus the confirmation
+  // seed, that the confirmation accepts: by default 0.03.
+  double confirm_min_delta = 4;
 }
 
-// The SWE-fficiency lane's gain and significance thresholds.
+// The SWE-fficiency lane's thresholds (spec §8.3). The lane is on hold (2026-10-15).
 message SweThresholds {
   // The smallest gain in harmonic-mean SR accepted, relative to the best's: 0.1 is 10%.
   double min_relative_gain = 1;
   // The smallest bootstrap P(Δ>0) accepted.
   double min_gain_probability = 2;
+  // The most regressions accepted. A task regresses if it has a real speedup under the best,
+  // SR above 1/gold speedup, and drops to SR at most 1/gold speedup under the candidate.
+  int32 max_regressions = 3;
 }
 
 // The tokens and cost of the calls made for one purpose (spec §9).
@@ -281,14 +304,16 @@ message Lesson {
   Lane lane = 2;
   // What was tried, what happened and why.
   string text = 3;
-  // The experiments the lesson cites as evidence.
+  // The experiments the lesson cites as evidence: the one link between lessons and experiments.
   repeated string experiment_ids = 4;
-  // How many times the lesson has helped.
-  int32 helped = 5;
-  // How many times it has hurt.
-  int32 hurt = 6;
+  // The experiments in which the lesson helped, each listed once: how often it helped (spec
+  // §8.6) is the list's length. Recording an experiment again changes nothing, so a restarted
+  // lane cannot count it twice.
+  repeated string helped_by = 5;
+  // The experiments in which it hurt, each listed once: how often it hurt is the list's length.
+  repeated string hurt_by = 6;
   // When the lesson was added.
   google.protobuf.Timestamp created_at = 7;
-  // When it last changed, as when a counter was updated.
+  // When it last changed, as when an experiment was added to helped_by or hurt_by.
   google.protobuf.Timestamp updated_at = 8;
 }

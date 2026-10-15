@@ -32,22 +32,23 @@ class _LaneEnumTypeWrapper(_enum_type_wrapper._EnumTypeWrapper[_Lane.ValueType],
     DESCRIPTOR: _descriptor.EnumDescriptor
     LANE_UNSPECIFIED: _Lane.ValueType  # 0
     """Not set."""
-    LANE_BIRD: _Lane.ValueType  # 1
-    """The BIRD-CRITIC lane."""
+    LANE_EFFISQL: _Lane.ValueType  # 1
+    """The Effi-SQL lane."""
     LANE_SWE: _Lane.ValueType  # 2
-    """The SWE-fficiency lane."""
+    """The SWE-fficiency lane, on hold since 2026-10-15."""
 
 class Lane(_Lane, metaclass=_LaneEnumTypeWrapper):
     """An RSI lane (spec §8.1): one benchmark's improvement loop, which edits only that benchmark's
-    pack.
+    pack. LANE_EFFISQL is the benchmark whose adapter is named "effisql", and LANE_SWE the one
+    named "swefficiency". The SWE lane is on hold (2026-10-15).
     """
 
 LANE_UNSPECIFIED: Lane.ValueType  # 0
 """Not set."""
-LANE_BIRD: Lane.ValueType  # 1
-"""The BIRD-CRITIC lane."""
+LANE_EFFISQL: Lane.ValueType  # 1
+"""The Effi-SQL lane."""
 LANE_SWE: Lane.ValueType  # 2
-"""The SWE-fficiency lane."""
+"""The SWE-fficiency lane, on hold since 2026-10-15."""
 Global___Lane: _TypeAlias = Lane  # noqa: Y015
 
 class _ChangeKind:
@@ -127,7 +128,7 @@ class _GuardEnumTypeWrapper(_enum_type_wrapper._EnumTypeWrapper[_Guard.ValueType
     GUARD_CHECKSUMS: _Guard.ValueType  # 2
     """The bench/, harness/core/ and contracts/ checksums are unchanged."""
     GUARD_HARD_CODING_SCAN: _Guard.ValueType  # 3
-    """The hard-coding scan finds no instance_id, gold fragment or full db_id in the diff."""
+    """The hard-coding scan finds no fragment of a gold answer in the diff (spec §8.5)."""
     GUARD_UNIT_TESTS: _Guard.ValueType  # 4
     """The pack's unit tests pass."""
 
@@ -141,7 +142,7 @@ GUARD_ALLOWED_PATHS: Guard.ValueType  # 1
 GUARD_CHECKSUMS: Guard.ValueType  # 2
 """The bench/, harness/core/ and contracts/ checksums are unchanged."""
 GUARD_HARD_CODING_SCAN: Guard.ValueType  # 3
-"""The hard-coding scan finds no instance_id, gold fragment or full db_id in the diff."""
+"""The hard-coding scan finds no fragment of a gold answer in the diff (spec §8.5)."""
 GUARD_UNIT_TESTS: Guard.ValueType  # 4
 """The pack's unit tests pass."""
 Global___Guard: _TypeAlias = Guard  # noqa: Y015
@@ -153,21 +154,37 @@ class _Decision:
 class _DecisionEnumTypeWrapper(_enum_type_wrapper._EnumTypeWrapper[_Decision.ValueType], _builtins.type):
     DESCRIPTOR: _descriptor.EnumDescriptor
     DECISION_UNSPECIFIED: _Decision.ValueType  # 0
-    """Not decided yet."""
-    DECISION_ACCEPTED: _Decision.ValueType  # 1
+    """Not set."""
+    DECISION_PENDING: _Decision.ValueType  # 1
+    """Not decided yet. A lane writes this before the decision, so that after a crash it knows
+    where it stopped (spec §8.7).
+    """
+    DECISION_ACCEPTED: _Decision.ValueType  # 2
     """It became the lane's new best."""
-    DECISION_REJECTED: _Decision.ValueType  # 2
-    """It was rejected; rejection_reason says why."""
+    DECISION_REJECTED: _Decision.ValueType  # 3
+    """It was rejected; rejection_reasons says why."""
+    DECISION_ABORTED: _Decision.ValueType  # 4
+    """It could not be evaluated, as when the lane's time budget ran out or the infrastructure
+    failed. That says nothing about the hypothesis, so no lesson may blame it.
+    """
 
 class Decision(_Decision, metaclass=_DecisionEnumTypeWrapper):
     """What became of a candidate (spec §8.2)."""
 
 DECISION_UNSPECIFIED: Decision.ValueType  # 0
-"""Not decided yet."""
-DECISION_ACCEPTED: Decision.ValueType  # 1
+"""Not set."""
+DECISION_PENDING: Decision.ValueType  # 1
+"""Not decided yet. A lane writes this before the decision, so that after a crash it knows
+where it stopped (spec §8.7).
+"""
+DECISION_ACCEPTED: Decision.ValueType  # 2
 """It became the lane's new best."""
-DECISION_REJECTED: Decision.ValueType  # 2
-"""It was rejected; rejection_reason says why."""
+DECISION_REJECTED: Decision.ValueType  # 3
+"""It was rejected; rejection_reasons says why."""
+DECISION_ABORTED: Decision.ValueType  # 4
+"""It could not be evaluated, as when the lane's time budget ran out or the infrastructure
+failed. That says nothing about the hypothesis, so no lesson may blame it.
+"""
 Global___Decision: _TypeAlias = Decision  # noqa: Y015
 
 class _RejectionReason:
@@ -177,7 +194,7 @@ class _RejectionReason:
 class _RejectionReasonEnumTypeWrapper(_enum_type_wrapper._EnumTypeWrapper[_RejectionReason.ValueType], _builtins.type):
     DESCRIPTOR: _descriptor.EnumDescriptor
     REJECTION_REASON_UNSPECIFIED: _RejectionReason.ValueType  # 0
-    """Not rejected."""
+    """Not set; never written."""
     REJECTION_REASON_IMPLEMENTATION_FAILED: _RejectionReason.ValueType  # 1
     """The implementer made no commit for the hypothesis."""
     REJECTION_REASON_GUARD_FAILED: _RejectionReason.ValueType  # 2
@@ -191,7 +208,7 @@ class _RejectionReasonEnumTypeWrapper(_enum_type_wrapper._EnumTypeWrapper[_Rejec
     REJECTION_REASON_COST_GUARDRAIL: _RejectionReason.ValueType  # 6
     """Its gain reached the threshold, but not the doubled one that the cost guardrail set."""
     REJECTION_REASON_NOT_SIGNIFICANT: _RejectionReason.ValueType  # 7
-    """Its gain was not significant: BIRD's win count or sign test, or SWE's bootstrap, failed."""
+    """Its gain was not significant: Effi-SQL's sign test or SWE's bootstrap failed."""
     REJECTION_REASON_REGRESSION: _RejectionReason.ValueType  # 8
     """It caused more regressions than allowed."""
     REJECTION_REASON_OUTRANKED: _RejectionReason.ValueType  # 9
@@ -199,15 +216,15 @@ class _RejectionReasonEnumTypeWrapper(_enum_type_wrapper._EnumTypeWrapper[_Rejec
     queue.
     """
     REJECTION_REASON_NOT_CONFIRMED: _RejectionReason.ValueType  # 10
-    """BIRD: its gain over all 3 seeds fell below the confirmation threshold."""
-
-class RejectionReason(_RejectionReason, metaclass=_RejectionReasonEnumTypeWrapper):
-    """Why a candidate was rejected: one value for each way spec §8.2 and §8.3 reject one, in the
-    order a candidate meets them. A candidate that fails several decision rules gets the first.
+    """Effi-SQL: its gain over the validation seeds plus the confirmation seed fell below the
+    confirmation threshold.
     """
 
+class RejectionReason(_RejectionReason, metaclass=_RejectionReasonEnumTypeWrapper):
+    """A rule that rejects a candidate: one value for each way spec §8.2 and §8.3 reject one."""
+
 REJECTION_REASON_UNSPECIFIED: RejectionReason.ValueType  # 0
-"""Not rejected."""
+"""Not set; never written."""
 REJECTION_REASON_IMPLEMENTATION_FAILED: RejectionReason.ValueType  # 1
 """The implementer made no commit for the hypothesis."""
 REJECTION_REASON_GUARD_FAILED: RejectionReason.ValueType  # 2
@@ -221,7 +238,7 @@ REJECTION_REASON_INSUFFICIENT_GAIN: RejectionReason.ValueType  # 5
 REJECTION_REASON_COST_GUARDRAIL: RejectionReason.ValueType  # 6
 """Its gain reached the threshold, but not the doubled one that the cost guardrail set."""
 REJECTION_REASON_NOT_SIGNIFICANT: RejectionReason.ValueType  # 7
-"""Its gain was not significant: BIRD's win count or sign test, or SWE's bootstrap, failed."""
+"""Its gain was not significant: Effi-SQL's sign test or SWE's bootstrap failed."""
 REJECTION_REASON_REGRESSION: RejectionReason.ValueType  # 8
 """It caused more regressions than allowed."""
 REJECTION_REASON_OUTRANKED: RejectionReason.ValueType  # 9
@@ -229,17 +246,20 @@ REJECTION_REASON_OUTRANKED: RejectionReason.ValueType  # 9
 queue.
 """
 REJECTION_REASON_NOT_CONFIRMED: RejectionReason.ValueType  # 10
-"""BIRD: its gain over all 3 seeds fell below the confirmation threshold."""
+"""Effi-SQL: its gain over the validation seeds plus the confirmation seed fell below the
+confirmation threshold.
+"""
 Global___RejectionReason: _TypeAlias = RejectionReason  # noqa: Y015
 
 @_typing.final
 class Hypothesis(_message.Message):
-    """A change the analyst proposes to a lane's pack (spec §8.2)."""
+    """A change the analyst proposes to a lane's pack (spec §8.2). Its lane is that of the
+    experiment that tries it, and hypothesis queues are kept per lane.
+    """
 
     DESCRIPTOR: _descriptor.Descriptor
 
     HYPOTHESIS_ID_FIELD_NUMBER: _builtins.int
-    LANE_FIELD_NUMBER: _builtins.int
     FAILURE_PATTERN_FIELD_NUMBER: _builtins.int
     TARGET_INSTANCE_IDS_FIELD_NUMBER: _builtins.int
     CHANGE_KIND_FIELD_NUMBER: _builtins.int
@@ -249,8 +269,6 @@ class Hypothesis(_message.Message):
     SOURCE_FIELD_NUMBER: _builtins.int
     hypothesis_id: _builtins.str
     """A unique ID. A hypothesis rebuilt in a later round keeps it."""
-    lane: Global___Lane.ValueType
-    """The lane whose pack it changes."""
     failure_pattern: _builtins.str
     """The failure pattern it targets, as the analyst grouped the failures."""
     change_kind: Global___ChangeKind.ValueType
@@ -271,7 +289,6 @@ class Hypothesis(_message.Message):
         self,
         *,
         hypothesis_id: _builtins.str = ...,
-        lane: Global___Lane.ValueType = ...,
         failure_pattern: _builtins.str = ...,
         target_instance_ids: _abc.Iterable[_builtins.str] | None = ...,
         change_kind: Global___ChangeKind.ValueType = ...,
@@ -282,7 +299,7 @@ class Hypothesis(_message.Message):
     ) -> None: ...
     _HasFieldArgType: _TypeAlias = _Never  # noqa: Y015
     def HasField(self, field_name: _HasFieldArgType) -> _builtins.bool: ...
-    _ClearFieldArgType: _TypeAlias = _typing.Literal["change", b"change", "change_kind", b"change_kind", "expected_effect", b"expected_effect", "failure_pattern", b"failure_pattern", "hypothesis_id", b"hypothesis_id", "lane", b"lane", "risk", b"risk", "source", b"source", "target_instance_ids", b"target_instance_ids"]  # noqa: Y015
+    _ClearFieldArgType: _TypeAlias = _typing.Literal["change", b"change", "change_kind", b"change_kind", "expected_effect", b"expected_effect", "failure_pattern", b"failure_pattern", "hypothesis_id", b"hypothesis_id", "risk", b"risk", "source", b"source", "target_instance_ids", b"target_instance_ids"]  # noqa: Y015
     def ClearField(self, field_name: _ClearFieldArgType) -> None: ...
     def WhichOneof(self, oneof_group: _Never) -> None: ...
 
@@ -291,7 +308,9 @@ Global___Hypothesis: _TypeAlias = Hypothesis  # noqa: Y015
 @_typing.final
 class ExperimentRecord(_message.Message):
     """One candidate's experiment, from hypothesis to decision (spec §8.2, §8.6): one line of
-    experiments.jsonl. The fields of a step that has not run yet stay unset.
+    experiments.jsonl. A lane writes the record as the experiment goes (spec §8.7), and the last
+    line for an experiment_id wins. Until the decision, decision is DECISION_PENDING and the
+    fields of the steps that have not run stay unset.
     """
 
     DESCRIPTOR: _descriptor.Descriptor
@@ -308,19 +327,18 @@ class ExperimentRecord(_message.Message):
     VALIDATION_FIELD_NUMBER: _builtins.int
     CONFIRMATION_FIELD_NUMBER: _builtins.int
     DECISION_FIELD_NUMBER: _builtins.int
-    REJECTION_REASON_FIELD_NUMBER: _builtins.int
+    REJECTION_REASONS_FIELD_NUMBER: _builtins.int
     DECISION_REASON_FIELD_NUMBER: _builtins.int
     THRESHOLDS_FIELD_NUMBER: _builtins.int
     USAGE_BY_PURPOSE_FIELD_NUMBER: _builtins.int
     STARTED_AT_FIELD_NUMBER: _builtins.int
     FINISHED_AT_FIELD_NUMBER: _builtins.int
-    LESSON_IDS_FIELD_NUMBER: _builtins.int
     experiment_id: _builtins.str
-    """A unique ID, which lessons cite."""
+    """A unique ID, which lessons cite in Lesson.experiment_ids."""
     lane: Global___Lane.ValueType
     """The lane."""
     round: _builtins.int
-    """The lane's round the experiment ran in."""
+    """The lane's round the experiment ran in, counting from 1."""
     parent_version: _builtins.str
     """The best version the candidate was built on (spec §8.1): its commit, or a fixed tag such as
     baseline-v0.
@@ -329,8 +347,6 @@ class ExperimentRecord(_message.Message):
     """The commit that implements the hypothesis; empty if the implementer made none."""
     decision: Global___Decision.ValueType
     """What became of the candidate."""
-    rejection_reason: Global___RejectionReason.ValueType
-    """Why it was rejected, if it was."""
     decision_reason: _builtins.str
     """The reasoning behind the decision, in words."""
     @_builtins.property
@@ -355,8 +371,14 @@ class ExperimentRecord(_message.Message):
 
     @_builtins.property
     def confirmation(self) -> Global___PhaseResult:
-        """BIRD only: the confirmation's results, over the validation seeds and the extra one; absent
-        if it did not run.
+        """Effi-SQL only: the confirmation's results, over the validation seeds plus the
+        confirmation seed; absent if it did not run.
+        """
+
+    @_builtins.property
+    def rejection_reasons(self) -> _containers.RepeatedScalarFieldContainer[Global___RejectionReason.ValueType]:
+        """Every rule the candidate failed, in the order the decision code checked them; empty unless
+        decision is DECISION_REJECTED.
         """
 
     @_builtins.property
@@ -365,7 +387,10 @@ class ExperimentRecord(_message.Message):
 
     @_builtins.property
     def usage_by_purpose(self) -> _containers.RepeatedCompositeFieldContainer[Global___PurposeUsage]:
-        """The experiment's tokens and cost, one entry per call purpose (spec §9)."""
+        """The experiment's tokens and cost, one entry per call purpose (spec §9). The round's single
+        CALL_PURPOSE_RSI_ANALYST usage is split evenly across the experiments it proposed, any
+        token remainder going to the first, so summing over experiments gives the exact total.
+        """
 
     @_builtins.property
     def started_at(self) -> _timestamp_pb2.Timestamp:
@@ -373,11 +398,7 @@ class ExperimentRecord(_message.Message):
 
     @_builtins.property
     def finished_at(self) -> _timestamp_pb2.Timestamp:
-        """When it was decided; absent until then."""
-
-    @_builtins.property
-    def lesson_ids(self) -> _containers.RepeatedScalarFieldContainer[_builtins.str]:
-        """The lessons written about it."""
+        """When it was decided or aborted; absent until then."""
 
     def __init__(
         self,
@@ -394,17 +415,16 @@ class ExperimentRecord(_message.Message):
         validation: Global___PhaseResult | None = ...,
         confirmation: Global___PhaseResult | None = ...,
         decision: Global___Decision.ValueType = ...,
-        rejection_reason: Global___RejectionReason.ValueType = ...,
+        rejection_reasons: _abc.Iterable[Global___RejectionReason.ValueType] | None = ...,
         decision_reason: _builtins.str = ...,
         thresholds: Global___DecisionThresholds | None = ...,
         usage_by_purpose: _abc.Iterable[Global___PurposeUsage] | None = ...,
         started_at: _timestamp_pb2.Timestamp | None = ...,
         finished_at: _timestamp_pb2.Timestamp | None = ...,
-        lesson_ids: _abc.Iterable[_builtins.str] | None = ...,
     ) -> None: ...
     _HasFieldArgType: _TypeAlias = _typing.Literal["confirmation", b"confirmation", "diff_stats", b"diff_stats", "finished_at", b"finished_at", "hypothesis", b"hypothesis", "screening", b"screening", "started_at", b"started_at", "thresholds", b"thresholds", "validation", b"validation"]  # noqa: Y015
     def HasField(self, field_name: _HasFieldArgType) -> _builtins.bool: ...
-    _ClearFieldArgType: _TypeAlias = _typing.Literal["candidate_commit", b"candidate_commit", "confirmation", b"confirmation", "decision", b"decision", "decision_reason", b"decision_reason", "diff_stats", b"diff_stats", "experiment_id", b"experiment_id", "finished_at", b"finished_at", "guards", b"guards", "hypothesis", b"hypothesis", "lane", b"lane", "lesson_ids", b"lesson_ids", "parent_version", b"parent_version", "rejection_reason", b"rejection_reason", "round", b"round", "screening", b"screening", "started_at", b"started_at", "thresholds", b"thresholds", "usage_by_purpose", b"usage_by_purpose", "validation", b"validation"]  # noqa: Y015
+    _ClearFieldArgType: _TypeAlias = _typing.Literal["candidate_commit", b"candidate_commit", "confirmation", b"confirmation", "decision", b"decision", "decision_reason", b"decision_reason", "diff_stats", b"diff_stats", "experiment_id", b"experiment_id", "finished_at", b"finished_at", "guards", b"guards", "hypothesis", b"hypothesis", "lane", b"lane", "parent_version", b"parent_version", "rejection_reasons", b"rejection_reasons", "round", b"round", "screening", b"screening", "started_at", b"started_at", "thresholds", b"thresholds", "usage_by_purpose", b"usage_by_purpose", "validation", b"validation"]  # noqa: Y015
     def ClearField(self, field_name: _ClearFieldArgType) -> None: ...
     def WhichOneof(self, oneof_group: _Never) -> None: ...
 
@@ -473,7 +493,9 @@ Global___GuardResult: _TypeAlias = GuardResult  # noqa: Y015
 @_typing.final
 class PhaseResult(_message.Message):
     """How a candidate did against the best in one phase: screen, validate or confirm (spec §8.2,
-    §8.3). Scores and deltas are fractions, not percentages: 3pp is 0.03.
+    §8.3). Scores and deltas are fractions, not percentages: 5 R-VES points is 0.05. A task's
+    tokens are its input plus output tokens, output including reasoning. A statistic the phase
+    did not compute is absent.
     """
 
     DESCRIPTOR: _descriptor.Descriptor
@@ -484,17 +506,19 @@ class PhaseResult(_message.Message):
     CANDIDATE_SCORE_FIELD_NUMBER: _builtins.int
     BEST_SCORE_FIELD_NUMBER: _builtins.int
     DELTA_FIELD_NUMBER: _builtins.int
+    EFFECTIVE_MIN_DELTA_FIELD_NUMBER: _builtins.int
     WINS_FIELD_NUMBER: _builtins.int
     LOSSES_FIELD_NUMBER: _builtins.int
     SIGN_TEST_P_FIELD_NUMBER: _builtins.int
     GAIN_PROBABILITY_FIELD_NUMBER: _builtins.int
     REGRESSIONS_FIELD_NUMBER: _builtins.int
     TOKEN_RATIO_VS_BEST_FIELD_NUMBER: _builtins.int
-    COST_RATIO_VS_BEST_FIELD_NUMBER: _builtins.int
     TIME_RATIO_VS_BEST_FIELD_NUMBER: _builtins.int
     COST_RATIO_VS_V0_FIELD_NUMBER: _builtins.int
     TIME_RATIO_VS_V0_FIELD_NUMBER: _builtins.int
-    RUN_IDS_FIELD_NUMBER: _builtins.int
+    CANDIDATE_RUN_IDS_FIELD_NUMBER: _builtins.int
+    BEST_RUN_IDS_FIELD_NUMBER: _builtins.int
+    V0_RUN_IDS_FIELD_NUMBER: _builtins.int
     split: _task_pb2.Split.ValueType
     """The split the phase ran on."""
     task_count: _builtins.int
@@ -502,25 +526,28 @@ class PhaseResult(_message.Message):
     seed_count: _builtins.int
     """How many seeds it compared per task."""
     candidate_score: _builtins.float
-    """The candidate's score: BIRD mean success rate; SWE harmonic-mean SR."""
+    """The candidate's score: Effi-SQL's mean credit (R-VES / 100); SWE's harmonic-mean SR."""
     best_score: _builtins.float
     """The best's score on the same tasks and seeds."""
     delta: _builtins.float
-    """candidate_score - best_score. SWE's gain rule takes it relative to best_score."""
+    """candidate_score - best_score."""
+    effective_min_delta: _builtins.float
+    """The smallest delta the phase accepted. For the validation: Effi-SQL's min_delta, or SWE's
+    min_relative_gain times best_score, doubled if the cost guardrail tripped. For the
+    confirmation: confirm_min_delta. Absent for the screen, which needs only a delta above 0.
+    """
     wins: _builtins.int
     """How many tasks the candidate beat the best on, by each task's score averaged over seeds."""
     losses: _builtins.int
     """How many tasks the best beat the candidate on."""
     sign_test_p: _builtins.float
-    """The one-sided sign test's p-value for wins against losses; absent if not computed."""
+    """The one-sided sign test's p-value for wins against losses."""
     gain_probability: _builtins.float
-    """P(Δ>0), the probability of a gain, by paired bootstrap; absent if not computed."""
+    """P(Δ>0), the probability of a gain, by paired bootstrap."""
     regressions: _builtins.int
     """How many tasks regressed, as spec §8.3 defines a regression for the lane."""
     token_ratio_vs_best: _builtins.float
     """The candidate's mean tokens per task over the best's, which the cost guardrail checks."""
-    cost_ratio_vs_best: _builtins.float
-    """Its mean cost per task over the best's."""
     time_ratio_vs_best: _builtins.float
     """Its mean wall time per task over the best's, which the cost guardrail checks."""
     cost_ratio_vs_v0: _builtins.float
@@ -528,8 +555,16 @@ class PhaseResult(_message.Message):
     time_ratio_vs_v0: _builtins.float
     """Its mean wall time per task over v0's on the same split, which the efficiency cap checks."""
     @_builtins.property
-    def run_ids(self) -> _containers.RepeatedScalarFieldContainer[_builtins.str]:
-        """The runs whose results the phase compared, the candidate's and the best's."""
+    def candidate_run_ids(self) -> _containers.RepeatedScalarFieldContainer[_builtins.str]:
+        """The candidate's runs whose results the phase compared."""
+
+    @_builtins.property
+    def best_run_ids(self) -> _containers.RepeatedScalarFieldContainer[_builtins.str]:
+        """The best's runs whose results the phase compared."""
+
+    @_builtins.property
+    def v0_run_ids(self) -> _containers.RepeatedScalarFieldContainer[_builtins.str]:
+        """The v0 runs whose cost and wall time the ratios against v0 used."""
 
     def __init__(
         self,
@@ -540,48 +575,79 @@ class PhaseResult(_message.Message):
         candidate_score: _builtins.float = ...,
         best_score: _builtins.float = ...,
         delta: _builtins.float = ...,
-        wins: _builtins.int = ...,
-        losses: _builtins.int = ...,
+        effective_min_delta: _builtins.float | None = ...,
+        wins: _builtins.int | None = ...,
+        losses: _builtins.int | None = ...,
         sign_test_p: _builtins.float | None = ...,
         gain_probability: _builtins.float | None = ...,
-        regressions: _builtins.int = ...,
-        token_ratio_vs_best: _builtins.float = ...,
-        cost_ratio_vs_best: _builtins.float = ...,
-        time_ratio_vs_best: _builtins.float = ...,
-        cost_ratio_vs_v0: _builtins.float = ...,
-        time_ratio_vs_v0: _builtins.float = ...,
-        run_ids: _abc.Iterable[_builtins.str] | None = ...,
+        regressions: _builtins.int | None = ...,
+        token_ratio_vs_best: _builtins.float | None = ...,
+        time_ratio_vs_best: _builtins.float | None = ...,
+        cost_ratio_vs_v0: _builtins.float | None = ...,
+        time_ratio_vs_v0: _builtins.float | None = ...,
+        candidate_run_ids: _abc.Iterable[_builtins.str] | None = ...,
+        best_run_ids: _abc.Iterable[_builtins.str] | None = ...,
+        v0_run_ids: _abc.Iterable[_builtins.str] | None = ...,
     ) -> None: ...
-    _HasFieldArgType: _TypeAlias = _typing.Literal["_gain_probability", b"_gain_probability", "_sign_test_p", b"_sign_test_p", "gain_probability", b"gain_probability", "sign_test_p", b"sign_test_p"]  # noqa: Y015
+    _HasFieldArgType: _TypeAlias = _typing.Literal["_cost_ratio_vs_v0", b"_cost_ratio_vs_v0", "_effective_min_delta", b"_effective_min_delta", "_gain_probability", b"_gain_probability", "_losses", b"_losses", "_regressions", b"_regressions", "_sign_test_p", b"_sign_test_p", "_time_ratio_vs_best", b"_time_ratio_vs_best", "_time_ratio_vs_v0", b"_time_ratio_vs_v0", "_token_ratio_vs_best", b"_token_ratio_vs_best", "_wins", b"_wins", "cost_ratio_vs_v0", b"cost_ratio_vs_v0", "effective_min_delta", b"effective_min_delta", "gain_probability", b"gain_probability", "losses", b"losses", "regressions", b"regressions", "sign_test_p", b"sign_test_p", "time_ratio_vs_best", b"time_ratio_vs_best", "time_ratio_vs_v0", b"time_ratio_vs_v0", "token_ratio_vs_best", b"token_ratio_vs_best", "wins", b"wins"]  # noqa: Y015
     def HasField(self, field_name: _HasFieldArgType) -> _builtins.bool: ...
-    _ClearFieldArgType: _TypeAlias = _typing.Literal["_gain_probability", b"_gain_probability", "_sign_test_p", b"_sign_test_p", "best_score", b"best_score", "candidate_score", b"candidate_score", "cost_ratio_vs_best", b"cost_ratio_vs_best", "cost_ratio_vs_v0", b"cost_ratio_vs_v0", "delta", b"delta", "gain_probability", b"gain_probability", "losses", b"losses", "regressions", b"regressions", "run_ids", b"run_ids", "seed_count", b"seed_count", "sign_test_p", b"sign_test_p", "split", b"split", "task_count", b"task_count", "time_ratio_vs_best", b"time_ratio_vs_best", "time_ratio_vs_v0", b"time_ratio_vs_v0", "token_ratio_vs_best", b"token_ratio_vs_best", "wins", b"wins"]  # noqa: Y015
+    _ClearFieldArgType: _TypeAlias = _typing.Literal["_cost_ratio_vs_v0", b"_cost_ratio_vs_v0", "_effective_min_delta", b"_effective_min_delta", "_gain_probability", b"_gain_probability", "_losses", b"_losses", "_regressions", b"_regressions", "_sign_test_p", b"_sign_test_p", "_time_ratio_vs_best", b"_time_ratio_vs_best", "_time_ratio_vs_v0", b"_time_ratio_vs_v0", "_token_ratio_vs_best", b"_token_ratio_vs_best", "_wins", b"_wins", "best_run_ids", b"best_run_ids", "best_score", b"best_score", "candidate_run_ids", b"candidate_run_ids", "candidate_score", b"candidate_score", "cost_ratio_vs_v0", b"cost_ratio_vs_v0", "delta", b"delta", "effective_min_delta", b"effective_min_delta", "gain_probability", b"gain_probability", "losses", b"losses", "regressions", b"regressions", "seed_count", b"seed_count", "sign_test_p", b"sign_test_p", "split", b"split", "task_count", b"task_count", "time_ratio_vs_best", b"time_ratio_vs_best", "time_ratio_vs_v0", b"time_ratio_vs_v0", "token_ratio_vs_best", b"token_ratio_vs_best", "v0_run_ids", b"v0_run_ids", "wins", b"wins"]  # noqa: Y015
     def ClearField(self, field_name: _ClearFieldArgType) -> None: ...
+    _WhichOneofReturnType__cost_ratio_vs_v0: _TypeAlias = _typing.Literal["cost_ratio_vs_v0"]  # noqa: Y015
+    _WhichOneofArgType__cost_ratio_vs_v0: _TypeAlias = _typing.Literal["_cost_ratio_vs_v0", b"_cost_ratio_vs_v0"]  # noqa: Y015
+    _WhichOneofReturnType__effective_min_delta: _TypeAlias = _typing.Literal["effective_min_delta"]  # noqa: Y015
+    _WhichOneofArgType__effective_min_delta: _TypeAlias = _typing.Literal["_effective_min_delta", b"_effective_min_delta"]  # noqa: Y015
     _WhichOneofReturnType__gain_probability: _TypeAlias = _typing.Literal["gain_probability"]  # noqa: Y015
     _WhichOneofArgType__gain_probability: _TypeAlias = _typing.Literal["_gain_probability", b"_gain_probability"]  # noqa: Y015
+    _WhichOneofReturnType__losses: _TypeAlias = _typing.Literal["losses"]  # noqa: Y015
+    _WhichOneofArgType__losses: _TypeAlias = _typing.Literal["_losses", b"_losses"]  # noqa: Y015
+    _WhichOneofReturnType__regressions: _TypeAlias = _typing.Literal["regressions"]  # noqa: Y015
+    _WhichOneofArgType__regressions: _TypeAlias = _typing.Literal["_regressions", b"_regressions"]  # noqa: Y015
     _WhichOneofReturnType__sign_test_p: _TypeAlias = _typing.Literal["sign_test_p"]  # noqa: Y015
     _WhichOneofArgType__sign_test_p: _TypeAlias = _typing.Literal["_sign_test_p", b"_sign_test_p"]  # noqa: Y015
+    _WhichOneofReturnType__time_ratio_vs_best: _TypeAlias = _typing.Literal["time_ratio_vs_best"]  # noqa: Y015
+    _WhichOneofArgType__time_ratio_vs_best: _TypeAlias = _typing.Literal["_time_ratio_vs_best", b"_time_ratio_vs_best"]  # noqa: Y015
+    _WhichOneofReturnType__time_ratio_vs_v0: _TypeAlias = _typing.Literal["time_ratio_vs_v0"]  # noqa: Y015
+    _WhichOneofArgType__time_ratio_vs_v0: _TypeAlias = _typing.Literal["_time_ratio_vs_v0", b"_time_ratio_vs_v0"]  # noqa: Y015
+    _WhichOneofReturnType__token_ratio_vs_best: _TypeAlias = _typing.Literal["token_ratio_vs_best"]  # noqa: Y015
+    _WhichOneofArgType__token_ratio_vs_best: _TypeAlias = _typing.Literal["_token_ratio_vs_best", b"_token_ratio_vs_best"]  # noqa: Y015
+    _WhichOneofReturnType__wins: _TypeAlias = _typing.Literal["wins"]  # noqa: Y015
+    _WhichOneofArgType__wins: _TypeAlias = _typing.Literal["_wins", b"_wins"]  # noqa: Y015
+    @_typing.overload
+    def WhichOneof(self, oneof_group: _WhichOneofArgType__cost_ratio_vs_v0) -> _WhichOneofReturnType__cost_ratio_vs_v0 | None: ...
+    @_typing.overload
+    def WhichOneof(self, oneof_group: _WhichOneofArgType__effective_min_delta) -> _WhichOneofReturnType__effective_min_delta | None: ...
     @_typing.overload
     def WhichOneof(self, oneof_group: _WhichOneofArgType__gain_probability) -> _WhichOneofReturnType__gain_probability | None: ...
     @_typing.overload
+    def WhichOneof(self, oneof_group: _WhichOneofArgType__losses) -> _WhichOneofReturnType__losses | None: ...
+    @_typing.overload
+    def WhichOneof(self, oneof_group: _WhichOneofArgType__regressions) -> _WhichOneofReturnType__regressions | None: ...
+    @_typing.overload
     def WhichOneof(self, oneof_group: _WhichOneofArgType__sign_test_p) -> _WhichOneofReturnType__sign_test_p | None: ...
+    @_typing.overload
+    def WhichOneof(self, oneof_group: _WhichOneofArgType__time_ratio_vs_best) -> _WhichOneofReturnType__time_ratio_vs_best | None: ...
+    @_typing.overload
+    def WhichOneof(self, oneof_group: _WhichOneofArgType__time_ratio_vs_v0) -> _WhichOneofReturnType__time_ratio_vs_v0 | None: ...
+    @_typing.overload
+    def WhichOneof(self, oneof_group: _WhichOneofArgType__token_ratio_vs_best) -> _WhichOneofReturnType__token_ratio_vs_best | None: ...
+    @_typing.overload
+    def WhichOneof(self, oneof_group: _WhichOneofArgType__wins) -> _WhichOneofReturnType__wins | None: ...
 
 Global___PhaseResult: _TypeAlias = PhaseResult  # noqa: Y015
 
 @_typing.final
 class DecisionThresholds(_message.Message):
     """The decision thresholds, as config set them (spec §8.3: every decision records the thresholds
-    it used). Gains are fractions, as in PhaseResult.
+    it used). Gains are fractions, and a task's tokens are counted, as in PhaseResult.
     """
 
     DESCRIPTOR: _descriptor.Descriptor
 
-    MAX_REGRESSIONS_FIELD_NUMBER: _builtins.int
     COST_GUARDRAIL_RATIO_FIELD_NUMBER: _builtins.int
     EFFICIENCY_CAP_RATIO_FIELD_NUMBER: _builtins.int
-    BIRD_FIELD_NUMBER: _builtins.int
+    EFFISQL_FIELD_NUMBER: _builtins.int
     SWE_FIELD_NUMBER: _builtins.int
-    max_regressions: _builtins.int
-    """The most regressions a candidate may cause."""
     cost_guardrail_ratio: _builtins.float
     """The cost guardrail: above this multiple of the best's mean tokens or wall time per task, the
     gain threshold doubles.
@@ -591,8 +657,8 @@ class DecisionThresholds(_message.Message):
     is rejected whatever its gain.
     """
     @_builtins.property
-    def bird(self) -> Global___BirdThresholds:
-        """The BIRD-CRITIC lane's."""
+    def effisql(self) -> Global___EffiSqlThresholds:
+        """The Effi-SQL lane's."""
 
     @_builtins.property
     def swe(self) -> Global___SweThresholds:
@@ -601,73 +667,88 @@ class DecisionThresholds(_message.Message):
     def __init__(
         self,
         *,
-        max_regressions: _builtins.int = ...,
         cost_guardrail_ratio: _builtins.float = ...,
         efficiency_cap_ratio: _builtins.float = ...,
-        bird: Global___BirdThresholds | None = ...,
+        effisql: Global___EffiSqlThresholds | None = ...,
         swe: Global___SweThresholds | None = ...,
     ) -> None: ...
-    _HasFieldArgType: _TypeAlias = _typing.Literal["benchmark", b"benchmark", "bird", b"bird", "swe", b"swe"]  # noqa: Y015
+    _HasFieldArgType: _TypeAlias = _typing.Literal["benchmark", b"benchmark", "effisql", b"effisql", "swe", b"swe"]  # noqa: Y015
     def HasField(self, field_name: _HasFieldArgType) -> _builtins.bool: ...
-    _ClearFieldArgType: _TypeAlias = _typing.Literal["benchmark", b"benchmark", "bird", b"bird", "cost_guardrail_ratio", b"cost_guardrail_ratio", "efficiency_cap_ratio", b"efficiency_cap_ratio", "max_regressions", b"max_regressions", "swe", b"swe"]  # noqa: Y015
+    _ClearFieldArgType: _TypeAlias = _typing.Literal["benchmark", b"benchmark", "cost_guardrail_ratio", b"cost_guardrail_ratio", "efficiency_cap_ratio", b"efficiency_cap_ratio", "effisql", b"effisql", "swe", b"swe"]  # noqa: Y015
     def ClearField(self, field_name: _ClearFieldArgType) -> None: ...
-    _WhichOneofReturnType_benchmark: _TypeAlias = _typing.Literal["bird", "swe"]  # noqa: Y015
+    _WhichOneofReturnType_benchmark: _TypeAlias = _typing.Literal["effisql", "swe"]  # noqa: Y015
     _WhichOneofArgType_benchmark: _TypeAlias = _typing.Literal["benchmark", b"benchmark"]  # noqa: Y015
     def WhichOneof(self, oneof_group: _WhichOneofArgType_benchmark) -> _WhichOneofReturnType_benchmark | None: ...
 
 Global___DecisionThresholds: _TypeAlias = DecisionThresholds  # noqa: Y015
 
 @_typing.final
-class BirdThresholds(_message.Message):
-    """The BIRD-CRITIC lane's gain and significance thresholds."""
+class EffiSqlThresholds(_message.Message):
+    """The Effi-SQL lane's thresholds (spec §8.3). The defaults named here are config's."""
 
     DESCRIPTOR: _descriptor.Descriptor
 
-    MIN_GAIN_FIELD_NUMBER: _builtins.int
-    MAX_SIGN_TEST_P_FIELD_NUMBER: _builtins.int
-    MIN_CONFIRMED_GAIN_FIELD_NUMBER: _builtins.int
-    min_gain: _builtins.float
-    """The smallest gain in mean success rate accepted."""
-    max_sign_test_p: _builtins.float
-    """The largest sign-test p-value accepted."""
-    min_confirmed_gain: _builtins.float
-    """The smallest gain over all 3 seeds that the confirmation accepts."""
+    MIN_DELTA_FIELD_NUMBER: _builtins.int
+    SIGN_TEST_MAX_P_FIELD_NUMBER: _builtins.int
+    MAX_REGRESSIONS_FIELD_NUMBER: _builtins.int
+    CONFIRM_MIN_DELTA_FIELD_NUMBER: _builtins.int
+    min_delta: _builtins.float
+    """The smallest gain in R-VES accepted, as a fraction: by default 0.05, i.e. 5 points."""
+    sign_test_max_p: _builtins.float
+    """The largest p-value accepted from the one-sided sign test on per-task credit: by default
+    0.1.
+    """
+    max_regressions: _builtins.int
+    """The most regressions accepted, by default 1. A task regresses if its credit is at least
+    0.75 under the best and at most 0.25 under the candidate.
+    """
+    confirm_min_delta: _builtins.float
+    """The smallest gain in R-VES over both seeds, the validation seed plus the confirmation
+    seed, that the confirmation accepts: by default 0.03.
+    """
     def __init__(
         self,
         *,
-        min_gain: _builtins.float = ...,
-        max_sign_test_p: _builtins.float = ...,
-        min_confirmed_gain: _builtins.float = ...,
+        min_delta: _builtins.float = ...,
+        sign_test_max_p: _builtins.float = ...,
+        max_regressions: _builtins.int = ...,
+        confirm_min_delta: _builtins.float = ...,
     ) -> None: ...
     _HasFieldArgType: _TypeAlias = _Never  # noqa: Y015
     def HasField(self, field_name: _HasFieldArgType) -> _builtins.bool: ...
-    _ClearFieldArgType: _TypeAlias = _typing.Literal["max_sign_test_p", b"max_sign_test_p", "min_confirmed_gain", b"min_confirmed_gain", "min_gain", b"min_gain"]  # noqa: Y015
+    _ClearFieldArgType: _TypeAlias = _typing.Literal["confirm_min_delta", b"confirm_min_delta", "max_regressions", b"max_regressions", "min_delta", b"min_delta", "sign_test_max_p", b"sign_test_max_p"]  # noqa: Y015
     def ClearField(self, field_name: _ClearFieldArgType) -> None: ...
     def WhichOneof(self, oneof_group: _Never) -> None: ...
 
-Global___BirdThresholds: _TypeAlias = BirdThresholds  # noqa: Y015
+Global___EffiSqlThresholds: _TypeAlias = EffiSqlThresholds  # noqa: Y015
 
 @_typing.final
 class SweThresholds(_message.Message):
-    """The SWE-fficiency lane's gain and significance thresholds."""
+    """The SWE-fficiency lane's thresholds (spec §8.3). The lane is on hold (2026-10-15)."""
 
     DESCRIPTOR: _descriptor.Descriptor
 
     MIN_RELATIVE_GAIN_FIELD_NUMBER: _builtins.int
     MIN_GAIN_PROBABILITY_FIELD_NUMBER: _builtins.int
+    MAX_REGRESSIONS_FIELD_NUMBER: _builtins.int
     min_relative_gain: _builtins.float
     """The smallest gain in harmonic-mean SR accepted, relative to the best's: 0.1 is 10%."""
     min_gain_probability: _builtins.float
     """The smallest bootstrap P(Δ>0) accepted."""
+    max_regressions: _builtins.int
+    """The most regressions accepted. A task regresses if it has a real speedup under the best,
+    SR above 1/gold speedup, and drops to SR at most 1/gold speedup under the candidate.
+    """
     def __init__(
         self,
         *,
         min_relative_gain: _builtins.float = ...,
         min_gain_probability: _builtins.float = ...,
+        max_regressions: _builtins.int = ...,
     ) -> None: ...
     _HasFieldArgType: _TypeAlias = _Never  # noqa: Y015
     def HasField(self, field_name: _HasFieldArgType) -> _builtins.bool: ...
-    _ClearFieldArgType: _TypeAlias = _typing.Literal["min_gain_probability", b"min_gain_probability", "min_relative_gain", b"min_relative_gain"]  # noqa: Y015
+    _ClearFieldArgType: _TypeAlias = _typing.Literal["max_regressions", b"max_regressions", "min_gain_probability", b"min_gain_probability", "min_relative_gain", b"min_relative_gain"]  # noqa: Y015
     def ClearField(self, field_name: _ClearFieldArgType) -> None: ...
     def WhichOneof(self, oneof_group: _Never) -> None: ...
 
@@ -713,8 +794,8 @@ class Lesson(_message.Message):
     LANE_FIELD_NUMBER: _builtins.int
     TEXT_FIELD_NUMBER: _builtins.int
     EXPERIMENT_IDS_FIELD_NUMBER: _builtins.int
-    HELPED_FIELD_NUMBER: _builtins.int
-    HURT_FIELD_NUMBER: _builtins.int
+    HELPED_BY_FIELD_NUMBER: _builtins.int
+    HURT_BY_FIELD_NUMBER: _builtins.int
     CREATED_AT_FIELD_NUMBER: _builtins.int
     UPDATED_AT_FIELD_NUMBER: _builtins.int
     lesson_id: _builtins.str
@@ -723,13 +804,20 @@ class Lesson(_message.Message):
     """The lane whose experiments taught it."""
     text: _builtins.str
     """What was tried, what happened and why."""
-    helped: _builtins.int
-    """How many times the lesson has helped."""
-    hurt: _builtins.int
-    """How many times it has hurt."""
     @_builtins.property
     def experiment_ids(self) -> _containers.RepeatedScalarFieldContainer[_builtins.str]:
-        """The experiments the lesson cites as evidence."""
+        """The experiments the lesson cites as evidence: the one link between lessons and experiments."""
+
+    @_builtins.property
+    def helped_by(self) -> _containers.RepeatedScalarFieldContainer[_builtins.str]:
+        """The experiments in which the lesson helped, each listed once: how often it helped (spec
+        §8.6) is the list's length. Recording an experiment again changes nothing, so a restarted
+        lane cannot count it twice.
+        """
+
+    @_builtins.property
+    def hurt_by(self) -> _containers.RepeatedScalarFieldContainer[_builtins.str]:
+        """The experiments in which it hurt, each listed once: how often it hurt is the list's length."""
 
     @_builtins.property
     def created_at(self) -> _timestamp_pb2.Timestamp:
@@ -737,7 +825,7 @@ class Lesson(_message.Message):
 
     @_builtins.property
     def updated_at(self) -> _timestamp_pb2.Timestamp:
-        """When it last changed, as when a counter was updated."""
+        """When it last changed, as when an experiment was added to helped_by or hurt_by."""
 
     def __init__(
         self,
@@ -746,14 +834,14 @@ class Lesson(_message.Message):
         lane: Global___Lane.ValueType = ...,
         text: _builtins.str = ...,
         experiment_ids: _abc.Iterable[_builtins.str] | None = ...,
-        helped: _builtins.int = ...,
-        hurt: _builtins.int = ...,
+        helped_by: _abc.Iterable[_builtins.str] | None = ...,
+        hurt_by: _abc.Iterable[_builtins.str] | None = ...,
         created_at: _timestamp_pb2.Timestamp | None = ...,
         updated_at: _timestamp_pb2.Timestamp | None = ...,
     ) -> None: ...
     _HasFieldArgType: _TypeAlias = _typing.Literal["created_at", b"created_at", "updated_at", b"updated_at"]  # noqa: Y015
     def HasField(self, field_name: _HasFieldArgType) -> _builtins.bool: ...
-    _ClearFieldArgType: _TypeAlias = _typing.Literal["created_at", b"created_at", "experiment_ids", b"experiment_ids", "helped", b"helped", "hurt", b"hurt", "lane", b"lane", "lesson_id", b"lesson_id", "text", b"text", "updated_at", b"updated_at"]  # noqa: Y015
+    _ClearFieldArgType: _TypeAlias = _typing.Literal["created_at", b"created_at", "experiment_ids", b"experiment_ids", "helped_by", b"helped_by", "hurt_by", b"hurt_by", "lane", b"lane", "lesson_id", b"lesson_id", "text", b"text", "updated_at", b"updated_at"]  # noqa: Y015
     def ClearField(self, field_name: _ClearFieldArgType) -> None: ...
     def WhichOneof(self, oneof_group: _Never) -> None: ...
 

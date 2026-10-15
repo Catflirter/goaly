@@ -33,7 +33,7 @@ class _StopReasonEnumTypeWrapper(_enum_type_wrapper._EnumTypeWrapper[_StopReason
     STOP_REASON_UNSPECIFIED: _StopReason.ValueType  # 0
     """Not set."""
     STOP_REASON_SUBMITTED: _StopReason.ValueType  # 1
-    """The agent submitted its answer."""
+    """A tool returned a submission (ToolResult.submission), which ended the episode."""
     STOP_REASON_STEP_BUDGET_EXHAUSTED: _StopReason.ValueType  # 2
     """The step budget ran out (spec §5.1), so the policy's fallback answered (spec §5.4)."""
     STOP_REASON_TIME_BUDGET_EXHAUSTED: _StopReason.ValueType  # 3
@@ -45,15 +45,17 @@ class _StopReasonEnumTypeWrapper(_enum_type_wrapper._EnumTypeWrapper[_StopReason
     STOP_REASON_CONSECUTIVE_ERRORS: _StopReason.ValueType  # 6
     """The model made too many errors in a row (spec §5.1)."""
     STOP_REASON_CRASHED: _StopReason.ValueType  # 7
-    """An exception stopped the agent; error says what it was."""
+    """An exception ended the task; error_message says what it was."""
+    STOP_REASON_CANCELLED: _StopReason.ValueType  # 8
+    """The runner cancelled the task, for example at its time limit."""
 
 class StopReason(_StopReason, metaclass=_StopReasonEnumTypeWrapper):
-    """Why the agent stopped working on a task."""
+    """Why the agent stopped working on a task. TaskErrorType says which reason each error comes with."""
 
 STOP_REASON_UNSPECIFIED: StopReason.ValueType  # 0
 """Not set."""
 STOP_REASON_SUBMITTED: StopReason.ValueType  # 1
-"""The agent submitted its answer."""
+"""A tool returned a submission (ToolResult.submission), which ended the episode."""
 STOP_REASON_STEP_BUDGET_EXHAUSTED: StopReason.ValueType  # 2
 """The step budget ran out (spec §5.1), so the policy's fallback answered (spec §5.4)."""
 STOP_REASON_TIME_BUDGET_EXHAUSTED: StopReason.ValueType  # 3
@@ -65,7 +67,9 @@ STOP_REASON_COST_BUDGET_EXHAUSTED: StopReason.ValueType  # 5
 STOP_REASON_CONSECUTIVE_ERRORS: StopReason.ValueType  # 6
 """The model made too many errors in a row (spec §5.1)."""
 STOP_REASON_CRASHED: StopReason.ValueType  # 7
-"""An exception stopped the agent; error says what it was."""
+"""An exception ended the task; error_message says what it was."""
+STOP_REASON_CANCELLED: StopReason.ValueType  # 8
+"""The runner cancelled the task, for example at its time limit."""
 Global___StopReason: _TypeAlias = StopReason  # noqa: Y015
 
 class _ChatRole:
@@ -130,8 +134,9 @@ Global___ToolCallSource: _TypeAlias = ToolCallSource  # noqa: Y015
 
 @_typing.final
 class Trajectory(_message.Message):
-    """Everything the agent did on one task in one run (spec §5.1): one line of the run's
-    trajectories file.
+    """Everything the agent did on one task, one seed, in one run (spec §5.1): one line of the run's
+    trajectories file. If several lines share run_id, instance_id and seed, the last one wins, so
+    a late grade is appended as a new line.
     """
 
     DESCRIPTOR: _descriptor.Descriptor
@@ -140,12 +145,12 @@ class Trajectory(_message.Message):
     INSTANCE_ID_FIELD_NUMBER: _builtins.int
     SEED_FIELD_NUMBER: _builtins.int
     TASK_FIELD_NUMBER: _builtins.int
-    INITIAL_MESSAGES_FIELD_NUMBER: _builtins.int
+    CHATS_FIELD_NUMBER: _builtins.int
     STEPS_FIELD_NUMBER: _builtins.int
     PREDICTION_FIELD_NUMBER: _builtins.int
     GRADE_FIELD_NUMBER: _builtins.int
     STOP_REASON_FIELD_NUMBER: _builtins.int
-    ERROR_FIELD_NUMBER: _builtins.int
+    ERROR_MESSAGE_FIELD_NUMBER: _builtins.int
     USAGE_FIELD_NUMBER: _builtins.int
     STARTED_AT_FIELD_NUMBER: _builtins.int
     FINISHED_AT_FIELD_NUMBER: _builtins.int
@@ -154,22 +159,27 @@ class Trajectory(_message.Message):
     instance_id: _builtins.str
     """The task."""
     seed: _builtins.int
-    """The replicate index (spec §6.1): which of the run's independent repeats this is."""
+    """The 0-based replicate index (spec §6.1), which names the same replicate in every run. A
+    confirmation run takes a new index, so the evaluation cache never hands it a validation
+    seed's result.
+    """
     stop_reason: Global___StopReason.ValueType
     """Why the agent stopped."""
-    error: _builtins.str
+    error_message: _builtins.str
     """What went wrong, if the agent stopped on an error; empty otherwise."""
     @_builtins.property
     def task(self) -> _task_pb2.TaskInput:
         """What the agent was given."""
 
     @_builtins.property
-    def initial_messages(self) -> _containers.RepeatedCompositeFieldContainer[Global___ChatMessage]:
-        """The messages the first model call was sent: the system prompt and the task."""
+    def chats(self) -> _containers.RepeatedCompositeFieldContainer[Global___Chat]:
+        """The policy's conversations with the model, in the order they started. A policy with one
+        conversation has exactly chats[0]; best-of-n, phases or a verifier have more (spec §5.2).
+        """
 
     @_builtins.property
     def steps(self) -> _containers.RepeatedCompositeFieldContainer[Global___Step]:
-        """The steps, in order."""
+        """Every model call, of every chat, in the order the calls were made."""
 
     @_builtins.property
     def prediction(self) -> _task_pb2.Prediction:
@@ -177,7 +187,9 @@ class Trajectory(_message.Message):
 
     @_builtins.property
     def grade(self) -> _task_pb2.Grade:
-        """How the prediction was graded; absent until it is graded."""
+        """How the prediction was graded, as in the task's TaskResult; absent until it is graded, and
+        in a run without gold answers.
+        """
 
     @_builtins.property
     def usage(self) -> _llm_call_pb2.Usage:
@@ -198,65 +210,117 @@ class Trajectory(_message.Message):
         instance_id: _builtins.str = ...,
         seed: _builtins.int = ...,
         task: _task_pb2.TaskInput | None = ...,
-        initial_messages: _abc.Iterable[Global___ChatMessage] | None = ...,
+        chats: _abc.Iterable[Global___Chat] | None = ...,
         steps: _abc.Iterable[Global___Step] | None = ...,
         prediction: _task_pb2.Prediction | None = ...,
         grade: _task_pb2.Grade | None = ...,
         stop_reason: Global___StopReason.ValueType = ...,
-        error: _builtins.str = ...,
+        error_message: _builtins.str = ...,
         usage: _llm_call_pb2.Usage | None = ...,
         started_at: _timestamp_pb2.Timestamp | None = ...,
         finished_at: _timestamp_pb2.Timestamp | None = ...,
     ) -> None: ...
     _HasFieldArgType: _TypeAlias = _typing.Literal["finished_at", b"finished_at", "grade", b"grade", "prediction", b"prediction", "started_at", b"started_at", "task", b"task", "usage", b"usage"]  # noqa: Y015
     def HasField(self, field_name: _HasFieldArgType) -> _builtins.bool: ...
-    _ClearFieldArgType: _TypeAlias = _typing.Literal["error", b"error", "finished_at", b"finished_at", "grade", b"grade", "initial_messages", b"initial_messages", "instance_id", b"instance_id", "prediction", b"prediction", "run_id", b"run_id", "seed", b"seed", "started_at", b"started_at", "steps", b"steps", "stop_reason", b"stop_reason", "task", b"task", "usage", b"usage"]  # noqa: Y015
+    _ClearFieldArgType: _TypeAlias = _typing.Literal["chats", b"chats", "error_message", b"error_message", "finished_at", b"finished_at", "grade", b"grade", "instance_id", b"instance_id", "prediction", b"prediction", "run_id", b"run_id", "seed", b"seed", "started_at", b"started_at", "steps", b"steps", "stop_reason", b"stop_reason", "task", b"task", "usage", b"usage"]  # noqa: Y015
     def ClearField(self, field_name: _ClearFieldArgType) -> None: ...
     def WhichOneof(self, oneof_group: _Never) -> None: ...
 
 Global___Trajectory: _TypeAlias = Trajectory  # noqa: Y015
 
 @_typing.final
+class Chat(_message.Message):
+    """One linear conversation with the model: each of its steps is sent everything before it in the
+    chat. Calls that are not sent each other's messages, such as best-of-n samples, belong to
+    separate chats.
+    """
+
+    DESCRIPTOR: _descriptor.Descriptor
+
+    LABEL_FIELD_NUMBER: _builtins.int
+    FORKED_FROM_STEP_FIELD_NUMBER: _builtins.int
+    INITIAL_MESSAGES_FIELD_NUMBER: _builtins.int
+    label: _builtins.str
+    """A name the policy gives the chat, such as "main", "sample-2" or "verify"."""
+    forked_from_step: _builtins.int
+    """The step whose full context the chat continues, as an index into Trajectory.steps; absent
+    if the chat starts afresh. That context is the step's prompt, then its assistant message,
+    tool results and injected messages, and it comes before initial_messages.
+    """
+    @_builtins.property
+    def initial_messages(self) -> _containers.RepeatedCompositeFieldContainer[Global___ChatMessage]:
+        """The messages the chat starts with, after any forked context: for the first chat, the system
+        prompt and the task. May be empty in a forked chat.
+        """
+
+    def __init__(
+        self,
+        *,
+        label: _builtins.str = ...,
+        forked_from_step: _builtins.int | None = ...,
+        initial_messages: _abc.Iterable[Global___ChatMessage] | None = ...,
+    ) -> None: ...
+    _HasFieldArgType: _TypeAlias = _typing.Literal["_forked_from_step", b"_forked_from_step", "forked_from_step", b"forked_from_step"]  # noqa: Y015
+    def HasField(self, field_name: _HasFieldArgType) -> _builtins.bool: ...
+    _ClearFieldArgType: _TypeAlias = _typing.Literal["_forked_from_step", b"_forked_from_step", "forked_from_step", b"forked_from_step", "initial_messages", b"initial_messages", "label", b"label"]  # noqa: Y015
+    def ClearField(self, field_name: _ClearFieldArgType) -> None: ...
+    _WhichOneofReturnType__forked_from_step: _TypeAlias = _typing.Literal["forked_from_step"]  # noqa: Y015
+    _WhichOneofArgType__forked_from_step: _TypeAlias = _typing.Literal["_forked_from_step", b"_forked_from_step"]  # noqa: Y015
+    def WhichOneof(self, oneof_group: _WhichOneofArgType__forked_from_step) -> _WhichOneofReturnType__forked_from_step | None: ...
+
+Global___Chat: _TypeAlias = Chat  # noqa: Y015
+
+@_typing.final
 class Step(_message.Message):
-    """One model call and the tool calls it made (spec §5.1). A step holds only what it adds to the
-    chat, never the history before it. Before any folding, a call's prompt is the trajectory's
-    initial_messages, then each earlier step's assistant message, its tool results as tool
-    messages, and its injected messages.
+    """One model call and the tool calls it made (spec §5.1). A step holds only what it adds to its
+    chat, never the history before it. The prompt its call was sent is, in order:
+      1. the forked context of its chat, if any;
+      2. the chat's initial_messages;
+      3. each earlier step of the same chat: its assistant message, its tool results as tool
+         messages, and its injected messages.
+    Then every fold in effect at the step replaces the content of the tool message it names.
     """
 
     DESCRIPTOR: _descriptor.Descriptor
 
     INDEX_FIELD_NUMBER: _builtins.int
+    CHAT_FIELD_NUMBER: _builtins.int
     CALL_ID_FIELD_NUMBER: _builtins.int
     STARTED_AT_FIELD_NUMBER: _builtins.int
     LATENCY_S_FIELD_NUMBER: _builtins.int
     USAGE_FIELD_NUMBER: _builtins.int
-    PROMPT_TOKENS_FIELD_NUMBER: _builtins.int
-    CONTEXT_FOLDED_FIELD_NUMBER: _builtins.int
+    ESTIMATED_PROMPT_TOKENS_FIELD_NUMBER: _builtins.int
+    FOLDS_FIELD_NUMBER: _builtins.int
     ASSISTANT_FIELD_NUMBER: _builtins.int
     TOOL_RESULTS_FIELD_NUMBER: _builtins.int
     INJECTED_FIELD_NUMBER: _builtins.int
     index: _builtins.int
-    """The step's position in the trajectory, from 0."""
+    """The step's position in Trajectory.steps, from 0."""
+    chat: _builtins.int
+    """The chat it belongs to, as an index into Trajectory.chats."""
     call_id: _builtins.str
     """The call_id of the LlmCallRecord of this step's model call."""
     latency_s: _builtins.float
     """How long the whole model call took, in seconds, including any wait for a concurrency slot
     or a backoff: the same as its LlmCallRecord.latency_s.
     """
-    prompt_tokens: _builtins.int
-    """The context size at this call: how many tokens its prompt held."""
-    context_folded: _builtins.bool
-    """True if older tool outputs were folded into summaries before this call (spec §5.1). The
-    trajectory keeps them unfolded.
+    estimated_prompt_tokens: _builtins.int
+    """The harness's own count of the prompt's tokens before the call: the number the folding
+    threshold compares (spec §5.1). usage.input_tokens is the gateway's count.
     """
     @_builtins.property
     def started_at(self) -> _timestamp_pb2.Timestamp:
-        """When the model call started."""
+        """When the model call began, before any wait for a concurrency slot, as in its LlmCallRecord."""
 
     @_builtins.property
     def usage(self) -> _llm_call_pb2.Usage:
         """The tokens and cost of the model call."""
+
+    @_builtins.property
+    def folds(self) -> _containers.RepeatedCompositeFieldContainer[Global___ContextFold]:
+        """The tool outputs folded into summaries just before this call (spec §5.1). A fold stays in
+        effect for the rest of the chat, and in any chat forked from this step or a later one.
+        """
 
     @_builtins.property
     def assistant(self) -> Global___ChatMessage:
@@ -276,27 +340,61 @@ class Step(_message.Message):
         self,
         *,
         index: _builtins.int = ...,
+        chat: _builtins.int = ...,
         call_id: _builtins.str = ...,
         started_at: _timestamp_pb2.Timestamp | None = ...,
         latency_s: _builtins.float = ...,
         usage: _llm_call_pb2.Usage | None = ...,
-        prompt_tokens: _builtins.int = ...,
-        context_folded: _builtins.bool = ...,
+        estimated_prompt_tokens: _builtins.int = ...,
+        folds: _abc.Iterable[Global___ContextFold] | None = ...,
         assistant: Global___ChatMessage | None = ...,
         tool_results: _abc.Iterable[Global___ToolResult] | None = ...,
         injected: _abc.Iterable[Global___ChatMessage] | None = ...,
     ) -> None: ...
     _HasFieldArgType: _TypeAlias = _typing.Literal["assistant", b"assistant", "started_at", b"started_at", "usage", b"usage"]  # noqa: Y015
     def HasField(self, field_name: _HasFieldArgType) -> _builtins.bool: ...
-    _ClearFieldArgType: _TypeAlias = _typing.Literal["assistant", b"assistant", "call_id", b"call_id", "context_folded", b"context_folded", "index", b"index", "injected", b"injected", "latency_s", b"latency_s", "prompt_tokens", b"prompt_tokens", "started_at", b"started_at", "tool_results", b"tool_results", "usage", b"usage"]  # noqa: Y015
+    _ClearFieldArgType: _TypeAlias = _typing.Literal["assistant", b"assistant", "call_id", b"call_id", "chat", b"chat", "estimated_prompt_tokens", b"estimated_prompt_tokens", "folds", b"folds", "index", b"index", "injected", b"injected", "latency_s", b"latency_s", "started_at", b"started_at", "tool_results", b"tool_results", "usage", b"usage"]  # noqa: Y015
     def ClearField(self, field_name: _ClearFieldArgType) -> None: ...
     def WhichOneof(self, oneof_group: _Never) -> None: ...
 
 Global___Step: _TypeAlias = Step  # noqa: Y015
 
 @_typing.final
+class ContextFold(_message.Message):
+    """A tool output that the context manager replaced with a summary (spec §5.1). A model call that
+    writes such a summary is an ordinary step, in a chat the harness labels, e.g.
+    "fold-summarizer".
+    """
+
+    DESCRIPTOR: _descriptor.Descriptor
+
+    STEP_FIELD_NUMBER: _builtins.int
+    TOOL_CALL_ID_FIELD_NUMBER: _builtins.int
+    REPLACEMENT_FIELD_NUMBER: _builtins.int
+    step: _builtins.int
+    """The step whose tool result was folded, as an index into Trajectory.steps."""
+    tool_call_id: _builtins.str
+    """The tool_call_id of that tool result."""
+    replacement: _builtins.str
+    """The text the model was sent instead of the tool result's content."""
+    def __init__(
+        self,
+        *,
+        step: _builtins.int = ...,
+        tool_call_id: _builtins.str = ...,
+        replacement: _builtins.str = ...,
+    ) -> None: ...
+    _HasFieldArgType: _TypeAlias = _Never  # noqa: Y015
+    def HasField(self, field_name: _HasFieldArgType) -> _builtins.bool: ...
+    _ClearFieldArgType: _TypeAlias = _typing.Literal["replacement", b"replacement", "step", b"step", "tool_call_id", b"tool_call_id"]  # noqa: Y015
+    def ClearField(self, field_name: _ClearFieldArgType) -> None: ...
+    def WhichOneof(self, oneof_group: _Never) -> None: ...
+
+Global___ContextFold: _TypeAlias = ContextFold  # noqa: Y015
+
+@_typing.final
 class ChatMessage(_message.Message):
-    """One message of a chat with the model, in the OpenAI chat format."""
+    """One message of a chat with the model, modeled on the OpenAI chat format."""
 
     DESCRIPTOR: _descriptor.Descriptor
 
@@ -343,6 +441,7 @@ class ToolCall(_message.Message):
     ID_FIELD_NUMBER: _builtins.int
     NAME_FIELD_NUMBER: _builtins.int
     ARGUMENTS_JSON_FIELD_NUMBER: _builtins.int
+    REPAIRED_ARGUMENTS_JSON_FIELD_NUMBER: _builtins.int
     SOURCE_FIELD_NUMBER: _builtins.int
     id: _builtins.str
     """The call's ID, which the tool message answering it repeats. The parser makes one up for a
@@ -354,6 +453,10 @@ class ToolCall(_message.Message):
     """The arguments, a JSON object as text, exactly as the model wrote it: possibly malformed or
     truncated (spec §5.1). For a call parsed from XML, the parser writes it from the parameters.
     """
+    repaired_arguments_json: _builtins.str
+    """The arguments the tool actually ran with, after core repaired malformed JSON (spec §5.1);
+    empty when no repair happened.
+    """
     source: Global___ToolCallSource.ValueType
     """Where the call was parsed from."""
     def __init__(
@@ -362,11 +465,12 @@ class ToolCall(_message.Message):
         id: _builtins.str = ...,
         name: _builtins.str = ...,
         arguments_json: _builtins.str = ...,
+        repaired_arguments_json: _builtins.str = ...,
         source: Global___ToolCallSource.ValueType = ...,
     ) -> None: ...
     _HasFieldArgType: _TypeAlias = _Never  # noqa: Y015
     def HasField(self, field_name: _HasFieldArgType) -> _builtins.bool: ...
-    _ClearFieldArgType: _TypeAlias = _typing.Literal["arguments_json", b"arguments_json", "id", b"id", "name", b"name", "source", b"source"]  # noqa: Y015
+    _ClearFieldArgType: _TypeAlias = _typing.Literal["arguments_json", b"arguments_json", "id", b"id", "name", b"name", "repaired_arguments_json", b"repaired_arguments_json", "source", b"source"]  # noqa: Y015
     def ClearField(self, field_name: _ClearFieldArgType) -> None: ...
     def WhichOneof(self, oneof_group: _Never) -> None: ...
 
@@ -375,7 +479,8 @@ Global___ToolCall: _TypeAlias = ToolCall  # noqa: Y015
 @_typing.final
 class ToolResult(_message.Message):
     """The result of one tool call. The model sees it as a tool message: tool_call_id and content.
-    Tool.run returns content and is_error; the tool executor fills in the rest.
+    The tool fills content, is_error and submission; core's executor fills the rest, and writes
+    the error itself when the arguments are invalid, the call times out or the tool raises.
     """
 
     DESCRIPTOR: _descriptor.Descriptor
@@ -386,6 +491,7 @@ class ToolResult(_message.Message):
     IS_ERROR_FIELD_NUMBER: _builtins.int
     TRUNCATED_FIELD_NUMBER: _builtins.int
     ELAPSED_S_FIELD_NUMBER: _builtins.int
+    SUBMISSION_FIELD_NUMBER: _builtins.int
     tool_call_id: _builtins.str
     """The ID of the tool call this answers."""
     name: _builtins.str
@@ -393,11 +499,22 @@ class ToolResult(_message.Message):
     content: _builtins.str
     """The text shown to the model, after any truncation."""
     is_error: _builtins.bool
-    """True if the call failed: its arguments were invalid, it timed out, or the tool failed."""
+    """True if the call itself failed: its arguments were invalid, it timed out, or the tool
+    raised. A statement or command that ran and failed, such as SQL that raised an error or a
+    command that exited non-zero, is a normal result. So the consecutive-error rule (spec
+    §5.1) counts only calls that failed.
+    """
     truncated: _builtins.bool
     """True if the executor cut long output down to its start and end (spec §5.1)."""
     elapsed_s: _builtins.float
     """How long the tool ran, in seconds."""
+    @_builtins.property
+    def submission(self) -> _task_pb2.Prediction:
+        """What the tool submits, if it submits. A tool ends the episode by returning a result with
+        this set: the agent loop stops, and the policy decides whether to return it. So a pack
+        can submit through any tool, one that verifies before it submits included.
+        """
+
     def __init__(
         self,
         *,
@@ -407,11 +524,14 @@ class ToolResult(_message.Message):
         is_error: _builtins.bool = ...,
         truncated: _builtins.bool = ...,
         elapsed_s: _builtins.float = ...,
+        submission: _task_pb2.Prediction | None = ...,
     ) -> None: ...
-    _HasFieldArgType: _TypeAlias = _Never  # noqa: Y015
+    _HasFieldArgType: _TypeAlias = _typing.Literal["_submission", b"_submission", "submission", b"submission"]  # noqa: Y015
     def HasField(self, field_name: _HasFieldArgType) -> _builtins.bool: ...
-    _ClearFieldArgType: _TypeAlias = _typing.Literal["content", b"content", "elapsed_s", b"elapsed_s", "is_error", b"is_error", "name", b"name", "tool_call_id", b"tool_call_id", "truncated", b"truncated"]  # noqa: Y015
+    _ClearFieldArgType: _TypeAlias = _typing.Literal["_submission", b"_submission", "content", b"content", "elapsed_s", b"elapsed_s", "is_error", b"is_error", "name", b"name", "submission", b"submission", "tool_call_id", b"tool_call_id", "truncated", b"truncated"]  # noqa: Y015
     def ClearField(self, field_name: _ClearFieldArgType) -> None: ...
-    def WhichOneof(self, oneof_group: _Never) -> None: ...
+    _WhichOneofReturnType__submission: _TypeAlias = _typing.Literal["submission"]  # noqa: Y015
+    _WhichOneofArgType__submission: _TypeAlias = _typing.Literal["_submission", b"_submission"]  # noqa: Y015
+    def WhichOneof(self, oneof_group: _WhichOneofArgType__submission) -> _WhichOneofReturnType__submission | None: ...
 
 Global___ToolResult: _TypeAlias = ToolResult  # noqa: Y015

@@ -1,1 +1,1 @@
-"""goaly: a self-evolving harness for SWE-fficiency and BIRD-CRITIC."""
+"""goaly: a self-evolving harness for Effi-SQL and SWE-fficiency."""

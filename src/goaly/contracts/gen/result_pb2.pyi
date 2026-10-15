@@ -30,45 +30,61 @@ class _TaskErrorTypeEnumTypeWrapper(_enum_type_wrapper._EnumTypeWrapper[_TaskErr
     TASK_ERROR_TYPE_UNSPECIFIED: _TaskErrorType.ValueType  # 0
     """Not set."""
     TASK_ERROR_TYPE_NONE: _TaskErrorType.ValueType  # 1
-    """No error: the task ran to the end, though its grade may still fail it."""
+    """No error: stop_reason is STOP_REASON_SUBMITTED, a budget running out, or
+    STOP_REASON_CONSECUTIVE_ERRORS. The grade may still fail the task.
+    """
     TASK_ERROR_TYPE_POLICY_CRASH: _TaskErrorType.ValueType  # 2
-    """The policy raised an unexpected exception."""
+    """The policy raised an unexpected exception; stop_reason is STOP_REASON_CRASHED."""
     TASK_ERROR_TYPE_ENVIRONMENT: _TaskErrorType.ValueType  # 3
-    """The task's environment failed: it could not be provisioned, or it broke during the run."""
+    """The task's environment could not be provisioned, or broke during the run; stop_reason is
+    STOP_REASON_CRASHED.
+    """
     TASK_ERROR_TYPE_LLM: _TaskErrorType.ValueType  # 4
-    """A model call failed after all its retries; its LlmCallRecord says how."""
-    TASK_ERROR_TYPE_GRADER: _TaskErrorType.ValueType  # 5
-    """The grader failed, so the task has no usable grade."""
-    TASK_ERROR_TYPE_TIMEOUT: _TaskErrorType.ValueType  # 6
-    """The task ran past its time limit and was cancelled. A budget running out is not an error,
-    but a stop_reason.
+    """A model call failed after all its retries, as its LlmCallRecord says; stop_reason is
+    STOP_REASON_CRASHED.
+    """
+    TASK_ERROR_TYPE_TIMEOUT: _TaskErrorType.ValueType  # 5
+    """The runner cancelled the whole task at its time limit; stop_reason is
+    STOP_REASON_CANCELLED. This is about the task: one model call that our code cancelled is
+    LLM_CALL_STATUS_CANCELLED, and a budget running out is a stop reason, not an error.
     """
 
 class TaskErrorType(_TaskErrorType, metaclass=_TaskErrorTypeEnumTypeWrapper):
-    """What kind of error ended a task."""
+    """What kind of error ended a task. A grading failure is not one: it shows in the grade, as
+    GRADE_STATUS_GRADER_ERROR.
+    """
 
 TASK_ERROR_TYPE_UNSPECIFIED: TaskErrorType.ValueType  # 0
 """Not set."""
 TASK_ERROR_TYPE_NONE: TaskErrorType.ValueType  # 1
-"""No error: the task ran to the end, though its grade may still fail it."""
+"""No error: stop_reason is STOP_REASON_SUBMITTED, a budget running out, or
+STOP_REASON_CONSECUTIVE_ERRORS. The grade may still fail the task.
+"""
 TASK_ERROR_TYPE_POLICY_CRASH: TaskErrorType.ValueType  # 2
-"""The policy raised an unexpected exception."""
+"""The policy raised an unexpected exception; stop_reason is STOP_REASON_CRASHED."""
 TASK_ERROR_TYPE_ENVIRONMENT: TaskErrorType.ValueType  # 3
-"""The task's environment failed: it could not be provisioned, or it broke during the run."""
+"""The task's environment could not be provisioned, or broke during the run; stop_reason is
+STOP_REASON_CRASHED.
+"""
 TASK_ERROR_TYPE_LLM: TaskErrorType.ValueType  # 4
-"""A model call failed after all its retries; its LlmCallRecord says how."""
-TASK_ERROR_TYPE_GRADER: TaskErrorType.ValueType  # 5
-"""The grader failed, so the task has no usable grade."""
-TASK_ERROR_TYPE_TIMEOUT: TaskErrorType.ValueType  # 6
-"""The task ran past its time limit and was cancelled. A budget running out is not an error,
-but a stop_reason.
+"""A model call failed after all its retries, as its LlmCallRecord says; stop_reason is
+STOP_REASON_CRASHED.
+"""
+TASK_ERROR_TYPE_TIMEOUT: TaskErrorType.ValueType  # 5
+"""The runner cancelled the whole task at its time limit; stop_reason is
+STOP_REASON_CANCELLED. This is about the task: one model call that our code cancelled is
+LLM_CALL_STATUS_CANCELLED, and a budget running out is a stop reason, not an error.
 """
 Global___TaskErrorType: _TypeAlias = TaskErrorType  # noqa: Y015
 
 @_typing.final
 class TaskResult(_message.Message):
-    """How one task went in a run (spec §6.1): one line of the run's results file. Its score and
-    correctness are in its grade.
+    """How one task, one seed, went in one run (spec §6.1): one line of the run's results file. Its
+    score and correctness are in its grade, and in a run with gold answers every task gets one.
+    If several lines share run_id, instance_id and seed, the last one wins, so a late SWE grade is
+    appended as a new line. Breakdowns, by difficulty for Effi-SQL or by repository for SWE, join
+    on instance_id with the task's TaskInput, as its Trajectory records it: TaskInput itself
+    carries no ID.
     """
 
     DESCRIPTOR: _descriptor.Descriptor
@@ -78,8 +94,9 @@ class TaskResult(_message.Message):
     SEED_FIELD_NUMBER: _builtins.int
     GRADE_FIELD_NUMBER: _builtins.int
     WALL_TIME_S_FIELD_NUMBER: _builtins.int
+    PROVISION_S_FIELD_NUMBER: _builtins.int
     USAGE_FIELD_NUMBER: _builtins.int
-    STEPS_FIELD_NUMBER: _builtins.int
+    STEP_COUNT_FIELD_NUMBER: _builtins.int
     STOP_REASON_FIELD_NUMBER: _builtins.int
     ERROR_TYPE_FIELD_NUMBER: _builtins.int
     ERROR_MESSAGE_FIELD_NUMBER: _builtins.int
@@ -90,12 +107,20 @@ class TaskResult(_message.Message):
     instance_id: _builtins.str
     """The task."""
     seed: _builtins.int
-    """The replicate index (spec §6.1): which of the run's independent repeats this is."""
-    wall_time_s: _builtins.float
-    """How long the task took, in seconds, from started_at to finished_at: the wall time the
-    efficiency rules compare (spec §8.3).
+    """The 0-based replicate index (spec §6.1), which names the same replicate in every run. A
+    confirmation run takes a new index, so the evaluation cache never hands it a validation
+    seed's result.
     """
-    steps: _builtins.int
+    wall_time_s: _builtins.float
+    """The policy's solving time, in seconds: from receiving its provisioned environment to
+    returning the prediction. Slot waits, provisioning and grading are left out, so this is the
+    time the efficiency rules compare (spec §8.3).
+    """
+    provision_s: _builtins.float
+    """How long provisioning the task's environment took, in seconds: from started_at until the
+    policy received the environment.
+    """
+    step_count: _builtins.int
     """How many steps the agent took."""
     stop_reason: _trajectory_pb2.StopReason.ValueType
     """Why the agent stopped."""
@@ -105,8 +130,9 @@ class TaskResult(_message.Message):
     """The error's message; empty when error_type is TASK_ERROR_TYPE_NONE."""
     @_builtins.property
     def grade(self) -> _task_pb2.Grade:
-        """How the prediction was graded; absent if it was not, as in the organizers' runs, which have
-        no gold answers.
+        """How the task was graded. A task with no prediction, after a crash or an error, is graded as
+        an empty prediction: Effi-SQL scores 0, and SWE scores 1/gold speedup without an evaluation
+        run (spec §4.2). Absent only in a run without gold answers, such as an organizers' run.
         """
 
     @_builtins.property
@@ -115,11 +141,13 @@ class TaskResult(_message.Message):
 
     @_builtins.property
     def started_at(self) -> _timestamp_pb2.Timestamp:
-        """When the runner started the task."""
+        """When the task got its slot, after any queueing."""
 
     @_builtins.property
     def finished_at(self) -> _timestamp_pb2.Timestamp:
-        """When the policy returned or the task failed. Grading comes after and is not counted."""
+        """When the policy returned its prediction, or the task failed. Grading has its own timing,
+        such as SweGrade.eval_wall_s.
+        """
 
     def __init__(
         self,
@@ -129,8 +157,9 @@ class TaskResult(_message.Message):
         seed: _builtins.int = ...,
         grade: _task_pb2.Grade | None = ...,
         wall_time_s: _builtins.float = ...,
+        provision_s: _builtins.float = ...,
         usage: _llm_call_pb2.Usage | None = ...,
-        steps: _builtins.int = ...,
+        step_count: _builtins.int = ...,
         stop_reason: _trajectory_pb2.StopReason.ValueType = ...,
         error_type: Global___TaskErrorType.ValueType = ...,
         error_message: _builtins.str = ...,
@@ -139,7 +168,7 @@ class TaskResult(_message.Message):
     ) -> None: ...
     _HasFieldArgType: _TypeAlias = _typing.Literal["finished_at", b"finished_at", "grade", b"grade", "started_at", b"started_at", "usage", b"usage"]  # noqa: Y015
     def HasField(self, field_name: _HasFieldArgType) -> _builtins.bool: ...
-    _ClearFieldArgType: _TypeAlias = _typing.Literal["error_message", b"error_message", "error_type", b"error_type", "finished_at", b"finished_at", "grade", b"grade", "instance_id", b"instance_id", "run_id", b"run_id", "seed", b"seed", "started_at", b"started_at", "steps", b"steps", "stop_reason", b"stop_reason", "usage", b"usage", "wall_time_s", b"wall_time_s"]  # noqa: Y015
+    _ClearFieldArgType: _TypeAlias = _typing.Literal["error_message", b"error_message", "error_type", b"error_type", "finished_at", b"finished_at", "grade", b"grade", "instance_id", b"instance_id", "provision_s", b"provision_s", "run_id", b"run_id", "seed", b"seed", "started_at", b"started_at", "step_count", b"step_count", "stop_reason", b"stop_reason", "usage", b"usage", "wall_time_s", b"wall_time_s"]  # noqa: Y015
     def ClearField(self, field_name: _ClearFieldArgType) -> None: ...
     def WhichOneof(self, oneof_group: _Never) -> None: ...
 

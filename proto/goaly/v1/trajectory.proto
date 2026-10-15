@@ -8,29 +8,34 @@ import "goaly/v1/llm_call.proto";
 import "goaly/v1/task.proto";
 import "google/protobuf/timestamp.proto";
 
-// Everything the agent did on one task in one run (spec §5.1): one line of the run's
-// trajectories file.
+// Everything the agent did on one task, one seed, in one run (spec §5.1): one line of the run's
+// trajectories file. If several lines share run_id, instance_id and seed, the last one wins, so
+// a late grade is appended as a new line.
 message Trajectory {
   // The run it belongs to.
   string run_id = 1;
   // The task.
   string instance_id = 2;
-  // The replicate index (spec §6.1): which of the run's independent repeats this is.
+  // The 0-based replicate index (spec §6.1), which names the same replicate in every run. A
+  // confirmation run takes a new index, so the evaluation cache never hands it a validation
+  // seed's result.
   int32 seed = 3;
   // What the agent was given.
   TaskInput task = 4;
-  // The messages the first model call was sent: the system prompt and the task.
-  repeated ChatMessage initial_messages = 5;
-  // The steps, in order.
+  // The policy's conversations with the model, in the order they started. A policy with one
+  // conversation has exactly chats[0]; best-of-n, phases or a verifier have more (spec §5.2).
+  repeated Chat chats = 5;
+  // Every model call, of every chat, in the order the calls were made.
   repeated Step steps = 6;
   // What the policy returned; absent if it returned nothing, as when it crashed.
   Prediction prediction = 7;
-  // How the prediction was graded; absent until it is graded.
+  // How the prediction was graded, as in the task's TaskResult; absent until it is graded, and
+  // in a run without gold answers.
   Grade grade = 8;
   // Why the agent stopped.
   StopReason stop_reason = 9;
   // What went wrong, if the agent stopped on an error; empty otherwise.
-  string error = 10;
+  string error_message = 10;
   // The tokens and cost of every model call made for the task.
   Usage usage = 11;
   // When the agent started on the task.
@@ -39,11 +44,11 @@ message Trajectory {
   google.protobuf.Timestamp finished_at = 13;
 }
 
-// Why the agent stopped working on a task.
+// Why the agent stopped working on a task. TaskErrorType says which reason each error comes with.
 enum StopReason {
   // Not set.
   STOP_REASON_UNSPECIFIED = 0;
-  // The agent submitted its answer.
+  // A tool returned a submission (ToolResult.submission), which ended the episode.
   STOP_REASON_SUBMITTED = 1;
   // The step budget ran out (spec §5.1), so the policy's fallback answered (spec §5.4).
   STOP_REASON_STEP_BUDGET_EXHAUSTED = 2;
@@ -55,41 +60,76 @@ enum StopReason {
   STOP_REASON_COST_BUDGET_EXHAUSTED = 5;
   // The model made too many errors in a row (spec §5.1).
   STOP_REASON_CONSECUTIVE_ERRORS = 6;
-  // An exception stopped the agent; error says what it was.
+  // An exception ended the task; error_message says what it was.
   STOP_REASON_CRASHED = 7;
+  // The runner cancelled the task, for example at its time limit.
+  STOP_REASON_CANCELLED = 8;
 }
 
-// One model call and the tool calls it made (spec §5.1). A step holds only what it adds to the
-// chat, never the history before it. Before any folding, a call's prompt is the trajectory's
-// initial_messages, then each earlier step's assistant message, its tool results as tool
-// messages, and its injected messages.
+// One linear conversation with the model: each of its steps is sent everything before it in the
+// chat. Calls that are not sent each other's messages, such as best-of-n samples, belong to
+// separate chats.
+message Chat {
+  // A name the policy gives the chat, such as "main", "sample-2" or "verify".
+  string label = 1;
+  // The step whose full context the chat continues, as an index into Trajectory.steps; absent
+  // if the chat starts afresh. That context is the step's prompt, then its assistant message,
+  // tool results and injected messages, and it comes before initial_messages.
+  optional int32 forked_from_step = 2;
+  // The messages the chat starts with, after any forked context: for the first chat, the system
+  // prompt and the task. May be empty in a forked chat.
+  repeated ChatMessage initial_messages = 3;
+}
+
+// One model call and the tool calls it made (spec §5.1). A step holds only what it adds to its
+// chat, never the history before it. The prompt its call was sent is, in order:
+//   1. the forked context of its chat, if any;
+//   2. the chat's initial_messages;
+//   3. each earlier step of the same chat: its assistant message, its tool results as tool
+//      messages, and its injected messages.
+// Then every fold in effect at the step replaces the content of the tool message it names.
 message Step {
-  // The step's position in the trajectory, from 0.
+  // The step's position in Trajectory.steps, from 0.
   int32 index = 1;
+  // The chat it belongs to, as an index into Trajectory.chats.
+  int32 chat = 2;
   // The call_id of the LlmCallRecord of this step's model call.
-  string call_id = 2;
-  // When the model call started.
-  google.protobuf.Timestamp started_at = 3;
+  string call_id = 3;
+  // When the model call began, before any wait for a concurrency slot, as in its LlmCallRecord.
+  google.protobuf.Timestamp started_at = 4;
   // How long the whole model call took, in seconds, including any wait for a concurrency slot
   // or a backoff: the same as its LlmCallRecord.latency_s.
-  double latency_s = 4;
+  double latency_s = 5;
   // The tokens and cost of the model call.
-  Usage usage = 5;
-  // The context size at this call: how many tokens its prompt held.
-  int64 prompt_tokens = 6;
-  // True if older tool outputs were folded into summaries before this call (spec §5.1). The
-  // trajectory keeps them unfolded.
-  bool context_folded = 7;
+  Usage usage = 6;
+  // The harness's own count of the prompt's tokens before the call: the number the folding
+  // threshold compares (spec §5.1). usage.input_tokens is the gateway's count.
+  int64 estimated_prompt_tokens = 7;
+  // The tool outputs folded into summaries just before this call (spec §5.1). A fold stays in
+  // effect for the rest of the chat, and in any chat forked from this step or a later one.
+  repeated ContextFold folds = 8;
   // The message the model returned.
-  ChatMessage assistant = 8;
+  ChatMessage assistant = 9;
   // The results of the assistant's tool calls, in the order of its tool_calls.
-  repeated ToolResult tool_results = 9;
+  repeated ToolResult tool_results = 10;
   // Guidance the policy added after the tool results, such as a hint or a reminder of the tool
   // schemas (spec §5.1, §5.3).
-  repeated ChatMessage injected = 10;
+  repeated ChatMessage injected = 11;
 }
 
-// One message of a chat with the model, in the OpenAI chat format.
+// A tool output that the context manager replaced with a summary (spec §5.1). A model call that
+// writes such a summary is an ordinary step, in a chat the harness labels, e.g.
+// "fold-summarizer".
+message ContextFold {
+  // The step whose tool result was folded, as an index into Trajectory.steps.
+  int32 step = 1;
+  // The tool_call_id of that tool result.
+  string tool_call_id = 2;
+  // The text the model was sent instead of the tool result's content.
+  string replacement = 3;
+}
+
+// One message of a chat with the model, modeled on the OpenAI chat format.
 message ChatMessage {
   // Who the message is from.
   ChatRole role = 1;
@@ -127,8 +167,11 @@ message ToolCall {
   // The arguments, a JSON object as text, exactly as the model wrote it: possibly malformed or
   // truncated (spec §5.1). For a call parsed from XML, the parser writes it from the parameters.
   string arguments_json = 3;
+  // The arguments the tool actually ran with, after core repaired malformed JSON (spec §5.1);
+  // empty when no repair happened.
+  string repaired_arguments_json = 4;
   // Where the call was parsed from.
-  ToolCallSource source = 4;
+  ToolCallSource source = 5;
 }
 
 // Where a tool call was parsed from (spec §5.1).
@@ -144,7 +187,8 @@ enum ToolCallSource {
 }
 
 // The result of one tool call. The model sees it as a tool message: tool_call_id and content.
-// Tool.run returns content and is_error; the tool executor fills in the rest.
+// The tool fills content, is_error and submission; core's executor fills the rest, and writes
+// the error itself when the arguments are invalid, the call times out or the tool raises.
 message ToolResult {
   // The ID of the tool call this answers.
   string tool_call_id = 1;
@@ -152,10 +196,17 @@ message ToolResult {
   string name = 2;
   // The text shown to the model, after any truncation.
   string content = 3;
-  // True if the call failed: its arguments were invalid, it timed out, or the tool failed.
+  // True if the call itself failed: its arguments were invalid, it timed out, or the tool
+  // raised. A statement or command that ran and failed, such as SQL that raised an error or a
+  // command that exited non-zero, is a normal result. So the consecutive-error rule (spec
+  // §5.1) counts only calls that failed.
   bool is_error = 4;
   // True if the executor cut long output down to its start and end (spec §5.1).
   bool truncated = 5;
   // How long the tool ran, in seconds.
   double elapsed_s = 6;
+  // What the tool submits, if it submits. A tool ends the episode by returning a result with
+  // this set: the agent loop stops, and the policy decides whether to return it. So a pack
+  // can submit through any tool, one that verifies before it submits included.
+  optional Prediction submission = 7;
 }

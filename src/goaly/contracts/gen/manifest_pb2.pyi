@@ -35,6 +35,7 @@ class RunManifest(_message.Message):
     CONFIG_HASH_FIELD_NUMBER: _builtins.int
     DATASET_REVISION_FIELD_NUMBER: _builtins.int
     DATASET_NOTES_FIELD_NUMBER: _builtins.int
+    GOLD_SHA256_FIELD_NUMBER: _builtins.int
     MODELS_FIELD_NUMBER: _builtins.int
     SEEDS_FIELD_NUMBER: _builtins.int
     INSTANCE_IDS_FIELD_NUMBER: _builtins.int
@@ -46,7 +47,7 @@ class RunManifest(_message.Message):
     run_id: _builtins.str
     """A unique ID for the run."""
     benchmark: _builtins.str
-    """The benchmark, by its adapter's name, the same as the CLI's --bench: "birdcritic" or
+    """The benchmark, by its adapter's name, the same as the CLI's --bench: "effisql" or
     "swefficiency".
     """
     split: _task_pb2.Split.ValueType
@@ -58,11 +59,20 @@ class RunManifest(_message.Message):
     git_dirty: _builtins.bool
     """True if the working tree had uncommitted changes, so git_commit alone does not reproduce it."""
     harness_hash: _builtins.str
-    """The harness content hash, which keys the evaluation cache with the task and seed (spec §6.1)."""
+    """A content hash of the harness the run used: src/goaly/harness/core/ plus the run's pack,
+    its config.yaml, prompt and skills included. With the task and seed, it keys the evaluation
+    cache (spec §6.1).
+    """
     config_hash: _builtins.str
-    """A hash of the run's config."""
+    """A hash of the run's settings outside the harness: its CLI options, concurrency shares and
+    seeds.
+    """
     dataset_revision: _builtins.str
     """The revision of the dataset the tasks came from: the commit hash of its Hugging Face repo."""
+    gold_sha256: _builtins.str
+    """The SHA-256 of the gold-answer files the grader used that are not part of the dataset, in
+    hex; empty if there were none, as when the gold answers ship with the dataset.
+    """
     uv_lock_sha256: _builtins.str
     """The SHA-256 of uv.lock, in hex. The lock file pins every dependency's version (spec §10)."""
     @_builtins.property
@@ -77,7 +87,10 @@ class RunManifest(_message.Message):
 
     @_builtins.property
     def seeds(self) -> _containers.RepeatedScalarFieldContainer[_builtins.int]:
-        """The replicate indices the run ran (spec §6.1)."""
+        """The replicate indices the run ran (spec §6.1): 0-based, each naming the same replicate in
+        every run. A confirmation run takes a new index, so the evaluation cache never hands it a
+        validation seed's result.
+        """
 
     @_builtins.property
     def instance_ids(self) -> _containers.RepeatedScalarFieldContainer[_builtins.str]:
@@ -111,6 +124,7 @@ class RunManifest(_message.Message):
         config_hash: _builtins.str = ...,
         dataset_revision: _builtins.str = ...,
         dataset_notes: _abc.Iterable[_builtins.str] | None = ...,
+        gold_sha256: _builtins.str = ...,
         models: _abc.Iterable[Global___ModelSettings] | None = ...,
         seeds: _abc.Iterable[_builtins.int] | None = ...,
         instance_ids: _abc.Iterable[_builtins.str] | None = ...,
@@ -122,7 +136,7 @@ class RunManifest(_message.Message):
     ) -> None: ...
     _HasFieldArgType: _TypeAlias = _typing.Literal["finished_at", b"finished_at", "machine", b"machine", "started_at", b"started_at"]  # noqa: Y015
     def HasField(self, field_name: _HasFieldArgType) -> _builtins.bool: ...
-    _ClearFieldArgType: _TypeAlias = _typing.Literal["benchmark", b"benchmark", "command_line", b"command_line", "config_hash", b"config_hash", "dataset_notes", b"dataset_notes", "dataset_revision", b"dataset_revision", "finished_at", b"finished_at", "git_commit", b"git_commit", "git_dirty", b"git_dirty", "harness_hash", b"harness_hash", "instance_ids", b"instance_ids", "machine", b"machine", "models", b"models", "run_id", b"run_id", "seeds", b"seeds", "split", b"split", "started_at", b"started_at", "uv_lock_sha256", b"uv_lock_sha256"]  # noqa: Y015
+    _ClearFieldArgType: _TypeAlias = _typing.Literal["benchmark", b"benchmark", "command_line", b"command_line", "config_hash", b"config_hash", "dataset_notes", b"dataset_notes", "dataset_revision", b"dataset_revision", "finished_at", b"finished_at", "git_commit", b"git_commit", "git_dirty", b"git_dirty", "gold_sha256", b"gold_sha256", "harness_hash", b"harness_hash", "instance_ids", b"instance_ids", "machine", b"machine", "models", b"models", "run_id", b"run_id", "seeds", b"seeds", "split", b"split", "started_at", b"started_at", "uv_lock_sha256", b"uv_lock_sha256"]  # noqa: Y015
     def ClearField(self, field_name: _ClearFieldArgType) -> None: ...
     def WhichOneof(self, oneof_group: _Never) -> None: ...
 
@@ -130,7 +144,9 @@ Global___RunManifest: _TypeAlias = RunManifest  # noqa: Y015
 
 @_typing.final
 class ModelSettings(_message.Message):
-    """The settings a run called a model with."""
+    """The settings a run called a model with. A sampling parameter or limit that the run did not
+    send is absent, so it differs from 0: the gateway's default applied.
+    """
 
     DESCRIPTOR: _descriptor.Descriptor
 
@@ -156,17 +172,32 @@ class ModelSettings(_message.Message):
         self,
         *,
         model: _builtins.str = ...,
-        temperature: _builtins.float = ...,
-        top_p: _builtins.float = ...,
-        top_k: _builtins.int = ...,
-        max_tokens: _builtins.int = ...,
+        temperature: _builtins.float | None = ...,
+        top_p: _builtins.float | None = ...,
+        top_k: _builtins.int | None = ...,
+        max_tokens: _builtins.int | None = ...,
         thinking: _builtins.bool = ...,
     ) -> None: ...
-    _HasFieldArgType: _TypeAlias = _Never  # noqa: Y015
+    _HasFieldArgType: _TypeAlias = _typing.Literal["_max_tokens", b"_max_tokens", "_temperature", b"_temperature", "_top_k", b"_top_k", "_top_p", b"_top_p", "max_tokens", b"max_tokens", "temperature", b"temperature", "top_k", b"top_k", "top_p", b"top_p"]  # noqa: Y015
     def HasField(self, field_name: _HasFieldArgType) -> _builtins.bool: ...
-    _ClearFieldArgType: _TypeAlias = _typing.Literal["max_tokens", b"max_tokens", "model", b"model", "temperature", b"temperature", "thinking", b"thinking", "top_k", b"top_k", "top_p", b"top_p"]  # noqa: Y015
+    _ClearFieldArgType: _TypeAlias = _typing.Literal["_max_tokens", b"_max_tokens", "_temperature", b"_temperature", "_top_k", b"_top_k", "_top_p", b"_top_p", "max_tokens", b"max_tokens", "model", b"model", "temperature", b"temperature", "thinking", b"thinking", "top_k", b"top_k", "top_p", b"top_p"]  # noqa: Y015
     def ClearField(self, field_name: _ClearFieldArgType) -> None: ...
-    def WhichOneof(self, oneof_group: _Never) -> None: ...
+    _WhichOneofReturnType__max_tokens: _TypeAlias = _typing.Literal["max_tokens"]  # noqa: Y015
+    _WhichOneofArgType__max_tokens: _TypeAlias = _typing.Literal["_max_tokens", b"_max_tokens"]  # noqa: Y015
+    _WhichOneofReturnType__temperature: _TypeAlias = _typing.Literal["temperature"]  # noqa: Y015
+    _WhichOneofArgType__temperature: _TypeAlias = _typing.Literal["_temperature", b"_temperature"]  # noqa: Y015
+    _WhichOneofReturnType__top_k: _TypeAlias = _typing.Literal["top_k"]  # noqa: Y015
+    _WhichOneofArgType__top_k: _TypeAlias = _typing.Literal["_top_k", b"_top_k"]  # noqa: Y015
+    _WhichOneofReturnType__top_p: _TypeAlias = _typing.Literal["top_p"]  # noqa: Y015
+    _WhichOneofArgType__top_p: _TypeAlias = _typing.Literal["_top_p", b"_top_p"]  # noqa: Y015
+    @_typing.overload
+    def WhichOneof(self, oneof_group: _WhichOneofArgType__max_tokens) -> _WhichOneofReturnType__max_tokens | None: ...
+    @_typing.overload
+    def WhichOneof(self, oneof_group: _WhichOneofArgType__temperature) -> _WhichOneofReturnType__temperature | None: ...
+    @_typing.overload
+    def WhichOneof(self, oneof_group: _WhichOneofArgType__top_k) -> _WhichOneofReturnType__top_k | None: ...
+    @_typing.overload
+    def WhichOneof(self, oneof_group: _WhichOneofArgType__top_p) -> _WhichOneofReturnType__top_p | None: ...
 
 Global___ModelSettings: _TypeAlias = ModelSettings  # noqa: Y015
 

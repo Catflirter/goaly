@@ -10,7 +10,7 @@ import "google/protobuf/timestamp.proto";
 message RunManifest {
   // A unique ID for the run.
   string run_id = 1;
-  // The benchmark, by its adapter's name, the same as the CLI's --bench: "birdcritic" or
+  // The benchmark, by its adapter's name, the same as the CLI's --bench: "effisql" or
   // "swefficiency".
   string benchmark = 2;
   // The split the tasks came from; SPLIT_EXTERNAL for a task file from outside our splits, such
@@ -20,45 +20,54 @@ message RunManifest {
   string git_commit = 4;
   // True if the working tree had uncommitted changes, so git_commit alone does not reproduce it.
   bool git_dirty = 5;
-  // The harness content hash, which keys the evaluation cache with the task and seed (spec §6.1).
+  // A content hash of the harness the run used: src/goaly/harness/core/ plus the run's pack,
+  // its config.yaml, prompt and skills included. With the task and seed, it keys the evaluation
+  // cache (spec §6.1).
   string harness_hash = 6;
-  // A hash of the run's config.
+  // A hash of the run's settings outside the harness: its CLI options, concurrency shares and
+  // seeds.
   string config_hash = 7;
   // The revision of the dataset the tasks came from: the commit hash of its Hugging Face repo.
   string dataset_revision = 8;
   // How the loader changed the dataset, such as rewriting the SWE image registry (spec §4.2);
   // empty if it changed nothing.
   repeated string dataset_notes = 9;
+  // The SHA-256 of the gold-answer files the grader used that are not part of the dataset, in
+  // hex; empty if there were none, as when the gold answers ship with the dataset.
+  string gold_sha256 = 10;
   // The settings of every model the run called.
-  repeated ModelSettings models = 10;
-  // The replicate indices the run ran (spec §6.1).
-  repeated int32 seeds = 11;
+  repeated ModelSettings models = 11;
+  // The replicate indices the run ran (spec §6.1): 0-based, each naming the same replicate in
+  // every run. A confirmation run takes a new index, so the evaluation cache never hands it a
+  // validation seed's result.
+  repeated int32 seeds = 12;
   // The tasks the run ran.
-  repeated string instance_ids = 12;
+  repeated string instance_ids = 13;
   // The command that started the run, one argument per element.
-  repeated string command_line = 13;
+  repeated string command_line = 14;
   // When the run started.
-  google.protobuf.Timestamp started_at = 14;
+  google.protobuf.Timestamp started_at = 15;
   // When the run finished; absent until it does.
-  google.protobuf.Timestamp finished_at = 15;
+  google.protobuf.Timestamp finished_at = 16;
   // The machine the run ran on.
-  MachineInfo machine = 16;
+  MachineInfo machine = 17;
   // The SHA-256 of uv.lock, in hex. The lock file pins every dependency's version (spec §10).
-  string uv_lock_sha256 = 17;
+  string uv_lock_sha256 = 18;
 }
 
-// The settings a run called a model with.
+// The settings a run called a model with. A sampling parameter or limit that the run did not
+// send is absent, so it differs from 0: the gateway's default applied.
 message ModelSettings {
   // The model, by its name at the gateway, such as "qwen3.6-35b-a3b".
   string model = 1;
   // The sampling temperature.
-  double temperature = 2;
+  optional double temperature = 2;
   // Nucleus sampling: sampling chooses from the likeliest tokens up to this total probability.
-  double top_p = 3;
+  optional double top_p = 3;
   // How many of the likeliest tokens sampling chooses from.
-  int32 top_k = 4;
+  optional int32 top_k = 4;
   // The most tokens one call may generate.
-  int64 max_tokens = 5;
+  optional int64 max_tokens = 5;
   // True if the model's thinking was on.
   bool thinking = 6;
 }

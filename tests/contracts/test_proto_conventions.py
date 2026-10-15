@@ -1,4 +1,8 @@
-"""The conventions every contract in proto/goaly/v1/ follows (spec §3.3)."""
+"""The conventions every contract in proto/goaly/v1/ follows (spec §3.3).
+
+One rule no test can check: JSONL files key fields and enum values by name, so never rename one;
+when one is removed, reserve its name as well as its number.
+"""
 
 import re
 import subprocess
@@ -96,6 +100,11 @@ def documentable(file: FileDescriptorProto) -> Iterator[tuple[str, SourcePath]]:
             yield f"{enum.name}.{value.name}", (*path, ENUM_VALUE, index)
 
 
+def leading_comments(file: FileDescriptorProto) -> dict[SourcePath, str]:
+    """The comment above each element of ``file``, by source path."""
+    return {tuple(where.path): where.leading_comments for where in file.source_code_info.location}
+
+
 def test_every_file_is_proto3_in_package_goaly_v1(files: list[FileDescriptorProto]) -> None:
     assert [
         file.name for file in files if (file.syntax, file.package) != ("proto3", "goaly.v1")
@@ -105,8 +114,7 @@ def test_every_file_is_proto3_in_package_goaly_v1(files: list[FileDescriptorProt
 def test_every_element_has_a_comment(files: list[FileDescriptorProto]) -> None:
     undocumented = []
     for file in files:
-        locations = file.source_code_info.location
-        comments = {tuple(where.path): where.leading_comments for where in locations}
+        comments = leading_comments(file)
         undocumented += [
             f"{file.name}: {name}"
             for name, path in documentable(file)
@@ -146,6 +154,40 @@ def test_field_names_carry_their_units(
         for message, field, _ in fields(file)
         if field.name.endswith(suffix) and (field.type_name or types.get(field.type)) != expected
     ]
+
+    assert wrong == []
+
+
+def test_every_timestamp_is_named_at(files: list[FileDescriptorProto]) -> None:
+    # The other direction of the _at rule: no point in time goes by another name.
+    assert [
+        f"{message}.{field.name}"
+        for file in files
+        for message, field, _ in fields(file)
+        if field.type_name == ".google.protobuf.Timestamp" and not field.name.endswith("_at")
+    ] == []
+
+
+@pytest.mark.parametrize(
+    ("unit", "suffix"),
+    [
+        (r"\bseconds\b", "_s"),  # Durations.
+        (r"\bdollars\b", "_usd"),  # Money.
+    ],
+)
+def test_fields_documented_in_a_unit_carry_its_suffix(
+    files: list[FileDescriptorProto], unit: str, suffix: str
+) -> None:
+    # The other direction of the _s and _usd rules. A double does not say what it measures, so
+    # the unit its comment states stands in for its type.
+    wrong = []
+    for file in files:
+        comments = leading_comments(file)
+        wrong += [
+            f"{message}.{field.name}"
+            for message, field, path in fields(file)
+            if re.search(unit, comments.get(path, "")) and not field.name.endswith(suffix)
+        ]
 
     assert wrong == []
 

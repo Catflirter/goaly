@@ -11,11 +11,13 @@ message SqlResult {
   // The result's column names, in order.
   repeated string columns = 1;
   // The rows, in order, each a list of one value per column; only the first rows if truncated.
-  // SQL NULL is a null value, so it stays distinct from the string "NULL". A NaN or infinite
-  // float must be a string: protobuf's JSON mapping cannot write it as a number.
+  // SQL NULL is a null value, so it stays distinct from the string "NULL". Integers beyond
+  // ±2^53 and values of the SQL type numeric are strings, so no precision is lost. So are NaN
+  // and infinite floats, which protobuf's JSON mapping cannot write as numbers.
   repeated google.protobuf.ListValue rows = 2;
-  // How many rows the statement returned, before truncation.
-  int64 row_count = 3;
+  // For a statement that returns rows, how many it returned before truncation; for any other
+  // statement, how many rows it affected, as the database reports it.
+  int32 row_count = 3;
   // True if rows holds only the first of the row_count rows.
   bool truncated = 4;
   // The database's error message, or empty if the statement succeeded.
@@ -28,10 +30,12 @@ message SqlResult {
 message ShellResult {
   // The command's exit status; 0 means success.
   int32 exit_code = 1;
-  // What the command wrote to standard output.
+  // What the command wrote to standard output, as UTF-8; invalid bytes become U+FFFD.
   string stdout = 2;
-  // What the command wrote to standard error.
+  // What the command wrote to standard error, as UTF-8; invalid bytes become U+FFFD.
   string stderr = 3;
+  // True if the environment capped stdout or stderr, so it holds only part of the output.
+  bool truncated = 6;
   // True if the command ran past its timeout and was stopped; exit_code then means nothing.
   bool timed_out = 4;
   // How long the command ran, in seconds.
