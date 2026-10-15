@@ -9,4 +9,5 @@ Rules:
 Tools:
 
 - execute_sql runs a query and shows its row count, its first rows and its execution time. Use it to check results and to time queries.
+- verify_equivalence counts the rows on which your rewrite and the original query disagree, in both directions. Call it once with your final rewrite before submitting; if the answer is not EQUIVALENT, or the call errors or times out, submit the original query unchanged instead.
 - submit hands in your final query and ends the task.

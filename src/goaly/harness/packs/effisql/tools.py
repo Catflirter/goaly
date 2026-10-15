@@ -1,10 +1,15 @@
-"""Effi-SQL's two v0 tools (spec §5.4): execute_sql, to run and time queries, and submit.
+"""Effi-SQL's v0 tools (spec §5.4): execute_sql, to run and time queries; verify_equivalence,
+to check a rewrite's rows against the original query's; and submit.
 
 execute_sql runs one query in the task's read-only solving database and shows the model its first
 rows, or the error, with how long it ran and, apart from that, how long it waited for a statement
 slot. Its statement timeout is enforced by the environment, which cancels the statement from the
 client. The policy binds it with the task's wall budget as core's executor backstop (600 s in v0),
 which also bounds the queue wait, so a timed-out statement is an ordinary result.
+
+verify_equivalence runs both queries once in one statement, the bidirectional EXCEPT ALL diff of
+their results, and answers EQUIVALENT, the number of differing rows, or the database's error. It
+reuses execute_sql's plumbing: the same statement timeout and the wall budget as its backstop.
 """
 
 from pydantic import BaseModel, ConfigDict, Field
@@ -67,6 +72,69 @@ class ExecuteSql:
     async def run(self, args: ExecuteSqlArgs, env: SqlEnvironment) -> ToolResult:
         result = await env.execute(args.sql, timeout_s=self.config.statement_timeout_s)
         return ToolResult(content=render(result, self.config))
+
+
+class VerifyEquivalenceArgs(BaseModel):
+    """Check a rewrite against the original query before you submit it.
+
+    Call this once with your final rewrite before submitting. If the result is not EQUIVALENT,
+    or the call errors or times out, submit the base query unchanged instead.
+    """
+
+    base_sql: str = Field(min_length=1, pattern=r"\S", description="The original query, unchanged.")
+    candidate_sql: str = Field(
+        min_length=1, pattern=r"\S", description="The rewritten query you plan to submit."
+    )
+
+
+class VerifyEquivalence:
+    """Counts the rows on which a rewrite and the original query disagree, both directions."""
+
+    name = "verify_equivalence"
+    description = (
+        "Check your final rewrite against the original query in one call: it counts the rows "
+        "one result has that the other does not, in both directions (EXCEPT ALL), and answers "
+        "EQUIVALENT when there are none, NOT EQUIVALENT with the number of differing rows, or "
+        "the database's error, such as a column-count mismatch. It runs the queries, so it can "
+        "take as long as the slower of the two."
+    )
+    args_model = VerifyEquivalenceArgs
+
+    def __init__(self, config: ExecuteSqlConfig) -> None:
+        self.config = config
+
+    async def run(self, args: VerifyEquivalenceArgs, env: SqlEnvironment) -> ToolResult:
+        verdict = await verify_equivalence(
+            args.base_sql, args.candidate_sql, env, self.config.statement_timeout_s
+        )
+        return ToolResult(content=verdict)
+
+
+async def verify_equivalence(
+    base_sql: str, candidate_sql: str, env: SqlEnvironment, timeout_s: float
+) -> str:
+    """Diff the two queries' results in one statement and report whether they match.
+
+    Call this once with your final rewrite before submitting. If the result is not EQUIVALENT,
+    or the call errors or times out, submit the base query unchanged instead.
+    """
+    base = base_sql.strip().rstrip(";").rstrip()
+    candidate = candidate_sql.strip().rstrip(";").rstrip()
+    statement = (
+        "SELECT count(*) AS diffs FROM ("  # noqa: S608  # The model's own queries, read-only.
+        f"(SELECT * FROM ({candidate}) c EXCEPT ALL SELECT * FROM ({base}) b)"
+        f" UNION ALL (SELECT * FROM ({base}) b EXCEPT ALL SELECT * FROM ({candidate}) c)"
+        ") d"
+    )
+    result = await env.execute(statement, timeout_s=timeout_s)
+    if result.error:
+        return result.error
+    values = iter(result.rows[0].items()) if result.rows else iter(())
+    value = next(values, None)
+    if not isinstance(value, float | str):
+        return "the database returned no count, so equivalence is unknown"
+    diffs = int(value)
+    return "EQUIVALENT" if diffs == 0 else f"NOT EQUIVALENT: {diffs} differing rows"
 
 
 class Submit:

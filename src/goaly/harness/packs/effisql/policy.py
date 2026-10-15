@@ -21,7 +21,7 @@ from goaly.harness.core.agent import AgentContext, AgentHooks, run_agent
 from goaly.harness.core.budgets import Budgets
 from goaly.harness.core.tools import ToolRegistry, bind
 
-from .tools import ExecuteSql, ExecuteSqlConfig, Submit
+from .tools import ExecuteSql, ExecuteSqlConfig, Submit, VerifyEquivalence
 
 
 class PackConfig(BaseModel):
@@ -56,11 +56,13 @@ class EffiSqlPolicy:
 
 
 def registry(config: PackConfig, budgets: Budgets) -> ToolRegistry[SqlEnvironment]:
-    """The tools: execute_sql with the task's wall budget as its backstop, and submit."""
+    """The tools: execute_sql and verify_equivalence with the task's wall budget as their
+    backstop, and submit."""
     execute_sql = ExecuteSql(config.execute_sql)
     return ToolRegistry(
         [
             bind(execute_sql, timeout_s=budgets.wall_clock_s),
+            bind(VerifyEquivalence(config.execute_sql), timeout_s=budgets.wall_clock_s),
             bind(Submit(), timeout_s=config.submit_timeout_s),
         ]
     )

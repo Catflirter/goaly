@@ -10,7 +10,7 @@ from pydantic import ValidationError
 
 from goaly.contracts.gen.environment_pb2 import SqlResult
 from goaly.contracts.gen.task_pb2 import EffiSqlTaskInput, SweTaskInput, TaskInput
-from goaly.contracts.gen.trajectory_pb2 import StopReason
+from goaly.contracts.gen.trajectory_pb2 import ChatRole, StopReason
 from goaly.contracts.interfaces import Policy, SqlEnvironment
 from goaly.harness.core.agent import AgentContext
 from goaly.harness.core.budgets import Budgets
@@ -93,8 +93,39 @@ class TestSolve:
         sent: Any = json.loads(json.dumps(llm.requests[0].tools))
         assert [tool["function"]["name"] for tool in sent] == [
             "execute_sql",
+            "verify_equivalence",
             "submit",
         ]
+
+    async def test_the_model_can_verify_a_rewrite_before_submitting_it(self) -> None:
+        env = FakeSqlEnvironment()  # Nothing canned: the diff statement comes back as an error.
+        llm = FakeLLM(
+            [
+                reply(
+                    tool_call("verify_equivalence", {"base_sql": BASE_SQL, "candidate_sql": FASTER})
+                ),
+                reply(tool_call("submit", {"sql": BASE_SQL})),
+            ]
+        )
+
+        prediction = await policy().solve(TASK, env, context(llm))
+
+        assert prediction.effisql.sql == BASE_SQL
+        assert not prediction.fallback
+        assert len(env.executed) == 1  # The one fixed statement, with the statement timeout.
+        statement, timeout = env.executed[0]
+        assert timeout == 120.0
+        assert statement.count("EXCEPT ALL") == 2
+        assert statement.count(f"({FASTER})") == 2
+        assert statement.count(f"({BASE_SQL})") == 2
+        assert statement.startswith("SELECT count(*) AS diffs FROM (")
+        assert statement.endswith(") d")
+        verdict = next(
+            message.content
+            for message in llm.requests[1].messages
+            if message.role == ChatRole.CHAT_ROLE_TOOL
+        )
+        assert verdict.startswith("no canned result for")  # The database's error, as it is.
 
     async def test_running_out_of_steps_submits_base_sql_unchanged(self) -> None:
         env = FakeSqlEnvironment({FASTER: SqlResult(row_count=1)})
