@@ -12,14 +12,18 @@ from typing import Any, cast
 
 import psycopg
 import pytest
+from psycopg.rows import tuple_row
 
 from goaly.bench.effisql import grader
 from goaly.bench.effisql.grader import (
+    HARD_CAP_MARGIN_S,
     LONG_RUN_MS,
     SPEEDUP_CAP,
     DigestBuilder,
     GraderError,
+    GradingFailure,
     PgSession,
+    Psycopg2Timestamptz,
     QueryError,
     QueryTimeoutError,
     ResultDigest,
@@ -93,9 +97,35 @@ class TestDigest:
         assert ResultDigest.from_json(digest.to_json()) == digest
         assert len(str(digest.to_json()["row_hash_sum"])) == 64
 
-    def test_from_json_rejects_a_malformed_value(self) -> None:
-        with pytest.raises(ValueError, match="not a result digest"):
-            ResultDigest.from_json({"row_count": "3", "row_hash_sum": "00", "complete": True})
+    @pytest.mark.parametrize(
+        "value",
+        [
+            pytest.param(
+                {"row_count": "3", "row_hash_sum": "0" * 64, "complete": True}, id="text count"
+            ),
+            pytest.param(
+                {"row_count": True, "row_hash_sum": "0" * 64, "complete": True}, id="bool count"
+            ),
+            pytest.param(
+                {"row_count": -1, "row_hash_sum": "0" * 64, "complete": True}, id="negative"
+            ),
+            pytest.param(
+                {"row_count": 3, "row_hash_sum": "0" * 63, "complete": True}, id="short sum"
+            ),
+            pytest.param(
+                {"row_count": 3, "row_hash_sum": "-" + "0" * 63, "complete": True}, id="sign"
+            ),
+            pytest.param(
+                {"row_count": 3, "row_hash_sum": "f" * 65, "complete": True}, id="long sum"
+            ),
+            pytest.param({"row_count": 3, "row_hash_sum": "0" * 64, "complete": 1}, id="int flag"),
+            pytest.param({"row_count": 3, "complete": True}, id="missing sum"),
+            pytest.param([3, "0" * 64, True], id="not an object"),
+        ],
+    )
+    def test_from_json_rejects_a_malformed_value(self, value: object) -> None:
+        with pytest.raises(ValueError, match="result digest"):
+            ResultDigest.from_json(value)
 
 
 class TestPsycopg2RowStrings:
@@ -279,8 +309,8 @@ class TestWatchdog:
         fired = threading.Event()
         watchdog = Watchdog(fired.set)
         try:
-            watchdog.arm(0.05)
-            assert fired.wait(2.0)
+            watchdog.arm(0.01)
+            assert fired.wait(10)
             assert watchdog.disarm()
         finally:
             watchdog.close()
@@ -289,50 +319,52 @@ class TestWatchdog:
         fired = threading.Event()
         watchdog = Watchdog(fired.set)
         try:
-            watchdog.arm(0.2)
+            watchdog.arm(60)
             assert not watchdog.disarm()
-            assert not fired.wait(0.4)
+            watchdog.arm(60)  # Re-arming resets the deadline and the fired flag.
+            assert not watchdog.disarm()
         finally:
             watchdog.close()
+        assert not fired.is_set()
 
-    def test_extend_moves_the_deadline_up_to_the_hard_limit(self) -> None:
-        fired = threading.Event()
-        watchdog = Watchdog(fired.set)
+    def test_disarm_waits_for_a_cancel_in_flight(self) -> None:
+        """A cancel fired as a statement ends must finish before the next statement starts."""
+        entered, release = threading.Event(), threading.Event()
+        log: list[str] = []
+
+        def slow_cancel() -> None:
+            entered.set()
+            release.wait(10)
+            log.append("cancel done")
+
+        watchdog = Watchdog(slow_cancel)
         try:
-            started = time.monotonic()
-            watchdog.arm(0.1, hard_s=0.3)
-            watchdog.extend(10.0)
-            assert fired.wait(2.0)
-            assert 0.25 <= time.monotonic() - started < 1.5
+            watchdog.arm(0.0)
+            assert entered.wait(10)
+            disarmed = threading.Thread(target=lambda: log.append(f"disarm {watchdog.disarm()}"))
+            disarmed.start()
+            disarmed.join(0.2)
+            assert disarmed.is_alive(), "disarm returned while the cancel was in flight"
+            release.set()
+            disarmed.join(10)
+            assert log == ["cancel done", "disarm True"]
         finally:
+            release.set()
             watchdog.close()
 
-    def test_extend_without_a_deadline_does_nothing(self) -> None:
-        fired = threading.Event()
-        watchdog = Watchdog(fired.set)
-        try:
-            watchdog.extend(1.0)
-            assert not fired.wait(0.1)
-        finally:
-            watchdog.close()
-
-    def test_a_failing_cancel_is_ignored(self) -> None:
-        calls: list[int] = []
+    def test_a_failing_cancel_is_ignored_and_the_watchdog_still_works(self) -> None:
+        calls = threading.Semaphore(0)
 
         def cancel() -> None:
-            calls.append(1)
+            calls.release()
             raise psycopg.OperationalError("already idle")
 
         watchdog = Watchdog(cancel)
         try:
-            watchdog.arm(0.01)
-            deadline = time.monotonic() + 2
-            while not calls and time.monotonic() < deadline:
-                time.sleep(0.01)
-            watchdog.arm(0.01)  # Still running: it fires again.
-            while len(calls) < 2 and time.monotonic() < deadline:
-                time.sleep(0.01)
-            assert len(calls) == 2
+            for _ in range(2):
+                watchdog.arm(0.0)
+                assert calls.acquire(timeout=10)
+                assert watchdog.disarm()
         finally:
             watchdog.close()
 
@@ -374,23 +406,28 @@ class FakeConn:
         self.broken = False
         self.autocommit = False
         self.read_only: bool | None = None
+        self.row_factory: object = None
+        self.prepare_threshold: int | None = 5
         self.cancels = 0
         self.stream_closed = False
-        self.registered: list[str] = []
+        self.registered: list[str | int] = []
         self.adapters = self
+        self.types = psycopg.adapters.types
         self._rows = rows
         self.explain = explain
-        self.fail_setup = False
+        self.fail_on: str | None = None  # A session statement that fails, such as DISCARD ALL.
 
-    def register_loader(self, name: str, _loader: object) -> None:
+    def register_loader(self, name: str | int, _loader: object) -> None:
         self.registered.append(name)
 
     def execute(self, query: str) -> None:
-        if self.fail_setup:
+        if self.fail_on is not None and query.startswith(self.fail_on):
             raise psycopg.OperationalError("")
         self.statements.append(query)
 
     def cursor(self) -> FakeCursor:
+        if self.closed:
+            raise psycopg.OperationalError("the connection is closed")
         return FakeCursor(self)
 
     @contextmanager
@@ -399,6 +436,8 @@ class FakeConn:
         assert self.read_only is True
         self.transactions += 1
         yield
+        if self.closed:
+            raise psycopg.OperationalError("the connection is closed")
 
     def stream_rows(self, _query: str) -> Generator[Row]:
         try:
@@ -417,26 +456,46 @@ def session_on(conn: FakeConn, **kwargs: Any) -> PgSession:
     return PgSession(conn, **kwargs)  # type: ignore[arg-type]  # A structural fake.
 
 
+SETTINGS = "SET statement_timeout = 300000"
+RESET = ["DISCARD ALL", SETTINGS]
+
+
+def raising(error: Exception) -> Callable[[], Iterator[Row]]:
+    def rows() -> Iterator[Row]:
+        raise error
+
+    return rows
+
+
 class TestPgSession:
     def test_setup_makes_the_session_read_only_with_psycopg2_types(self) -> None:
         conn = FakeConn()
-        session_on(conn).close()
+        with session_on(conn):
+            pass
         assert conn.autocommit
         assert conn.read_only is True
-        assert conn.registered == ["uuid", "inet", "cidr", "record", "timestamptz"]
-        assert conn.statements == ["SET statement_timeout = 660000"]
+        assert conn.row_factory is tuple_row
+        assert conn.prepare_threshold is None
+        types = psycopg.adapters.types
+        arrays = [types[name].array_oid for name in ("uuid", "inet", "cidr", "record", "money")]
+        assert conn.registered[:4] == ["uuid", "inet", "cidr", "record"]
+        assert set(arrays) <= set(conn.registered)
+        assert conn.registered[-1] == "timestamptz"
+        assert conn.statements == [SETTINGS]
         assert conn.closed
 
-    def test_digest_streams_and_hashes_every_row(self) -> None:
+    def test_the_server_timeout_follows_the_session_timeout(self) -> None:
+        conn = FakeConn()
+        session_on(conn, timeout_s=1.5).close()
+        assert conn.statements == ["SET statement_timeout = 1500"]
+
+    def test_digest_streams_and_hashes_every_row_then_resets(self) -> None:
         rows = [(i, f"r{i}") for i in range(12_001)]
         conn = FakeConn(rows=lambda: iter(rows))
-        session = session_on(conn)
-        try:
+        with session_on(conn) as session:
             digest = session.digest(" SELECT * FROM t ; ")
-        finally:
-            session.close()
         assert digest == digest_of(rows)
-        assert conn.statements[-1] == "SELECT * FROM t"
+        assert conn.statements == [SETTINGS, "SELECT * FROM t", *RESET]
         assert conn.transactions == 1
 
     def test_digest_stops_past_the_row_limit_and_closes_the_stream(self) -> None:
@@ -447,11 +506,8 @@ class TestPgSession:
                 yield (i,)
 
         conn = FakeConn(rows=endless)
-        session = session_on(conn)
-        try:
+        with session_on(conn) as session:
             digest = session.digest("SELECT x", row_limit=7)
-        finally:
-            session.close()
         assert not digest.complete
         assert digest.row_count > 7
         assert conn.stream_closed
@@ -460,101 +516,99 @@ class TestPgSession:
         ("error", "expected", "message"),
         [
             (psycopg.errors.SyntaxError("syntax error at or near x"), QueryError, "syntax"),
-            (psycopg.errors.QueryCanceled("canceling statement"), QueryTimeoutError, "after 300"),
+            (
+                psycopg.errors.QueryCanceled("canceling statement due to statement timeout"),
+                QueryTimeoutError,
+                r"statement timeout \(300 s\)",
+            ),
         ],
     )
-    def test_errors_map_to_the_graders(
+    def test_errors_map_to_the_graders_and_the_session_resets(
         self, error: Exception, expected: type[Exception], message: str
     ) -> None:
-        def failing() -> Iterator[Row]:
-            raise error
-
-        conn = FakeConn(rows=failing)
-        session = session_on(conn)
-        try:
+        conn = FakeConn(rows=raising(error))
+        with session_on(conn) as session:
             with pytest.raises(expected, match=message):
                 session.digest("SELECT 1")
-        finally:
-            session.close()
+            assert conn.statements[-2:] == RESET
+            assert isinstance(expected("x"), GradingFailure)
 
-    def test_a_broken_connection_is_a_grader_error(self) -> None:
+    def test_a_dead_connection_is_a_grader_error_every_time(self) -> None:
         conn = FakeConn()
 
         def lost() -> Iterator[Row]:
-            conn.broken = True
+            conn.broken = conn.closed = True
             raise psycopg.OperationalError("server closed the connection unexpectedly")
 
         conn._rows = lost
         session = session_on(conn)
-        try:
-            with pytest.raises(GraderError, match="server closed"):
+        with pytest.raises(GraderError, match="server closed"):
+            session.digest("SELECT 1")
+        for _ in range(2):  # The connection stays dead: never a raw psycopg error.
+            with pytest.raises(GraderError, match="the connection is closed"):
                 session.digest("SELECT 1")
-        finally:
-            session.close()
+            with pytest.raises(GraderError):
+                session.plan("SELECT 1")
+        assert "DISCARD ALL" not in conn.statements
 
-    def test_the_watchdog_cancels_a_slow_statement(self) -> None:
+    def test_a_failed_reset_is_a_grader_error(self) -> None:
+        conn = FakeConn(rows=lambda: iter([(1,)]))
+        conn.fail_on = "DISCARD ALL"
+        with session_on(conn) as session, pytest.raises(GraderError, match="cannot reset"):
+            session.digest("SELECT 1")
+
+    def test_the_hard_cap_cancels_a_hung_statement(self) -> None:
         conn = FakeConn()
 
-        def slow() -> Iterator[Row]:
-            deadline = time.monotonic() + 5
+        def hung() -> Iterator[Row]:
+            deadline = time.monotonic() + 10
             while not conn.cancels and time.monotonic() < deadline:
                 time.sleep(0.005)
             raise psycopg.errors.QueryCanceled("canceling statement due to user request")
 
-        conn._rows = slow
-        session = session_on(conn, timeout_s=0.05)
-        try:
-            with pytest.raises(QueryTimeoutError):
-                session.digest("SELECT pg_sleep(10)")
-        finally:
-            session.close()
+        conn._rows = hung
+        with (
+            session_on(conn, hard_cap_s=0.01) as session,
+            pytest.raises(QueryTimeoutError, match="hard cap"),
+        ):
+            session.digest("SELECT pg_sleep(1000)")
         assert conn.cancels == 1
+
+    def test_the_default_hard_cap_is_twice_the_timeout_plus_a_margin(self) -> None:
+        with session_on(FakeConn(), timeout_s=10) as session:
+            assert session._hard_cap_s == 20 + HARD_CAP_MARGIN_S
 
     def test_execution_ms_reads_explain_analyze(self) -> None:
         conn = FakeConn(explain=lambda _: ([{"Plan": {}, "Execution Time": 12.5}],))
-        session = session_on(conn)
-        try:
+        with session_on(conn) as session:
             assert session.execution_ms("SELECT 1;") == 12.5
-        finally:
-            session.close()
-        assert conn.statements[-1] == "EXPLAIN (ANALYZE, FORMAT JSON) SELECT 1"
+        assert conn.statements == [SETTINGS, "EXPLAIN (ANALYZE, FORMAT JSON) SELECT 1", *RESET]
 
     def test_plan_parses_text_and_only_plans(self) -> None:
         conn = FakeConn(explain=lambda _: ('[{"Plan": {"Node Type": "Result"}}]',))
-        session = session_on(conn)
-        try:
+        with session_on(conn) as session:
             assert session.plan("SELECT 1") == {"Plan": {"Node Type": "Result"}}
-        finally:
-            session.close()
-        assert conn.statements[-1] == "EXPLAIN (FORMAT JSON) SELECT 1"
+        assert conn.statements[1] == "EXPLAIN (FORMAT JSON) SELECT 1"
 
     @pytest.mark.parametrize(
         ("row", "message"),
         [
             (None, "no plan document"),
             (([],), "no plan document"),
+            (("not json",), "not JSON"),
             (([{"Plan": {}}],), "no Execution Time"),
         ],
     )
     def test_a_malformed_explain_is_a_grader_error(self, row: Row | None, message: str) -> None:
         conn = FakeConn(explain=lambda _: row)
-        session = session_on(conn)
-        try:
-            with pytest.raises(GraderError, match=message):
-                session.execution_ms("SELECT 1")
-        finally:
-            session.close()
+        with session_on(conn) as session, pytest.raises(GraderError, match=message):
+            session.execution_ms("SELECT 1")
 
     def test_an_explain_error_is_the_querys(self) -> None:
-        conn = FakeConn(
-            explain=lambda _: psycopg.errors.UndefinedTable("relation x does not exist")
-        )
-        session = session_on(conn)
-        try:
-            with pytest.raises(QueryError, match="relation x does not exist"):
-                session.plan("SELECT * FROM x")
-        finally:
-            session.close()
+        error = psycopg.errors.UndefinedTable("relation x does not exist")
+        conn = FakeConn(explain=lambda _: error)
+        with session_on(conn) as session, pytest.raises(QueryError, match="x does not exist"):
+            session.plan("SELECT * FROM x")
 
     def test_open_reports_a_failed_connection(self) -> None:
         def connect(_db: str) -> psycopg.Connection[Any]:
@@ -565,9 +619,15 @@ class TestPgSession:
 
     def test_open_closes_a_connection_it_cannot_set_up(self) -> None:
         conn = FakeConn()
-
-        conn.fail_setup = True
+        conn.fail_on = "SET"
         with pytest.raises(GraderError, match="cannot set up the session on tpch"):
+            PgSession.open(lambda _db: conn, "tpch")  # type: ignore[arg-type,return-value]  # A structural fake.
+        assert conn.closed
+
+    def test_an_old_libpq_is_refused(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        monkeypatch.setattr(psycopg.pq, "version", lambda: 160004)
+        conn = FakeConn()
+        with pytest.raises(GraderError, match="libpq 160004 is too old"):
             PgSession.open(lambda _db: conn, "tpch")  # type: ignore[arg-type,return-value]  # A structural fake.
         assert conn.closed
 
@@ -576,3 +636,42 @@ class TestPgSession:
         session = PgSession.open(lambda _db: conn, "tpch")  # type: ignore[arg-type,return-value]  # A structural fake.
         assert session.connection is cast(Any, conn)
         session.close()
+
+
+class TestPsycopg2Timestamptz:
+    """The loader on its own, without a server: the session's time zone is UTC then."""
+
+    def load(self, text: bytes) -> datetime:
+        loader = Psycopg2Timestamptz(psycopg.adapters.types["timestamptz"].oid, None)
+        return loader.load(text)
+
+    def test_a_fixed_offset_utc_as_psycopg2_builds_it(self) -> None:
+        value = self.load(b"2026-10-15 05:28:00+00")
+        assert value.tzinfo is UTC
+        assert str((value,)) == (
+            "(datetime.datetime(2026, 10, 15, 5, 28, tzinfo=datetime.timezone.utc),)"
+        )
+
+    def test_another_offset_is_the_same_instant_with_a_fixed_offset(self) -> None:
+        value = self.load(b"1995-01-01 00:00:00+05:30")
+        assert value == datetime(1994, 12, 31, 18, 30, tzinfo=UTC)
+        assert type(value.tzinfo) is timezone
+
+
+def test_the_evaluators_constants() -> None:
+    assert grader.STATEMENT_TIMEOUT_S == 300.0
+    assert grader.LONG_RUN_MS == 60_000.0
+    assert grader.TIMING_RUNS == 3
+    assert grader.SPEEDUP_CAP == 1000.0
+    assert grader.ZERO_TIME_MS == 0.001
+    assert grader.FETCH_CHUNK_ROWS == 5000
+    assert grader.MIN_LIBPQ_VERSION == 170000
+
+
+@pytest.mark.parametrize("runs", [0, -1])
+def test_timing_needs_a_run(runs: int) -> None:
+    rng = random.Random(0)  # noqa: S311  # A reproducible order, not a secret.
+    with pytest.raises(ValueError, match="at least 1 run"):
+        time_interleaved(lambda: 1.0, lambda: 1.0, rng=rng, runs=runs)
+    with pytest.raises(ValueError, match="at least 1 run"):
+        time_prediction(lambda: 1.0, base_ms=1.0, runs=runs)
