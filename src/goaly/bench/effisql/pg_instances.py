@@ -73,6 +73,7 @@ __all__ = [
     "INSTANCES",
     "PYTHON_CPUS",
     "ROLE_DEFAULTS",
+    "SERVER_SETTINGS",
     "SOLVING",
     "Instance",
     "InstanceError",
@@ -85,6 +86,7 @@ __all__ = [
     "database_statements",
     "environment_settings",
     "fetch_server_settings",
+    "fetch_server_settings_sync",
     "instance_spec",
     "instance_status",
     "logical_cpus",
@@ -414,7 +416,8 @@ def count_problems(
 
 
 # The server settings that change plans and timings; all stay the postgres:16 defaults, as in
-# the official TPC-H container.
+# the official TPC-H container. The settings read also hold every enable_* planner switch and
+# whatever the image's configuration file sets, such as DateStyle, TimeZone and the locales.
 SERVER_SETTINGS = (
     "server_version",
     "shared_buffers",
@@ -422,22 +425,52 @@ SERVER_SETTINGS = (
     "hash_mem_multiplier",
     "maintenance_work_mem",
     "effective_cache_size",
+    "effective_io_concurrency",
     "jit",
     "max_worker_processes",
     "max_parallel_workers",
     "max_parallel_workers_per_gather",
+    "parallel_setup_cost",
+    "parallel_tuple_cost",
+    "min_parallel_table_scan_size",
+    "min_parallel_index_scan_size",
+    "seq_page_cost",
     "random_page_cost",
+    "cpu_tuple_cost",
+    "cpu_index_tuple_cost",
+    "cpu_operator_cost",
     "default_statistics_target",
+    "from_collapse_limit",
+    "join_collapse_limit",
+    "geqo_threshold",
+)
+_SETTINGS_SQL = (
+    "SELECT name, current_setting(name) FROM pg_settings WHERE name = ANY(%s) "
+    "OR name LIKE 'enable\\_%%' OR source = 'configuration file' ORDER BY name"
 )
 
 
 async def fetch_server_settings(conn: psycopg.AsyncConnection[Any]) -> dict[str, str]:
-    """Read :data:`SERVER_SETTINGS` from a running instance, as SHOW prints them."""
-    cursor = await conn.execute(
-        "SELECT name, current_setting(name) FROM unnest(%s::text[]) AS name",
-        [list(SERVER_SETTINGS)],
-    )
-    return dict(await cursor.fetchall())
+    """Read the settings that change plans and timings from an instance, as SHOW prints them.
+
+    They are :data:`SERVER_SETTINGS`, every ``enable_*`` planner switch and each setting the
+    image's configuration file sets. Any role can read them. The five containers share one image
+    and one command line, so one instance speaks for all; comparing them is the caller's job.
+    """
+    cursor = await conn.execute(_SETTINGS_SQL, [list(SERVER_SETTINGS)])
+    return _server_settings(await cursor.fetchall())
+
+
+def fetch_server_settings_sync(conn: psycopg.Connection[Any]) -> dict[str, str]:
+    """:func:`fetch_server_settings` over a sync connection."""
+    return _server_settings(conn.execute(_SETTINGS_SQL, [list(SERVER_SETTINGS)]).fetchall())
+
+
+def _server_settings(rows: Sequence[Sequence[Any]]) -> dict[str, str]:
+    settings = {str(name): str(value) for name, value in rows}
+    if missing := [name for name in SERVER_SETTINGS if name not in settings]:
+        raise InstanceError(f"the server does not report the settings {missing}")
+    return settings
 
 
 def environment_settings(
@@ -448,11 +481,21 @@ def environment_settings(
 ) -> dict[str, str]:
     """The settings that can change Effi-SQL results, for ``RunManifest.environment_settings``.
 
-    They are the image, the server settings (from :func:`fetch_server_settings`), the dbgen
-    build, every data file's checksum and the CPU pinning.
+    They are the image the instances run, the server settings (from
+    :func:`fetch_server_settings`), what the golden build ran in and made of the cluster, the
+    dbgen build, every data file's checksum and the CPU pinning.
     """
     settings = {"postgres.image": config.image, "postgres.shm_size": SHM_SIZE}
     settings |= {f"postgres.{name}": value for name, value in sorted(server.items())}
+    golden = {
+        "image": record.image,
+        "server_version": record.server_version,
+        "encoding": record.encoding,
+        "collation": record.collation,
+        "built_at": record.built_at.isoformat(),
+    }
+    # A record from before the build kept the cluster's details lacks them.
+    settings |= {f"golden.{name}": value for name, value in golden.items() if value is not None}
     dbgen = record.dbgen
     settings |= {
         "dbgen.repository": dbgen.repository,

@@ -20,6 +20,7 @@ from goaly.bench.effisql.pg_containers import CONTAINER_PREFIX, ContainerSpec
 from goaly.bench.effisql.pg_instances import (
     INSTANCES,
     PYTHON_CPUS,
+    SERVER_SETTINGS,
     Instance,
     InstanceError,
     Kind,
@@ -30,6 +31,7 @@ from goaly.bench.effisql.pg_instances import (
     database_statements,
     environment_settings,
     fetch_server_settings,
+    fetch_server_settings_sync,
     instance_spec,
     instance_status,
     logical_cpus,
@@ -447,29 +449,87 @@ def test_count_problems_names_each_table_that_differs() -> None:
 def test_the_environment_settings_record_what_can_change_results(tmp_path: Path) -> None:
     config = PgEnvConfig(data_root=tmp_path)
     server = {"work_mem": "4MB", "jit": "on"}
+    record = _record().model_copy(
+        update={"server_version": "16.15", "encoding": "UTF8", "collation": "en_US.utf8"}
+    )
 
-    settings = environment_settings(config, _record(), server)
+    settings = environment_settings(config, record, server)
 
-    assert settings["postgres.image"] == config.image
-    assert settings["postgres.shm_size"] == "64m"
-    assert settings["postgres.work_mem"] == "4MB"
-    assert settings["dbgen.commit"] == "c"
-    assert settings["data.tpch.scale_factor"] == "3"
-    assert settings["data.tpch.lineitem.sha256"] == TPCH.files["lineitem"].sha256
-    assert settings["data.tpch_alt.lineitem.sha256"] == TPCH_ALT.files["lineitem"].sha256
-    assert settings["cpuset.grade-3"] == "10,11,22,23"
-    assert settings["cpuset.python"] == "0,1,12,13"
+    checksums = {
+        f"data.{dataset.db}.{table}.sha256": entry.sha256
+        for dataset in (TPCH, TPCH_ALT)
+        for table, entry in dataset.files.items()
+    }
+    assert settings == {
+        "postgres.image": config.image,
+        "postgres.shm_size": "64m",
+        "postgres.jit": "on",
+        "postgres.work_mem": "4MB",
+        "golden.image": "i",
+        "golden.server_version": "16.15",
+        "golden.encoding": "UTF8",
+        "golden.collation": "en_US.utf8",
+        "golden.built_at": "2026-10-15T00:00:00+00:00",
+        "dbgen.repository": "r",
+        "dbgen.commit": "c",
+        "dbgen.version": "v",
+        "dbgen.binary_sha256": "b",
+        "data.tpch.scale_factor": "3",
+        "data.tpch_alt.scale_factor": "0.3",
+        **checksums,
+        "cpuset.solve-1": "2,3,14,15",
+        "cpuset.solve-2": "4,5,16,17",
+        "cpuset.grade-1": "6,7,18,19",
+        "cpuset.grade-2": "8,9,20,21",
+        "cpuset.grade-3": "10,11,22,23",
+        "cpuset.python": "0,1,12,13",
+    }
+    assert len(checksums) == 2 * len(TPCH_TABLES)
     manifest = RunManifest(environment_settings=settings)
     assert (
         dict(RunManifest.FromString(manifest.SerializeToString()).environment_settings) == settings
     )
 
 
+def test_an_old_golden_record_leaves_out_the_details_it_lacks(tmp_path: Path) -> None:
+    settings = environment_settings(PgEnvConfig(data_root=tmp_path), _record(), {})
+
+    assert [key for key in settings if key.startswith("golden.")] == [
+        "golden.image",
+        "golden.built_at",
+    ]
+
+
+def _settings_answer(params: object) -> list[tuple[str, str]]:
+    """Answers the settings query, as a server that knows every name asked for."""
+    assert params == [list(SERVER_SETTINGS)]
+    return [(name, "x") for name in SERVER_SETTINGS] + [("enable_hashjoin", "on")]
+
+
 @pytest.mark.anyio
 async def test_server_settings_are_read_as_show_prints_them() -> None:
-    conn = AsyncFakeConnection("tpch", [("current_setting", [("work_mem", "4MB"), ("jit", "on")])])
+    conn = AsyncFakeConnection("tpch", [("current_setting", _settings_answer)])
 
-    assert await fetch_server_settings(conn) == {"work_mem": "4MB", "jit": "on"}  # type: ignore[arg-type]
+    settings = await fetch_server_settings(conn)  # type: ignore[arg-type]
+
+    assert settings == {**dict.fromkeys(SERVER_SETTINGS, "x"), "enable_hashjoin": "on"}
+    assert "LIKE 'enable\\_%'" in conn.statements[0].replace("%%", "%")
+
+
+def test_the_sync_read_of_the_server_settings_is_the_same() -> None:
+    conn = FakeServer([("current_setting", _settings_answer)]).connect("tpch")
+
+    assert fetch_server_settings_sync(conn) == {
+        **dict.fromkeys(SERVER_SETTINGS, "x"),
+        "enable_hashjoin": "on",
+    }
+
+
+def test_a_server_that_lacks_a_setting_is_refused() -> None:
+    conn = FakeServer([("current_setting", [("work_mem", "4MB")])]).connect("tpch")
+
+    with pytest.raises(InstanceError, match="does not report the settings"):
+        fetch_server_settings_sync(conn)
 
 
 def test_count_problems_names_an_alternate_database_that_is_too_similar() -> None:
