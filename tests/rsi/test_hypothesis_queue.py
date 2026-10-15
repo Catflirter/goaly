@@ -120,7 +120,7 @@ def test_a_failed_write_keeps_the_old_queue(
     def broken(descriptor: int) -> None:
         raise OSError("disk full")
 
-    monkeypatch.setattr("goaly.rsi.hypothesis_queue.os.fsync", broken)
+    monkeypatch.setattr("goaly.rsi.ledger.os.fsync", broken)
     with pytest.raises(OSError, match="disk full"):
         queue.push([hypothesis("h-2")])
     monkeypatch.undo()
@@ -138,3 +138,13 @@ def test_an_unchanged_queue_is_not_rewritten(tmp_path: Path) -> None:
     queue.push([hypothesis("h-1")])
     queue.remove(["h-9"])
     assert queue.path.stat().st_ino == before
+
+
+def test_a_write_clears_temporary_files_a_crash_left(tmp_path: Path) -> None:
+    queue = HypothesisQueue(tmp_path / "a" / "b" / "ledger", LANE_EFFISQL)
+    queue.push([hypothesis("h-1")])  # Creates every missing level.
+    stale = queue.path.with_name(f".{queue.path.name}.0123456789abcdef.tmp")
+    stale.write_text("half a queue", encoding="utf-8")
+    queue.push([hypothesis("h-2")])
+    assert not stale.exists()
+    assert ids(queue) == ["h-1", "h-2"]

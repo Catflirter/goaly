@@ -43,8 +43,10 @@ from goaly.harness.core.stats import (
 
 __all__ = [
     "REGRESSED_CREDIT",
+    "SCORED_STATUSES",
     "SOLVED_CREDIT",
     "SPEEDUP_CAP",
+    "TIERS",
     "Comparison",
     "GradeTable",
     "Metrics",
@@ -68,12 +70,13 @@ SPEEDUP_CAP = 1000.0  # τ is capped here, by the grader and again by GMS.
 SOLVED_CREDIT = 0.75  # A task with at least this credit is solved: matched with τ ≥ 1.2.
 REGRESSED_CREDIT = 0.25  # A solved task regresses if the candidate's credit is at most this.
 
-_TIERS = ((2.0, 1.0), (1.2, 0.75), (1.0, 0.5), (0.5, 0.25))  # g(τ): each tier's lowest τ.
-_CREDITS = frozenset({0.0, *(credit for _, credit in _TIERS)})
+# g(τ)'s tiers, highest first: each tier's lowest τ and its credit; any lower τ earns 0.
+TIERS = ((2.0, 1.0), (1.2, 0.75), (1.0, 0.5), (0.5, 0.25))
+_CREDITS = frozenset({0.0, *(credit for _, credit in TIERS)})
 _COVERED_SPEEDUP = 2.0
-# Any other status means the grade says nothing about the prediction: GRADER_ERROR is the
-# grader's own failure, to regrade first (task.proto), and UNSPECIFIED was never set.
-_SCORED_STATUSES = frozenset(
+# The statuses whose grades score the prediction. Any other says nothing about it: GRADER_ERROR
+# is the grader's own failure, to regrade first (task.proto), and UNSPECIFIED was never set.
+SCORED_STATUSES = frozenset(
     {GRADE_STATUS_GRADED, GRADE_STATUS_PREDICTION_FAILED, GRADE_STATUS_TIMEOUT}
 )
 _DIFFICULTY_ORDER = {"easy": 0, "medium": 1, "hard": 2}
@@ -208,7 +211,7 @@ def tier_credit(speedup: float) -> float:
     """Return g(τ), a matched task's credit for its speedup τ: 1, 0.75, 0.5, 0.25 or 0."""
     if not speedup >= 0:
         raise ValueError(f"a speedup is at least 0, not {speedup}")
-    return next((credit for lowest, credit in _TIERS if speedup >= lowest), 0.0)
+    return next((credit for lowest, credit in TIERS if speedup >= lowest), 0.0)
 
 
 def is_flagged(grade: EffiSqlGrade) -> bool:
@@ -385,7 +388,7 @@ def _effisql_grade(result: TaskResult) -> EffiSqlGrade:
         raise ValueError(f"{where} has no grade: metrics need a graded run")
     if result.grade.WhichOneof("benchmark") != "effisql":
         raise ValueError(f"{where} has no Effi-SQL grade")
-    if result.grade.status not in _SCORED_STATUSES:
+    if result.grade.status not in SCORED_STATUSES:
         status = GradeStatus.Name(result.grade.status)
         raise ValueError(f"{where} is {status}: regrade it before computing metrics")
     return result.grade.effisql
