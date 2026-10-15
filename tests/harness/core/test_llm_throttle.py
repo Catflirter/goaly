@@ -980,7 +980,11 @@ async def test_500_faulty_calls_hold_every_limit_and_are_each_recorded_once(
             for entry in caplog.records
             if getattr(entry, "event", "").startswith("llm_limit") and fields(entry)[0] == model
         ]
-        downs = [fields(entry)[1] for entry in events(caplog, "llm_limit_down")]
+        downs = [
+            fields(entry)[1]
+            for entry in events(caplog, "llm_limit_down")
+            if fields(entry)[0] == model
+        ]
         assert min(downs) == 1, model
         assert limits[-1] == share, model
     # The 500s opened each model's breaker under load, and each closed again.
