@@ -82,8 +82,9 @@ class TaskResult(_message.Message):
     """How one task, one seed, went in one run (spec §6.1): one line of the run's results file. Its
     score and correctness are in its grade, and in a run with gold answers every task gets one.
     If several lines share run_id, instance_id and seed, the last one wins, so a late SWE grade is
-    appended as a new line. Breakdowns by category or by repository join on instance_id with the
-    task's TaskInput.
+    appended as a new line. Breakdowns, by difficulty for Effi-SQL or by repository for SWE, join
+    on instance_id with the task's TaskInput, as its Trajectory records it: TaskInput itself
+    carries no ID.
     """
 
     DESCRIPTOR: _descriptor.Descriptor
