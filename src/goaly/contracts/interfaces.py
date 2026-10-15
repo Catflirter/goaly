@@ -146,8 +146,9 @@ class Tool[ArgsT: BaseModel, EnvT: Environment](Protocol):
         with ``submission`` set: the agent loop stops, and the policy decides whether to return
         it. The executor fills in the other fields. A statement or command that ran and failed is
         a normal result; a tool that cannot do its job raises instead. The executor re-raises
-        EnvironmentFailure and turns every other exception into an error result, with
-        ``is_error`` set.
+        EnvironmentFailure and turns every other Exception into an error result, with
+        ``is_error`` set; cancellation (asyncio.CancelledError, a BaseException) always
+        propagates.
         """
 
 
