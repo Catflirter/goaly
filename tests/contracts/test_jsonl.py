@@ -271,6 +271,15 @@ def test_writes_a_row_count_as_a_json_number() -> None:
     assert parse(to_json_line(SqlResult(row_count=3)))["row_count"] == 3
 
 
+def test_writes_a_statement_s_wait_for_its_slot_apart_from_its_run_time() -> None:
+    result = SqlResult(row_count=3, elapsed_s=0.25, queue_wait_s=4.0)
+
+    line = to_json_line(result)
+
+    assert (parse(line)["elapsed_s"], parse(line)["queue_wait_s"]) == (0.25, 4.0)
+    assert from_json_line(line, SqlResult) == result
+
+
 @pytest.mark.parametrize(
     ("value", "written"), [(math.nan, "NaN"), (math.inf, "Infinity"), (-math.inf, "-Infinity")]
 )
