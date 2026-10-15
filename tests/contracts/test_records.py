@@ -3,15 +3,20 @@
 import json
 from collections.abc import Sequence
 
+from google.protobuf.message import Message
+
 from goaly.contracts.gen.experiment_pb2 import (
     Decision,
     DecisionThresholds,
     ExperimentRecord,
     Guard,
     GuardResult,
+    ImplementerExit,
+    ImplementerRun,
     Lane,
     PhaseResult,
     RejectionReason,
+    SmokeTest,
 )
 from goaly.contracts.gen.manifest_pb2 import RunManifest
 from goaly.contracts.gen.task_pb2 import Prediction, Split
@@ -260,3 +265,52 @@ def test_a_phase_lists_the_tasks_a_hard_coding_check_flagged() -> None:
     assert fields["screening"]["flagged_instance_ids"] == ["17", "203"]
     assert fields["rejection_reasons"] == ["REJECTION_REASON_HARD_CODED"]
     assert from_json_line(line, ExperimentRecord) == record
+
+
+def set_fields(*messages: Message) -> set[str]:
+    """The names of the fields that hold something other than their default in ``messages``."""
+    return {field.name for message in messages for field, _ in message.ListFields()}
+
+
+def test_an_experiment_records_its_implementer_run_and_smoke_tests() -> None:
+    run = ImplementerRun(
+        exit=ImplementerExit.IMPLEMENTER_EXIT_SUBMITTED,
+        steps=23,
+        wall_time_s=812.5,
+        trajectory_path="rsi/effisql/exp-3/implementer.traj.json",
+        smoke_tests=[
+            SmokeTest(
+                instance_id="17",
+                run_id="smoke-exp-3-17",
+                score=0.75,
+                detail="credit 0.75; stop reason: submitted; 9 steps; $0.02; no tool error",
+            ),
+            SmokeTest(instance_id="250", detail="refused: 250 is not in train"),
+        ],
+        summary="Added a skill that turns correlated subqueries into joins; unit tests pass.",
+    )
+    record = ExperimentRecord(experiment_id="exp-3", lane=Lane.LANE_EFFISQL, implementer=run)
+
+    read = from_json_line(to_json_line(record), ExperimentRecord)
+
+    assert read.implementer == run
+    assert set_fields(run) == set(ImplementerRun.DESCRIPTOR.fields_by_name)
+    assert set_fields(run.smoke_tests[0]) == set(SmokeTest.DESCRIPTOR.fields_by_name)
+
+
+def test_an_implementer_that_never_started_leaves_no_run() -> None:
+    line = to_json_line(ExperimentRecord(experiment_id="exp-3"))
+
+    assert "implementer" not in json.loads(line)
+    assert not from_json_line(line, ExperimentRecord).HasField("implementer")
+
+
+def test_a_smoke_test_that_never_ran_the_candidate_has_no_score() -> None:
+    # The host refused the call, or a guard failed: no run, so no score. A score of 0 was earned.
+    refused = to_json_line(SmokeTest(instance_id="250", detail="refused: 250 is not in train"))
+    scored_zero = to_json_line(SmokeTest(instance_id="17", run_id="smoke-exp-3-17", score=0.0))
+
+    assert "score" not in json.loads(refused)
+    assert json.loads(scored_zero)["score"] == 0.0
+    assert not from_json_line(refused, SmokeTest).HasField("score")
+    assert from_json_line(scored_zero, SmokeTest).HasField("score")

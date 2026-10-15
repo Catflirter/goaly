@@ -1,5 +1,5 @@
-// The RSI ledger contracts (spec §3.3, §8.2, §8.3, §8.6): the experiments and the lessons
-// learned from them.
+// The RSI ledger contracts (spec §3.3, §8.2, §8.3, §8.6, §8.8): the experiments with their
+// implementer runs, and the lessons learned from them.
 syntax = "proto3";
 
 package goaly.v1;
@@ -87,6 +87,9 @@ message ExperimentRecord {
   string candidate_commit = 5;
   // What the candidate tries.
   Hypothesis hypothesis = 6;
+  // How the implementer agent built the candidate (spec §8.8); absent until the agent's run
+  // ends, and absent if it never started.
+  ImplementerRun implementer = 19;
   // The size of the candidate's diff against parent_version.
   DiffStats diff_stats = 7;
   // The guards' outcomes, in the order they ran.
@@ -115,6 +118,78 @@ message ExperimentRecord {
   google.protobuf.Timestamp started_at = 17;
   // When it was decided or aborted; absent until then.
   google.protobuf.Timestamp finished_at = 18;
+}
+
+// How the implementer agent built a candidate (spec §8.2 step 2, §8.6, §8.8): one run of
+// mini-swe-agent's DefaultAgent in a Docker sandbox. Its model calls are recorded as
+// LlmCallRecords with purpose CALL_PURPOSE_RSI_IMPL and the experiment ID as run_id, and their
+// tokens and cost are in the experiment's usage_by_purpose.
+message ImplementerRun {
+  // How the run ended.
+  ImplementerExit exit = 1;
+  // How many steps the agent took, one model call each.
+  int32 steps = 2;
+  // From the agent's start to its end, in seconds.
+  double wall_time_s = 3;
+  // Where the agent's trajectory is, relative to the runs directory:
+  // rsi/<lane>/<experiment_id>/implementer.traj.json. The file stays in mini-swe-agent's own
+  // format, which it names in its trajectory_format key; it is not converted to a Trajectory.
+  // Empty if the agent saved none.
+  string trajectory_path = 4;
+  // The agent's goaly-smoke calls, in order.
+  repeated SmokeTest smoke_tests = 5;
+  // The agent's closing summary, which it submitted with COMPLETE_TASK_AND_SUBMIT_FINAL_OUTPUT:
+  // what it changed and what it checked. Empty unless the agent finished.
+  string summary = 6;
+}
+
+// How an implementer run ended (spec §8.2 step 2, §8.8). Only IMPLEMENTER_EXIT_SUBMITTED leads to
+// a commit. Every other ending makes none, and the candidate is rejected as not implemented
+// (REJECTION_REASON_IMPLEMENTATION_FAILED), except after IMPLEMENTER_EXIT_INFRASTRUCTURE or
+// IMPLEMENTER_EXIT_INTERRUPTED: neither says anything about the hypothesis, so the experiment is
+// aborted instead.
+enum ImplementerExit {
+  // Not set.
+  IMPLEMENTER_EXIT_UNSPECIFIED = 0;
+  // The agent finished and changed its pack; goaly.rsi then commits the change on the host.
+  IMPLEMENTER_EXIT_SUBMITTED = 1;
+  // The agent finished without changing anything.
+  IMPLEMENTER_EXIT_NO_CHANGES = 2;
+  // The agent reached its step limit.
+  IMPLEMENTER_EXIT_STEP_LIMIT = 3;
+  // The agent reached its cost limit, which counts each call's cost as the gateway reports it.
+  IMPLEMENTER_EXIT_COST_LIMIT = 4;
+  // The agent reached its wall-time limit.
+  IMPLEMENTER_EXIT_TIME_LIMIT = 5;
+  // The agent stopped after too many model responses in a row that it could not parse.
+  IMPLEMENTER_EXIT_FORMAT_ERRORS = 6;
+  // The gateway or Docker failed.
+  IMPLEMENTER_EXIT_INFRASTRUCTURE = 7;
+  // The run was cut short: goaly.rsi stopped it, as when the lane's time budget ran out, or the
+  // lane crashed, and the restarted lane found the run unfinished (spec §8.7). It has a value of
+  // its own because such an experiment is aborted, while a crash of the run itself rejects the
+  // candidate.
+  IMPLEMENTER_EXIT_INTERRUPTED = 8;
+  // Any other error ended the run.
+  IMPLEMENTER_EXIT_CRASHED = 9;
+}
+
+// One goaly-smoke call by the implementer agent (spec §8.8). The host refuses any task that is
+// not in train, and any call after the second; otherwise it runs the step-3 guards on the
+// worktree as it stands, then the candidate on the task with the bench runner and one seed. The
+// smoke run's model calls count toward the experiment's usage_by_purpose (spec §9).
+message SmokeTest {
+  // The task the agent asked for.
+  string instance_id = 1;
+  // The smoke run that holds the task's result and trajectory; empty if the candidate never ran.
+  string run_id = 2;
+  // The task's score, as its benchmark defines it: for Effi-SQL, the credit. Unset if the
+  // candidate never ran, because the host refused the call or a guard failed. It is optional so
+  // that such a call stays distinct from a run that scored 0.
+  optional double score = 3;
+  // What goaly-smoke told the agent besides the score: the stop reason, the step count, the cost
+  // and the last tool error; or why the host refused the call, or which guard failed.
+  string detail = 4;
 }
 
 // The size of a diff, as git diff --shortstat counts it.
