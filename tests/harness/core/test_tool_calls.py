@@ -1,14 +1,15 @@
 """Tests for goaly.harness.core.tool_calls: reading tool calls out of a reply, and repairing them.
 
-The Qwen fixtures in qwen_replies.json are real replies of qwen3.6-35b-a3b through the gateway,
-sanitized to the assistant message; each says how it was produced.
+The Qwen fixtures in qwen_replies.json are replies of qwen3.6-35b-a3b through the gateway,
+sanitized to the assistant message: six as Qwen gave them, and two built from real ones for
+failures that never happened. Each says how it was produced.
 """
 
 import enum
 import json
 import re
 import time
-from collections.abc import Sequence
+from collections.abc import Callable, Sequence
 from pathlib import Path
 
 import pytest
@@ -175,6 +176,10 @@ EXPLAIN = f"EXPLAIN {BASE_SQL}"
         ('{"sql": "SELECT 1", ', '{"sql": "SELECT 1"}'),
         ('{"sql": "SELECT a,\n  b FROM t"}', '{"sql": "SELECT a,\\n  b FROM t"}'),
         ('{"sql": "say \\"hi\\", then }"', '{"sql": "say \\"hi\\", then }"}'),
+        ('{"sql": "caf\\u00', '{"sql": "caf"}'),
+        ('{"sql": "caf\\u', '{"sql": "caf"}'),
+        ('{"sql": "caf\\u00e9', '{"sql": "café"}'),
+        ('{"path": "C:\\\\u00', '{"path": "C:\\\\u00"}'),
         ("", "{}"),
         (" \n", "{}"),
     ],
@@ -194,6 +199,10 @@ EXPLAIN = f"EXPLAIN {BASE_SQL}"
         "cut after a comma",
         "raw newline in a string",
         "brackets inside a string",
+        "cut inside a unicode escape",
+        "cut right after \\u",
+        "unicode escape complete",
+        "escaped backslash before u",
         "empty",
         "blank",
     ],
@@ -204,7 +213,16 @@ def test_repair_fixes_json_it_can_fix(text: str, repaired: str) -> None:
 
 @pytest.mark.parametrize(
     "text",
-    ['{"sql": ', '{"sql"', '{"sq', '{"sql": "a"}}', "[1, 2]", '"SELECT 1"', "SELECT 1"],
+    [
+        '{"sql": ',
+        '{"sql"',
+        '{"sq',
+        '{"sql": "a"}}',
+        "[1, 2]",
+        '"SELECT 1"',
+        "SELECT 1",
+        '{"sql": "caf\\uZZ',
+    ],
     ids=[
         "key with no value",
         "key with no colon",
@@ -213,6 +231,7 @@ def test_repair_fixes_json_it_can_fix(text: str, repaired: str) -> None:
         "an array",
         "a string",
         "not JSON",
+        "cut after a \\u that is no escape",
     ],
 )
 def test_repair_gives_up_on_json_it_cannot_make_an_object(text: str) -> None:
@@ -407,18 +426,38 @@ def test_the_parameters_of_an_unknown_tool_stay_strings() -> None:
     assert (call.name, arguments(call)) == ("explain_query", {"sql": "SELECT 1", "analyze": "true"})
 
 
-def test_an_xml_call_cut_off_inside_a_value_keeps_what_was_written() -> None:
-    message = assistant(
-        content="<tool_call>\n<function=execute_sql>\n<parameter=limit>\n5\n</parameter>\n"
-        "<parameter=sql>\nSELECT a FROM t WHERE"
-    )
+# A draft cut off before its closing tag, at the end of the text.
+UNTERMINATED_BLOCK = "<tool_call>\n<function=submit>\n<parameter=sql>\nSELECT 1 WHERE"
+UNTERMINATED_BARE = "<function=submit>\n<parameter=sql>\nSELECT 1\n</parameter>\n"
+
+
+@pytest.mark.parametrize(
+    "content",
+    [
+        "Let me submit.\n" + UNTERMINATED_BLOCK,
+        "Let me submit.\n" + UNTERMINATED_BARE,
+        # Its function block is closed, but the <tool_call> block is not.
+        "<tool_call>\n<function=submit>\n<parameter=sql>\nSELECT 1\n</parameter>\n</function>\n",
+    ],
+    ids=["tool_call block", "bare function block", "closed function, open tool_call"],
+)
+def test_unterminated_xml_in_the_content_is_no_call(content: str) -> None:
+    # Whatever the finish reason: a draft cut off at the end must never become the answer.
+    assert parse_tool_calls(assistant(content=content), OFFERED) == []
+
+
+def test_unterminated_xml_in_the_reasoning_is_no_call() -> None:
+    message = assistant(reasoning="I could submit now:\n" + UNTERMINATED_BLOCK)
+
+    assert parse_tool_calls(message, OFFERED) == []
+
+
+def test_a_terminated_block_after_an_unterminated_draft_is_the_only_call() -> None:
+    message = assistant(content=UNTERMINATED_BLOCK + "\n" + xml_call("execute_sql", sql="SELECT 1"))
 
     [call] = parse_tool_calls(message, OFFERED)
 
-    assert (call.name, arguments(call)) == (
-        "execute_sql",
-        {"limit": 5, "sql": "SELECT a FROM t WHERE"},
-    )
+    assert (call.name, arguments(call)) == ("execute_sql", {"sql": "SELECT 1"})
 
 
 def test_an_xml_call_with_unclosed_parameters_splits_them_at_the_next_tag() -> None:
@@ -432,19 +471,24 @@ def test_an_xml_call_with_unclosed_parameters_splits_them_at_the_next_tag() -> N
     assert arguments(call) == {"sql": "SELECT 1", "limit": 5}
 
 
-def test_a_function_block_without_a_tool_call_tag_is_still_a_call() -> None:
-    message = assistant(
-        reasoning="I'll run it:\n"
-        "<function=execute_sql>\n<parameter=sql>\nSELECT 1\n</parameter>\n</function>"
-    )
+BARE_CALL = (
+    "I'll run it:\n<function=execute_sql>\n<parameter=sql>\nSELECT 1\n</parameter>\n</function>"
+)
 
-    [call] = parse_tool_calls(message, OFFERED)
+
+def test_a_function_block_in_the_content_without_a_tool_call_tag_is_still_a_call() -> None:
+    [call] = parse_tool_calls(assistant(content=BARE_CALL), OFFERED)
 
     assert (call.name, arguments(call), call.source) == (
         "execute_sql",
         {"sql": "SELECT 1"},
-        TOOL_CALL_SOURCE_REASONING_XML,
+        TOOL_CALL_SOURCE_CONTENT_XML,
     )
+
+
+def test_a_function_block_in_the_reasoning_without_a_tool_call_tag_is_no_call() -> None:
+    # Thinking can mention a call in prose; only a <tool_call> block there is a call.
+    assert parse_tool_calls(assistant(reasoning=BARE_CALL), OFFERED) == []
 
 
 def test_names_in_the_xml_are_read_without_surrounding_spaces() -> None:
@@ -507,17 +551,8 @@ def test_a_qwen_xml_call_in_the_content_is_read_with_typed_parameters() -> None:
     assert CALL_ID.fullmatch(call.id)
 
 
-def test_a_qwen_xml_call_cut_off_in_the_content_keeps_what_was_written() -> None:
-    [call] = parse_tool_calls(qwen_reply("truncated_xml_in_content"), OFFERED)
-
-    assert (call.name, arguments(call), call.source) == (
-        "execute_sql",
-        {
-            "sql": "EXPLAIN SELECT count(*) FROM orders WHERE o_custkey IN "
-            "(SELECT c_custkey FROM customer WHERE c_nationkey"
-        },
-        TOOL_CALL_SOURCE_CONTENT_XML,
-    )
+def test_a_qwen_xml_call_cut_off_in_the_content_is_no_call() -> None:
+    assert parse_tool_calls(qwen_reply("truncated_xml_in_content"), OFFERED) == []
 
 
 async def test_a_qwen_call_to_an_unknown_tool_gets_an_error_that_lists_the_tools() -> None:
@@ -697,7 +732,7 @@ def test_strip_removes_each_of_two_call_blocks() -> None:
 def test_strip_removes_a_call_written_into_the_reasoning() -> None:
     reasoning = QWEN_REPLIES["replies"]["call_in_reasoning"]["reasoning_content"]
 
-    stripped = strip_tool_call_markup(reasoning)
+    stripped = strip_tool_call_markup(reasoning, reasoning=True)
 
     assert stripped == reasoning[: reasoning.index("<tool_call>")]
     assert stripped.endswith("Let's do that.\n")
@@ -709,13 +744,30 @@ def test_strip_leaves_text_with_no_call_as_it_was() -> None:
     assert strip_tool_call_markup(text) == text
 
 
-def test_strip_removes_an_unclosed_block_to_the_end_as_the_parser_reads_it() -> None:
+def test_strip_removes_an_unterminated_block_to_the_end_though_it_is_no_call() -> None:
     content = QWEN_REPLIES["replies"]["truncated_xml_in_content"]["content"]
 
     assert strip_tool_call_markup(content) == (
         "Let me first look at the query plan for the original query to understand how it's "
         "being executed.\n\n"
     )
+
+
+@pytest.mark.parametrize(
+    ("text", "reasoning"),
+    [
+        ("Let me submit.\n" + UNTERMINATED_BLOCK, False),
+        ("Let me submit.\n" + UNTERMINATED_BARE, False),
+        ("Let me submit.\n" + UNTERMINATED_BLOCK, True),
+    ],
+    ids=[
+        "tool_call block in the content",
+        "bare block in the content",
+        "tool_call block in the reasoning",
+    ],
+)
+def test_strip_removes_unterminated_markup_too(text: str, reasoning: bool) -> None:
+    assert strip_tool_call_markup(text, reasoning=reasoning) == "Let me submit.\n"
 
 
 def test_strip_removes_a_block_that_holds_no_call_as_the_parser_skips_it() -> None:
@@ -733,8 +785,24 @@ def test_strip_removes_bare_function_blocks_only_where_the_parser_reads_them() -
     # block outside them is not a call, and stays.
     outside = "\n<function=execute_sql>\n</function>"
 
+    mixed = xml_call("submit", sql="SELECT 1") + outside
+
     assert strip_tool_call_markup(bare + "\nThen check.") == "I'll run it:\n\nThen check."
-    assert strip_tool_call_markup(xml_call("submit", sql="SELECT 1") + outside) == outside
+    assert strip_tool_call_markup(mixed) == outside
+    [call] = parse_tool_calls(assistant(content=mixed), OFFERED)
+    assert (call.name, arguments(call)) == ("submit", {"sql": "SELECT 1"})
+
+
+def test_strip_keeps_a_bare_function_block_in_the_reasoning_which_is_no_call() -> None:
+    text = BARE_CALL + "\nThen check."
+
+    assert strip_tool_call_markup(text, reasoning=True) == text
+    assert (
+        strip_tool_call_markup(
+            "Plan.\n" + xml_call("submit", sql="SELECT 1") + "\n" + text, reasoning=True
+        )
+        == "Plan.\n\n" + text
+    )
 
 
 @pytest.mark.parametrize(
@@ -744,6 +812,195 @@ def test_strip_removes_bare_function_blocks_only_where_the_parser_reads_them() -
 def test_after_strip_no_call_is_left_in_a_qwen_reply(name: str) -> None:
     reply = QWEN_REPLIES["replies"][name]
     content = strip_tool_call_markup(reply["content"])
-    reasoning = strip_tool_call_markup(reply["reasoning_content"])
+    reasoning = strip_tool_call_markup(reply["reasoning_content"], reasoning=True)
 
     assert parse_tool_calls(assistant(content=content, reasoning=reasoning), OFFERED) == []
+
+
+def deepest(fits: Callable[[int], bool]) -> int:
+    """The largest depth, below 100,000, at which nesting still ``fits``."""
+    low, high = 1, 100_000
+    while low < high:
+        middle = (low + high + 1) // 2
+        low, high = (middle, high) if fits(middle) else (low, middle - 1)
+    return low
+
+
+def nested(depth: int) -> str:
+    return "[" * depth + "]" * depth
+
+
+def loads_fits(depth: int) -> bool:
+    try:
+        json.loads(nested(depth))
+    except RecursionError:
+        return False
+    return True
+
+
+def dumps_one_deeper_fits(depth: int) -> bool:
+    try:
+        json.dumps([json.loads(nested(depth))])
+    except RecursionError:
+        return False
+    return True
+
+
+def json_limits() -> tuple[int, int]:
+    """The deepest lists json.loads parses, and the deepest it parses that json.dumps can still
+    write one level deeper, as inside a call's arguments.
+
+    They depend on how much C stack the caller has used, so a test measures them where it calls
+    the parser: about 9,997 and 9,996 on CPython 3.12.
+    """
+    return deepest(loads_fits), deepest(
+        lambda depth: loads_fits(depth) and dumps_one_deeper_fits(depth)
+    )
+
+
+@pytest.mark.parametrize(
+    "where",
+    ["writable", "parses but is unwritable one level deeper", "deepest parsed", "too deep"],
+)
+def test_an_xml_value_at_the_json_depth_limits_is_typed_or_kept_and_never_raises(
+    where: str,
+) -> None:
+    loads_limit, write_limit = json_limits()
+    assert write_limit < loads_limit  # Else this test would not reach the boundary.
+    depth = {
+        "writable": write_limit,
+        "parses but is unwritable one level deeper": write_limit + 1,
+        "deepest parsed": loads_limit,
+        "too deep": loads_limit + 1,
+    }[where]
+    message = assistant(content=xml_call("configure", tags=nested(depth)))
+
+    [call] = parse_tool_calls(message, OFFERED)
+
+    if depth <= write_limit:
+        assert call.arguments_json == '{"tags": ' + nested(depth) + "}"
+    else:
+        assert call.arguments_json == '{"tags": "' + nested(depth) + '"}'
+
+
+@pytest.mark.parametrize("where", ["one below the limit", "at the limit", "past the limit"])
+def test_repair_at_the_json_depth_limit_repairs_or_gives_up_and_never_raises(where: str) -> None:
+    loads_limit, _ = json_limits()
+    depth = loads_limit + {"one below the limit": -1, "at the limit": 0, "past the limit": 1}[where]
+    text = '{"tags": ' + nested(depth - 1) + ",}"  # The object is one level of the depth.
+
+    repaired = repair_arguments(text)
+
+    if depth <= loads_limit:
+        assert repaired == '{"tags": ' + nested(depth - 1) + "}"
+    else:
+        assert repaired is None
+
+
+def test_a_repaired_lone_surrogate_is_escaped_so_the_call_can_hold_it() -> None:
+    written = '{"sql": "SELECT \'\\ud800\'",}'  # A \ud800 escape: a lone surrogate.
+    message = assistant(calls=[ToolCall(id="call_a", name="execute_sql", arguments_json=written)])
+
+    [call] = parse_tool_calls(message, OFFERED)
+
+    assert call.repaired_arguments_json == '{"sql": "SELECT \'\\ud800\'"}'
+    assert json.loads(call.repaired_arguments_json) == {"sql": "SELECT '\ud800'"}
+
+
+def test_an_xml_value_with_a_lone_surrogate_is_escaped_so_the_call_can_hold_it() -> None:
+    message = assistant(content=xml_call("configure", tags='["caf\\u00e9", "\\ud800"]'))
+
+    [call] = parse_tool_calls(message, OFFERED)
+
+    assert call.arguments_json == '{"tags": ["caf\\u00e9", "\\ud800"]}'
+    assert arguments(call) == {"tags": ["café", "\ud800"]}
+
+
+@pytest.mark.parametrize("number", ["NaN", "Infinity", "-Infinity", "1e999"])
+def test_a_non_finite_xml_number_stays_a_string(number: str) -> None:
+    message = assistant(content=xml_call("configure", ratio=number, tags=f"[{number}]"))
+
+    [call] = parse_tool_calls(message, OFFERED)
+
+    assert call.arguments_json == json.dumps({"ratio": number, "tags": f"[{number}]"})
+
+
+@pytest.mark.parametrize(
+    "text",
+    ['{"limit": NaN,}', '{"limit": Infinity', '{"limit": -Infinity,}', '{"limit": 1e999,}'],
+)
+def test_repair_gives_up_on_non_finite_numbers(text: str) -> None:
+    assert repair_arguments(text) is None
+
+
+def test_a_standard_call_with_a_non_finite_number_gets_no_repaired_arguments() -> None:
+    message = assistant(
+        calls=[ToolCall(id="call_a", name="execute_sql", arguments_json='{"limit": NaN}')]
+    )
+
+    [call] = parse_tool_calls(message, OFFERED)
+
+    assert call.repaired_arguments_json == ""
+
+
+def test_a_calls_id_is_the_sha256_of_its_index_name_and_arguments() -> None:
+    message = assistant(calls=[ToolCall(name="execute_sql", arguments_json='{"sql": "SELECT 1"}')])
+
+    [call] = parse_tool_calls(message, OFFERED)
+
+    # The first 24 hex digits of sha256('0\nexecute_sql\n{"sql": "SELECT 1"}').
+    assert call.id == "call_edd3f0731f55e9d52bf87b18"
+
+
+@pytest.mark.parametrize(
+    ("name", "arguments_json"),
+    [("submit", '{"sql": "SELECT 1"}'), ("execute_sql", '{"sql": "SELECT 2"}')],
+    ids=["only the name differs", "only the arguments differ"],
+)
+def test_calls_that_differ_in_name_or_arguments_get_different_ids(
+    name: str, arguments_json: str
+) -> None:
+    first = assistant(calls=[ToolCall(name="execute_sql", arguments_json='{"sql": "SELECT 1"}')])
+    second = assistant(calls=[ToolCall(name=name, arguments_json=arguments_json)])
+
+    [one], [other] = parse_tool_calls(first, OFFERED), parse_tool_calls(second, OFFERED)
+
+    assert one.id != other.id
+
+
+async def test_a_gateway_id_repeated_in_one_reply_is_replaced_so_each_result_answers_one_call() -> (
+    None
+):
+    calls = [
+        ToolCall(id="call_0", name="execute_sql", arguments_json='{"sql": "SELECT 1"}'),
+        ToolCall(id="call_0", name="execute_sql", arguments_json='{"sql": "SELECT 1"}'),
+    ]
+    env = FakeSqlEnvironment({"SELECT 1": SqlResult(row_count=1)})
+
+    first, second = parse_tool_calls(assistant(calls=calls), OFFERED)
+    results = [await REGISTRY.execute(call, env) for call in (first, second)]
+
+    # The first keeps the gateway's id; the second gets the formula's id for index 1.
+    assert (first.id, second.id) == ("call_0", "call_7a300c3273e4108aa15a6c53")
+    assert [result.tool_call_id for result in results] == [
+        "call_0",
+        "call_7a300c3273e4108aa15a6c53",
+    ]
+
+
+def test_xml_parameters_are_typed_through_one_of_and_all_of_too() -> None:
+    parameters: dict[str, JsonValue] = {
+        "properties": {
+            "choice": {"oneOf": [{"type": "integer"}, {"type": "boolean"}]},
+            "frame": {"allOf": [{"$ref": "#/$defs/Window"}], "description": "A range of rows."},
+        },
+        "$defs": {"Window": {"type": "object"}},
+    }
+    tools: list[dict[str, JsonValue]] = [
+        {"type": "function", "function": {"name": "pick", "parameters": parameters}}
+    ]
+    message = assistant(content=xml_call("pick", choice="7", frame='{"start": 1, "end": 2}'))
+
+    [call] = parse_tool_calls(message, tools)
+
+    assert arguments(call) == {"choice": 7, "frame": {"start": 1, "end": 2}}
