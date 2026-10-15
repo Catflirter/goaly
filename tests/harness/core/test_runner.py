@@ -829,6 +829,58 @@ async def test_an_external_run_is_not_graded_but_every_task_gets_its_official_re
     ]
 
 
+# The solve phase of a two-phase run.
+
+
+async def test_a_solve_phase_never_grades_and_leaves_the_run_unfinished(tmp_path: Path) -> None:
+    benchmark = ScriptedBenchmark(toy_instances(2))
+    policy = ScriptedPolicy({"t1": raising(ValueError("boom"))})
+    cache = EvalCache(tmp_path / "cache", CACHE_NAMESPACE)
+
+    async with asyncio.timeout(GUARD_S):
+        summary = await make_runner(benchmark, policy, cache=cache).run(
+            tmp_path / "run", template(), split=SPLIT_TRAIN, seeds=[0], grading=False
+        )
+
+    assert benchmark.graded == []
+    found = results(tmp_path / "run")
+    assert not any(result.HasField("grade") for result in found.values())
+    assert found[("t1", 0)].error_type == TASK_ERROR_TYPE_POLICY_CRASH
+    assert official(tmp_path / "run") == [base_answer(0), base_answer(1)]
+    # The grade phase finishes the run, and only it writes the cache: graded evaluations only.
+    assert not read_manifest(RunFiles(tmp_path / "run").manifest).HasField("finished_at")
+    assert not (tmp_path / "cache").exists()
+    assert summary.ran == 2
+
+
+async def test_a_solve_phase_takes_a_graded_evaluation_from_the_cache(tmp_path: Path) -> None:
+    cache = EvalCache(tmp_path / "cache", CACHE_NAMESPACE)
+    await run(make_runner(ScriptedBenchmark(toy_instances(2)), cache=cache), tmp_path / "a")
+
+    policy = ScriptedPolicy()
+    async with asyncio.timeout(GUARD_S):
+        summary = await make_runner(ScriptedBenchmark(toy_instances(2)), policy, cache=cache).run(
+            tmp_path / "b", template("run-2"), split=SPLIT_TRAIN, seeds=[0], grading=False
+        )
+
+    assert policy.solved == []
+    assert all(result.HasField("grade") for result in results(tmp_path / "b").values())
+    assert summary.cached == 2
+
+
+async def test_a_solve_phase_of_an_external_run_finishes_it(tmp_path: Path) -> None:
+    organizers = [replace(inst, split=SPLIT_EXTERNAL, gold_sql=None) for inst in toy_instances(1)]
+    benchmark = ScriptedBenchmark(toy_instances(1), external=organizers)
+
+    async with asyncio.timeout(GUARD_S):
+        await make_runner(benchmark).run(
+            tmp_path, template(), split=SPLIT_EXTERNAL, seeds=[0], grading=False
+        )
+
+    # No gold answers: there is nothing left to grade.
+    assert read_manifest(RunFiles(tmp_path).manifest).HasField("finished_at")
+
+
 # The evaluation cache.
 
 

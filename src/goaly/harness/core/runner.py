@@ -78,8 +78,11 @@ __all__ = [
     "RunSummary",
     "Runner",
     "TaskContext",
+    "cacheable",
     "classify_error",
     "error_classifier",
+    "grade_prediction",
+    "last_records",
     "lock_run_dir",
 ]
 
@@ -302,6 +305,7 @@ class Runner[InstanceT: Instance, EnvT: Environment, CtxT: TaskContext]:
         instance_ids: Collection[str] | None = None,
         resume: bool = False,
         lock: RunLock | None = None,
+        grading: bool = True,
     ) -> RunSummary:
         """Run each instance of ``split`` once per seed, in ``run_dir``, and record every task.
 
@@ -317,6 +321,11 @@ class Runner[InstanceT: Instance, EnvT: Environment, CtxT: TaskContext]:
 
         The run holds the directory's lock throughout. A caller that holds it already, as
         `goaly run` does from before it opens the harness, passes it as ``lock``.
+
+        Without ``grading``, this is the solve phase of a two-phase run: it records each task
+        ungraded and never calls the benchmark's grader, and the grade phase (grading.Grader)
+        grades the run and finishes it later. A task the cache holds is recorded from it, graded,
+        as it is in any run; only graded evaluations go into the cache, so this phase puts none.
         """
         if not manifest.run_id:
             raise ValueError("the manifest has no run_id")
@@ -331,8 +340,8 @@ class Runner[InstanceT: Instance, EnvT: Environment, CtxT: TaskContext]:
             plan = await asyncio.to_thread(
                 self._plan, files, manifest, split, seeds, instance_ids, resume
             )
-            run = await self._run_tasks(files, plan)
-            await asyncio.to_thread(self._finish, files, plan)
+            run = await self._run_tasks(files, plan, grading=grading)
+            await asyncio.to_thread(self._finish, files, plan, grading=grading)
         finally:
             if own_lock is not None:
                 own_lock.release()
@@ -413,9 +422,13 @@ class Runner[InstanceT: Instance, EnvT: Environment, CtxT: TaskContext]:
             raise ValueError(f"{Split.Name(split)} has no instance {', '.join(map(repr, unknown))}")
         return [inst for inst in instances if inst.instance_id in instance_ids]
 
-    def _finish(self, files: RunFiles, plan: "_Plan[InstanceT]") -> None:
-        """Write the official prediction files from the trajectories, then finish the manifest."""
-        predictions = _predictions(files)
+    def _finish(self, files: RunFiles, plan: "_Plan[InstanceT]", *, grading: bool) -> None:
+        """Write the official prediction files from the trajectories, then finish the manifest,
+        unless the run has a grade phase still to come."""
+        predictions = {
+            key: trajectory.prediction
+            for key, trajectory in last_records(files.trajectories, Trajectory).items()
+        }
         for seed in plan.seeds:
             lines = []
             for inst in plan.instances:
@@ -431,12 +444,15 @@ class Runner[InstanceT: Instance, EnvT: Environment, CtxT: TaskContext]:
             path = files.official(seed)
             path.parent.mkdir(exist_ok=True)
             write_text_atomically(path, "".join(f"{line}\n" for line in lines))
-        plan.manifest.finished_at.GetCurrentTime()
-        write_manifest(files.manifest, plan.manifest)
+        if grading or plan.manifest.split == SPLIT_EXTERNAL:  # Else the grade phase finishes it.
+            plan.manifest.finished_at.GetCurrentTime()
+            write_manifest(files.manifest, plan.manifest)
 
     # The tasks.
 
-    async def _run_tasks(self, files: RunFiles, plan: "_Plan[InstanceT]") -> "_Run":
+    async def _run_tasks(
+        self, files: RunFiles, plan: "_Plan[InstanceT]", *, grading: bool
+    ) -> "_Run":
         identity = RunIdentity(
             run_id=plan.manifest.run_id,
             benchmark=plan.manifest.benchmark,
@@ -452,6 +468,7 @@ class Runner[InstanceT: Instance, EnvT: Environment, CtxT: TaskContext]:
                 results=results,
                 trajectories=trajectories,
                 slots=asyncio.Semaphore(self._max_tasks),
+                grading=grading and plan.manifest.split != SPLIT_EXTERNAL,
             )
             async with asyncio.TaskGroup() as group:
                 for seed in plan.seeds:  # A whole replicate first, then the next.
@@ -478,10 +495,10 @@ class Runner[InstanceT: Instance, EnvT: Environment, CtxT: TaskContext]:
                     return
             attempt = await self._attempt(run, inst, seed, task)
         prediction = self._submission(attempt, inst, seed)
-        grade = await self._grade(inst, prediction) if run.graded else None
+        grade = await grade_prediction(self._benchmark, inst, prediction) if run.grading else None
         result, trajectory = self._records(run, inst, seed, task, attempt, prediction, grade)
         await run.record(result, trajectory, cached=False)
-        if key is not None and _clean(result):
+        if key is not None and cacheable(result):
             await self._cache_put(key, result, trajectory)
 
     async def _attempt(
@@ -556,26 +573,6 @@ class Runner[InstanceT: Instance, EnvT: Environment, CtxT: TaskContext]:
             else:
                 return prediction
         return Prediction(instance_id=inst.instance_id)
-
-    async def _grade(self, inst: InstanceT, prediction: Prediction) -> Grade:
-        cancel_requests = _cancel_requests()
-        try:
-            # In a task of its own, as solving is: see _attempt.
-            grade = await asyncio.create_task(self._benchmark.grade(inst, prediction))
-        except Exception as error:
-            _propagate_cancellation(cancel_requests, error, "grading")
-            _logger.warning(
-                "grading %s raised an exception",
-                inst.instance_id,
-                exc_info=error,
-                extra={"instance_id": inst.instance_id},
-            )
-            feedback = _cut(f"The grader failed: {_describe(error)}")
-            return Grade(
-                instance_id=inst.instance_id, status=GRADE_STATUS_GRADER_ERROR, feedback=feedback
-            )
-        _propagate_cancellation(cancel_requests, None, "grading")
-        return grade
 
     def _records(
         self,
@@ -656,7 +653,7 @@ class Runner[InstanceT: Instance, EnvT: Environment, CtxT: TaskContext]:
     def _cache_key(
         self, run: "_Run", inst: InstanceT, seed: int, task: TaskInput
     ) -> CacheKey | None:
-        if self._cache is None or not run.graded:
+        if self._cache is None or run.identity.split == SPLIT_EXTERNAL:
             return None  # Organizer IDs on SPLIT_EXTERNAL may collide with ours.
         return CacheKey(
             harness_hash=run.harness_hash,
@@ -703,14 +700,12 @@ class _Run:
     results: JsonlWriter[TaskResult]
     trajectories: JsonlWriter[Trajectory]
     slots: asyncio.Semaphore
+    # Whether its tasks are graded now: not in a solve phase, nor on SPLIT_EXTERNAL, which has
+    # no gold answers.
+    grading: bool
     cached: int = 0
     ran: int = 0
     errors: Counter[str] = field(default_factory=Counter)
-
-    @property
-    def graded(self) -> bool:
-        """Whether its tasks are graded: SPLIT_EXTERNAL has no gold answers."""
-        return self.identity.split != SPLIT_EXTERNAL
 
     async def record(self, result: TaskResult, trajectory: Trajectory, *, cached: bool) -> None:
         """Write a task's records: the trajectory first, so a result always has its trajectory."""
@@ -772,16 +767,50 @@ def _recorded(files: RunFiles, keys: set[_Key]) -> set[_Key]:
     } & keys
 
 
-def _predictions(files: RunFiles) -> dict[_Key, Prediction]:
-    """Each task's submitted prediction, from its last trajectory line; empty if it had none."""
-    return {
-        (trajectory.instance_id, trajectory.seed): trajectory.prediction
-        for trajectory in read_jsonl(files.trajectories, Trajectory)
-    }
+def last_records[M: (TaskResult, Trajectory)](path: Path, kind: type[M]) -> dict[_Key, M]:
+    """Each task's last record in the JSONL file at ``path``, by (instance ID, seed).
+
+    A later line for a task replaces an earlier one, as result.proto and trajectory.proto say:
+    a crash between a task's writes, or the grade phase, leaves a task more than one line. A
+    torn last line is skipped. The file is read whole, so this blocks.
+    """
+    return {(record.instance_id, record.seed): record for record in read_jsonl(path, kind)}
 
 
-def _clean(result: TaskResult) -> bool:
-    """Whether the result is worth caching: no error, and a grade that means something."""
+async def grade_prediction[I: Instance, E: Environment](
+    benchmark: Benchmark[I, E], inst: I, prediction: Prediction
+) -> Grade:
+    """Grade ``prediction`` of ``inst`` with ``benchmark``, which must never raise.
+
+    A grader that raises gives a GRADER_ERROR grade that says why. The grader runs in a task of
+    its own: a cancel request it leaves behind, as Python 3.12's TaskGroup can, stays out of
+    the caller's task. A cancellation of the caller propagates, even if the grader turns it
+    into an error or swallows it.
+    """
+    cancel_requests = _cancel_requests()
+    try:
+        grade = await asyncio.create_task(benchmark.grade(inst, prediction))
+    except Exception as error:
+        _propagate_cancellation(cancel_requests, error, "grading")
+        _logger.warning(
+            "grading %s raised an exception",
+            inst.instance_id,
+            exc_info=error,
+            extra={"instance_id": inst.instance_id},
+        )
+        feedback = _cut(f"The grader failed: {_describe(error)}")
+        return Grade(
+            instance_id=inst.instance_id, status=GRADE_STATUS_GRADER_ERROR, feedback=feedback
+        )
+    _propagate_cancellation(cancel_requests, None, "grading")
+    return grade
+
+
+def cacheable(result: TaskResult) -> bool:
+    """Whether a task's evaluation is worth caching: no error, and a grade that means something.
+
+    Only graded evaluations are: the cache holds what a run would record, grade included.
+    """
     return (
         result.error_type == TASK_ERROR_TYPE_NONE
         and result.HasField("grade")
