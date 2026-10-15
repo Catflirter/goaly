@@ -5,8 +5,8 @@ small, deterministic implementation that records how it was called.
 tests/contracts/test_interfaces.py proves, under mypy and at runtime, that each conforms to its
 Protocol.
 
-pytest imports tests/ as a namespace package, so any test can import them, e.g.
-``from tests.fakes import FakeSqlEnvironment``.
+pytest puts the repository root on sys.path (``pythonpath`` in pyproject.toml), so any test can
+import them, e.g. ``from tests.fakes import FakeSqlEnvironment``.
 """
 
 import asyncio

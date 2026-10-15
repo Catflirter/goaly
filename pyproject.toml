@@ -69,6 +69,8 @@ warn_required_dynamic_aliases = true
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]
+# The repository root, so tests import shared test code as tests.<module>, e.g. tests.fakes.
+pythonpath = ["."]
 addopts = ["--strict-markers", "--strict-config", "--import-mode=importlib", "-ra"]
 markers = [
     "integration: needs Docker, a database or the real model API; skipped unless --integration is given",
