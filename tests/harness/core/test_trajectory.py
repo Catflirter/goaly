@@ -222,8 +222,15 @@ def test_a_step_needs_a_chat() -> None:
         record.add_step(1, call_record("llm-1", Usage()), assistant())
 
 
-@pytest.mark.parametrize("keep_turns", [0, -1])
-def test_an_executor_chat_keeps_at_least_one_turn(keep_turns: int) -> None:
-    # 0 or unset would mark a chat whose replies replay unchanged, as GLM's do (trajectory.proto).
+def test_a_chat_with_no_replay_window_records_0() -> None:
+    # Chat.keep_turns 0, like unset, marks a chat whose replies replay unchanged, as GLM's do.
+    record = TrajectoryRecorder()
+
+    record.start_chat("main", [], keep_turns=0)
+
+    assert record.trajectory().chats[0].keep_turns == 0
+
+
+def test_a_replay_window_cannot_be_negative() -> None:
     with pytest.raises(ValueError, match="keep_turns"):
-        TrajectoryRecorder().start_chat("main", [], keep_turns=keep_turns)
+        TrajectoryRecorder().start_chat("main", [], keep_turns=-1)
