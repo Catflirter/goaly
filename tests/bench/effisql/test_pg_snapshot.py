@@ -70,8 +70,22 @@ def test_a_parallel_scan_counts_the_rows_of_all_its_processes() -> None:
             **{"Parallel Aware": True, "Actual Rows": rows_per_process, "Actual Loops": 3},
         )
 
-    assert not foreign_scale_plan(_root(parallel(1_500_000)))
-    assert foreign_scale_plan(_root(parallel(5_000_000)))
+    assert not foreign_scale_plan(_root(parallel(1_500_000)))  # 4.5M rows in all: SF3's orders.
+    # 2M per process is within SF3's 4.5M rows, but the three processes read 6M in all.
+    assert foreign_scale_plan(_root(parallel(2_000_000)))
+
+
+def test_a_scan_just_above_the_sf3_size_is_still_native() -> None:
+    estimate = int(17_996_609 * 1.05)  # Within the margin a fresh ANALYZE can overshoot by.
+
+    assert not foreign_scale_plan(_root(_scan("lineitem", estimate)))
+    assert foreign_scale_plan(_root(_scan("lineitem", int(17_996_609 * 1.15))))
+
+
+def test_only_scan_nodes_count_even_if_they_name_a_relation() -> None:
+    update = {"Node Type": "ModifyTable", "Relation Name": "orders", "Plan Rows": 15_000_000}
+
+    assert not foreign_scale_plan(_root(update))
 
 
 def test_tables_outside_tpch_are_ignored() -> None:
@@ -122,6 +136,7 @@ def test_plan_requests_cover_tasks_without_a_plan_or_with_a_foreign_one(tmp_path
         _task(4, plan={}),
         _task(5, plan=foreign),
         _task(6, db="solar_panel"),
+        _task(7, plan="  \n"),
         "",
     ]
     path.write_text("\n".join(lines))
@@ -133,6 +148,7 @@ def test_plan_requests_cover_tasks_without_a_plan_or_with_a_foreign_one(tmp_path
         PlanRequest(instance_id="3", base_sql="SELECT 3", reason="no plan"),
         PlanRequest(instance_id="4", base_sql="SELECT 4", reason="no plan"),
         PlanRequest(instance_id="5", base_sql="SELECT 5", reason="foreign scale"),
+        PlanRequest(instance_id="7", base_sql="SELECT 7", reason="no plan"),
     ]
 
 

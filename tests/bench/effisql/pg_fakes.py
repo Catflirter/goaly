@@ -27,6 +27,14 @@ class FakeCursor:
     def __init__(self, connection: "FakeConnection", rows: Sequence[tuple[Any, ...]] = ()) -> None:
         self._connection = connection
         self._rows = list(rows)
+        self.adapters = SimpleNamespace(
+            register_loader=lambda *args: connection.loaders.append(args)
+        )
+
+    def execute(
+        self, query: object, params: object = None, *, prepare: bool | None = None
+    ) -> "FakeCursor":
+        return self._connection.execute(query, params, prepare=prepare)
 
     def fetchone(self) -> tuple[Any, ...] | None:
         return self._rows[0] if self._rows else None
