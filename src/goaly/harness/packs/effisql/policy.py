@@ -2,8 +2,9 @@
 
 The harness factory reads prompt.md and config.yaml, gives core the sampling, the budgets and the
 context window, and calls :func:`build_policy` with the config's ``pack`` section and the prompt.
-When a budget runs out before submit, the fallback submits ``base_sql`` unchanged, which the
-grader credits with its identity τ (spec §5.4).
+The prompt then carries the pack's skill guides, which :func:`with_skills` appends to it (spec
+§5.2). When a budget runs out before submit, the fallback submits ``base_sql`` unchanged,
+which the grader credits with its identity τ (spec §5.4).
 """
 
 from collections.abc import Mapping
@@ -23,6 +24,41 @@ from goaly.harness.core.tools import ToolRegistry, bind
 
 from .tools import ExecuteSql, ExecuteSqlConfig, Submit
 
+# The pack's skill guides (spec §5.2). Pack code may not read files (GUARD_PACK_CODE_ALLOWLIST),
+# so each guide's text is held here as a constant and carried into the system prompt by
+# with_skills(); the same text is committed as skills/<name>.md, which the pack's tests compare
+# with the constant, so the two cannot drift apart. Keep each guide short and mechanical, and
+# name no task's SQL: a guide teaches rewrite shapes that hold on any data.
+EQUIVALENCE_INVARIANTS = """\
+Keep the rewrite's output shape identical to the base query's: the same columns, in the same
+order, with the same types. Three mechanical rules:
+
+1. STAR EXPANSION. Inlining or flattening a subquery or CTE that adds computed columns drops
+them from an outer `alias.*`: re-list every computed column, with the same alias, beside the star.
+2. AGGREGATE TYPE. Re-associating an aggregate changes its type: SUM over per-group counts is
+numeric where the base's COUNT(col) is bigint, and SUM over bigint is numeric. Keep the base's
+outer aggregate function, or cast the final expression back (e.g. `::bigint` for a base COUNT).
+Never change an output column's expression or type.
+3. TIES UNDER LIMIT. If the base ends in ORDER BY ... LIMIT and the sort keys can repeat, the row
+it returns depends on which plan runs. Keep that part of the query unchanged, submitting the
+base's own structure, instead of restructuring it.
+"""
+
+# The guides with_skills() carries, in the order the model reads them.
+SKILLS = (EQUIVALENCE_INVARIANTS,)
+
+
+def with_skills(system_prompt: str) -> str:
+    """Return ``system_prompt`` with the pack's skill guides appended (spec §5.2).
+
+    A guide that holds only whitespace is skipped, so a skill is removed by taking its text out
+    of SKILLS, and a prompt whose guides are all gone is returned unchanged.
+    """
+    guides = [guide for guide in SKILLS if guide.strip()]
+    if not guides:
+        return system_prompt
+    return "\n\n".join([system_prompt.rstrip(), "Skill guides:", "\n\n".join(guides)])
+
 
 class PackConfig(BaseModel):
     """The pack's own settings: the ``pack`` section of config.yaml."""
@@ -39,7 +75,8 @@ class EffiSqlPolicy:
 
     def __init__(self, config: PackConfig, system_prompt: str) -> None:
         self.config = config
-        self.system_prompt = system_prompt
+        # The skill guides ride in the system prompt, so they open every chat of a task.
+        self.system_prompt = with_skills(system_prompt)
 
     async def solve(self, task: TaskInput, env: SqlEnvironment, ctx: AgentContext) -> Prediction:
         """Run the agent on ``task`` in ``env`` until it submits or a budget runs out."""

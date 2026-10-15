@@ -1,6 +1,7 @@
 """Effi-SQL's capability pack: the v0 baseline (spec §5.4).
 
 - prompt.md: the system prompt.
+- skills/*.md: the skill guides; policy.py holds each one's text and carries it into the prompt.
 - config.yaml: sampling, budgets and the context window, which the harness factory gives core,
   and the pack's own section, which build_policy validates.
 - tools.py: execute_sql and submit.
