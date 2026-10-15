@@ -9,8 +9,9 @@ UV_RUN := uv run --locked
 help: ## List the targets
 	@awk 'BEGIN {FS = ":.*## "} /^[a-z][a-z-]*:.*## / {printf "  %-18s %s\n", $$1, $$2}' $(MAKEFILE_LIST)
 
-setup: ## Create .venv from uv.lock and install the git hooks
-	uv sync --locked
+# Every dependency group, rsi included; the organizers' plain `uv sync --locked` leaves rsi out.
+setup: ## Create .venv from uv.lock, with every dependency group, and install the git hooks
+	uv sync --locked --all-groups
 	$(UV_RUN) pre-commit install
 
 lint: ## Check linting and formatting
