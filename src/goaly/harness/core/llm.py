@@ -21,6 +21,9 @@ connection pool, sized to the process's share of the model's budget::
             messages, model=EXECUTOR_MODEL, tags=CallTags(CallPurpose.CALL_PURPOSE_EXEC)
         )
 
+Synchronous code in a worker thread, such as the mini-swe-agent that RSI's implementer runs
+(T20), calls ``complete_sync``, which runs the call on the client's own loop.
+
 The API key goes in the Authorization header and nowhere else: no message, log line, repr or
 record holds it, and the client removes it from any text it quotes from the gateway.
 """
@@ -277,6 +280,7 @@ class LlmClient:
             model: ModelThrottle(model, share, policy, self._clock)
             for model, share in shares.items()
         }
+        self._loop: asyncio.AbstractEventLoop | None = None  # Set by the first async use.
         self._api_key = settings.api_key
         headers = {"Authorization": f"Bearer {settings.api_key.get_secret_value()}"}
         self._http = {  # One connection pool per model, as large as its share.
@@ -291,6 +295,7 @@ class LlmClient:
         }
 
     async def __aenter__(self) -> Self:
+        self._bind_loop()
         return self
 
     async def __aexit__(
@@ -325,6 +330,7 @@ class LlmClient:
         exactly one record, however it ends: a failure raises an LlmError, and
         asyncio.CancelledError goes through at once, with no retry.
         """
+        self._bind_loop()
         if allowed_model(tags.purpose) != model:
             raise self._refuse(model, tags)
         body = _request_body(self._profiles[model].with_overrides(params), messages, tools)
@@ -345,6 +351,51 @@ class LlmClient:
             self._finish(record, start)
         choice = response.choices[0]
         return LlmReply(_assistant_message(choice.message), choice.finish_reason or "", record)
+
+    def complete_sync(
+        self,
+        messages: Sequence[ChatMessage],
+        *,
+        model: str,
+        tags: CallTags,
+        tools: Sequence[Mapping[str, object]] = (),
+        params: ModelParams | None = None,
+    ) -> LlmReply:
+        """Make a call from a worker thread: run complete() on the client's loop and wait for it.
+
+        The call runs on the client's own event loop, the one it was entered or first used on, so
+        it shares that loop's limits and connections: there is no second loop, and no second set
+        of limits. Any number of threads may call at once. RSI's implementer (T20) drives
+        mini-swe-agent, which is synchronous, this way::
+
+            async with LlmClient(settings, recorder) as llm:
+                await asyncio.to_thread(run_agent, llm)  # The agent's model calls complete_sync.
+
+        It returns or raises as complete() does. It raises RuntimeError if the client's loop is
+        not running, or if called in the loop's own thread, where waiting would deadlock. If the
+        loop cancels the call, at shutdown say, it raises concurrent.futures.CancelledError.
+        """
+        loop = self._loop
+        if loop is None:
+            raise RuntimeError("complete_sync needs the client's loop: `async with` it there first")
+        if not loop.is_running():
+            raise RuntimeError("complete_sync needs the client's event loop, which is not running")
+        try:
+            running = asyncio.get_running_loop()
+        except RuntimeError:  # No loop runs in this thread: the usual case, a worker thread.
+            running = None
+        if running is loop:
+            raise RuntimeError("complete_sync would block the loop it needs: await complete()")
+        call = self.complete(messages, model=model, tags=tags, tools=tools, params=params)
+        return asyncio.run_coroutine_threadsafe(call, loop).result()
+
+    def _bind_loop(self) -> None:
+        """Make the running loop the client's own, the one its connections and limits live on."""
+        loop = asyncio.get_running_loop()
+        if self._loop is None:
+            self._loop = loop
+        elif loop is not self._loop:
+            raise RuntimeError("an LlmClient serves one event loop: the one it was first used on")
 
     def _refuse(self, model: str, tags: CallTags) -> ModelNotAllowed:
         purpose = CallPurpose.Name(tags.purpose)
