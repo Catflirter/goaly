@@ -47,6 +47,11 @@ def analyzed(result: subprocess.CompletedProcess[str]) -> tuple[int, int]:
         ("goaly.rsi", "goaly.bench", "kept"),
         ("goaly.contracts", "goaly.harness", "broken"),
         ("goaly.harness", "goaly.contracts", "kept"),
+        # Only goaly.rsi may import mini-swe-agent (spec §3.1).
+        ("goaly.contracts", "minisweagent", "broken"),
+        ("goaly.harness", "minisweagent", "broken"),
+        ("goaly.bench", "minisweagent", "broken"),
+        ("goaly.rsi", "minisweagent", "kept"),
     ],
 )
 def test_layers_contract(
@@ -73,5 +78,8 @@ def test_layers_contract(
         assert "_layer_probe" in output, output
     else:
         assert result.returncode == 0, output
-        # One more file and one more import prove that the probe's import was analysed.
-        assert analyzed(result) == (files + 1, imports + 1), output
+        # One more file and one more import prove that the probe's import was analysed. A
+        # third-party package also enters the graph as a module, unless the copy imported it.
+        new_files, new_imports = analyzed(result)
+        assert new_imports == imports + 1, output
+        assert new_files - files in ((1,) if imported.startswith("goaly.") else (1, 2)), output

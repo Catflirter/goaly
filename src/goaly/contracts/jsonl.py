@@ -59,9 +59,12 @@ def to_json_line(message: Message) -> str:
     """Write ``message`` as one line of compact JSON, with no line break at the end.
 
     Keys follow the order the .proto declares the fields in, at every level, so the lines of a
-    file line up whichever fields are set. Raises ``json_format.SerializeToJsonError`` for a value
-    JSON cannot hold, such as a NaN in a ``google.protobuf.Value``, and for a message that is not
-    written as a JSON object, such as a ``Timestamp``.
+    file line up whichever fields are set. A map field's keys are sorted, since protobuf keeps no
+    order for them, so the same map gives the same line in every process. The keys of a
+    ``google.protobuf.Struct`` are written as protobuf gives them. Raises
+    ``json_format.SerializeToJsonError`` for a value JSON cannot hold, such as a NaN in a
+    ``google.protobuf.Value``, and for a message that is not written as a JSON object, such as a
+    ``Timestamp``.
     """
     # The stubs say dict, but a well-known type such as Timestamp, Value or ListValue gives a
     # string, a list or any JSON value instead, and from_json_line reads only objects.
@@ -167,13 +170,16 @@ def _in_field_order(descriptor: Descriptor, fields: dict[str, Any]) -> dict[str,
 
 
 def _value_in_field_order(field: FieldDescriptor, value: Any) -> Any:
-    """Order the keys inside a field's JSON value; a well-known type's value stays as it is."""
+    """Order the keys inside a field's JSON value; a well-known type's value stays as it is.
+
+    A map's own keys, which JSON writes as strings, are sorted: protobuf keeps no order for them.
+    """
     message = field.message_type
     if message is None or message.file.package == _WELL_KNOWN_TYPES:
         return value
-    if message.GetOptions().map_entry:  # A map: its keys stay as they are, its values are ordered.
+    if message.GetOptions().map_entry:  # A map: its keys are sorted, its values are ordered.
         entry_value = message.fields_by_name["value"]
-        return {key: _value_in_field_order(entry_value, item) for key, item in value.items()}
+        return {key: _value_in_field_order(entry_value, value[key]) for key in sorted(value)}
     if field.is_repeated:
         return [_in_field_order(message, item) for item in value]
     return _in_field_order(message, value)
