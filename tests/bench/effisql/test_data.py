@@ -122,6 +122,22 @@ def test_a_task_without_a_plan_is_valid(record: dict[str, JsonValue]) -> None:
     assert EffiSqlInstance.model_validate(record).base_explain_analyze is None
 
 
+# An empty plan counts as no plan, so agent_input falls back to plans.json (controller's ruling).
+EMPTY_PLANS: list[JsonValue] = [None, {}, [], "", " \n\t"]
+EMPTY_PLAN_IDS = ["null", "empty-object", "empty-array", "empty-string", "blank-string"]
+
+
+@pytest.mark.parametrize("plan", EMPTY_PLANS, ids=EMPTY_PLAN_IDS)
+def test_an_empty_plan_counts_as_no_plan(plan: JsonValue) -> None:
+    inst = EffiSqlInstance.model_validate(
+        task(base_explain_analyze=plan, optimized_explain_analyze=plan)
+    )
+
+    assert inst.base_explain_analyze is None
+    assert inst.optimized_explain_analyze is None
+    assert inst.record["base_explain_analyze"] == plan  # The record keeps it as loaded.
+
+
 def test_an_empty_gold_answer_is_kept_as_it_is() -> None:
     # Gold answers are never checked here: an organizers' file may blank them.
     assert EffiSqlInstance.model_validate(task(optimized_sql="")).optimized_sql == ""
@@ -301,10 +317,14 @@ def test_loads_a_file_with_string_ids(tmp_path: Path) -> None:
 
 
 def test_loads_a_file_with_no_plans(tmp_path: Path) -> None:
-    no_plan = without(task(), "base_explain_analyze")
-    path = write_tasks(tmp_path / "tasks.jsonl", no_plan, task(id=8, base_explain_analyze=None))
+    no_plan = without(task(id=1), "base_explain_analyze")
+    empty = [task(id=n, base_explain_analyze=plan) for n, plan in enumerate(EMPTY_PLANS, start=2)]
+    path = write_tasks(tmp_path / "tasks.jsonl", no_plan, *empty)
 
-    assert [inst.base_explain_analyze for inst in load_instances(path)] == [None, None]
+    instances = load_instances(path)
+
+    assert ids(instances) == ["1", "2", "3", "4", "5", "6"]
+    assert {inst.base_explain_analyze is None for inst in instances} == {True}
 
 
 def test_skips_blank_lines(tmp_path: Path) -> None:
@@ -585,7 +605,12 @@ def test_the_runtime_file_holds_no_gold_answer(tmp_path: Path) -> None:
 
 
 def test_the_runtime_file_loads_as_the_dataset_without_gold(tmp_path: Path) -> None:
-    dataset = write_tasks(tmp_path / DATASET_FILE, task(id=1, extra=True), task(id="2"))
+    dataset = write_tasks(
+        tmp_path / DATASET_FILE,
+        task(id=1, extra=True),
+        task(id="2"),
+        task(id=3, base_explain_analyze={}),
+    )
     target = tmp_path / RUNTIME_FILE
 
     write_runtime_file(dataset, target)
