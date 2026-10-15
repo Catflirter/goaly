@@ -328,10 +328,7 @@ class HostRunner[InstanceT: Instance, EnvT: Environment]:
         """Grade each task of ``keys`` from its solve record, and record it on the host."""
         if not keys:
             return
-        solve = files.solve
-        records = await asyncio.to_thread(
-            read_solve_records, solve.predictions, solve.results, solve.trajectories, keys
-        )
+        records = await asyncio.to_thread(read_solve_records, files.solve.root, keys)
         usage = await asyncio.to_thread(_attributed, files, plan.manifest.run_id, set(keys))
         by_id = {inst.instance_id: inst for inst in plan.instances}
         async with asyncio.TaskGroup() as group:
