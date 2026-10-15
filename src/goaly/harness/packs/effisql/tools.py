@@ -23,25 +23,28 @@ class ExecuteSqlConfig(BaseModel):
 
     model_config = ConfigDict(frozen=True, extra="forbid")
 
-    # The statement timeout, enforced by client-side cancellation in the environment.
-    statement_timeout_s: float = Field(default=120.0, gt=0)
+    # The statement timeout, enforced by client-side cancellation in the environment. The
+    # solving instances' capacity rests on it (spec §6.2), so a pack may lower it but never
+    # raise it: the trusted environment caps every statement at 120 s whatever is asked.
+    statement_timeout_s: float = Field(default=120.0, gt=0, le=120)
     # How many rows the model sees, at most; the environment keeps no more than its own limit.
-    rows_shown: int = Field(default=20, ge=0)
-    # How many characters of each value the model sees.
-    value_chars: int = Field(default=200, ge=1)
+    rows_shown: int = Field(default=100, ge=0)
+    # How many characters of each value the model sees: enough for a plan's EXPLAIN text.
+    value_chars: int = Field(default=2000, ge=1)
 
 
 class ExecuteSqlArgs(BaseModel):
     """Run one SQL query in the task's database, read-only, and see its result and timing."""
 
-    sql: str = Field(min_length=1, description="The query to run.")
+    sql: str = Field(min_length=1, pattern=r"\S", description="The query to run.")
 
 
 class SubmitArgs(BaseModel):
     """Hand in the final query; this ends the task."""
 
+    # Whitespace alone is no query: such a submit is refused, so the fallback still applies.
     sql: str = Field(
-        min_length=1,
+        pattern=r"\S",
         description="The rewritten query: one statement that begins with SELECT or WITH.",
     )
 
@@ -52,8 +55,8 @@ class ExecuteSql:
     name = "execute_sql"
     description = (
         "Run one SQL query in the task's PostgreSQL database, which is read-only. Returns the "
-        "first rows or the error, how long the query ran, and how long it first waited for a "
-        "free statement slot."
+        "row count and the first rows, with long values cut, or the error; how long the query "
+        "ran; and how long it first waited for a free statement slot."
     )
     args_model = ExecuteSqlArgs
 
@@ -104,6 +107,8 @@ def render_rows(result: SqlResult, config: ExecuteSqlConfig) -> list[str]:
         for row in result.rows[: config.rows_shown]
     ]
     count = f"{result.row_count} row" + ("" if result.row_count == 1 else "s")
+    if not result.columns:  # Not a query: the count is of the rows the statement affected.
+        return ["Columns: (none)", f"Rows: {count}."]
     if len(rows) < result.row_count:
         count += f", the first {len(rows)} shown"
     return [f"Columns: {', '.join(result.columns)}", f"Rows: {count}.", *rows]

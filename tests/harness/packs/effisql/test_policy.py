@@ -11,6 +11,7 @@ from pydantic import ValidationError
 from goaly.contracts.gen.environment_pb2 import SqlResult
 from goaly.contracts.gen.task_pb2 import EffiSqlTaskInput, SweTaskInput, TaskInput
 from goaly.contracts.gen.trajectory_pb2 import StopReason
+from goaly.contracts.interfaces import Policy, SqlEnvironment
 from goaly.harness.core.agent import AgentContext
 from goaly.harness.core.budgets import Budgets
 from goaly.harness.core.context_window import ContextWindow
@@ -120,6 +121,15 @@ class TestSolve:
         assert stop == StopReason.STOP_REASON_TIME_BUDGET_EXHAUSTED
         assert env.stopped == [FASTER]  # The running statement was cancelled.
 
+    async def test_a_whitespace_submit_is_no_submit_so_the_fallback_applies(self) -> None:
+        llm = FakeLLM([reply(tool_call("submit", {"sql": "  \n\t "})) for _ in range(2)])
+        ctx = context(llm, Budgets(steps=2, wall_clock_s=600))
+
+        prediction = await policy().solve(TASK, FakeSqlEnvironment(), ctx)
+
+        assert prediction.fallback
+        assert prediction.effisql.sql == BASE_SQL
+
     async def test_a_task_of_another_benchmark_is_refused(self) -> None:
         with pytest.raises(ValueError, match="Effi-SQL tasks only"):
             await policy().solve(
@@ -171,8 +181,41 @@ class TestConfig:
         execute_sql = PackConfig().execute_sql
 
         assert execute_sql.statement_timeout_s == 120
-        assert execute_sql.rows_shown == 20
+        assert execute_sql.rows_shown == 100
+        assert execute_sql.value_chars == 2000
 
-    def test_an_unknown_pack_setting_is_refused(self) -> None:
+    @pytest.mark.parametrize(
+        "config",
+        [
+            {"execute_sql": {"statement_timeout": 5}},
+            {"unknown": 1},
+            {"execute_sql": {"statement_timeout_s": 0}},
+            {"execute_sql": {"statement_timeout_s": 120.5}},
+            {"execute_sql": {"statement_timeout_s": 1e9}},
+            {"execute_sql": {"rows_shown": -1}},
+            {"execute_sql": {"value_chars": 0}},
+            {"submit_timeout_s": 0},
+        ],
+    )
+    def test_invalid_pack_settings_are_refused(self, config: dict[str, object]) -> None:
         with pytest.raises(ValidationError):
-            build_policy({"execute_sql": {"statement_timeout": 5}}, "prompt")
+            build_policy(config, "prompt")  # type: ignore[arg-type]
+
+    async def test_a_pack_may_lower_the_statement_timeout(self) -> None:
+        env = FakeSqlEnvironment({FASTER: SqlResult(row_count=1)})
+        llm = FakeLLM(
+            [
+                reply(tool_call("execute_sql", {"sql": FASTER})),
+                reply(tool_call("submit", {"sql": FASTER})),
+            ]
+        )
+        lowered = build_policy({"execute_sql": {"statement_timeout_s": 30}}, "prompt")
+
+        await lowered.solve(TASK, env, context(llm))
+
+        assert env.executed == [(FASTER, 30.0)]
+
+    def test_the_policy_is_a_policy(self) -> None:
+        typed: Policy[SqlEnvironment, AgentContext] = policy()
+
+        assert typed is not None
