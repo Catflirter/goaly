@@ -217,6 +217,26 @@ def test_tells_a_robustness_check_that_did_not_run_from_one_that_failed() -> Non
     assert hard_coded["alt_matched"] is False
 
 
+def test_tells_a_plan_check_that_did_not_run_from_one_that_passed() -> None:
+    # Unset: no check ran, as for the official-protocol numbers. True: a literal result.
+    unchecked = parse(to_json_line(EffiSqlGrade(matched=True)))
+    passed = parse(to_json_line(EffiSqlGrade(matched=True, literal_result=False)))
+    literal = parse(to_json_line(EffiSqlGrade(matched=True, literal_result=True)))
+
+    assert "literal_result" not in unchecked
+    assert passed["literal_result"] is False
+    assert literal["literal_result"] is True
+
+
+def test_always_writes_whether_dev_mode_reused_the_identity_speedup() -> None:
+    # A plain bool: false whenever the prediction was timed, as official mode always times it.
+    measured = parse(to_json_line(EffiSqlGrade(matched=True)))
+    cached = EffiSqlGrade(matched=True, speedup=1.02, credit=0.5, identity_cached=True)
+
+    assert measured["identity_cached"] is False
+    assert from_json_line(to_json_line(cached), EffiSqlGrade) == cached
+
+
 def test_writes_timestamps_in_rfc_3339() -> None:
     started_at = Timestamp()
     started_at.FromDatetime(datetime(2026, 10, 15, 1, 2, 3, 456000, tzinfo=UTC))
