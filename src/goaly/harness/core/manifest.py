@@ -34,6 +34,7 @@ __all__ = [
     "GitState",
     "config_hash",
     "content_hash",
+    "core_hash",
     "cpu_model",
     "git_state",
     "harness_hash",
@@ -70,38 +71,52 @@ def content_hash(trees: Mapping[str, Path]) -> str:
     """Return the SHA-256, in hex, of every file under the directories in ``trees``.
 
     Each file counts with its contents and its path: the tree's label, then the path within the
-    tree. Python bytecode (``__pycache__``, ``*.pyc``, ``*.pyo``) is left out. A linked file
-    counts with the contents it links to; a linked directory is not followed.
+    tree. A symbolic link counts with the path it holds, never what it links to, so the hash
+    reads nothing outside the trees; a link to a directory raises ValueError, as its files would
+    go uncounted. Python bytecode (``__pycache__``, ``*.pyc``, ``*.pyo``) is left out.
     """
-    files: list[tuple[str, str]] = []
+    files: list[tuple[str, str, str]] = []
     for label, root in trees.items():
         if not root.is_dir():
             raise FileNotFoundError(f"no such directory: {root}")
         for directory, dirnames, filenames in root.walk():
             dirnames[:] = [name for name in dirnames if name != _BYTECODE_DIR]
-            for name in filenames:
+            for name in filenames:  # Path.walk lists links, to directories too, among the files.
                 path = directory / name
-                # Path.walk lists a link to a directory among the files.
-                if name.endswith(_BYTECODE_SUFFIXES) or path.is_dir():
+                if name.endswith(_BYTECODE_SUFFIXES):
                     continue
-                files.append((f"{label}/{path.relative_to(root).as_posix()}", sha256_file(path)))
+                where = f"{label}/{path.relative_to(root).as_posix()}"
+                if path.is_symlink():
+                    if path.is_dir():
+                        raise ValueError(f"{path} links to a directory, which cannot be hashed")
+                    target = hashlib.sha256(os.fsencode(path.readlink())).hexdigest()
+                    files.append((where, "link", target))
+                else:
+                    files.append((where, "file", sha256_file(path)))
     listing = json.dumps(sorted(files), ensure_ascii=False, separators=(",", ":"))
     return hashlib.sha256(listing.encode("utf-8")).hexdigest()
 
 
-def harness_hash(pack_dir: Path | None) -> str:
-    """Return the content hash of core plus the pack in ``pack_dir``, or of core alone."""
-    trees = {"core": CORE_DIR} if pack_dir is None else {"core": CORE_DIR, "pack": pack_dir}
-    return content_hash(trees)
+def harness_hash(pack_dir: Path) -> str:
+    """Return the harness hash: the content hash of core plus the pack in ``pack_dir``."""
+    return content_hash({"core": CORE_DIR, "pack": pack_dir})
 
 
-def config_hash(config: Mapping[str, JsonValue]) -> str:
-    """Return the SHA-256, in hex, of ``config`` as JSON with its keys sorted at every level."""
+def core_hash() -> str:
+    """Return the content hash of core alone, for a harness without a pack, such as a test's."""
+    return content_hash({"core": CORE_DIR})
+
+
+def config_hash(config: dict[str, JsonValue]) -> str:
+    """Return the SHA-256, in hex, of ``config`` as JSON with its keys sorted at every level.
+
+    Raise ValueError for a value JSON cannot hold, such as NaN or an object of another type.
+    """
     try:
         text = json.dumps(
             config, sort_keys=True, ensure_ascii=False, separators=(",", ":"), allow_nan=False
         )
-    except ValueError as error:
+    except (TypeError, ValueError) as error:
         raise ValueError(f"the config holds a value JSON cannot hold: {error}") from error
     return hashlib.sha256(text.encode("utf-8")).hexdigest()
 
@@ -127,9 +142,10 @@ class GitState:
 def git_state(directory: Path) -> GitState | None:
     """Return the state of the git checkout that holds ``directory``.
 
-    Return None if git is not installed, ``directory`` is in no checkout, or the checkout has no
-    commit yet. GIT_* variables of the calling process, which a git hook sets, are not passed
-    on. git runs as a subprocess, so this blocks.
+    Return None if git is not installed, ``directory`` is in no checkout, the checkout has no
+    commit yet, or git does not answer within a minute. GIT_* variables of the calling process,
+    which a git hook sets, are not passed on. git runs as a subprocess, so this blocks: run it in
+    a worker thread from the event loop.
     """
     git = shutil.which("git")
     if git is None:
@@ -137,15 +153,18 @@ def git_state(directory: Path) -> GitState | None:
     environment = {name: value for name, value in os.environ.items() if not name.startswith("GIT_")}
 
     def output(*args: str) -> str | None:
-        # The arguments are fixed strings and a path, run without a shell.
-        completed = subprocess.run(  # noqa: S603
-            [git, "--no-optional-locks", "-C", str(directory), *args],
-            env=environment,
-            capture_output=True,
-            text=True,
-            timeout=_GIT_TIMEOUT_S,
-            check=False,
-        )
+        try:
+            # The arguments are fixed strings and a path, run without a shell.
+            completed = subprocess.run(  # noqa: S603
+                [git, "--no-optional-locks", "-C", str(directory), *args],
+                env=environment,
+                capture_output=True,
+                text=True,
+                timeout=_GIT_TIMEOUT_S,
+                check=False,
+            )
+        except subprocess.TimeoutExpired:  # A hung git, say on a locked repository.
+            return None
         return completed.stdout.strip() if completed.returncode == 0 else None
 
     root = output("rev-parse", "--show-toplevel")
@@ -194,7 +213,8 @@ def provenance(directory: Path) -> RunManifest:
 
     It has the commit and dirty flag of the checkout that holds ``directory``, the SHA-256 of
     the checkout's uv.lock, and the machine. Outside a checkout it has only the machine, and a
-    warning is logged. Merge it into the run's manifest with ``MergeFrom``.
+    warning is logged. Merge it into the run's manifest with ``MergeFrom``. It runs git and
+    reads files, so it blocks: run it in a worker thread from the event loop.
     """
     found = RunManifest(machine=machine_info())
     state = git_state(directory)
@@ -215,6 +235,7 @@ def write_manifest(path: Path, manifest: RunManifest) -> None:
     """Write ``manifest`` to ``path`` as indented JSON, replacing the file atomically.
 
     The keys follow the .proto's field order and the protobuf JSON mapping, as in a JSONL line.
+    It writes and syncs a file, so it blocks: run it in a worker thread from the event loop.
     """
     fields = json.loads(to_json_line(manifest))
     write_text_atomically(path, json.dumps(fields, ensure_ascii=False, indent=2) + "\n")

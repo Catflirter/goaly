@@ -1,12 +1,15 @@
 """Tests for goaly.harness.core.jsonl_writer: the single-writer JSONL sink (spec §6.2)."""
 
 import asyncio
+import logging
 import threading
 from collections.abc import Iterator
 from pathlib import Path
 
 import pytest
+from google.protobuf.json_format import SerializeToJsonError
 from google.protobuf.message import Message
+from google.protobuf.timestamp_pb2 import Timestamp
 
 from goaly.contracts.gen.result_pb2 import TaskResult
 from goaly.contracts.gen.task_pb2 import Grade
@@ -172,6 +175,45 @@ async def test_entering_fails_at_once_if_the_file_cannot_be_created(tmp_path: Pa
         await writer.__aenter__()
 
 
+# Messages that cannot be lines.
+
+
+def invalid(n: int) -> TaskResult:
+    """A result whose start time no JSON timestamp can hold."""
+    return TaskResult(run_id="run", instance_id=f"task-{n}", started_at=Timestamp(seconds=10**13))
+
+
+async def test_a_message_that_cannot_be_a_line_fails_only_its_own_caller(path: Path) -> None:
+    async with JsonlWriter[TaskResult](path) as writer:
+        writer.put(result(1))
+        with pytest.raises(SerializeToJsonError, match="Timestamp is not valid"):
+            writer.put(invalid(2))
+        with pytest.raises(SerializeToJsonError, match="Timestamp is not valid"):
+            await writer.write(invalid(3))
+        await writer.write(result(4))  # Every other caller carries on.
+
+    assert instance_ids(path) == ["task-1", "task-4"]
+
+
+async def test_an_unexpected_error_fails_only_its_line(
+    path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    def append_or_fail(path: Path, message: Message) -> None:
+        if isinstance(message, TaskResult) and message.instance_id == "task-2":
+            raise RuntimeError("an unexpected bug")
+        append_jsonl(path, message)
+
+    monkeypatch.setattr(jsonl_writer, "append_jsonl", append_or_fail)
+
+    async with JsonlWriter[TaskResult](path) as writer:
+        await writer.write(result(1))
+        with pytest.raises(JsonlWriterError, match="an unexpected bug"):
+            await writer.write(result(2))
+        await writer.write(result(3))
+
+    assert instance_ids(path) == ["task-1", "task-3"]
+
+
 # Cancellation.
 
 
@@ -209,10 +251,51 @@ async def test_cancelling_the_close_stops_the_writer_and_fails_its_waiters(
         with pytest.raises(asyncio.CancelledError):
             await closing
         # Nobody waits forever: each waiter learns that its line may not have been written.
-        with pytest.raises(JsonlWriterError, match="stopped before"):
+        with pytest.raises(JsonlWriterError, match="may not have been written"):
             await first
-        with pytest.raises(JsonlWriterError, match="stopped before"):
+        with pytest.raises(JsonlWriterError, match="stopped before it wrote this line"):
             await second
+    blocking_append.release.set()
+    await writer.aclose()  # Closing again does not wait for the stopped writer.
+
+
+async def test_a_cancelled_body_still_writes_every_queued_line(path: Path) -> None:
+    queued = asyncio.Event()
+
+    async def body() -> None:
+        async with JsonlWriter[TaskResult](path) as writer:
+            for n in range(20):
+                writer.put(result(n))
+            queued.set()
+            await asyncio.sleep(GUARD_S)
+
+    running = asyncio.create_task(body())
+    async with asyncio.timeout(GUARD_S):
+        await queued.wait()
+    running.cancel()
+
+    with pytest.raises(asyncio.CancelledError):
+        await running
+    assert instance_ids(path) == [f"task-{n}" for n in range(20)]
+
+
+async def test_a_writer_that_stops_early_logs_how_many_lines_it_dropped(
+    path: Path, blocking_append: BlockingAppend, caplog: pytest.LogCaptureFixture
+) -> None:
+    writer = JsonlWriter[TaskResult](path)
+    await writer.__aenter__()
+    for n in range(3):
+        writer.put(result(n))
+    await wait_for(blocking_append.started)
+    closing = asyncio.create_task(writer.aclose())
+    await asyncio.sleep(0)
+
+    with caplog.at_level(logging.WARNING, logger="goaly.harness.core.jsonl_writer"):
+        closing.cancel()
+        with pytest.raises(asyncio.CancelledError):
+            await closing
+
+    assert "stopped with 3 lines unwritten" in caplog.text
     blocking_append.release.set()
 
 
@@ -288,9 +371,9 @@ async def test_closing_after_an_error_in_the_body_keeps_that_error(path: Path) -
 async def test_refuses_messages_before_it_is_entered(path: Path) -> None:
     writer = JsonlWriter[TaskResult](path)
 
-    with pytest.raises(RuntimeError, match="not open"):
+    with pytest.raises(RuntimeError, match="has not been entered"):
         writer.put(result(1))
-    with pytest.raises(RuntimeError, match="not open"):
+    with pytest.raises(RuntimeError, match="has not been entered"):
         await writer.write(result(1))
 
 
@@ -299,9 +382,9 @@ async def test_refuses_messages_once_closed_and_closing_again_does_nothing(path:
         writer.put(result(1))
     await writer.aclose()
 
-    with pytest.raises(RuntimeError, match="not open"):
+    with pytest.raises(RuntimeError, match="is closed"):
         writer.put(result(2))
-    with pytest.raises(RuntimeError, match="not open"):
+    with pytest.raises(RuntimeError, match="is closed"):
         await writer.write(result(2))
     assert instance_ids(path) == ["task-1"]
 
@@ -323,6 +406,18 @@ async def test_cannot_be_entered_twice(path: Path) -> None:
             await writer.__aenter__()
     with pytest.raises(RuntimeError, match="already"):
         await writer.__aenter__()
+
+
+async def test_cannot_be_entered_twice_at_once(path: Path) -> None:
+    writer = JsonlWriter[TaskResult](path)
+    first = asyncio.create_task(writer.__aenter__())
+    await asyncio.sleep(0)  # The first entry is now creating the file.
+
+    with pytest.raises(RuntimeError, match="already"):
+        await writer.__aenter__()  # While the first entry is still creating the file.
+
+    await first
+    await writer.aclose()
 
 
 def _typing_checks(writer: JsonlWriter[TaskResult]) -> None:
