@@ -166,15 +166,57 @@ def test_a_container_docker_cannot_account_for_is_a_sandbox_error(
         environment.execute({"command": "ls"})
 
 
-def test_a_hung_docker_exec_is_a_sandbox_error(docker: FakeDocker, worktree: Worktree) -> None:
+def test_an_exec_held_open_past_its_time_is_a_timed_out_command(
+    docker: FakeDocker, worktree: Worktree
+) -> None:
+    # As when the command left `setsid cmd &` behind, holding the exec's output open.
     with make(
         docker, worktree, command_timeout_s=0.1, kill_after_s=0.1, docker_timeout_s=0.5
     ) as environment:
-        docker.script({"exec": {"sleep": 5}})
+        docker.script({"exec": {"sleep": 5}, "inspect": {"stdout": "true 0 false\n"}})
 
-        with pytest.raises(SandboxError, match="timed out"):
+        output = environment.execute({"command": "setsid sleep 600 &"})
+        docker.script({})
+
+    assert output["returncode"] == 124
+    assert "output stayed open" in output["exception_info"]
+    assert "cmd > /tmp/log 2>&1 &" in output["exception_info"]
+
+
+def test_a_hung_exec_that_docker_cannot_account_for_is_a_sandbox_error(
+    docker: FakeDocker, worktree: Worktree
+) -> None:
+    with make(
+        docker, worktree, command_timeout_s=0.1, kill_after_s=0.1, docker_timeout_s=0.5
+    ) as environment:
+        docker.script({"exec": {"sleep": 5}, "inspect": {"stderr": "daemon gone", "exit": 1}})
+
+        with pytest.raises(SandboxError, match="docker inspect failed"):
             environment.execute({"command": "ls"})
         docker.script({})
+
+
+def test_a_hung_docker_call_is_a_sandbox_error(docker: FakeDocker, worktree: Worktree) -> None:
+    environment = make(docker, worktree, docker_timeout_s=0.5)
+    docker.script({"rm": {"sleep": 5}})
+
+    with pytest.raises(SandboxError, match="docker rm timed out"):
+        environment.cleanup()
+
+
+def test_a_docker_warning_does_not_spoil_the_state(
+    docker: FakeDocker, environment: SandboxEnvironment
+) -> None:
+    docker.script(
+        {
+            "exec": {"stdout": "no such file\n", "exit": 1},
+            "inspect": {"stdout": "true 0 false\n", "stderr": "WARNING: config unreadable\n"},
+        }
+    )
+
+    output = environment.execute({"command": "cat missing"})
+
+    assert output["returncode"] == 1
 
 
 def test_output_that_starts_with_the_marker_finishes_the_run(
@@ -217,10 +259,10 @@ def test_cleanup_removes_every_container_of_the_experiment_and_checks(
     name = environment.container_id
 
     environment.cleanup()
-    environment.cleanup()  # Once is enough.
+    environment.cleanup()  # No container to remove by name, but it sweeps by label again.
     del environment  # The base class would remove it again, in the background.
 
-    assert docker.commands() == ["ps", "run", "rm", "ps", "ps"]
+    assert docker.commands() == ["ps", "run", "rm", "ps", "ps", "ps", "ps"]
     calls = [call["args"] for call in docker.calls()]
     assert calls[2] == ["rm", "--force", name]
     assert calls[3] == calls[4] == ["ps", "--all", "--quiet", *LABELS]

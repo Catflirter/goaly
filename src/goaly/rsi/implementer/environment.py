@@ -22,9 +22,11 @@ stopped on its own, which only something run inside it can make it do, raises Sa
 and the candidate is rejected.
 """
 
+import contextlib
 import logging
 import os
 import secrets
+import signal
 import subprocess
 import threading
 from types import TracebackType
@@ -153,7 +155,20 @@ class SandboxEnvironment(msa.DockerEnvironment):
             *timed_shell(limit, self._sandbox),
             action.get("command", ""),
         ]
-        returncode, kept = self._stream(command, timeout_s=limit + self._sandbox.kill_after_s)
+        try:
+            returncode, kept = self._stream(command, timeout_s=limit + self._sandbox.kill_after_s)
+        except _HostTimeout as timeout_error:
+            # Docker hung, or a process the command left behind holds its output open.
+            self._check_running(container)
+            return {
+                "output": "",
+                "returncode": _TIMED_OUT,
+                "exception_info": (
+                    f"The command's output stayed open for {timeout_error.limit_s:g} s, so it was "
+                    "stopped. A process started in the background must send its output to a "
+                    "file, as in `cmd > /tmp/log 2>&1 &`."
+                ),
+            }
         output: dict[str, Any] = {
             "output": kept.text(),
             "returncode": returncode,
@@ -176,13 +191,13 @@ class SandboxEnvironment(msa.DockerEnvironment):
 
     def cleanup(self) -> None:
         """Remove every container of the experiment, wait until they are gone, and check that
-        none is left (spec §8.8, Finishing). Raises SandboxError if docker fails or a container
-        remains.
+        none is left (spec §8.8, Finishing), even if none was started. Raises SandboxError if
+        docker fails or a container remains.
         """
-        if self.container_id is None:
-            return
-        self._docker(["rm", "--force", self.container_id])
-        self.container_id = None
+        if self.container_id is not None:
+            self._docker(["rm", "--force", self.container_id])
+            self.container_id = None
+        # Always, by label: a start that failed may still have left a container behind.
         experiment_id = self._worktree.experiment_id
         remove_containers(experiment_id=experiment_id, config=self._sandbox)
         left = containers(experiment_id=experiment_id, config=self._sandbox)
@@ -220,15 +235,35 @@ class SandboxEnvironment(msa.DockerEnvironment):
         raise SandboxStoppedError(f"the sandbox container {container} stopped: {reason}")
 
     def _docker(self, args: list[str]) -> str:
-        """Run a docker command that must succeed, and return its output."""
-        returncode, kept = self._stream(args, timeout_s=0)
-        if returncode != 0:
-            raise SandboxError(f"docker {args[0]} failed ({returncode}): {kept.text().strip()}")
-        return kept.text()
+        """Run a docker command that must succeed, and return its standard output; its error
+        output only explains a failure.
+        """
+        try:
+            completed = subprocess.run(  # noqa: S603  (the docker CLI, with arguments built here)
+                [self._sandbox.docker, *args],
+                env=_docker_environment(),
+                stdin=subprocess.DEVNULL,
+                capture_output=True,
+                timeout=self._sandbox.docker_timeout_s,
+                check=False,
+            )
+        except subprocess.TimeoutExpired:
+            limit = self._sandbox.docker_timeout_s
+            raise SandboxError(f"docker {args[0]} timed out after {limit:g} s") from None
+        except OSError as error:
+            raise SandboxError(f"cannot run {self._sandbox.docker}: {error}") from error
+        if completed.returncode != 0:
+            reason = completed.stderr.decode("utf-8", "replace").strip()
+            raise SandboxError(f"docker {args[0]} failed ({completed.returncode}): {reason}")
+        return completed.stdout.decode("utf-8", "replace")
 
     def _stream(self, args: list[str], *, timeout_s: float) -> tuple[int, "_BoundedOutput"]:
-        """Run the docker CLI for at most ``timeout_s`` plus docker's own timeout, reading its
+        """Run ``docker exec`` for at most ``timeout_s`` plus docker's own timeout, reading its
         output as it comes, and return its exit status and what was kept of its output.
+
+        Raises _HostTimeout once that time is up, with the exec's process group killed: docker
+        exec waits for its output to close, which a process the command left in the background
+        can hold open past the in-container timeout.
         """
         limit = timeout_s + self._sandbox.docker_timeout_s
         try:
@@ -238,6 +273,7 @@ class SandboxEnvironment(msa.DockerEnvironment):
                 stdin=subprocess.DEVNULL,
                 stdout=subprocess.PIPE,
                 stderr=subprocess.STDOUT,
+                start_new_session=True,  # Its own process group, to kill as one.
             )
         except OSError as error:
             raise SandboxError(f"cannot run {self._sandbox.docker}: {error}") from error
@@ -248,13 +284,22 @@ class SandboxEnvironment(msa.DockerEnvironment):
         try:
             returncode = process.wait(timeout=limit)
         except subprocess.TimeoutExpired:
-            process.kill()
+            with contextlib.suppress(ProcessLookupError):
+                os.killpg(process.pid, signal.SIGKILL)
             process.wait()
-            raise SandboxError(f"docker {args[0]} timed out after {limit:g} s") from None
+            raise _HostTimeout(limit) from None
         finally:
             reader.join()
             stdout.close()
         return returncode, output
+
+
+class _HostTimeout(Exception):  # noqa: N818  (not an error of its own: execute() decides)
+    """docker exec did not end within its time on the host."""
+
+    def __init__(self, limit_s: float) -> None:
+        super().__init__(f"docker exec did not end within {limit_s:g} s")
+        self.limit_s = limit_s
 
 
 class _BoundedOutput:

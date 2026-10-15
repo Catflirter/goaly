@@ -8,6 +8,7 @@ import concurrent.futures
 import secrets
 import subprocess
 import threading
+import time
 from collections.abc import Iterator
 from pathlib import Path
 
@@ -17,7 +18,7 @@ from goaly.contracts.gen.experiment_pb2 import LANE_EFFISQL, Hypothesis, Impleme
 from goaly.rsi.implementer import msa
 from goaly.rsi.implementer.environment import SandboxEnvironment, SandboxStoppedError
 from goaly.rsi.implementer.run import Implementer
-from goaly.rsi.sandbox import LABEL_EXPERIMENT, ensure_image
+from goaly.rsi.sandbox import LABEL_EXPERIMENT, SandboxConfig, ensure_image
 from goaly.rsi.workspace import Workspace, Worktree
 from tests.rsi.gitrepo import git, make_repo
 from tests.rsi.implementer.fakes import NoLlm, ScriptedModel, submit
@@ -103,6 +104,29 @@ def test_a_sandbox_the_agent_stops_is_the_candidates_fault(image: str, worktree:
             sandbox.execute({"command": "kill 1; sleep 5"})
     finally:
         sandbox.cleanup()
+
+
+def test_a_background_process_with_open_output_does_not_hold_the_command(
+    image: str, worktree: Worktree
+) -> None:
+    # On this Docker, exec ends with its command even when a setsid child keeps the output
+    # open. Were it to wait, the host's timeout would end it as a timed-out command (see the
+    # fake-docker test), never as a Docker failure.
+    with SandboxEnvironment(
+        image=image,
+        worktree=worktree,
+        command_timeout_s=5,
+        lifetime_s=600,
+        sandbox=SandboxConfig(docker_timeout_s=15),
+    ) as sandbox:
+        started = time.monotonic()
+        held = sandbox.execute({"command": "setsid sleep 600 &"})
+        elapsed = time.monotonic() - started
+        after = sandbox.execute({"command": "echo still here"})
+
+    assert held["returncode"] in (0, 124)
+    assert elapsed < 5 + 5 + 15 + 5
+    assert after["output"] == "still here\n"
 
 
 def test_huge_output_is_read_as_it_comes_and_cut(image: str, worktree: Worktree) -> None:
