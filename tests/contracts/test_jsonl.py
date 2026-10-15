@@ -18,7 +18,7 @@ from google.protobuf.struct_pb2 import ListValue, Struct, Value
 from google.protobuf.timestamp_pb2 import Timestamp
 
 from goaly.contracts.gen.environment_pb2 import ShellResult, SqlResult
-from goaly.contracts.gen.llm_call_pb2 import LlmCallRecord, LlmCallStatus, Usage
+from goaly.contracts.gen.llm_call_pb2 import LlmCallAttempt, LlmCallRecord, LlmCallStatus, Usage
 from goaly.contracts.gen.task_pb2 import (
     EffiSqlPrediction,
     EffiSqlTaskInput,
@@ -172,6 +172,27 @@ def test_writes_the_elements_of_lists_and_the_values_of_maps_in_declaration_orde
 
     assert list(fields["items"][0]) == ["late", "early"]
     assert list(fields["by_key"]["k"]) == ["late", "early"]
+
+
+def test_writes_each_attempt_of_a_call_and_only_the_retry_after_it_was_sent() -> None:
+    throttled = LlmCallAttempt(
+        wait_s=0.5,
+        latency_s=0.2,
+        status=LlmCallStatus.LLM_CALL_STATUS_RATE_LIMITED,
+        http_status=429,
+        retry_after_s=2.0,
+    )
+    answered = LlmCallAttempt(
+        wait_s=2.0, latency_s=3.1, status=LlmCallStatus.LLM_CALL_STATUS_OK, http_status=200
+    )
+    record = LlmCallRecord(attempts=[throttled, answered], wait_s=2.5, latency_s=5.8)
+
+    line = to_json_line(record)
+
+    attempts = parse(line)["attempts"]
+    assert [attempt["http_status"] for attempt in attempts] == [429, 200]
+    assert [attempt.get("retry_after_s") for attempt in attempts] == [2.0, None]
+    assert from_json_line(line, LlmCallRecord) == record
 
 
 def test_writes_timestamps_in_rfc_3339() -> None:

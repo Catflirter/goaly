@@ -3,9 +3,11 @@
 isort:skip_file
 The record of one LLM call (spec §5.1, §6.2, §9), and the Usage that other records reuse."""
 
+from collections import abc as _abc
 from google.protobuf import descriptor as _descriptor
 from google.protobuf import message as _message
 from google.protobuf import timestamp_pb2 as _timestamp_pb2
+from google.protobuf.internal import containers as _containers
 from google.protobuf.internal import enum_type_wrapper as _enum_type_wrapper
 import builtins as _builtins
 import sys
@@ -80,7 +82,7 @@ class _LlmCallStatusEnumTypeWrapper(_enum_type_wrapper._EnumTypeWrapper[_LlmCall
     """
 
 class LlmCallStatus(_LlmCallStatus, metaclass=_LlmCallStatusEnumTypeWrapper):
-    """How an LLM call ended. A failed call reports the error of its last attempt."""
+    """How an LLM call, or one attempt of it, ended. A call reports its last attempt's status."""
 
 LLM_CALL_STATUS_UNSPECIFIED: LlmCallStatus.ValueType  # 0
 """Not set."""
@@ -140,18 +142,22 @@ class LlmCallRecord(_message.Message):
     model: _builtins.str
     """The model called, such as "qwen3.6-35b-a3b"."""
     latency_s: _builtins.float
-    """From the start of the call to its end, in seconds, every attempt and every wait included."""
+    """The whole call, from its start to its end, in seconds: every attempt and every wait included."""
     wait_s: _builtins.float
-    """The part of latency_s spent waiting for a concurrency slot or a retry backoff (spec §6.2)."""
-    attempts: _builtins.int
-    """How many requests the call sent: 1, plus one per retry."""
+    """The part of latency_s spent waiting for a concurrency slot or a retry backoff: the sum of the
+    attempts' wait_s (spec §6.2).
+    """
     status: Global___LlmCallStatus.ValueType
-    """How the call ended."""
+    """How the call ended: the status of its last attempt."""
     http_status: _builtins.int
-    """The HTTP status of the last response, or 0 if no response arrived."""
+    """The HTTP status of the last attempt's response, or 0 if no response arrived."""
     @_builtins.property
     def usage(self) -> Global___Usage:
         """The tokens and cost the gateway reported for the call."""
+
+    @_builtins.property
+    def attempts(self) -> _containers.RepeatedCompositeFieldContainer[Global___LlmCallAttempt]:
+        """Every request the call sent, in order: the first attempt, then each retry."""
 
     @_builtins.property
     def started_at(self) -> _timestamp_pb2.Timestamp:
@@ -169,7 +175,7 @@ class LlmCallRecord(_message.Message):
         usage: Global___Usage | None = ...,
         latency_s: _builtins.float = ...,
         wait_s: _builtins.float = ...,
-        attempts: _builtins.int = ...,
+        attempts: _abc.Iterable[Global___LlmCallAttempt] | None = ...,
         status: Global___LlmCallStatus.ValueType = ...,
         http_status: _builtins.int = ...,
         started_at: _timestamp_pb2.Timestamp | None = ...,
@@ -181,6 +187,56 @@ class LlmCallRecord(_message.Message):
     def WhichOneof(self, oneof_group: _Never) -> None: ...
 
 Global___LlmCallRecord: _TypeAlias = LlmCallRecord  # noqa: Y015
+
+@_typing.final
+class LlmCallAttempt(_message.Message):
+    """One request of an LLM call: its first attempt, or a retry. Every 429 or 503 response and every
+    backoff is on record here (spec §6.2).
+    """
+
+    DESCRIPTOR: _descriptor.Descriptor
+
+    STARTED_AT_FIELD_NUMBER: _builtins.int
+    WAIT_S_FIELD_NUMBER: _builtins.int
+    LATENCY_S_FIELD_NUMBER: _builtins.int
+    STATUS_FIELD_NUMBER: _builtins.int
+    HTTP_STATUS_FIELD_NUMBER: _builtins.int
+    RETRY_AFTER_S_FIELD_NUMBER: _builtins.int
+    wait_s: _builtins.float
+    """The time waited before this attempt's request was sent: for a concurrency slot and, for a
+    retry, the backoff.
+    """
+    latency_s: _builtins.float
+    """From sending the request to its response or its failure, in seconds."""
+    status: Global___LlmCallStatus.ValueType
+    """How the attempt ended."""
+    http_status: _builtins.int
+    """The HTTP status of the response, or 0 if no response arrived."""
+    retry_after_s: _builtins.float
+    """The server's Retry-After value, in seconds, when it sent one."""
+    @_builtins.property
+    def started_at(self) -> _timestamp_pb2.Timestamp:
+        """When the attempt began, before its wait."""
+
+    def __init__(
+        self,
+        *,
+        started_at: _timestamp_pb2.Timestamp | None = ...,
+        wait_s: _builtins.float = ...,
+        latency_s: _builtins.float = ...,
+        status: Global___LlmCallStatus.ValueType = ...,
+        http_status: _builtins.int = ...,
+        retry_after_s: _builtins.float | None = ...,
+    ) -> None: ...
+    _HasFieldArgType: _TypeAlias = _typing.Literal["_retry_after_s", b"_retry_after_s", "retry_after_s", b"retry_after_s", "started_at", b"started_at"]  # noqa: Y015
+    def HasField(self, field_name: _HasFieldArgType) -> _builtins.bool: ...
+    _ClearFieldArgType: _TypeAlias = _typing.Literal["_retry_after_s", b"_retry_after_s", "http_status", b"http_status", "latency_s", b"latency_s", "retry_after_s", b"retry_after_s", "started_at", b"started_at", "status", b"status", "wait_s", b"wait_s"]  # noqa: Y015
+    def ClearField(self, field_name: _ClearFieldArgType) -> None: ...
+    _WhichOneofReturnType__retry_after_s: _TypeAlias = _typing.Literal["retry_after_s"]  # noqa: Y015
+    _WhichOneofArgType__retry_after_s: _TypeAlias = _typing.Literal["_retry_after_s", b"_retry_after_s"]  # noqa: Y015
+    def WhichOneof(self, oneof_group: _WhichOneofArgType__retry_after_s) -> _WhichOneofReturnType__retry_after_s | None: ...
+
+Global___LlmCallAttempt: _TypeAlias = LlmCallAttempt  # noqa: Y015
 
 @_typing.final
 class Usage(_message.Message):

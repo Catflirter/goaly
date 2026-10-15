@@ -22,18 +22,37 @@ message LlmCallRecord {
   string model = 5;
   // The tokens and cost the gateway reported for the call.
   Usage usage = 6;
-  // From the start of the call to its end, in seconds, every attempt and every wait included.
+  // The whole call, from its start to its end, in seconds: every attempt and every wait included.
   double latency_s = 7;
-  // The part of latency_s spent waiting for a concurrency slot or a retry backoff (spec §6.2).
+  // The part of latency_s spent waiting for a concurrency slot or a retry backoff: the sum of the
+  // attempts' wait_s (spec §6.2).
   double wait_s = 8;
-  // How many requests the call sent: 1, plus one per retry.
-  int32 attempts = 9;
-  // How the call ended.
+  // Every request the call sent, in order: the first attempt, then each retry.
+  repeated LlmCallAttempt attempts = 9;
+  // How the call ended: the status of its last attempt.
   LlmCallStatus status = 10;
-  // The HTTP status of the last response, or 0 if no response arrived.
+  // The HTTP status of the last attempt's response, or 0 if no response arrived.
   int32 http_status = 11;
   // When the call began, before any wait for a concurrency slot.
   google.protobuf.Timestamp started_at = 12;
+}
+
+// One request of an LLM call: its first attempt, or a retry. Every 429 or 503 response and every
+// backoff is on record here (spec §6.2).
+message LlmCallAttempt {
+  // When the attempt began, before its wait.
+  google.protobuf.Timestamp started_at = 1;
+  // The time waited before this attempt's request was sent: for a concurrency slot and, for a
+  // retry, the backoff.
+  double wait_s = 2;
+  // From sending the request to its response or its failure, in seconds.
+  double latency_s = 3;
+  // How the attempt ended.
+  LlmCallStatus status = 4;
+  // The HTTP status of the response, or 0 if no response arrived.
+  int32 http_status = 5;
+  // The server's Retry-After value, in seconds, when it sent one.
+  optional double retry_after_s = 6;
 }
 
 // Why an LLM call was made (spec §9).
@@ -50,7 +69,7 @@ enum CallPurpose {
   CALL_PURPOSE_RSI_LESSON = 4;
 }
 
-// How an LLM call ended. A failed call reports the error of its last attempt.
+// How an LLM call, or one attempt of it, ended. A call reports its last attempt's status.
 enum LlmCallStatus {
   // Not set.
   LLM_CALL_STATUS_UNSPECIFIED = 0;
