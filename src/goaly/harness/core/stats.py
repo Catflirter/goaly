@@ -94,10 +94,11 @@ def bootstrap_ci[T](
     """Return the percentile bootstrap interval of ``statistic(items)``.
 
     Each resample draws ``len(items)`` items with replacement from ``random.Random(seed)``, so
-    the same arguments always give the same interval. The bounds are the statistic's
-    (1 - confidence) / 2 and (1 + confidence) / 2 quantiles over the resamples, interpolated
-    linearly between order statistics. To compare two versions, pass each task's pair or
-    difference as one item, so that a resample keeps the pair together.
+    the same arguments always give the same interval. The draws pick positions, so the interval
+    also depends on the order of ``items``: pass them in a fixed order, such as by task ID. The
+    bounds are the statistic's (1 - confidence) / 2 and (1 + confidence) / 2 quantiles over the
+    resamples, interpolated linearly between order statistics. To compare two versions, pass
+    each task's pair or difference as one item, so that a resample keeps the pair together.
     """
     if not items:
         raise ValueError("bootstrap_ci needs at least one item")
