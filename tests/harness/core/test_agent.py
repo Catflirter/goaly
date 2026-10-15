@@ -25,6 +25,7 @@ from goaly.contracts.gen.task_pb2 import EffiSqlPrediction, Prediction
 from goaly.contracts.gen.trajectory_pb2 import (
     ChatMessage,
     ChatRole,
+    ContextFold,
     Step,
     StopReason,
     ToolCall,
@@ -36,6 +37,7 @@ from goaly.contracts.interfaces import Environment, SqlEnvironment
 from goaly.contracts.jsonl import append_jsonl, read_jsonl
 from goaly.harness.core.agent import AgentContext, AgentHooks, run_agent
 from goaly.harness.core.budgets import Budgets, BudgetUse
+from goaly.harness.core.context_window import ContextWindow
 from goaly.harness.core.llm import BoundLlm, CallTags, LlmClient
 from goaly.harness.core.llm_errors import ContextOverflow, ServerError
 from goaly.harness.core.llm_models import EXECUTOR_MODEL, ModelParams
@@ -137,6 +139,28 @@ class PairTool:
         return ToolResult(content="Both ran.")
 
 
+def big(n: int) -> str:
+    """A 4,000-character output, a different one for each ``n``."""
+    return f"{n}".ljust(4000, "x")
+
+
+class PageArgs(BaseModel):
+    """PageTool's arguments."""
+
+    n: int
+
+
+class PageTool:
+    """A short call with a long output, as reading a big plan is: page ``n`` is big(n)."""
+
+    name = "page"
+    description = "Read page n."
+    args_model = PageArgs
+
+    async def run(self, args: PageArgs, env: Environment) -> ToolResult:
+        return ToolResult(content=big(args.n))
+
+
 def environment() -> FakeSqlEnvironment:
     return FakeSqlEnvironment(
         {
@@ -151,11 +175,17 @@ def environment() -> FakeSqlEnvironment:
 
 def registry() -> ToolRegistry[SqlEnvironment]:
     return ToolRegistry[SqlEnvironment](
-        [bind(ExecuteSql()), bind(SubmitTool()), bind(FragileTool()), bind(PairTool())]
+        [
+            bind(ExecuteSql()),
+            bind(SubmitTool()),
+            bind(FragileTool()),
+            bind(PairTool()),
+            bind(PageTool()),
+        ]
     )
 
 
-TOOL_NAMES = "execute_sql, submit, fragile, pair"
+TOOL_NAMES = "execute_sql, submit, fragile, pair, page"
 SCHEMAS = registry().json_schemas()
 
 
@@ -179,9 +209,9 @@ def hooks(
     )
 
 
-def context(llm: BoundLlm, **budgets: Any) -> AgentContext:
+def context(llm: BoundLlm, *, window: ContextWindow | None = None, **budgets: Any) -> AgentContext:
     limits = Budgets.model_validate({"steps": 30, "wall_clock_s": 600.0} | budgets)
-    return AgentContext(llm, budgets=limits, params=PARAMS)
+    return AgentContext(llm, budgets=limits, params=PARAMS, window=window)
 
 
 def execute_sql(sql: str) -> ToolCall:
@@ -217,17 +247,34 @@ def replayed(assistant: ChatMessage) -> ChatMessage:
     return message
 
 
-def rebuilt_prompts(trajectory: Trajectory) -> list[list[ChatMessage]]:
-    """Each step's prompt, rebuilt from the trajectory by the rule trajectory.proto gives."""
-    histories: dict[int, list[ChatMessage]] = {}
+def rebuilt_prompts(trajectory: Trajectory, *, keep_turns: int = 8) -> list[list[ChatMessage]]:
+    """Each step's prompt, rebuilt from the trajectory by the rule trajectory.proto gives.
+
+    Every fold in effect at a step replaces the content of the tool message it names, by its
+    step and call ID. Two rules of the loop's own complete it: a reply goes out with its calls
+    only as structured calls, and only a chat's last ``keep_turns`` turns keep their reasoning.
+    """
+    earlier: dict[int, list[Step]] = {}
+    folds: dict[int, dict[tuple[int, str], str]] = {}
     prompts = []
     for step in trajectory.steps:
-        initial = trajectory.chats[step.chat].initial_messages
-        history = histories.setdefault(step.chat, list(initial))
-        prompts.append(list(history))
-        history.append(replayed(step.assistant))
-        history.extend(tool_message(result) for result in step.tool_results)
-        history.extend(step.injected)
+        turns = earlier.setdefault(step.chat, [])
+        in_effect = folds.setdefault(step.chat, {})
+        in_effect.update({(fold.step, fold.tool_call_id): fold.replacement for fold in step.folds})
+        prompt = list(trajectory.chats[step.chat].initial_messages)
+        for position, turn in enumerate(turns):
+            reply = replayed(turn.assistant)
+            if len(turns) - position > keep_turns:
+                reply.reasoning_content = ""
+            prompt.append(reply)
+            for result in turn.tool_results:
+                content = in_effect.get((turn.index, result.tool_call_id), result.content)
+                prompt.append(
+                    ChatMessage(role=TOOL, content=content, tool_call_id=result.tool_call_id)
+                )
+            prompt.extend(turn.injected)
+        prompts.append(prompt)
+        turns.append(step)
     return prompts
 
 
@@ -969,3 +1016,199 @@ async def test_the_wall_clock_cancels_a_real_call_and_its_record_says_so() -> No
     assert ctx.trajectory().stop_reason == TIME
     [record] = recorder.records
     assert record.status == LlmCallStatus.LLM_CALL_STATUS_CANCELLED
+
+
+# Context folding (spec §5.1): older tool outputs fold, and older reasoning stays behind.
+
+FOLD_MARKER = "\n[... folded: the first 500 of 4000 characters ...]"
+
+
+def folded(n: int) -> str:
+    return big(n)[:500] + FOLD_MARKER
+
+
+def page(n: int) -> ToolCall:
+    return tool_call("page", {"n": n})
+
+
+def counted(input_tokens: int) -> Usage:
+    """The usage of a call whose prompt the gateway counted as ``input_tokens``."""
+    return Usage(input_tokens=input_tokens, output_tokens=10)
+
+
+async def test_a_long_chat_folds_its_oldest_tool_outputs() -> None:
+    calls = [page(n) for n in range(4)]
+    script = [
+        reply(call, usage=counted(n))
+        for call, n in zip(calls, (500, 1500, 2500, 3500), strict=True)
+    ]
+    llm = FakeLLM([*script, reply(submit())])
+    ctx = context(llm, window=ContextWindow(fold_above_tokens=3000, keep_turns=2))
+
+    prediction = await run_agent(environment(), ctx, hooks())
+
+    assert prediction == SUBMISSION
+    trajectory = ctx.trajectory()
+    assert [list(step.folds) for step in trajectory.steps] == [
+        [],
+        [],
+        [],
+        [ContextFold(step=0, tool_call_id=calls[0].id, replacement=folded(0))],
+        [ContextFold(step=1, tool_call_id=calls[1].id, replacement=folded(1))],
+    ]
+    estimates = [step.estimated_prompt_tokens for step in trajectory.steps]
+    assert 0 < estimates[0] < estimates[1] < estimates[2] < 3000
+    assert estimates[3] <= 3000  # One fold brought it back under the threshold.
+    assert estimates[4] > 3000  # The two outputs it may fold were not enough; it went anyway.
+    assert [step.tool_results[0].content for step in trajectory.steps[:4]] == [
+        big(n) for n in range(4)
+    ]
+    assert [m.content for m in sent(llm)[4] if m.role == TOOL] == [
+        folded(0),
+        folded(1),
+        big(2),
+        big(3),
+    ]
+    assert rebuilt_prompts(trajectory, keep_turns=2) == sent(llm)
+
+
+async def test_only_the_last_turns_go_out_with_their_reasoning() -> None:
+    script = [reply(execute_sql(FAST), reasoning=f"Thought {n}.") for n in range(3)]
+    llm = FakeLLM([*script, reply(submit())])
+    ctx = context(llm, window=ContextWindow(keep_turns=2))
+
+    await run_agent(environment(), ctx, hooks())
+
+    replies = [m for m in sent(llm)[3] if m.role == ASSISTANT]
+    assert [m.reasoning_content for m in replies] == ["", "Thought 1.", "Thought 2."]
+    trajectory = ctx.trajectory()
+    assert trajectory.steps[0].assistant.reasoning_content == "Thought 0."  # Kept here.
+    assert rebuilt_prompts(trajectory, keep_turns=2) == sent(llm)
+
+
+async def test_a_prompt_too_long_for_the_model_folds_and_goes_once_more() -> None:
+    overflow = ContextOverflow("qwen3.6-35b-a3b: HTTP 400: maximum context length is 131072")
+    calls = [page(n) for n in range(3)]
+    llm = FakeLLM([*(reply(call) for call in calls), overflow, reply(submit())])
+    ctx = context(llm, window=ContextWindow(keep_turns=1))  # The estimate never passes 96K.
+
+    prediction = await run_agent(environment(), ctx, hooks())
+
+    assert prediction == SUBMISSION
+    trajectory = ctx.trajectory()
+    assert trajectory.stop_reason == SUBMITTED
+    assert len(trajectory.steps) == 4  # The call that overflowed has no step.
+    assert [(fold.step, fold.tool_call_id) for fold in trajectory.steps[3].folds] == [
+        (0, calls[0].id),
+        (1, calls[1].id),
+    ]
+    overflowed, retried = sent(llm)[3], sent(llm)[4]
+    assert [m.content for m in overflowed if m.role == TOOL] == [big(0), big(1), big(2)]
+    assert [m.content for m in retried if m.role == TOOL] == [folded(0), folded(1), big(2)]
+    assert rebuilt_prompts(trajectory, keep_turns=1) == [*sent(llm)[:3], retried]
+
+
+async def test_a_prompt_too_long_after_its_fold_ends_in_the_fallback() -> None:
+    first = ContextOverflow("too long")
+    second = ContextOverflow("still too long")
+    llm = FakeLLM([reply(page(0)), reply(page(1)), first, second])
+    ctx = context(llm, window=ContextWindow(keep_turns=1))
+
+    prediction = await run_agent(environment(), ctx, hooks())
+
+    assert prediction.fallback
+    assert len(llm.requests) == 4
+    trajectory = ctx.trajectory()
+    assert trajectory.stop_reason == TOKENS
+    assert trajectory.error_message == "ContextOverflow: still too long"
+
+
+async def test_a_prompt_too_long_with_nothing_to_fold_is_not_sent_again() -> None:
+    llm = FakeLLM([reply(page(0)), ContextOverflow("too long")])
+    ctx = context(llm, window=ContextWindow(keep_turns=1))  # The one turn is the tail.
+
+    prediction = await run_agent(environment(), ctx, hooks())
+
+    assert prediction.fallback
+    assert len(llm.requests) == 2
+    assert ctx.trajectory().error_message == "ContextOverflow: too long"
+
+
+# Repeated calls (spec §5.1): the same call again counts as an error, and says so.
+
+REPEATED = (
+    "Note: this call repeats your previous one, the same tool with the same arguments, so its "
+    "result is unchanged. Repeating a call does not help: change the arguments or try another "
+    "approach."
+)
+
+
+async def test_a_call_that_repeats_the_one_before_runs_with_a_note_and_counts_as_an_error() -> None:
+    env = environment()
+    llm = FakeLLM([reply(execute_sql(FAST)), reply(execute_sql(FAST)), reply(submit())])
+    ctx = context(llm, remind_after_errors=1, stop_after_errors=2)
+
+    prediction = await run_agent(env, ctx, hooks())
+
+    assert prediction == SUBMISSION
+    assert [sql for sql, _ in env.executed] == [FAST, FAST]  # It still ran.
+    first, second, _ = ctx.trajectory().steps
+    assert first.tool_results[0].content == "rows: 1"
+    assert second.tool_results[0].content == f"rows: 1\n\n{REPEATED}"
+    assert not second.tool_results[0].is_error
+    assert not first.injected
+    assert second.injected[0].content.startswith("You have made 1 error in a row.")
+
+
+async def test_arguments_that_differ_only_in_layout_repeat() -> None:
+    one = tool_call("execute_sql", f'{{"sql": "{FAST}",  "limit": 20}}')
+    other = tool_call("execute_sql", f'{{"limit":20,"sql":"{FAST}"}}')
+    ctx = context(FakeLLM([reply(one), reply(other), reply(submit())]))
+
+    await run_agent(environment(), ctx, hooks())
+
+    assert ctx.trajectory().steps[1].tool_results[0].content.endswith(REPEATED)
+
+
+async def test_a_repeat_in_the_same_reply_counts() -> None:
+    ctx = context(FakeLLM([reply(execute_sql(FAST), execute_sql(FAST)), reply(submit())]))
+
+    await run_agent(environment(), ctx, hooks())
+
+    results = ctx.trajectory().steps[0].tool_results
+    assert [result.content.endswith(REPEATED) for result in results] == [False, True]
+
+
+async def test_only_the_immediately_preceding_call_that_ran_counts() -> None:
+    cut = reply(execute_sql(EXPLAIN), finish_reason="length")  # It does not run.
+    script = [
+        reply(execute_sql(FAST)),
+        reply(execute_sql(EXPLAIN)),
+        reply(execute_sql(FAST)),  # Not right after the other FAST.
+        cut,
+        reply(execute_sql(EXPLAIN)),  # The cut-off call came between, but never ran.
+        reply(submit()),
+    ]
+    ctx = context(FakeLLM(script))
+
+    await run_agent(environment(), ctx, hooks())
+
+    contents = [step.tool_results[0].content for step in ctx.trajectory().steps]
+    assert [content.endswith(REPEATED) for content in contents] == [False] * 6
+
+
+async def test_the_pack_sees_the_note_and_its_guidance_follows_it() -> None:
+    seen: list[str] = []
+
+    def guide(call: ToolCall, result: ToolResult) -> str:
+        seen.append(result.content)
+        return "Hint: try a join."
+
+    ctx = context(FakeLLM([reply(execute_sql(FAST)), reply(execute_sql(FAST)), reply(submit())]))
+
+    await run_agent(environment(), ctx, hooks(on_tool_result=guide))
+
+    assert seen[1] == f"rows: 1\n\n{REPEATED}"
+    assert ctx.trajectory().steps[1].tool_results[0].content == (
+        f"rows: 1\n\n{REPEATED}\n\nHint: try a join."
+    )
