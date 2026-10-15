@@ -372,13 +372,17 @@ class QueuedNotifier:
     def _run(self) -> None:
         while True:
             with self._condition:
+                final = False
                 while True:
                     now = self._monotonic()
-                    if self._closing and (not self._queue or now >= self._deadline):
-                        return  # Every attempt left was recorded as its last.
+                    if self._closing and not self._queue:
+                        return
                     if not self._queue:
                         self._condition.wait()
                         continue
+                    if self._closing and now >= self._deadline:
+                        final = True  # Past the budget: one last attempt each, no retry.
+                        break
                     wait = self._queue[0].due - now
                     if wait <= 0:
                         break
@@ -388,14 +392,14 @@ class QueuedNotifier:
                 attempt = heapq.heappop(self._queue)
                 self._busy = True
             try:
-                self._attempt(attempt)
+                self._attempt(attempt, final=final)
             except Exception:  # The worker must outlive any bug in one attempt.
                 _logger.exception("a notification attempt failed unexpectedly")
             finally:
                 with self._condition:
                     self._busy = False
 
-    def _attempt(self, attempt: _Attempt) -> None:
+    def _attempt(self, attempt: _Attempt, *, final: bool = False) -> None:
         notification = attempt.notification
         if self._channel is None:
             self._record(notification, delivered=False, detail=_OFF)
@@ -413,7 +417,7 @@ class QueuedNotifier:
             closing = self._closing
             delays = self._close_delays if closing else self._delays
             delay = delays[min(attempt.failures, len(delays)) - 1]
-            retry = not closing or self._monotonic() + delay < self._deadline
+            retry = not final and (not closing or self._monotonic() + delay < self._deadline)
             if retry:
                 attempt.due = self._monotonic() + delay
                 heapq.heappush(self._queue, attempt)
