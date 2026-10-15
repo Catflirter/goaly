@@ -1,11 +1,13 @@
 """Tests for goaly.rsi.git: how goaly.rsi runs git."""
 
 import os
+import shutil
 import time
 from pathlib import Path
 
 import pytest
 
+from goaly.rsi import git as git_module
 from goaly.rsi.git import GitError, run_git, run_git_unless_no
 from tests.rsi.gitrepo import git, make_repo
 
@@ -122,3 +124,18 @@ def test_run_git_unless_no_tells_no_apart_from_a_failure(tmp_path: Path) -> None
     with pytest.raises(GitError) as caught:
         run_git_unless_no(["merge-base", "--is-ancestor", "no-such-ref", head], cwd=repo)
     assert caught.value.returncode == 128
+
+
+@pytest.mark.skipif(shutil.which("setsid") is None, reason="needs setsid")
+def test_a_process_that_left_the_group_holding_the_pipes_does_not_stall_a_timeout(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    repo = make_repo(tmp_path / "repo")
+    git(repo, "config", "alias.slow", "!setsid sleep 4 & sleep 2")  # The first keeps the pipes.
+    monkeypatch.setattr(git_module, "_REAP_S", 0.3)
+    started = time.monotonic()
+
+    with pytest.raises(GitError, match="timed out"):
+        run_git(["slow"], cwd=repo, timeout_s=0.3)
+
+    assert time.monotonic() - started < 2
