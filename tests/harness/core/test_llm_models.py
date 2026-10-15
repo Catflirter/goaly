@@ -69,8 +69,9 @@ def test_qwen_profile_sends_the_recommended_sampling_with_thinking_on() -> None:
     assert QWEN_PROFILE.params.preserve_thinking is None
 
 
-def test_glm_profile_leaves_every_parameter_to_the_gateway() -> None:
-    expected = ModelProfile(model="glm-5.3", params=ModelParams())
+def test_glm_profile_sets_only_a_max_tokens_that_fits_one_attempt() -> None:
+    # 12K tokens take about 270 s at 45 tokens/s, GLM's speed under load: within 300 s.
+    expected = ModelProfile(model="glm-5.3", params=ModelParams(max_tokens=12000))
 
     assert expected == GLM_PROFILE
 

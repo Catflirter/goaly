@@ -297,11 +297,20 @@ async def test_a_call_overrides_the_profile_field_by_field() -> None:
 
 
 async def test_sends_glm_no_thinking_parameter_and_no_sampling_defaults() -> None:
-    gateway = Gateway(completion())
+    gateway = Gateway(completion(), completion())
     async with connect(gateway) as llm:
         await llm.complete([user("hi")], model=GLM, tags=ANALYST)
+        await llm.complete(
+            [user("hi")], model=GLM, tags=ANALYST, params=ModelParams(max_tokens=30000)
+        )
 
-    assert gateway.bodies == [{"model": "glm-5.3", "messages": [{"role": "user", "content": "hi"}]}]
+    first, second = gateway.bodies
+    assert first == {
+        "model": "glm-5.3",
+        "messages": [{"role": "user", "content": "hi"}],
+        "max_tokens": 12000,
+    }
+    assert second["max_tokens"] == 30000  # A caller may ask for more.
 
 
 async def test_refuses_to_switch_glm_thinking_before_any_io() -> None:
