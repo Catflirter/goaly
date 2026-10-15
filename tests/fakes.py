@@ -15,6 +15,7 @@ from dataclasses import dataclass
 
 from pydantic import BaseModel
 
+from goaly.contracts.errors import EnvironmentFailure
 from goaly.contracts.gen.environment_pb2 import ShellResult, SqlResult
 from goaly.contracts.gen.task_pb2 import (
     GRADE_STATUS_GRADED,
@@ -53,10 +54,11 @@ class FakeSqlEnvironment(FakeEnvironment):
     """A SqlEnvironment that answers each statement from a table of canned results.
 
     A statement missing from the table gets a result with ``error`` set, as a failing statement
-    does. ``executed`` records each statement with its timeout.
+    does. A canned EnvironmentFailure is raised instead, as when the database dies. ``executed``
+    records each statement with its timeout.
     """
 
-    def __init__(self, results: Mapping[str, SqlResult] | None = None) -> None:
+    def __init__(self, results: Mapping[str, SqlResult | EnvironmentFailure] | None = None) -> None:
         super().__init__()
         self.results = dict(results or {})
         self.executed: list[tuple[str, float]] = []
@@ -64,24 +66,25 @@ class FakeSqlEnvironment(FakeEnvironment):
     async def execute(self, sql: str, *, timeout_s: float) -> SqlResult:
         self._ensure_open()
         self.executed.append((sql, timeout_s))
+        canned = self.results.get(sql, SqlResult(error=f"no canned result for {sql!r}"))
+        if isinstance(canned, EnvironmentFailure):
+            raise canned
         result = SqlResult()
-        if sql in self.results:
-            result.CopyFrom(self.results[sql])  # A copy: the caller cannot change the table.
-        else:
-            result.error = f"no canned result for {sql!r}"
+        result.CopyFrom(canned)  # A copy: the caller cannot change the table.
         return result
 
 
 class FakeShellEnvironment(FakeEnvironment):
     """A ShellEnvironment with canned command results and files kept in memory.
 
-    A command missing from the table exits with status 127, as an unknown command does.
-    ``commands`` records each command with its timeout, and ``files`` maps paths to contents.
+    A command missing from the table exits with status 127, as an unknown command does, and a
+    canned EnvironmentFailure is raised instead, as when the container dies. ``commands``
+    records each command with its timeout, and ``files`` maps paths to contents.
     """
 
     def __init__(
         self,
-        results: Mapping[str, ShellResult] | None = None,
+        results: Mapping[str, ShellResult | EnvironmentFailure] | None = None,
         files: Mapping[str, str] | None = None,
     ) -> None:
         super().__init__()
@@ -92,12 +95,12 @@ class FakeShellEnvironment(FakeEnvironment):
     async def exec(self, command: str, *, timeout_s: float) -> ShellResult:
         self._ensure_open()
         self.commands.append((command, timeout_s))
+        unknown = f"no canned result for {command!r}"
+        canned = self.results.get(command, ShellResult(exit_code=COMMAND_NOT_FOUND, stderr=unknown))
+        if isinstance(canned, EnvironmentFailure):
+            raise canned
         result = ShellResult()
-        if command in self.results:
-            result.CopyFrom(self.results[command])  # A copy: the caller cannot change the table.
-        else:
-            result.exit_code = COMMAND_NOT_FOUND
-            result.stderr = f"no canned result for {command!r}"
+        result.CopyFrom(canned)  # A copy: the caller cannot change the table.
         return result
 
     async def read_file(self, path: str) -> str:

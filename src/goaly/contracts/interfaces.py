@@ -40,6 +40,10 @@ class Environment(Protocol):
     bench implements it, as a PostgreSQL sandbox (SqlEnvironment) or a Docker container
     (ShellEnvironment); harness unit tests use fakes. It belongs to whoever created it, normally
     the context manager that Benchmark.provision returns, which closes it.
+
+    A statement or command that fails gives a result. A call raises EnvironmentFailure
+    (goaly.contracts.errors) when the environment itself fails, such as a dead database
+    connection or container, and only then.
     """
 
     async def close(self) -> None:
@@ -53,7 +57,7 @@ class SqlEnvironment(Environment, Protocol):
         """Run ``sql``, stopping it after ``timeout_s`` seconds, and return its result.
 
         A statement that fails or times out gives a result with ``error`` set, not an exception.
-        An exception means that the environment itself failed.
+        Only a failure of the environment itself raises EnvironmentFailure.
         """
 
 
@@ -67,7 +71,8 @@ class ShellEnvironment(Environment, Protocol):
         """Run ``command`` in a shell, stopping it after ``timeout_s`` seconds.
 
         A command that fails or times out gives a result, with ``exit_code`` or ``timed_out``
-        saying so, not an exception. An exception means that the environment itself failed.
+        saying so, not an exception. Only a failure of the environment itself raises
+        EnvironmentFailure.
         """
 
     async def read_file(self, path: str) -> str:
@@ -106,7 +111,8 @@ class Tool[ArgsT: BaseModel, EnvT: Environment](Protocol):
         """Run the tool on validated ``args`` in ``env``.
 
         Set ``content``, the text the model sees, and ``is_error``; the executor fills in the
-        other fields. A tool may raise: the executor turns the exception into an error result.
+        other fields. A tool may raise. The executor re-raises EnvironmentFailure and turns every
+        other exception into an error result.
         """
 
 
@@ -120,7 +126,10 @@ class Policy[EnvT: Environment, CtxT](Protocol):
     async def solve(self, task: TaskInput, env: EnvT, ctx: CtxT) -> Prediction:
         """Solve ``task`` in ``env`` and return the prediction; ``env`` stays the caller's.
 
-        When a budget runs out, return the fallback prediction, with ``fallback`` set (spec §5.4).
+        A budget running out is not an exception: return the fallback prediction, with
+        ``fallback`` set (spec §5.4). Let EnvironmentFailure propagate, and an LLM failure that
+        outlasts the client's retries; the runner records them as TASK_ERROR_TYPE_ENVIRONMENT
+        and TASK_ERROR_TYPE_LLM.
         """
 
 
@@ -143,7 +152,11 @@ class Benchmark[InstanceT, EnvT: Environment](Protocol):
         """Return the instances in ``split``."""
 
     def provision(self, inst: InstanceT) -> AbstractAsyncContextManager[EnvT]:
-        """Create the environment to solve ``inst`` in. Leaving the context closes it."""
+        """Create the environment to solve ``inst`` in. Leaving the context closes it.
+
+        If the environment cannot be created, entering the context raises EnvironmentFailure,
+        which the runner records as TASK_ERROR_TYPE_ENVIRONMENT.
+        """
 
     def agent_input(self, inst: InstanceT) -> TaskInput:
         """Copy out what the agent may see of ``inst``, which is never a gold answer."""
@@ -152,6 +165,8 @@ class Benchmark[InstanceT, EnvT: Environment](Protocol):
         """Grade ``prediction`` against ``inst``'s gold answers.
 
         Grading uses its own environment, never the one the task was solved in (spec §4.1).
+        Grading trouble does not raise: the returned Grade's ``status`` says what went wrong,
+        such as a prediction that failed to run, a timeout, or the grader's own failure.
         """
 
     def to_official(self, inst: InstanceT, prediction: Prediction) -> dict[str, JsonValue]:

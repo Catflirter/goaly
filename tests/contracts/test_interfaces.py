@@ -20,6 +20,7 @@ from google.protobuf.message import Message
 from pydantic import BaseModel
 
 from goaly.contracts import interfaces
+from goaly.contracts.errors import EnvironmentFailure
 from goaly.contracts.gen.environment_pb2 import ShellResult, SqlResult
 from goaly.contracts.gen.task_pb2 import (
     GRADE_STATUS_GRADED,
@@ -279,6 +280,20 @@ def test_a_closed_fake_shell_environment_refuses_every_call(
     with pytest.raises(RuntimeError, match="the environment is closed"):
         asyncio.run(scenario())
     assert (fake.commands, fake.files) == ([], {"notes.txt": "old"})
+
+
+def test_fake_environments_raise_a_canned_environment_failure() -> None:
+    died = EnvironmentFailure("the container died")
+    sql_env: SqlEnvironment = FakeSqlEnvironment({"SELECT 1": died})
+    shell_env: ShellEnvironment = FakeShellEnvironment({"ls": died})
+
+    with pytest.raises(EnvironmentFailure) as raised_by_sql:
+        asyncio.run(sql_env.execute("SELECT 1", timeout_s=1.0))
+    with pytest.raises(EnvironmentFailure) as raised_by_shell:
+        asyncio.run(shell_env.exec("ls", timeout_s=1.0))
+
+    assert raised_by_sql.value is died
+    assert raised_by_shell.value is died
 
 
 def test_echo_tool_answers_with_its_text_in_any_environment() -> None:
