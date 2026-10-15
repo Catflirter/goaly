@@ -5,6 +5,7 @@ sent them on 2026-10-15, and FakeClock makes every backoff take no time.
 """
 
 import asyncio
+import inspect
 import json
 import logging
 import math
@@ -23,7 +24,14 @@ from pydantic import SecretStr, ValidationError
 from goaly.contracts.gen.llm_call_pb2 import CallPurpose, LlmCallRecord, LlmCallStatus, Usage
 from goaly.contracts.gen.trajectory_pb2 import ChatMessage, ChatRole, ToolCall, ToolCallSource
 from goaly.contracts.jsonl import read_jsonl, to_json_line
-from goaly.harness.core.llm import CallTags, JsonlCallRecorder, LlmClient, RetryPolicy
+from goaly.harness.core.llm import (
+    BoundLlm,
+    BoundLlmClient,
+    CallTags,
+    JsonlCallRecorder,
+    LlmClient,
+    RetryPolicy,
+)
 from goaly.harness.core.llm_errors import (
     ClientError,
     ConnectionFailed,
@@ -336,9 +344,10 @@ async def test_sends_the_tools_as_given() -> None:
 @pytest.mark.parametrize("value", [object(), math.nan], ids=["not-json", "nan"])
 async def test_refuses_tools_that_are_not_json_before_any_io(value: object) -> None:
     gateway = Gateway()
+    not_json: Any = {"x": value}  # The wrong type is the point.
     async with connect(gateway) as llm:
         with pytest.raises(ValueError, match="JSON"):
-            await llm.complete([user("hi")], model=QWEN, tags=EXEC, tools=[{"x": value}])
+            await llm.complete([user("hi")], model=QWEN, tags=EXEC, tools=[not_json])
 
     assert gateway.requests == []
 
@@ -992,6 +1001,65 @@ async def test_a_call_cancelled_during_its_backoff_is_not_retried() -> None:
     assert attempts(record) == [(RATE_LIMITED, 429), (CANCELLED, 0)]
     assert record.attempts[1].latency_s == 0.0  # Its request was never sent.
     assert len(gateway.requests) == 1
+
+
+# Binding a model and tags (spec ruling V3): what a task's agent loop gets.
+
+
+async def test_a_bound_client_calls_its_model_with_its_tags() -> None:
+    recorder = Recorder()
+    gateway = Gateway(completion())
+    async with connect(gateway, recorder=recorder) as llm:
+        bound: BoundLlm = llm.bind(model=QWEN, tags=EXEC)
+        reply = await bound.complete(
+            [user("hi")], tools=[SQL_TOOL], params=ModelParams(max_tokens=512)
+        )
+
+    record = reply.record
+    assert (record.model, record.purpose) == (QWEN, CallPurpose.CALL_PURPOSE_EXEC)
+    assert (record.run_id, record.instance_id, record.seed) == ("run-1", "task-7", 2)
+    assert recorder.records == [record]
+    (body,) = gateway.bodies
+    assert (body["model"], body["max_tokens"], body["tools"]) == (QWEN, 512, [SQL_TOOL])
+
+
+def test_a_bound_client_offers_no_way_to_choose_its_purpose_or_model() -> None:
+    public = [name for name in dir(BoundLlmClient) if not name.startswith("_")]
+    parameters = list(inspect.signature(BoundLlmClient.complete).parameters)
+
+    assert public == ["complete"]
+    assert parameters == ["self", "messages", "tools", "params"]
+
+
+@pytest.mark.parametrize(
+    ("model", "tags"),
+    [pytest.param(GLM, EXEC, id="exec-glm"), pytest.param(QWEN, ANALYST, id="analyst-qwen")],
+)
+async def test_binding_a_pair_the_allowlist_refuses_raises_before_any_io(
+    model: str, tags: CallTags
+) -> None:
+    gateway, recorder = Gateway(), Recorder()
+    async with connect(gateway, recorder=recorder) as llm:
+        with pytest.raises(ModelNotAllowed, match=f"may not call {model}"):
+            llm.bind(model=model, tags=tags)
+
+    assert (gateway.requests, recorder.records) == ([], [])
+
+
+async def test_bound_clients_call_through_the_one_client_that_bound_them() -> None:
+    recorder = Recorder()
+    gateway = Gateway(completion(), completion())
+    llm = connect(gateway, recorder=recorder)
+    first = llm.bind(model=QWEN, tags=EXEC)
+    second = llm.bind(model=QWEN, tags=CallTags(CallPurpose.CALL_PURPOSE_EXEC, instance_id="x"))
+    await first.complete([user("hi")])
+    await second.complete([user("hi")])
+
+    await llm.aclose()  # Its connections are theirs too: neither has any of its own.
+    with pytest.raises(RuntimeError, match="closed"):
+        await first.complete([user("hi")])
+
+    assert [record.instance_id for record in recorder.records] == ["task-7", "x", "task-7"]
 
 
 # The model allowlist.

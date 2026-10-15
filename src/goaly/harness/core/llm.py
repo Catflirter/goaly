@@ -18,6 +18,11 @@ A process uses one client, on its event loop::
             messages, model=EXECUTOR_MODEL, tags=CallTags(CallPurpose.CALL_PURPOSE_EXEC)
         )
 
+A task gets a client bound to one model and one call's tags, ``LlmClient.bind``, which offers
+just ``complete(messages, *, tools, params)``: whoever holds it cannot choose another purpose or
+model. T11's per-task factory binds CALL_PURPOSE_EXEC with the task's run, instance and seed;
+only goaly.rsi binds the rsi-* purposes.
+
 The API key goes in the Authorization header and nowhere else: no message, log line, repr or
 record holds it, and the client removes it from any text it quotes from the gateway.
 """
@@ -49,6 +54,7 @@ from goaly.contracts.gen.llm_call_pb2 import (
     Usage,
 )
 from goaly.contracts.gen.trajectory_pb2 import ChatMessage, ChatRole, ToolCall, ToolCallSource
+from goaly.contracts.interfaces import JsonValue
 from goaly.contracts.jsonl import append_jsonl
 from goaly.harness.core.llm_errors import ModelNotAllowed, error_type
 from goaly.harness.core.llm_models import (
@@ -60,6 +66,8 @@ from goaly.harness.core.llm_models import (
 from goaly.harness.core.settings import Settings
 
 __all__ = [
+    "BoundLlm",
+    "BoundLlmClient",
     "CallRecorder",
     "CallTags",
     "Clock",
@@ -246,6 +254,22 @@ class _Outcome:
     response: _WireResponse | None = None
 
 
+class BoundLlm(Protocol):
+    """A model to chat with, its purpose and tags fixed: what T05's agent loop calls.
+
+    LlmClient.bind makes one; tests may stand in their own.
+    """
+
+    async def complete(
+        self,
+        messages: Sequence[ChatMessage],
+        *,
+        tools: Sequence[Mapping[str, JsonValue]] = (),
+        params: ModelParams | None = None,
+    ) -> LlmReply:
+        """Send ``messages`` and return the assistant's reply, as LlmClient.complete does."""
+
+
 class LlmClient:
     """An async client of the OpenAI-compatible model gateway; the module docstring has more.
 
@@ -303,7 +327,7 @@ class LlmClient:
         *,
         model: str,
         tags: CallTags,
-        tools: Sequence[Mapping[str, object]] = (),
+        tools: Sequence[Mapping[str, JsonValue]] = (),
         params: ModelParams | None = None,
     ) -> LlmReply:
         """Send ``messages`` to ``model`` and return the assistant's reply.
@@ -336,6 +360,17 @@ class LlmClient:
             self._finish(record, start)
         choice = response.choices[0]
         return LlmReply(_assistant_message(choice.message), choice.finish_reason or "", record)
+
+    def bind(self, *, model: str, tags: CallTags) -> "BoundLlmClient":
+        """Return a client whose calls all go to ``model``, tagged ``tags``.
+
+        The pair is checked against the model allowlist now, before any I/O: a purpose that
+        may not use ``model`` raises ModelNotAllowed. Every bound client calls through this
+        one, so all of them share its limits, connections and recorder.
+        """
+        if allowed_model(tags.purpose) != model:
+            raise self._refuse(model, tags)
+        return BoundLlmClient(self, model, tags)
 
     def _refuse(self, model: str, tags: CallTags) -> ModelNotAllowed:
         purpose = CallPurpose.Name(tags.purpose)
@@ -493,8 +528,33 @@ class LlmClient:
         return _cut(self._redact(text))
 
 
+class BoundLlmClient:
+    """A BoundLlm that calls through the LlmClient that bound it; build one with bind()."""
+
+    __slots__ = ("_client", "_model", "_tags")
+
+    def __init__(self, client: LlmClient, model: str, tags: CallTags) -> None:
+        self._client = client
+        self._model = model
+        self._tags = tags
+
+    async def complete(
+        self,
+        messages: Sequence[ChatMessage],
+        *,
+        tools: Sequence[Mapping[str, JsonValue]] = (),
+        params: ModelParams | None = None,
+    ) -> LlmReply:
+        """Send ``messages`` to the bound model with the bound tags; see LlmClient.complete."""
+        return await self._client.complete(
+            messages, model=self._model, tags=self._tags, tools=tools, params=params
+        )
+
+
 def _request_body(
-    profile: ModelProfile, messages: Sequence[ChatMessage], tools: Sequence[Mapping[str, object]]
+    profile: ModelProfile,
+    messages: Sequence[ChatMessage],
+    tools: Sequence[Mapping[str, JsonValue]],
 ) -> bytes:
     """Build the request as JSON. Qwen's thinking switches go in chat_template_kwargs."""
     body: dict[str, object] = {
