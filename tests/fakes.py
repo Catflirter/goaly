@@ -257,8 +257,8 @@ class ToyBenchmark:
     of 1, the base query unchanged earns 0.5, as a speedup of 1 does, and any other query does
     not match. A prediction with no branch set, as after a crash, stands for the empty answer,
     the base query unchanged, in both ``grade`` and ``to_official``. Its manifest fields name a
-    fixed dataset revision and hash and the "dev" grading mode. ``environments`` records each
-    environment provisioned.
+    fixed dataset revision, note and hash, and its ``grading_mode``, "dev" by default.
+    ``environments`` records each environment provisioned.
     """
 
     name = "toy"
@@ -268,8 +268,10 @@ class ToyBenchmark:
         instances: Sequence[ToyInstance] = TOY_INSTANCES,
         *,
         external: Sequence[ToyInstance] | None = None,
+        grading_mode: str = "dev",
     ) -> None:
         self.instances = tuple(instances)
+        self.grading_mode = grading_mode
         self.external = None if external is None else tuple(external)
         self.environments: list[FakeSqlEnvironment] = []
 
@@ -313,8 +315,9 @@ class ToyBenchmark:
     def manifest_fields(self) -> RunManifest:
         return RunManifest(
             dataset_revision="toy-revision-1",
+            dataset_notes=["the toy tasks are held in memory"],
             dataset_sha256=TOY_DATASET_SHA256,
-            environment_settings={"grading_mode": "dev"},
+            environment_settings={"grading_mode": self.grading_mode},
         )
 
     def to_official(self, inst: ToyInstance, prediction: Prediction) -> dict[str, JsonValue]:

@@ -720,19 +720,39 @@ def test_toy_benchmark_writes_its_official_record() -> None:
     assert json.loads(json.dumps(record)) == {"instance_id": "toy-1", "sql": "SELECT 1"}
 
 
+# The run manifest's fields that only the benchmark knows: the runner sets none of them itself,
+# and a resumed run must match all of them (Benchmark.manifest_fields).
+ADAPTER_FIELDS = {"dataset_revision", "dataset_notes", "environment_settings", "dataset_sha256"}
+
+
 def test_toy_benchmark_hands_the_runner_its_manifest_fields() -> None:
     benchmark: Benchmark[ToyInstance, SqlEnvironment] = ToyBenchmark()
-    manifest = RunManifest(run_id="run-1", benchmark=benchmark.name)
+    manifest = RunManifest(run_id="run-1", benchmark=benchmark.name)  # None of the four.
 
     fields = benchmark.manifest_fields()
     manifest.MergeFrom(fields)  # As the runner merges them in.
 
-    assert {field.name for field, _ in fields.ListFields()} <= {
-        *("dataset_revision", "dataset_notes", "environment_settings", "dataset_sha256"),
-    }
+    assert {field.name for field, _ in fields.ListFields()} == ADAPTER_FIELDS
     assert fields.environment_settings["grading_mode"] == "dev"
-    assert (manifest.run_id, manifest.dataset_revision) == ("run-1", fields.dataset_revision)
-    assert len(manifest.dataset_sha256) == 64
+    assert manifest.run_id == "run-1"
+    # The runner set none of the four, so the merge leaves exactly the adapter's values, with no
+    # repeated dataset_notes.
+    assert [getattr(manifest, name) for name in sorted(ADAPTER_FIELDS)] == [
+        getattr(fields, name) for name in sorted(ADAPTER_FIELDS)
+    ]
+
+
+def test_the_fields_a_resume_must_match_tell_a_dev_run_from_an_official_one() -> None:
+    dev: Benchmark[ToyInstance, SqlEnvironment] = ToyBenchmark()
+    official: Benchmark[ToyInstance, SqlEnvironment] = ToyBenchmark(grading_mode="official")
+
+    differing = {
+        name
+        for name in ADAPTER_FIELDS
+        if getattr(dev.manifest_fields(), name) != getattr(official.manifest_fields(), name)
+    }
+
+    assert differing == {"environment_settings"}
 
 
 def test_toy_benchmark_writes_the_empty_answer_for_a_prediction_with_no_branch() -> None:

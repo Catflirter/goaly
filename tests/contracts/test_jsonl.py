@@ -5,6 +5,8 @@ import logging
 import math
 import pickle
 import stat
+import subprocess
+import sys
 from collections.abc import Iterator
 from datetime import UTC, datetime
 from pathlib import Path, PurePath
@@ -187,6 +189,25 @@ def test_writes_map_keys_sorted_whatever_order_they_were_set_in() -> None:
 
     assert line == to_json_line(backward)
     assert list(parse(line)["environment_settings"]) == sorted(settings)
+
+
+def test_writes_the_same_map_line_in_separate_processes() -> None:
+    # upb orders a map by a hash seeded per process: only separate processes show the property.
+    script = (
+        "from goaly.contracts.gen.manifest_pb2 import RunManifest\n"
+        "from goaly.contracts.jsonl import to_json_line\n"
+        "keys = ['work_mem', 'jit', 'shared_buffers', 'cpuset', 'grading_mode', 'dbgen']\n"
+        "print(to_json_line(RunManifest(environment_settings={k: k.upper() for k in keys})))\n"
+    )
+    # The arguments are this interpreter and a fixed script.
+    lines = {
+        subprocess.run(  # noqa: S603
+            [sys.executable, "-c", script], check=True, capture_output=True, text=True, timeout=60
+        ).stdout
+        for _ in range(2)
+    }
+
+    assert len(lines) == 1
 
 
 def test_sorts_the_keys_of_a_map_of_messages() -> None:

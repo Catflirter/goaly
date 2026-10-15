@@ -59,8 +59,9 @@ def to_json_line(message: Message) -> str:
     """Write ``message`` as one line of compact JSON, with no line break at the end.
 
     Keys follow the order the .proto declares the fields in, at every level, so the lines of a
-    file line up whichever fields are set. A map's keys are sorted, since protobuf keeps no order
-    for them, so the same message gives the same line in every process. Raises
+    file line up whichever fields are set. A map field's keys are sorted, since protobuf keeps no
+    order for them, so the same map gives the same line in every process. The keys of a
+    ``google.protobuf.Struct`` are written as protobuf gives them. Raises
     ``json_format.SerializeToJsonError`` for a value JSON cannot hold, such as a NaN in a
     ``google.protobuf.Value``, and for a message that is not written as a JSON object, such as a
     ``Timestamp``.

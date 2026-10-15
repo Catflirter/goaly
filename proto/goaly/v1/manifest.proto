@@ -32,8 +32,9 @@ message RunManifest {
   // How the loader changed the dataset, such as rewriting the SWE image registry (spec §4.2);
   // empty if it changed nothing.
   repeated string dataset_notes = 9;
-  // The SHA-256 of the dataset file the tasks came from, in hex, such as Effi-SQL's
-  // effi-sql-pg.jsonl or the organizers' --instances file.
+  // The SHA-256, in hex, of the task file the tasks came from, in the official format: the
+  // dataset's effi-sql-pg.jsonl for our splits, or the organizers' --instances file. It is not
+  // the hash of any file derived from it, such as the gold-free runtime file.
   string dataset_sha256 = 20;
   // The SHA-256 of the gold-answer files the grader used that are not part of the dataset, in
   // hex; empty if there were none, as when the gold answers ship with the dataset.

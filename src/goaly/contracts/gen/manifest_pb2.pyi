@@ -92,8 +92,9 @@ class RunManifest(_message.Message):
     dataset_revision: _builtins.str
     """The revision of the dataset the tasks came from: the commit hash of its Hugging Face repo."""
     dataset_sha256: _builtins.str
-    """The SHA-256 of the dataset file the tasks came from, in hex, such as Effi-SQL's
-    effi-sql-pg.jsonl or the organizers' --instances file.
+    """The SHA-256, in hex, of the task file the tasks came from, in the official format: the
+    dataset's effi-sql-pg.jsonl for our splits, or the organizers' --instances file. It is not
+    the hash of any file derived from it, such as the gold-free runtime file.
     """
     gold_sha256: _builtins.str
     """The SHA-256 of the gold-answer files the grader used that are not part of the dataset, in
