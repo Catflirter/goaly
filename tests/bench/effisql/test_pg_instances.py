@@ -161,9 +161,13 @@ def test_apply_roles_creates_missing_roles_and_sends_only_verifiers() -> None:
     assert server.statements("tpch_alt")[1:4] == _texts(database_statements("tpch_alt"))[:3]
 
 
-def _golden(config: PgEnvConfig, built_at: str) -> None:
+SCRAM_HBA = "local all all scram-sha-256\nhost all all 127.0.0.1/32 scram-sha-256\n"
+
+
+def _golden(config: PgEnvConfig, built_at: str, hba: str = SCRAM_HBA) -> None:
     (config.golden_pgdata / "base").mkdir(parents=True, exist_ok=True)
     (config.golden_pgdata / "PG_VERSION").write_text("16\n")
+    (config.golden_pgdata / "pg_hba.conf").write_text(hba)
     record = {
         "image": config.image,
         "dbgen": {"repository": "r", "commit": "c", "version": "v", "binary_sha256": "b"},
@@ -212,6 +216,18 @@ def test_start_copies_the_golden_build_once_and_again_only_for_a_new_build(
     assert third == {"solve-1": "running, data copied"}
     assert copy.read_text() == "16\n"  # The new build replaced the old copy.
     assert lifecycle.ready.count("goaly-effisql-grade-3") == 2
+
+
+def test_an_instance_whose_pg_hba_skips_scram_is_never_started(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    config = PgEnvConfig(data_root=tmp_path)
+    _golden(config, "2026-10-15T05:00:00Z", hba=SCRAM_HBA + "host all all ::1/128 trust\n")
+    lifecycle = FakeLifecycle(monkeypatch)
+
+    with pytest.raises(InstanceError, match="lets in without a password"):
+        start_instances(config, CREDENTIALS)
+    assert lifecycle.ensured == []
 
 
 def test_start_needs_a_golden_build(tmp_path: Path) -> None:
