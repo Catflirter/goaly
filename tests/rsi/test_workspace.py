@@ -347,6 +347,26 @@ def test_a_failed_create_removes_its_worktree_and_its_branch(
     assert git(repo, "branch", "--list", "rsi/effisql/exp-1") == ""
 
 
+def test_a_worktree_add_that_fails_late_leaves_no_branch(
+    workspace: Workspace, repo: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    real_git = workspace._git
+
+    def late_failure(args: list[str], **options: Any) -> str:
+        output = real_git(args, **options)
+        if args[:2] == ["worktree", "add"]:  # As when git times out after making the branch.
+            raise GitError(args, None, "timed out after 120 s")
+        return output
+
+    monkeypatch.setattr(workspace, "_git", late_failure)
+
+    with pytest.raises(GitError, match="timed out"):
+        workspace.create(LANE_EFFISQL, "exp-1")
+
+    assert git(repo, "branch", "--list", "rsi/effisql/exp-1") == ""
+    assert registered(repo) == [repo]
+
+
 def test_a_failed_cleanup_after_a_failed_create_keeps_the_first_error(
     workspace: Workspace, monkeypatch: pytest.MonkeyPatch
 ) -> None:
