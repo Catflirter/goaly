@@ -87,13 +87,16 @@ async def complete_structured[M: BaseModel](
     *,
     context: Mapping[str, Any] | None = None,
     params: ModelParams | None = None,
+    attempt_timeout_s: float | None = None,
     max_attempts: int = DEFAULT_MAX_ATTEMPTS,
 ) -> StructuredReply[M]:
     """Ask ``llm`` for one JSON object of ``schema`` and return it validated.
 
     ``messages`` must end with a user message; the schema is appended to a copy of it.
     ``context`` is pydantic's validation context, for checks that depend on the call, such as
-    which task IDs exist. Raises StructuredOutputError after ``max_attempts`` invalid replies,
+    which task IDs exist. ``params`` and ``attempt_timeout_s`` go with every call, as
+    LlmClient.complete takes them: a long answer needs both a larger max_tokens and more than the
+    default 300 s per attempt. Raises StructuredOutputError after ``max_attempts`` invalid replies,
     and the LlmError of a call that failed.
     """
     if max_attempts < 1:
@@ -108,7 +111,7 @@ async def complete_structured[M: BaseModel](
     usage = Usage()
     problems = ""
     for attempt in range(1, max_attempts + 1):
-        reply = await llm.complete(chat, params=params)
+        reply = await llm.complete(chat, params=params, attempt_timeout_s=attempt_timeout_s)
         call_ids.append(reply.record.call_id)
         add_usage(usage, reply.usage)
         value, problems = _validate(reply, schema, context)

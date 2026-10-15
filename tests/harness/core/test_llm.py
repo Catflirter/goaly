@@ -1,17 +1,12 @@
-"""Tests for goaly.harness.core.llm: the client, against a scripted gateway on httpx.MockTransport.
-
-No test reaches the network. The replies are shaped as the real gateway (LiteLLM 1.92 on SGLang)
-sent them on 2026-10-15, and FakeClock makes every backoff take no time.
-"""
+"""Tests for goaly.harness.core.llm: the client, against the scripted gateway of llm_fakes."""
 
 import asyncio
 import inspect
-import json
 import logging
 import math
 import random
 import re
-from collections.abc import Awaitable, Callable, Mapping, Sequence
+from collections.abc import Callable, Mapping
 from datetime import UTC, datetime, timedelta
 from email.utils import format_datetime
 from pathlib import Path
@@ -19,7 +14,7 @@ from typing import Any
 
 import httpx
 import pytest
-from pydantic import SecretStr, ValidationError
+from pydantic import ValidationError
 
 from goaly.contracts.gen.llm_call_pb2 import CallPurpose, LlmCallRecord, LlmCallStatus, Usage
 from goaly.contracts.gen.trajectory_pb2 import ChatMessage, ChatRole, ToolCall, ToolCallSource
@@ -43,23 +38,30 @@ from goaly.harness.core.llm_errors import (
     ServerError,
     TimedOut,
 )
-from goaly.harness.core.llm_models import (
-    EXECUTOR_MODEL,
-    IMPROVEMENT_MODEL,
-    ModelParams,
-    ModelProfile,
-)
+from goaly.harness.core.llm_models import ModelParams, ModelProfile
 from goaly.harness.core.logs import JsonFormatter
-from goaly.harness.core.settings import Settings
+from tests.harness.core.llm_fakes import (
+    ANALYST,
+    BASE_URL,
+    EXEC,
+    GLM,
+    KEY,
+    QWEN,
+    FakeClock,
+    Gateway,
+    Recorder,
+    Reply,
+    TopOfRange,
+    attempts,
+    completion,
+    connect,
+    failure,
+    hang,
+    settings,
+    user,
+)
 
 pytestmark = pytest.mark.anyio
-
-KEY = "sk-test-0123456789abcdef-never-in-any-output"
-BASE_URL = "https://gateway.test/v1"
-QWEN = EXECUTOR_MODEL
-GLM = IMPROVEMENT_MODEL
-EXEC = CallTags(CallPurpose.CALL_PURPOSE_EXEC, run_id="run-1", instance_id="task-7", seed=2)
-ANALYST = CallTags(CallPurpose.CALL_PURPOSE_RSI_ANALYST)
 
 S = LlmCallStatus
 OK = S.LLM_CALL_STATUS_OK
@@ -78,12 +80,6 @@ ASSISTANT = ChatRole.CHAT_ROLE_ASSISTANT
 TOOL = ChatRole.CHAT_ROLE_TOOL
 STANDARD = ToolCallSource.TOOL_CALL_SOURCE_STANDARD
 
-USAGE: Mapping[str, Any] = {
-    "completion_tokens": 309,
-    "prompt_tokens": 26,
-    "total_tokens": 335,
-    "completion_tokens_details": {"reasoning_tokens": 304, "text_tokens": 5},
-}
 SQL_TOOL: Mapping[str, Any] = {
     "type": "function",
     "function": {
@@ -96,151 +92,6 @@ SQL_TOOL: Mapping[str, Any] = {
         },
     },
 }
-
-
-def user(text: str) -> ChatMessage:
-    return ChatMessage(role=USER, content=text)
-
-
-def completion(
-    content: str = "391",
-    *,
-    reasoning: str = "",
-    tool_calls: Sequence[Mapping[str, Any]] = (),
-    finish_reason: str = "stop",
-    usage: Mapping[str, Any] | None = USAGE,
-    cost: str | None = "0.0003129",
-) -> httpx.Response:
-    """A chat completion as the gateway sends one; ``usage=None`` leaves the usage out."""
-    message: dict[str, Any] = {"content": content, "role": "assistant"}
-    if reasoning:
-        message["reasoning_content"] = reasoning
-    if tool_calls:
-        message["tool_calls"] = [dict(call) for call in tool_calls]
-    message["provider_specific_fields"] = {"refusal": None}
-    body: dict[str, Any] = {
-        "id": "chatcmpl-1",
-        "created": 1760500000,
-        "model": QWEN,
-        "object": "chat.completion",
-        "choices": [{"finish_reason": finish_reason, "index": 0, "message": message}],
-    }
-    if usage is not None:
-        body["usage"] = dict(usage)
-    headers = {} if cost is None else {"x-litellm-response-cost": cost}
-    return httpx.Response(200, json=body, headers=headers)
-
-
-def failure(
-    status: int,
-    message: str = "something went wrong",
-    *,
-    retry_after: str | None = None,
-    cost: str = "0",
-) -> httpx.Response:
-    """An error response as LiteLLM sends one, cost header included."""
-    headers = {"x-litellm-response-cost": cost}
-    if retry_after is not None:
-        headers["retry-after"] = retry_after
-    body = {"error": {"message": message, "type": None, "param": None, "code": str(status)}}
-    return httpx.Response(status, json=body, headers=headers)
-
-
-type Handler = Callable[[httpx.Request], Awaitable[httpx.Response]]
-type Reply = httpx.Response | Exception | Handler
-
-
-class Gateway:
-    """A model gateway that answers each request with the next of its scripted replies.
-
-    A reply is a response, an exception for the transport to raise, or a coroutine function that
-    makes the response, such as one that never answers.
-    """
-
-    def __init__(self, *replies: Reply) -> None:
-        self.replies = list(replies)
-        self.requests: list[httpx.Request] = []
-
-    async def handle(self, request: httpx.Request) -> httpx.Response:
-        self.requests.append(request)
-        reply = self.replies.pop(0)
-        if isinstance(reply, Exception):
-            raise reply
-        if isinstance(reply, httpx.Response):
-            return reply
-        return await reply(request)
-
-    @property
-    def bodies(self) -> list[Any]:
-        return [json.loads(request.content) for request in self.requests]
-
-
-async def hang(request: httpx.Request) -> httpx.Response:
-    """A reply that never comes."""
-    await asyncio.Event().wait()
-    raise AssertionError("unreachable")
-
-
-class Recorder:
-    """A CallRecorder that keeps the records it gets."""
-
-    def __init__(self) -> None:
-        self.records: list[LlmCallRecord] = []
-
-    def record(self, record: LlmCallRecord) -> None:
-        self.records.append(record)
-
-
-class FakeClock:
-    """A Clock whose sleeps return at once and move its time on by as long."""
-
-    def __init__(self) -> None:
-        self.now = 100.0
-        self.sleeps: list[float] = []
-
-    def monotonic(self) -> float:
-        return self.now
-
-    async def sleep(self, seconds: float) -> None:
-        self.sleeps.append(seconds)
-        self.now += seconds
-        await asyncio.sleep(0)
-
-
-class TopOfRange(random.Random):
-    """Jitter that always picks the top of its range, so the backoff ceilings show."""
-
-    def uniform(self, a: float, b: float) -> float:
-        return b
-
-
-def settings() -> Settings:
-    return Settings(api_key=SecretStr(KEY), base_url=BASE_URL)
-
-
-def connect(
-    gateway: Gateway,
-    *,
-    recorder: Recorder | None = None,
-    clock: FakeClock | None = None,
-    retry: RetryPolicy | None = None,
-    rng: random.Random | None = None,
-    profiles: Sequence[ModelProfile] = (),
-) -> LlmClient:
-    return LlmClient(
-        settings(),
-        Recorder() if recorder is None else recorder,
-        profiles=profiles,
-        retry=retry,
-        transport=httpx.MockTransport(gateway.handle),
-        clock=FakeClock() if clock is None else clock,
-        rng=rng,
-    )
-
-
-def attempts(record: LlmCallRecord) -> list[tuple[int, int]]:
-    """Each attempt's status and HTTP status."""
-    return [(attempt.status, attempt.http_status) for attempt in record.attempts]
 
 
 # The request: the wire format and the model profiles.
@@ -1050,6 +901,49 @@ async def test_retries_an_attempt_that_timed_out() -> None:
     assert attempts(reply.record) == [(TIMEOUT, 0), (OK, 200)]
 
 
+def request_timeouts(gateway: Gateway) -> list[float]:
+    """The timeout httpx gave each request, the same for connecting, reading and writing."""
+    timeouts = [request.extensions["timeout"] for request in gateway.requests]
+    assert all(len(set(timeout.values())) == 1 for timeout in timeouts)
+    return [timeout["read"] for timeout in timeouts]
+
+
+async def test_a_call_may_give_its_attempts_longer() -> None:
+    gateway = Gateway(hang)
+    async with connect(gateway, retry=RetryPolicy(timeout_s=0.05, max_retries=0)) as llm:
+        with pytest.raises(TimedOut, match=r"no response within 0\.2 s \(1 attempt\)"):
+            await llm.complete([user("hi")], model=QWEN, tags=EXEC, attempt_timeout_s=0.2)
+
+    assert request_timeouts(gateway) == [0.2]
+
+
+async def test_a_longer_attempt_timeout_holds_for_every_retry_of_that_call_only() -> None:
+    gateway = Gateway(failure(503), completion(), completion())
+    async with connect(gateway, retry=RetryPolicy(timeout_s=30)) as llm:
+        await llm.complete([user("hi")], model=GLM, tags=ANALYST, attempt_timeout_s=900)
+        await llm.complete([user("hi")], model=GLM, tags=ANALYST)
+
+    assert request_timeouts(gateway) == [900, 900, 30]
+
+
+@pytest.mark.parametrize(
+    "timeout_s",
+    [
+        pytest.param(0.0, id="zero"),
+        pytest.param(-1.0, id="negative"),
+        pytest.param(math.inf, id="infinite"),
+        pytest.param(math.nan, id="nan"),
+    ],
+)
+async def test_refuses_an_attempt_timeout_that_is_not_a_positive_time(timeout_s: float) -> None:
+    gateway, recorder = Gateway(), Recorder()
+    async with connect(gateway, recorder=recorder) as llm:
+        with pytest.raises(ValueError, match="attempt_timeout_s must be a positive"):
+            await llm.complete([user("hi")], model=QWEN, tags=EXEC, attempt_timeout_s=timeout_s)
+
+    assert (gateway.requests, recorder.records) == ([], [])
+
+
 async def test_cancellation_propagates_at_once_and_is_recorded() -> None:
     recorder, arrived = Recorder(), asyncio.Event()
 
@@ -1069,6 +963,23 @@ async def test_cancellation_propagates_at_once_and_is_recorded() -> None:
     assert attempts(record) == [(CANCELLED, 0)]
     assert (record.status, record.http_status) == (CANCELLED, 0)
     assert len(gateway.requests) == 1
+
+
+async def test_a_call_stops_retrying_once_its_client_closes() -> None:
+    recorder = Recorder()
+
+    class ClosingClock(FakeClock):
+        async def sleep(self, seconds: float) -> None:
+            await llm.aclose()  # The client closes while the call backs off.
+
+    gateway = Gateway(failure(503), completion())
+    llm = connect(gateway, recorder=recorder, clock=ClosingClock())
+    with pytest.raises(RuntimeError, match="closed during the call"):
+        await llm.complete([user("hi")], model=QWEN, tags=EXEC)
+
+    assert len(gateway.requests) == 1
+    (record,) = recorder.records
+    assert attempts(record) == [(SERVER_ERROR, 503), (CANCELLED, 0)]  # None without a status.
 
 
 async def test_a_callers_deadline_cancels_the_call_and_leaves_one_record() -> None:
@@ -1135,7 +1046,16 @@ def test_a_bound_client_offers_no_way_to_choose_its_purpose_or_model() -> None:
     parameters = list(inspect.signature(BoundLlmClient.complete).parameters)
 
     assert public == ["complete"]
-    assert parameters == ["self", "messages", "tools", "params"]
+    assert parameters == ["self", "messages", "tools", "params", "attempt_timeout_s"]
+
+
+async def test_a_bound_client_passes_a_longer_attempt_timeout_on() -> None:
+    gateway = Gateway(completion())
+    async with connect(gateway) as llm:
+        bound: BoundLlm = llm.bind(model=GLM, tags=ANALYST)
+        await bound.complete([user("hi")], attempt_timeout_s=900)
+
+    assert request_timeouts(gateway) == [900]
 
 
 @pytest.mark.parametrize(
@@ -1162,11 +1082,13 @@ async def test_bound_clients_call_through_the_one_client_that_bound_them() -> No
     await first.complete([user("hi")])
     await second.complete([user("hi")])
 
-    await llm.aclose()  # Its connections are theirs too: neither has any of its own.
+    await llm.aclose()  # It is theirs to share: neither has a client of its own.
     with pytest.raises(RuntimeError, match="closed"):
         await first.complete([user("hi")])
 
-    assert [record.instance_id for record in recorder.records] == ["task-7", "x", "task-7"]
+    # Two calls, each recorded once; the call after the close was refused before it began.
+    assert [record.instance_id for record in recorder.records] == ["task-7", "x"]
+    assert len(gateway.requests) == 2
 
 
 # The model allowlist.

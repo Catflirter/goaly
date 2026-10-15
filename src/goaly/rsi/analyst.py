@@ -49,6 +49,7 @@ from goaly.rsi.ids import check_id
 from goaly.rsi.structured import StructuredOutputError, complete_structured
 
 __all__ = [
+    "ANALYST_ATTEMPT_TIMEOUT_S",
     "ANALYST_MAX_TOKENS",
     "HYPOTHESIS_COUNT",
     "Analysis",
@@ -64,6 +65,9 @@ HYPOTHESIS_COUNT: Final = 3
 # GLM may think past GLM_PROFILE's 12K tokens on this prompt: a 2026-10-15 smoke run spent all 12K
 # on reasoning. A reply cut off anyway is retried, its reasoning replayed (goaly.rsi.structured).
 ANALYST_MAX_TOKENS: Final = 24_000
+# 24K tokens at GLM's ~45 tokens/s under load (spec §6.2) take about 530 s, past the client's
+# default 300 s per attempt.
+ANALYST_ATTEMPT_TIMEOUT_S: Final = 900.0
 
 _logger = logging.getLogger(__name__)
 
@@ -217,9 +221,9 @@ async def analyze(
     """Ask GLM for the round's hypotheses: one structured call, retried while invalid.
 
     The calls are recorded with purpose CALL_PURPOSE_RSI_ANALYST and ``round_id`` as run ID.
-    Each call may use ANALYST_MAX_TOKENS. With no failed train task there is nothing to
-    analyze, and no call is made. A gateway
-    failure that outlasted the client's retries raises its LlmError.
+    Each call may use ANALYST_MAX_TOKENS, and each attempt ANALYST_ATTEMPT_TIMEOUT_S. With no
+    failed train task there is nothing to analyze, and no call is made. A gateway failure that
+    outlasted the client's retries raises its LlmError.
     """
     check_id(round_id, "round_id")
     if not analyst_input.failed_task_ids:
@@ -237,6 +241,7 @@ async def analyze(
             AnalystAnswer,
             context=context,
             params=ModelParams(max_tokens=ANALYST_MAX_TOKENS),
+            attempt_timeout_s=ANALYST_ATTEMPT_TIMEOUT_S,
         )
     except StructuredOutputError as error:
         cost = error.usage.cost_usd if error.usage.HasField("cost_usd") else None
