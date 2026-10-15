@@ -33,6 +33,7 @@ class SqlResult(_message.Message):
     TRUNCATED_FIELD_NUMBER: _builtins.int
     ERROR_FIELD_NUMBER: _builtins.int
     ELAPSED_S_FIELD_NUMBER: _builtins.int
+    QUEUE_WAIT_S_FIELD_NUMBER: _builtins.int
     row_count: _builtins.int
     """For a statement that returns rows, how many it returned before truncation; for any other
     statement, how many rows it affected, as the database reports it.
@@ -42,7 +43,14 @@ class SqlResult(_message.Message):
     error: _builtins.str
     """The database's error message, or empty if the statement succeeded."""
     elapsed_s: _builtins.float
-    """How long the statement ran, in seconds."""
+    """How long the statement ran, in seconds. It leaves out the wait for a statement slot, which
+    is queue_wait_s.
+    """
+    queue_wait_s: _builtins.float
+    """How long the statement waited for a statement slot on its instance before it started, in
+    seconds. Each solving instance runs at most 2 statements at once, and the others queue (spec
+    §6.2). The agent sees this apart from elapsed_s, so the run time it reads stays meaningful.
+    """
     @_builtins.property
     def columns(self) -> _containers.RepeatedScalarFieldContainer[_builtins.str]:
         """The result's column names, in order."""
@@ -64,10 +72,11 @@ class SqlResult(_message.Message):
         truncated: _builtins.bool = ...,
         error: _builtins.str = ...,
         elapsed_s: _builtins.float = ...,
+        queue_wait_s: _builtins.float = ...,
     ) -> None: ...
     _HasFieldArgType: _TypeAlias = _Never  # noqa: Y015
     def HasField(self, field_name: _HasFieldArgType) -> _builtins.bool: ...
-    _ClearFieldArgType: _TypeAlias = _typing.Literal["columns", b"columns", "elapsed_s", b"elapsed_s", "error", b"error", "row_count", b"row_count", "rows", b"rows", "truncated", b"truncated"]  # noqa: Y015
+    _ClearFieldArgType: _TypeAlias = _typing.Literal["columns", b"columns", "elapsed_s", b"elapsed_s", "error", b"error", "queue_wait_s", b"queue_wait_s", "row_count", b"row_count", "rows", b"rows", "truncated", b"truncated"]  # noqa: Y015
     def ClearField(self, field_name: _ClearFieldArgType) -> None: ...
     def WhichOneof(self, oneof_group: _Never) -> None: ...
 
