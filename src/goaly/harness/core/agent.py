@@ -441,15 +441,20 @@ def _with_calls(message: ChatMessage, calls: Sequence[ToolCall]) -> ChatMessage:
 def _replayed(assistant: ChatMessage) -> ChatMessage:
     """``assistant`` as later prompts carry it: each call only once, as a structured call.
 
-    When its calls were parsed from XML, the call markup is taken out of both the content and
-    the reasoning. A call drafted in one and written again in the other then reaches the model
-    once, and a drafted call that never ran cannot look as if it ran. The trajectory keeps the
-    reply as it came.
+    When its calls were parsed from XML, the call markup goes from both its content and its
+    reasoning, as Step's rebuild rule in trajectory.proto says: the content loses its
+    <tool_call> blocks, or its bare <function=...> blocks if it has none, and the reasoning
+    loses its <tool_call> blocks. A call drafted in one field and written again in the other
+    then reaches the model once, and a drafted call that never ran cannot look as if it ran. A
+    reply whose calls came from the standard field goes out as written. The trajectory keeps
+    every reply as it came.
     """
     message = _copy(assistant)
     if any(call.source in _XML_SOURCES for call in assistant.tool_calls):
         message.content = strip_tool_call_markup(message.content)
-        message.reasoning_content = strip_tool_call_markup(message.reasoning_content)
+        message.reasoning_content = strip_tool_call_markup(
+            message.reasoning_content, reasoning=True
+        )
     return message
 
 

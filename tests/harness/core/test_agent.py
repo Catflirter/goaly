@@ -44,6 +44,7 @@ from goaly.harness.core.llm_models import EXECUTOR_MODEL, ModelParams
 from goaly.harness.core.settings import Settings
 from goaly.harness.core.tool_calls import strip_tool_call_markup
 from goaly.harness.core.tools import ToolRegistry, bind, environment_failure_in
+from tests.contracts.test_records import prompt
 from tests.fakes import FakeSqlEnvironment, SubmitTool
 from tests.harness.core.agent_fakes import (
     DEFAULT_USAGE,
@@ -234,16 +235,20 @@ def tool_message(result: ToolResult) -> ChatMessage:
     return ChatMessage(role=TOOL, content=result.content, tool_call_id=result.tool_call_id)
 
 
-def replayed(assistant: ChatMessage) -> ChatMessage:
-    """An assistant message as a later prompt carries it: its calls only as structured calls.
+def reference_prompts(trajectory: Trajectory) -> list[list[ChatMessage]]:
+    """Each step's prompt, as the contract's reference rebuild (test_records.prompt) makes it."""
+    return [prompt(trajectory, index) for index in range(len(trajectory.steps))]
 
-    Once any call was parsed from XML, neither the content nor the reasoning keeps call markup.
-    """
+
+def replayed(assistant: ChatMessage) -> ChatMessage:
+    """An assistant message as a later prompt carries it: its calls only as structured calls."""
     message = ChatMessage()
     message.CopyFrom(assistant)
     if {call.source for call in assistant.tool_calls} & {CONTENT_XML, REASONING_XML}:
         message.content = strip_tool_call_markup(message.content)
-        message.reasoning_content = strip_tool_call_markup(message.reasoning_content)
+        message.reasoning_content = strip_tool_call_markup(
+            message.reasoning_content, reasoning=True
+        )
     return message
 
 
@@ -278,6 +283,16 @@ def rebuilt_prompts(trajectory: Trajectory, *, keep_turns: int = 8) -> list[list
         prompts.append(prompt)
         turns.append(step)
     return prompts
+
+
+def function_block(name: str, sql: str) -> str:
+    """A Qwen3-Coder XML call to ``name``, bare."""
+    return f"<function={name}>\n<parameter=sql>\n{sql}\n</parameter>\n</function>"
+
+
+def tool_call_block(name: str, sql: str) -> str:
+    """A Qwen3-Coder XML call to ``name``, wrapped in its <tool_call> tags."""
+    return f"<tool_call>\n{function_block(name, sql)}\n</tool_call>"
 
 
 def sent(llm: FakeLLM) -> list[list[ChatMessage]]:
@@ -371,6 +386,42 @@ async def test_every_prompt_can_be_rebuilt_from_the_trajectory() -> None:
     assert len(trajectory.steps) == len(script)
     assert trajectory.steps[5].injected[0].content.startswith("You have made 3 errors in a row.")
     assert rebuilt_prompts(trajectory) == sent(llm)
+
+
+async def test_the_loop_sends_the_prompts_the_contracts_reference_rebuilds() -> None:
+    """Both kinds of call markup, in content and reasoning, replay as trajectory.proto says."""
+    bare = function_block("execute_sql", "SELECT 2")
+    wrapped = tool_call_block("execute_sql", "SELECT 1")
+    script = [
+        # A call from the content's <tool_call> block: such blocks go from both fields, and a
+        # bare block stays.
+        reply(
+            content=f"Run it.\n{wrapped}\nNot this: {bare}", reasoning=f"Draft: {wrapped}\n{bare}"
+        ),
+        # A call from a bare block in a content with no <tool_call>: that block goes, but a
+        # bare block in the reasoning is never a call, and stays.
+        reply(content=f"Then: {function_block('execute_sql', 'SELECT 3')}", reasoning=bare),
+        # A call from the reasoning's <tool_call> block.
+        reply(reasoning=f"Thinking.\n{tool_call_block('execute_sql', 'SELECT 4')}"),
+        # A standard call: its reply replays as written, markup and all.
+        reply(execute_sql("SELECT 5"), content=f"Also {wrapped}", reasoning=f"Also {bare}"),
+        reply(submit()),
+    ]
+    llm = FakeLLM(script)
+    ctx = context(llm)
+
+    await run_agent(environment(), ctx, hooks())
+
+    trajectory = ctx.trajectory()
+    assert [len(step.assistant.tool_calls) for step in trajectory.steps] == [1] * 5
+    assert reference_prompts(trajectory) == sent(llm)
+    replies = [(m.content, m.reasoning_content) for m in sent(llm)[4] if m.role == ASSISTANT]
+    assert replies == [
+        (f"Run it.\n\nNot this: {bare}", f"Draft: \n{bare}"),
+        ("Then: ", bare),
+        ("", "Thinking.\n"),
+        (f"Also {wrapped}", f"Also {bare}"),
+    ]
 
 
 async def test_a_trajectory_round_trips_through_jsonl(tmp_path: Path) -> None:
