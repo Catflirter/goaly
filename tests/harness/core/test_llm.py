@@ -782,14 +782,25 @@ async def test_reads_retry_after_as_an_http_date(zone: str) -> None:
     assert reply.record.attempts[0].retry_after_s == slept
 
 
-async def test_a_retry_after_in_the_past_means_retry_at_once() -> None:
+@pytest.mark.parametrize(
+    "retry_after",
+    [
+        pytest.param("0", id="zero"),
+        pytest.param(
+            format_datetime(datetime.now(UTC) - timedelta(minutes=5), usegmt=True), id="past"
+        ),
+    ],
+)
+async def test_a_retry_after_shorter_than_the_backoff_still_waits_the_backoff(
+    retry_after: str,
+) -> None:
     clock = FakeClock()
-    moment = datetime.now(UTC) - timedelta(minutes=5)
-    gateway = Gateway(failure(429, retry_after=format_datetime(moment, usegmt=True)), completion())
-    async with connect(gateway, clock=clock) as llm:
-        await llm.complete([user("hi")], model=QWEN, tags=EXEC)
+    gateway = Gateway(failure(429, retry_after=retry_after), completion())
+    async with connect(gateway, clock=clock, rng=TopOfRange()) as llm:
+        reply = await llm.complete([user("hi")], model=QWEN, tags=EXEC)
 
-    assert clock.sleeps == []
+    assert clock.sleeps == [1.0]  # The first retry's jitter, at the top of its range.
+    assert reply.record.attempts[0].retry_after_s == 0.0
 
 
 async def test_waits_no_longer_than_the_cap_whatever_retry_after_says() -> None:
@@ -815,8 +826,9 @@ async def test_backs_off_with_jitter_when_retry_after_is_malformed(value: str) -
 
 async def test_the_system_clock_really_waits() -> None:
     gateway = Gateway(failure(429, retry_after="0.05"), completion())
+    retry = RetryPolicy(backoff_base_s=0.01)  # So the 0.05 s of Retry-After is the longer wait.
     async with LlmClient(
-        settings(), Recorder(), transport=httpx.MockTransport(gateway.handle)
+        settings(), Recorder(), retry=retry, transport=httpx.MockTransport(gateway.handle)
     ) as llm:
         reply = await llm.complete([user("hi")], model=QWEN, tags=EXEC)
 

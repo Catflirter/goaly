@@ -107,8 +107,8 @@ class RetryPolicy(BaseModel):
     """How long an attempt may take, and how the client retries a failed one (spec §5.1, §6.2).
 
     ``timeout_s`` runs from sending an attempt's request to reading all of its response. A retry
-    waits for the server's Retry-After when it sends one, and otherwise for full jitter on an
-    exponential backoff; either way no longer than ``backoff_cap_s``.
+    waits for full jitter on an exponential backoff, or for the server's Retry-After when that is
+    longer; either way no longer than ``backoff_cap_s``.
     """
 
     model_config = ConfigDict(frozen=True, extra="forbid", allow_inf_nan=False)
@@ -120,10 +120,12 @@ class RetryPolicy(BaseModel):
 
     def delay_s(self, retry: int, retry_after_s: float | None, rng: random.Random) -> float:
         """Return the wait before retry number ``retry``, counting from 0."""
-        if retry_after_s is not None:
-            return min(retry_after_s, self.backoff_cap_s)
         ceiling = self.backoff_base_s * 2.0 ** min(retry, 64)  # The bound keeps it a float.
-        return rng.uniform(0.0, min(ceiling, self.backoff_cap_s))
+        jitter = rng.uniform(0.0, min(ceiling, self.backoff_cap_s))
+        if retry_after_s is None:
+            return jitter
+        # Even a Retry-After of 0, or a date in the past, waits for the backoff.
+        return min(max(retry_after_s, jitter), self.backoff_cap_s)
 
 
 @dataclass(frozen=True, slots=True)
