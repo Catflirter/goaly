@@ -18,10 +18,10 @@ from goaly.contracts.jsonl import read_jsonl
 from goaly.harness.core import cli
 from goaly.harness.core.manifest import CORE_DIR, git_state, harness_hash, read_manifest
 from goaly.harness.core.registry import (
-    Grading,
-    GradingOptions,
     Harness,
     HarnessOptions,
+    HostBenchmark,
+    HostOptions,
     Registry,
 )
 from goaly.harness.core.runner import RunFiles, lock_run_dir
@@ -47,13 +47,16 @@ quiet = {}
 
 type ToyHarness = Harness[ToyInstance, FakeSqlEnvironment, StubContext]
 
+TOY_MODELS = (ModelSettings(model="qwen3.6-35b-a3b", temperature=0.6, thinking=True),)
+
 
 @dataclass
 class ToyFactory:
     """The toy harness's factory, as the composition root would register it.
 
     It reads an ``--instances`` file of toy tasks, one JSON object a line, and records the
-    options it got and whether its harness was closed.
+    options it got and whether its harness was closed. ``pack_dir`` is what the registry is
+    told of its pack.
     """
 
     policy: ScriptedPolicy = field(default_factory=ScriptedPolicy)
@@ -83,8 +86,6 @@ class ToyFactory:
                 benchmark=benchmark,
                 policy=self.policy,
                 contexts=StubContexts(),
-                pack_dir=self.pack_dir,
-                models=(ModelSettings(model="qwen3.6-35b-a3b", temperature=0.6, thinking=True),),
                 gold_sha256="g" * 64,
                 cache_namespace=self.cache_namespace,
             )
@@ -93,22 +94,26 @@ class ToyFactory:
 
 
 @dataclass
-class ToyGradingFactory:
-    """The toy benchmark alone, for the grade phase: it opens no pack."""
+class ToyHostFactory:
+    """The toy benchmark's host side: the benchmark alone, which opens no pack."""
 
     name: str = "toy"
     cache_namespace: str = "toy-dev"
+    options: list[HostOptions] = field(default_factory=list)
     benchmarks: list[ScriptedBenchmark] = field(default_factory=list)
 
     @asynccontextmanager
     async def __call__(
-        self, options: GradingOptions
-    ) -> AsyncIterator[Grading[ToyInstance, FakeSqlEnvironment]]:
+        self, options: HostOptions
+    ) -> AsyncIterator[HostBenchmark[ToyInstance, FakeSqlEnvironment]]:
+        self.options.append(options)
         instances = [*toy_instances(3), ToyInstance("v0", SPLIT_VAL, base_sql(9), "SELECT 9")]
         benchmark = ScriptedBenchmark(instances)
         benchmark.name = self.name
         self.benchmarks.append(benchmark)
-        yield Grading(benchmark=benchmark, cache_namespace=self.cache_namespace)
+        yield HostBenchmark(
+            benchmark=benchmark, cache_namespace=self.cache_namespace, gold_sha256="g" * 64
+        )
 
 
 @pytest.fixture(autouse=True)
@@ -146,14 +151,14 @@ def factory(pack: Path) -> ToyFactory:
 
 
 @pytest.fixture
-def grading() -> ToyGradingFactory:
-    return ToyGradingFactory()
+def grading() -> ToyHostFactory:
+    return ToyHostFactory()
 
 
 @pytest.fixture
-def registry(factory: ToyFactory, grading: ToyGradingFactory) -> Registry:
+def registry(factory: ToyFactory, grading: ToyHostFactory) -> Registry:
     registry = Registry()
-    registry.add("toy", "v0", factory)
+    registry.add("toy", "v0", factory, pack_dir=factory.pack_dir, models=TOY_MODELS)
     registry.add_benchmark("toy", grading)
     return registry
 
@@ -258,9 +263,15 @@ def test_runs_the_toy_benchmark_end_to_end(
     assert manifest.HasField("started_at")
     assert manifest.HasField("finished_at")
     (options,) = factory.options
-    assert options.files == RunFiles(out)
-    assert options.instances_file is None
-    assert options.llm_shares == {"qwen3.6-35b-a3b": 4}
+    assert options == HarnessOptions(
+        files=RunFiles(out),
+        instances_file=None,
+        llm_shares={"qwen3.6-35b-a3b": 4},
+        split=SPLIT_TRAIN,
+        budget_phase="test",
+        in_container=False,
+        inputs_dir=None,
+    )
     assert factory.closed
 
 
@@ -534,15 +545,21 @@ def test_a_run_solves_then_grades_and_the_grade_phase_opens_no_pack(
     registry: Registry,
     budgets: Path,
     factory: ToyFactory,
-    grading: ToyGradingFactory,
+    grading: ToyHostFactory,
     tmp_path: Path,
 ) -> None:
     out = tmp_path / "run"
 
-    solved, graded = solve_and_grade(capsys, registry, budgets, out)
+    solved, graded = solve_and_grade(capsys, registry, budgets, out, "--budget-phase", "test")
 
     assert solved.status == 0, solved.stderr
     assert graded.status == 0, graded.stderr
+    # The grade phase's host side gets the run's split, from its manifest, and the budget phase.
+    assert grading.options == [
+        HostOptions(
+            files=RunFiles(out), instances_file=None, split=SPLIT_TRAIN, budget_phase="test"
+        )
+    ]
     assert (solved.summary["phase"], graded.summary["phase"]) == ("solve", "grade")
     assert (solved.summary["ran"], graded.summary["ran"]) == (3, 3)
     assert graded.summary["run_id"] == solved.summary["run_id"]
@@ -572,8 +589,8 @@ def test_the_grade_phase_fills_the_cache_for_the_next_solve_phase(
     [
         (["--split", "train"], "--split"),
         (
-            ["--seeds", "2", "--resume", "--budget-phase", "test"],
-            "--seeds, --resume, --budget-phase",
+            ["--seeds", "2", "--resume", "--budget-share", "toy"],
+            "--seeds, --resume, --budget-share",
         ),
         (["--harness", "v0", "--max-tasks", "2"], "--harness, --max-tasks"),
     ],
@@ -617,7 +634,7 @@ def test_the_grade_phase_needs_a_run_to_grade(
     assert not out.exists()
 
 
-def test_a_benchmark_registered_without_a_grading_cannot_grade(
+def test_a_benchmark_registered_without_a_host_side_cannot_grade(
     capsys: pytest.CaptureFixture[str], factory: ToyFactory, budgets: Path, tmp_path: Path
 ) -> None:
     registry = Registry()
@@ -628,7 +645,7 @@ def test_a_benchmark_registered_without_a_grading_cannot_grade(
     )
 
     assert outcome.status == cli.USAGE
-    assert "no benchmark 'toy' to grade with; none is registered" in outcome.stderr
+    assert "no host side for the benchmark 'toy'; none has one" in outcome.stderr
 
 
 def test_a_grading_without_a_namespace_cannot_use_the_cache(
@@ -636,7 +653,7 @@ def test_a_grading_without_a_namespace_cannot_use_the_cache(
 ) -> None:
     registry = Registry()
     registry.add("toy", "v0", factory)
-    registry.add_benchmark("toy", ToyGradingFactory(cache_namespace=""))
+    registry.add_benchmark("toy", ToyHostFactory(cache_namespace=""))
     out = tmp_path / "run"
 
     _, graded = solve_and_grade(capsys, registry, budgets, out, "--cache", str(tmp_path / "c"))
@@ -650,7 +667,7 @@ def test_a_grading_of_another_benchmark_is_refused(
 ) -> None:
     registry = Registry()
     registry.add("toy", "v0", factory)
-    registry.add_benchmark("toy", ToyGradingFactory(name="not-toy"))
+    registry.add_benchmark("toy", ToyHostFactory(name="not-toy"))
 
     _, graded = solve_and_grade(capsys, registry, budgets, tmp_path / "run")
 
