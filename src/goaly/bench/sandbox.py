@@ -1,7 +1,15 @@
-"""The Docker sandbox that candidate code runs in (spec §6.1, §8.5, §8.8).
+"""The Docker sandbox that candidate code runs in (spec §6.1, §8.5, §8.8): one builder, two uses.
 
-goaly.rsi.sandbox builds the implementer's and the unit-test guard's sandboxes on it. It lives in
-goaly.bench, so that the solve phase of goaly run can use it without loading goaly.rsi (spec
+- **goaly.rsi's sandboxes** (goaly.rsi.sandbox): the implementer's and the unit-test guard's, on
+  a candidate's worktree.
+- **The solve phase of goaly run** (spec §6.1): :func:`solve_options` and :func:`run_solve` run a
+  pack's policy away from the key, the grader and gold. The harness and the gold-free runtime data
+  file are mounted read-only, and the run directory is writable. Besides PYTHONPATH, which points
+  at the harness's ``src``, the environment holds only what :class:`SolveEnvironment` allows: the
+  LLM proxy's URL and the run's dummy token, the agent role's PostgreSQL host, ports and password,
+  and the run and seed.
+
+The builder lives in goaly.bench, so that goaly run can use it without loading goaly.rsi (spec
 §3.1).
 
 Every container runs as the host user with ``--network=host``, the only mode that works on this
@@ -17,6 +25,7 @@ import hashlib
 import logging
 import os
 import re
+import secrets
 import shutil
 import subprocess
 import tempfile
@@ -24,31 +33,43 @@ import time
 from collections.abc import Mapping
 from dataclasses import dataclass
 from pathlib import Path
+from urllib.parse import urlsplit
 
-from pydantic import BaseModel, ConfigDict, Field, field_validator
+from pydantic import BaseModel, ConfigDict, Field, SecretStr, field_validator
 
 __all__ = [
     "DOCKERFILE",
     "IMAGE_REPOSITORY",
+    "LABEL_RUN",
+    "LABEL_SOLVE",
     "SandboxConfig",
     "SandboxError",
     "SandboxResult",
+    "SolveEnvironment",
     "bind",
     "ensure_image",
     "hardened_options",
     "image_tag",
     "mount_path",
     "remove_containers",
+    "remove_solve_containers",
     "run_container",
+    "run_solve",
+    "solve_options",
     "timed_shell",
 ]
 
 IMAGE_REPOSITORY = "goaly-rsi-sandbox"
 DOCKERFILE = Path("docker/rsi-sandbox.Dockerfile")  # Relative to the repository root.
+LABEL_SOLVE = "goaly.bench.solve"  # "1" on every solve container.
+LABEL_RUN = "goaly.bench.run"
 _LABEL_DOCKERFILE = "goaly.rsi.dockerfile-sha256"  # On the image: the Dockerfile it came from.
 
 _CPUSET = re.compile(r"\d+(-\d+)?(,\d+(-\d+)?)*")
 _SIZE = re.compile(r"\d+[bkmg]")
+_LABEL_VALUE = re.compile(r"[A-Za-z0-9][A-Za-z0-9_.-]{0,127}")
+_VARIABLE = re.compile(r"[A-Z_][A-Z0-9_]*")
+_LOOPBACK = frozenset({"127.0.0.1", "localhost", "::1"})
 _TIMED_OUT = 124  # timeout's exit status once it has stopped the command.
 _KILLED = 137  # 128 + SIGKILL: after --kill-after, or when the kernel killed the command.
 
@@ -169,18 +190,28 @@ def run_container(
     *,
     name: str,
     timeout_s: float,
+    environment: Mapping[str, str] | None = None,
     config: SandboxConfig = SandboxConfig(),  # noqa: B008  (frozen, so one default is safe)
 ) -> SandboxResult:
     """Run the bash ``command`` once in a container of ``image`` started with ``options``, and
     return how it ended. The container is removed before this returns, whatever happens.
 
-    Raises SandboxError if docker fails or hangs, or after ``timeout_s`` plus the docker timeouts.
-    A command that fails or times out is a result, not an error.
+    ``environment``'s variables reach the container through a private env file, deleted as soon
+    as the container has started, never through the command line. Raises SandboxError if docker
+    fails or hangs, or after ``timeout_s`` plus the docker timeouts. A command that fails or
+    times out is a result, not an error.
     """
     shell = [*timed_shell(timeout_s, config), f"exec 2>&1\n{command}"]
+    env_file = _env_file(environment or {})
+    env_options = [] if env_file is None else [f"--env-file={env_file}"]
     started = time.monotonic()
     try:
-        _docker(config, ["run", "--detach", f"--name={name}", *options, image, *shell])
+        try:
+            _docker(
+                config, ["run", "--detach", f"--name={name}", *options, *env_options, image, *shell]
+            )
+        finally:
+            _discard(env_file)  # The container holds its variables now.
         status = _docker(
             config,
             ["wait", name],
@@ -210,6 +241,160 @@ def remove_containers(
     if containers:
         _docker(config, ["rm", "--force", *containers])
     return len(containers)
+
+
+# The solve phase (spec §6.1).
+
+
+class SolveEnvironment(BaseModel):
+    """The only variables a solve container gets (spec §6.1): never the real key, a grader's
+    credentials or ``~/.config``.
+    """
+
+    model_config = ConfigDict(frozen=True, extra="forbid")
+
+    # The LLM proxy on the host, which holds the real key (T03's LlmProxy.base_url).
+    base_url: str
+    # The run's dummy token, which only the proxy accepts.
+    token: SecretStr
+    # The solving instances, which the agent role reaches with SELECT on tpch alone.
+    pg_host: str = "127.0.0.1"
+    pg_ports: tuple[int, ...]
+    pg_agent_password: SecretStr
+    run_id: str
+    seed: int = Field(ge=0)
+
+    @field_validator("base_url")
+    @classmethod
+    def _check_base_url(cls, value: str) -> str:
+        parts = urlsplit(value)
+        local = parts.scheme == "http" and parts.hostname in _LOOPBACK and parts.port
+        extra = "@" in parts.netloc or parts.path not in ("", "/") or parts.query or parts.fragment
+        if not local or extra:
+            raise ValueError("must be the LLM proxy on this machine, http://127.0.0.1:<port>")
+        return value
+
+    @field_validator("token", "pg_agent_password")
+    @classmethod
+    def _check_secret(cls, value: SecretStr) -> SecretStr:
+        text = value.get_secret_value()
+        if not text or "\n" in text or "\0" in text:
+            raise ValueError("must be one non-empty line")
+        return value
+
+    @field_validator("pg_host")
+    @classmethod
+    def _check_host(cls, value: str) -> str:
+        if not value or any(not char.isprintable() or char.isspace() for char in value):
+            raise ValueError("must be a host name")
+        return value
+
+    @field_validator("pg_ports")
+    @classmethod
+    def _check_ports(cls, value: tuple[int, ...]) -> tuple[int, ...]:
+        if not value or any(not 0 < port < 65536 for port in value):
+            raise ValueError("must be one or more ports")
+        return value
+
+    @field_validator("run_id")
+    @classmethod
+    def _check_run_id(cls, value: str) -> str:
+        if not _LABEL_VALUE.fullmatch(value):
+            raise ValueError(f"must match {_LABEL_VALUE.pattern}")
+        return value
+
+    def variables(self) -> dict[str, str]:
+        """The container's environment, by variable name."""
+        return {
+            "GOALY_BASE_URL": self.base_url,
+            "GOALY_API_KEY": self.token.get_secret_value(),
+            "GOALY_PG_HOST": self.pg_host,
+            "GOALY_PG_PORTS": ",".join(map(str, self.pg_ports)),
+            "GOALY_PG_AGENT_PASSWORD": self.pg_agent_password.get_secret_value(),
+            "GOALY_RUN_ID": self.run_id,
+            "GOALY_SEED": str(self.seed),
+        }
+
+
+def solve_options(
+    harness: Path,
+    run_dir: Path,
+    data_file: Path,
+    *,
+    run_id: str,
+    uid: int,
+    gid: int,
+    config: SandboxConfig = SandboxConfig(),  # noqa: B008
+) -> list[str]:
+    """Return the ``docker run`` options of the solve container for ``run_id``.
+
+    ``harness``, the candidate's snapshot or another checkout, and ``data_file``, the gold-free
+    runtime task file, are mounted read-only and ``run_dir`` writable, each at its own path.
+    Nothing else from the host is mounted. Raises ValueError for a path docker could misread, and
+    for mounts that would make the harness or the data writable.
+    """
+    if run_dir.is_relative_to(harness):
+        raise ValueError(f"the run directory {run_dir} must lie outside the harness {harness}")
+    if harness.is_relative_to(run_dir):
+        raise ValueError(f"the harness {harness} must lie outside the run directory {run_dir}")
+    if data_file.is_relative_to(run_dir):
+        raise ValueError(f"the data file {data_file} must lie outside the run directory")
+    if not _LABEL_VALUE.fullmatch(run_id):
+        raise ValueError(f"the run ID must match {_LABEL_VALUE.pattern}; got {run_id!r}")
+    labels = {LABEL_SOLVE: "1", LABEL_RUN: run_id}
+    return [
+        *hardened_options(uid=uid, gid=gid, workdir=harness, labels=labels, config=config),
+        bind(harness, what="harness"),
+        bind(data_file, what="data file"),
+        bind(run_dir, writable=True, what="run directory"),
+    ]
+
+
+def run_solve(
+    image: str,
+    harness: Path,
+    run_dir: Path,
+    data_file: Path,
+    *,
+    environment: SolveEnvironment,
+    command: str,
+    timeout_s: float,
+    config: SandboxConfig = SandboxConfig(),  # noqa: B008
+) -> SandboxResult:
+    """Run the solve phase's ``command`` in a fresh solve container, as the host user, for at most
+    ``timeout_s``, and remove the container before returning, whatever happens.
+
+    Raises SandboxError if docker fails or hangs.
+    """
+    options = solve_options(
+        harness,
+        run_dir,
+        data_file,
+        run_id=environment.run_id,
+        uid=os.getuid(),
+        gid=os.getgid(),
+        config=config,
+    )
+    name = f"goaly-solve-{environment.run_id}-{secrets.token_hex(4)}"
+    return run_container(
+        image,
+        options,
+        command,
+        name=name,
+        timeout_s=timeout_s,
+        environment=environment.variables(),
+        config=config,
+    )
+
+
+def remove_solve_containers(
+    *,
+    run_id: str | None = None,
+    config: SandboxConfig = SandboxConfig(),  # noqa: B008
+) -> int:
+    """Remove every solve container, or one run's, and return how many there were."""
+    labels = {LABEL_SOLVE: "1", **({} if run_id is None else {LABEL_RUN: run_id})}
+    return remove_containers(labels, config=config)
 
 
 # The image.
@@ -298,6 +483,26 @@ def _docker_environment() -> dict[str, str]:
     }
     environment["LANG"] = "C.UTF-8"
     return environment
+
+
+def _env_file(variables: Mapping[str, str]) -> Path | None:
+    """Write ``variables`` to a new file only this user can read, in a directory of its own."""
+    if not variables:
+        return None
+    for name, value in variables.items():
+        if not _VARIABLE.fullmatch(name) or "\n" in value or "\0" in value:
+            raise ValueError(f"cannot pass the variable {name} in an env file")
+    path = Path(tempfile.mkdtemp(prefix="goaly-sandbox-env-")) / "env"
+    descriptor = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_CLOEXEC, 0o600)
+    with os.fdopen(descriptor, "w", encoding="utf-8") as file:
+        file.writelines(f"{name}={value}\n" for name, value in variables.items())
+    return path
+
+
+def _discard(env_file: Path | None) -> None:
+    if env_file is not None:
+        env_file.unlink(missing_ok=True)
+        env_file.parent.rmdir()
 
 
 def _exit_code(status: str) -> int:

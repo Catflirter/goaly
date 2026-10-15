@@ -21,8 +21,14 @@ command = " ".join(args[:2]) if args[:1] == ["image"] else args[0]
 context = None
 if command == "build":
     context = sorted(p.name for p in Path(args[-1]).iterdir())
+env_file = None
+for arg in args:
+    if arg.startswith("--env-file="):
+        path = Path(arg.removeprefix("--env-file="))
+        env_file = {{"text": path.read_text(), "mode": oct(path.stat().st_mode & 0o777)}}
+record = {{"args": args, "env": dict(os.environ), "context": context, "env_file": env_file}}
 with (here / "calls.jsonl").open("a") as calls:
-    calls.write(json.dumps({{"args": args, "env": dict(os.environ), "context": context}}) + "\\n")
+    calls.write(json.dumps(record) + "\\n")
 answer = json.loads((here / "script.json").read_text()).get(command, {{}})
 time.sleep(answer.get("sleep", 0))
 sys.stdout.write(answer.get("stdout", ""))
