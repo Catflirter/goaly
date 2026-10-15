@@ -44,10 +44,16 @@ class Environment(Protocol):
     A statement or command that fails gives a result. A call raises EnvironmentFailure
     (goaly.contracts.errors) when the environment itself fails, such as a dead database
     connection or container, and only then.
+
+    A cancelled call stops the statement or command it started before CancelledError
+    propagates, and the environment stays usable.
     """
 
     async def close(self) -> None:
-        """Release the environment's resources. Calling it again does nothing."""
+        """Release the environment's resources. Calling it again does nothing.
+
+        It completes even while its caller is being cancelled: implementations shield it.
+        """
 
 
 class SqlEnvironment(Environment, Protocol):
@@ -154,8 +160,10 @@ class Benchmark[InstanceT, EnvT: Environment](Protocol):
     def provision(self, inst: InstanceT) -> AbstractAsyncContextManager[EnvT]:
         """Create the environment to solve ``inst`` in. Leaving the context closes it.
 
-        If the environment cannot be created, entering the context raises EnvironmentFailure,
-        which the runner records as TASK_ERROR_TYPE_ENVIRONMENT.
+        The context closes the environment however it exits: normally, on an exception or on
+        cancellation. It never suppresses an exception raised in its body. If the environment
+        cannot be created, entering the context raises EnvironmentFailure, which the runner
+        records as TASK_ERROR_TYPE_ENVIRONMENT.
         """
 
     def agent_input(self, inst: InstanceT) -> TaskInput:

@@ -9,6 +9,7 @@ pytest imports tests/ as a namespace package, so any test can import them, e.g.
 ``from tests.fakes import FakeSqlEnvironment``.
 """
 
+import asyncio
 from collections.abc import AsyncIterator, Mapping, Sequence
 from contextlib import asynccontextmanager
 from dataclasses import dataclass
@@ -34,13 +35,21 @@ from goaly.contracts.interfaces import Environment, JsonValue
 
 # The exit status a shell gives for a command it cannot find.
 COMMAND_NOT_FOUND = 127
+# PostgreSQL's error for a statement that ran past its statement_timeout.
+STATEMENT_TIMEOUT = "canceling statement due to statement timeout"
 
 
 class FakeEnvironment:
-    """An Environment with nothing in it. Once closed, its subclasses refuse every call."""
+    """An Environment with nothing in it.
+
+    Each call of its subclasses takes the canned result's ``elapsed_s`` of real time, and stops
+    at the call's timeout. A call cancelled midway stops at once, is recorded in ``stopped`` and
+    leaves the environment usable. Once closed, the environment refuses every call.
+    """
 
     def __init__(self) -> None:
         self.closed = False
+        self.stopped: list[str] = []
 
     async def close(self) -> None:
         self.closed = True
@@ -48,6 +57,15 @@ class FakeEnvironment:
     def _ensure_open(self) -> None:
         if self.closed:
             raise RuntimeError("the environment is closed")
+
+    async def _take(self, call: str, elapsed_s: float, timeout_s: float) -> bool:
+        """Spend the time ``call`` takes, up to ``timeout_s``; return whether it timed out."""
+        try:
+            await asyncio.sleep(min(elapsed_s, timeout_s))
+        except asyncio.CancelledError:
+            self.stopped.append(call)
+            raise
+        return elapsed_s > timeout_s
 
 
 class FakeSqlEnvironment(FakeEnvironment):
@@ -69,6 +87,8 @@ class FakeSqlEnvironment(FakeEnvironment):
         canned = self.results.get(sql, SqlResult(error=f"no canned result for {sql!r}"))
         if isinstance(canned, EnvironmentFailure):
             raise canned
+        if await self._take(sql, canned.elapsed_s, timeout_s):
+            return SqlResult(error=STATEMENT_TIMEOUT, elapsed_s=timeout_s)
         result = SqlResult()
         result.CopyFrom(canned)  # A copy: the caller cannot change the table.
         return result
@@ -99,6 +119,8 @@ class FakeShellEnvironment(FakeEnvironment):
         canned = self.results.get(command, ShellResult(exit_code=COMMAND_NOT_FOUND, stderr=unknown))
         if isinstance(canned, EnvironmentFailure):
             raise canned
+        if await self._take(command, canned.elapsed_s, timeout_s):
+            return ShellResult(timed_out=True, elapsed_s=timeout_s)
         result = ShellResult()
         result.CopyFrom(canned)  # A copy: the caller cannot change the table.
         return result

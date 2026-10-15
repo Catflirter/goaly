@@ -47,6 +47,7 @@ from goaly.contracts.interfaces import (
 from goaly.contracts.jsonl import to_json_line
 from tests.fakes import (
     COMMAND_NOT_FOUND,
+    STATEMENT_TIMEOUT,
     TOY_INSTANCES,
     DoNothingPolicy,
     EchoArgs,
@@ -218,7 +219,7 @@ def test_a_closed_fake_sql_environment_refuses_statements() -> None:
 
 
 def test_fake_shell_environment_runs_canned_commands() -> None:
-    canned = ShellResult(stdout="1 passed\n", elapsed_s=0.5)
+    canned = ShellResult(stdout="1 passed\n", elapsed_s=0.001)
     fake = FakeShellEnvironment({"pytest -q": canned})
     env: ShellEnvironment = fake
 
@@ -294,6 +295,60 @@ def test_fake_environments_raise_a_canned_environment_failure() -> None:
 
     assert raised_by_sql.value is died
     assert raised_by_shell.value is died
+
+
+def test_a_cancelled_fake_statement_stops_and_leaves_the_environment_usable() -> None:
+    fake = FakeSqlEnvironment({"SELECT pg_sleep(60)": SqlResult(elapsed_s=60.0)})
+    env: SqlEnvironment = fake
+
+    async def cancel_midway() -> None:
+        async with asyncio.timeout(0.01):
+            await env.execute("SELECT pg_sleep(60)", timeout_s=120.0)
+
+    async def scenario() -> SqlResult:
+        with pytest.raises(TimeoutError):
+            await cancel_midway()
+        return await env.execute("SELEC 1", timeout_s=1.0)
+
+    assert asyncio.run(scenario()).error == "no canned result for 'SELEC 1'"
+    assert fake.stopped == ["SELECT pg_sleep(60)"]
+
+
+def test_a_cancelled_fake_command_stops_and_leaves_the_environment_usable() -> None:
+    fake = FakeShellEnvironment({"sleep 60": ShellResult(elapsed_s=60.0)})
+    env: ShellEnvironment = fake
+
+    async def cancel_midway() -> None:
+        async with asyncio.timeout(0.01):
+            await env.exec("sleep 60", timeout_s=120.0)
+
+    async def scenario() -> ShellResult:
+        with pytest.raises(TimeoutError):
+            await cancel_midway()
+        return await env.exec("slep 60", timeout_s=1.0)
+
+    assert asyncio.run(scenario()).exit_code == COMMAND_NOT_FOUND
+    assert fake.stopped == ["sleep 60"]
+
+
+def test_fake_sql_environment_stops_a_statement_at_its_timeout() -> None:
+    fake = FakeSqlEnvironment({"SELECT pg_sleep(60)": SqlResult(elapsed_s=60.0)})
+    env: SqlEnvironment = fake
+
+    result = asyncio.run(env.execute("SELECT pg_sleep(60)", timeout_s=0.01))
+
+    assert result == SqlResult(error=STATEMENT_TIMEOUT, elapsed_s=0.01)
+    assert fake.stopped == []
+
+
+def test_fake_shell_environment_stops_a_command_at_its_timeout() -> None:
+    fake = FakeShellEnvironment({"sleep 60": ShellResult(stdout="partial", elapsed_s=60.0)})
+    env: ShellEnvironment = fake
+
+    result = asyncio.run(env.exec("sleep 60", timeout_s=0.01))
+
+    assert result == ShellResult(timed_out=True, elapsed_s=0.01)
+    assert fake.stopped == []
 
 
 def test_echo_tool_answers_with_its_text_in_any_environment() -> None:
@@ -383,6 +438,32 @@ def test_toy_benchmark_closes_the_environment_it_provisions() -> None:
 
     assert gold == SqlResult()
     assert issue.error
+    assert [env.closed for env in fake.environments] == [True]
+
+
+def test_toy_benchmark_closes_the_environment_and_lets_an_exception_through() -> None:
+    fake = ToyBenchmark()
+    benchmark: Benchmark[ToyInstance, SqlEnvironment] = fake
+
+    async def crash() -> None:
+        async with benchmark.provision(TOY_INSTANCES[0]):
+            raise LookupError("the policy crashed")
+
+    with pytest.raises(LookupError, match="the policy crashed"):
+        asyncio.run(crash())
+    assert [env.closed for env in fake.environments] == [True]
+
+
+def test_toy_benchmark_closes_the_environment_when_the_task_is_cancelled() -> None:
+    fake = ToyBenchmark()
+    benchmark: Benchmark[ToyInstance, SqlEnvironment] = fake
+
+    async def cancelled() -> None:
+        async with asyncio.timeout(0.01), benchmark.provision(TOY_INSTANCES[0]):
+            await asyncio.sleep(60)
+
+    with pytest.raises(TimeoutError):
+        asyncio.run(cancelled())
     assert [env.closed for env in fake.environments] == [True]
 
 
