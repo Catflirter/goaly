@@ -22,7 +22,7 @@ from datetime import UTC, datetime
 from pathlib import Path
 
 from goaly.contracts.gen.experiment_pb2 import LANE_EFFISQL, Lane
-from goaly.harness.core.settings import load_settings
+from goaly.harness.core.settings import SettingsError, load_settings
 from goaly.rsi.cli import LaneSettings
 from goaly.rsi.heartbeat import heartbeat, heartbeat_file
 from goaly.rsi.lane import LaneHooks, StopInfo
@@ -100,10 +100,20 @@ def state_dir(settings: LaneSettings) -> Path:
 
 
 def lane_hooks(settings: LaneSettings) -> LaneHooks:
-    """Build the real lane's hooks: GitHub results PRs and ntfy.sh notifications."""
-    gateway = load_settings()
+    """Build the real lane's hooks: GitHub results PRs and ntfy.sh notifications.
+
+    It stays light, with no Docker, dataset or network, since a lane past its deadline builds
+    only these. Unusable goaly settings turn notifications off rather than fail the lane.
+    """
     ledger = Ledger(settings.ledger())
-    notifier = notifier_from_settings(gateway, ledger)
+    notifier: Notifier
+    try:
+        notifier = notifier_from_settings(load_settings(), ledger)
+    except SettingsError as error:
+        _logger.error(
+            "notifications are off: the settings are unusable", extra={"reason": str(error)}
+        )
+        notifier = QueuedNotifier(None, ledger)
     publisher = ResultsPublisherImpl(
         ledger,
         settings.repo.resolve(),

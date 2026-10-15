@@ -147,3 +147,8 @@ async def test_running_removes_the_breaker_watch(tmp_path: Path) -> None:
         assert any(isinstance(h, BreakerWatch) for h in throttle.handlers)
     assert not any(isinstance(h, BreakerWatch) for h in throttle.handlers)
     notifier.close()
+
+
+def test_lane_hooks_without_settings_turn_notifications_off(tmp_path: Path) -> None:
+    hooks = lane_hooks(lane_settings(tmp_path))  # No GOALY_API_KEY in the test environment.
+    assert hooks.notify is not None
