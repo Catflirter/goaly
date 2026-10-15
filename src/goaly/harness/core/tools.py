@@ -24,7 +24,7 @@ from goaly.contracts.gen.task_pb2 import Prediction
 from goaly.contracts.gen.trajectory_pb2 import ToolCall, ToolResult
 from goaly.contracts.interfaces import Environment, JsonValue, Tool
 
-__all__ = ["DEFAULT_TIMEOUT_S", "BoundTool", "ToolRegistry", "bind"]
+__all__ = ["DEFAULT_TIMEOUT_S", "BoundTool", "ToolRegistry", "bind", "environment_failure_in"]
 
 # How long a call may run when the tool's config sets no timeout.
 DEFAULT_TIMEOUT_S = 60.0
@@ -35,6 +35,8 @@ _CONTENT_KEEP = 4_000
 _MESSAGE_KEEP = 250
 # The model sees this many characters at each end of arguments that are not valid JSON.
 _EXCERPT_KEEP = 100
+# An invalid-arguments error lists this many of pydantic's errors, and counts the rest.
+_LISTED_ERRORS = 10
 
 _logger = logging.getLogger(__name__)
 
@@ -55,7 +57,13 @@ class BoundTool[E: Environment](ABC):
 
     @abstractmethod
     def json_schema(self) -> dict[str, JsonValue]:
-        """Return the tool's entry in the OpenAI ``tools`` list, a fresh copy each time."""
+        """Return the tool's entry in the OpenAI ``tools`` list, a fresh copy each time.
+
+        The entry holds the tool's name, its description and its arguments' JSON Schema as
+        pydantic writes it, and the model reads all of it as written: the args model's
+        docstring, its field descriptions and its titles. Nothing is stripped, so whoever writes
+        a tool, RSI's implementer included, writes that text for the model.
+        """
 
     @abstractmethod
     async def invoke(self, arguments_json: str, env: E) -> ToolResult:
@@ -68,13 +76,23 @@ class BoundTool[E: Environment](ABC):
           covers the whole invocation, validation included.
         - Content longer than 8,000 characters keeps its first and last 4,000, with a marker
           between them that says how many were cut, and ``truncated`` is set.
-        - ``is_error`` is set when the call itself failed, and only then. Arguments that fail
-          validation get pydantic's errors listed, and the tool does not run. A call that runs
-          past ``timeout_s`` is stopped. A tool that raised gets its exception's type and
-          message, never a traceback; the traceback goes to the log. A statement or command
-          that ran and failed is a normal result.
-        - EnvironmentFailure propagates, never as a result, and so does an exception group that
-          holds one, as a TaskGroup raises. Cancellation propagates too.
+        - ``is_error`` is set when the call itself failed, and only then:
+          - arguments that fail validation get pydantic's first 10 errors listed, or the type
+            and message of what a validator raised, and the tool does not run;
+          - a call that runs past ``timeout_s`` is cancelled;
+          - a tool that raised, or returned something other than a ToolResult, gets the
+            exception's type and message, and an exception group each of its leaves', never a
+            traceback; the traceback goes to the log, at WARNING.
+
+          A statement or command that ran and failed is a normal result.
+        - EnvironmentFailure propagates, from a validator too, and never becomes a result. When
+          an exception group holds one, as a TaskGroup raises, the first is raised from the
+          group (:func:`environment_failure_in`), so that ``except EnvironmentFailure`` catches
+          it. Cancellation propagates too.
+        - The tool runs in a task of its own. It must let CancelledError propagate; one that
+          does not still cannot change the outcome. A cancellation of the caller that it
+          swallowed, or turned into another exception, still propagates, and a call that ran
+          past its timeout gets the timeout error, whatever the tool returned.
         """
 
 
@@ -83,9 +101,19 @@ def bind[A: BaseModel, E: Environment](
 ) -> BoundTool[E]:
     """Bind ``tool`` for a registry; each of its calls may run for ``timeout_s`` seconds.
 
-    ``timeout_s`` is the timeout the pack's config gives the tool, and DEFAULT_TIMEOUT_S if it
-    gives none; one that is not a positive, finite number raises ValueError. The tool's name,
-    description and JSON Schema are read once, here: a tool whose arguments have no JSON Schema
+    ``timeout_s`` bounds the whole call, including any time the environment queues the work.
+    It is the timeout the pack's config gives the tool, or DEFAULT_TIMEOUT_S, which suits a
+    fast tool; one that is not a positive, finite number raises ValueError.
+
+    A tool that enforces its own timeout needs a ``timeout_s`` that is a backstop, not the
+    limit. Otherwise the executor cancels the tool first, and what would have been an ordinary
+    timeout result becomes an error result, which counts toward the agent loop's stop after 5
+    consecutive errors (spec §5.1). Effi-SQL's execute_sql is one: it stops a statement after
+    120 s, with up to 2 statements in flight per solving instance and a queue in front of them,
+    so its pack binds it with the task's wall-clock budget, 600 s in v0, as the backstop.
+
+    The tool's name, description and JSON Schema are read once, here, and the model reads them
+    as written (see :meth:`BoundTool.json_schema`). A tool whose arguments have no JSON Schema
     fails now, with pydantic's PydanticInvalidForJsonSchema, rather than at the first model
     call.
     """
@@ -129,25 +157,53 @@ class _Binding[A: BaseModel, E: Environment](BoundTool[E]):
         except ValidationError as error:
             content = _invalid_arguments(self.name, arguments_json, error)
             return _result(self.name, content, is_error=True)
+        except Exception as error:  # A validator raised what pydantic does not wrap.
+            _reraise_environment_failure(error)
+            _logger.warning(
+                "validating the arguments of the tool %s raised an exception",
+                self.name,
+                extra={"tool": self.name},
+                exc_info=error,
+            )
+            content = f"Error: invalid arguments for {self.name}: {_describe(error)}"
+            return _result(self.name, content, is_error=True)
+        cancel_requests = _cancel_requests()
         timeout = asyncio.timeout(self.timeout_s)
         try:
             async with timeout:
-                returned = await self.tool.run(args, env)
+                # The tool runs in a task of its own, which a cancellation of this one cancels,
+                # so that its cancellation bookkeeping never touches this task's: Python 3.12's
+                # TaskGroup leaves an extra cancel request on its parent when a child fails
+                # while it exits. The result is an object: pack code can break the contract.
+                returned: object = await asyncio.create_task(self.tool.run(args, env))
+            if not isinstance(returned, ToolResult):
+                kind = type(returned).__name__
+                raise TypeError(f"{self.name} returned {kind}, not a ToolResult")
         except Exception as error:
-            if _environment_failed(error):
-                raise
+            if _cancel_requests() > cancel_requests:
+                # The tool turned an outer cancellation into an exception; it still propagates.
+                raise asyncio.CancelledError from error
+            _reraise_environment_failure(error)
             if timeout.expired():
-                content = (
-                    f"Error: {self.name} timed out after {self.timeout_s:g} s and was stopped."
-                )
-            else:
-                _logger.warning(
-                    "a tool raised an exception", extra={"tool": self.name}, exc_info=error
-                )
-                content = f"Error: {self.name} failed with {_describe(error)}"
+                return self._timed_out()
+            _logger.warning(
+                "the tool %s raised an exception",
+                self.name,
+                extra={"tool": self.name},
+                exc_info=error,
+            )
+            content = f"Error: {self.name} failed with {_describe(error)}"
             return _result(self.name, content, is_error=True)
+        if _cancel_requests() > cancel_requests:
+            raise asyncio.CancelledError  # The tool swallowed an outer cancellation.
+        if timeout.expired():
+            return self._timed_out()  # The tool swallowed its timeout's cancellation.
         submission = returned.submission if returned.HasField("submission") else None
         return _result(self.name, returned.content, submission=submission)
+
+    def _timed_out(self) -> ToolResult:
+        content = f"Error: {self.name} timed out after {self.timeout_s:g} s and was cancelled."
+        return _result(self.name, content, is_error=True)
 
 
 class ToolRegistry[E: Environment]:
@@ -155,7 +211,10 @@ class ToolRegistry[E: Environment]:
 
     It lists them for the LLM client in the order they were registered. A tool that works in
     any environment fits a registry for a narrower one: ``bind(EchoTool())`` fits a
-    ``ToolRegistry[SqlEnvironment]``.
+    ``ToolRegistry[SqlEnvironment]``. A registry or a list that mixes tools for different
+    environments must state its type, because mypy joins their bound tools' types to
+    ``object``: ``registry: ToolRegistry[SqlEnvironment] = ToolRegistry([...])``, or
+    ``tools: list[BoundTool[SqlEnvironment]] = [...]``.
     """
 
     def __init__(self, tools: Iterable[BoundTool[E]] = ()) -> None:
@@ -204,6 +263,45 @@ def _result(
     )
 
 
+def environment_failure_in(error: BaseException) -> EnvironmentFailure | None:
+    """Return ``error`` if it is an EnvironmentFailure, or else the first one inside it.
+
+    The first one is looked for depth first, through the exception groups that a TaskGroup
+    raises; there is none, and the result is None, when no leaf is an EnvironmentFailure. The
+    executor raises what it finds, and the runner can apply it to a group that a pack's own
+    TaskGroup raised, so that the task is recorded as an environment failure.
+    """
+    return next((leaf for leaf in _leaves(error) if isinstance(leaf, EnvironmentFailure)), None)
+
+
+def _reraise_environment_failure(error: Exception) -> None:
+    """Raise the EnvironmentFailure that ``error`` is or holds, if there is one.
+
+    A failure inside a group is raised from the group, so that a caller's ``except
+    EnvironmentFailure`` catches it, as the contract asks, and the group stays its __cause__.
+    """
+    failure = environment_failure_in(error)
+    if failure is error:
+        raise error
+    if failure is not None:
+        raise failure from error
+
+
+def _leaves(error: BaseException) -> Iterator[BaseException]:
+    """Yield ``error``, or if it is an exception group, each exception at its leaves, in order."""
+    if isinstance(error, BaseExceptionGroup):
+        for inner in error.exceptions:
+            yield from _leaves(inner)
+    else:
+        yield error
+
+
+def _cancel_requests() -> int:
+    """How many requests to cancel the current task are pending, as Task.cancelling counts."""
+    task = asyncio.current_task()
+    return 0 if task is None else task.cancelling()
+
+
 def _invalid_arguments(name: str, arguments_json: str, error: ValidationError) -> str:
     details = error.errors(include_url=False, include_context=False, include_input=False)
     if details[0]["type"] == "json_invalid":  # Invalid JSON is the only error pydantic reports.
@@ -211,22 +309,29 @@ def _invalid_arguments(name: str, arguments_json: str, error: ValidationError) -
         excerpt, _ = _truncate(arguments_json, _EXCERPT_KEEP)
         return f"Error: the arguments for {name} are not valid JSON ({reason}):\n{excerpt}"
     lines = [f"Error: invalid arguments for {name}:"]
-    for detail in details:
+    for detail in details[:_LISTED_ERRORS]:
         where = ".".join(str(part) for part in detail["loc"])
         lines.append(f"- {where}: {detail['msg']}" if where else f"- {detail['msg']}")
+    if len(details) > _LISTED_ERRORS:
+        lines.append(f"- and {len(details) - _LISTED_ERRORS} more")
     return "\n".join(lines)
 
 
-def _environment_failed(error: Exception) -> bool:
-    """Whether ``error`` is an EnvironmentFailure, or a group holding one, as a TaskGroup raises."""
-    if isinstance(error, ExceptionGroup):
-        return error.subgroup(EnvironmentFailure) is not None
-    return isinstance(error, EnvironmentFailure)
+def _describe(error: BaseException) -> str:
+    """Name ``error``'s type and give its message, never a traceback; a group lists its leaves."""
+    text = _type_and_message(error)
+    if isinstance(error, BaseExceptionGroup):
+        text += ":" + "".join(f"\n- {_type_and_message(leaf)}" for leaf in _leaves(error))
+    return text
 
 
-def _describe(error: Exception) -> str:
-    """Name ``error``'s type and give its message, cut short: never a traceback."""
-    message, _ = _truncate(str(error), _MESSAGE_KEEP)
+def _type_and_message(error: BaseException) -> str:
+    """``error``'s type and its message, cut short; the type alone if it has no message."""
+    try:
+        message = str(error)
+    except Exception:  # noqa: BLE001 - A broken __str__ must not take the executor down.
+        message = ""
+    message, _ = _truncate(message, _MESSAGE_KEEP)
     return f"{type(error).__name__}: {message}" if message else type(error).__name__
 
 
