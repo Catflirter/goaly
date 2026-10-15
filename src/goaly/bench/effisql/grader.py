@@ -65,6 +65,7 @@ __all__ = [
     "Psycopg2Timestamptz",
     "QueryError",
     "QueryTimeoutError",
+    "ResourceError",
     "ResultDigest",
     "Timing",
     "TimingError",
@@ -224,6 +225,13 @@ class QueryTimeoutError(GradingFailure):
 
 class GraderError(GradingFailure):
     """The grader's own infrastructure failed, such as a lost connection: nothing was measured."""
+
+
+class ResourceError(GraderError):
+    """The server ran out of a resource (SQLSTATE class 53), such as shared memory or disk.
+
+    It says nothing about the query, so it is the grader's failure, retried once.
+    """
 
 
 @dataclass(frozen=True, slots=True)
@@ -481,6 +489,19 @@ class PgSession:
             raise GraderError("EXPLAIN ANALYZE gave no Execution Time")
         return float(value)
 
+    def column_types(self, sql: str) -> list[str]:
+        """Return the type name of each column ``sql`` returns, without fetching a row."""
+        with self._statement():
+            cursor = self._conn.cursor()
+            # Only the fixed wrapper is added to the query, which runs as one statement.
+            cursor.execute(f"SELECT * FROM ({statement_body(sql)}) AS q LIMIT 0", binary=True)  # noqa: S608
+            description = cursor.description or []
+        names = []
+        for column in description:
+            info = self._conn.adapters.types.get(column.type_code)
+            names.append(info.name if info is not None else "unknown")
+        return names
+
     def plan(self, sql: str) -> dict[str, Any]:
         """Return ``EXPLAIN (FORMAT JSON)``'s document for ``sql``: planned, never run."""
         return self._explain("FORMAT JSON", sql)
@@ -550,6 +571,8 @@ class PgSession:
             return QueryTimeoutError(f"stopped by the {self._hard_cap_s:g} s hard cap")
         if isinstance(error, psycopg.errors.QueryCanceled):
             return QueryTimeoutError(f"{_message(error)} ({self._timeout_s:g} s)")
+        if (error.sqlstate or "").startswith("53"):
+            return ResourceError(f"the server ran out of resources: {_message(error)}")
         return QueryError(_message(error))
 
 
