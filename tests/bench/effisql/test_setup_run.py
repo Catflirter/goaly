@@ -113,6 +113,24 @@ class TestDataCheck:
         check = data_check(task(task_40), 4_572_053)
         assert check == DataCheck(outcome="foreign scale", plan_rows=15_240_492)
 
+    def test_a_filter_subplan_that_ran_once_per_sf10_row_is_an_anomaly(self) -> None:
+        """Task 40's recorded plan, which leaves out Rows Removed by Filter."""
+        subplan = {
+            "Node Type": "Aggregate",
+            "Parent Relationship": "SubPlan",
+            "Actual Loops": 59_986_052,
+        }
+        task_40 = {
+            "Node Type": "Seq Scan",
+            "Relation Name": "lineitem",
+            "Actual Rows": 15_240_492,
+            "Actual Loops": 1,
+            "Plans": [subplan],
+        }
+        assert data_check(task(task_40), 4_572_053).outcome == "foreign scale"
+        initplan = {**subplan, "Parent Relationship": "InitPlan"}
+        assert data_check(task({**task_40, "Plans": [initplan]}), 4_572_053).outcome == "fail"
+
     def test_a_filtered_sf3_scan_still_counts(self) -> None:
         sf3 = {
             "Node Type": "Seq Scan",

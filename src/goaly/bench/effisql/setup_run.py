@@ -175,9 +175,12 @@ _SCANS = frozenset({"Seq Scan", "Index Scan", "Index Only Scan", "Bitmap Heap Sc
 def _filtered_beyond_sf3(node: Mapping[str, Any]) -> bool:
     """Say whether a scan read, per loop, more rows than its table holds at SF3.
 
-    A scan reads its Actual Rows plus its Rows Removed by Filter. foreign_scale_plan reads only
-    the rows a scan returns, so it misses a plan whose filter drops most of an SF10 table, as
-    task 40's does (the controller's ruling).
+    A scan reads its Actual Rows plus its Rows Removed by Filter (the controller's ruling). The
+    dataset's plans often leave that count out, but a subplan in the scan's filter runs once per
+    row read, so its Actual Loops count them too. foreign_scale_plan reads only the rows a scan
+    returns, so it misses a plan whose filter drops most of an SF10 table, as task 40's does:
+    its lineitem scan returns 15,240,492 rows, and its filter's subplan runs 59,986,052 times,
+    SF10's lineitem.
     """
     rows = _SF3_ROWS.get(str(node.get("Relation Name")))
     if rows is not None and node.get("Node Type") in _SCANS:
@@ -186,6 +189,7 @@ def _filtered_beyond_sf3(node: Mapping[str, Any]) -> bool:
             for value in (node.get("Actual Rows"), node.get("Rows Removed by Filter"))
             if isinstance(value, int | float)
         )
+        read = max([read, *_subplan_loops(node)])
         if node.get("Parallel Aware") is True:  # Rows per process; one pass in all.
             loops = node.get("Actual Loops")
             read *= loops if isinstance(loops, int | float) and loops > 0 else 1
@@ -195,6 +199,17 @@ def _filtered_beyond_sf3(node: Mapping[str, Any]) -> bool:
     return isinstance(children, list) and any(
         _filtered_beyond_sf3(child) for child in children if isinstance(child, Mapping)
     )
+
+
+def _subplan_loops(node: Mapping[str, Any]) -> list[float]:
+    children = node.get("Plans")
+    return [
+        loops
+        for child in (children if isinstance(children, list) else [])
+        if isinstance(child, Mapping)
+        and child.get("Parent Relationship") == "SubPlan"
+        and isinstance(loops := child.get("Actual Loops"), int | float)
+    ]
 
 
 def exclusion_reason(record: SetupRecord) -> str | None:
