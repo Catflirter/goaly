@@ -4,6 +4,7 @@ The runs here are the FakeLLM dry run: synthetic tasks, a scripted model, fake s
 instances and a fake grader, wired through the real CLI, runner and grade phase.
 """
 
+import asyncio
 import dataclasses
 import hashlib
 import json
@@ -14,7 +15,7 @@ from collections.abc import Iterator
 from pathlib import Path
 
 import pytest
-from pydantic import ValidationError
+from pydantic import SecretStr, ValidationError
 
 from goaly import cli as goaly_cli
 from goaly.bench.effisql.data import (
@@ -30,6 +31,7 @@ from goaly.bench.effisql.grading import Mode
 from goaly.bench.effisql.grading_pool import Priority
 from goaly.bench.effisql.harness import (
     PACK_DIR,
+    SOLVING_STATEMENT_TIMEOUT_S,
     EffiSqlPaths,
     EffiSqlWiring,
     PackRunConfig,
@@ -46,7 +48,10 @@ from goaly.bench.effisql.harness import (
     pack_models,
     recorded_priority,
 )
+from goaly.bench.effisql.pg_instances import SOLVING
+from goaly.bench.effisql.pg_settings import AgentCredentials
 from goaly.bench.effisql.splits import load_splits
+from goaly.bench.effisql.sql_env import STATEMENT_TIMEOUT, PgSqlEnvironment, SolvingPool
 from goaly.contracts.errors import EnvironmentFailure
 from goaly.contracts.gen.llm_call_pb2 import CALL_PURPOSE_EXEC, LlmCallRecord
 from goaly.contracts.gen.manifest_pb2 import RunManifest
@@ -76,6 +81,8 @@ from goaly.harness.core.llm_models import EXECUTOR_MODEL, IMPROVEMENT_MODEL, Mod
 from goaly.harness.core.manifest import read_manifest, write_manifest
 from goaly.harness.core.registry import HarnessOptions, HostOptions, Registry
 from goaly.harness.core.runner import RunFiles, RunIdentity
+from goaly.harness.core.tools import bind
+from goaly.harness.packs.effisql.tools import ExecuteSql, ExecuteSqlConfig
 from tests.bench.effisql.fake_run import (
     OFFICIAL_FORM,
     FakeClient,
@@ -84,6 +91,7 @@ from tests.bench.effisql.fake_run import (
     write_inputs,
 )
 from tests.bench.effisql.synthetic import task
+from tests.bench.effisql.test_sql_env import Scenario
 
 pytestmark = pytest.mark.anyio
 
@@ -503,3 +511,53 @@ class TestReviewFixes:
         monkeypatch.setattr(sys, "argv", ["goaly", "run"])
         assert goaly_cli.main() == 0  # EINVAL is a warning, not a failure.
         assert confined == [True]
+
+
+class TestSolvingTrust:
+    async def test_the_solving_pool_holds_the_agent_password_alone(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        def refuse() -> None:
+            raise AssertionError("the solve path must never load every password")
+
+        monkeypatch.setattr("goaly.bench.effisql.pg_settings.load_credentials", refuse)
+        monkeypatch.setattr(
+            "goaly.bench.effisql.harness.load_agent_credentials",
+            lambda: AgentCredentials(agent_password=SecretStr("agent-only")),
+        )
+
+        pool = await EffiSqlWiring().solving()
+
+        assert isinstance(pool, SolvingPool)
+        assert pool.options.timeout_s == SOLVING_STATEMENT_TIMEOUT_S == 120
+        assert not hasattr(AgentCredentials(agent_password=SecretStr("x")), "admin_password")
+
+    async def test_the_trusted_cap_stops_a_lifted_pack_timeout_end_to_end(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        monkeypatch.setattr("goaly.bench.effisql.harness.SOLVING_STATEMENT_TIMEOUT_S", 0.2)
+        monkeypatch.setattr(
+            "goaly.bench.effisql.harness.load_agent_credentials",
+            lambda: AgentCredentials(agent_password=SecretStr("agent-only")),
+        )
+        pool = await EffiSqlWiring().solving()
+        assert isinstance(pool, SolvingPool)
+        scenario = Scenario("cancellable")
+        env = PgSqlEnvironment(
+            SOLVING[0],
+            asyncio.Semaphore(2),
+            pool.options,  # The wiring's options: the trusted side's cap.
+            connect=scenario.connect,
+            terminate=scenario.terminate,
+            runner=scenario.run,
+        )
+        await env.open()
+        lifted = ExecuteSqlConfig.model_construct(statement_timeout_s=1e9)  # As pack code may.
+
+        result = await bind(ExecuteSql(lifted), timeout_s=600).invoke(
+            json.dumps({"sql": "SELECT pg_sleep(1e9)"}), env
+        )
+
+        assert result.content.startswith(f"The query failed: {STATEMENT_TIMEOUT}\n")
+        assert result.elapsed_s < 1
+        await env.close()

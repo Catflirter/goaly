@@ -78,7 +78,9 @@ class FakeLLM:
         *,
         tools: Sequence[Mapping[str, JsonValue]] = (),
         params: ModelParams | None = None,
+        attempt_timeout_s: float | None = None,
     ) -> LlmReply:
+        del attempt_timeout_s  # A scripted reply takes no time.
         self.requests.append(Request(tuple(map(_copy, messages)), tuple(tools), params))
         item = next(self._script, None)
         if item is None:
