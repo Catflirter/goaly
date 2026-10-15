@@ -6,7 +6,7 @@ package goaly.v1;
 
 // A data split (spec §7).
 enum Split {
-  // Not one of our splits: a task file from elsewhere, such as the organizers' --instances file.
+  // Not set.
   SPLIT_UNSPECIFIED = 0;
   // The analyst may see its trajectories, grader feedback and gold answers.
   SPLIT_TRAIN = 1;
@@ -14,6 +14,8 @@ enum Split {
   SPLIT_VAL = 2;
   // Used only by the final evaluation and by v0's baseline runs.
   SPLIT_HELDOUT = 3;
+  // A task file outside our splits, such as the organizers' --instances file.
+  SPLIT_EXTERNAL = 4;
 }
 
 // What the agent may see of a task (spec §3.3, §4): nothing gold, and nothing that gives it away.
