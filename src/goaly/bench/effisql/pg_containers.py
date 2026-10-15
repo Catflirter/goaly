@@ -21,6 +21,7 @@ __all__ = [
     "LABEL",
     "PGDATA",
     "SHM_SIZE",
+    "SOCKET_DIR",
     "SPEC_LABEL",
     "ContainerError",
     "ContainerSpec",
@@ -40,6 +41,7 @@ CONTAINER_PREFIX = "goaly-effisql-"
 LABEL = "goaly.component=effisql-postgres"
 SPEC_LABEL = "goaly.spec"  # A digest of the run arguments, so a changed spec is noticed.
 PGDATA = "/var/lib/postgresql/data"  # Where the postgres image keeps its data directory.
+SOCKET_DIR = "/var/run/postgresql"  # Where the image's server puts its Unix socket.
 # The official TPC-H container sets no --shm-size, so Docker's default applies. We pin that
 # default, so a different Docker cannot change the shared memory that parallel queries use.
 SHM_SIZE = "64m"
