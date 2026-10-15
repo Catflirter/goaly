@@ -1,7 +1,8 @@
 """Tests for goaly.harness.core.tool_calls: reading tool calls out of a reply, and repairing them.
 
-The Qwen fixtures in qwen_replies.json are real replies of qwen3.6-35b-a3b through the gateway,
-sanitized to the assistant message; each says how it was produced.
+The Qwen fixtures in qwen_replies.json are replies of qwen3.6-35b-a3b through the gateway,
+sanitized to the assistant message: six as Qwen gave them, and two built from real ones for
+failures that never happened. Each says how it was produced.
 """
 
 import enum
@@ -175,6 +176,10 @@ EXPLAIN = f"EXPLAIN {BASE_SQL}"
         ('{"sql": "SELECT 1", ', '{"sql": "SELECT 1"}'),
         ('{"sql": "SELECT a,\n  b FROM t"}', '{"sql": "SELECT a,\\n  b FROM t"}'),
         ('{"sql": "say \\"hi\\", then }"', '{"sql": "say \\"hi\\", then }"}'),
+        ('{"sql": "caf\\u00', '{"sql": "caf"}'),
+        ('{"sql": "caf\\u', '{"sql": "caf"}'),
+        ('{"sql": "caf\\u00e9', '{"sql": "café"}'),
+        ('{"path": "C:\\\\u00', '{"path": "C:\\\\u00"}'),
         ("", "{}"),
         (" \n", "{}"),
     ],
@@ -194,6 +199,10 @@ EXPLAIN = f"EXPLAIN {BASE_SQL}"
         "cut after a comma",
         "raw newline in a string",
         "brackets inside a string",
+        "cut inside a unicode escape",
+        "cut right after \\u",
+        "unicode escape complete",
+        "escaped backslash before u",
         "empty",
         "blank",
     ],
@@ -204,7 +213,16 @@ def test_repair_fixes_json_it_can_fix(text: str, repaired: str) -> None:
 
 @pytest.mark.parametrize(
     "text",
-    ['{"sql": ', '{"sql"', '{"sq', '{"sql": "a"}}', "[1, 2]", '"SELECT 1"', "SELECT 1"],
+    [
+        '{"sql": ',
+        '{"sql"',
+        '{"sq',
+        '{"sql": "a"}}',
+        "[1, 2]",
+        '"SELECT 1"',
+        "SELECT 1",
+        '{"sql": "caf\\uZZ',
+    ],
     ids=[
         "key with no value",
         "key with no colon",
@@ -213,6 +231,7 @@ def test_repair_fixes_json_it_can_fix(text: str, repaired: str) -> None:
         "an array",
         "a string",
         "not JSON",
+        "cut after a \\u that is no escape",
     ],
 )
 def test_repair_gives_up_on_json_it_cannot_make_an_object(text: str) -> None:
@@ -939,3 +958,21 @@ async def test_a_gateway_id_repeated_in_one_reply_is_replaced_so_each_result_ans
         "call_0",
         "call_7a300c3273e4108aa15a6c53",
     ]
+
+
+def test_xml_parameters_are_typed_through_one_of_and_all_of_too() -> None:
+    parameters: dict[str, JsonValue] = {
+        "properties": {
+            "choice": {"oneOf": [{"type": "integer"}, {"type": "boolean"}]},
+            "frame": {"allOf": [{"$ref": "#/$defs/Window"}], "description": "A range of rows."},
+        },
+        "$defs": {"Window": {"type": "object"}},
+    }
+    tools: list[dict[str, JsonValue]] = [
+        {"type": "function", "function": {"name": "pick", "parameters": parameters}}
+    ]
+    message = assistant(content=xml_call("pick", choice="7", frame='{"start": 1, "end": 2}'))
+
+    [call] = parse_tool_calls(message, tools)
+
+    assert arguments(call) == {"choice": 7, "frame": {"start": 1, "end": 2}}

@@ -16,6 +16,7 @@ were parsed from it can be replayed with them as structured calls only.
 import hashlib
 import json
 import re
+import string
 from collections.abc import Iterable, Mapping
 from typing import NoReturn
 
@@ -106,8 +107,9 @@ def repair_arguments(text: str) -> str | None:
 
     The repairs: strip a Markdown code fence around the text; drop each comma before a closing
     bracket or brace; close each string, bracket and brace still open at the end, as when the
-    reply was cut off. Strings may hold control characters, such as raw newlines, and blank
-    text is an empty object. The object comes back as JSON text, as json.dumps writes it.
+    reply was cut off, first dropping an escape the cut fell inside, such as a partial
+    ``\\u00``. Strings may hold control characters, such as raw newlines, and blank text is an
+    empty object. The object comes back as JSON text, as json.dumps writes it.
     """
     stripped = _strip_fence(text.strip())
     if not stripped:
@@ -272,14 +274,19 @@ def _close(text: str) -> str:
     out: list[str] = []
     closers: list[str] = []
     in_string = escaped = False
+    unicode_start = -1  # Where an unfinished \uXXXX escape starts in out, or -1.
     for char in text:
         if in_string:
             if escaped:
                 escaped = False
-            elif char == "\\":
-                escaped = True
-            elif char == '"':
-                in_string = False
+                unicode_start = len(out) - 1 if char == "u" else -1
+            else:
+                if char not in string.hexdigits:
+                    unicode_start = -1  # Not a \uXXXX escape: json.loads judges it.
+                if char == "\\":
+                    escaped = True
+                elif char == '"':
+                    in_string = False
         elif char == '"':
             in_string = True
         elif char in "[{":
@@ -289,9 +296,13 @@ def _close(text: str) -> str:
             if closers and closers[-1] == char:
                 closers.pop()
         out.append(char)
+        if unicode_start >= 0 and len(out) - unicode_start == 6:
+            unicode_start = -1  # A complete \uXXXX escape.
     if in_string:
         if escaped:
             out.pop()  # The text was cut inside an escape: drop its backslash.
+        elif unicode_start >= 0:
+            del out[unicode_start:]  # It was cut inside a \uXXXX escape: drop the escape.
         out.append('"')
     _drop_trailing_comma(out)
     out.extend(reversed(closers))
