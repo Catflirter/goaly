@@ -23,6 +23,7 @@ def request(**change: object) -> SolveRequest:
         "run_id": "r1",
         "benchmark": "effisql",
         "harness": "v0",
+        "checkout": Path("/home/me/goaly"),
         "pack_dir": Path("/home/me/goaly/packs/effisql"),
         "split": SPLIT_VAL,
         "instances_file": None,

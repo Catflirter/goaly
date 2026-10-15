@@ -15,28 +15,45 @@ files, the manifest, the evaluation cache and the proxy's call log.
 """
 
 import json
-from collections.abc import Awaitable, Callable, Mapping
+import logging
+from collections import Counter
+from collections.abc import Awaitable, Callable, Collection, Iterator, Mapping, Sequence
 from dataclasses import dataclass
 from pathlib import Path
 
+from google.protobuf import json_format
+from google.protobuf.message import Message
+
+from goaly.contracts.gen.result_pb2 import TaskResult
 from goaly.contracts.gen.task_pb2 import (
     SPLIT_EXTERNAL,
     SPLIT_HELDOUT,
     SPLIT_TRAIN,
     SPLIT_VAL,
+    Prediction,
     Split,
 )
+from goaly.contracts.gen.trajectory_pb2 import Trajectory
+from goaly.contracts.jsonl import from_json_line, to_json_line
 from goaly.harness.core.atomic import write_text_atomically
 
 __all__ = [
+    "MAX_PREDICTION_BYTES",
+    "MAX_RESULT_BYTES",
+    "MAX_TRAJECTORY_BYTES",
     "SPLIT_NAMES",
     "TASKS_FILE",
     "SolveLauncher",
+    "SolveRecord",
     "SolveRequest",
     "SolveTasks",
+    "read_solve_records",
     "read_solve_tasks",
+    "write_predictions",
     "write_solve_tasks",
 ]
+
+_logger = logging.getLogger(__name__)
 
 # Our splits, by the name `goaly run --split` takes.
 SPLIT_NAMES: Mapping[Split.ValueType, str] = {
@@ -47,6 +64,11 @@ SPLIT_NAMES: Mapping[Split.ValueType, str] = {
 
 # The tasks file, in the solve directory: what the container solves.
 TASKS_FILE = "tasks.json"
+
+# The longest line the host reads of each file the container wrote; a longer one is malformed.
+MAX_PREDICTION_BYTES = 4 * 2**20
+MAX_RESULT_BYTES = 2**20
+MAX_TRAJECTORY_BYTES = 64 * 2**20
 
 type _Task = tuple[str, int]
 
@@ -68,8 +90,10 @@ class SolveRequest:
     benchmark: str
     # The registered harness the container runs, by name.
     harness: str
-    # The directory of that harness's pack, which the host hashed: the container must run the
-    # checkout that holds it. None for a harness without one, such as a test's.
+    # The checkout the container runs, read-only: --harness-checkout's, or the host's own.
+    checkout: Path
+    # The directory of that harness's pack, inside ``checkout``, which the host hashed with the
+    # checkout's core. None for a harness without one, such as a test's.
     pack_dir: Path | None
     # The split the tasks come from; SPLIT_EXTERNAL for instances_file.
     split: Split.ValueType
@@ -216,3 +240,141 @@ def _task(value: object) -> _Task:
 
 def _is_seed(value: object) -> bool:
     return isinstance(value, int) and not isinstance(value, bool) and value >= 0
+
+
+# The predictions files, which the solve phase writes and the host grades.
+
+
+def write_predictions(path: Path, predictions: Sequence[Prediction]) -> None:
+    """Write one seed's predictions, a JSON line each, replacing the file at ``path`` atomically.
+
+    The solve phase writes each seed's file once its tasks are recorded, with one prediction per
+    recorded task, its last. It blocks: run it in a worker thread from the event loop.
+    """
+    write_text_atomically(
+        path, "".join(f"{to_json_line(prediction)}\n" for prediction in predictions)
+    )
+
+
+@dataclass(frozen=True)
+class SolveRecord:
+    """What the solve container recorded of one task, as the host reads it: untrusted input.
+
+    Only ``prediction`` decides the task's score, once the host has graded it. ``result`` and
+    ``trajectory``, the container's own, say what the container claims happened: the host keeps
+    them for people and for the analyst, never for a decision.
+    """
+
+    # The task's one valid prediction; None if it has none, as ``problem`` says.
+    prediction: Prediction | None
+    # Why there is no valid prediction, for the task's error message; empty if there is one.
+    problem: str
+    # The container's ungraded result and trajectory of the task, its last; None if it wrote
+    # none that could be read.
+    result: TaskResult | None
+    trajectory: Trajectory | None
+
+
+type _Key = tuple[str, int]
+
+
+def read_solve_records(
+    files: Callable[[int], Path],
+    results: Path,
+    trajectories: Path,
+    keys: Collection[_Key],
+) -> dict[_Key, SolveRecord]:
+    """Read the solve directory's record of each task of ``keys``, whatever the container wrote.
+
+    ``files(seed)`` is the predictions file of a seed. A task's prediction is valid when that
+    file holds exactly one line for its instance, and the line is a Prediction; a task with none,
+    with two or more, or with one that does not parse, has a ``problem`` instead. A line longer
+    than the file's bound, or that names no instance, counts for no task. The results and the
+    trajectories give each task's last line that parses. It reads files, so it blocks.
+    """
+    wanted = set(keys)
+    valid: dict[_Key, Prediction] = {}
+    lines: Counter[_Key] = Counter()
+    malformed: set[_Key] = set()
+    for seed in sorted({seed for _, seed in wanted}):
+        path = files(seed)
+        if not path.is_file():
+            continue
+        for instance_id, prediction in _instance_lines(path, MAX_PREDICTION_BYTES, Prediction):
+            key = (instance_id, seed)
+            if key not in wanted:
+                continue
+            lines[key] += 1
+            if prediction is None:
+                malformed.add(key)
+            else:
+                valid[key] = prediction
+    last_results = _last_lines(results, MAX_RESULT_BYTES, TaskResult, wanted)
+    last_trajectories = _last_lines(trajectories, MAX_TRAJECTORY_BYTES, Trajectory, wanted)
+    records: dict[_Key, SolveRecord] = {}
+    for key in wanted:
+        problem = ""
+        if lines[key] == 0:
+            problem = "the solve phase left no prediction for this task"
+        elif lines[key] > 1:
+            problem = f"the solve phase left {lines[key]} predictions for this task, not one"
+        elif key in malformed:
+            problem = "the solve phase left a prediction for this task that does not parse"
+        prediction = None if problem else valid[key]
+        if prediction is not None:
+            prediction.instance_id = key[0]
+        records[key] = SolveRecord(
+            prediction, problem, last_results.get(key), last_trajectories.get(key)
+        )
+    return records
+
+
+def _last_lines[M: (TaskResult, Trajectory)](
+    path: Path, max_bytes: int, kind: type[M], wanted: set[_Key]
+) -> dict[_Key, M]:
+    """Each wanted task's last line in ``path`` that parses as a ``kind``, by its seed field."""
+    if not path.is_file():
+        return {}
+    last: dict[_Key, M] = {}
+    for _, record in _instance_lines(path, max_bytes, kind):
+        if record is not None and (record.instance_id, record.seed) in wanted:
+            last[(record.instance_id, record.seed)] = record
+    return last
+
+
+def _instance_lines[M: Message](
+    path: Path, max_bytes: int, kind: type[M]
+) -> Iterator[tuple[str, M | None]]:
+    """Each line of ``path`` that names an instance: its instance ID, and the line as a ``kind``,
+    or None if it does not parse. A line longer than ``max_bytes`` is skipped whole."""
+    for line in _bounded_lines(path, max_bytes):
+        if line is None or not line.strip():
+            continue
+        try:
+            text = line.decode("utf-8")
+            fields = json.loads(text)
+        except (UnicodeDecodeError, ValueError, RecursionError):
+            continue
+        if not isinstance(fields, dict) or not isinstance(fields.get("instance_id"), str):
+            continue
+        try:
+            message: M | None = from_json_line(text, kind)
+        except (json_format.ParseError, ValueError, TypeError, RecursionError):
+            message = None
+        yield fields["instance_id"], message
+
+
+def _bounded_lines(path: Path, max_bytes: int) -> Iterator[bytes | None]:
+    """The lines of ``path``, each with its line feed; None for one longer than ``max_bytes``,
+    which is read no further than that, so a huge line never sits in memory whole."""
+    with path.open("rb") as file:
+        while line := file.readline(max_bytes + 1):
+            if len(line) <= max_bytes:
+                yield line
+                continue
+            while line and not line.endswith(b"\n"):  # The rest of the overlong line.
+                line = file.readline(max_bytes + 1)
+            _logger.warning(
+                "%s holds a line longer than %d bytes, which is ignored", path, max_bytes
+            )
+            yield None

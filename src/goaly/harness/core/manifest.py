@@ -31,7 +31,10 @@ from goaly.harness.core.atomic import write_text_atomically
 
 __all__ = [
     "CORE_DIR",
+    "CORE_IN_CHECKOUT",
+    "REPO_ROOT",
     "GitState",
+    "checkout_harness_hash",
     "config_hash",
     "content_hash",
     "core_hash",
@@ -50,6 +53,9 @@ _logger = logging.getLogger(__name__)
 
 # src/goaly/harness/core/: the part of the harness RSI cannot edit.
 CORE_DIR = Path(__file__).resolve().parent
+# Where core is within a checkout, and the checkout that holds this one.
+CORE_IN_CHECKOUT = Path("src/goaly/harness/core")
+REPO_ROOT = CORE_DIR.parents[len(CORE_IN_CHECKOUT.parts) - 1]
 _BYTECODE_DIR = "__pycache__"
 _BYTECODE_SUFFIXES = (".pyc", ".pyo")
 _GIT_TIMEOUT_S = 60
@@ -100,6 +106,20 @@ def harness_hash(pack_dir: Path) -> str:
     It reads both trees, so it blocks: run it in a worker thread from the event loop.
     """
     return content_hash({"core": CORE_DIR, "pack": pack_dir})
+
+
+def checkout_harness_hash(checkout: Path, pack: Path) -> str:
+    """Return the harness hash of the core and the pack that the checkout ``checkout`` holds.
+
+    ``pack`` is the pack's directory within the checkout, such as ``packs/effisql``. The hash
+    is harness_hash()'s, over that checkout's own files, which may be a snapshot of a candidate
+    commit: ``checkout_harness_hash(REPO_ROOT, pack)`` is ``harness_hash(REPO_ROOT / pack)``.
+    Raise ValueError for an absolute ``pack`` or one that leaves the checkout. It reads both
+    trees, so it blocks: run it in a worker thread from the event loop.
+    """
+    if pack.is_absolute() or ".." in pack.parts:
+        raise ValueError(f"the pack's directory must be within the checkout: {pack}")
+    return content_hash({"core": checkout / CORE_IN_CHECKOUT, "pack": checkout / pack})
 
 
 def core_hash() -> str:
