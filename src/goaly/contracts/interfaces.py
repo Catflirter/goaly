@@ -23,6 +23,7 @@ from goaly.contracts.gen.trajectory_pb2 import ToolResult
 __all__ = [
     "Benchmark",
     "Environment",
+    "Instance",
     "JsonValue",
     "Policy",
     "ShellEnvironment",
@@ -132,6 +133,8 @@ class Policy[EnvT: Environment, CtxT](Protocol):
     async def solve(self, task: TaskInput, env: EnvT, ctx: CtxT) -> Prediction:
         """Solve ``task`` in ``env`` and return the prediction; ``env`` stays the caller's.
 
+        The task carries no instance ID, and the runner sets the prediction's ``instance_id``.
+
         A budget running out is not an exception: return the fallback prediction, with
         ``fallback`` set (spec §5.4). Let EnvironmentFailure propagate, and an LLM failure that
         outlasts the client's retries; the runner records them as TASK_ERROR_TYPE_ENVIRONMENT
@@ -139,7 +142,21 @@ class Policy[EnvT: Environment, CtxT](Protocol):
         """
 
 
-class Benchmark[InstanceT, EnvT: Environment](Protocol):
+class Instance(Protocol):
+    """A benchmark's own record of one task, as its adapter loads it.
+
+    The runner identifies a task by its ``instance_id``, because the TaskInput the agent sees
+    carries no ID: an ID can give the answer away, as an SWE-fficiency ID names the upstream
+    pull request whose diff is the gold patch. A frozen dataclass with an ``instance_id`` field
+    satisfies this Protocol.
+    """
+
+    @property
+    def instance_id(self) -> str:
+        """The benchmark's ID for the task."""
+
+
+class Benchmark[InstanceT: Instance, EnvT: Environment](Protocol):
     """A benchmark adapter: it loads tasks, provisions their environments and grades predictions.
 
     bench implements one per benchmark, and the runner drives it. Adding a benchmark takes an
@@ -147,7 +164,7 @@ class Benchmark[InstanceT, EnvT: Environment](Protocol):
 
     ``InstanceT`` is the benchmark's own record of a task and may hold gold answers. Only the
     copy that :meth:`agent_input` makes reaches the agent, so the types keep gold answers away
-    from it.
+    from it. The runner identifies each instance by its ``instance_id``.
     """
 
     @property

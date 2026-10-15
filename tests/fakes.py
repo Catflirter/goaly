@@ -157,6 +157,7 @@ class DoNothingPolicy:
     """A Policy that submits the do-nothing answer: BIRD's issue_sql unchanged, or no SWE patch.
 
     It works in any environment and with any context. ``tasks`` records each task it solved.
+    Like every policy, it leaves the prediction's ``instance_id`` to the runner.
     """
 
     def __init__(self) -> None:
@@ -165,14 +166,16 @@ class DoNothingPolicy:
     async def solve(self, task: TaskInput, env: Environment, ctx: object) -> Prediction:
         self.tasks.append(task)
         if task.HasField("swe"):
-            return Prediction(instance_id=task.instance_id, swe=SwePrediction())
-        sqls = task.bird.issue_sql
-        return Prediction(instance_id=task.instance_id, bird=BirdPrediction(sqls=sqls))
+            return Prediction(swe=SwePrediction())
+        return Prediction(bird=BirdPrediction(sqls=task.bird.issue_sql))
 
 
 @dataclass(frozen=True)
 class ToyInstance:
-    """A ToyBenchmark task: the benchmark's own record, so it holds the gold answer."""
+    """A ToyBenchmark task: the benchmark's own record, so it holds the gold answer.
+
+    Being a frozen dataclass with an ``instance_id``, it satisfies the Instance Protocol.
+    """
 
     instance_id: str
     split: Split.ValueType
@@ -234,7 +237,7 @@ class ToyBenchmark:
 
     def agent_input(self, inst: ToyInstance) -> TaskInput:
         bird = BirdTaskInput(db_id="toy", query=inst.query, issue_sql=[inst.issue_sql])
-        return TaskInput(instance_id=inst.instance_id, bird=bird)
+        return TaskInput(bird=bird)  # No instance ID: the agent sees no ID (Instance).
 
     async def grade(self, inst: ToyInstance, prediction: Prediction) -> Grade:
         sqls = prediction.bird.sqls

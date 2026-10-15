@@ -38,6 +38,7 @@ from goaly.contracts.gen.trajectory_pb2 import ToolResult
 from goaly.contracts.interfaces import (
     Benchmark,
     Environment,
+    Instance,
     JsonValue,
     Policy,
     ShellEnvironment,
@@ -132,11 +133,12 @@ def violations(protocol: type) -> list[str]:
     return found
 
 
-def test_the_module_defines_the_six_protocols_and_nothing_else() -> None:
+def test_the_module_defines_the_seven_protocols_and_nothing_else() -> None:
     assert PROTOCOLS == CLASSES
     assert sorted(cls.__name__ for cls in PROTOCOLS) == [
         "Benchmark",
         "Environment",
+        "Instance",
         "Policy",
         "ShellEnvironment",
         "SqlEnvironment",
@@ -377,24 +379,28 @@ def test_do_nothing_policy_submits_the_issue_sql_of_a_bird_task() -> None:
     fake = DoNothingPolicy()
     # EnvT and CtxT are contravariant, so a policy for any environment and context fits here.
     policy: Policy[SqlEnvironment, StandInContext] = fake
-    task = TaskInput(instance_id="t", bird=BirdTaskInput(issue_sql=["SELECT 1", "SELECT 2"]))
+    task = TaskInput(bird=BirdTaskInput(issue_sql=["SELECT 1", "SELECT 2"]))
 
     prediction = asyncio.run(policy.solve(task, FakeSqlEnvironment(), StandInContext()))
 
-    assert prediction == Prediction(
-        instance_id="t", bird=BirdPrediction(sqls=["SELECT 1", "SELECT 2"])
-    )
+    assert prediction == Prediction(bird=BirdPrediction(sqls=["SELECT 1", "SELECT 2"]))
     assert fake.tasks == [task]
 
 
 def test_do_nothing_policy_submits_no_patch_for_a_swe_task() -> None:
     policy: Policy[ShellEnvironment, StandInContext] = DoNothingPolicy()
-    task = TaskInput(instance_id="t", swe=SweTaskInput(repo="astropy/astropy"))
+    task = TaskInput(swe=SweTaskInput(repo="astropy/astropy"))
 
     prediction = asyncio.run(policy.solve(task, FakeShellEnvironment(), StandInContext()))
 
-    assert prediction == Prediction(instance_id="t", swe=SwePrediction(patch=""))
+    assert prediction == Prediction(swe=SwePrediction(patch=""))
     assert prediction.WhichOneof("benchmark") == "swe"
+
+
+def test_a_frozen_dataclass_with_an_instance_id_is_an_instance() -> None:
+    inst: Instance = TOY_INSTANCES[0]
+
+    assert inst.instance_id == "toy-1"
 
 
 def test_toy_benchmark_loads_the_instances_of_a_split() -> None:
@@ -416,8 +422,7 @@ def test_toy_benchmark_shows_the_agent_no_gold_answer() -> None:
     task = benchmark.agent_input(inst)
 
     assert task == TaskInput(
-        instance_id="toy-1",
-        bird=BirdTaskInput(db_id="toy", query=inst.query, issue_sql=[inst.issue_sql]),
+        bird=BirdTaskInput(db_id="toy", query=inst.query, issue_sql=[inst.issue_sql])
     )
     assert inst.gold_sql not in to_json_line(task)
 
@@ -496,30 +501,30 @@ def test_toy_benchmark_writes_the_official_bird_format() -> None:
     assert json.loads(json.dumps(record)) == {"instance_id": "toy-1", "pred_sqls": ["SELECT 1"]}
 
 
-async def solve_and_grade[InstanceT, EnvT: Environment, CtxT](
+async def solve_and_grade[InstanceT: Instance, EnvT: Environment, CtxT](
     benchmark: Benchmark[InstanceT, EnvT], policy: Policy[EnvT, CtxT], inst: InstanceT, ctx: CtxT
-) -> Grade:
+) -> tuple[Prediction, Grade]:
     """Solve and grade one task as the runner will, through the Protocols alone."""
     async with benchmark.provision(inst) as env:
         prediction = await policy.solve(benchmark.agent_input(inst), env, ctx)
-    return await benchmark.grade(inst, prediction)
+    prediction.instance_id = inst.instance_id  # The task input carries no ID.
+    return prediction, await benchmark.grade(inst, prediction)
 
 
 def test_the_fakes_run_a_split_end_to_end() -> None:
     benchmark = ToyBenchmark()
     policy = DoNothingPolicy()
 
-    async def run_split() -> list[Grade]:
+    async def run_split() -> list[tuple[Prediction, Grade]]:
         return [
             await solve_and_grade(benchmark, policy, inst, StandInContext())
             for inst in benchmark.load_instances(SPLIT_TRAIN)
         ]
 
-    grades = asyncio.run(run_split())
+    results = asyncio.run(run_split())
 
-    assert [(grade.instance_id, grade.correct) for grade in grades] == [
-        ("toy-1", False),
-        ("toy-2", True),
-    ]
-    assert [task.instance_id for task in policy.tasks] == ["toy-1", "toy-2"]
+    assert [
+        (prediction.instance_id, grade.instance_id, grade.correct) for prediction, grade in results
+    ] == [("toy-1", "toy-1", False), ("toy-2", "toy-2", True)]
+    assert [task.bird.query for task in policy.tasks] == [inst.query for inst in TOY_INSTANCES[:2]]
     assert [env.closed for env in benchmark.environments] == [True, True]
