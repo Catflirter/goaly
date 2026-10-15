@@ -88,15 +88,14 @@ Global___GradeStatus: _TypeAlias = GradeStatus  # noqa: Y015
 
 @_typing.final
 class TaskInput(_message.Message):
-    """What the agent may see of a task (spec §3.3, §4): nothing gold, and nothing that gives it away."""
+    """What the agent may see of a task (spec §3.3, §4): nothing gold, and nothing that gives it away.
+    Not even the task's ID: an SWE ID names the upstream pull request whose diff is the gold patch.
+    """
 
     DESCRIPTOR: _descriptor.Descriptor
 
-    INSTANCE_ID_FIELD_NUMBER: _builtins.int
     EFFISQL_FIELD_NUMBER: _builtins.int
     SWE_FIELD_NUMBER: _builtins.int
-    instance_id: _builtins.str
-    """The benchmark's ID for the task."""
     @_builtins.property
     def effisql(self) -> Global___EffiSqlTaskInput:
         """An Effi-SQL task."""
@@ -108,13 +107,12 @@ class TaskInput(_message.Message):
     def __init__(
         self,
         *,
-        instance_id: _builtins.str = ...,
         effisql: Global___EffiSqlTaskInput | None = ...,
         swe: Global___SweTaskInput | None = ...,
     ) -> None: ...
     _HasFieldArgType: _TypeAlias = _typing.Literal["benchmark", b"benchmark", "effisql", b"effisql", "swe", b"swe"]  # noqa: Y015
     def HasField(self, field_name: _HasFieldArgType) -> _builtins.bool: ...
-    _ClearFieldArgType: _TypeAlias = _typing.Literal["benchmark", b"benchmark", "effisql", b"effisql", "instance_id", b"instance_id", "swe", b"swe"]  # noqa: Y015
+    _ClearFieldArgType: _TypeAlias = _typing.Literal["benchmark", b"benchmark", "effisql", b"effisql", "swe", b"swe"]  # noqa: Y015
     def ClearField(self, field_name: _ClearFieldArgType) -> None: ...
     _WhichOneofReturnType_benchmark: _TypeAlias = _typing.Literal["effisql", "swe"]  # noqa: Y015
     _WhichOneofArgType_benchmark: _TypeAlias = _typing.Literal["benchmark", b"benchmark"]  # noqa: Y015
@@ -223,7 +221,7 @@ class Prediction(_message.Message):
     EFFISQL_FIELD_NUMBER: _builtins.int
     SWE_FIELD_NUMBER: _builtins.int
     instance_id: _builtins.str
-    """The task this answers."""
+    """The task this answers. The runner sets it after solve, since TaskInput does not carry it."""
     fallback: _builtins.bool
     """True if the policy's budget fallback produced this prediction instead of a submit (spec §5.4)."""
     @_builtins.property

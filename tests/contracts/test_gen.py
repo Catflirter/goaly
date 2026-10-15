@@ -29,7 +29,7 @@ GENERATED_FOR = re.compile(r"^# Protobuf Python Version: (\S+)$", re.MULTILINE)
 # answers, and whatever would give them away, must never appear here. So a field added anywhere
 # TaskInput reaches fails the test below until someone reviews it and adds it here.
 AGENT_VISIBLE = {
-    "goaly.v1.TaskInput": {"instance_id", "effisql", "swe"},
+    "goaly.v1.TaskInput": {"effisql", "swe"},
     "goaly.v1.EffiSqlTaskInput": {"db", "base_sql", "schema", "base_plan", "difficulty"},
     "goaly.v1.SweTaskInput": {
         *("repo", "base_commit", "workload", "test_cmd", "rebuild_cmd", "covering_tests"),

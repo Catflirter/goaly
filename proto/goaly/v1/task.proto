@@ -20,16 +20,14 @@ enum Split {
 }
 
 // What the agent may see of a task (spec §3.3, §4): nothing gold, and nothing that gives it away.
+// Not even the task's ID: an SWE ID names the upstream pull request whose diff is the gold patch.
 message TaskInput {
-  // The benchmark's ID for the task.
-  string instance_id = 1;
-
   // The benchmark-specific fields.
   oneof benchmark {
     // An Effi-SQL task.
-    EffiSqlTaskInput effisql = 2;
+    EffiSqlTaskInput effisql = 1;
     // A SWE-fficiency task.
-    SweTaskInput swe = 3;
+    SweTaskInput swe = 2;
   }
 }
 
@@ -69,7 +67,7 @@ message SweTaskInput {
 
 // What a policy returns for a task.
 message Prediction {
-  // The task this answers.
+  // The task this answers. The runner sets it after solve, since TaskInput does not carry it.
   string instance_id = 1;
   // True if the policy's budget fallback produced this prediction instead of a submit (spec §5.4).
   bool fallback = 2;
