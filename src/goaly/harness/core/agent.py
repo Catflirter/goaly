@@ -184,7 +184,8 @@ async def run_agent[E: Environment](
     The chat goes into ``ctx``'s trajectory under ``label``, which no other chat of the task may
     have, with why it stopped. What may raise is as the module docstring says, and a label
     already taken raises ValueError; the trajectory then records STOP_REASON_CANCELLED, or
-    STOP_REASON_CRASHED and the error.
+    STOP_REASON_CRASHED and the error. The stop reason is the task's, so the last loop sets it:
+    a loop that raises marks the trajectory crashed even after an earlier chat submitted.
     """
     return await _Chat(env, ctx, hooks, label).run()
 
@@ -464,7 +465,10 @@ def _without_markup(text: str) -> str:
 
 
 def _drafted(call: ToolCall, result: ToolResult) -> ToolResult:
-    """The error result of a call from the reasoning that would have submitted: it does not."""
+    """The error result of a call from the reasoning that would have submitted: it does not.
+
+    The tool has run, since only its result shows that it submits; its submission is dropped.
+    """
     return ToolResult(
         tool_call_id=call.id,
         name=call.name,
