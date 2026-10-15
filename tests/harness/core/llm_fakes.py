@@ -21,7 +21,7 @@ from pydantic import SecretStr
 
 from goaly.contracts.gen.llm_call_pb2 import CallPurpose, LlmCallRecord
 from goaly.contracts.gen.trajectory_pb2 import ChatMessage, ChatRole
-from goaly.harness.core.llm import CallTags, LlmClient, RetryPolicy
+from goaly.harness.core.llm import CallRecorder, CallTags, LlmClient, RetryPolicy
 from goaly.harness.core.llm_models import EXECUTOR_MODEL, IMPROVEMENT_MODEL, ModelProfile
 from goaly.harness.core.settings import Settings
 
@@ -163,7 +163,7 @@ def settings() -> Settings:
 def connect(
     gateway: Gateway,
     *,
-    recorder: Recorder | None = None,
+    recorder: CallRecorder | None = None,
     clock: FakeClock | None = None,
     retry: RetryPolicy | None = None,
     rng: random.Random | None = None,
