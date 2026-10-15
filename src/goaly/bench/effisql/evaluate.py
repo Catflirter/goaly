@@ -53,6 +53,8 @@ _CORE = Path("src/goaly/harness/core")
 _CHECKOUT_OPTION = "--harness-checkout"
 # How far the per-task usage may drift from the proxy's total before it is flagged.
 _DRIFT = 0.01
+# How long a cancelled host command has to stop its container and proxy before it is killed.
+_TERMINATE_GRACE_S = 60.0
 
 # Runs the host command: (argv, working directory) -> its exit status and its output's end.
 type RunCommand = Callable[[Sequence[str], Path], Any]
@@ -108,13 +110,25 @@ class TaskBudget:
 
 
 async def _run_command(argv: Sequence[str], cwd: Path) -> tuple[int, str]:
+    """Run the host command; if cancelled, SIGTERM it, which stops its proxy and container, and
+    wait for it to end before the cancellation goes on."""
     process = await asyncio.create_subprocess_exec(
         *argv,
         cwd=cwd,
         stdout=asyncio.subprocess.PIPE,
         stderr=asyncio.subprocess.STDOUT,
     )
-    output, _ = await process.communicate()
+    try:
+        output, _ = await process.communicate()
+    except asyncio.CancelledError:
+        if process.returncode is None:
+            process.terminate()
+            try:
+                await asyncio.shield(asyncio.wait_for(process.wait(), _TERMINATE_GRACE_S))
+            except TimeoutError:
+                process.kill()
+                await asyncio.shield(process.wait())
+        raise
     return process.returncode or 0, output.decode("utf-8", "replace")[-20_000:]
 
 
@@ -149,7 +163,9 @@ class EffiSqlEvaluator:
         chosen = [results[key] for key in sorted(wanted) if key in results]
         calls = await asyncio.to_thread(_records, run_dir / "llm_calls.jsonl", LlmCallRecord)
         stats = self.cost_stats(chosen, [c for c in calls if c.run_id == request.run_id])
-        return self.evaluation_type(results=chosen, stats=stats)
+        # TODO(T06): the host's own set of tasks the infrastructure failed, once the host run
+        # reports it; None makes T21 fall back to the results' error types.
+        return self.evaluation_type(results=chosen, stats=stats, infra_failed=None)
 
     def command(
         self, request: EvaluationRequestLike, snapshot: Path, run_dir: Path, max_tasks: int
@@ -170,24 +186,41 @@ class EffiSqlEvaluator:
         ]  # fmt: skip
 
     def cost_stats(self, results: Sequence[TaskResult], calls: Sequence[LlmCallRecord]) -> Any:
-        """The means per (task, seed), from the usage the host attributed to each task."""
+        """The means per (task, seed), host-verified (T21's ruling).
+
+        Tokens and cost are the proxy's own records of the run, which cover every task solved
+        now; a task the cache answered brings the host numbers stored with it, as no call was
+        made for it. Wall time is the host's, per task. The container's own counts are never
+        used. A per-task sum that differs from the proxy's total by more than 1% is a WARNING.
+        """
         count = len(results)
-        tokens = sum(r.usage.input_tokens + r.usage.output_tokens for r in results)
-        cost = sum(r.usage.cost_usd for r in results)
-        wall = sum(r.wall_time_s for r in results)
+        if not count:
+            return self.cost_stats_type(
+                mean_tokens=0.0, mean_cost_usd=None, mean_wall_time_s=0.0, count=0
+            )
+        solved = {(c.instance_id, c.seed) for c in calls}
+        cached = [r for r in results if (r.instance_id, r.seed) not in solved]
+        fresh = [r for r in results if (r.instance_id, r.seed) in solved]
         proxy_tokens = sum(c.usage.input_tokens + c.usage.output_tokens for c in calls)
-        if calls and abs(tokens - proxy_tokens) > _DRIFT * max(proxy_tokens, 1):
+        proxy_cost = sum(c.usage.cost_usd for c in calls)
+        tokens = proxy_tokens + sum(r.usage.input_tokens + r.usage.output_tokens for r in cached)
+        cost = proxy_cost + sum(r.usage.cost_usd for r in cached)
+        attributed = sum(r.usage.input_tokens + r.usage.output_tokens for r in fresh)
+        if calls and abs(attributed - proxy_tokens) > _DRIFT * max(proxy_tokens, 1):
             _logger.warning(
                 "the tasks' tokens differ from the proxy's total by more than 1%%",
-                extra={"tasks": tokens, "proxy": proxy_tokens},
+                extra={"tasks": attributed, "proxy": proxy_tokens},
             )
-        priced = any(r.usage.cost_usd for r in results) or any(c.usage.cost_usd for c in calls)
+        priced = any(c.usage.cost_usd for c in calls) or any(r.usage.cost_usd for r in cached)
         return self.cost_stats_type(
-            mean_tokens=tokens / count if count else 0.0,
-            mean_cost_usd=(cost / count if count else 0.0) if priced else None,
-            mean_wall_time_s=wall / count if count else 0.0,
+            mean_tokens=tokens / count,
+            mean_cost_usd=cost / count if priced else None,
+            mean_wall_time_s=sum(r.wall_time_s for r in results) / count,
             count=count,
         )
+
+    async def aclose(self) -> None:
+        """Release what the evaluator holds; it starts no pool of its own yet."""
 
     def snapshot(self, commit: str, tree: str) -> Path:
         """The commit's files, read-only, under ``<runs>/snapshots/<commit>``; made once.

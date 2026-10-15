@@ -3,13 +3,19 @@
 import asyncio
 import logging
 import subprocess
+import sys
 from collections.abc import Sequence
 from dataclasses import dataclass
 from pathlib import Path
 
 import pytest
 
-from goaly.bench.effisql.evaluate import EffiSqlEvaluator, TaskBudget, make_evaluator
+from goaly.bench.effisql.evaluate import (
+    EffiSqlEvaluator,
+    TaskBudget,
+    _run_command,  # The child's lifetime, tested directly.
+    make_evaluator,
+)
 from goaly.bench.effisql.grading_pool import Priority
 from goaly.contracts.gen.llm_call_pb2 import LlmCallRecord, Usage
 from goaly.contracts.gen.manifest_pb2 import RunManifest
@@ -26,6 +32,7 @@ pytestmark = pytest.mark.anyio
 class Evaluation:  # T21's goaly.rsi.round.Evaluation, as T21 passes it in.
     results: Sequence[TaskResult]
     stats: object
+    infra_failed: object = None
 
 
 @dataclass(frozen=True)
@@ -140,6 +147,16 @@ def calls(*tokens: int, run_id: str = "run-1") -> list[LlmCallRecord]:
     return [LlmCallRecord(run_id=run_id, usage=Usage(input_tokens=t)) for t in tokens]
 
 
+def tagged(instance_id: str, tokens: int, cost: float) -> LlmCallRecord:
+    """A proxy record of one of the run's calls, tagged with its task (X-Goaly-Call-Tags)."""
+    return LlmCallRecord(
+        run_id="run-1",
+        instance_id=instance_id,
+        seed=0,
+        usage=Usage(input_tokens=tokens, cost_usd=cost),
+    )
+
+
 async def test_it_runs_the_host_command_on_a_read_only_snapshot(repo: Path, tmp_path: Path) -> None:
     commit, tree = head(repo)
     host = FakeHost(
@@ -148,7 +165,7 @@ async def test_it_runs_the_host_command_on_a_read_only_snapshot(repo: Path, tmp_
             result("1", 0, 300, 0.03, 30),
             result("2", 0, 200, 0.02, 20),
         ],
-        calls(300, 200),
+        [tagged("1", 300, 0.03), tagged("2", 200, 0.02)],
     )
     request = Request(commit, tree, SPLIT_TRAIN, ("1", "2"), (0,), "run-1")
 
@@ -272,3 +289,32 @@ def test_known_train_finds_the_commits_finished_train_runs(repo: Path, tmp_path:
     assert [(r.instance_id, r.seed) for r in results] == [("1", 0)]
     assert [(t.instance_id, t.seed) for t in trajectories] == [("1", 0)]
     assert made.known_train("0" * 40) == ([], [])
+
+
+async def test_a_cached_task_brings_its_stored_host_numbers(repo: Path, tmp_path: Path) -> None:
+    commit, tree = head(repo)
+    # Task 1 solved now (the proxy saw it); task 2 came from the cache (no call was made).
+    host = FakeHost(
+        [result("1", 0, 300, 0.03, 30), result("2", 0, 100, 0.01, 10)], [tagged("1", 300, 0.03)]
+    )
+
+    evaluation = await evaluator(repo, tmp_path, host).evaluate(
+        Request(commit, tree, SPLIT_TRAIN, ("1", "2"), (0,), "run-1")
+    )
+
+    stats = evaluation.stats
+    assert stats.mean_tokens == 200.0  # (300 from the proxy + 100 stored) / 2
+    assert stats.mean_cost_usd == pytest.approx(0.02)
+    assert evaluation.infra_failed is None
+
+
+async def test_a_cancelled_evaluation_stops_its_host_command(tmp_path: Path) -> None:
+    started = tmp_path / "started"
+    script = f"import pathlib, time; pathlib.Path({str(started)!r}).touch(); time.sleep(60)"
+    running = asyncio.create_task(_run_command([sys.executable, "-c", script], tmp_path))
+    while not started.exists():
+        await asyncio.sleep(0.05)
+
+    running.cancel()
+    with pytest.raises(asyncio.CancelledError):
+        await running
