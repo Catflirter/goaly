@@ -2,6 +2,7 @@ import fcntl
 import hashlib
 import io
 import stat
+import time
 from collections.abc import Callable, Mapping, Sequence
 from datetime import UTC, datetime
 from pathlib import Path
@@ -594,6 +595,33 @@ def test_a_server_that_dies_while_starting_is_reported_with_its_log(
             run=FakeRunner(tables=CONTENTS),
             datasets=[_synthetic_dataset(CONTENTS)],
         )
+
+
+def test_a_server_that_docker_is_restarting_is_still_starting(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    containers = FakeContainers(status="restarting")  # Its port was briefly taken, say.
+    containers.install(monkeypatch)
+    attempts: list[str] = []
+    server = FakeServer([("SELECT count(*)", [(1,)]), CLUSTER])
+
+    def connect_on_third_try(dbname: str) -> Any:
+        attempts.append(dbname)
+        if len(attempts) < 3:
+            raise psycopg.OperationalError("connection refused")
+        return server.connect(dbname)
+
+    monkeypatch.setattr(pg_build, "connector", lambda *args, **kwargs: connect_on_third_try)
+    monkeypatch.setattr(time, "sleep", lambda seconds: None)
+
+    build_golden(
+        PgEnvConfig(data_root=tmp_path),
+        SecretStr("pw"),
+        run=FakeRunner(tables=CONTENTS),
+        datasets=[_synthetic_dataset(CONTENTS)],
+    )
+
+    assert attempts[:3] == ["postgres", "postgres", "postgres"]
 
 
 def test_a_server_that_never_accepts_connections_times_out(
