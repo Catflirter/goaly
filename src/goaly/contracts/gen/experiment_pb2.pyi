@@ -128,7 +128,11 @@ class _GuardEnumTypeWrapper(_enum_type_wrapper._EnumTypeWrapper[_Guard.ValueType
     GUARD_CHECKSUMS: _Guard.ValueType  # 2
     """The bench/, harness/core/ and contracts/ checksums are unchanged."""
     GUARD_HARD_CODING_SCAN: _Guard.ValueType  # 3
-    """The hard-coding scan finds no fragment of a gold answer in the diff (spec §8.5)."""
+    """The hard-coding scan finds nothing task-specific in the diff (spec §8.5). For Effi-SQL it
+    rejects any fragment of a gold optimized_sql 40 or more characters long after
+    normalization, and pack changes that embed large literal lists. For SWE (on hold) it also
+    rejects any instance_id from any split.
+    """
     GUARD_UNIT_TESTS: _Guard.ValueType  # 4
     """The pack's unit tests pass."""
 
@@ -142,7 +146,11 @@ GUARD_ALLOWED_PATHS: Guard.ValueType  # 1
 GUARD_CHECKSUMS: Guard.ValueType  # 2
 """The bench/, harness/core/ and contracts/ checksums are unchanged."""
 GUARD_HARD_CODING_SCAN: Guard.ValueType  # 3
-"""The hard-coding scan finds no fragment of a gold answer in the diff (spec §8.5)."""
+"""The hard-coding scan finds nothing task-specific in the diff (spec §8.5). For Effi-SQL it
+rejects any fragment of a gold optimized_sql 40 or more characters long after
+normalization, and pack changes that embed large literal lists. For SWE (on hold) it also
+rejects any instance_id from any split.
+"""
 GUARD_UNIT_TESTS: Guard.ValueType  # 4
 """The pack's unit tests pass."""
 Global___Guard: _TypeAlias = Guard  # noqa: Y015
@@ -532,8 +540,8 @@ class PhaseResult(_message.Message):
     delta: _builtins.float
     """candidate_score - best_score."""
     effective_min_delta: _builtins.float
-    """The smallest delta the phase accepted. For the validation: Effi-SQL's min_delta, or SWE's
-    min_relative_gain times best_score, doubled if the cost guardrail tripped. For the
+    """The smallest delta the phase accepted, doubled if the cost guardrail tripped. For the
+    validation: Effi-SQL's min_delta, or SWE's min_relative_gain times best_score. For the
     confirmation: confirm_min_delta. Absent for the screen, which needs only a delta above 0.
     """
     wins: _builtins.int
@@ -649,8 +657,9 @@ class DecisionThresholds(_message.Message):
     EFFISQL_FIELD_NUMBER: _builtins.int
     SWE_FIELD_NUMBER: _builtins.int
     cost_guardrail_ratio: _builtins.float
-    """The cost guardrail: above this multiple of the best's mean tokens or wall time per task, the
-    gain threshold doubles.
+    """The cost guardrail: above this multiple of the best's mean tokens or wall time per task,
+    every gain threshold doubles. For Effi-SQL, min_delta 0.05 becomes 0.10 and
+    confirm_min_delta 0.03 becomes 0.06; for SWE, min_relative_gain doubles.
     """
     efficiency_cap_ratio: _builtins.float
     """The efficiency cap: above this multiple of v0's mean cost or wall time per task, a candidate

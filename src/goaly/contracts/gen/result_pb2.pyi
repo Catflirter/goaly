@@ -113,8 +113,9 @@ class TaskResult(_message.Message):
     """
     wall_time_s: _builtins.float
     """The policy's solving time, in seconds: from receiving its provisioned environment to
-    returning the prediction. Slot waits, provisioning and grading are left out, so this is the
-    time the efficiency rules compare (spec §8.3).
+    returning the prediction. It leaves out the wait for the task's slot, provisioning and
+    grading, but includes the LLM concurrency waits and backoffs during solving, which
+    Step.latency_s counts. This is the time the efficiency rules compare (spec §8.3).
     """
     provision_s: _builtins.float
     """How long provisioning the task's environment took, in seconds: from started_at until the
