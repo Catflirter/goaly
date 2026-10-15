@@ -109,7 +109,8 @@ src/goaly/
       effisql/       prompt.md, skills/, tools.py, policy.py, config.yaml
       swefficiency/  (same files; on hold)
   bench/
-    effisql/         data.py, env.py, grader.py, adapter.py
+    effisql/         data.py, env.py, grader.py, adapter.py, and the pipeline that launches
+                     isolated runs (§6.1)
     swefficiency/    data.py, env.py, grader.py, adapter.py (on hold)
     runner.py, metrics.py, manifest.py
     sandbox.py       the shared container builder: the isolated solve phase (§6.1) and the implementer (§8.8)
@@ -472,31 +473,47 @@ The first option costs more tokens, although the gateway's prefix cache absorbs 
 
 - Built on asyncio, with separate resource pools for: LLM concurrency, the solving and grading database instances, and, for SWE (on hold), solving CPU slots and evaluation workers (at most 4).
 - An exception in one task never affects the others. Each task's result is written to disk as soon as it's done, so an interrupted run can resume.
-- Evaluations are cached by (harness content hash, task, seed). Cache entries carry the grade.
+- Evaluations are cached by (harness identity, task digest, seed, grading mode), on the host only (Isolated evaluation, below). Cache entries carry the grade.
 
 **Isolated evaluation.** The project lead decided on 2026-10-15 to isolate candidate code. The static allowlist (§8.5) kept leaking, and pack code shared a process with the API key, the LLM client and the grader. One bypass could therefore steal the key, patch the grader in memory, or call GLM. The isolation closes this structurally, and the allowlist stays as a second layer.
 
 1. **Two phases, two processes.** `goaly run` has a solve phase and a grade phase (`--phase solve|grade|all`, §6.4).
-   - The solve phase runs the pack's policy. It writes predictions, the official records, trajectories, ungraded `TaskResult`s and `llm_calls.jsonl` to the run directory.
-   - The grade phase runs on the host, as a separate process. It reads the run directory and grades with the grader role, and it never imports pack code: only `bench` and `core` are loaded. It then appends a graded copy of each `TaskResult` to `results.jsonl`, where the last line for a task wins. A two-phase trajectory carries no grade, so readers take grades from `results.jsonl`.
-   - Every real Effi-SQL run takes the two-phase path, so v0 and candidates are measured the same way. That covers the T12 baseline, every RSI evaluation (smoke, screening, validation and confirmation) and the final runs. The one-process mode stays for unit tests and the toy benchmark only.
-2. **The solve phase runs in the sandbox container,** with `--network=host`. It is built by the same builder as the implementer's sandbox (§8.8). The project lead decided that this builder lives in `goaly.bench`, so `goaly run` can use it without loading `goaly.rsi` (§3.1), and that T18 owns it.
-   - Mounts: the candidate's worktree and the gold-free runtime data file, both read-only, and the run directory, writable.
-   - Environment: a per-run dummy token; `GOALY_BASE_URL`, pointing at the local proxy (below); and the agent role's PostgreSQL password. That role is `SELECT`-only on `tpch` and cannot connect to the alternate database.
+   - **The default command is the isolated pipeline.** `goaly run --bench effisql`, which runs `--phase all`, starts the proxy, then the solve container, then grades on the host in a fresh process.
+   - **The launcher.** T11's `bench/effisql` pipeline is the host-side launcher that starts the proxy and the container, and T06's CLI calls it through a benchmark hook. Inside the container, the worker runs as `goaly run --phase solve --in-container`, an entry point that only the launcher uses.
+   - **The solve phase** runs the pack's policy, inside the container.
+   - **The grade phase** runs on the host, as a separate process, and grades with the grader role. It never imports pack code: only `bench` and `core` are loaded.
+   - **Every real Effi-SQL run takes this path,** so v0 and candidates are measured the same way. That covers the T12 baseline, every RSI evaluation (smoke, screening, validation and confirmation) and the final runs.
+   - **The one-process mode** needs an explicit `--in-process` flag. It refuses to run with the real gateway key unless `--unsafe-in-process` is also given. It is for unit tests, the toy benchmark and local debugging only, and no real experiment uses it.
+2. **The trust boundary.** The solve container is untrusted, and the host never trusts a file the container wrote for anything that decides a score.
+   - **The container writes only `<run>/solve/`:** its predictions, its trajectories, its ungraded result lines, and its own call log, which is informational only.
+   - **Host-only files.** Everything else in the run directory is written only by the host and never mounted writable: the graded `results.jsonl`, `official/`, the manifest, the grade phase's state, the evaluation cache and the proxy's `llm_calls.jsonl`. After the solve phase, the host writes the official records to `official/seed-<k>.jsonl` from the predictions in `solve/`, one per input record; a task with no valid prediction gets an empty one, which always fails (§3.3).
+   - **The grade phase takes what it expects from the host caller,** never from files in `solve/`:
+     - the run's task IDs, seeds, split and grading mode;
+     - the harness identity: the snapshot's commit and tree hash, plus the config hash. The config hash leaves out run-time knobs such as `max_tasks`, the phase, budget shares and LLM shares;
+     - the task digest, computed on the host from the dataset.
+   - **Every expected (task, seed) is graded.** A missing, duplicate or malformed solve record gives that task an error status with credit 0. It is never skipped, and never counted as already graded.
+   - **Grades go to `results.jsonl`.** The grade phase appends a graded copy of each result there, and the last line for a task wins. A two-phase trajectory carries no grade, so readers take grades from `results.jsonl`.
+   - **The evaluation cache** is read and written only by the host, keyed only by host-known identity. A cache hit is decided on the host before the container starts, and cached tasks are not sent to the container.
+   - **Cost, tokens and time.** Decision-relevant cost and tokens come from the proxy's records, which the host writes; the project lead decided this. The host measures the run's wall time. Per-task wall time reported by the container is informational only. §8.3 says how the decision rules use these numbers.
+3. **The solve container** runs with `--network=host`, made by the same builder as the implementer's sandbox (§8.8). The project lead decided that this builder lives in `goaly.bench`, so `goaly run` can use it without loading `goaly.rsi` (§3.1). T18 owns it, including the solve container's mount layout.
+   - Mounts: the candidate's snapshot (§8.2 step 3), fully read-only and without `.git`; the gold-free runtime data file, read-only; and `<run>/solve/`, writable. Nothing else is mounted.
+   - Environment: an explicit allowlist with a per-run dummy token; `GOALY_BASE_URL`, pointing at the local proxy (below); and the agent role's PostgreSQL password. That role is `SELECT`-only on `tpch`, and it can log in only on the 2 solving instances: its CONNECT on the grading instances is revoked explicitly, and it cannot connect to the alternate database (§4.1).
+   - It runs on CPUs 0, 1, 12 and 13 with a 4 GB memory limit, like the implementer sandbox (§6.2, §8.8).
    - Never present: `~/.config`, the real API key, grader credentials and gold.
-3. **A key-injecting LLM proxy runs on the host,** in the trusted parent process.
+4. **A key-injecting LLM proxy runs on the host,** in the trusted parent process.
    - It listens on 127.0.0.1 and requires the per-run token.
-   - It forwards each request to the gateway with the real key, and passes the response back unchanged, `x-litellm-response-cost` included.
+   - It rebuilds the forwarded body from an allowlist of the keys that core's client sends. It refuses anything else with a 400, which is logged. It forces `stream=false` and `n=1`, and clamps `max_tokens` to the profile's limit.
    - It allows only the executor model, `qwen3.6-35b-a3b`. Any other model gets a 403, which is logged.
-   - Inside the container, the client is core's LLM client (T03), configured with the proxy's URL and the dummy token, so throttling and call records work as before.
-   - Files written in the container are untrusted. The decision rules therefore take their cost and token numbers from the proxy's records, which cover every call; the project lead has decided this.
-4. **What this closes.** Pack code can no longer see the key, reach GLM, or touch the grader or the grading data. A bypass inside the container reaches only three things:
-   - the read-only agent role;
+   - It forwards each request to the gateway with the real key, and passes the response back unchanged, `x-litellm-response-cost` included.
+   - It writes one `LlmCallRecord` per request, refusals included, to the host-only `llm_calls.jsonl`. Each record holds the model, the status, the latency, the tokens from the response's `usage`, and the cost from `x-litellm-response-cost`. T21's decision rules and T07's metrics aggregate those records per run.
+   - Inside the container, the client is core's LLM client (T03), configured with the proxy's URL and the dummy token, so throttling works as before. Its own call log is informational.
+5. **What this closes.** Pack code can no longer see the key, reach GLM, or touch the grader, the grading data or the grades. A bypass inside the container reaches only three things:
+   - the read-only agent role, on the solving instances;
    - Qwen, through the proxy;
-   - the run directory, from which the grader reads only predictions, never code.
-5. **The guards are unchanged.** Paths, checksums, the hard-coding scan, the AST allowlist and the unit-test guard still run first (§8.2 step 3).
+   - `<run>/solve/`, which the grade phase reads only for predictions.
+6. **The guards are unchanged.** Paths, checksums, the hard-coding scan, the AST allowlist and the unit-test guard still run first (§8.2 step 3).
 
-The organizers' entry point (§6.4) needs only the solve phase, and it runs that phase in the same container. Reproducing our results therefore needs Docker, by the project lead's decision, and there is no non-Docker fallback for official runs (§11).
+The organizers' entry point (§6.4) needs only the solve phase, and it runs that phase in the same container. Reproducing our results therefore needs Docker, by the project lead's decision, and there is no non-Docker fallback for official runs (§11). Their database also needs the agent role. The environment setup creates it along with the PostgreSQL instances (`make final`, §10), and the README gives the statements that create it on a database they provide.
 
 **Seeds and reproducibility.** In this document a *seed* means one independent replicate run, not a sampler seed.
 
@@ -506,7 +523,7 @@ The organizers' entry point (§6.4) needs only the solve phase, and it runs that
 
 **Run manifest** (`RunManifest` contract): git commit, harness content hash, config hash, dataset revision, model names and sampling parameters, start and end times, machine info.
 
-**Per-task records** (`TaskResult` contract): score, correctness, wall time, tokens (input, output and reasoning, counted separately), cost, steps and error type.
+**Per-task records** (`TaskResult` contract): score, correctness, wall time, tokens (input, output and reasoning, counted separately), cost, steps and error type. In a two-phase run, the wall time, tokens and cost that the container wrote are informational; the decision rules use the host's numbers (§8.3).
 
 ### 6.2 Concurrency and rate limiting
 
@@ -644,19 +661,22 @@ Each PostgreSQL instance is pinned with cpuset to both SMT siblings of its physi
 ### 6.4 CLI
 
 - `goaly run --bench {effisql,swefficiency} --split {train,val,heldout} --harness <path|tag> --seeds N --phase {solve,grade,all} --out runs/<id>`
-  - `--phase solve` runs the isolated solve phase and leaves ungraded results.
-  - `--phase grade` grades a run directory on the host.
-  - `--phase all`, the default, runs both in turn (§6.1).
+  - `--phase all`, the default, is the isolated pipeline: the host starts the proxy, then the solve container, then grades in a fresh process (§6.1).
+  - `--phase solve` stops after the solve container. The host writes the official records from the container's predictions, and the results stay ungraded.
+  - `--phase grade` grades a run directory on the host. It takes the tasks, seeds, mode and harness identity from its arguments and the host-written manifest, never from `solve/` (§6.1).
   - `--out` names a run directory, never a single file. Grades go to `results.jsonl` in it, where the grade phase appends a graded copy of each result and the last line wins (§6.1).
+- **Who starts what.** T06's CLI calls the benchmark's launcher through a hook. For Effi-SQL the launcher is T11's `bench/effisql` pipeline, which starts the proxy and the solve container on the host.
+- `--phase solve --in-container` is the worker's entry point inside the container. Only the launcher passes it.
+- `--in-process` runs both phases in one process, with no container and no proxy. It refuses to run with the real gateway key unless `--unsafe-in-process` is also given. It is for unit tests, the toy benchmark and local debugging only; no real experiment uses it.
 - `--instances <official-format jsonl>` runs any task file. The organizers use this for their held-out set, and the README documents it as the official entry point. They need only the solve phase:
 
   ```
   goaly run --bench effisql --instances heldout.jsonl --harness final --phase solve --out runs/heldout
   ```
 
-  The official predictions land in the run directory as `official/seed-<k>.jsonl`, one file per seed. Each is the official prediction file: every input record plus its `prediction` field, which holds both the SQL and the diff, in that order (§3.3).
+  The official predictions land in the run directory as `official/seed-<k>.jsonl`, one file per seed, written by the host. Each is the official prediction file: every input record plus its `prediction` field, which holds both the SQL and the diff, in that order (§3.3).
 
-  This needs the executor API, a PostgreSQL database for Effi-SQL, and Docker. The solve phase always runs in its container (§6.1), so there is no non-Docker fallback for official runs (§11). SWE (on hold) would need Docker for its task containers too.
+  This needs the executor API, a PostgreSQL database for Effi-SQL with the agent role (§6.1), and Docker. The solve phase always runs in its container (§6.1), so there is no non-Docker fallback for official runs (§11). SWE (on hold) would need Docker for its task containers too.
 
 ## 7. Data splits
 
@@ -726,6 +746,8 @@ Every external call has a timeout. Every agent run has step, cost and time limit
    - the hard-coding scan passes (§8.5);
    - the static AST allowlist passes on the candidate's pack code (§8.5). As defense in depth, it bans the known ways for pack code to reach the key or build an LLM client (§5.1);
    - the pack's unit tests pass. They run in a fresh sandbox with the whole worktree read-only, never on the host, because the agent may have written them.
+
+   The guards and every evaluation run on a **snapshot**: a read-only copy of the candidate commit's files, with no `.git`, never the live worktree. The commit and its tree hash identify the harness (§6.1).
 4. **Screen.** The candidate's results are compared with the best's cached results on the same tasks. No net gain means rejection. In screening, validation and confirmation alike, a candidate with any prediction flagged `hard_coded` or `literal_result` (§4.1) fails outright. Every candidate evaluation, smoke tests included, takes the isolated two-phase path (§6.1).
    - Effi-SQL: up to 15 train failures the hypothesis targets, plus 5 train tasks the best already solves, 1 seed. Solved and failed are as defined in §6.3.
    - SWE (on hold): the 3 train tasks the hypothesis targets.
@@ -752,6 +774,8 @@ Cost guardrail: if the candidate uses more than 1.5× the best's mean tokens or 
 - Cost guardrail: same as Effi-SQL.
 
 **Every lane: efficiency cap.** A candidate is rejected outright, whatever its gain, if on the same split its mean cost or mean wall time per task is more than 3× that of baseline v0. Without this cap, many small accepted changes could add up to a large cost increase; the cap keeps gains from depending on unlimited extra compute. The report states the cap and where the final harness stands against it.
+
+**Where the cost and time numbers come from** (§6.1). Tokens and cost come from the proxy's records, and wall time from the host's clock around each solve run. Each run's totals are spread evenly over the tasks it solved. Wall time is also multiplied by the run's task concurrency, capped at its number of tasks, so runs with different shares compare fairly. A cache entry keeps these per-task numbers with the grade. Numbers that the container reports per task are informational only.
 
 **Why these thresholds.** A higher bar accepts fewer changes, but the ones it accepts are more trustworthy. A lower bar accepts more changes, but more of them are noise mistaken for gains.
 
@@ -892,12 +916,12 @@ The implementer is mini-swe-agent's `DefaultAgent` (`mini-swe-agent==2.4.6`, MIT
 
 ## 9. Cost and efficiency accounting
 
-- Every LLM call records its purpose (exec, rsi-analyst, rsi-impl or rsi-lesson), model, tokens, cost from the response header, and latency. In isolated runs, the host's proxy also records every call it forwards. The decision rules use its numbers, because files written in the solve container are untrusted (§6.1).
+- Every LLM call records its purpose (exec, rsi-analyst, rsi-impl or rsi-lesson), model, tokens, cost from the response header, and latency. In isolated runs, the host's proxy writes one record per request, refusals included, to the host-only `llm_calls.jsonl` (§6.1). The decision rules and the report use those records, because files written in the solve container are untrusted; the container's own call log is informational.
 - The report shows two costs separately:
   - what the final harness costs, in money and time, to run on the held-out set;
   - what the RSI experiments cost in total, by lane and by purpose.
 - Implementer calls are recorded by core's LLM client like every other call, with purpose `rsi-impl` and the experiment ID as the run ID. mini-swe-agent's own cost tracking is not used. A smoke test's Qwen calls are `exec` calls in a smoke run attributed to the experiment, and they count toward its cost.
-- On the machine side, we record wall time per task, how long each Effi-SQL evaluation holds its grading instance, and the CPU time used by SWE evaluation (on hold).
+- On the machine side, the host records each run's wall time, how long each Effi-SQL evaluation holds its grading instance, and the CPU time used by SWE evaluation (on hold). Per-task wall time follows §8.3; the container's own per-task times are informational.
 - The report compares the final harness's mean cost and wall time per task with v0's, against the 3× efficiency cap (§8.3).
 
 ## 10. Final evaluation and reproducibility
