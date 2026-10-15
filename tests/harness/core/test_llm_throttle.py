@@ -7,6 +7,7 @@ against a FakeLLM that injects 429s, latency and timeouts.
 
 import asyncio
 import logging
+from collections.abc import Callable, Coroutine
 from contextlib import AsyncExitStack
 from typing import Any
 
@@ -809,6 +810,31 @@ async def test_a_client_serves_only_the_loop_it_was_first_used_on() -> None:
             await asyncio.to_thread(call_on_a_second_loop)
 
     assert gateway.requests == []
+
+
+class CloseFailsOnce(httpx.MockTransport):
+    """A transport whose first close fails; every model's pool shares it in these tests."""
+
+    def __init__(
+        self, handler: Callable[[httpx.Request], Coroutine[None, None, httpx.Response]]
+    ) -> None:
+        super().__init__(handler)
+        self.closes = 0
+
+    async def aclose(self) -> None:
+        self.closes += 1
+        if self.closes == 1:
+            raise OSError("close failed")
+
+
+async def test_closing_closes_every_pool_even_when_one_fails() -> None:
+    transport = CloseFailsOnce(Gateway().handle)
+    llm = LlmClient(settings(), Recorder(), transport=transport)
+
+    with pytest.raises(OSError, match="close failed"):
+        await llm.aclose()
+
+    assert transport.closes == 2  # Qwen's pool and GLM's.
 
 
 async def test_each_model_has_its_own_limit(caplog: pytest.LogCaptureFixture) -> None:

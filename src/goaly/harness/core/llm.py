@@ -31,6 +31,7 @@ record holds it, and the client removes it from any text it quotes from the gate
 """
 
 import asyncio
+import contextlib
 import json
 import logging
 import math
@@ -332,9 +333,13 @@ class LlmClient:
         await self.aclose()
 
     async def aclose(self) -> None:
-        """Close the client's connections; it cannot make calls after."""
-        for http in self._http.values():
-            await http.aclose()
+        """Close the client's connections; it cannot make calls after.
+
+        Every model's pool is closed, even when closing another fails.
+        """
+        async with contextlib.AsyncExitStack() as pools:
+            for http in self._http.values():
+                pools.push_async_callback(http.aclose)
 
     async def complete(
         self,
