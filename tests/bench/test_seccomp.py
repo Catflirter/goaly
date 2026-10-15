@@ -34,6 +34,9 @@ def load(path: Path) -> Profile:
 def derive(default: Profile) -> Profile:
     """Docker's default profile with the V28 changes, and nothing else."""
     profile = copy.deepcopy(default)
+    for entry in profile["archMap"]:  # No 32-bit syscalls on x86_64: their arguments differ.
+        if entry["architecture"] == "SCMP_ARCH_X86_64":
+            entry["subArchitectures"] = []
     rules = []
     for rule in profile["syscalls"]:
         if rule["names"] == ["socket"]:
@@ -110,6 +113,20 @@ def test_a_range_rule_like_dockers_lets_a_high_bit_family_through() -> None:
 @pytest.mark.parametrize("high", [0, 1 << 32])
 def test_unix_sockets_stay_open(high: int) -> None:
     assert allows_socket(load(SECCOMP_PROFILE), high | AF_UNIX)
+
+
+def test_x86_64_allows_no_32_bit_syscalls() -> None:
+    # Docker's default lets i386 and x32 syscalls through, whose socket calls no rule here
+    # covers; without a subarchitecture, any of them stops the process.
+    (x86_64,) = [
+        entry
+        for entry in load(SECCOMP_PROFILE)["archMap"]
+        if entry["architecture"] == "SCMP_ARCH_X86_64"
+    ]
+
+    assert x86_64["subArchitectures"] == []
+    default = [e for e in load(DEFAULT)["archMap"] if e["architecture"] == "SCMP_ARCH_X86_64"]
+    assert default[0]["subArchitectures"] == ["SCMP_ARCH_X86", "SCMP_ARCH_X32"]
 
 
 def test_io_uring_and_socketcall_are_refused() -> None:
