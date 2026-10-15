@@ -2,13 +2,20 @@
 
 :class:`SolvingPool` gives each task a :class:`PgSqlEnvironment` on the least-loaded solving
 instance. The environment holds the task's own connection, as the read-only agent role, from
-provisioning until ``close()``. No other task ever uses that connection, so session settings
-never leak from one task to another.
+provisioning until ``close()``. No other task ever uses that connection. Before a run, T11 and
+T21 call :meth:`SolvingPool.preflight`, which fails fast if the agent role cannot log in or is
+not read-only by default.
 
-Statements stream through libpq's chunked-rows mode on the simple query protocol:
+Nothing an agent statement does can persist. Each ``execute`` runs one statement, through the
+extended query protocol, inside ``BEGIN READ ONLY`` … ``ROLLBACK``, followed by ``DISCARD ALL``.
+A string with several statements fails with the server's error. This narrows the interface's
+"one statement or more": a statement's effects last only for that call. Read-only itself comes
+from the role's privileges; the transaction, the rollback and the discard add defense in depth.
 
-- the server runs them as it runs any client's query, so a parallel plan stays parallel; a
-  DECLARE CURSOR would forbid one;
+Rows stream through libpq's chunked-rows mode:
+
+- the server runs the statement as it runs any client's query, so a parallel plan stays
+  parallel; a DECLARE CURSOR would forbid one;
 - every row is counted, so ``row_count`` is honest, but only the first ``row_limit`` rows are
   decoded and kept, so a 60M-row result costs the memory of 100 rows;
 - ``elapsed_s`` therefore includes transferring the rows to the client, which EXPLAIN
@@ -23,6 +30,12 @@ Each instance runs at most ``statement_cap`` statements at once. The wait for a 
    statement opens a new connection.
 
 A cancelled ``execute`` stops its statement the same way before CancelledError propagates.
+
+Other sessions: every task shares the agent role, and PostgreSQL shows a role the query text of
+its own sessions. So the instances revoke pg_stat_activity and the functions behind it from
+PUBLIC, and the agent role is no member of pg_read_all_stats. With those in place, a task cannot
+read another task's statements. Those statements would be base SQL and agent probes, never gold
+answers.
 """
 
 import asyncio
@@ -37,7 +50,7 @@ from typing import Any, Protocol
 import psycopg
 from google.protobuf.struct_pb2 import NULL_VALUE, Value
 from psycopg import generators
-from psycopg.pq import DiagnosticField, ExecStatus
+from psycopg.pq import DiagnosticField, ExecStatus, TransactionStatus
 from pydantic import BaseModel, ConfigDict, Field
 
 from goaly.bench.effisql.pg_instances import SOLVING, Instance
@@ -59,11 +72,15 @@ __all__ = [
     "SqlEnvOptions",
     "connection_lost",
     "encode_value",
-    "stream_statements",
+    "run_statement",
 ]
 
 # PostgreSQL's own message for a statement that ran past statement_timeout.
 STATEMENT_TIMEOUT = "canceling statement due to statement timeout"
+_PREFLIGHT_SQL = (
+    "SELECT current_setting('default_transaction_read_only'), "
+    "has_table_privilege('public.lineitem', 'SELECT')"
+)
 
 _log = logging.getLogger(__name__)
 
@@ -191,18 +208,27 @@ class ResultBuilder:
         self._finished, self._current, self._count = result, None, 0
 
 
-async def stream_statements(
+async def run_statement(
     conn: psycopg.AsyncConnection[Any], sql: str, builder: ResultBuilder
 ) -> None:
-    """Run ``sql``, one statement or more, and feed every result to ``builder``.
+    """Run the agent's one statement in a read-only transaction that is then rolled back.
 
-    The simple query protocol in chunked-rows mode: rows reach the client a chunk at a time,
-    and every statement's results arrive in turn. This uses psycopg's generators, which
-    uv.lock pins; the integration tests cover it.
+    The statement goes through the extended query protocol, which takes exactly one statement;
+    a string with more fails with the server's error. Its rows reach the client a chunk at a
+    time. ROLLBACK and DISCARD ALL then undo everything a statement can leave in a session:
+    settings, prepared statements, cursors, temporary tables, advisory locks and listens. A
+    DISCARD ALL first also cleans up after a call whose own cleanup a cancel cut short.
+
+    This drives libpq through psycopg's generators, which uv.lock pins; the integration tests
+    cover it.
     """
     pgconn = conn.pgconn
     async with conn.lock:
-        pgconn.send_query(sql.encode())
+        if pgconn.transaction_status != TransactionStatus.IDLE:
+            await _control(conn, b"ROLLBACK")
+        await _control(conn, b"DISCARD ALL")
+        await _control(conn, b"BEGIN READ ONLY")
+        pgconn.send_query_params(sql.encode(), None)
         pgconn.set_chunked_rows_mode(_CHUNK_ROWS)
         await conn.wait(generators.send(pgconn))
         while (res := await conn.wait(generators.fetch(pgconn))) is not None:
@@ -216,6 +242,19 @@ async def stream_statements(
                 )
             else:
                 builder.add(res)
+        await _control(conn, b"ROLLBACK")
+        await _control(conn, b"DISCARD ALL")
+
+
+async def _control(conn: psycopg.AsyncConnection[Any], command: bytes) -> None:
+    """Run one of the environment's own commands, which must succeed."""
+    pgconn = conn.pgconn
+    pgconn.send_query(command)
+    await conn.wait(generators.send(pgconn))
+    while (res := await conn.wait(generators.fetch(pgconn))) is not None:
+        if res.status == ExecStatus.FATAL_ERROR:
+            message = res.error_message.decode("utf-8", errors="replace").strip()
+            raise psycopg.OperationalError(f"{command.decode()} failed: {message}")
 
 
 type _Runner = Callable[
@@ -241,7 +280,7 @@ class PgSqlEnvironment:
         options: SqlEnvOptions,
         connect: Callable[[], Awaitable[psycopg.AsyncConnection[Any]]],
         terminate: Callable[[int], Awaitable[None]],
-        runner: _Runner = stream_statements,
+        runner: _Runner = run_statement,
     ) -> None:
         self._slot = slot
         self._options = options
@@ -407,6 +446,40 @@ class SolvingPool:
         """How many environments each instance holds now."""
         return {slot.instance.name: slot.environments for slot in self._slots}
 
+    async def preflight(self) -> None:
+        """Check every solving instance before a run, and fail fast if one is not ready.
+
+        The agent role must log in, read the TPC-H tables, and get read-only transactions by
+        default. Raise EnvironmentFailure naming every problem found.
+        """
+        problems: list[str] = []
+        for slot in self._slots:
+            name = f"{slot.instance.name} (port {slot.instance.port})"
+            try:
+                conn = await self._connect(slot.instance, AGENT_ROLE, MAIN_DB)
+            except psycopg.Error as error:
+                problems.append(f"{name}: the agent role cannot log in: {error}")
+                continue
+            try:
+                row = await (await conn.execute(_PREFLIGHT_SQL)).fetchone()
+            except psycopg.Error as error:
+                problems.append(f"{name}: the agent's session failed: {error}")
+            else:
+                read_only, can_read = row if row is not None else (None, False)
+                if read_only != "on":
+                    problems.append(
+                        f"{name}: the agent's transactions are not read-only by default"
+                    )
+                if not can_read:
+                    problems.append(f"{name}: the agent role cannot read the TPC-H tables")
+            finally:
+                await _close_quietly(conn)
+        if problems:
+            raise EnvironmentFailure(
+                f"the solving instances are not ready: {'; '.join(problems)}. "
+                "`pgenv.py start` starts them and reapplies the roles."
+            )
+
     @asynccontextmanager
     async def environment(self) -> AsyncIterator[PgSqlEnvironment]:
         """Provision a task's environment; it is closed however the block exits."""
@@ -441,6 +514,7 @@ class SolvingPool:
             autocommit=True,
             connect_timeout=10,
             application_name=f"goaly-effisql-{role}",
+            prepare_threshold=None,  # Nothing prepared for DISCARD ALL to pull away.
         )
 
     async def _terminate(self, instance: Instance, pid: int) -> None:

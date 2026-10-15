@@ -54,6 +54,7 @@ __all__ = [
     "dbgen_binary",
     "ensure_dbgen",
     "ensure_generated",
+    "hba_problems",
     "inspect_table_file",
     "load_dataset",
     "read_golden_record",
@@ -73,6 +74,7 @@ _DBGEN_CC = "gcc -std=gnu89 -fcommon"
 
 _SECRETS_TARGET = "/run/goaly"
 _READY_TIMEOUT_S = 300.0
+_STARTING = frozenset({"created", "running", "restarting"})  # Container states still starting.
 _STOP_TIMEOUT_S = 600
 
 _log = logging.getLogger(__name__)
@@ -484,6 +486,9 @@ def _build_server(config: PgEnvConfig, password: SecretStr, pgdata: Path) -> Ite
         try:
             connect = connector(config.host, config.build_port, password)
             wait_until_ready(connect, name)
+            problems = hba_problems((pgdata / "pg_hba.conf").read_text(encoding="utf-8"))
+            if problems:
+                raise BuildError(f"{pgdata}/pg_hba.conf lets in without a password: {problems}")
             yield connect
             with connect("postgres") as conn:
                 conn.execute("CHECKPOINT")
@@ -492,6 +497,36 @@ def _build_server(config: PgEnvConfig, password: SecretStr, pgdata: Path) -> Ite
                 raise BuildError(f"the build server exited with code {exit_code}, not cleanly")
         finally:
             pg_containers.remove(name, force=True)
+
+
+def hba_problems(text: str) -> list[str]:
+    """Say what in a pg_hba.conf would let a connection in without a password.
+
+    Every server shares the host network, so every rule, local socket and TCP alike, must be
+    scram-sha-256: never trust, peer, ident, md5 or password. An include directive is refused
+    too, since its rules cannot be checked here.
+    """
+    problems = []
+    rules = 0
+    for number, line in enumerate(text.splitlines(), start=1):
+        fields = line.split("#", 1)[0].split()
+        if not fields:
+            continue
+        rules += 1
+        kind = fields[0]
+        if kind.startswith("include"):
+            problems.append(f"line {number}: {kind} pulls in rules that are not checked")
+            continue
+        # local DATABASE USER METHOD; host* DATABASE USER ADDRESS [MASK] METHOD [OPTIONS].
+        method_at = 3 if kind == "local" else 5 if len(fields) > 5 and "/" not in fields[3] else 4
+        method = fields[method_at] if len(fields) > method_at else "?"
+        if method != "scram-sha-256":
+            problems.append(
+                f"line {number}: {kind} rule authenticates by {method}, not scram-sha-256"
+            )
+    if rules == 0:
+        problems.append("it has no rule")
+    return problems
 
 
 def connector(host: str, port: int, password: SecretStr, *, user: str = ADMIN_ROLE) -> Connect:
@@ -512,17 +547,25 @@ def connector(host: str, port: int, password: SecretStr, *, user: str = ADMIN_RO
 
 
 def wait_until_ready(connect: Connect, container: str) -> None:
-    """Wait until the server in ``container`` accepts connections; fail if the container stops."""
+    """Wait until the server in ``container`` accepts connections; fail if the container stops.
+
+    A container that Docker is restarting is still starting. Our ports lie in Linux's ephemeral
+    range (32768-60999), so a client socket can briefly hold a server's port: the server then
+    exits, and the restart policy retries until the port is free.
+    """
     deadline = time.monotonic() + _READY_TIMEOUT_S
     while True:
         try:
             with connect("postgres"):
                 return
         except psycopg.OperationalError:
-            if pg_containers.state(container) != "running":
+            if pg_containers.state(container) not in _STARTING:
                 raise BuildError(
                     f"{container} stopped while starting:\n{pg_containers.logs(container)}"
                 ) from None
             if time.monotonic() > deadline:
-                raise BuildError(f"{container} did not accept connections in time") from None
+                raise BuildError(
+                    f"{container} did not accept connections in time:\n"
+                    f"{pg_containers.logs(container)}"
+                ) from None
             time.sleep(0.5)

@@ -2,6 +2,7 @@ import fcntl
 import hashlib
 import io
 import stat
+import time
 from collections.abc import Callable, Mapping, Sequence
 from datetime import UTC, datetime
 from pathlib import Path
@@ -30,6 +31,7 @@ from goaly.bench.effisql.pg_build import (
     dbgen_binary,
     ensure_dbgen,
     ensure_generated,
+    hba_problems,
     inspect_table_file,
     read_golden_record,
     run_command,
@@ -426,13 +428,69 @@ def test_run_command_reports_a_missing_program() -> None:
         run_command(["goaly-no-such-program"])
 
 
+# What initdb --auth=scram-sha-256 and the image's entrypoint write, as on the real instances.
+SCRAM_HBA = """# TYPE  DATABASE        USER            ADDRESS                 METHOD
+local   all             all                                     scram-sha-256
+host    all             all             127.0.0.1/32            scram-sha-256
+host    all             all             ::1/128                 scram-sha-256
+local   replication     all                                     scram-sha-256
+host    replication     all             127.0.0.1/32            scram-sha-256
+host    replication     all             ::1/128                 scram-sha-256
+
+host all all all scram-sha-256
+"""
+
+
+def test_a_pg_hba_that_requires_scram_everywhere_passes() -> None:
+    assert hba_problems(SCRAM_HBA) == []
+    assert hba_problems("hostssl all all 10.0.0.0 255.0.0.0 scram-sha-256\n") == []
+
+
+@pytest.mark.parametrize(
+    ("rule", "named"),
+    [
+        ("host all all 127.0.0.1/32 trust", "host rule authenticates by trust"),
+        ("host all all ::1/128 trust", "host rule authenticates by trust"),
+        ("local all all peer", "local rule authenticates by peer"),
+        ("host all all 127.0.0.1 255.255.255.255 md5", "host rule authenticates by md5"),
+        ("hostnossl all all all password", "hostnossl rule authenticates by password"),
+        ("include_dir conf.d", "include_dir pulls in rules"),
+    ],
+)
+def test_any_rule_that_skips_scram_is_named(rule: str, named: str) -> None:
+    assert [named in problem for problem in hba_problems(SCRAM_HBA + rule + "\n")] == [True]
+
+
+def test_a_pg_hba_with_no_rule_lets_nobody_in_and_is_refused() -> None:
+    assert hba_problems("# nothing\n") == ["it has no rule"]
+
+
+def test_a_build_whose_pg_hba_allows_trust_is_refused(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    containers = FakeContainers(hba=SCRAM_HBA + "host all all 127.0.0.1/32 trust\n")
+    _install_server(monkeypatch, FakeServer([("SELECT count(*)", [(1,)]), CLUSTER]), containers)
+
+    with pytest.raises(BuildError, match="lets in without a password"):
+        build_golden(
+            PgEnvConfig(data_root=tmp_path),
+            SecretStr("pw"),
+            run=FakeRunner(tables=CONTENTS),
+            datasets=[_synthetic_dataset(CONTENTS)],
+        )
+    assert containers.events[-1] == "remove"
+
+
 CLUSTER: tuple[str, Answer] = ("pg_encoding_to_char", [("16.15", "UTF8", "en_US.utf8")])
 
 
 class FakeContainers:
     """Stands in for pg_containers: records the build server's lifecycle."""
 
-    def __init__(self, *, exit_code: int = 0, status: str = "running") -> None:
+    def __init__(
+        self, *, exit_code: int = 0, status: str = "running", hba: str = SCRAM_HBA
+    ) -> None:
+        self.hba = hba
         self.events: list[str] = []
         self.specs: list[ContainerSpec] = []
         self.password_files: list[str] = []
@@ -449,6 +507,7 @@ class FakeContainers:
     def start(self, spec: ContainerSpec) -> None:
         self.events.append("start")
         self.specs.append(spec)
+        (spec.data_dir / "pg_hba.conf").write_text(self.hba)  # What initdb would write.
         secrets_dir = spec.mounts[0].source
         password_file = secrets_dir / "admin_password"
         assert stat.S_IMODE(password_file.stat().st_mode) == 0o600
@@ -594,6 +653,33 @@ def test_a_server_that_dies_while_starting_is_reported_with_its_log(
             run=FakeRunner(tables=CONTENTS),
             datasets=[_synthetic_dataset(CONTENTS)],
         )
+
+
+def test_a_server_that_docker_is_restarting_is_still_starting(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    containers = FakeContainers(status="restarting")  # Its port was briefly taken, say.
+    containers.install(monkeypatch)
+    attempts: list[str] = []
+    server = FakeServer([("SELECT count(*)", [(1,)]), CLUSTER])
+
+    def connect_on_third_try(dbname: str) -> Any:
+        attempts.append(dbname)
+        if len(attempts) < 3:
+            raise psycopg.OperationalError("connection refused")
+        return server.connect(dbname)
+
+    monkeypatch.setattr(pg_build, "connector", lambda *args, **kwargs: connect_on_third_try)
+    monkeypatch.setattr(time, "sleep", lambda seconds: None)
+
+    build_golden(
+        PgEnvConfig(data_root=tmp_path),
+        SecretStr("pw"),
+        run=FakeRunner(tables=CONTENTS),
+        datasets=[_synthetic_dataset(CONTENTS)],
+    )
+
+    assert attempts[:3] == ["postgres", "postgres", "postgres"]
 
 
 def test_a_server_that_never_accepts_connections_times_out(
