@@ -129,7 +129,8 @@ enum GradeStatus {
   GRADE_STATUS_PREDICTION_FAILED = 2;
   // The prediction ran past the grader's time limit.
   GRADE_STATUS_TIMEOUT = 3;
-  // The grader's own infrastructure failed, so the score says nothing about the prediction.
+  // The grader's infrastructure failed: no property of the prediction, so the score means
+  // nothing. Regrade the task before computing metrics.
   GRADE_STATUS_GRADER_ERROR = 4;
 }
 

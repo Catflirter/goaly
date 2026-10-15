@@ -8,52 +8,66 @@ import "goaly/v1/task.proto";
 import "goaly/v1/trajectory.proto";
 import "google/protobuf/timestamp.proto";
 
-// How one task went in a run (spec §6.1): one line of the run's results file. Its score and
-// correctness are in its grade.
+// How one task, one seed, went in one run (spec §6.1): one line of the run's results file. Its
+// score and correctness are in its grade, and in a run with gold answers every task gets one.
+// If several lines share run_id, instance_id and seed, the last one wins, so a late SWE grade is
+// appended as a new line. Breakdowns by category or by repository join on instance_id with the
+// task's TaskInput.
 message TaskResult {
   // The run it belongs to.
   string run_id = 1;
   // The task.
   string instance_id = 2;
-  // The replicate index (spec §6.1): which of the run's independent repeats this is.
+  // The 0-based replicate index (spec §6.1), which names the same replicate in every run. A
+  // confirmation run takes a new index, so the evaluation cache never hands it a validation
+  // seed's result.
   int32 seed = 3;
-  // How the prediction was graded; absent if it was not, as in the organizers' runs, which have
-  // no gold answers.
+  // How the task was graded. A task with no prediction, after a crash or an error, is graded as
+  // an empty prediction: BIRD scores 0, and SWE scores 1/gold speedup without an evaluation run
+  // (spec §4.2). Absent only in a run without gold answers, such as an organizers' run.
   Grade grade = 4;
-  // How long the task took, in seconds, from started_at to finished_at: the wall time the
-  // efficiency rules compare (spec §8.3).
+  // The policy's solving time, in seconds: from receiving its provisioned environment to
+  // returning the prediction. Slot waits, provisioning and grading are left out, so this is the
+  // time the efficiency rules compare (spec §8.3).
   double wall_time_s = 5;
+  // How long provisioning the task's environment took, in seconds: from started_at until the
+  // policy received the environment.
+  double provision_s = 6;
   // The tokens and cost of every model call made for the task.
-  Usage usage = 6;
+  Usage usage = 7;
   // How many steps the agent took.
-  int32 steps = 7;
+  int32 step_count = 8;
   // Why the agent stopped.
-  StopReason stop_reason = 8;
+  StopReason stop_reason = 9;
   // What kind of error ended the task, if any.
-  TaskErrorType error_type = 9;
+  TaskErrorType error_type = 10;
   // The error's message; empty when error_type is TASK_ERROR_TYPE_NONE.
-  string error_message = 10;
-  // When the runner started the task.
-  google.protobuf.Timestamp started_at = 11;
-  // When the policy returned or the task failed. Grading comes after and is not counted.
-  google.protobuf.Timestamp finished_at = 12;
+  string error_message = 11;
+  // When the task got its slot, after any queueing.
+  google.protobuf.Timestamp started_at = 12;
+  // When the policy returned its prediction, or the task failed. Grading has its own timing,
+  // such as SweGrade.eval_wall_s.
+  google.protobuf.Timestamp finished_at = 13;
 }
 
-// What kind of error ended a task.
+// What kind of error ended a task. A grading failure is not one: it shows in the grade, as
+// GRADE_STATUS_GRADER_ERROR.
 enum TaskErrorType {
   // Not set.
   TASK_ERROR_TYPE_UNSPECIFIED = 0;
-  // No error: the task ran to the end, though its grade may still fail it.
+  // No error: stop_reason is STOP_REASON_SUBMITTED, a budget running out, or
+  // STOP_REASON_CONSECUTIVE_ERRORS. The grade may still fail the task.
   TASK_ERROR_TYPE_NONE = 1;
-  // The policy raised an unexpected exception.
+  // The policy raised an unexpected exception; stop_reason is STOP_REASON_CRASHED.
   TASK_ERROR_TYPE_POLICY_CRASH = 2;
-  // The task's environment failed: it could not be provisioned, or it broke during the run.
+  // The task's environment could not be provisioned, or broke during the run; stop_reason is
+  // STOP_REASON_CRASHED.
   TASK_ERROR_TYPE_ENVIRONMENT = 3;
-  // A model call failed after all its retries; its LlmCallRecord says how.
+  // A model call failed after all its retries, as its LlmCallRecord says; stop_reason is
+  // STOP_REASON_CRASHED.
   TASK_ERROR_TYPE_LLM = 4;
-  // The grader failed, so the task has no usable grade.
-  TASK_ERROR_TYPE_GRADER = 5;
-  // The task ran past its time limit and was cancelled. A budget running out is not an error,
-  // but a stop_reason.
-  TASK_ERROR_TYPE_TIMEOUT = 6;
+  // The runner cancelled the whole task at its time limit; stop_reason is
+  // STOP_REASON_CANCELLED. This is about the task: one model call that our code cancelled is
+  // LLM_CALL_STATUS_CANCELLED, and a budget running out is a stop reason, not an error.
+  TASK_ERROR_TYPE_TIMEOUT = 5;
 }

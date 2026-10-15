@@ -28,15 +28,15 @@ from goaly.contracts.gen import trajectory_pb2 as goaly_dot_v1_dot_trajectory__p
 from google.protobuf import timestamp_pb2 as google_dot_protobuf_dot_timestamp__pb2
 
 
-DESCRIPTOR = _descriptor_pool.Default().AddSerializedFile(b'\n\x15goaly/v1/result.proto\x12\x08goaly.v1\x1a\x17goaly/v1/llm_call.proto\x1a\x13goaly/v1/task.proto\x1a\x19goaly/v1/trajectory.proto\x1a\x1fgoogle/protobuf/timestamp.proto\"\xf3\x02\n\nTaskResult\x12\x0e\n\x06run_id\x18\x01 \x01(\t\x12\x13\n\x0binstance_id\x18\x02 \x01(\t\x12\x0c\n\x04seed\x18\x03 \x01(\x05\x12\x1e\n\x05grade\x18\x04 \x01(\x0b\x32\x0f.goaly.v1.Grade\x12\x13\n\x0bwall_time_s\x18\x05 \x01(\x01\x12\x1e\n\x05usage\x18\x06 \x01(\x0b\x32\x0f.goaly.v1.Usage\x12\r\n\x05steps\x18\x07 \x01(\x05\x12)\n\x0bstop_reason\x18\x08 \x01(\x0e\x32\x14.goaly.v1.StopReason\x12+\n\nerror_type\x18\t \x01(\x0e\x32\x17.goaly.v1.TaskErrorType\x12\x15\n\rerror_message\x18\n \x01(\t\x12.\n\nstarted_at\x18\x0b \x01(\x0b\x32\x1a.google.protobuf.Timestamp\x12/\n\x0b\x66inished_at\x18\x0c \x01(\x0b\x32\x1a.google.protobuf.Timestamp*\xdf\x01\n\rTaskErrorType\x12\x1f\n\x1bTASK_ERROR_TYPE_UNSPECIFIED\x10\x00\x12\x18\n\x14TASK_ERROR_TYPE_NONE\x10\x01\x12 \n\x1cTASK_ERROR_TYPE_POLICY_CRASH\x10\x02\x12\x1f\n\x1bTASK_ERROR_TYPE_ENVIRONMENT\x10\x03\x12\x17\n\x13TASK_ERROR_TYPE_LLM\x10\x04\x12\x1a\n\x16TASK_ERROR_TYPE_GRADER\x10\x05\x12\x1b\n\x17TASK_ERROR_TYPE_TIMEOUT\x10\x06\x62\x06proto3')
+DESCRIPTOR = _descriptor_pool.Default().AddSerializedFile(b'\n\x15goaly/v1/result.proto\x12\x08goaly.v1\x1a\x17goaly/v1/llm_call.proto\x1a\x13goaly/v1/task.proto\x1a\x19goaly/v1/trajectory.proto\x1a\x1fgoogle/protobuf/timestamp.proto\"\x8d\x03\n\nTaskResult\x12\x0e\n\x06run_id\x18\x01 \x01(\t\x12\x13\n\x0binstance_id\x18\x02 \x01(\t\x12\x0c\n\x04seed\x18\x03 \x01(\x05\x12\x1e\n\x05grade\x18\x04 \x01(\x0b\x32\x0f.goaly.v1.Grade\x12\x13\n\x0bwall_time_s\x18\x05 \x01(\x01\x12\x13\n\x0bprovision_s\x18\x06 \x01(\x01\x12\x1e\n\x05usage\x18\x07 \x01(\x0b\x32\x0f.goaly.v1.Usage\x12\x12\n\nstep_count\x18\x08 \x01(\x05\x12)\n\x0bstop_reason\x18\t \x01(\x0e\x32\x14.goaly.v1.StopReason\x12+\n\nerror_type\x18\n \x01(\x0e\x32\x17.goaly.v1.TaskErrorType\x12\x15\n\rerror_message\x18\x0b \x01(\t\x12.\n\nstarted_at\x18\x0c \x01(\x0b\x32\x1a.google.protobuf.Timestamp\x12/\n\x0b\x66inished_at\x18\r \x01(\x0b\x32\x1a.google.protobuf.Timestamp*\xc3\x01\n\rTaskErrorType\x12\x1f\n\x1bTASK_ERROR_TYPE_UNSPECIFIED\x10\x00\x12\x18\n\x14TASK_ERROR_TYPE_NONE\x10\x01\x12 \n\x1cTASK_ERROR_TYPE_POLICY_CRASH\x10\x02\x12\x1f\n\x1bTASK_ERROR_TYPE_ENVIRONMENT\x10\x03\x12\x17\n\x13TASK_ERROR_TYPE_LLM\x10\x04\x12\x1b\n\x17TASK_ERROR_TYPE_TIMEOUT\x10\x05\x62\x06proto3')
 
 _globals = globals()
 _builder.BuildMessageAndEnumDescriptors(DESCRIPTOR, _globals)
 _builder.BuildTopDescriptorsAndMessages(DESCRIPTOR, 'goaly.contracts.gen.result_pb2', _globals)
 if not _descriptor._USE_C_DESCRIPTORS:
   DESCRIPTOR._loaded_options = None
-  _globals['_TASKERRORTYPE']._serialized_start=516
-  _globals['_TASKERRORTYPE']._serialized_end=739
+  _globals['_TASKERRORTYPE']._serialized_start=542
+  _globals['_TASKERRORTYPE']._serialized_end=737
   _globals['_TASKRESULT']._serialized_start=142
-  _globals['_TASKRESULT']._serialized_end=513
+  _globals['_TASKRESULT']._serialized_end=539
 # @@protoc_insertion_point(module_scope)

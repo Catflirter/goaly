@@ -75,8 +75,9 @@ class _LlmCallStatusEnumTypeWrapper(_enum_type_wrapper._EnumTypeWrapper[_LlmCall
     LLM_CALL_STATUS_CLIENT_ERROR: _LlmCallStatus.ValueType  # 8
     """Any other 4xx: not 429 and not a context overflow, which LiteLLM also reports as a 400."""
     LLM_CALL_STATUS_CANCELLED: _LlmCallStatus.ValueType  # 9
-    """Our own code cancelled the call, for example when a task's wall-clock budget ran out. The
-    gateway may still have billed it.
+    """Our own code cancelled this one call, for example when a task's wall-clock budget ran out;
+    the gateway may still have billed it. A whole task that the runner cancels is
+    TASK_ERROR_TYPE_TIMEOUT.
     """
 
 class LlmCallStatus(_LlmCallStatus, metaclass=_LlmCallStatusEnumTypeWrapper):
@@ -101,8 +102,9 @@ LLM_CALL_STATUS_INVALID_RESPONSE: LlmCallStatus.ValueType  # 7
 LLM_CALL_STATUS_CLIENT_ERROR: LlmCallStatus.ValueType  # 8
 """Any other 4xx: not 429 and not a context overflow, which LiteLLM also reports as a 400."""
 LLM_CALL_STATUS_CANCELLED: LlmCallStatus.ValueType  # 9
-"""Our own code cancelled the call, for example when a task's wall-clock budget ran out. The
-gateway may still have billed it.
+"""Our own code cancelled this one call, for example when a task's wall-clock budget ran out;
+the gateway may still have billed it. A whole task that the runner cancels is
+TASK_ERROR_TYPE_TIMEOUT.
 """
 Global___LlmCallStatus: _TypeAlias = LlmCallStatus  # noqa: Y015
 
