@@ -2,18 +2,31 @@
 
 - Typing tests: each fake in tests/fakes.py is assigned to a variable typed with its Protocol,
   so ``make typecheck`` proves that it conforms, and is then exercised at runtime.
-- The gRPC-ready rule (acceptance criterion 4): Protocol methods take and return only contract
-  messages and plain values. mypy --strict already requires every annotation to be present.
+- The gRPC-ready rule (acceptance criterion 4): every annotation of every Protocol member is a
+  contract message or a plain value. That covers inherited members, overloads, and property
+  setters and deleters, as well as type parameters' bounds and constraints. One leaky Protocol
+  per kind proves that the guard catches each.
 """
 
 import asyncio
 import inspect
 import json
-from collections.abc import Awaitable, Callable, Iterator, Sequence
+from collections.abc import Awaitable, Callable, Iterator, Sequence, Sized
 from contextlib import AbstractAsyncContextManager
 from pathlib import Path
 from types import NoneType
-from typing import Any, Protocol, TypeVar, assert_type, get_args, get_origin, get_type_hints
+from typing import (
+    Any,
+    Protocol,
+    SupportsAbs,
+    TypeVar,
+    assert_type,
+    get_args,
+    get_origin,
+    get_overloads,
+    get_type_hints,
+    overload,
+)
 
 import pytest
 from google.protobuf.message import Message
@@ -102,36 +115,104 @@ def is_allowed(hint: object, type_params: Sequence[object]) -> bool:
     return is_plain(hint, type_params)
 
 
-def annotations(protocol: type) -> Iterator[tuple[str, object]]:
-    """Yield each annotation of ``protocol``'s own members, after a note of where it is."""
-    owner = protocol.__name__
-    members = vars(protocol)["__protocol_attrs__"]  # What typing.get_protocol_members() reads.
-    for name, value in vars(protocol).items():
-        if name not in members:
+def is_allowed_limit(limit: object) -> bool:
+    """Whether a type parameter may be bound or constrained to ``limit``."""
+    return limit in PROTOCOLS or is_plain(limit, ())
+
+
+def members(protocol: type) -> Iterator[tuple[type, str]]:
+    """Yield each member of ``protocol``, inherited or not, with the class that defines it."""
+    names = vars(protocol)["__protocol_attrs__"]  # What typing.get_protocol_members() reads.
+    found: set[str] = set()
+    for base in protocol.__mro__:
+        for name in (*vars(base), *inspect.get_annotations(base)):
+            if name in names and name not in found:
+                found.add(name)
+                yield base, name
+    assert found == names, f"{protocol.__name__}: no class defines {names - found}"
+
+
+def overloads(owner: type, name: str) -> Sequence[Callable[..., object]]:
+    """The @overload signatures of ``owner.name``, whether it has an implementation or not.
+
+    typing.get_overloads finds them by module and qualified name. Overloads with no
+    implementation leave only typing's unannotated placeholder in the class, so the lookup goes
+    through a stand-in that carries the member's names.
+    """
+
+    def stand_in() -> None: ...
+
+    stand_in.__module__ = owner.__module__
+    stand_in.__qualname__ = f"{owner.__qualname__}.{name}"
+    return get_overloads(stand_in)
+
+
+def functions(owner: type, name: str) -> Iterator[tuple[str, object]]:
+    """Yield each function that makes up the member ``owner.name``, with a label for it.
+
+    A property gives its getter, setter and deleter. An overloaded method gives its overloads,
+    which are its interface; its implementation is not.
+    """
+    value = vars(owner)[name]
+    if isinstance(value, property):
+        for part, function in (("", value.fget), (" setter", value.fset), (" deleter", value.fdel)):
+            if function is not None:
+                yield f"{name}{part}", function
+    elif signatures := overloads(owner, name):
+        for number, function in enumerate(signatures, start=1):
+            yield f"{name} overload {number}", function
+    else:
+        yield name, value
+
+
+def limit_violations(protocol: type) -> Iterator[str]:
+    """Describe each bound or constraint of ``protocol``'s type parameters that breaks the rule."""
+    for param in protocol.__type_params__:
+        if not isinstance(param, TypeVar):
+            continue  # A ParamSpec or TypeVarTuple shows in the annotations that use it.
+        where = f"{protocol.__name__}[{param.__name__}]"
+        if param.__bound__ is not None and not is_allowed_limit(param.__bound__):
+            yield f"{where} is bound to {describe(param.__bound__)}"
+        for constraint in param.__constraints__:
+            if not is_allowed_limit(constraint):
+                yield f"{where} is constrained to {describe(constraint)}"
+
+
+def member_violations(protocol: type) -> Iterator[str]:
+    """Describe each annotation of ``protocol``'s members that breaks the rule.
+
+    A member defined in another of this module's Protocols is checked there. Any other member,
+    even one inherited from outside, is checked against ``protocol``'s own type parameters, so
+    a foreign type variable is reported. Every function needs a return annotation.
+    """
+    owner, type_params = protocol.__name__, protocol.__type_params__
+    for definer, name in members(protocol):
+        if definer is not protocol and definer in PROTOCOLS:
             continue
-        function = value.fget if isinstance(value, property) else value
-        assert inspect.isfunction(function), f"{owner}.{name} is neither a method nor a property"
-        for parameter, hint in get_type_hints(function).items():
-            role = "returns" if parameter == "return" else f"takes {parameter}:"
-            yield f"{owner}.{name} {role}", hint
-    for name, hint in inspect.get_annotations(protocol).items():
-        yield f"{owner}.{name} is", hint
+        if name not in vars(definer):  # An annotation-only data member.
+            hint = inspect.get_annotations(definer)[name]
+            if not is_allowed(hint, type_params):
+                yield f"{owner}.{name} is {describe(hint)}"
+            continue
+        for label, function in functions(definer, name):
+            if not inspect.isfunction(function):
+                yield f"{owner}.{label} is neither a method nor a property"
+                continue
+            hints = get_type_hints(function)
+            for parameter in list(inspect.signature(function).parameters)[1:]:  # Not self.
+                if parameter not in hints:
+                    yield f"{owner}.{label} takes {parameter} with no annotation"
+                elif not is_allowed(hints[parameter], type_params):
+                    yield f"{owner}.{label} takes {parameter}: {describe(hints[parameter])}"
+            if "return" not in hints:
+                yield f"{owner}.{label} has no return annotation"
+            elif not is_allowed(hints["return"], type_params):
+                yield f"{owner}.{label} returns {describe(hints['return'])}"
 
 
 def violations(protocol: type) -> list[str]:
     """Describe each type in ``protocol``'s interface that breaks the gRPC-ready rule."""
-    type_params = protocol.__type_params__
-    found = [
-        f"{protocol.__name__}[{param.__name__}] is bound to {describe(param.__bound__)}"
-        for param in type_params
-        if isinstance(param, TypeVar) and param.__bound__ not in (None, *PROTOCOLS)
-    ]
-    found += [
-        f"{where} {describe(hint)}"
-        for where, hint in annotations(protocol)
-        if not is_allowed(hint, type_params)
-    ]
-    return found
+    return [*limit_violations(protocol), *member_violations(protocol)]
 
 
 def test_the_module_defines_the_seven_protocols_and_nothing_else() -> None:
@@ -152,28 +233,116 @@ def test_protocols_take_and_return_only_contract_messages_and_plain_values(proto
     assert violations(protocol) == DOCUMENTED_EXCEPTIONS.get(protocol.__name__, [])
 
 
-class Leaky[ModelT: BaseModel](Protocol):
-    """Breaks the gRPC-ready rule in each way the rule test must catch."""
+# One Protocol per way to break the gRPC-ready rule, each with the violations the rule must name.
 
-    limit: Any
 
-    async def run(self, model: ModelT, options: dict[str, str]) -> Any: ...
+class LeakyBound[ModelT: BaseModel](Protocol):
+    def get(self) -> ModelT: ...
 
+
+class LeakyConstraint[ValueT: (str, Path)](Protocol):
+    def get(self) -> ValueT: ...
+
+
+class LeakyParameter(Protocol):
+    async def run(self, options: dict[str, str]) -> None: ...
+
+
+class LeakyReturn(Protocol):
+    def run(self) -> Any: ...
+
+
+class LeakyNested(Protocol):
     def rows(self) -> Sequence[Sequence[str]]: ...
 
+
+class LeakyGetter(Protocol):
     @property
     def path(self) -> Path: ...
 
 
-def test_the_rule_names_each_type_that_breaks_it() -> None:
-    assert violations(Leaky) == [
-        "Leaky[ModelT] is bound to BaseModel",
-        "Leaky.run takes options: dict[str, str]",
-        "Leaky.run returns Any",
-        "Leaky.rows returns collections.abc.Sequence[collections.abc.Sequence[str]]",
-        "Leaky.path returns Path",
-        "Leaky.limit is Any",
-    ]
+class LeakySetter(Protocol):
+    @property
+    def name(self) -> str: ...
+
+    @name.setter
+    def name(self, value: Path) -> None: ...
+
+
+class LeakyDeleter(Protocol):
+    @property
+    def name(self) -> str: ...
+
+    @name.deleter
+    def name(self) -> Path: ...
+
+
+class LeakyAttribute(Protocol):
+    limit: Any
+
+
+class LeakyOverload(Protocol):
+    """Without an implementation, the class holds only typing's placeholder."""
+
+    @overload
+    def fetch(self, key: str) -> str: ...
+
+    @overload
+    def fetch(self, key: int) -> Path: ...
+
+
+class LeakyImplementedOverload(Protocol):
+    """The overloads are the interface; the implementation's wider types are not."""
+
+    @overload
+    def fetch(self, key: str) -> str: ...
+
+    @overload
+    def fetch(self, key: int) -> Path: ...
+
+    def fetch(self, key: str | int) -> str | Path: ...
+
+
+class LeakyForeignMember(SupportsAbs[Path], Protocol):
+    """Inherits __abs__ from typing, which returns SupportsAbs's own type variable."""
+
+
+class LeakyUnannotated(Sized, Protocol):
+    """Inherits __len__ from collections.abc, which has no annotations at runtime."""
+
+
+LEAKS: list[tuple[type, list[str]]] = [
+    (LeakyBound, ["LeakyBound[ModelT] is bound to BaseModel"]),
+    (LeakyConstraint, ["LeakyConstraint[ValueT] is constrained to Path"]),
+    (LeakyParameter, ["LeakyParameter.run takes options: dict[str, str]"]),
+    (LeakyReturn, ["LeakyReturn.run returns Any"]),
+    (
+        LeakyNested,
+        ["LeakyNested.rows returns collections.abc.Sequence[collections.abc.Sequence[str]]"],
+    ),
+    (LeakyGetter, ["LeakyGetter.path returns Path"]),
+    (LeakySetter, ["LeakySetter.name setter takes value: Path"]),
+    (LeakyDeleter, ["LeakyDeleter.name deleter returns Path"]),
+    (LeakyAttribute, ["LeakyAttribute.limit is Any"]),
+    (LeakyOverload, ["LeakyOverload.fetch overload 2 returns Path"]),
+    (LeakyImplementedOverload, ["LeakyImplementedOverload.fetch overload 2 returns Path"]),
+    (LeakyForeignMember, ["LeakyForeignMember.__abs__ returns T"]),
+    (LeakyUnannotated, ["LeakyUnannotated.__len__ has no return annotation"]),
+]
+
+
+@pytest.mark.parametrize(
+    ("protocol", "expected"), LEAKS, ids=[protocol.__name__ for protocol, _ in LEAKS]
+)
+def test_the_rule_names_each_kind_of_leak(protocol: type, expected: list[str]) -> None:
+    assert violations(protocol) == expected
+
+
+def test_json_value_holds_only_the_json_types() -> None:
+    # The rule allows JsonValue by name, so widening it would widen the rule.
+    assert JsonValue.__value__ == (
+        dict[str, JsonValue] | list[JsonValue] | str | int | float | bool | None
+    )
 
 
 def test_fake_environment_closes_and_closing_again_does_nothing() -> None:
