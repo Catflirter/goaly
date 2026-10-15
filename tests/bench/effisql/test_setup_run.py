@@ -345,11 +345,12 @@ class TestSummarize:
         summary = summarize(list(records), records, val=VAL)
         assert summary.identity_failures == {}
 
-    def test_the_stop_rule_allows_up_to_10_percent(self) -> None:
-        records = {str(i): record(str(i)) for i in range(1, 11)}
+    def test_the_stop_rule_allows_up_to_25_percent(self) -> None:
+        records = {str(i): record(str(i)) for i in range(1, 9)}
         records["1"] = record("1", gold=gold(speedup=1.0))
-        assert not summarize(list(records), records, val=[]).stop
         records["2"] = record("2", gold=gold(speedup=1.0))
+        assert not summarize(list(records), records, val=[]).stop  # 2 of 8 is 25%.
+        records["3"] = record("3", gold=gold(speedup=1.0))
         assert summarize(list(records), records, val=[]).stop
 
     def test_reviewed_exclusions_are_merged_and_counted(self) -> None:
@@ -401,7 +402,7 @@ def test_manual_exclusions_load_from_their_file(tmp_path: Path) -> None:
 
 
 def test_the_committed_manual_exclusions_file_is_valid() -> None:
-    assert [e.instance_id for e in load_manual_exclusions()] == ["93"]
+    assert [e.instance_id for e in load_manual_exclusions()] == ["93", "94"]
 
 
 def test_grade_summary_of_a_grade() -> None:
@@ -690,7 +691,7 @@ class TestRulingsOfTheTail:
 
     def test_exclusions_are_counted_by_reason_and_split(self) -> None:
         records = {str(i): record(str(i)) for i in range(1, 21)}
-        records["1"] = record("1", gold=gold(speedup=1.1))
+        records["1"] = record("1", gold=gold(speedup=1.1))  # 2 of 20 excluded.
         records["2"] = record("2", base=None, gold=None, base_failure="x", base_timed_out=True)
         splits = {"1": "train", "2": "heldout"}
         summary = summarize(list(records), records, val=[], splits=splits)
