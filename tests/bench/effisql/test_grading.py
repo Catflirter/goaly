@@ -6,7 +6,13 @@ from typing import Any
 
 import pytest
 
-from goaly.bench.effisql.grader import LONG_RUN_MS, GraderError, QueryError, QueryTimeoutError
+from goaly.bench.effisql.grader import (
+    LONG_RUN_MS,
+    GraderError,
+    QueryError,
+    QueryTimeoutError,
+    ResourceError,
+)
 from goaly.bench.effisql.grading import (
     BaseCache,
     Mode,
@@ -542,3 +548,37 @@ def test_evaluate_hands_out_the_plan_it_took(cache: BaseCache) -> None:
         plans=nothing,
     )
     assert nothing == []
+
+
+class TestOutOfResources:
+    """The re-review's I-3: SQLSTATE class 53 on the prediction, after its one retry."""
+
+    def grade(self, main: FakeSession, *, final: bool, mode: Mode = Mode.OFFICIAL) -> Grade:
+        return evaluate(
+            sessions(main, alt_session()),
+            INST,
+            PRED,
+            mode,
+            cache=None,
+            rng=random.Random(0),  # noqa: S311  # Reproducible order.
+            final_attempt=final,
+        )
+
+    def test_the_first_attempt_is_a_grader_error_to_retry(self) -> None:
+        main = main_session(pred_rows=ResourceError("the server ran out of resources: shm"))
+        assert self.grade(main, final=False).status == GRADE_STATUS_GRADER_ERROR
+
+    def test_the_final_attempt_fails_the_prediction(self) -> None:
+        main = main_session(pred_rows=ResourceError("the server ran out of resources: shm"))
+        grade = self.grade(main, final=True)
+        assert grade.status == GRADE_STATUS_PREDICTION_FAILED
+        assert grade.score == 0
+        assert "ran out of resources" in grade.feedback
+
+    def test_running_out_in_the_predictions_timing_fails_it_too(self) -> None:
+        main = main_session(pred_times=[ResourceError("out of memory")])
+        assert self.grade(main, final=True).status == GRADE_STATUS_PREDICTION_FAILED
+
+    def test_running_out_on_the_base_stays_the_graders(self) -> None:
+        main = main_session(base_rows=ResourceError("out of memory"))
+        assert self.grade(main, final=True).status == GRADE_STATUS_GRADER_ERROR
