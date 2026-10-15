@@ -5,6 +5,9 @@ T18's labels) and its worktrees, then checks, in order:
 
 - Docker answers;
 - the sandbox image exists, built from the current Dockerfile (built now if it is not);
+- the hard-coding guard's gold-windows store (T18) exists and loads. It is built once, outside
+  the repository, by ``python -m goaly.rsi.guards.gold_windows --dataset <effi-sql-pg.jsonl>
+  --schema <schema_snapshot.json>``; without it the lane's wiring fails at every start;
 - the model gateway answers ``GET /models`` with the key;
 - PostgreSQL: T09's ``SolvingPool.preflight()`` on the solving instances;
 - the repository's disk has room.
@@ -26,6 +29,7 @@ from pydantic import BaseModel, ConfigDict, Field
 
 from goaly.contracts.gen.experiment_pb2 import Lane
 from goaly.harness.core.settings import Settings, load_settings
+from goaly.rsi.guards.gold_windows import DEFAULT_STORE, GoldWindows
 from goaly.rsi.resume import remove_worktrees
 from goaly.rsi.sandbox import SandboxConfig, ensure_image, remove_containers
 from goaly.rsi.workspace import Workspace
@@ -35,6 +39,7 @@ __all__ = [
     "check_disk",
     "check_docker",
     "check_gateway",
+    "check_gold_windows",
     "check_lane",
     "check_postgres",
     "cleanup",
@@ -92,6 +97,24 @@ def check_image(repo: Path) -> str | None:
         ensure_image(repo)
     except Exception as error:  # noqa: BLE001  (any failure is a failed start)
         return f"the sandbox image is not ready: {type(error).__name__}"
+    return None
+
+
+_BUILD_GOLD = (
+    "python -m goaly.rsi.guards.gold_windows --dataset <effi-sql-pg.jsonl> "
+    "--schema <schema_snapshot.json>"
+)
+
+
+def check_gold_windows(path: Path = DEFAULT_STORE) -> str | None:
+    """Check that the gold-windows store loads; the problem says how to build it."""
+    try:
+        GoldWindows.load(path)
+    except FileNotFoundError:
+        return f"the gold windows store {path} is missing: build it with `{_BUILD_GOLD}`"
+    except (OSError, ValueError) as error:
+        # load()'s messages name the file and the problem, never a window.
+        return f"the gold windows store is not usable ({error}): rebuild it with `{_BUILD_GOLD}`"
     return None
 
 
@@ -161,6 +184,7 @@ def check_lane(
             ("cleanup", lambda: cleanup(lane, repo, worktree_root)),
             ("docker", lambda: check_docker(timeout_s=config.docker_timeout_s)),
             ("image", lambda: check_image(repo)),
+            ("gold windows", check_gold_windows),
             ("gateway", gateway),
             ("postgres", lambda: check_postgres(config.postgres_timeout_s)),
             ("disk", lambda: check_disk(repo, config.min_free_gb)),
