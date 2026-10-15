@@ -31,6 +31,17 @@ pytestmark = pytest.mark.integration
 
 REPO_ROOT = Path(__file__).resolve().parents[2]
 
+# socket(2) with a family whose high bits are set and whose low 32 bits are AF_INET: the kernel
+# reads only the low bits, so the profile must refuse it (x86_64's syscall number 41).
+HIGH_BIT_SOCKET = (
+    "import ctypes, errno\n"
+    "libc = ctypes.CDLL(None, use_errno=True)\n"
+    "family = ctypes.c_long((1 << 32) | 2)\n"
+    "fd = libc.syscall(ctypes.c_long(41), family, ctypes.c_long(1), ctypes.c_long(0))\n"
+    "refused = fd == -1 and ctypes.get_errno() == errno.EPERM\n"
+    "print('high-bit family', 'refused' if refused else f'opened {fd}')\n"
+)
+
 
 @pytest.fixture(scope="module")
 def image() -> str:
@@ -226,7 +237,9 @@ def test_the_implementer_sandbox_cannot_open_a_tcp_socket(image: str, worktree: 
         "    print('tcp refused')\n"
     )
 
-    result = run(image, worktree, f"python -c {shlex.quote(code)}", writable_packs=True)
+    script = shlex.quote(code + HIGH_BIT_SOCKET)
+    result = run(image, worktree, f"python -c {script}", writable_packs=True)
 
     assert result.exit_code == 0, result.output
     assert "tcp refused" in result.output
+    assert "high-bit family refused" in result.output
