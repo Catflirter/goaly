@@ -12,7 +12,8 @@ so its capacity can drop at any moment, and each model's limit adapts below the 
   it. A 500 or a connection error is a failure, not congestion: it lowers nothing.
 - Circuit breaker. When more than half of a model's attempts in the last 2 minutes failed (429,
   5xx, timeout or connection error), no new attempt starts for 60 s; the breaker then judges
-  afresh. A retry is a new attempt, so it waits too, while requests already sent run on.
+  afresh, on attempts sent after it opened only. A retry is a new attempt, so it waits too,
+  while requests already sent run on.
 
 Each change of a limit, and each opening and closing of a breaker, is logged with the model and
 the purpose of the call that caused it.
@@ -119,6 +120,7 @@ class ModelThrottle:
         self._halved_at = -math.inf
         self._window: deque[tuple[float, bool]] = deque()  # When recent attempts ended; failed?
         self._failures = 0  # In the window.
+        self._opened_at = -math.inf
         self._open_until = -math.inf
         self._opened = False  # Open, or past its open period but not yet logged as closed.
 
@@ -155,7 +157,7 @@ class ModelThrottle:
         """Take in how an attempt sent at ``sent_at`` ended: feed AIMD and the breaker."""
         now = self._clock.monotonic()
         failed = status in TRANSIENT_FAILURES
-        self._judge(failed, now, record)
+        self._judge(failed, sent_at, now, record)
         if failed:
             self._successes = 0  # Any failure ends the run of successes.
             congested = status == _S.LLM_CALL_STATUS_TIMEOUT or (
@@ -238,9 +240,11 @@ class ModelThrottle:
         )
         self._wake()
 
-    def _judge(self, failed: bool, now: float, record: LlmCallRecord) -> None:
+    def _judge(self, failed: bool, sent_at: float, now: float, record: LlmCallRecord) -> None:
         """Count an attempt that just ended, and open the breaker if too many failed."""
         self._close_if_due(now, record)
+        if sent_at <= self._opened_at:  # It went out before the breaker last opened.
+            return
         self._window.append((now, failed))
         self._failures += failed
         horizon = now - self._policy.breaker_window_s
@@ -251,9 +255,10 @@ class ModelThrottle:
         if (
             now < self._open_until
             or attempts < self._policy.breaker_min_attempts
-            or self._failures <= self._policy.breaker_failure_ratio * attempts
+            or self._failures / attempts <= self._policy.breaker_failure_ratio
         ):
             return
+        self._opened_at = now
         self._open_until = now + self._policy.breaker_open_s
         self._opened = True
         _logger.warning(

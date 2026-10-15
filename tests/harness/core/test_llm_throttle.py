@@ -531,6 +531,48 @@ async def test_closes_after_its_open_period_and_judges_afresh() -> None:
         assert clock.sleeps == [60.0, 60.0]
 
 
+async def test_attempts_sent_before_it_opened_do_not_count_toward_its_next_judgement(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    clock = FakeClock()
+    limiter = new_throttle(share=20, clock=clock)
+    done, entered = asyncio.Event(), list[int]()
+    held = [asyncio.create_task(hold(limiter, done, entered, n)) for n in range(10)]
+    await settle()
+    held_sent = clock.now  # Ten attempts in flight, sent at t=100.
+    clock.now += 1.0
+    fail(limiter, clock, 10)  # Ten others, sent at t=101, open the breaker.
+
+    for _ in range(10):  # The held ones fail too, while it is open.
+        observe(limiter, SERVER_ERROR, 500, held_sent)
+    done.set()
+    await asyncio.gather(*held)
+    async with limiter.slot(RECORD):  # Waits out the 60 s.
+        pass
+    succeed(limiter, clock, 1)  # A fresh success, judged on its own.
+    async with limiter.slot(RECORD):
+        pass
+
+    assert clock.sleeps == [60.0]
+    assert len(events(caplog, "llm_breaker_open")) == 1
+
+
+async def test_failures_reported_while_it_is_open_extend_nothing(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    clock = FakeClock()
+    limiter = new_throttle(clock=clock)
+    fail(limiter, clock, 10)  # Opens at t=100, until t=160.
+    clock.now += 0.5
+    fail(limiter, clock, 10)  # Enough to open it again, but it is open already.
+
+    async with limiter.slot(RECORD):
+        pass
+
+    assert clock.sleeps == [59.5]  # Until t=160, not t=160.5.
+    assert len(events(caplog, "llm_breaker_open")) == 1
+
+
 async def test_calls_in_flight_finish_while_it_is_open() -> None:
     clock = FakeClock()
     limiter = new_throttle(share=2, clock=clock)
