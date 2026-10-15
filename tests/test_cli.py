@@ -29,13 +29,14 @@ def test_the_console_script_runs_the_goaly_command() -> None:
 
     assert completed.returncode == 0, completed.stderr
     assert "--bench" in completed.stdout
-    assert "--phase" in completed.stdout
+    assert "--phase {solve,grade,all}" in completed.stdout  # Not --budget-phase.
+    assert "--budget-phase" in completed.stdout
 
 
 def test_main_runs_goaly_run_with_the_registered_harnesses(
     monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str], tmp_path: Path
 ) -> None:
-    argv = ["goaly", "run", "--bench", "effisql", "--split", "val", "--phase", "rsi"]
+    argv = ["goaly", "run", "--bench", "effisql", "--split", "val", "--budget-phase", "rsi"]
     monkeypatch.setattr(sys, "argv", [*argv, "--out", str(tmp_path / "run")])
 
     status = cli.main()

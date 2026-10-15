@@ -5,6 +5,13 @@ with. The composition root (``goaly.cli``) registers each harness under its benc
 its own: T11 registers Effi-SQL's v0 pack, and tests register the toy benchmark. Adding a
 benchmark registers it here; core does not change (spec §3.3).
 
+A benchmark also has a host side, which the composition root registers with add_benchmark(): a
+HostBenchmark, the benchmark adapter alone, with the launcher of its isolated solve phase
+(spec §6.1, V27). The host plans and grades a run with it, and never imports pack code, so a
+harness factory imports its pack's modules inside itself, never at the top of the module that
+registers it. What the host needs to know of a harness, its pack's directory and its models, is
+therefore given when the harness is registered, not by its factory.
+
 A harness factory is an async context manager, so it owns what the harness needs for the run,
 such as the LLM client and the writer of the run's LLM call log, and closes them after it. It
 binds the harness's types, the benchmark's instance and environment and the policy's context,
@@ -21,6 +28,8 @@ from goaly.contracts.gen.manifest_pb2 import ModelSettings, RunManifest
 from goaly.contracts.gen.task_pb2 import Split
 from goaly.contracts.interfaces import Benchmark, Environment, Instance, Policy
 from goaly.harness.core.eval_cache import EvalCache
+from goaly.harness.core.grading import HostRunner, SolveOptions
+from goaly.harness.core.isolation import SolveLauncher
 from goaly.harness.core.runner import (
     ContextFactory,
     ErrorClassifier,
@@ -36,9 +45,15 @@ __all__ = [
     "Harness",
     "HarnessFactory",
     "HarnessOptions",
+    "HostBenchmark",
+    "HostFactory",
+    "HostOptions",
+    "RegisteredHarness",
     "Registry",
     "RegistryError",
     "RunnableHarness",
+    "RunnableHost",
+    "RunsHost",
     "RunsTasks",
 ]
 
@@ -49,15 +64,31 @@ class RegistryError(LookupError):
 
 @dataclass(frozen=True)
 class HarnessOptions:
-    """What `goaly run` gives a harness factory."""
+    """What `goaly run` gives a harness factory: in the solve container, or with --in-process."""
 
-    # The run's directory. The LLM call log belongs in files.llm_calls.
+    # The run's directory: in the container, the solve directory. The LLM call log belongs in
+    # files.llm_calls.
     files: RunFiles
     # The organizers' task file (--instances), for the adapter's SPLIT_EXTERNAL; or None.
     instances_file: Path | None
     # This process's share of each model's concurrency budget (llm_budgets); a model with no
     # share must not be called. The LLM client enforces it.
     llm_shares: Mapping[str, int]
+    # The split the run's tasks come from; SPLIT_EXTERNAL for --instances. It sets the grading
+    # mode of a benchmark whose mode depends on it.
+    split: Split.ValueType
+    # The schedule's phase whose concurrency shares apply (--budget-phase), as a benchmark may
+    # order its own work by it; None if the command named none.
+    budget_phase: str | None
+    # True in the solve container (--in-container), where the LLM and the databases are reached
+    # as the container's environment says.
+    in_container: bool = False
+    # In the solve container, the read-only directory of inputs its benchmark's launcher staged
+    # (--inputs); None elsewhere.
+    inputs_dir: Path | None = None
+    # How --in-process grades: as HostOptions's.
+    grading_priority: str | None = None
+    grading_instances: str = "grading"
 
 
 class RunsTasks(Protocol):
@@ -74,6 +105,8 @@ class RunsTasks(Protocol):
         resume: bool = False,
         retry_errors: bool = False,
         lock: RunLock | None = None,
+        grading: bool = True,
+        tasks: Collection[tuple[str, int]] | None = None,
     ) -> RunSummary:
         """Run the tasks and record them, as Runner.run does."""
 
@@ -84,14 +117,6 @@ class RunnableHarness(Protocol):
     @property
     def benchmark_name(self) -> str:
         """The benchmark adapter's name."""
-
-    @property
-    def pack_dir(self) -> Path | None:
-        """The pack's directory, which the harness hash covers with core."""
-
-    @property
-    def models(self) -> Sequence[ModelSettings]:
-        """The settings of every model the pack calls."""
 
     @property
     def gold_sha256(self) -> str:
@@ -115,16 +140,10 @@ class Harness[InstanceT: Instance, EnvT: Environment, CtxT: TaskContext]:
     policy: Policy[EnvT, CtxT]
     contexts: ContextFactory[InstanceT, CtxT]
     classify: ErrorClassifier = classify_error
-    # The pack's directory, for the harness hash; None for a harness without one, such as a test's.
-    pack_dir: Path | None = None
-    # The settings of every model the pack calls, for the manifest.
-    models: tuple[ModelSettings, ...] = ()
-    # The SHA-256, in hex, of the gold-answer files its grader uses that are not part of the
-    # dataset, for the manifest; empty if there are none. The dataset's own fields come from the
-    # benchmark's manifest_fields() alone.
+    # For --in-process, which grades with this harness's benchmark: as HostBenchmark's, the
+    # SHA-256 of the gold-answer files outside the dataset, and the grading identity that keys
+    # the evaluation cache. The two must equal the benchmark's HostBenchmark's.
     gold_sha256: str = ""
-    # The grading identity of its runs, which keys its evaluation cache (EvalCache's namespace),
-    # such as f"{mode}-{bench_fingerprint}"; empty if it cannot use a cache.
     cache_namespace: str = ""
 
     @property
@@ -151,29 +170,173 @@ class Harness[InstanceT: Instance, EnvT: Environment, CtxT: TaskContext]:
 type HarnessFactory = Callable[[HarnessOptions], AbstractAsyncContextManager[RunnableHarness]]
 
 
+@dataclass(frozen=True)
+class HostOptions:
+    """What `goaly run`, on the host, gives a benchmark's host factory."""
+
+    # The run's directory on the host.
+    files: RunFiles
+    # The organizers' task file (--instances), for the adapter's SPLIT_EXTERNAL; or None.
+    instances_file: Path | None
+    # As HarnessOptions.split; on --phase grade, the run's, from its manifest.
+    split: Split.ValueType
+    # As HarnessOptions.budget_phase.
+    budget_phase: str | None
+    # The priority of the run's grading among the grader's work (--grading-priority), such as
+    # "smoke"; None for the one its split and budget phase give. The benchmark checks the name.
+    grading_priority: str | None = None
+    # Which database instances grade (--grading-instances): "grading", those kept for it, or
+    # "all", the solving ones too, while no solve phase uses them.
+    grading_instances: str = "grading"
+
+
+class RunsHost(Protocol):
+    """A HostRunner, whatever its types."""
+
+    async def run(
+        self,
+        run_dir: Path,
+        manifest: RunManifest,
+        *,
+        split: Split.ValueType,
+        seeds: list[int],
+        instance_ids: Collection[str] | None,
+        solve: SolveOptions,
+        resume: bool = False,
+        retry_errors: bool = False,
+        lock: RunLock | None = None,
+        grading: bool = True,
+    ) -> RunSummary:
+        """Solve the run in the container, then grade it, as HostRunner.run does."""
+
+    async def grade(
+        self, run_dir: Path, *, lock: RunLock | None = None, retry_errors: bool = False
+    ) -> RunSummary:
+        """Grade the run's solved tasks, as HostRunner.grade does."""
+
+
+class RunnableHost(Protocol):
+    """A HostBenchmark, whatever its types: what the host side of a run needs."""
+
+    @property
+    def benchmark_name(self) -> str:
+        """The benchmark adapter's name."""
+
+    @property
+    def cache_namespace(self) -> str:
+        """The grading identity the evaluation cache is kept under; empty for none."""
+
+    @property
+    def gold_sha256(self) -> str:
+        """The SHA-256 of the gold-answer files outside the dataset; empty if there are none."""
+
+    @property
+    def launcher(self) -> SolveLauncher | None:
+        """The launcher of the benchmark's isolated solve phase; None if it has none."""
+
+    def host_runner(self, *, cache: EvalCache | None) -> RunsHost:
+        """Return the host side of this benchmark's runs, with this cache."""
+
+
+@dataclass(frozen=True)
+class HostBenchmark[InstanceT: Instance, EnvT: Environment]:
+    """A benchmark's trusted host side: its adapter alone, which loads no pack code, and the
+    launcher of its isolated solve phase (spec §6.1, V27).
+
+    The host plans a run with it, takes the cached evaluations, has ``launcher`` solve the rest
+    in the solve container, and grades every task.
+    """
+
+    benchmark: Benchmark[InstanceT, EnvT]
+    # The grading identity of the benchmark's runs, which keys the evaluation cache (EvalCache's
+    # namespace), such as f"{mode}-{bench_fingerprint}"; empty if they cannot use a cache.
+    cache_namespace: str = ""
+    # The SHA-256, in hex, of the gold-answer files its grader uses that are not part of the
+    # dataset, for the manifest; empty if there are none. The dataset's own fields come from
+    # the benchmark's manifest_fields() alone.
+    gold_sha256: str = ""
+    # Runs the isolated solve phase of a run's tasks (isolation.SolveRequest); None for a
+    # benchmark that has none, which only --in-process can run.
+    launcher: SolveLauncher | None = None
+
+    @property
+    def benchmark_name(self) -> str:
+        """The benchmark adapter's name."""
+        return self.benchmark.name
+
+    def host_runner(self, *, cache: EvalCache | None) -> HostRunner[InstanceT, EnvT]:
+        """Return the host side of this benchmark's runs, with this cache."""
+        return HostRunner(self.benchmark, launcher=self.launcher, cache=cache)
+
+
+# Opens a benchmark's host side for one run, and closes what it holds when the run is over.
+type HostFactory = Callable[[HostOptions], AbstractAsyncContextManager[RunnableHost]]
+
+
+@dataclass(frozen=True)
+class RegisteredHarness:
+    """A harness as it is registered: what the host knows of it without importing its pack."""
+
+    name: str
+    factory: HarnessFactory
+    # The pack's directory, which the harness hash covers with core; None for a harness without
+    # one, such as a test's.
+    pack_dir: Path | None = None
+    # The settings of every model the pack calls, for the manifest.
+    models: tuple[ModelSettings, ...] = ()
+
+
 class Registry:
     """The harnesses `goaly run` can run, by benchmark name, then by harness name."""
 
     def __init__(self) -> None:
-        self._harnesses: dict[str, dict[str, HarnessFactory]] = {}
+        self._harnesses: dict[str, dict[str, RegisteredHarness]] = {}
+        self._hosts: dict[str, HostFactory] = {}
 
-    def add(self, benchmark: str, harness: str, factory: HarnessFactory) -> None:
-        """Register ``factory`` as ``benchmark``'s harness ``harness``, a name it has once."""
+    def add(
+        self,
+        benchmark: str,
+        harness: str,
+        factory: HarnessFactory,
+        *,
+        pack_dir: Path | None = None,
+        models: Sequence[ModelSettings] = (),
+    ) -> None:
+        """Register ``factory`` as ``benchmark``'s harness ``harness``, a name it has once.
+
+        ``pack_dir`` is the directory of the pack it runs, and ``models`` the settings of every
+        model the pack calls: the host hashes the one and records the other without importing
+        the pack.
+        """
         harnesses = self._harnesses.setdefault(benchmark, {})
         if harness in harnesses:
             raise ValueError(f"{benchmark!r} already has a harness {harness!r}")
-        harnesses[harness] = factory
+        harnesses[harness] = RegisteredHarness(harness, factory, pack_dir, tuple(models))
+
+    def add_benchmark(self, benchmark: str, factory: HostFactory) -> None:
+        """Register ``factory`` as the host side of ``benchmark``, which has one."""
+        if benchmark in self._hosts:
+            raise ValueError(f"{benchmark!r} already has a host side")
+        self._hosts[benchmark] = factory
+
+    def host(self, benchmark: str) -> HostFactory:
+        """Return the factory of ``benchmark``'s host side, or raise RegistryError."""
+        if benchmark not in self._hosts:
+            known = ", ".join(sorted(self._hosts))
+            there = f"the benchmarks that have one are: {known}" if known else "none has one"
+            raise RegistryError(f"no host side for the benchmark {benchmark!r}; {there}")
+        return self._hosts[benchmark]
 
     def benchmarks(self) -> list[str]:
-        """The benchmarks registered, in name order."""
+        """The benchmarks registered with a harness, in name order."""
         return sorted(self._harnesses)
 
     def harnesses(self, benchmark: str) -> list[str]:
         """The names of ``benchmark``'s harnesses, in order."""
         return sorted(self._registered(benchmark))
 
-    def factory(self, benchmark: str, harness: str | None) -> HarnessFactory:
-        """Return the factory of ``benchmark``'s harness ``harness``.
+    def harness(self, benchmark: str, harness: str | None) -> RegisteredHarness:
+        """Return ``benchmark``'s harness ``harness``, as it was registered.
 
         Without a name, return the benchmark's only harness. Raise RegistryError, listing the
         names there are, if there is no such benchmark or harness, or no name for several.
@@ -190,7 +353,7 @@ class Registry:
             )
         return harnesses[harness]
 
-    def _registered(self, benchmark: str) -> dict[str, HarnessFactory]:
+    def _registered(self, benchmark: str) -> dict[str, RegisteredHarness]:
         if benchmark not in self._harnesses:
             known = ", ".join(self.benchmarks())
             there = f"the benchmarks are: {known}" if known else "none is registered"
