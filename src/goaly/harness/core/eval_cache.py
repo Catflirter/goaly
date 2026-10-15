@@ -6,9 +6,11 @@ task anew; RSI's screening and resumed experiments rely on this (spec §8.2, §8
 is the task's TaskResult and its Trajectory, which holds the prediction.
 
 The key's task is the benchmark's name, the instance's ID and a digest of the agent's input, so
-an instance whose input has changed, say after a dataset fix, gets no stale evaluation. The
-benchmark's grading is not part of the key: bench is frozen while RSI runs (spec §8.1), and a run
-that grades differently, such as in official mode, uses a cache directory of its own.
+an instance whose input has changed, say after a dataset fix, gets no stale evaluation. How the
+benchmark grades is not part of the key: bench is frozen while RSI runs (spec §8.1). So runs that
+grade differently use separate cache directories: dev-mode and official-mode runs never share
+one (the wiring, T10 and T11, configures them). Runs on SPLIT_EXTERNAL bypass the cache, since
+an organizer's instance IDs may collide with ours.
 
 Each entry is one JSON file, under a directory named for its harness hash, which a write
 replaces atomically (spec §6.2): readers never see part of an entry, and concurrent writers of
