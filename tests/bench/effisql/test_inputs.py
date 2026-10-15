@@ -372,7 +372,9 @@ def test_a_file_plan_shows_only_its_root_node(plan: JsonValue) -> None:
     assert task_input.effisql.base_plan == json.dumps(BASE_PLAN, indent=2)
 
 
-@pytest.mark.parametrize("entry", ["42", "[]", '[{"Plan": []}]', '{"Plan": {}}'])
+@pytest.mark.parametrize(
+    "entry", ["42", "[]", '[{"Plan": []}]', '{"Plan": {}}', "null", "Seq Scan on orders"]
+)
 def test_a_cached_plan_that_is_not_a_plan_is_an_error(entry: str) -> None:
     # load_plans rejects such an entry; a mapping built some other way still gets a clear error.
     with pytest.raises(ValueError, match=r"^task 7 has a base plan that is not a query plan$"):

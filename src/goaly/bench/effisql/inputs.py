@@ -219,8 +219,15 @@ def agent_input(
 
 def _base_plan(inst: EffiSqlInstance, plans: Mapping[str, str]) -> str:
     cached = plans.get(inst.instance_id)
-    plan: JsonValue = json.loads(cached) if cached is not None else inst.base_explain_analyze
-    if plan is None:
+    plan: JsonValue
+    if cached is not None:
+        try:
+            plan = json.loads(cached)
+        except ValueError:
+            plan = None  # Not JSON: _root_node rejects it, naming the task.
+    elif inst.base_explain_analyze is not None:
+        plan = inst.base_explain_analyze
+    else:
         raise ValueError(
             f"task {inst.instance_id} has no base plan: plans.json has no entry for it, and its "
             "task file has no base_explain_analyze"
