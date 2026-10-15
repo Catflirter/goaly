@@ -71,7 +71,9 @@ class _GradeStatusEnumTypeWrapper(_enum_type_wrapper._EnumTypeWrapper[_GradeStat
     GRADE_STATUS_GRADED: _GradeStatus.ValueType  # 1
     """The grader evaluated the prediction."""
     GRADE_STATUS_PREDICTION_FAILED: _GradeStatus.ValueType  # 2
-    """The prediction failed to run (Effi-SQL: the query raised an error) or to apply (SWE)."""
+    """The prediction failed to run (Effi-SQL: the query raised an error or was refused, e.g. a plan
+    that modifies data) or to apply (SWE).
+    """
     GRADE_STATUS_TIMEOUT: _GradeStatus.ValueType  # 3
     """The prediction ran past the grader's time limit."""
     GRADE_STATUS_GRADER_ERROR: _GradeStatus.ValueType  # 4
@@ -87,7 +89,9 @@ GRADE_STATUS_UNSPECIFIED: GradeStatus.ValueType  # 0
 GRADE_STATUS_GRADED: GradeStatus.ValueType  # 1
 """The grader evaluated the prediction."""
 GRADE_STATUS_PREDICTION_FAILED: GradeStatus.ValueType  # 2
-"""The prediction failed to run (Effi-SQL: the query raised an error) or to apply (SWE)."""
+"""The prediction failed to run (Effi-SQL: the query raised an error or was refused, e.g. a plan
+that modifies data) or to apply (SWE).
+"""
 GRADE_STATUS_TIMEOUT: GradeStatus.ValueType  # 3
 """The prediction ran past the grader's time limit."""
 GRADE_STATUS_GRADER_ERROR: GradeStatus.ValueType  # 4
@@ -150,8 +154,10 @@ class EffiSqlTaskInput(_message.Message):
     schema: _builtins.str
     """The database's DDL, row counts and indexes, as text."""
     base_plan: _builtins.str
-    """The base query's plan, as JSON text: the task file's base_explain_analyze when it has one,
-    otherwise our own EXPLAIN (FORMAT JSON).
+    """The base query's plan, as JSON text: our plans.json entry for the task when there is one,
+    otherwise the task file's base_explain_analyze. plans.json holds our own EXPLAIN (FORMAT
+    JSON) for the tasks whose file has no plan and for those whose plan was recorded at another
+    scale (spec §4.1).
     """
     difficulty: _builtins.str
     """The dataset's difficulty label: easy, medium or hard."""
@@ -320,13 +326,13 @@ class Grade(_message.Message):
     instance_id: _builtins.str
     """The task graded."""
     score: _builtins.float
-    """The score: Effi-SQL the R-VES credit (EffiSqlGrade.credit); SWE SR_i (spec §4.2), already
+    """The score: Effi-SQL the checked credit (EffiSqlGrade.credit); SWE SR_i (spec §4.2), already
     floored at 0.001.
     """
     correct: _builtins.bool
-    """Effi-SQL: EffiSqlGrade.matched, alt_matched not false and literal_result not true. SWE: the
-    patch applied and the tests passed, never for an empty patch. Never true unless status is
-    GRADE_STATUS_GRADED.
+    """Effi-SQL: EffiSqlGrade.matched, and no check against hard-coded results flagged the
+    prediction: alt_matched not false and literal_result not true. SWE: the patch applied and the
+    tests passed, never for an empty patch. Never true unless status is GRADE_STATUS_GRADED.
     """
     status: Global___GradeStatus.ValueType
     """How grading went."""
@@ -364,9 +370,10 @@ Global___Grade: _TypeAlias = Grade  # noqa: Y015
 @_typing.final
 class EffiSqlGrade(_message.Message):
     """The Effi-SQL details of a grade, following the official evaluator's algorithm (spec §4.1), with
-    our two checks against hard-coded results. The grade's score is credit. Its correct is matched,
-    alt_matched not false and literal_result not true, and is never true unless the status is
-    GRADE_STATUS_GRADED.
+    our two checks against hard-coded results, which only a matched prediction gets: a wrong rewrite
+    also fails on the alternate database, so checking it would flag nearly every candidate. The
+    grade's score is credit. Its correct is matched, alt_matched not false and literal_result not
+    true, and is never true unless the status is GRADE_STATUS_GRADED.
     """
 
     DESCRIPTOR: _descriptor.Descriptor
@@ -386,21 +393,25 @@ class EffiSqlGrade(_message.Message):
     IDENTITY_CACHED_FIELD_NUMBER: _builtins.int
     matched: _builtins.bool
     """True if the prediction ran without an error or a timeout and its result equals the base
-    query's: the same row count and the same multiset of row hashes.
+    query's: the same row count and the same multiset of row hashes. A plan that would modify
+    data, with a ModifyTable node, is refused before it runs: the grade is then not matched, and
+    its status is GRADE_STATUS_PREDICTION_FAILED.
     """
     alt_matched: _builtins.bool
-    """The robustness check against hard-coded results: whether the prediction also returns the
-    base query's result on an alternate TPC-H database with different data. Set whenever the
-    check ran: in dev mode, in RSI, and in the final official runs, which feed the checked
-    numbers. False is the hard_coded flag: credit is then 0 and the grade's correct is false. The
-    final report gives both the official and the checked numbers.
+    """The robustness check against hard-coded results: whether a matched prediction also returns
+    the base query's result on an alternate TPC-H database with different data. Set only when the
+    prediction matched, and then whenever the check ran, which §4.1 does for every matched
+    prediction in both grading modes, except an identity-cached grade; unset otherwise. False is
+    the hard_coded flag: credit is then 0 and the grade's correct is false. The final report
+    gives both the official and the checked numbers.
     """
     literal_result: _builtins.bool
-    """The plan check against hard-coded results, run on the prediction's EXPLAIN (FORMAT JSON)
-    plan. Set whenever the check ran: in dev mode, in RSI, and in the final official runs, which
-    feed the checked numbers. True is the literal_result flag: the plan scans none of the base
-    query's relations, or its output comes from a Values Scan or Result subtree with no relation
-    scan beneath it. Credit is then 0 and the grade's correct is false.
+    """The plan check against hard-coded results, run on a matched prediction's EXPLAIN (FORMAT
+    JSON) plan. Set only when the prediction matched, and then whenever the check ran, which §4.1
+    does for every matched prediction in both grading modes, except an identity-cached grade;
+    unset otherwise. True is the literal_result flag: the plan scans none of the base query's
+    relations, or its output comes from a Values Scan or Result subtree with no relation scan
+    beneath it. Credit is then 0 and the grade's correct is false.
     """
     base_time_s: _builtins.float
     """The base query's median EXPLAIN ANALYZE execution time, in seconds; unset if not measured."""
@@ -408,16 +419,18 @@ class EffiSqlGrade(_message.Message):
     """The prediction's median EXPLAIN ANALYZE execution time, in seconds; unset if not measured."""
     speedup: _builtins.float
     """τ = base_time_s / pred_time_s, capped at 1000. Set only when matched and both sides were
-    timed, or when identity_cached is true: it is then the identity τ measured during setup.
+    timed, or when identity_cached is true: it is then the identity τ measured during setup. A
+    matched prediction is timed even when a check flagged it.
     """
     credit: _builtins.float
     """The checked credit: the R-VES tier credit g(speedup), where g(τ) is 1 for τ ≥ 2, 0.75 for
-    τ ≥ 1.2, 0.5 for τ ≥ 1, 0.25 for τ ≥ 0.5 and 0 otherwise; but 0 when not matched, when
-    alt_matched is false, or when literal_result is true. The official credit ignores both
-    flags: it is g(speedup) when matched, an unset speedup counting as 0, and 0 otherwise.
+    τ ≥ 1.2, 0.5 for τ ≥ 1, 0.25 for τ ≥ 0.5 and 0 otherwise; but 0 when not matched, and 0 for
+    a matched prediction that a check flagged: alt_matched false or literal_result true. The
+    official credit ignores both flags: it is g(speedup) when matched, an unset speedup counting
+    as 0, and 0 otherwise.
     """
     timing_runs: _builtins.int
-    """How many timed runs the times come from."""
+    """How many timed runs the times come from; 0 for an identity-cached grade."""
     pred_row_count: _builtins.int
     """How many rows the prediction returned."""
     base_row_count: _builtins.int
@@ -431,8 +444,10 @@ class EffiSqlGrade(_message.Message):
     identity_cached: _builtins.bool
     """True if dev mode graded a prediction identical to base_sql after normalization with the
     identity τ measured during setup, and that τ's credit, without timing it again (spec §4.1).
-    Official mode always times the prediction, identity submissions included, so it is false
-    there.
+    Such a grade has matched true, speedup the setup's identity τ, base_time_s the cached value,
+    pred_time_s unset, timing_runs 0, eval_wall_s unset, and alt_matched and literal_result
+    unset: the checks do not run on it. Official mode always times the prediction, identity
+    submissions included, so it is false there.
     """
     def __init__(
         self,
