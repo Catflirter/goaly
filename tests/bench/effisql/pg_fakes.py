@@ -15,6 +15,11 @@ from psycopg import sql
 type Answer = Sequence[tuple[Any, ...]] | BaseException | Callable[[Any], Sequence[tuple[Any, ...]]]
 
 
+def _fake_verifier(password: bytes, user: bytes, algorithm: bytes | None = None) -> bytes:
+    """Stands in for libpq's PQencryptPasswordConn; never contains the password."""
+    return b"SCRAM-SHA-256$fake:" + user + b":" + str(len(password)).encode()
+
+
 def as_text(query: object) -> str:
     if isinstance(query, sql.Composable):
         return query.as_string(None)
@@ -27,12 +32,23 @@ class FakeCursor:
     def __init__(self, connection: "FakeConnection", rows: Sequence[tuple[Any, ...]] = ()) -> None:
         self._connection = connection
         self._rows = list(rows)
+        self.adapters = SimpleNamespace(
+            register_loader=lambda *args: connection.loaders.append(args)
+        )
+
+    def execute(
+        self, query: object, params: object = None, *, prepare: bool | None = None
+    ) -> "FakeCursor":
+        return self._connection.execute(query, params, prepare=prepare)
 
     def fetchone(self) -> tuple[Any, ...] | None:
         return self._rows[0] if self._rows else None
 
     def fetchall(self) -> list[tuple[Any, ...]]:
         return list(self._rows)
+
+    def __iter__(self) -> Iterator[tuple[Any, ...]]:
+        return iter(self._rows)
 
     @contextmanager
     def copy(self, query: object) -> Iterator["FakeCopy"]:
@@ -66,6 +82,7 @@ class FakeConnection:
         self.info = SimpleNamespace(dbname=dbname)
         self.loaders: list[tuple[str, object]] = []
         self.adapters = SimpleNamespace(register_loader=lambda *args: self.loaders.append(args))
+        self.pgconn = SimpleNamespace(encrypt_password=_fake_verifier)
         self.closed = False
 
     def execute(
@@ -117,3 +134,31 @@ class FakeServer:
 
     def statements(self, dbname: str) -> list[str]:
         return [s for c in self.connections if c.info.dbname == dbname for s in c.statements]
+
+
+class AsyncFakeCursor:
+    def __init__(self, cursor: FakeCursor) -> None:
+        self._cursor = cursor
+
+    async def fetchone(self) -> tuple[Any, ...] | None:
+        return self._cursor.fetchone()
+
+    async def fetchall(self) -> list[tuple[Any, ...]]:
+        return self._cursor.fetchall()
+
+
+class AsyncFakeConnection:
+    """The async face of a FakeConnection: same canned answers, same record of statements."""
+
+    def __init__(self, dbname: str, responses: Sequence[tuple[str, Answer]] = ()) -> None:
+        self.sync = FakeConnection(dbname, responses)
+        self.info = self.sync.info
+
+    @property
+    def statements(self) -> list[str]:
+        return self.sync.statements
+
+    async def execute(
+        self, query: object, params: object = None, *, prepare: bool | None = None
+    ) -> AsyncFakeCursor:
+        return AsyncFakeCursor(self.sync.execute(query, params, prepare=prepare))
