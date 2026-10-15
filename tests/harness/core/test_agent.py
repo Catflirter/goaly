@@ -36,7 +36,7 @@ from goaly.contracts.interfaces import Environment, SqlEnvironment
 from goaly.contracts.jsonl import append_jsonl, read_jsonl
 from goaly.harness.core.agent import AgentContext, AgentHooks, run_agent
 from goaly.harness.core.budgets import CALLS_PER_REPLY, Budgets, BudgetUse
-from goaly.harness.core.llm import BoundLlm, CallTags, LlmClient
+from goaly.harness.core.llm import BoundLlm, CallTags, LlmClient, LlmReply
 from goaly.harness.core.llm_errors import ContextOverflow, ServerError
 from goaly.harness.core.llm_models import EXECUTOR_MODEL, ModelParams
 from goaly.harness.core.settings import Settings
@@ -312,40 +312,60 @@ async def test_every_prompt_can_be_rebuilt_from_the_trajectory() -> None:
     assert reference_prompts(trajectory) == sent(llm)
 
 
-async def test_the_loop_sends_the_prompts_the_contracts_reference_rebuilds() -> None:
-    """Both kinds of call markup, in content and reasoning, replay as trajectory.proto says."""
-    bare = function_block("execute_sql", "SELECT 2")
-    wrapped = tool_call_block("execute_sql", "SELECT 1")
-    script = [
-        # A call from the content's <tool_call> block: such blocks go from both fields, and a
-        # bare block stays.
+BARE_CALL = function_block("execute_sql", "SELECT 2")
+WRAPPED_CALL = tool_call_block("execute_sql", "SELECT 1")
+
+
+def markup_script() -> list[LlmReply]:
+    """Replies with both kinds of call markup, in content and in reasoning, from each source."""
+    return [
+        # Calls from the content's <tool_call> block; the reasoning drafts it too.
         reply(
-            content=f"Run it.\n{wrapped}\nNot this: {bare}", reasoning=f"Draft: {wrapped}\n{bare}"
+            content=f"Run it.\n{WRAPPED_CALL}\nNot this: {BARE_CALL}",
+            reasoning=f"Draft: {WRAPPED_CALL}\n{BARE_CALL}",
         ),
-        # A call from a bare block in a content with no <tool_call>: that block goes, but a
-        # bare block in the reasoning is never a call, and stays.
-        reply(content=f"Then: {function_block('execute_sql', 'SELECT 3')}", reasoning=bare),
+        # A call from a bare block, in a content with no <tool_call>; a bare one in reasoning.
+        reply(content=f"Then: {function_block('execute_sql', 'SELECT 3')}", reasoning=BARE_CALL),
         # A call from the reasoning's <tool_call> block.
         reply(reasoning=f"Thinking.\n{tool_call_block('execute_sql', 'SELECT 4')}"),
-        # A standard call: its reply replays as written, markup and all.
-        reply(execute_sql("SELECT 5"), content=f"Also {wrapped}", reasoning=f"Also {bare}"),
+        # A standard call, with markup in both fields all the same.
+        reply(
+            execute_sql("SELECT 5"), content=f"Also {WRAPPED_CALL}", reasoning=f"Also {BARE_CALL}"
+        ),
         reply(submit()),
     ]
-    llm = FakeLLM(script)
+
+
+async def test_replies_go_out_without_call_markup_whatever_their_calls_source() -> None:
+    """Spec §5.1: an executor chat replays no XML call markup, in content or reasoning."""
+    llm = FakeLLM(markup_script())
     ctx = context(llm)
 
     await run_agent(environment(), ctx, hooks())
 
     trajectory = ctx.trajectory()
     assert [len(step.assistant.tool_calls) for step in trajectory.steps] == [1] * 5
-    assert reference_prompts(trajectory) == sent(llm)
     replies = [(m.content, m.reasoning_content) for m in sent(llm)[4] if m.role == ASSISTANT]
     assert replies == [
-        (f"Run it.\n\nNot this: {bare}", f"Draft: \n{bare}"),
-        ("Then: ", bare),
+        # A text with a <tool_call> block loses those blocks (strip_tool_call_markup).
+        (f"Run it.\n\nNot this: {BARE_CALL}", f"Draft: \n{BARE_CALL}"),
+        ("Then: ", ""),  # One with none loses its bare blocks, in content and reasoning alike.
         ("", "Thinking.\n"),
-        (f"Also {wrapped}", f"Also {bare}"),
+        ("Also ", "Also "),  # The standard call's reply loses its markup too.
     ]
+    assert trajectory.steps[3].assistant.content == f"Also {WRAPPED_CALL}"  # Kept as it came.
+
+
+@pytest.mark.xfail(
+    strict=True, reason="#29's round 3 gives the reference rebuild the same unconditional strip"
+)
+async def test_the_loop_sends_the_prompts_the_contracts_reference_rebuilds() -> None:
+    llm = FakeLLM(markup_script())
+    ctx = context(llm)
+
+    await run_agent(environment(), ctx, hooks())
+
+    assert reference_prompts(ctx.trajectory()) == sent(llm)
 
 
 async def test_a_trajectory_round_trips_through_jsonl(tmp_path: Path) -> None:

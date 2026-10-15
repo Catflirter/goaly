@@ -56,8 +56,6 @@ __all__ = ["AgentContext", "AgentHooks", "run_agent"]
 # The finish_reason of a reply that max_tokens cut off.
 _CUT_OFF: Final = "length"
 _REASONING_XML: Final = ToolCallSource.TOOL_CALL_SOURCE_REASONING_XML
-# Where the parser finds calls written as Qwen3-Coder XML.
-_XML_SOURCES: Final = frozenset({ToolCallSource.TOOL_CALL_SOURCE_CONTENT_XML, _REASONING_XML})
 
 # What the loop tells the model. {tools} lists the tools' names.
 _CUT_OFF_CALL: Final = (
@@ -371,22 +369,18 @@ def _with_calls(message: ChatMessage, calls: Sequence[ToolCall]) -> ChatMessage:
 
 
 def _replayed(assistant: ChatMessage) -> ChatMessage:
-    """``assistant`` as later prompts carry it: each call only once, as a structured call.
+    """``assistant`` as later prompts carry it: no call markup, its calls only as structured calls.
 
-    When its calls were parsed from XML, the call markup goes from both its content and its
-    reasoning, as Step's rebuild rule in trajectory.proto says: the content loses its
-    <tool_call> blocks, or its bare <function=...> blocks if it has none, and the reasoning
-    loses its <tool_call> blocks. A call drafted in one field and written again in the other
-    then reaches the model once, and a drafted call that never ran cannot look as if it ran. A
-    reply whose calls came from the standard field goes out as written. The trajectory keeps
-    every reply as it came.
+    An executor chat replays no Qwen3-Coder XML call markup (spec §5.1). Its content and its
+    reasoning both pass through strip_tool_call_markup, whichever field its calls came from,
+    the standard one included. A call drafted in one field and written again in the other then
+    reaches the model once; a drafted call that never ran cannot look as if it ran; and markup
+    the parser took for no call never reaches the model either. The trajectory keeps every
+    reply as it came.
     """
     message = _copy(assistant)
-    if any(call.source in _XML_SOURCES for call in assistant.tool_calls):
-        message.content = strip_tool_call_markup(message.content)
-        message.reasoning_content = strip_tool_call_markup(
-            message.reasoning_content, reasoning=True
-        )
+    message.content = strip_tool_call_markup(message.content)
+    message.reasoning_content = strip_tool_call_markup(message.reasoning_content)
     return message
 
 
