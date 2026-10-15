@@ -4,7 +4,9 @@
 session: a tiny golden build (TPC-H SF0.02 as ``tpch``, SF0.01 as ``tpch_alt``) and five
 instances with their own names and ports, removed afterwards, so tests never touch the real
 environment. With ``GOALY_EFFISQL_ITEST_REAL=1`` it is the real, running environment instead;
-tests that write or restart instances skip then.
+tests that write or restart instances skip then, and GOALY_EFFISQL_ITEST_INSTANCES (such as
+``solve-1``) limits them to the named instances. The tiny instances run on CPUs 0, 1, 12 and 13,
+never on the real instances' cores.
 """
 
 import os
@@ -19,7 +21,7 @@ from pydantic import SecretStr
 
 from goaly.bench.effisql import pg_containers
 from goaly.bench.effisql.pg_build import Dataset, TableFile, build_golden
-from goaly.bench.effisql.pg_instances import INSTANCES, Instance, start_instances
+from goaly.bench.effisql.pg_instances import INSTANCES, PYTHON_CPUS, Instance, start_instances
 from goaly.bench.effisql.pg_settings import (
     ADMIN_ROLE,
     AGENT_ROLE,
@@ -65,7 +67,9 @@ TINY_ALT = _dataset(
         "lineitem": ("517b566190fbeadc638602554d109a463631e19788936ccb97196ebd407b51f1", 60175),
     },
 )
-_PORT_OFFSET = 20  # The tiny instances listen on 55452-55456.
+# The tiny instances listen on 25432-25436: below Linux's ephemeral range, so no client socket
+# can hold their ports when they start.
+_PORT_OFFSET = -30_000
 
 
 @dataclass(frozen=True)
@@ -76,9 +80,15 @@ class PgEnv:
     real: bool
 
     def instance(self, kind: str) -> Instance:
-        return next(instance for instance in self.instances if instance.kind == kind)
+        """The first instance of ``kind``; the test skips if the run left none of that kind."""
+        for instance in self.instances:
+            if instance.kind == kind:
+                return instance
+        pytest.skip(f"no {kind} instance in GOALY_EFFISQL_ITEST_INSTANCES")
 
-    def connect(self, instance: Instance, role: str, db: str, **kwargs: Any) -> Any:
+    def connect(
+        self, instance: Instance, role: str, db: str, **kwargs: Any
+    ) -> psycopg.Connection[Any]:
         passwords = {
             ADMIN_ROLE: self.credentials.admin_password,
             AGENT_ROLE: self.credentials.agent_password,
@@ -98,17 +108,22 @@ class PgEnv:
 @pytest.fixture(scope="session")
 def pg_env(tmp_path_factory: pytest.TempPathFactory) -> Iterator[PgEnv]:
     if os.environ.get("GOALY_EFFISQL_ITEST_REAL") == "1":
-        yield PgEnv(PgEnvConfig(), load_credentials(), INSTANCES, real=True)
+        # GOALY_EFFISQL_ITEST_INSTANCES=solve-1 keeps the tests off instances others are using.
+        chosen = os.environ.get("GOALY_EFFISQL_ITEST_INSTANCES", "")
+        names = {name.strip() for name in chosen.split(",") if name.strip()}
+        instances = tuple(i for i in INSTANCES if not names or i.name in names)
+        yield PgEnv(PgEnvConfig(), load_credentials(), instances, real=True)
         return
     root = tmp_path_factory.mktemp("effisql-env")
     real_dbgen = PgEnvConfig().dbgen_dir
     if real_dbgen.is_dir():
         (root / "dbgen").symlink_to(real_dbgen)
+    test_cpus = ",".join(str(cpu) for cpu in PYTHON_CPUS)  # Never the real instances' cores.
     config = PgEnvConfig(
         data_root=root,
-        build_port=55451,
+        build_port=25451,
         build_container="goaly-effisql-itest-env-build",
-        build_cpuset=None,
+        build_cpuset=test_cpus,
     )
     credentials = PgCredentials(
         admin_password=SecretStr(secrets.token_urlsafe(16)),
@@ -117,7 +132,7 @@ def pg_env(tmp_path_factory: pytest.TempPathFactory) -> Iterator[PgEnv]:
         _env_file=None,  # pydantic-settings: read no env file.
     )
     instances = tuple(
-        Instance(f"itest-{i.name}", i.kind, i.port + _PORT_OFFSET, i.cpus) for i in INSTANCES
+        Instance(f"itest-{i.name}", i.kind, i.port + _PORT_OFFSET, PYTHON_CPUS) for i in INSTANCES
     )
     build_golden(config, credentials.admin_password, datasets=[TINY_TPCH, TINY_ALT])
     try:
