@@ -13,7 +13,7 @@ import asyncio
 import enum
 import heapq
 import itertools
-from collections.abc import AsyncIterator, Sequence
+from collections.abc import AsyncIterator, Callable, Sequence
 from contextlib import asynccontextmanager
 from dataclasses import dataclass
 
@@ -70,7 +70,7 @@ class GradingPool[R]:
             raise ValueError("a grading pool needs at least one resource")
         self._resources = tuple(resources)
         self._free = list(resources)
-        self._waiting: list[tuple[int, int, asyncio.Future[R]]] = []
+        self._waiting: list[tuple[int, int, asyncio.Future[R], Callable[[R], bool]]] = []
         self._arrivals = itertools.count()
 
     @property
@@ -84,22 +84,30 @@ class GradingPool[R]:
 
     @property
     def waiting_count(self) -> int:
-        return sum(not future.done() for _, _, future in self._waiting)
+        return sum(not future.done() for _, _, future, _ in self._waiting)
 
     @asynccontextmanager
-    async def lease(self, priority: Priority) -> AsyncIterator[R]:
-        """Wait for a resource, hold it for the body, then hand it to the next waiter."""
-        resource = await self._acquire(priority)
+    async def lease(
+        self, priority: Priority, *, which: Callable[[R], bool] | None = None
+    ) -> AsyncIterator[R]:
+        """Wait for a resource, hold it for the body, then hand it to the next waiter.
+
+        With ``which``, wait for a resource it accepts, such as one particular instance.
+        """
+        resource = await self._acquire(priority, which)
         try:
             yield resource
         finally:
             self._release(resource)
 
-    async def _acquire(self, priority: Priority) -> R:
-        if self._free and not self.waiting_count:
-            return self._free.pop(0)
+    async def _acquire(self, priority: Priority, which: Callable[[R], bool] | None = None) -> R:
+        accepts = which or _any
+        for index, free in enumerate(self._free):
+            # A free resource that a waiter accepts is that waiter's, by priority and arrival.
+            if accepts(free) and not self._wanted(free):
+                return self._free.pop(index)
         future: asyncio.Future[R] = asyncio.get_running_loop().create_future()
-        heapq.heappush(self._waiting, (int(priority), next(self._arrivals), future))
+        heapq.heappush(self._waiting, (int(priority), next(self._arrivals), future, accepts))
         try:
             return await future
         except asyncio.CancelledError:
@@ -107,10 +115,26 @@ class GradingPool[R]:
                 self._release(future.result())  # Handed over just as the wait was cancelled.
             raise
 
+    def _wanted(self, resource: R) -> bool:
+        return any(not f.done() and accepts(resource) for _, _, f, accepts in self._waiting)
+
     def _release(self, resource: R) -> None:
-        while self._waiting:
-            _, _, future = heapq.heappop(self._waiting)
-            if not future.done():
-                future.set_result(resource)
-                return
-        self._free.append(resource)
+        skipped = []
+        try:
+            while self._waiting:
+                waiter = heapq.heappop(self._waiting)
+                _, _, future, accepts = waiter
+                if future.done():
+                    continue
+                if accepts(resource):
+                    future.set_result(resource)
+                    return
+                skipped.append(waiter)
+            self._free.append(resource)
+        finally:
+            for waiter in skipped:
+                heapq.heappush(self._waiting, waiter)
+
+
+def _any(_resource: object) -> bool:
+    return True

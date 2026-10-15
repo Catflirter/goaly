@@ -83,6 +83,8 @@ def commit_candidate(
             for pack in info.pack_dirs
             if (worktree.path / pack).exists() or any(path.is_relative_to(pack) for path in changed)
         ]
+        if not staged:  # Neither pack exists or changed; git add without a path adds all.
+            return None
         run_git(["add", "--all", "--", *staged], cwd=worktree.path)
         try:
             _check_modes(_staged(worktree, info), "staged")

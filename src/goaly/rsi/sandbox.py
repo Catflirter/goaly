@@ -3,9 +3,11 @@ unit-test guard's.
 
 Both mount one worktree, a candidate's or a snapshot of one, read-only at its own path; the
 implementer's also mounts the lane's two pack directories read-write over it. Nothing else from
-the host is mounted. No git metadata is mounted, so nothing inside can commit. The hardening,
-the one-shot runs, the cleanup and the image are goaly.bench.sandbox's, which the solve phase of
-goaly run shares (spec §6.1).
+the host is mounted. No git metadata is mounted, so nothing inside can commit; a main repository,
+whose ``.git`` is a directory, is refused. A worktree's ``.git`` file stays visible and names the
+main repository's path, which is harmless, since that path is not mounted. The hardening, the
+limits, the one-shot runs, the cleanup and the image are goaly.bench.sandbox's, which the solve
+phase of goaly run shares (spec §6.1).
 """
 
 import os
@@ -22,6 +24,7 @@ from goaly.bench.sandbox import (
     ensure_image,
     hardened_options,
     image_tag,
+    list_containers,
     mount_path,
     run_container,
     timed_shell,
@@ -41,6 +44,7 @@ __all__ = [
     "SandboxConfig",
     "SandboxError",
     "SandboxResult",
+    "containers",
     "ensure_image",
     "image_tag",
     "remove_containers",
@@ -70,13 +74,15 @@ def run_options(
 
     The worktree is mounted read-only at its own path; with ``writable_packs`` the lane's two pack
     directories are mounted read-write over it, and they must exist. The image and the command
-    follow these options. Raises ValueError for a worktree path docker could misread, or an
-    invalid label.
+    follow these options. Raises ValueError for a worktree path docker could misread, a main
+    repository, or an invalid label.
     """
     check_id(experiment_id, "experiment_id")
     check_id(purpose, "purpose")
     info = lane_info(lane)
     mount_path(worktree, "worktree")
+    if (worktree / ".git").is_dir():
+        raise ValueError(f"{worktree} is a main repository; mounting it would expose its .git")
     labels = {
         LABEL_SANDBOX: "1",
         LABEL_LANE: info.name,
@@ -105,10 +111,15 @@ def run_once(
     config: SandboxConfig = SandboxConfig(),  # noqa: B008
 ) -> SandboxResult:
     """Run the bash ``command`` in a fresh sandbox on ``worktree``, as the host user, and return
-    how it ended. The container is removed before this returns, whatever happens.
+    how it ended.
 
-    Raises SandboxError if docker fails or hangs. A command that fails or times out is a result,
-    not an error.
+    The container is removed before this returns. If removing it fails while another error is
+    already on its way, that failure is only logged, and :func:`remove_containers`, which a lane
+    runs when it starts, is the backstop. A run with ``writable_packs`` is the implementer's; any
+    other run that evaluates a candidate takes a snapshot of its commit, never the live worktree
+    (goaly.rsi.workspace.Workspace.snapshot). Raises SandboxError if docker fails or hangs, and
+    ValueError for a timeout that would not stop the command. A command that fails or times out is
+    a result, not an error.
     """
     options = run_options(
         worktree,
@@ -133,10 +144,33 @@ def remove_containers(
     """Remove every sandbox container, or a lane's or an experiment's, running or not, and
     return how many there were. Containers without the sandbox label are never touched.
     """
+    return remove_labelled(_labels(lane, experiment_id, None), config=config)
+
+
+def containers(
+    *,
+    lane: Lane.ValueType | None = None,
+    experiment_id: str | None = None,
+    purpose: str | None = None,
+    config: SandboxConfig = SandboxConfig(),  # noqa: B008
+) -> list[str]:
+    """Return the IDs of every sandbox container, running or not, or of those a lane, an
+    experiment or a purpose has. An experiment's implementer has stopped for good once this
+    lists none of its containers.
+    """
+    return list_containers(_labels(lane, experiment_id, purpose), config=config)
+
+
+def _labels(
+    lane: Lane.ValueType | None, experiment_id: str | None, purpose: str | None
+) -> dict[str, str]:
     labels = {LABEL_SANDBOX: "1"}
     if lane is not None:
         labels[LABEL_LANE] = lane_info(lane).name
     if experiment_id is not None:
         check_id(experiment_id, "experiment_id")
         labels[LABEL_EXPERIMENT] = experiment_id
-    return remove_labelled(labels, config=config)
+    if purpose is not None:
+        check_id(purpose, "purpose")
+        labels[LABEL_PURPOSE] = purpose
+    return labels

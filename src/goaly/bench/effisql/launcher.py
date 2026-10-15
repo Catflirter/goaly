@@ -16,12 +16,17 @@ Cancelled, it removes the container before the proxy stops and the cancellation 
 """
 
 import asyncio
+import fcntl
 import logging
 import math
+import os
 import shutil
-from collections.abc import AsyncIterator, Callable
-from contextlib import AbstractAsyncContextManager, asynccontextmanager
-from dataclasses import dataclass, field
+import subprocess
+import tarfile
+import tempfile
+from collections.abc import AsyncIterator, Callable, Iterator, Sequence
+from contextlib import AbstractAsyncContextManager, asynccontextmanager, contextmanager
+from dataclasses import dataclass
 from pathlib import Path
 from typing import Protocol
 
@@ -31,13 +36,13 @@ from goaly.bench.effisql.data import write_runtime_file
 from goaly.bench.effisql.harness import EffiSqlPaths, RunCallLog
 from goaly.bench.effisql.layout import SolveInputs
 from goaly.bench.effisql.pg_instances import SOLVING
-from goaly.bench.effisql.pg_settings import PgCredentials, load_credentials
+from goaly.bench.effisql.pg_settings import AgentCredentials, PgEnvConfig, load_agent_credentials
 from goaly.bench.sandbox import (
     SandboxResult,
     SolveEnvironment,
     ensure_image,
-    remove_solve_containers,
     run_solve,
+    stop_solve,
 )
 from goaly.contracts.gen.llm_call_pb2 import LlmCallRecord
 from goaly.harness.core.atomic import write_text_atomically
@@ -52,7 +57,10 @@ __all__ = [
     "SolveContainerError",
     "SolveRequestLike",
     "checkout_of",
-    "container_command",
+    "container_argv",
+    "hold_solving_instances",
+    "proxy_socket",
+    "snapshot_checkout",
     "stage_inputs",
 ]
 
@@ -104,10 +112,12 @@ class SolveRequestLike(Protocol):
 
 
 class Gateway(Protocol):
-    """The proxy, as the launcher uses it: LlmProxy, or a test's stand-in."""
+    """The proxy, as the launcher uses it: LlmProxy, or a test's stand-in.
 
-    @property
-    def base_url(self) -> str: ...
+    Its container_env() names the run's token (GOALY_API_KEY), the client's base URL
+    (GOALY_BASE_URL) and, since the container opens no IP socket (V28), the Unix socket it
+    listens on (GOALY_LLM_UDS), in a per-run directory of its own.
+    """
 
     def container_env(self) -> dict[str, str]: ...
 
@@ -122,14 +132,15 @@ class Sandbox(Protocol):
         self,
         checkout: Path,
         request: SolveRequestLike,
-        command: str,
+        argv: list[str],
+        staged_instances: Path | None,
         environment: SolveEnvironment,
         timeout_s: float,
     ) -> SandboxResult:
-        """Run ``command`` in a solve container and return how it ended."""
+        """Run ``argv`` in a solve container and return how it ended."""
 
-    async def remove(self, run_id: str) -> None:
-        """Remove the run's solve containers, as after a cancellation."""
+    async def stop(self, run_id: str) -> None:
+        """Stop and remove the run's solve containers, as after a cancellation."""
 
 
 class DockerSandbox:
@@ -145,7 +156,8 @@ class DockerSandbox:
         self,
         checkout: Path,
         request: SolveRequestLike,
-        command: str,
+        argv: list[str],
+        staged_instances: Path | None,
         environment: SolveEnvironment,
         timeout_s: float,
     ) -> SandboxResult:
@@ -156,24 +168,80 @@ class DockerSandbox:
             self._image,
             checkout,
             request.solve_dir,
-            request.inputs_dir,
+            None,  # A staged organizers' file lies in inputs_dir, which mounts it already.
+            inputs_dir=request.inputs_dir,
             environment=environment,
-            command=command,
+            argv=argv,
             timeout_s=timeout_s,
         )
 
-    async def remove(self, run_id: str) -> None:
-        await asyncio.to_thread(remove_solve_containers, run_id=run_id)
+    async def stop(self, run_id: str) -> None:
+        await asyncio.to_thread(stop_solve, run_id)
 
 
-def _open_proxy(recorder: CallRecorder, run_id: str) -> AbstractAsyncContextManager[Gateway]:
-    """T03's proxy for run ``run_id``, which records every request to ``recorder``.
+def _open_proxy(
+    recorder: CallRecorder, run_id: str, uds: Path
+) -> AbstractAsyncContextManager[Gateway]:
+    """T03's proxy for run ``run_id``: it records every request to ``recorder``, on the host,
+    and listens on the Unix socket ``uds``, which the container reaches (V28)."""
+    return LlmProxy(load_settings(), recorder, run_id=run_id, uds=uds)
 
-    TODO(T03 fix round, #33): becomes ``LlmProxy(load_settings(), recorder, run_id=run_id)``
-    once the proxy takes a recorder; until then it keeps no records of its own.
+
+# The longest Unix-socket path the kernel takes, less a margin (sockaddr_un.sun_path is 108).
+_UDS_MAX = 100
+
+
+def proxy_socket(run_root: Path, run_id: str) -> Path:
+    """Where the run's proxy listens: ``<run>/proxy/llm.sock``, beside solve/, or a short per-run
+    directory under /tmp when that path is too long for a Unix socket."""
+    socket = run_root / "proxy" / "llm.sock"
+    if len(os.fsencode(socket)) <= _UDS_MAX:
+        return socket
+    return Path(tempfile.gettempdir()) / f"goaly-proxy-{run_id}" / "llm.sock"
+
+
+def _solving_socket_dirs() -> tuple[Path, ...]:
+    """The solving instances' socket directories on the host, in SOLVING order (T09, V28).
+
+    TODO(T09 #26): pg_instances.socket_dirs(PgEnvConfig(), SOLVING), once it is in; this is its
+    documented default, ``~/data/effisql/sockets/<name>``.
     """
-    del recorder, run_id
-    return LlmProxy(load_settings())
+    root = PgEnvConfig().data_root / "sockets"
+    return tuple(root / instance.name for instance in SOLVING)
+
+
+def _grading_lock_dir() -> Path:
+    """Where grader processes lock each instance they grade on (T10): ``~/.cache/goaly/grading``.
+
+    TODO(T10 #36): grading_service.default_lock_dir(), once the stack has it.
+    """
+    return Path.home() / ".cache" / "goaly" / "grading"
+
+
+@contextmanager
+def hold_solving_instances(lock_dir: Path, names: Sequence[str]) -> Iterator[None]:
+    """Share the solving instances' grading locks while a solve phase uses them.
+
+    A grader that grades on every instance (`goaly run --grading-instances all`, for T23's final
+    runs) locks each one exclusively, so it cannot start while any solve phase holds these, and a
+    solve phase cannot start while it grades. Solve phases share the locks with each other.
+    """
+    lock_dir.mkdir(parents=True, exist_ok=True)
+    handles = []
+    try:
+        for name in names:
+            handle = (lock_dir / f"{name}.lock").open("a", encoding="utf-8")
+            handles.append(handle)
+            try:
+                fcntl.flock(handle, fcntl.LOCK_SH | fcntl.LOCK_NB)
+            except BlockingIOError:
+                raise SolveContainerError(
+                    f"{name} is grading (goaly run --grading-instances all): solve once it is done"
+                ) from None
+        yield
+    finally:
+        for handle in handles:
+            handle.close()
 
 
 @dataclass(frozen=True)
@@ -182,42 +250,53 @@ class EffiSqlLauncher:
 
     paths: Callable[[], EffiSqlPaths] = EffiSqlPaths.default
     sandbox: Callable[[], Sandbox] = DockerSandbox
-    proxy: Callable[[CallRecorder, str], AbstractAsyncContextManager[Gateway]] = _open_proxy
-    credentials: Callable[[], PgCredentials] = load_credentials
-    # The solving instances' ports, which the agent role reaches.
-    solving_ports: tuple[int, ...] = field(
-        default_factory=lambda: tuple(instance.port for instance in SOLVING)
-    )
+    proxy: Callable[[CallRecorder, str, Path], AbstractAsyncContextManager[Gateway]] = _open_proxy
+    # Only the agent role's password: the container never gets the admin's or the grader's.
+    credentials: Callable[[], AgentCredentials] = load_agent_credentials
+    # The solving instances' Unix-socket directories, which the container mounts (V28).
+    socket_dirs: Callable[[], tuple[Path, ...]] = _solving_socket_dirs
+    # Where T10's graders lock the instances they grade on.
+    lock_dir: Callable[[], Path] = _grading_lock_dir
 
     async def __call__(self, request: SolveRequestLike) -> None:
         if not request.tasks:
             raise ValueError("a solve request names at least one task")
-        checkout = checkout_of(request.pack_dir)
+        for what, path in (("solve", request.solve_dir), ("inputs", request.inputs_dir)):
+            if path != path.resolve():  # The sandbox mounts each at its host path, as named.
+                raise ValueError(f"the {what} directory must be a canonical path: {path}")
         inputs = SolveInputs(request.inputs_dir)
         staged = await asyncio.to_thread(stage_inputs, inputs, self.paths(), request.instances_file)
+        checkout = await asyncio.to_thread(
+            snapshot_checkout, checkout_of(request.pack_dir), request.solve_dir.parent / "checkout"
+        )
         credentials = await asyncio.to_thread(self.credentials)
         sandbox = self.sandbox()
         await sandbox.prepare(checkout)
-        command = container_command(request, staged)
+        argv = container_argv(request, staged)
         timeout_s = _timeout(len(request.tasks), request.max_tasks, request.task_timeout_s)
         log = request.solve_dir.parent / "solve-container.log"  # Host-side, beside solve/.
+        uds = proxy_socket(request.solve_dir.parent, request.run_id)
         async with (
             self._recorder(request.llm_calls) as recorder,
-            self.proxy(recorder, request.run_id) as gateway,
+            self.proxy(recorder, request.run_id, uds) as gateway,
         ):
+            env = gateway.container_env()
             environment = SolveEnvironment(
-                base_url=gateway.base_url,
-                token=SecretStr(gateway.container_env()["GOALY_API_KEY"]),
-                pg_ports=self.solving_ports,
+                base_url=env["GOALY_BASE_URL"],
+                token=SecretStr(env["GOALY_API_KEY"]),
+                llm_uds=Path(env["GOALY_LLM_UDS"]),
+                pg_socket_dirs=self.socket_dirs(),
                 pg_agent_password=credentials.agent_password,
                 run_id=request.run_id,
-                seed=min(seed for _, seed in request.tasks),
             )
-            try:
-                result = await sandbox.run(checkout, request, command, environment, timeout_s)
-            except asyncio.CancelledError:
-                await asyncio.shield(sandbox.remove(request.run_id))
-                raise
+            with hold_solving_instances(self.lock_dir(), [i.name for i in SOLVING]):
+                try:
+                    result = await sandbox.run(
+                        checkout, request, argv, staged, environment, timeout_s
+                    )
+                except asyncio.CancelledError:
+                    await asyncio.shield(sandbox.stop(request.run_id))
+                    raise
         await asyncio.to_thread(_write_log, log, result)
         _logger.info(
             "the solve container exited",
@@ -232,6 +311,43 @@ class EffiSqlLauncher:
         """The run's host-side call log, which the proxy's records go to."""
         async with JsonlWriter[LlmCallRecord](path) as writer:
             yield RunCallLog(writer)
+
+
+def snapshot_checkout(checkout: Path, target: Path) -> Path:
+    """A copy of ``checkout``'s tracked files as they are now, without .git, at ``target``.
+
+    The solve container mounts a checkout with no .git (T18). The copy is of the working tree's
+    tracked files, uncommitted changes included, so it holds what the host hashed for the
+    manifest. A checkout without .git, such as an RSI snapshot, is used as it is.
+    """
+    if not (checkout / ".git").exists():
+        return checkout.resolve(strict=True)
+    if target.exists():
+        shutil.rmtree(target)
+    stash = _git(checkout, "stash", "create").strip()  # Empty for a clean working tree.
+    tree = stash or "HEAD"
+    target.mkdir(parents=True)
+    archive = target.parent / f".{target.name}.tar"
+    try:
+        _git(checkout, "archive", "--format=tar", f"--output={archive}", tree)
+        with tarfile.open(archive) as tar:
+            tar.extractall(target, filter="data")
+    finally:
+        archive.unlink(missing_ok=True)
+    return target.resolve(strict=True)
+
+
+def _git(repo: Path, *args: str) -> str:
+    completed = subprocess.run(  # noqa: S603 - fixed git arguments.
+        ["git", "-C", str(repo), *args],  # noqa: S607 - git on PATH.
+        capture_output=True,
+        text=True,
+        check=False,
+        timeout=300,
+    )
+    if completed.returncode != 0:
+        raise SolveContainerError(f"git {args[0]} failed: {completed.stderr.strip()[-500:]}")
+    return completed.stdout
 
 
 def checkout_of(pack_dir: Path | None) -> Path:
@@ -261,16 +377,13 @@ def stage_inputs(
     return None if instances_file is None else inputs.tasks
 
 
-def container_command(request: SolveRequestLike, staged_instances: Path | None) -> str:
-    """The bash command the container runs: ``python -m goaly`` with the request's arguments."""
+def container_argv(request: SolveRequestLike, staged_instances: Path | None) -> list[str]:
+    """What the container runs: ``python -m goaly`` with the request's arguments, as goaly is on
+    the image's PYTHONPATH, not installed."""
     args = request.goaly_args(
         solve_dir=request.solve_dir, inputs_dir=request.inputs_dir, instances_file=staged_instances
     )
-    return " ".join(_quoted(arg) for arg in ["python", "-m", "goaly", *args])
-
-
-def _quoted(arg: str) -> str:
-    return "'" + arg.replace("'", "'\\''") + "'"
+    return ["python", "-m", "goaly", *args]
 
 
 def _timeout(tasks: int, max_tasks: int, task_timeout_s: float | None) -> float:

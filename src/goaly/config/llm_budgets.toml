@@ -7,19 +7,21 @@
 # of is one it must not call, and nothing falls back to a model's whole budget.
 #
 # This file is outside harness/core/, so editing it leaves the harness hash and the evaluation
-# cache as they are; each run's config hash records its share.
+# cache as they are. A share limits how fast a run goes, not what it finds, so it is not in the
+# run's config hash either: an interrupted run may resume under another phase's share. The run's
+# log and its command line record the share it ran with.
 
 [budgets]
 "qwen3.6-35b-a3b" = 48 # About 75% of the concurrency at which throughput stops growing.
 "glm-5.3" = 16
 
-# The baseline (T12): v0's dev runs on train and val, then its three held-out runs.
+# The baseline (T12): v0's dev runs on train and val, then its one held-out run.
 [phases.baseline]
 effisql = { "qwen3.6-35b-a3b" = 40 }
 background = { "qwen3.6-35b-a3b" = 8 }
 
 # The RSI run (T22). The Effi-SQL lane's GLM share covers its analyst, its implementers and its
-# lesson writer. Background covers confirmation reruns and any v0 held-out runs still pending.
+# lesson writer. Background covers confirmation reruns and v0's held-out run, if still pending.
 # 8 of Qwen and 8 of GLM stay spare.
 [phases.rsi]
 effisql = { "qwen3.6-35b-a3b" = 32, "glm-5.3" = 8 }

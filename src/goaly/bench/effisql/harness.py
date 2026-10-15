@@ -24,6 +24,7 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Protocol, Self
 
+import httpx
 import yaml
 from pydantic import BaseModel, ConfigDict, SecretStr
 
@@ -39,9 +40,12 @@ from goaly.bench.effisql.data import (
     DATASET_REVISION,
     DATASET_SHA256,
     RUNTIME_FILE,
+    ChecksumMismatchError,
     EffiSqlInstance,
     default_cache_dir,
+    fetch_dataset,
     load_instances,
+    write_runtime_file,
 )
 from goaly.bench.effisql.grading import InstanceCheck, Mode
 from goaly.bench.effisql.grading_pool import GRADING_INSTANCES, Priority
@@ -49,14 +53,19 @@ from goaly.bench.effisql.grading_service import EffiSqlGrader
 from goaly.bench.effisql.inputs import load_plans, load_schema_snapshot
 from goaly.bench.effisql.layout import SolveInputs
 from goaly.bench.effisql.pg_instances import SOLVING
-from goaly.bench.effisql.pg_settings import MAIN_DB, PgCredentials, PgEnvConfig, load_credentials
+from goaly.bench.effisql.pg_settings import (
+    MAIN_DB,
+    AgentCredentials,
+    PgEnvConfig,
+    load_agent_credentials,
+)
 from goaly.bench.effisql.splits import load_exclusions, load_splits
 from goaly.bench.effisql.sql_env import SolvingPool, SqlEnvOptions
 from goaly.contracts.errors import EnvironmentFailure
 from goaly.contracts.gen.llm_call_pb2 import CALL_PURPOSE_EXEC, LlmCallRecord
 from goaly.contracts.gen.manifest_pb2 import ModelSettings, RunManifest
 from goaly.contracts.gen.result_pb2 import TASK_ERROR_TYPE_LLM
-from goaly.contracts.gen.task_pb2 import SPLIT_EXTERNAL, SPLIT_HELDOUT, Grade, Prediction, Split
+from goaly.contracts.gen.task_pb2 import SPLIT_HELDOUT, Grade, Prediction, Split
 from goaly.contracts.interfaces import JsonValue, SqlEnvironment
 from goaly.harness.core.agent import AgentContext
 from goaly.harness.core.budgets import Budgets
@@ -65,7 +74,12 @@ from goaly.harness.core.isolation import SolveLauncher
 from goaly.harness.core.jsonl_writer import JsonlWriter
 from goaly.harness.core.llm import BoundLlm, CallRecorder, CallTags, LlmClient
 from goaly.harness.core.llm_errors import ConnectionFailed, RateLimited, ServerError, TimedOut
-from goaly.harness.core.llm_models import EXECUTOR_MODEL, QWEN_PROFILE, ModelParams
+from goaly.harness.core.llm_models import (
+    DEFAULT_PROFILES,
+    EXECUTOR_MODEL,
+    QWEN_PROFILE,
+    ModelParams,
+)
 from goaly.harness.core.manifest import content_hash, read_manifest, sha256_file
 from goaly.harness.core.registry import (
     Harness,
@@ -80,6 +94,7 @@ from goaly.harness.core.settings import load_settings
 
 __all__ = [
     "PACK_DIR",
+    "RUNTIME_SHA256",
     "SOLVING_STATEMENT_TIMEOUT_S",
     "BindsLlm",
     "EffiSqlPaths",
@@ -107,6 +122,11 @@ _logger = logging.getLogger(__name__)
 # The v0 pack's directory, found without importing it: only open_harness imports pack code.
 PACK_DIR = Path(goaly.harness.__file__).resolve().parent / "packs" / "effisql"
 _BENCH_DIR = Path(goaly.bench.effisql.__file__).resolve().parent
+# Every model the client has a profile of; each needs a share.
+_ALL_MODELS = tuple(profile.model for profile in DEFAULT_PROFILES)
+# The sha256 of the runtime copy of the pinned dataset (data.write_runtime_file), which is
+# deterministic; the task file of our splits must be it.
+RUNTIME_SHA256 = "f5145f80e557194c455ad4e8eb42ba3e95c54cdebb0787425d1e80a90de63412"
 
 # The gateway's outages, after the client's retries: no property of the harness, so the task is
 # an infrastructure failure, never cached, and worth running again. Every other LLM failure,
@@ -150,16 +170,24 @@ class EffiSqlPaths:
     plans: Path
     # The grader's caches, one directory per mode; dev mode's holds the setup's base cache.
     grading_cache_root: Path
+    # The sha256 the task file must have: RUNTIME_SHA256, the runtime copy of the pinned
+    # dataset; None not to check, as for a test's synthetic tasks.
+    tasks_sha256: str | None = None
+    # The pinned dataset the runtime copy derives from when it is missing; None if it cannot.
+    dataset_cache: Path | None = None
 
     @classmethod
     def default(cls) -> Self:
         """The host's paths: the dataset cache and T09's data root."""
         pg = PgEnvConfig()
+        cache = default_cache_dir()
         return cls(
-            tasks_file=default_cache_dir() / RUNTIME_FILE,
+            tasks_file=cache / RUNTIME_FILE,
             snapshot=pg.snapshot_path(MAIN_DB),
             plans=pg.plans_path,
             grading_cache_root=pg.data_root / "grader",
+            tasks_sha256=RUNTIME_SHA256,
+            dataset_cache=cache,
         )
 
 
@@ -188,48 +216,51 @@ class GradesPredictions(Protocol):
 async def _real_llm(recorder: CallRecorder, shares: Mapping[str, int]) -> LlmClient:
     settings = await asyncio.to_thread(load_settings)
     profile = QWEN_PROFILE.model_copy()  # The pack's model params override it per call.
-    return LlmClient(settings, recorder, profiles=[profile], shares=_full_shares(shares))
+    # In the solve container no IP socket opens (V28): the proxy is on a Unix socket.
+    uds = os.environ.get("GOALY_LLM_UDS")
+    transport = None if not uds else httpx.AsyncHTTPTransport(uds=uds)
+    return LlmClient(
+        settings, recorder, profiles=[profile], shares=_full_shares(shares), transport=transport
+    )
 
 
 def _full_shares(shares: Mapping[str, int]) -> dict[str, int]:
-    """``shares``, with a nominal 1 for a model without one: the exec purpose cannot call it."""
-    return {EXECUTOR_MODEL: 1, "glm-5.3": 1, **shares}
+    """``shares``, which must give the executor model one, and a nominal 1 for every other
+    model: the exec purpose cannot call it, but the client needs a share for each."""
+    if EXECUTOR_MODEL not in shares:
+        raise ValueError(f"this process has no share of {EXECUTOR_MODEL}, which the pack calls")
+    return {**dict.fromkeys(_ALL_MODELS, 1), **shares}
 
 
 # The agent's statement timeout, a capacity rule of the shared solving instances (spec §6.2): the
-# trusted environment caps every statement at it, whatever the pack asks (T09).
+# environment runs each statement for at most this, whatever the pack asks (T09's cap).
 SOLVING_STATEMENT_TIMEOUT_S = 120.0
 
 
 async def _real_solving() -> SolvingPool:
-    credentials = await asyncio.to_thread(load_credentials)
+    """The solving instances, as the agent role only: no admin or grader password is read."""
+    credentials = await asyncio.to_thread(load_agent_credentials)
     return SolvingPool(
         PgEnvConfig(), credentials, SqlEnvOptions(timeout_s=SOLVING_STATEMENT_TIMEOUT_S)
     )
 
 
-# A password the solve container never gets: the admin's and the grader's (spec §6.1).
-_NOT_IN_CONTAINER = "not-available-in-the-solve-container"
-
-
 async def _container_solving() -> SolvingPool:
-    """The solving instances as the container's environment names them, as the agent role."""
+    """The solving instances as the container's environment names them (V28): their Unix-socket
+    directories, since the container opens no IP socket, and the agent role's password alone."""
     try:
-        host = os.environ["GOALY_PG_HOST"]
-        ports = {int(port) for port in os.environ["GOALY_PG_PORTS"].split(",")}
+        dirs = [Path(entry) for entry in os.environ["GOALY_PG_SOCKET_DIRS"].split(",")]
         password = os.environ["GOALY_PG_AGENT_PASSWORD"]
-    except (KeyError, ValueError) as error:
-        raise EnvironmentFailure(f"the solve container's PostgreSQL settings: {error!r}") from None
-    instances = [instance for instance in SOLVING if instance.port in ports]
-    if len(instances) != len(ports):
-        raise EnvironmentFailure(f"the solve container names unknown solving ports: {ports}")
-    credentials = PgCredentials(
-        admin_password=SecretStr(_NOT_IN_CONTAINER),
-        agent_password=SecretStr(password),
-        grader_password=SecretStr(_NOT_IN_CONTAINER),
-    )
+    except KeyError as error:
+        raise EnvironmentFailure(f"the solve container lacks {error.args[0]}") from None
+    if len(dirs) != len(SOLVING) or not all(path.is_absolute() for path in dirs):
+        raise EnvironmentFailure(
+            f"GOALY_PG_SOCKET_DIRS must name {len(SOLVING)} absolute directories, in SOLVING order"
+        )
+    credentials = AgentCredentials(agent_password=SecretStr(password))
     options = SqlEnvOptions(timeout_s=SOLVING_STATEMENT_TIMEOUT_S)
-    return SolvingPool(PgEnvConfig(host=host), credentials, options, instances=instances)
+    sockets = {instance.name: path for instance, path in zip(SOLVING, dirs, strict=True)}
+    return SolvingPool(PgEnvConfig(), credentials, options, socket_dirs=sockets)
 
 
 def _real_grader(cache_root: Path, check: InstanceCheck | None) -> EffiSqlGrader:
@@ -333,7 +364,7 @@ def load_tasks(
     mode: Mode | None,
     environment_settings: Mapping[str, str],
 ) -> LoadedTasks:
-    tasks = load_instances(paths.tasks_file)
+    tasks = load_instances(_checked_tasks_file(paths))
     external = None if instances_file is None else load_instances(instances_file)
     if instances_file is None:
         source = TaskSource(
@@ -356,9 +387,40 @@ def load_tasks(
         external=external,
         environment_settings=dict(environment_settings),
     )
+    # The grading identity: the mode, the grader's code and, for dev mode, the base cache it
+    # grades against, so a remeasured setup never hands out grades of the old one.
     fingerprint = content_hash({"bench/effisql": _BENCH_DIR})[:16]
-    namespace = "" if mode is None else f"{mode.value}-{fingerprint}"
+    if mode is None:
+        namespace = ""
+    elif mode is Mode.DEV:
+        namespace = f"dev-{fingerprint}-{_base_cache_digest(paths.grading_cache_root)}"
+    else:
+        namespace = f"{mode.value}-{fingerprint}"
     return LoadedTasks(benchmark, namespace)
+
+
+def _checked_tasks_file(paths: EffiSqlPaths) -> Path:
+    """The task file, derived from the pinned dataset if missing, and checked against its sha.
+
+    A stale or changed runtime copy would load other tasks under the pinned dataset's name in
+    the manifest, so it is refused: ChecksumMismatchError, a DatasetError.
+    """
+    if not paths.tasks_file.exists() and paths.dataset_cache is not None:
+        write_runtime_file(fetch_dataset(paths.dataset_cache), paths.tasks_file)
+    if paths.tasks_sha256 is not None:
+        actual = sha256_file(paths.tasks_file)
+        if actual != paths.tasks_sha256:
+            raise ChecksumMismatchError(
+                f"{paths.tasks_file} has sha256 {actual}, not the runtime copy's"
+                f" {paths.tasks_sha256}; delete it to derive it again from the pinned dataset"
+            )
+    return paths.tasks_file
+
+
+def _base_cache_digest(cache_root: Path) -> str:
+    """A digest of the dev base cache the setup measured, which dev grades depend on."""
+    dev = cache_root / Mode.DEV.value
+    return content_hash({"dev": dev})[:16] if dev.is_dir() else "nobase"
 
 
 class LazyGrader:
@@ -407,7 +469,7 @@ async def open_harness(
     config, prompt = await asyncio.to_thread(load_pack, wiring.pack_dir)
     policy = build_policy(config.pack, prompt)
     split = options.split
-    mode = Mode.DEV if split is None else grading_mode(split)
+    mode = grading_mode(split)
     priority = grading_priority(split, options.budget_phase)
     paths = wiring.paths()
     settings = {"grading_priority": priority.name.lower()}
@@ -416,7 +478,7 @@ async def open_harness(
     await solving.preflight()
     async with AsyncExitStack() as stack:
         grader = None
-        if mode is not None and split != SPLIT_EXTERNAL:
+        if mode is not None:
             grader = LazyGrader(
                 lambda: wiring.grader(paths.grading_cache_root, wiring.instance_check),
                 mode,
@@ -510,8 +572,16 @@ def with_parts(
 
 
 def pack_models(pack_dir: Path = PACK_DIR) -> tuple[ModelSettings, ...]:
-    """The settings of the models the pack calls, from its config.yaml, for Registry.add."""
-    config, _ = load_pack(pack_dir)
+    """The settings of the models the pack calls, from its config.yaml, for Registry.add.
+
+    A config that cannot be read gives none and a warning, so it never blocks a command that
+    does not run the pack, such as a grade phase or --help; a run of the pack fails on it.
+    """
+    try:
+        config, _ = load_pack(pack_dir)
+    except (OSError, ValueError, yaml.YAMLError):
+        _logger.warning("the pack's config.yaml cannot be read", extra={"pack": str(pack_dir)})
+        return ()
     return (model_settings(config.model),)
 
 

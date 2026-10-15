@@ -8,12 +8,12 @@ database or the gateway.
 
 import asyncio
 import json
-import shlex
+import os
 from collections.abc import AsyncIterator
 from contextlib import AbstractAsyncContextManager, asynccontextmanager
 from pathlib import Path
+from unittest.mock import patch
 
-import httpx
 import pytest
 from pydantic import SecretStr
 
@@ -21,15 +21,14 @@ from goaly import cli as goaly_cli
 from goaly.bench.effisql.harness import EffiSqlWiring, open_harness
 from goaly.bench.effisql.interim import (
     InterimRequest,
-    RecordingTransport,
     SolveRequest,
+    _lines,  # The reader of the container's untrusted files, tested directly.
     run_interim,
 )
 from goaly.bench.effisql.launcher import EffiSqlLauncher, SolveRequestLike
-from goaly.bench.effisql.pg_settings import PgCredentials
+from goaly.bench.effisql.pg_settings import AgentCredentials
 from goaly.bench.effisql.splits import load_splits
 from goaly.bench.sandbox import SandboxResult, SolveEnvironment
-from goaly.contracts.gen.llm_call_pb2 import LlmCallRecord
 from goaly.contracts.gen.result_pb2 import TASK_ERROR_TYPE_POLICY_CRASH, TaskResult
 from goaly.contracts.gen.task_pb2 import GRADE_STATUS_PREDICTION_FAILED, SPLIT_TRAIN
 from goaly.contracts.jsonl import read_jsonl
@@ -58,20 +57,27 @@ class FakeContainer:
         self,
         checkout: Path,
         request: SolveRequestLike,
-        command: str,
+        argv: list[str],
+        staged_instances: Path | None,
         environment: SolveEnvironment,
         timeout_s: float,
     ) -> SandboxResult:
-        argv = shlex.split(command)
         assert argv[:3] == ["python", "-m", "goaly"]
         self.commands.append(argv[3:])
         if not self.solve:
             return SandboxResult(0, "solved nothing", timed_out=False)
         registry = Registry()
         registry.add("effisql", "v0", self._open)
-        status = await asyncio.to_thread(
-            cli.main, argv[3:], registry, budgets_file=goaly_cli.BUDGETS_FILE
-        )
+        # A real container runs goaly in its own main thread; this worker thread cannot take
+        # the CLI's SIGTERM handler, so the loop's handler methods do nothing meanwhile.
+        loop_class = type(asyncio.get_running_loop())
+        with (
+            patch.object(loop_class, "add_signal_handler", lambda *_: None),
+            patch.object(loop_class, "remove_signal_handler", lambda *_: True),
+        ):
+            status = await asyncio.to_thread(
+                cli.main, argv[3:], registry, budgets_file=goaly_cli.BUDGETS_FILE
+            )
         return SandboxResult(status, "", timed_out=False)
 
     def _open(self, options: HarnessOptions) -> AbstractAsyncContextManager[RunnableHarness]:
@@ -83,31 +89,33 @@ class FakeContainer:
         )
         return open_harness(options, wiring)
 
-    async def remove(self, run_id: str) -> None:
+    async def stop(self, run_id: str) -> None:
         pass
 
 
 class FakeProxy:
-    base_url = "http://127.0.0.1:41234"
-
     def container_env(self) -> dict[str, str]:
-        return {"GOALY_API_KEY": "token", "GOALY_BASE_URL": self.base_url}
+        return {
+            "GOALY_API_KEY": "token",
+            "GOALY_BASE_URL": "http://localhost",
+            "GOALY_LLM_UDS": "/run/goaly/proxy/llm.sock",
+        }
 
 
 @asynccontextmanager
-async def fake_proxy(recorder: CallRecorder, run_id: str) -> AsyncIterator[FakeProxy]:
+async def fake_proxy(recorder: CallRecorder, run_id: str, uds: Path) -> AsyncIterator[FakeProxy]:
     yield FakeProxy()
 
 
-def launcher(fakes: FakeWiring, container: FakeContainer) -> EffiSqlLauncher:
+def launcher(fakes: FakeWiring, container: FakeContainer, locks: Path) -> EffiSqlLauncher:
     secret = SecretStr("agent")
     return EffiSqlLauncher(
         paths=fakes.wiring.paths,
         sandbox=lambda: container,
         proxy=fake_proxy,
-        credentials=lambda: PgCredentials(
-            admin_password=secret, agent_password=secret, grader_password=secret
-        ),
+        credentials=lambda: AgentCredentials(agent_password=secret),
+        socket_dirs=lambda: (Path("/sock/solve-1"), Path("/sock/solve-2")),
+        lock_dir=lambda: locks,
     )
 
 
@@ -124,7 +132,9 @@ async def test_the_whole_run_solves_in_the_container_and_grades_on_the_host(
     fakes = fake_wiring(tmp_path)
     container = FakeContainer(fakes)
 
-    summary = await run_interim(request(tmp_path, (0, 1)), fakes.wiring, launcher(fakes, container))
+    summary = await run_interim(
+        request(tmp_path, (0, 1)), fakes.wiring, launcher(fakes, container, tmp_path / "locks")
+    )
 
     (argv,) = container.commands
     assert argv[argv.index("--out") + 1] == str(tmp_path / "run" / "solve")
@@ -160,7 +170,9 @@ async def test_a_task_the_container_left_no_record_for_fails_with_credit_zero(
     fakes = fake_wiring(tmp_path)
 
     summary = await run_interim(
-        request(tmp_path), fakes.wiring, launcher(fakes, FakeContainer(fakes, solve=False))
+        request(tmp_path),
+        fakes.wiring,
+        launcher(fakes, FakeContainer(fakes, solve=False), tmp_path / "locks"),
     )
 
     tasks = summary["tasks"]
@@ -196,21 +208,14 @@ def test_the_request_names_every_task_and_seed(tmp_path: Path) -> None:
     assert args[args.index("--split") : args.index("--split") + 2] == ["--split", "train"]
 
 
-async def test_the_recording_transport_records_each_forwarded_call(tmp_path: Path) -> None:
-    def gateway(request: httpx.Request) -> httpx.Response:
-        body = {"usage": {"prompt_tokens": 10, "completion_tokens": 4,
-                          "completion_tokens_details": {"reasoning_tokens": 3}}}  # fmt: skip
-        return httpx.Response(200, json=body, headers={"x-litellm-response-cost": "0.002"})
+def test_a_planted_symlink_in_solve_is_refused(tmp_path: Path) -> None:
+    secret = tmp_path / "secret.jsonl"
+    secret.write_text("{}\n")
+    planted = tmp_path / "results.jsonl"
+    planted.symlink_to(secret)
 
-    path = tmp_path / "calls.jsonl"
-    transport = RecordingTransport(path, "run-1")
-    transport._inner = httpx.MockTransport(gateway)  # type: ignore[assignment]  # The test's gateway.
-    async with httpx.AsyncClient(transport=transport, base_url="http://gateway") as client:
-        response = await client.post("/chat/completions", json={"model": "qwen3.6-35b-a3b"})
-
-    assert response.json()["usage"]["prompt_tokens"] == 10
-    (record,) = read_jsonl(path, LlmCallRecord)
-    assert (record.run_id, record.model, record.http_status) == ("run-1", "qwen3.6-35b-a3b", 200)
-    assert (record.usage.input_tokens, record.usage.output_tokens) == (10, 4)
-    assert record.usage.reasoning_tokens == 3
-    assert record.usage.cost_usd == pytest.approx(0.002)
+    assert _lines(planted, TaskResult) == [None]
+    assert _lines(tmp_path / "absent.jsonl", TaskResult) == []
+    fifo = tmp_path / "fifo.jsonl"
+    os.mkfifo(fifo)
+    assert _lines(fifo, TaskResult) == [None]
