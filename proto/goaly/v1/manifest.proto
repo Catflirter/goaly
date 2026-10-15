@@ -51,6 +51,12 @@ message RunManifest {
   google.protobuf.Timestamp finished_at = 16;
   // The machine the run ran on.
   MachineInfo machine = 17;
+  // The settings of the benchmark's environment that can change results, keyed by the
+  // adapter's name for each setting; empty if the benchmark has none. For Effi-SQL: the
+  // PostgreSQL image digest; the server settings shared_buffers, work_mem, jit and the
+  // parallel-worker settings; the dbgen build; the generated data's checksums; and each
+  // instance's cpuset. The benchmark's adapter fills it, and the runner writes it.
+  map<string, string> environment_settings = 19;
   // The SHA-256 of uv.lock, in hex. The lock file pins every dependency's version (spec §10).
   string uv_lock_sha256 = 18;
 }

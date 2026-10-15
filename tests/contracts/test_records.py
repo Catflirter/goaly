@@ -4,6 +4,7 @@ import json
 from collections.abc import Sequence
 
 from goaly.contracts.gen.experiment_pb2 import DecisionThresholds, Lane, PhaseResult
+from goaly.contracts.gen.manifest_pb2 import RunManifest
 from goaly.contracts.gen.task_pb2 import Prediction
 from goaly.contracts.gen.trajectory_pb2 import (
     Chat,
@@ -199,3 +200,20 @@ def test_a_tool_result_says_whether_a_tool_submitted() -> None:
     assert from_json_line(to_json_line(submitted), ToolResult).HasField("submission")
     assert "submission" not in json.loads(to_json_line(plain))
     assert not from_json_line(to_json_line(plain), ToolResult).HasField("submission")
+
+
+def test_a_manifest_records_the_environment_settings_that_can_change_results() -> None:
+    settings = {
+        "postgres_image": "postgres@sha256:" + "ab" * 32,
+        "shared_buffers": "2GB",
+        "jit": "off",
+        "max_parallel_workers_per_gather": "2",
+        "cpuset.grade-1": "6,7,18,19",
+    }
+    manifest = RunManifest(run_id="run-1", environment_settings=settings)
+
+    line = to_json_line(manifest)
+
+    assert json.loads(line)["environment_settings"] == settings
+    assert from_json_line(line, RunManifest) == manifest
+    assert json.loads(to_json_line(RunManifest()))["environment_settings"] == {}
