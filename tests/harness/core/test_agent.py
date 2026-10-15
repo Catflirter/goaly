@@ -14,12 +14,13 @@ from collections.abc import Callable
 from pathlib import Path
 from typing import Any
 
+import httpx
 import pytest
-from pydantic import BaseModel
+from pydantic import BaseModel, SecretStr
 
 from goaly.contracts.errors import EnvironmentFailure
 from goaly.contracts.gen.environment_pb2 import SqlResult
-from goaly.contracts.gen.llm_call_pb2 import Usage
+from goaly.contracts.gen.llm_call_pb2 import CallPurpose, LlmCallRecord, LlmCallStatus, Usage
 from goaly.contracts.gen.task_pb2 import EffiSqlPrediction, Prediction
 from goaly.contracts.gen.trajectory_pb2 import (
     ChatMessage,
@@ -33,10 +34,12 @@ from goaly.contracts.gen.trajectory_pb2 import (
 )
 from goaly.contracts.interfaces import Environment, SqlEnvironment
 from goaly.contracts.jsonl import append_jsonl, read_jsonl
-from goaly.harness.core.agent import AgentContext, AgentHooks, ChatModel, run_agent
+from goaly.harness.core.agent import AgentContext, AgentHooks, run_agent
 from goaly.harness.core.budgets import Budgets, BudgetUse
+from goaly.harness.core.llm import BoundLlm, CallTags, LlmClient
 from goaly.harness.core.llm_errors import ContextOverflow, ServerError
-from goaly.harness.core.llm_models import ModelParams
+from goaly.harness.core.llm_models import EXECUTOR_MODEL, ModelParams
+from goaly.harness.core.settings import Settings
 from goaly.harness.core.tool_calls import strip_tool_call_markup
 from goaly.harness.core.tools import ToolRegistry, bind, environment_failure_in
 from tests.fakes import FakeSqlEnvironment, SubmitTool
@@ -176,7 +179,7 @@ def hooks(
     )
 
 
-def context(llm: ChatModel, **budgets: Any) -> AgentContext:
+def context(llm: BoundLlm, **budgets: Any) -> AgentContext:
     limits = Budgets.model_validate({"steps": 30, "wall_clock_s": 600.0} | budgets)
     return AgentContext(llm, budgets=limits, params=PARAMS)
 
@@ -806,7 +809,7 @@ async def test_a_later_loop_gets_only_the_time_left() -> None:
 
 
 def test_the_model_handle_takes_no_purpose_or_model() -> None:
-    parameters = inspect.signature(ChatModel.complete).parameters
+    parameters = inspect.signature(BoundLlm.complete).parameters
     assert list(parameters) == ["self", "messages", "tools", "params"]
 
 
@@ -821,3 +824,97 @@ def test_the_context_exposes_no_model_handle() -> None:
 
 def test_the_context_starts_with_an_empty_trajectory() -> None:
     assert context(FakeLLM([])).trajectory() == Trajectory()
+
+
+# The real client, bound to purpose exec, against a scripted gateway.
+
+EXEC_TAGS = CallTags(CallPurpose.CALL_PURPOSE_EXEC, run_id="run-1", instance_id="q7", seed=2)
+
+
+class Recorder:
+    """A CallRecorder that keeps the record of each call."""
+
+    def __init__(self) -> None:
+        self.records: list[LlmCallRecord] = []
+
+    def record(self, record: LlmCallRecord) -> None:
+        self.records.append(record)
+
+
+def settings() -> Settings:
+    return Settings(
+        api_key=SecretStr("sk-test-0123456789abcdef"), base_url="https://gateway.test/v1"
+    )
+
+
+def completion(call_id: str, name: str, arguments: dict[str, str]) -> httpx.Response:
+    """A chat completion that makes one tool call, as the gateway sends one."""
+    call = {
+        "id": call_id,
+        "type": "function",
+        "function": {"name": name, "arguments": json.dumps(arguments)},
+    }
+    message = {"role": "assistant", "content": "", "tool_calls": [call]}
+    body = {
+        "choices": [{"finish_reason": "tool_calls", "index": 0, "message": message}],
+        "usage": {"prompt_tokens": 900, "completion_tokens": 100},
+    }
+    return httpx.Response(200, json=body, headers={"x-litellm-response-cost": "0.0004"})
+
+
+async def test_the_loop_runs_on_the_real_exec_bound_client() -> None:
+    bodies: list[Any] = []
+    replies = iter(
+        [
+            completion("c1", "execute_sql", {"sql": FAST}),
+            completion("c2", "submit", {"sql": FAST}),
+        ]
+    )
+
+    def gateway(request: httpx.Request) -> httpx.Response:
+        bodies.append(json.loads(request.content))
+        return next(replies)
+
+    recorder = Recorder()
+    async with LlmClient(settings(), recorder, transport=httpx.MockTransport(gateway)) as client:
+        llm: BoundLlm = client.bind(model=EXECUTOR_MODEL, tags=EXEC_TAGS)  # mypy checks the fit.
+        ctx = context(llm)
+        prediction = await run_agent(environment(), ctx, hooks())
+
+    assert prediction == SUBMISSION
+    records = recorder.records
+    assert [record.status for record in records] == [LlmCallStatus.LLM_CALL_STATUS_OK] * 2
+    assert {(r.purpose, r.model, r.run_id, r.instance_id, r.seed) for r in records} == {
+        (CallPurpose.CALL_PURPOSE_EXEC, EXECUTOR_MODEL, "run-1", "q7", 2)
+    }
+    steps = ctx.trajectory().steps
+    assert [step.call_id for step in steps] == [record.call_id for record in records]
+    assert [step.latency_s for step in steps] == [record.latency_s for record in records]
+    second = bodies[1]
+    assert second["max_tokens"] == PARAMS.max_tokens  # The pack's parameters, over the profile's.
+    assert [tool["function"]["name"] for tool in second["tools"]] == TOOL_NAMES.split(", ")
+    assert [message["role"] for message in second["messages"]] == [
+        "system",
+        "user",
+        "assistant",
+        "tool",
+    ]
+    assert second["messages"][2]["tool_calls"][0]["id"] == "c1"
+    assert second["messages"][3] == {"role": "tool", "content": "rows: 1", "tool_call_id": "c1"}
+
+
+async def test_the_wall_clock_cancels_a_real_call_and_its_record_says_so() -> None:
+    async def gateway(request: httpx.Request) -> httpx.Response:
+        await asyncio.Event().wait()  # Never answers.
+        raise AssertionError("the gateway answered")
+
+    recorder = Recorder()
+    async with LlmClient(settings(), recorder, transport=httpx.MockTransport(gateway)) as client:
+        ctx = context(client.bind(model=EXECUTOR_MODEL, tags=EXEC_TAGS), wall_clock_s=0.1)
+        async with asyncio.timeout(10):
+            prediction = await run_agent(environment(), ctx, hooks())
+
+    assert prediction.fallback
+    assert ctx.trajectory().stop_reason == TIME
+    [record] = recorder.records
+    assert record.status == LlmCallStatus.LLM_CALL_STATUS_CANCELLED

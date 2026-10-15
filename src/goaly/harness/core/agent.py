@@ -23,9 +23,9 @@ the runner reads it with :meth:`AgentContext.trajectory` once the policy returns
 
 import asyncio
 import json
-from collections.abc import Callable, Mapping, Sequence
+from collections.abc import Callable, Sequence
 from dataclasses import dataclass
-from typing import Final, NamedTuple, Protocol
+from typing import Final, NamedTuple
 
 from google.protobuf.message import Message
 
@@ -42,14 +42,14 @@ from goaly.contracts.gen.trajectory_pb2 import (
 )
 from goaly.contracts.interfaces import Environment
 from goaly.harness.core.budgets import Budgets, BudgetUse, ErrorStreak
-from goaly.harness.core.llm import LlmReply
+from goaly.harness.core.llm import BoundLlm, LlmReply
 from goaly.harness.core.llm_errors import ContextOverflow, LlmError
 from goaly.harness.core.llm_models import ModelParams
 from goaly.harness.core.tool_calls import parse_tool_calls, strip_tool_call_markup
 from goaly.harness.core.tools import ToolRegistry
 from goaly.harness.core.trajectory import TrajectoryRecorder
 
-__all__ = ["AgentContext", "AgentHooks", "ChatModel", "run_agent"]
+__all__ = ["AgentContext", "AgentHooks", "run_agent"]
 
 # The finish_reason of a reply that max_tokens cut off.
 _CUT_OFF: Final = "length"
@@ -72,41 +72,22 @@ _REMINDER: Final = (
 )
 
 
-class ChatModel(Protocol):
-    """The executor model, as the agent loop calls it: the exec-bound client the runner gives.
-
-    The client is bound to purpose exec and to the task's run, instance and seed (T03), so the
-    loop, and the pack that drives it, can choose neither the purpose nor the model (spec §8.5).
-    """
-
-    async def complete(
-        self,
-        messages: Sequence[ChatMessage],
-        *,
-        tools: Sequence[Mapping[str, object]],
-        params: ModelParams | None,
-    ) -> LlmReply:
-        """Send ``messages``, with ``tools`` on offer, and return the model's reply.
-
-        ``params`` override the model profile's request parameters. A failed call raises an
-        LlmError, ContextOverflow among them, once the client's retries are spent.
-        """
-
-
 class AgentContext:
     """One task's context for the agent loop: its model, budgets and trajectory (spec §5.1).
 
     The runner's context factory builds one for each task and replicate seed (T06), and T11
-    wires in the exec-bound client and the pack's config: its ``budgets`` and the request
-    ``params``. A pack reaches the model only through :func:`run_agent`, so it can choose neither
-    the purpose nor the model, and every call it makes is held to the budgets and recorded.
+    wires in the pack's config, its ``budgets`` and request ``params``, and ``llm``: the client
+    bound to purpose exec, the executor model, and the task's run, instance and seed
+    (LlmClient.bind). A pack reaches the model only through :func:`run_agent`, so it can choose
+    neither the purpose nor the model, and every call it makes is held to the budgets and
+    recorded (spec §8.5).
 
     The context is the task's: every loop a policy runs with it adds a chat to one trajectory
     and spends the same budgets, whose wall clock starts with the first loop.
     """
 
     def __init__(
-        self, llm: ChatModel, *, budgets: Budgets, params: ModelParams | None = None
+        self, llm: BoundLlm, *, budgets: Budgets, params: ModelParams | None = None
     ) -> None:
         self._llm = llm
         self._budgets = budgets

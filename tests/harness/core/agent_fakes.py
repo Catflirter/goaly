@@ -1,6 +1,6 @@
 """FakeLLM: a scripted executor model, for tests of the agent loop and of the packs that drive it.
 
-FakeLLM stands in for the exec-bound LLM client the runner hands the loop (agent.ChatModel). It
+FakeLLM stands in for the exec-bound LLM client the runner hands the loop (llm.BoundLlm). It
 replays a script, one item per call: an LlmReply is returned, an LlmError is raised, and HANG
 waits until the call is cancelled, as a call cut short by a budget or the runner is. It records
 every request, with its own copies of the messages, so a test can check what the model was sent.
@@ -57,12 +57,12 @@ class Request:
     """One call the loop made: the messages, the tools and the parameters it sent."""
 
     messages: tuple[ChatMessage, ...]
-    tools: tuple[Mapping[str, object], ...]
+    tools: tuple[Mapping[str, JsonValue], ...]
     params: ModelParams | None
 
 
 class FakeLLM:
-    """A ChatModel that answers each call with the next item of its script.
+    """A BoundLlm that answers each call with the next item of its script.
 
     A call past the end of the script fails the test with an AssertionError, which the loop lets
     propagate like any bug.
@@ -76,8 +76,8 @@ class FakeLLM:
         self,
         messages: Sequence[ChatMessage],
         *,
-        tools: Sequence[Mapping[str, object]],
-        params: ModelParams | None,
+        tools: Sequence[Mapping[str, JsonValue]] = (),
+        params: ModelParams | None = None,
     ) -> LlmReply:
         self.requests.append(Request(tuple(map(_copy, messages)), tuple(tools), params))
         item = next(self._script, None)
