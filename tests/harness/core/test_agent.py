@@ -38,12 +38,12 @@ from goaly.contracts.jsonl import append_jsonl, read_jsonl
 from goaly.harness.core.agent import AgentContext, AgentHooks, run_agent
 from goaly.harness.core.budgets import CALLS_PER_REPLY, Budgets, BudgetUse
 from goaly.harness.core.context_window import ContextWindow
-from goaly.harness.core.llm import BoundLlm, CallTags, LlmClient
+from goaly.harness.core.llm import BoundLlm, CallTags, LlmClient, LlmReply
 from goaly.harness.core.llm_errors import ContextOverflow, ServerError
 from goaly.harness.core.llm_models import EXECUTOR_MODEL, ModelParams
 from goaly.harness.core.settings import Settings
-from goaly.harness.core.tool_calls import strip_tool_call_markup
 from goaly.harness.core.tools import ToolRegistry, bind, environment_failure_in
+from tests.contracts.test_records import prompt
 from tests.fakes import FakeSqlEnvironment, SubmitTool
 from tests.harness.core.agent_fakes import (
     DEFAULT_USAGE,
@@ -234,50 +234,19 @@ def tool_message(result: ToolResult) -> ChatMessage:
     return ChatMessage(role=TOOL, content=result.content, tool_call_id=result.tool_call_id)
 
 
-def replayed(assistant: ChatMessage) -> ChatMessage:
-    """An assistant message as a later prompt carries it: its calls only as structured calls.
-
-    Once any call was parsed from XML, neither the content nor the reasoning keeps call markup.
-    """
-    message = ChatMessage()
-    message.CopyFrom(assistant)
-    if {call.source for call in assistant.tool_calls} & {CONTENT_XML, REASONING_XML}:
-        message.content = strip_tool_call_markup(message.content)
-        message.reasoning_content = strip_tool_call_markup(message.reasoning_content)
-    return message
+def reference_prompts(trajectory: Trajectory) -> list[list[ChatMessage]]:
+    """Each step's prompt, as the contract's reference rebuild (test_records.prompt) makes it."""
+    return [prompt(trajectory, index) for index in range(len(trajectory.steps))]
 
 
-def rebuilt_prompts(trajectory: Trajectory, *, keep_turns: int = 8) -> list[list[ChatMessage]]:
-    """Each step's prompt, rebuilt from the trajectory: the reference rebuild.
+def function_block(name: str, sql: str) -> str:
+    """A Qwen3-Coder XML call to ``name``, bare."""
+    return f"<function={name}>\n<parameter=sql>\n{sql}\n</parameter>\n</function>"
 
-    It follows the rule trajectory.proto gives: every fold in effect at a step replaces the
-    content of the tool message it names, by its step and call ID. Two rules of the loop's own
-    complete it, which the contracts follow-up will write into that rule: a reply goes out with
-    its calls only as structured calls (replayed), and only a chat's last ``keep_turns`` turns
-    keep their reasoning.
-    """
-    earlier: dict[int, list[Step]] = {}
-    folds: dict[int, dict[tuple[int, str], str]] = {}
-    prompts = []
-    for step in trajectory.steps:
-        turns = earlier.setdefault(step.chat, [])
-        in_effect = folds.setdefault(step.chat, {})
-        in_effect.update({(fold.step, fold.tool_call_id): fold.replacement for fold in step.folds})
-        prompt = list(trajectory.chats[step.chat].initial_messages)
-        for position, turn in enumerate(turns):
-            reply = replayed(turn.assistant)
-            if len(turns) - position > keep_turns:
-                reply.reasoning_content = ""
-            prompt.append(reply)
-            for result in turn.tool_results:
-                content = in_effect.get((turn.index, result.tool_call_id), result.content)
-                prompt.append(
-                    ChatMessage(role=TOOL, content=content, tool_call_id=result.tool_call_id)
-                )
-            prompt.extend(turn.injected)
-        prompts.append(prompt)
-        turns.append(step)
-    return prompts
+
+def tool_call_block(name: str, sql: str) -> str:
+    """A Qwen3-Coder XML call to ``name``, wrapped in its <tool_call> tags."""
+    return f"<tool_call>\n{function_block(name, sql)}\n</tool_call>"
 
 
 def sent(llm: FakeLLM) -> list[list[ChatMessage]]:
@@ -370,7 +339,93 @@ async def test_every_prompt_can_be_rebuilt_from_the_trajectory() -> None:
     assert trajectory.stop_reason == SUBMITTED
     assert len(trajectory.steps) == len(script)
     assert trajectory.steps[5].injected[0].content.startswith("You have made 3 errors in a row.")
-    assert rebuilt_prompts(trajectory) == sent(llm)
+    assert reference_prompts(trajectory) == sent(llm)
+
+
+BARE_CALL = function_block("execute_sql", "SELECT 2")
+WRAPPED_CALL = tool_call_block("execute_sql", "SELECT 1")
+
+
+def markup_script() -> list[LlmReply]:
+    """Replies with both kinds of call markup, in content and reasoning, with calls from each
+    source; then six plain replies, which push the first two out of the 8-turn replay window."""
+    return [
+        # Calls from the content's <tool_call> block; the reasoning drafts it too.
+        reply(
+            content=f"Run it.\n{WRAPPED_CALL}\nNot this: {BARE_CALL}",
+            reasoning=f"Draft: {WRAPPED_CALL}\n{BARE_CALL}",
+        ),
+        # A call from a bare block, in a content with no <tool_call>; a bare one in reasoning.
+        reply(content=f"Then: {function_block('execute_sql', 'SELECT 3')}", reasoning=BARE_CALL),
+        # A call from the reasoning's <tool_call> block.
+        reply(reasoning=f"Thinking.\n{tool_call_block('execute_sql', 'SELECT 4')}"),
+        # A standard call, with markup in both fields all the same.
+        reply(
+            execute_sql("SELECT 5"), content=f"Also {WRAPPED_CALL}", reasoning=f"Also {BARE_CALL}"
+        ),
+        *(reply(execute_sql(f"SELECT {n}"), reasoning=f"Plain {n}.") for n in range(6, 12)),
+        reply(submit()),
+    ]
+
+
+def replies_sent(llm: FakeLLM, call: int) -> list[tuple[str, str]]:
+    """The content and reasoning of each reply that call number ``call`` was sent."""
+    return [(m.content, m.reasoning_content) for m in sent(llm)[call] if m.role == ASSISTANT]
+
+
+async def test_replies_go_out_without_call_markup_and_older_ones_without_reasoning() -> None:
+    """Spec §5.1: an executor chat replays no call markup, and reasoning only in its window."""
+    llm = FakeLLM(markup_script())
+    ctx = context(llm)
+
+    await run_agent(environment(), ctx, hooks())
+
+    trajectory = ctx.trajectory()
+    assert [len(step.assistant.tool_calls) for step in trajectory.steps] == [1] * 11
+    assert [chat.keep_turns for chat in trajectory.chats] == [8]
+    stripped = [
+        # Every <tool_call> block goes, then every bare <function=...> block, in either field,
+        # whatever field the calls came from: a standard call's reply loses its markup too.
+        ("Run it.\n\nNot this: ", "Draft: \n"),
+        ("Then: ", ""),
+        ("", "Thinking.\n"),
+        ("Also ", "Also "),
+    ]
+    assert replies_sent(llm, 4) == stripped  # All four within the window.
+    assert (
+        replies_sent(llm, 10)
+        == [
+            ("Run it.\n\nNot this: ", ""),  # Out of the window: no reasoning at all.
+            ("Then: ", ""),
+            *stripped[2:],
+            *(("", f"Plain {n}.") for n in range(6, 12)),
+        ]
+    )
+    assert trajectory.steps[3].assistant.content == f"Also {WRAPPED_CALL}"  # Kept as it came.
+
+
+@pytest.mark.parametrize("keep_turns", [0, 2, 8])
+async def test_the_loop_sends_the_prompts_the_contracts_reference_rebuilds(keep_turns: int) -> None:
+    llm = FakeLLM(markup_script())
+    ctx = context(llm, window=ContextWindow(keep_turns=keep_turns))
+
+    await run_agent(environment(), ctx, hooks())
+
+    trajectory = ctx.trajectory()
+    assert [chat.keep_turns for chat in trajectory.chats] == [keep_turns]
+    assert reference_prompts(trajectory) == sent(llm)
+
+
+async def test_a_window_of_0_replays_the_chat_unchanged() -> None:
+    llm = FakeLLM(markup_script())
+    ctx = context(llm, window=ContextWindow(keep_turns=0))
+
+    await run_agent(environment(), ctx, hooks())
+
+    as_written = [
+        (s.assistant.content, s.assistant.reasoning_content) for s in ctx.trajectory().steps
+    ]
+    assert replies_sent(llm, 10) == as_written[:10]  # Markup and reasoning, all as they came.
 
 
 async def test_a_trajectory_round_trips_through_jsonl(tmp_path: Path) -> None:
@@ -1213,7 +1268,7 @@ async def test_a_long_chat_folds_its_oldest_tool_outputs() -> None:
         big(2),
         big(3),
     ]
-    assert rebuilt_prompts(trajectory, keep_turns=2) == sent(llm)
+    assert reference_prompts(trajectory) == sent(llm)
 
 
 async def test_the_last_eight_turns_never_fold() -> None:
@@ -1226,7 +1281,7 @@ async def test_the_last_eight_turns_never_fold() -> None:
 
     last = [m.content for m in sent(llm)[10] if m.role == TOOL]
     assert last == [folded(0), folded(1), *(big(n) for n in range(2, 10))]
-    assert rebuilt_prompts(ctx.trajectory()) == sent(llm)
+    assert reference_prompts(ctx.trajectory()) == sent(llm)
 
 
 async def test_each_prompt_keeps_the_reasoning_of_the_chats_last_turns_before_it() -> None:
@@ -1244,7 +1299,7 @@ async def test_each_prompt_keeps_the_reasoning_of_the_chats_last_turns_before_it
         ["", "Thought 1.", "Thought 2."],
         ["", "", "Thought 2.", "Thought 3."],
     ]
-    assert rebuilt_prompts(ctx.trajectory(), keep_turns=2) == sent(llm)
+    assert reference_prompts(ctx.trajectory()) == sent(llm)
 
 
 async def test_only_the_last_turns_go_out_with_their_reasoning() -> None:
@@ -1258,7 +1313,7 @@ async def test_only_the_last_turns_go_out_with_their_reasoning() -> None:
     assert [m.reasoning_content for m in replies] == ["", "Thought 1.", "Thought 2."]
     trajectory = ctx.trajectory()
     assert trajectory.steps[0].assistant.reasoning_content == "Thought 0."  # Kept here.
-    assert rebuilt_prompts(trajectory, keep_turns=2) == sent(llm)
+    assert reference_prompts(trajectory) == sent(llm)
 
 
 async def test_a_prompt_too_long_for_the_model_folds_and_goes_once_more() -> None:
@@ -1280,7 +1335,7 @@ async def test_a_prompt_too_long_for_the_model_folds_and_goes_once_more() -> Non
     overflowed, retried = sent(llm)[3], sent(llm)[4]
     assert [m.content for m in overflowed if m.role == TOOL] == [big(0), big(1), big(2)]
     assert [m.content for m in retried if m.role == TOOL] == [folded(0), folded(1), big(2)]
-    assert rebuilt_prompts(trajectory, keep_turns=1) == [*sent(llm)[:3], retried]
+    assert reference_prompts(trajectory) == [*sent(llm)[:3], retried]
 
 
 async def test_a_prompt_too_long_after_its_fold_ends_in_the_fallback() -> None:

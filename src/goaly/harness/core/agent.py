@@ -63,8 +63,6 @@ __all__ = ["AgentContext", "AgentHooks", "run_agent"]
 # The finish_reason of a reply that max_tokens cut off.
 _CUT_OFF: Final = "length"
 _REASONING_XML: Final = ToolCallSource.TOOL_CALL_SOURCE_REASONING_XML
-# Where the parser finds calls written as Qwen3-Coder XML.
-_XML_SOURCES: Final = frozenset({ToolCallSource.TOOL_CALL_SOURCE_CONTENT_XML, _REASONING_XML})
 
 # What the loop tells the model. {tools} lists the tools' names.
 _CUT_OFF_CALL: Final = (
@@ -233,7 +231,9 @@ class _Chat[E: Environment]:
     async def run(self) -> Prediction:
         """Open the chat and converse; every exit, an exception's included, sets a stop reason."""
         try:
-            self._chat = self._recorder.start_chat(self._label, self._opening)
+            self._chat = self._recorder.start_chat(
+                self._label, self._opening, keep_turns=self._ctx._window.keep_turns
+            )
             outcome = await self._converse_in_time()
             prediction = outcome.submission
             if prediction is None:
@@ -338,7 +338,9 @@ class _Chat[E: Environment]:
         step.estimated_prompt_tokens = sent.estimated_tokens
         step.folds.extend(sent.folds)
         self._last = step
-        self._prompt.add_turn(step.index, _replayed(assistant))
+        # A window of 0 marks a chat whose replies replay unchanged (Chat.keep_turns).
+        replay = _replayed(assistant) if self._ctx._window.keep_turns > 0 else assistant
+        self._prompt.add_turn(step.index, replay)
         if reply.finish_reason == _CUT_OFF:
             for call in calls:  # A cut-off call may be a wrong submit: none runs.
                 self._answer(step, _not_run(call, _CUT_OFF_CALL))
@@ -439,18 +441,26 @@ def _with_calls(message: ChatMessage, calls: Sequence[ToolCall]) -> ChatMessage:
 
 
 def _replayed(assistant: ChatMessage) -> ChatMessage:
-    """``assistant`` as later prompts carry it: each call only once, as a structured call.
+    """``assistant`` as later prompts carry it: no call markup, its calls only as structured calls.
 
-    When its calls were parsed from XML, the call markup is taken out of both the content and
-    the reasoning. A call drafted in one and written again in the other then reaches the model
-    once, and a drafted call that never ran cannot look as if it ran. The trajectory keeps the
-    reply as it came.
+    An executor chat, one with a replay window, replays no Qwen3-Coder XML call markup (spec
+    §5.1, and Step's rebuild rule in trajectory.proto). Its content and its reasoning both lose
+    it, whichever field its calls came from, the standard one included. A call drafted in one
+    field and written again in the other then reaches the model once; a drafted call that never
+    ran cannot look as if it ran; and markup the parser took for no call never reaches the model
+    either. The trajectory keeps every reply as it came.
     """
     message = _copy(assistant)
-    if any(call.source in _XML_SOURCES for call in assistant.tool_calls):
-        message.content = strip_tool_call_markup(message.content)
-        message.reasoning_content = strip_tool_call_markup(message.reasoning_content)
+    message.content = _without_markup(message.content)
+    message.reasoning_content = _without_markup(message.reasoning_content)
     return message
+
+
+def _without_markup(text: str) -> str:
+    """``text`` without its <tool_call> blocks, and then without its bare <function=...> ones."""
+    # strip_tool_call_markup takes the <tool_call> blocks of a text that has some, or else its
+    # bare blocks: a second pass takes the bare blocks left beside <tool_call> ones.
+    return strip_tool_call_markup(strip_tool_call_markup(text))
 
 
 def _drafted(call: ToolCall, result: ToolResult) -> ToolResult:
