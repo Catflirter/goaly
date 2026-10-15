@@ -438,7 +438,8 @@ class LlmClient:
         if its loop is not running, or if called in the loop's own thread, where waiting would
         deadlock. If the loop cancels the call, at shutdown say, it raises
         asyncio.CancelledError, which ``except Exception`` does not catch. If ``timeout_s`` passes
-        first, it cancels the call and raises TimeoutError.
+        first, it cancels the call and raises TimeoutError; a ``timeout_s`` that is not a positive
+        time raises ValueError before the call is sent.
         """
         loop = self._loop
         if loop is None:
@@ -451,6 +452,8 @@ class LlmClient:
             running = None
         if running is loop:
             raise RuntimeError("complete_sync would block the loop it needs: await complete()")
+        if timeout_s is not None and not (math.isfinite(timeout_s) and timeout_s > 0):
+            raise ValueError(f"timeout_s must be a positive time, not {timeout_s!r}")
         self._check_open()
         call = self.complete(
             messages,

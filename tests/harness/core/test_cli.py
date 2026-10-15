@@ -1,10 +1,14 @@
 """Tests for goaly.harness.core.cli: `goaly run`, end to end with the toy benchmark (spec §6.4)."""
 
 import asyncio
+import importlib
 import json
 import logging
 import os
+import shutil
 import signal
+import sys
+import threading
 from collections.abc import AsyncIterator, Coroutine, Iterator
 from contextlib import AbstractAsyncContextManager, asynccontextmanager
 from dataclasses import dataclass, field
@@ -32,6 +36,9 @@ from goaly.contracts.jsonl import read_jsonl
 from goaly.harness.core import cli
 from goaly.harness.core.manifest import (
     CORE_DIR,
+    CORE_IN_CHECKOUT,
+    REPO_ROOT,
+    checkout_harness_hash,
     config_hash,
     core_hash,
     git_state,
@@ -75,6 +82,8 @@ other = { "qwen3.6-35b-a3b" = 3 }
 """
 
 type ToyHarness = Harness[ToyInstance, FakeSqlEnvironment, StubContext]
+
+GUARD_S = 10
 
 TOY_MODELS = (ModelSettings(model="qwen3.6-35b-a3b", temperature=0.6, thinking=True),)
 
@@ -1527,3 +1536,284 @@ def test_logs_are_json_lines_on_stderr_at_the_level_asked(
     assert logging.getLogger().level == logging.DEBUG
     # pydantic-settings logs the raw settings, the API key among them, at DEBUG.
     assert not logging.getLogger("pydantic_settings").isEnabledFor(logging.DEBUG)
+
+
+# The modes of V27: the isolated pipeline, --in-process and the solve container.
+
+
+TRAIN = ["--bench", "toy", "--split", "train", "--budget-phase", "test"]
+
+
+@pytest.mark.parametrize(
+    ("environment", "extra", "status"),
+    [
+        ({}, (), 0),  # No key at all, as with the fake LLM.
+        ({"GOALY_API_KEY": "sk-test"}, (), cli.USAGE),  # The real gateway's.
+        ({"GOALY_API_KEY": "sk-test"}, ("--unsafe-in-process",), 0),
+        ({"GOALY_API_KEY": "dummy", "GOALY_BASE_URL": "http://127.0.0.1:8650/v1"}, (), 0),
+        ({"GOALY_API_KEY": "dummy", "GOALY_BASE_URL": "http://localhost:8650/v1"}, (), 0),
+    ],
+    ids=["no key", "real key", "unsafe", "loopback proxy", "localhost proxy"],
+)
+def test_in_process_is_refused_with_a_real_gateway_key(
+    capsys: pytest.CaptureFixture[str],
+    registry: Registry,
+    budgets: Path,
+    factory: ToyFactory,
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    environment: dict[str, str],
+    extra: tuple[str, ...],
+    status: int,
+) -> None:
+    for name, value in environment.items():
+        monkeypatch.setenv(name, value)
+
+    outcome = goaly(
+        capsys, registry, budgets, *TRAIN, "--out", str(tmp_path / "r"), "--in-process", *extra
+    )
+
+    assert outcome.status == status, outcome.stderr
+    if status == cli.USAGE:
+        assert "add --unsafe-in-process to debug locally" in outcome.stderr
+        assert factory.options == []
+    else:
+        (options,) = factory.options  # Opened here, in this process.
+        assert (options.in_container, options.files) == (False, RunFiles(tmp_path / "r"))
+        assert all(result.HasField("grade") for result in results(tmp_path / "r"))
+
+
+@pytest.mark.parametrize(
+    ("argv", "message"),
+    [
+        (["--unsafe-in-process"], "--unsafe-in-process goes with --in-process"),
+        (["--in-process", "--phase", "solve"], "--in-process runs both phases at once"),
+        (["--in-process", "--harness-checkout", "x"], "cannot run another checkout's"),
+        (["--tasks", "t.json"], "only the solve container takes: --tasks"),
+        (
+            ["--llm-share", "m=1", "--inputs", "i"],
+            "only the solve container takes: --inputs, --llm",
+        ),
+        (["--in-container"], "--in-container runs only the solve phase"),
+        (["--in-container", "--phase", "solve", "--in-process"], "runs only the solve phase"),
+        (
+            ["--in-container", "--phase", "solve", "--cache", "c", "--grading-instances", "all"],
+            "the solve container takes none of: --cache, --budget-phase, --grading-instances",
+        ),
+    ],
+)
+def test_options_of_another_mode_are_refused(
+    capsys: pytest.CaptureFixture[str],
+    registry: Registry,
+    budgets: Path,
+    tmp_path: Path,
+    argv: list[str],
+    message: str,
+) -> None:
+    outcome = goaly(capsys, registry, budgets, *TRAIN, "--out", str(tmp_path / "r"), *argv)
+
+    assert outcome.status == cli.USAGE
+    assert message in outcome.stderr
+
+
+def test_the_container_needs_the_hosts_tasks_inputs_and_run_id(
+    capsys: pytest.CaptureFixture[str], registry: Registry, budgets: Path, tmp_path: Path
+) -> None:
+    outcome = goaly(
+        capsys, registry, budgets, "--bench", "toy", "--split", "train", "--phase", "solve",
+        "--in-container", "--out", str(tmp_path / "s"),
+    )  # fmt: skip
+
+    assert outcome.status == cli.USAGE
+    assert "the solve container needs: --tasks, --inputs, --run-id" in outcome.stderr
+
+
+def test_the_container_needs_its_split_and_resume_for_retries(
+    capsys: pytest.CaptureFixture[str], registry: Registry, budgets: Path, tmp_path: Path
+) -> None:
+    container = [
+        "--bench", "toy", "--phase", "solve", "--in-container", "--out", str(tmp_path / "s"),
+        "--tasks", str(tmp_path / "t.json"), "--inputs", str(tmp_path / "i"), "--run-id", "r1",
+    ]  # fmt: skip
+
+    no_split = goaly(capsys, registry, budgets, *container)
+    no_resume = goaly(capsys, registry, budgets, *container, "--split", "train", "--retry-errors")
+
+    assert no_split.status == no_resume.status == cli.USAGE
+    assert "the solve container needs --split or --instances" in no_split.stderr
+    assert "--retry-errors needs --resume" in no_resume.stderr
+
+
+def test_a_benchmark_without_a_launcher_runs_only_in_process(
+    capsys: pytest.CaptureFixture[str], budgets: Path, factory: ToyFactory, tmp_path: Path
+) -> None:
+    registry = registry_of(budgets, factory)
+    host = ToyHostFactory()
+    registry._hosts["toy"] = host
+
+    outcome = goaly(capsys, registry, budgets, *TRAIN, "--out", str(tmp_path / "r"))
+
+    assert outcome.status == cli.USAGE
+    assert "has no isolated solve phase: run it with --in-process" in outcome.stderr
+
+
+def test_the_grading_options_reach_both_sides(
+    capsys: pytest.CaptureFixture[str],
+    registry: Registry,
+    budgets: Path,
+    factory: ToyFactory,
+    grading: ToyHostFactory,
+    tmp_path: Path,
+) -> None:
+    options = ["--grading-priority", "smoke", "--grading-instances", "all"]
+
+    isolated = goaly(capsys, registry, budgets, *TRAIN, "--out", str(tmp_path / "a"), *options)
+    in_process = goaly(
+        capsys, registry, budgets, *TRAIN, "--out", str(tmp_path / "b"), *options, "--in-process"
+    )
+
+    assert isolated.status == in_process.status == 0
+    (host,) = grading.options
+    assert (host.grading_priority, host.grading_instances) == ("smoke", "all")
+    harness = factory.options[-1]
+    assert (harness.grading_priority, harness.grading_instances) == ("smoke", "all")
+    # They order the grader's work; they do not change its result, so no hash has them.
+    hashes = {read_manifest(RunFiles(tmp_path / "a").manifest).config_hash}
+    plain = goaly(capsys, registry, budgets, *TRAIN, "--out", str(tmp_path / "c"))
+    assert plain.status == 0
+    assert read_manifest(RunFiles(tmp_path / "c").manifest).config_hash in hashes
+
+
+def test_an_organizers_run_defaults_to_the_final_phase(
+    capsys: pytest.CaptureFixture[str], registry: Registry, tmp_path: Path, budgets: Path
+) -> None:
+    budgets.write_text(
+        BUDGETS + '\n[phases.final]\ntoy = { "qwen3.6-35b-a3b" = 6 }\n', encoding="utf-8"
+    )
+    tasks = tmp_path / "heldout.jsonl"
+    tasks.write_text('{"id": "x1", "base_sql": "SELECT 1 FROM t"}\n', encoding="utf-8")
+
+    outcome = goaly(
+        capsys, registry, budgets, "--bench", "toy", "--instances", str(tasks), "--phase",
+        "solve", "--out", str(tmp_path / "heldout"),
+    )  # fmt: skip
+
+    assert outcome.status == 0, outcome.stderr
+    assert "LLM shares of toy in the phase final" in outcome.stderr
+    assert official(tmp_path / "heldout") == [{"instance_id": "x1", "sql": "SELECT 1 FROM t"}]
+
+
+# --harness-checkout: a snapshot's pack, which the host hashes and the container runs.
+
+
+def snapshot(root: Path, pack: Path) -> Path:
+    """A checkout's core and pack, as git archive would give them."""
+    for part in (CORE_IN_CHECKOUT, pack):
+        shutil.copytree(REPO_ROOT / part, root / part, ignore=shutil.ignore_patterns("__pycache__"))
+    return root
+
+
+def test_a_snapshot_checkouts_pack_is_hashed_and_run(
+    capsys: pytest.CaptureFixture[str], budgets: Path, tmp_path: Path
+) -> None:
+    pack = Path("src/goaly/config")  # Any directory of this checkout stands in for a pack.
+    factory = ToyFactory(pack_dir=REPO_ROOT / pack)
+    host = ToyHostFactory()
+    registry = registry_of(budgets, factory, host)
+    checkout = snapshot(tmp_path / "snapshot", pack)
+    (checkout / pack / "llm_budgets.toml").write_text("# The candidate's.\n", encoding="utf-8")
+
+    outcome = goaly(
+        capsys, registry, budgets, *TRAIN, "--out", str(tmp_path / "r"),
+        "--harness-checkout", str(checkout),
+    )  # fmt: skip
+
+    assert outcome.status == 0, outcome.stderr
+    stored = read_manifest(RunFiles(tmp_path / "r").manifest)
+    assert stored.harness_hash == checkout_harness_hash(checkout, pack)
+    assert stored.harness_hash != harness_hash(REPO_ROOT / pack)
+    assert host.launcher is not None
+    (request,) = host.launcher.requests
+    assert (request.checkout, request.pack_dir) == (checkout, checkout / pack)
+
+
+@pytest.mark.parametrize("problem", ["missing", "no pack", "not ours", "pack missing", "a link"])
+def test_a_checkout_that_cannot_be_run_is_refused(
+    capsys: pytest.CaptureFixture[str], budgets: Path, tmp_path: Path, problem: str
+) -> None:
+    pack = Path("src/goaly/config")
+    factory = ToyFactory(pack_dir=REPO_ROOT / pack)
+    checkout = tmp_path / "snapshot"
+    if problem == "no pack":
+        factory = ToyFactory(pack_dir=None)
+    elif problem == "not ours":
+        factory = ToyFactory(pack_dir=tmp_path / "elsewhere")
+    if problem != "missing":
+        snapshot(checkout, pack)
+    if problem == "pack missing":
+        shutil.rmtree(checkout / pack)
+    if problem == "a link":
+        (checkout / pack / "linked").symlink_to(tmp_path)
+    expected = {
+        "missing": "no such checkout",
+        "no pack": "has no pack to take from a checkout",
+        "not ours": "is not in this checkout",
+        "pack missing": "has no src/goaly/config",
+        "a link": "cannot be hashed",
+    }[problem]
+
+    outcome = goaly(
+        capsys, registry_of(budgets, factory), budgets, *TRAIN, "--out", str(tmp_path / "r"),
+        "--harness-checkout", str(checkout),
+    )  # fmt: skip
+
+    assert outcome.status == cli.USAGE
+    assert expected in outcome.stderr
+
+
+def test_the_grade_phase_imports_no_pack(
+    capsys: pytest.CaptureFixture[str], budgets: Path, tmp_path: Path
+) -> None:
+    out = tmp_path / "run"
+    solved(capsys, budgets, out)
+    sentinel = "tests.harness.core._sentinel_pack"
+
+    @asynccontextmanager
+    async def importing(options: HarnessOptions) -> AsyncIterator[ToyHarness]:
+        importlib.import_module(sentinel)  # As a factory imports its pack, inside itself.
+        async with ToyFactory()(options) as harness:
+            yield harness
+
+    sys.modules.pop(sentinel, None)
+    graded = goaly(
+        capsys, registry_of(budgets, importing), budgets, "--bench", "toy", "--phase", "grade",
+        "--out", str(out),
+    )  # fmt: skip
+
+    assert graded.status == 0, graded.stderr
+    assert sentinel not in sys.modules
+
+
+@pytest.mark.parametrize("share", ["qwen", "=3", "qwen=0"])
+def test_a_share_is_a_model_and_a_count(
+    capsys: pytest.CaptureFixture[str], registry: Registry, budgets: Path, share: str
+) -> None:
+    with pytest.raises(SystemExit) as refused:
+        goaly(capsys, registry, budgets, "--bench", "toy", "--out", "r", "--llm-share", share)
+
+    assert refused.value.code == cli.USAGE
+
+
+def test_goaly_runs_outside_the_main_thread_without_its_sigterm_handler(
+    registry: Registry, budgets: Path, tmp_path: Path
+) -> None:
+    statuses: list[int] = []
+    argv = ["run", "--bench", "toy", "--phase", "grade", "--out", str(tmp_path / "none")]
+
+    thread = threading.Thread(
+        target=lambda: statuses.append(cli.main(argv, registry, budgets_file=budgets))
+    )
+    thread.start()
+    thread.join(GUARD_S)
+
+    assert statuses == [cli.USAGE]  # It ran, and refused a run that is not there.

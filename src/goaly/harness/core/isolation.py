@@ -16,6 +16,8 @@ files, the manifest, the evaluation cache and the proxy's call log.
 
 import json
 import logging
+import os
+import stat
 from collections import Counter
 from collections.abc import Awaitable, Callable, Collection, Iterator, Mapping, Sequence
 from dataclasses import dataclass
@@ -278,39 +280,61 @@ class SolveRecord:
 type _Key = tuple[str, int]
 
 
-def read_solve_records(
-    files: Callable[[int], Path],
-    results: Path,
-    trajectories: Path,
-    keys: Collection[_Key],
-) -> dict[_Key, SolveRecord]:
+def read_solve_records(solve_dir: Path, keys: Collection[_Key]) -> dict[_Key, SolveRecord]:
     """Read the solve directory's record of each task of ``keys``, whatever the container wrote.
 
-    ``files(seed)`` is the predictions file of a seed. A task's prediction is valid when that
-    file holds exactly one line for its instance, and the line is a Prediction; a task with none,
-    with two or more, or with one that does not parse, has a ``problem`` instead. A line longer
-    than the file's bound, or that names no instance, counts for no task. The results and the
-    trajectories give each task's last line that parses. It reads files, so it blocks.
+    A task's prediction is valid when its seed's predictions file holds exactly one line for its
+    instance, and the line is a Prediction. A task with none, with two or more, or with one that
+    does not parse, has a ``problem`` instead. A line longer than the file's bound, or that names
+    no instance, counts for no task. The results and the trajectories give each task's last line
+    that parses.
+
+    The container owns the directory, so nothing in it is opened by a path the host resolves:
+    each file and directory is opened relative to the one that holds it, without following a
+    symbolic link, and must be a regular file or a directory. Anything else, such as a link to
+    another run's predictions, counts as no record, with a warning. It reads files, so it blocks.
     """
     wanted = set(keys)
     valid: dict[_Key, Prediction] = {}
     lines: Counter[_Key] = Counter()
     malformed: set[_Key] = set()
-    for seed in sorted({seed for _, seed in wanted}):
-        path = files(seed)
-        if not path.is_file():
-            continue
-        for instance_id, prediction in _instance_lines(path, MAX_PREDICTION_BYTES, Prediction):
-            key = (instance_id, seed)
-            if key not in wanted:
-                continue
-            lines[key] += 1
-            if prediction is None:
-                malformed.add(key)
-            else:
-                valid[key] = prediction
-    last_results = _last_lines(results, MAX_RESULT_BYTES, TaskResult, wanted)
-    last_trajectories = _last_lines(trajectories, MAX_TRAJECTORY_BYTES, Trajectory, wanted)
+    last_results: dict[_Key, TaskResult] = {}
+    last_trajectories: dict[_Key, Trajectory] = {}
+    root = _open_plain(str(solve_dir), None, solve_dir, directory=True)
+    if root is not None:
+        try:
+            predictions = _open_plain(
+                "predictions", root, solve_dir / "predictions", directory=True
+            )
+            if predictions is not None:
+                try:
+                    for seed in sorted({seed for _, seed in wanted}):
+                        name = f"seed-{seed}.jsonl"
+                        where = solve_dir / "predictions" / name
+                        found = _open_plain(name, predictions, where, directory=False)
+                        if found is None:
+                            continue
+                        for instance_id, prediction in _instance_lines(
+                            found, where, MAX_PREDICTION_BYTES, Prediction
+                        ):
+                            key = (instance_id, seed)
+                            if key not in wanted:
+                                continue
+                            lines[key] += 1
+                            if prediction is None:
+                                malformed.add(key)
+                            else:
+                                valid[key] = prediction
+                finally:
+                    os.close(predictions)
+            last_results = _last_lines(
+                root, solve_dir, "results.jsonl", MAX_RESULT_BYTES, TaskResult, wanted
+            )
+            last_trajectories = _last_lines(
+                root, solve_dir, "trajectories.jsonl", MAX_TRAJECTORY_BYTES, Trajectory, wanted
+            )
+        finally:
+            os.close(root)
     records: dict[_Key, SolveRecord] = {}
     for key in wanted:
         problem = ""
@@ -329,25 +353,59 @@ def read_solve_records(
     return records
 
 
+# Opening what the container wrote: never through a link, and only a regular file or directory.
+_DIRECTORY_FLAGS = os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW | os.O_CLOEXEC
+# O_NONBLOCK, so that a FIFO in a file's place cannot hang the open; fstat then refuses it.
+_FILE_FLAGS = os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK | os.O_CLOEXEC
+
+
+def _open_plain(name: str, dir_fd: int | None, where: Path, *, directory: bool) -> int | None:
+    """Open ``name`` in the directory ``dir_fd`` without following a link, and return its
+    descriptor if it is a directory (``directory``) or a regular file. Return None, with a
+    warning for anything but a missing one, if it is not."""
+    kind = "directory" if directory else "regular file"
+    try:
+        fd = os.open(name, _DIRECTORY_FLAGS if directory else _FILE_FLAGS, dir_fd=dir_fd)
+    except FileNotFoundError:
+        return None
+    except OSError as error:  # ELOOP for a link, ENOTDIR for a file in a directory's place.
+        _logger.warning(
+            "%s is not a %s the host reads, so it counts as no record: %s",
+            where,
+            kind,
+            error.strerror or type(error).__name__,
+        )
+        return None
+    mode = os.fstat(fd).st_mode
+    if stat.S_ISDIR(mode) if directory else stat.S_ISREG(mode):
+        return fd
+    os.close(fd)
+    _logger.warning("%s is not a %s the host reads, so it counts as no record", where, kind)
+    return None
+
+
 def _last_lines[M: (TaskResult, Trajectory)](
-    path: Path, max_bytes: int, kind: type[M], wanted: set[_Key]
+    root: int, solve_dir: Path, name: str, max_bytes: int, kind: type[M], wanted: set[_Key]
 ) -> dict[_Key, M]:
-    """Each wanted task's last line in ``path`` that parses as a ``kind``, by its seed field."""
-    if not path.is_file():
+    """Each wanted task's last line in the solve directory's ``name`` that parses as a ``kind``,
+    by its instance and seed fields."""
+    found = _open_plain(name, root, solve_dir / name, directory=False)
+    if found is None:
         return {}
     last: dict[_Key, M] = {}
-    for _, record in _instance_lines(path, max_bytes, kind):
+    for _, record in _instance_lines(found, solve_dir / name, max_bytes, kind):
         if record is not None and (record.instance_id, record.seed) in wanted:
             last[(record.instance_id, record.seed)] = record
     return last
 
 
 def _instance_lines[M: Message](
-    path: Path, max_bytes: int, kind: type[M]
+    fd: int, where: Path, max_bytes: int, kind: type[M]
 ) -> Iterator[tuple[str, M | None]]:
-    """Each line of ``path`` that names an instance: its instance ID, and the line as a ``kind``,
-    or None if it does not parse. A line longer than ``max_bytes`` is skipped whole."""
-    for line in _bounded_lines(path, max_bytes):
+    """Each line of the file open as ``fd``, which it closes, that names an instance: its
+    instance ID, and the line as a ``kind``, or None if it does not parse. A line longer than
+    ``max_bytes`` is skipped whole."""
+    for line in _bounded_lines(fd, where, max_bytes):
         if line is None or not line.strip():
             continue
         try:
@@ -364,10 +422,11 @@ def _instance_lines[M: Message](
         yield fields["instance_id"], message
 
 
-def _bounded_lines(path: Path, max_bytes: int) -> Iterator[bytes | None]:
-    """The lines of ``path``, each with its line feed; None for one longer than ``max_bytes``,
-    which is read no further than that, so a huge line never sits in memory whole."""
-    with path.open("rb") as file:
+def _bounded_lines(fd: int, where: Path, max_bytes: int) -> Iterator[bytes | None]:
+    """The lines of the file open as ``fd``, which it closes, each with its line feed; None for
+    one longer than ``max_bytes``, which is read no further than that, so a huge line never sits
+    in memory whole."""
+    with os.fdopen(fd, "rb") as file:
         while line := file.readline(max_bytes + 1):
             if len(line) <= max_bytes:
                 yield line
@@ -375,6 +434,6 @@ def _bounded_lines(path: Path, max_bytes: int) -> Iterator[bytes | None]:
             while line and not line.endswith(b"\n"):  # The rest of the overlong line.
                 line = file.readline(max_bytes + 1)
             _logger.warning(
-                "%s holds a line longer than %d bytes, which is ignored", path, max_bytes
+                "%s holds a line longer than %d bytes, which is ignored", where, max_bytes
             )
             yield None

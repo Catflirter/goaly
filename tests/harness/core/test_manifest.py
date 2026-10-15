@@ -24,7 +24,10 @@ from goaly.contracts.jsonl import to_json_line
 from goaly.harness.core import manifest
 from goaly.harness.core.manifest import (
     CORE_DIR,
+    CORE_IN_CHECKOUT,
+    REPO_ROOT,
     GitState,
+    checkout_harness_hash,
     config_hash,
     content_hash,
     core_hash,
@@ -528,3 +531,16 @@ def test_reading_something_else_names_the_file(directory: Path, content: bytes) 
 
     with pytest.raises(ValueError, match=r"manifest\.json"):
         read_manifest(path)
+
+
+@pytest.mark.parametrize("pack", [Path("/abs/pack"), Path("packs/../../outside")])
+def test_a_checkouts_pack_must_be_within_it(tmp_path: Path, pack: Path) -> None:
+    with pytest.raises(ValueError, match="must be within the checkout"):
+        checkout_harness_hash(tmp_path, pack)
+
+
+def test_this_checkouts_hash_is_the_harness_hash() -> None:
+    pack = Path("src/goaly/config")
+
+    assert checkout_harness_hash(REPO_ROOT, pack) == harness_hash(REPO_ROOT / pack)
+    assert REPO_ROOT / CORE_IN_CHECKOUT == CORE_DIR

@@ -44,7 +44,7 @@ def test_the_console_script_runs_the_goaly_command() -> None:
 
     assert completed.returncode == 0, completed.stderr
     assert "--bench" in completed.stdout
-    assert "--phase" in completed.stdout
+    assert "--phase {solve,grade,all}" in completed.stdout  # Not --budget-phase.
     assert "--budget-phase" in completed.stdout
 
 
