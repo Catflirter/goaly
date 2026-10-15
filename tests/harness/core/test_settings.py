@@ -409,6 +409,52 @@ def test_settings_are_immutable(monkeypatch: pytest.MonkeyPatch) -> None:
         settings.base_url = "https://other.test/v1"  # type: ignore[misc]  # Tests the runtime check.
 
 
+# The RSI lane's secrets: the ntfy topic and the GitHub token.
+
+
+def test_rsi_secrets_default_to_none() -> None:
+    settings = Settings(api_key=SecretStr("k"))
+    assert settings.ntfy_topic is None
+    assert settings.github_token is None
+
+
+def test_rsi_secrets_load_from_the_env_file_and_stay_secret(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    env_file = write_env_file(
+        tmp_path / ".env",
+        "GOALY_API_KEY=k",
+        "GOALY_NTFY_TOPIC= goaly-topic_42 ",
+        "GOALY_GITHUB_TOKEN=ghu_abc",
+    )
+    settings = load_settings(env_file)
+    assert settings.ntfy_topic == SecretStr("goaly-topic_42")
+    assert settings.github_token == SecretStr("ghu_abc")
+    assert "goaly-topic_42" not in repr(settings)
+    assert "ghu_abc" not in repr(settings)
+
+
+def test_blank_rsi_secrets_count_as_unset() -> None:
+    settings = Settings(
+        api_key=SecretStr("k"), ntfy_topic=SecretStr(" "), github_token=SecretStr("")
+    )
+    assert settings.ntfy_topic is None
+    assert settings.github_token is None
+
+
+@pytest.mark.parametrize("topic", ["has space", "a/b", "x" * 65, "tópico"])
+def test_an_invalid_ntfy_topic_is_refused_without_echoing_it(tmp_path: Path, topic: str) -> None:
+    env_file = write_env_file(tmp_path / ".env", "GOALY_API_KEY=k", f"GOALY_NTFY_TOPIC={topic}")
+    with pytest.raises(SettingsError, match="GOALY_NTFY_TOPIC is invalid") as caught:
+        load_settings(env_file)
+    assert topic.strip() not in str(caught.value)
+
+
+def test_a_github_token_with_whitespace_is_refused(tmp_path: Path) -> None:
+    with pytest.raises(ValidationError, match="printable ASCII"):
+        Settings(api_key=SecretStr("k"), github_token=SecretStr("ghu abc"))
+
+
 # The Unix socket to the host's LLM proxy (spec §6.1, V28).
 
 
