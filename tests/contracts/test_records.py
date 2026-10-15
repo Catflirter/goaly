@@ -1,10 +1,33 @@
 """Tests for the run and experiment records: trajectory, result, manifest and experiment."""
 
 import json
+import re
 from collections.abc import Sequence
+from datetime import UTC, datetime
+from pathlib import Path
 
-from goaly.contracts.gen.experiment_pb2 import DecisionThresholds, Lane, PhaseResult
-from goaly.contracts.gen.task_pb2 import Prediction
+import pytest
+from google.protobuf.message import Message
+from google.protobuf.timestamp_pb2 import Timestamp
+
+from goaly.contracts.gen.experiment_pb2 import (
+    Decision,
+    DecisionThresholds,
+    ExperimentRecord,
+    Guard,
+    GuardResult,
+    ImplementerExit,
+    ImplementerRun,
+    Lane,
+    LaneEvent,
+    LaneEventKind,
+    Lesson,
+    PhaseResult,
+    RejectionReason,
+    SmokeTest,
+)
+from goaly.contracts.gen.manifest_pb2 import RunManifest
+from goaly.contracts.gen.task_pb2 import Prediction, Split
 from goaly.contracts.gen.trajectory_pb2 import (
     Chat,
     ChatMessage,
@@ -12,16 +35,24 @@ from goaly.contracts.gen.trajectory_pb2 import (
     ContextFold,
     Step,
     ToolCall,
+    ToolCallSource,
     ToolResult,
     Trajectory,
 )
-from goaly.contracts.jsonl import from_json_line, to_json_line
+from goaly.contracts.jsonl import append_jsonl, from_json_line, read_jsonl, to_json_line
 
 # Rebuilding the prompt a step's model call was sent, by the rule in Step's comment
 # (proto/goaly/v1/trajectory.proto). These helpers are that rule's reference implementation.
 
-type Origin = tuple[int, str] | None  # For a tool message: its step's index and tool_call_id.
+# For a tool message: its step's index and tool_call_id. For an assistant message: its step's
+# index. None for any other message.
+type Origin = tuple[int, str] | int | None
 type Located = tuple[Origin, ChatMessage]
+
+# Qwen3-Coder's tool-call markup: a block ends at its closing tag, at the next block of its kind,
+# or at the end of the text.
+TOOL_CALL_BLOCK = re.compile(r"<tool_call>.*?(?:</tool_call>|(?=<tool_call>)|\Z)", re.DOTALL)
+FUNCTION_BLOCK = re.compile(r"<function=[^>\n]*>.*?(?:</function>|(?=<function=)|\Z)", re.DOTALL)
 
 
 def tool_message(tool_call_id: str, content: str) -> ChatMessage:
@@ -30,7 +61,7 @@ def tool_message(tool_call_id: str, content: str) -> ChatMessage:
 
 def added_by(step: Step) -> list[Located]:
     """What ``step`` adds to its chat: its assistant message, tool messages and injected ones."""
-    added: list[Located] = [(None, step.assistant)]
+    added: list[Located] = [(step.index, step.assistant)]
     added += [
         ((step.index, result.tool_call_id), tool_message(result.tool_call_id, result.content))
         for result in step.tool_results
@@ -56,18 +87,39 @@ def unfolded(trajectory: Trajectory, step: Step) -> tuple[list[Located], list[Co
     return messages, [*folds, *step.folds]
 
 
+def without_markup(text: str) -> str:
+    """``text`` without its <tool_call> blocks, then without its bare <function=...> blocks."""
+    return FUNCTION_BLOCK.sub("", TOOL_CALL_BLOCK.sub("", text))
+
+
+def replayed(assistant: ChatMessage, *, keep_reasoning: bool) -> ChatMessage:
+    """An earlier assistant message as a later prompt of an executor chat carries it."""
+    message = ChatMessage()
+    message.CopyFrom(assistant)  # Its tool_calls stay, whatever their source.
+    message.content = without_markup(message.content)
+    message.reasoning_content = without_markup(message.reasoning_content) if keep_reasoning else ""
+    return message
+
+
 def prompt(trajectory: Trajectory, index: int) -> list[ChatMessage]:
-    """The messages the model was sent at step ``index``, folds applied."""
-    messages, folds = unfolded(trajectory, trajectory.steps[index])
+    """The messages the model was sent at step ``index``: folds and the replay rules applied."""
+    step = trajectory.steps[index]
+    messages, folds = unfolded(trajectory, step)
     replacements: dict[Origin, str] = {
         (fold.step, fold.tool_call_id): fold.replacement for fold in folds
     }
-    return [
-        tool_message(message.tool_call_id, replacements[origin])
-        if origin in replacements
-        else message
-        for origin, message in messages
-    ]
+    keep_turns = trajectory.chats[step.chat].keep_turns  # Unset reads as 0: not an executor chat.
+    assistants = [origin for origin, _ in messages if isinstance(origin, int)]
+    window = assistants[max(len(assistants) - keep_turns, 0) :]
+    sent = []
+    for origin, message in messages:
+        if origin in replacements:
+            sent.append(tool_message(message.tool_call_id, replacements[origin]))
+        elif isinstance(origin, int) and keep_turns > 0:
+            sent.append(replayed(message, keep_reasoning=origin in window))
+        else:
+            sent.append(message)
+    return sent
 
 
 SYSTEM = ChatMessage(role=ChatRole.CHAT_ROLE_SYSTEM, content="You make slow queries faster.")
@@ -89,6 +141,7 @@ def make_step(
         assistant=ChatMessage(
             role=ChatRole.CHAT_ROLE_ASSISTANT,
             content=f"answer {index}",
+            reasoning_content=f"thinking {index}",
             tool_calls=[
                 ToolCall(id=call, name="execute_sql", arguments_json="{}") for call in calls
             ],
@@ -183,6 +236,127 @@ def test_an_optional_statistic_keeps_its_presence_through_jsonl() -> None:
     assert not read.HasField("gain_probability")
 
 
+def without_reasoning(message: ChatMessage) -> ChatMessage:
+    """``message`` as a prompt carries it once its step is out of the reasoning window."""
+    sent = ChatMessage()
+    sent.CopyFrom(message)
+    sent.reasoning_content = ""
+    return sent
+
+
+def test_an_executor_chat_replays_reasoning_for_its_last_keep_turns_steps_only() -> None:
+    trajectory = Trajectory(
+        chats=[Chat(label="main", initial_messages=[SYSTEM, TASK], keep_turns=2)],
+        steps=[
+            make_step(0, 0, "t0"),
+            make_step(1, 0, "t1"),
+            make_step(2, 0, "t2"),
+            make_step(3, 0),
+        ],
+    )
+    steps = trajectory.steps
+
+    assert prompt(trajectory, 2) == [
+        *(SYSTEM, TASK, steps[0].assistant, tool("t0"), steps[1].assistant, tool("t1"))
+    ]
+    assert prompt(trajectory, 3) == [
+        *(SYSTEM, TASK, without_reasoning(steps[0].assistant), tool("t0")),
+        *(steps[1].assistant, tool("t1"), steps[2].assistant, tool("t2")),
+    ]
+    # The trajectory keeps every message in full.
+    assert steps[0].assistant.reasoning_content == "thinking 0"
+
+
+@pytest.mark.parametrize("keep_turns", [None, 0], ids=["unset", "zero"])
+def test_a_chat_that_is_not_an_executor_chat_replays_its_messages_unchanged(
+    keep_turns: int | None,
+) -> None:
+    # As GLM's are (spec §5.1): reasoning and any XML markup included.
+    chat = Chat(label="main", initial_messages=[SYSTEM, TASK], keep_turns=keep_turns)
+    marked = make_step(0, 0, "t0")
+    marked.assistant.content = "<tool_call><function=execute_sql></function></tool_call>"
+    trajectory = Trajectory(chats=[chat], steps=[marked, make_step(1, 0, "t1"), make_step(2, 0)])
+    steps = trajectory.steps
+
+    assert prompt(trajectory, 2) == [
+        *(SYSTEM, TASK, steps[0].assistant, tool("t0"), steps[1].assistant, tool("t1"))
+    ]
+
+
+def test_a_forked_chat_counts_its_reasoning_window_through_the_forked_context() -> None:
+    trajectory = Trajectory(
+        chats=[
+            Chat(label="main", initial_messages=[SYSTEM, TASK], keep_turns=2),
+            Chat(label="sample-1", forked_from_step=1, keep_turns=2),
+        ],
+        steps=[
+            make_step(0, 0, "t0"),
+            make_step(1, 0, "t1"),
+            make_step(2, 1, "s2"),
+            make_step(3, 1),
+        ],
+    )
+    steps = trajectory.steps
+
+    # At step 2 the window holds steps 0 and 1, both from the forked context.
+    assert prompt(trajectory, 2) == [
+        *(SYSTEM, TASK, steps[0].assistant, tool("t0"), steps[1].assistant, tool("t1"))
+    ]
+    # At step 3 it holds step 1, from the forked context, and step 2, the chat's own.
+    assert prompt(trajectory, 3) == [
+        *(SYSTEM, TASK, without_reasoning(steps[0].assistant), tool("t0")),
+        *(steps[1].assistant, tool("t1"), steps[2].assistant, tool("s2")),
+    ]
+
+
+def xml_step(index: int, source: ToolCallSource.ValueType, content: str, reasoning: str) -> Step:
+    """Step ``index`` of chat 0, with one call ``t{index}`` from ``source``."""
+    step = make_step(index, 0, f"t{index}")
+    step.assistant.content = content
+    step.assistant.reasoning_content = reasoning
+    step.assistant.tool_calls[0].source = source
+    return step
+
+
+def test_an_executor_chat_replays_no_xml_markup_whatever_became_of_it() -> None:
+    call = (
+        "<tool_call><function=execute_sql><parameter=sql>SELECT 1</parameter></function>"
+        "</tool_call>"
+    )
+    bare = "<function=execute_sql><parameter=sql>SELECT 2</parameter></function>"
+    unparsed = make_step(1, 0)  # Its markup gave no call.
+    unparsed.assistant.content = f"Again. {bare}"
+    unparsed.assistant.reasoning_content = ""
+    trajectory = Trajectory(
+        chats=[Chat(label="main", initial_messages=[SYSTEM, TASK], keep_turns=8)],
+        steps=[
+            xml_step(
+                0, ToolCallSource.TOOL_CALL_SOURCE_CONTENT_XML, f"Run it. {call}", f"Plan. {call}"
+            ),
+            unparsed,
+            # Cut off: the block runs to the end of the text. A bare block in reasoning goes too.
+            xml_step(2, ToolCallSource.TOOL_CALL_SOURCE_REASONING_XML, "", f"{bare} <tool_call>x"),
+            # Its call came from the standard field; the markup beside it goes all the same.
+            xml_step(3, ToolCallSource.TOOL_CALL_SOURCE_STANDARD, call, f"thinking 3 {bare}"),
+            make_step(4, 0),
+        ],
+    )
+
+    sent = [
+        message for message in prompt(trajectory, 4) if message.role == ChatRole.CHAT_ROLE_ASSISTANT
+    ]
+
+    assert [(message.content, message.reasoning_content) for message in sent] == [
+        ("Run it. ", "Plan. "),
+        ("Again. ", ""),
+        ("", " "),
+        ("", "thinking 3 "),
+    ]
+    # The calls stay as structured calls, whatever their source.
+    assert [len(message.tool_calls) for message in sent] == [1, 0, 1, 1]
+    assert trajectory.steps[3].assistant.content == call  # The trajectory keeps it as written.
+
+
 def test_every_lane_has_its_own_thresholds() -> None:
     lanes = {value.name.removeprefix("LANE_").lower() for value in Lane.DESCRIPTOR.values}
     variants = DecisionThresholds.DESCRIPTOR.oneofs_by_name["benchmark"].fields
@@ -199,3 +373,210 @@ def test_a_tool_result_says_whether_a_tool_submitted() -> None:
     assert from_json_line(to_json_line(submitted), ToolResult).HasField("submission")
     assert "submission" not in json.loads(to_json_line(plain))
     assert not from_json_line(to_json_line(plain), ToolResult).HasField("submission")
+
+
+def test_a_manifest_records_the_environment_settings_that_can_change_results() -> None:
+    settings = {
+        "postgres_image": "postgres@sha256:" + "ab" * 32,
+        "shared_buffers": "2GB",
+        "jit": "off",
+        "max_parallel_workers_per_gather": "2",
+        "cpuset.grade-1": "6,7,18,19",
+    }
+    manifest = RunManifest(run_id="run-1", environment_settings=settings)
+
+    line = to_json_line(manifest)
+
+    assert json.loads(line)["environment_settings"] == settings
+    assert from_json_line(line, RunManifest) == manifest
+    assert json.loads(to_json_line(RunManifest()))["environment_settings"] == {}
+
+
+# The RSI ledger: experiments, lane events and lessons (spec §8.2, §8.5-§8.8).
+
+
+def test_a_guard_result_names_the_pack_code_allowlist() -> None:
+    result = GuardResult(
+        guard=Guard.GUARD_PACK_CODE_ALLOWLIST, passed=False, detail="policy.py:3: import os"
+    )
+
+    line = to_json_line(result)
+
+    assert json.loads(line)["guard"] == "GUARD_PACK_CODE_ALLOWLIST"
+    assert from_json_line(line, GuardResult) == result
+
+
+def test_a_phase_lists_the_tasks_a_hard_coding_check_flagged() -> None:
+    # One flagged prediction fails the candidate outright (spec §8.2 step 4).
+    screening = PhaseResult(
+        split=Split.SPLIT_TRAIN, task_count=20, flagged_instance_ids=["17", "203"]
+    )
+    record = ExperimentRecord(
+        experiment_id="exp-3",
+        screening=screening,
+        decision=Decision.DECISION_REJECTED,
+        rejection_reasons=[RejectionReason.REJECTION_REASON_HARD_CODED],
+    )
+
+    line = to_json_line(record)
+
+    fields = json.loads(line)
+    assert fields["screening"]["flagged_instance_ids"] == ["17", "203"]
+    assert fields["rejection_reasons"] == ["REJECTION_REASON_HARD_CODED"]
+    assert from_json_line(line, ExperimentRecord) == record
+
+
+def set_fields(*messages: Message) -> set[str]:
+    """The names of the fields that hold something other than their default in ``messages``."""
+    return {field.name for message in messages for field, _ in message.ListFields()}
+
+
+def test_an_experiment_records_its_implementer_run_and_smoke_tests() -> None:
+    run = ImplementerRun(
+        exit=ImplementerExit.IMPLEMENTER_EXIT_SUBMITTED,
+        step_count=23,
+        wall_time_s=812.5,
+        trajectory_path="rsi/effisql/exp-3/implementer.traj.json",
+        smoke_tests=[
+            SmokeTest(
+                instance_id="17",
+                run_id="smoke-exp-3-17",
+                score=0.75,
+                detail="credit 0.75; stop reason: submitted; 9 steps; $0.02; no tool error",
+            ),
+            SmokeTest(instance_id="250", detail="refused: 250 is not in train"),
+        ],
+        summary="Added a skill that turns correlated subqueries into joins; unit tests pass.",
+    )
+    record = ExperimentRecord(experiment_id="exp-3", lane=Lane.LANE_EFFISQL, implementer=run)
+
+    read = from_json_line(to_json_line(record), ExperimentRecord)
+
+    assert read.implementer == run
+    assert set_fields(run) == set(ImplementerRun.DESCRIPTOR.fields_by_name)
+    assert set_fields(run.smoke_tests[0]) == set(SmokeTest.DESCRIPTOR.fields_by_name)
+
+
+def test_an_implementer_that_never_started_leaves_no_run() -> None:
+    line = to_json_line(ExperimentRecord(experiment_id="exp-3"))
+
+    assert "implementer" not in json.loads(line)
+    assert not from_json_line(line, ExperimentRecord).HasField("implementer")
+
+
+def test_an_implementer_run_that_was_never_measured_has_no_step_count_or_wall_time() -> None:
+    # An INTERRUPTED run found after a crash: its steps and time are unknown, not 0.
+    unmeasured = to_json_line(ImplementerRun(exit=ImplementerExit.IMPLEMENTER_EXIT_INTERRUPTED))
+    measured = to_json_line(ImplementerRun(step_count=0, wall_time_s=0.0))
+
+    assert {"step_count", "wall_time_s"}.isdisjoint(json.loads(unmeasured))
+    assert (json.loads(measured)["step_count"], json.loads(measured)["wall_time_s"]) == (0, 0.0)
+    read = from_json_line(unmeasured, ImplementerRun)
+    assert not read.HasField("step_count")
+    assert not read.HasField("wall_time_s")
+
+
+def test_a_smoke_test_that_never_ran_the_candidate_has_no_score() -> None:
+    # The host refused the call, or a guard failed: no run, so no score. A score of 0 was earned.
+    refused = to_json_line(SmokeTest(instance_id="250", detail="refused: 250 is not in train"))
+    scored_zero = to_json_line(SmokeTest(instance_id="17", run_id="smoke-exp-3-17", score=0.0))
+
+    assert "score" not in json.loads(refused)
+    assert json.loads(scored_zero)["score"] == 0.0
+    assert not from_json_line(refused, SmokeTest).HasField("score")
+    assert from_json_line(scored_zero, SmokeTest).HasField("score")
+
+
+def at(hour: int, minute: int) -> Timestamp:
+    """A point in time on 2026-10-15, in UTC."""
+    timestamp = Timestamp()
+    timestamp.FromDatetime(datetime(2026, 10, 15, hour, minute, tzinfo=UTC))
+    return timestamp
+
+
+def test_lane_events_are_appended_to_lane_events_jsonl_and_read_back(tmp_path: Path) -> None:
+    lane, kind = Lane.LANE_EFFISQL, LaneEventKind
+    pr_opened = "effisql: results PR #12 is open"
+    events = [
+        LaneEvent(
+            lane=lane,
+            occurred_at=at(16, 0),
+            kind=kind.LANE_EVENT_KIND_STARTED,
+            deadline_at=at(23, 59),  # Absolute, from config: a restart never moves it.
+        ),
+        LaneEvent(
+            lane=lane,
+            occurred_at=at(17, 31),
+            kind=kind.LANE_EVENT_KIND_CRASHED,  # The supervisor writes the cause here.
+            detail="killed after 10 minutes without a heartbeat",
+        ),
+        LaneEvent(
+            lane=lane,
+            occurred_at=at(17, 32),
+            kind=kind.LANE_EVENT_KIND_RESTARTED,  # Only the backoff: the cause is the crash's.
+            detail="restarted after a 30 s backoff",
+        ),
+        LaneEvent(
+            lane=lane,
+            occurred_at=at(19, 0),
+            kind=kind.LANE_EVENT_KIND_RESULTS_PR,
+            detail="3 accepted changes since the last results PR",
+            pr_number=12,
+            pr_url="https://github.com/Catflirter/goaly/pull/12",
+            head_commit="4f2c0de1b6a8e3f9c7d5b1a2e4f6c8d0a9b7e5f3",
+            experiment_ids=["exp-3", "exp-7", "exp-8"],
+        ),
+        LaneEvent(
+            lane=lane,
+            occurred_at=at(19, 1),
+            kind=kind.LANE_EVENT_KIND_NOTIFY_FAILED,
+            detail="HTTP 502 from ntfy.sh",
+            notification=pr_opened,
+            notification_id="notify-12",
+        ),
+        LaneEvent(
+            lane=lane,
+            occurred_at=at(19, 2),
+            kind=kind.LANE_EVENT_KIND_NOTIFIED,
+            notification=pr_opened,
+            notification_id="notify-12",  # The same notification, delivered on its retry.
+        ),
+        LaneEvent(
+            lane=lane,
+            occurred_at=at(23, 40),
+            kind=kind.LANE_EVENT_KIND_STOPPED,
+            detail="4 rounds in a row with no accepted change",
+        ),
+    ]
+    path = tmp_path / "lane_events.jsonl"
+
+    for event in events:
+        append_jsonl(path, event)
+
+    assert path.read_bytes().count(b"\n") == len(events)
+    assert list(read_jsonl(path, LaneEvent)) == events
+    assert set_fields(*events) == set(LaneEvent.DESCRIPTOR.fields_by_name)
+
+
+def test_a_deleted_lesson_keeps_its_earlier_lines_and_its_last_line_says_when(
+    tmp_path: Path,
+) -> None:
+    standing = Lesson(
+        lesson_id="lesson-4",
+        lane=Lane.LANE_EFFISQL,
+        text="Rewriting IN subqueries as joins helped on 3 tasks (exp-3).",
+        experiment_ids=["exp-3"],
+        created_at=at(18, 0),
+        updated_at=at(18, 0),
+    )
+    deleted = Lesson()
+    deleted.CopyFrom(standing)
+    deleted.updated_at.CopyFrom(at(21, 15))
+    deleted.deleted_at.CopyFrom(at(21, 15))
+    path = tmp_path / "lessons.jsonl"
+
+    append_jsonl(path, standing)
+    append_jsonl(path, deleted)
+
+    assert "deleted_at" not in json.loads(to_json_line(standing))
+    assert list(read_jsonl(path, Lesson)) == [standing, deleted]
