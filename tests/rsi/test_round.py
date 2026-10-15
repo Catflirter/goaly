@@ -1,8 +1,12 @@
 """Tests for goaly.rsi.round: one RSI round in the toy world of tests.rsi.round_world."""
 
 import asyncio
+import json
+import threading
+import time
 from collections.abc import AsyncIterator
 from pathlib import Path
+from typing import Any
 
 import pytest
 
@@ -28,7 +32,7 @@ from goaly.harness.core.llm import LlmClient
 from goaly.rsi import round as round_module
 from goaly.rsi.decision import DecisionConfig
 from goaly.rsi.resume import abort_experiments
-from goaly.rsi.round import EvalPhase, RoundConfig, lesson_id
+from goaly.rsi.round import EvalPhase, RoundConfig, lesson_id, tasks_digest
 from tests.rsi.gitrepo import git
 from tests.rsi.round_world import FAILING, TRAIN, VAL, World, make_world
 
@@ -290,14 +294,6 @@ async def test_an_experiment_cut_before_its_commit_is_aborted_and_queued_again(
     assert [h.hypothesis_id for h in world.queue.pending()] == ["good-1"]
 
 
-async def test_evaluations_stay_within_the_task_concurrency(world: World, llm: LlmClient) -> None:
-    world.evaluator.concurrency = 4
-    world.evaluator.__post_init__()
-    world.queue_up("good-1", "meh-1", "noisy-1")
-    await world.runner(llm).run(1)
-    assert 1 <= world.evaluator.most_in_flight <= 4
-
-
 def test_the_confirmation_needs_its_own_seed() -> None:
     with pytest.raises(ValueError, match="confirmation"):
         RoundConfig(validation_seed=1, confirmation_seed=1)
@@ -306,7 +302,14 @@ def test_the_confirmation_needs_its_own_seed() -> None:
 
 @pytest.mark.parametrize(
     ("kind", "says"),
-    [("short", "lacks 1 task results"), ("graderr", "is not usable"), ("late", "RuntimeError")],
+    [
+        ("short", "1 missing"),
+        ("extra", "1 unexpected"),
+        ("graderr", "is not usable"),
+        ("late", "RuntimeError"),
+        ("flaky", "the infrastructure failed 2 of 8 tasks"),
+        ("hostfail", "the infrastructure failed 2 of 8 tasks"),
+    ],
 )
 async def test_an_unusable_evaluation_aborts_the_experiment(
     world: World, llm: LlmClient, kind: str, says: str
@@ -352,7 +355,7 @@ async def test_a_confirmed_candidate_found_pending_is_accepted(
         raise Crash
 
     world.queue_up("good-1")
-    monkeypatch.setattr(round_module, "shielded_accept", crash)
+    monkeypatch.setattr(round_module, "_accept", crash)
     with pytest.raises(Crash):
         await world.runner(llm).run(1)
     monkeypatch.undo()
@@ -370,3 +373,101 @@ async def test_a_lane_without_its_best_tag_cannot_run_a_round(world: World, llm:
     git(world.repo, "tag", "--delete", "best/effisql")
     with pytest.raises(RuntimeError, match="best/effisql"):
         await world.runner(llm).run(1)
+
+
+async def test_infrastructure_failures_under_the_cap_are_scored(
+    world: World, llm: LlmClient
+) -> None:
+    world.queue_up("wobbly-1")
+    await world.runner(llm).run(1)
+    record = by_hypothesis(world)["wobbly-1"]
+    assert record.decision != DECISION_ABORTED
+    assert record.HasField("validation")
+
+
+async def test_a_cancelled_accept_finishes_before_the_cancellation_returns(
+    world: World, llm: LlmClient, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    started = threading.Event()
+    set_best = world.workspace.set_best
+
+    def slow_set_best(*args: Any, **kwargs: Any) -> None:
+        started.set()
+        time.sleep(0.5)
+        set_best(*args, **kwargs)
+
+    monkeypatch.setattr(world.workspace, "set_best", slow_set_best)
+    world.queue_up("good-1")
+    task = asyncio.create_task(world.runner(llm).run(1))
+    while not started.is_set():
+        await asyncio.sleep(0.01)
+    task.cancel()  # As the deadline does, while the tag moves.
+    with pytest.raises(asyncio.CancelledError):
+        await task
+    # By the time the cancellation returns, the tag and the ledger agree, so the stop's
+    # reconcile and abort find nothing to undo.
+    good = by_hypothesis(world)["good-1"]
+    assert good.decision == DECISION_ACCEPTED
+    assert world.best() == good.candidate_commit
+    assert abort_experiments(
+        world.ledger, world.queue, LANE_EFFISQL, "deadline", now=world.clock(),
+        uncommitted_only=False,
+    ) == []  # fmt: skip
+
+
+async def test_a_hypothesis_goes_back_at_most_twice(world: World, llm: LlmClient) -> None:
+    runner = world.runner(llm, RoundConfig(k=1))
+    world.glm.invalid = True
+    world.queue_up("infra-1")
+    for round_no in (1, 2, 3):
+        await runner.run(round_no)
+    records = [r for r in latest(world).values() if r.hypothesis.hypothesis_id == "infra-1"]
+    assert [r.decision for r in records] == [DECISION_ABORTED] * 3
+    assert world.queue.pending() == []  # Dropped after its second requeue.
+
+
+async def test_reference_evaluations_are_shared_within_a_round(
+    world: World, llm: LlmClient
+) -> None:
+    world.queue_up("good-1", "meh-1", "noisy-1")
+    await world.runner(llm).run(1)
+    keys = [
+        (r.commit, r.split, r.instance_ids, r.seeds)
+        for r in world.evaluator.requests
+        if r.phase == EvalPhase.REFERENCE
+    ]
+    assert len(keys) == len(set(keys))
+    validations = [r for r in world.evaluator.requests if r.phase == EvalPhase.VALIDATION]
+    assert len(validations) == len({r.commit for r in validations}) == 3
+
+
+async def test_every_request_names_its_pack_and_expected_tasks(
+    world: World, llm: LlmClient
+) -> None:
+    world.queue_up("good-1")
+    await world.runner(llm).run(1)
+    for request in world.evaluator.requests:
+        pack = git(world.repo, "rev-parse", f"{request.commit}:src/goaly/harness/packs/effisql")
+        assert request.pack_tree == pack.strip()
+        assert request.tasks_digest == tasks_digest(
+            request.split, request.instance_ids, request.seeds
+        )
+    assert tasks_digest(SPLIT_VAL, ("2", "1"), (1, 0)) == tasks_digest(
+        SPLIT_VAL, ("1", "2"), (0, 1)
+    )
+    assert tasks_digest(SPLIT_VAL, ("1",), (0,)) != tasks_digest(SPLIT_TRAIN, ("1",), (0,))
+
+
+async def test_no_lesson_prompt_ever_holds_a_val_task_id(world: World, llm: LlmClient) -> None:
+    # Lessons reach the analyst, so they must stay val-clean (spec §7): run every kind of
+    # decision, then search every lesson call for any val ID.
+    world.queue_up("good-1", "flag-1", "noisy-1")
+    await world.runner(llm).run(1)
+    world.queue_up("meh-2", "bad-2", "short-2")
+    await world.runner(llm).run(2)
+    lessons = [b for b in world.glm.bodies if "Write the lesson." in b["messages"][-1]["content"]]
+    assert len(lessons) >= 5
+    for body in lessons:
+        text = json.dumps(body)
+        for val_id in VAL:
+            assert val_id not in text

@@ -14,14 +14,18 @@ A hypothesis's ID names its candidate's behavior, by its first word:
 - ``broken``: its evaluation raises, as when the solve container fails;
 - ``late``: like ``good``, but its confirmation raises;
 - ``short``: its validation comes back without one task's result;
-- ``graderr``: its validation has a grader error.
+- ``graderr``: its validation has a grader error;
+- ``flaky``: like ``good``, but the infrastructure fails 2 of its 8 validation tasks (25%);
+- ``wobbly``: like ``good``, but the infrastructure fails 1 of them (12.5%), under the 20% cap;
+- ``hostfail``: like ``good``, but the host counts 2 infrastructure failures in its validation;
+- ``extra``: its validation returns one result more than was asked for.
 
 The best (v0) fails train tasks 1 to 5, solves 6 to 10, and scores 0.5 on every val task.
 """
 
 import asyncio
 import json
-from collections.abc import Sequence
+from collections.abc import Callable, Sequence
 from dataclasses import dataclass, field
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
@@ -44,7 +48,7 @@ from goaly.contracts.gen.experiment_pb2 import (
     ImplementerRun,
 )
 from goaly.contracts.gen.llm_call_pb2 import LlmCallRecord
-from goaly.contracts.gen.result_pb2 import TaskResult
+from goaly.contracts.gen.result_pb2 import TASK_ERROR_TYPE_LLM, TaskResult
 from goaly.contracts.gen.task_pb2 import (
     GRADE_STATUS_GRADED,
     GRADE_STATUS_GRADER_ERROR,
@@ -75,6 +79,7 @@ TRAIN = tuple(str(n) for n in range(1, 11))
 FAILING = TRAIN[:5]
 VAL = tuple(str(n) for n in range(101, 109))
 _SPEEDUP = {0.25: 0.6, 0.5: 1.0, 0.75: 1.5, 1.0: 3.0}
+_GOODLIKE = frozenset({"flaky", "wobbly", "hostfail", "extra"})
 
 
 def hypothesis(hypothesis_id: str) -> Hypothesis:
@@ -96,10 +101,10 @@ def behavior(hypothesis_id: str) -> str:
 
 def credit(kind: str, task: str, seed: int) -> float:
     """The checked credit a version of ``kind`` gets on ``task`` in ``seed``."""
-    improves = kind in {"good", "meh", "noisy", "flag", "late", "short", "graderr"}
+    improves = kind in {"good", "meh", "noisy", "flag", "late", "short", "graderr"} | _GOODLIKE
     if task in TRAIN:
         return 1.0 if task not in FAILING or improves else 0.0
-    if kind in {"good", "flag", "late", "short", "graderr"}:
+    if kind in {"good", "flag", "late", "short", "graderr"} | _GOODLIKE:
         return 1.0
     if kind == "meh":
         return 0.75
@@ -137,38 +142,58 @@ class ToyEvaluator:
     most_in_flight: int = 0
     gate: asyncio.Event | None = None  # When set, validations wait for it.
     train_known: bool = True  # Whether v0's train results exist.
+    kind_of: Callable[[str], str] | None = None  # The behavior of a commit not in ``kinds``.
 
     def __post_init__(self) -> None:
         self._limit = asyncio.Semaphore(self.concurrency)
 
     async def evaluate(self, request: EvaluationRequest) -> Evaluation:
         self.requests.append(request)
-        kind = self.kinds.get(request.commit, "base")
+        kind = self._kind(request.commit)
         if kind == "broken" or (kind == "late" and request.phase == "confirmation"):
             raise RuntimeError("the solve container exited with 137")
         if self.gate is not None and request.phase == "validation":
             await self.gate.wait()
-        results = []
-        for task in request.instance_ids:
-            for seed in request.seeds:
-                async with self._limit:
-                    self.in_flight += 1
-                    self.most_in_flight = max(self.most_in_flight, self.in_flight)
-                    await asyncio.sleep(0)
-                    self.in_flight -= 1
-                flagged = kind == "flag" and task == VAL[0]
-                value = credit(kind, task, seed)
-                results.append(task_result(request.run_id, task, seed, value, flagged=flagged))
+        pairs = [(task, seed) for task in request.instance_ids for seed in request.seeds]
+        await asyncio.gather(*(self._solve() for _ in pairs))  # The tasks run concurrently.
+        results = [
+            task_result(
+                request.run_id,
+                task,
+                seed,
+                credit(kind, task, seed),
+                flagged=kind == "flag" and task == VAL[0],
+            )
+            for task, seed in pairs
+        ]
         if request.phase == "validation" and kind == "short":
             results.pop()
         if request.phase == "validation" and kind == "graderr":
             results[0].grade.status = GRADE_STATUS_GRADER_ERROR
+        if request.phase == "validation" and kind in {"flaky", "wobbly"}:
+            for result in results[: 2 if kind == "flaky" else 1]:
+                result.error_type = TASK_ERROR_TYPE_LLM
+        if request.phase == "validation" and kind == "extra":
+            results.append(task_result(request.run_id, TRAIN[0], 0, 1.0, flagged=False))
+        infra = 2 if request.phase == "validation" and kind == "hostfail" else None
         count = len(results)
         stats = CostStats(1000.0, 0.01, 10.0, count=count)
-        return Evaluation(results, stats)
+        return Evaluation(results, stats, infra_failures=infra)
+
+    async def _solve(self) -> None:
+        async with self._limit:
+            self.in_flight += 1
+            self.most_in_flight = max(self.most_in_flight, self.in_flight)
+            await asyncio.sleep(0.001)
+            self.in_flight -= 1
+
+    def _kind(self, commit: str) -> str:
+        if commit in self.kinds:
+            return self.kinds[commit]
+        return "base" if self.kind_of is None else self.kind_of(commit)
 
     def known_train(self, commit: str) -> tuple[Sequence[TaskResult], Sequence[Trajectory]]:
-        kind = self.kinds.get(commit, "base")
+        kind = self._kind(commit)
         if kind != "base" or not self.train_known:
             return [], []
         results = [
