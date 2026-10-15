@@ -916,7 +916,7 @@ The implementer is mini-swe-agent's `DefaultAgent` (`mini-swe-agent==2.4.6`, MIT
 4. starts a fresh sandbox on the same worktree, whatever the outcome, so the agent continues where it was, with an empty `/tmp`;
 5. returns the score, the stop reason, the step count, the cost and the last tool error.
 
-**Limits.** These are config values. Our adapter enforces 60 steps, $3 of GLM and 30 minutes per hypothesis; the agent also stops after 3 format errors in a row, and each command times out after 120 s.
+**Limits.** These are config values. Our adapter enforces 60 steps, $10 of GLM and 30 minutes per hypothesis (raised from $3 on 2026-10-15, with the project lead's approval, since each GLM call resends the whole history); the agent also stops after 3 format errors in a row, and each command times out after 120 s.
 
 **The prompt** (`implementer.yaml`) gives the hypothesis, the pack layout (§5.2) and the allowed paths, how to run the unit tests and smoke tests, the hard-coding rules and the AST allowlist (§8.5), and how to finish.
 
