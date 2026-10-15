@@ -56,6 +56,7 @@ class Request:
     llm_calls: Path
     tasks: tuple[tuple[str, int], ...]
     pack_dir: Path | None
+    checkout: Path
     instances_file: Path | None = None
     max_tasks: int = 2
     task_timeout_s: float | None = None
@@ -170,6 +171,7 @@ def setup(
         llm_calls=run / "llm_calls.jsonl",
         tasks=(("1", 0), ("3", 0), ("1", 1)),
         pack_dir=pack,
+        checkout=tmp_path / "checkout",
     )
     return launcher, proxy, request, paths
 

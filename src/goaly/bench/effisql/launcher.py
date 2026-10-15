@@ -86,6 +86,9 @@ class SolveRequestLike(Protocol):
     def pack_dir(self) -> Path | None: ...
 
     @property
+    def checkout(self) -> Path: ...
+
+    @property
     def solve_dir(self) -> Path: ...
 
     @property
@@ -267,7 +270,7 @@ class EffiSqlLauncher:
         inputs = SolveInputs(request.inputs_dir)
         staged = await asyncio.to_thread(stage_inputs, inputs, self.paths(), request.instances_file)
         checkout = await asyncio.to_thread(
-            snapshot_checkout, checkout_of(request.pack_dir), request.solve_dir.parent / "checkout"
+            snapshot_checkout, request.checkout, request.solve_dir.parent / "checkout"
         )
         credentials = await asyncio.to_thread(self.credentials)
         sandbox = self.sandbox()

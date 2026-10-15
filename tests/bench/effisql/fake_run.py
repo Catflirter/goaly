@@ -6,12 +6,11 @@ Every task is synthetic, one per ID of our committed split.
 """
 
 import json
-from collections.abc import AsyncIterator, Mapping
+from collections.abc import AsyncIterator, Callable, Mapping
 from contextlib import AbstractAsyncContextManager, asynccontextmanager
 from dataclasses import dataclass, field
 from pathlib import Path
 
-from goaly.bench.effisql.benchmark import GradeFunction
 from goaly.bench.effisql.grading import Mode
 from goaly.bench.effisql.grading_pool import Priority
 from goaly.bench.effisql.harness import BindsLlm, EffiSqlPaths, EffiSqlWiring
@@ -96,26 +95,27 @@ class FakeGrader:
     graded: list[tuple[str, str, bool, Mode, Priority]] = field(default_factory=list)
     closed: bool = False
 
-    def benchmark_grade(self, mode: Mode, *, priority: Priority) -> GradeFunction:
-        async def grade(inst: object, prediction: Prediction) -> Grade:
-            self.graded.append(
-                (
-                    prediction.instance_id,
-                    prediction.effisql.sql,
-                    prediction.fallback,
-                    mode,
-                    priority,
-                )
-            )
-            return Grade(
-                instance_id=prediction.instance_id,
-                score=0.5,
-                correct=True,
-                status=GRADE_STATUS_GRADED,
-                effisql=EffiSqlGrade(matched=True, credit=0.5),
-            )
-
-        return grade
+    async def grade(
+        self,
+        inst: object,
+        prediction: Prediction,
+        mode: Mode,
+        *,
+        priority: Priority = Priority.RSI,
+        on_plan: Callable[[str, JsonValue], None] | None = None,
+    ) -> Grade:
+        self.graded.append(
+            (prediction.instance_id, prediction.effisql.sql, prediction.fallback, mode, priority)
+        )
+        if on_plan is not None:
+            on_plan(prediction.instance_id, {"Node Type": "Aggregate"})
+        return Grade(
+            instance_id=prediction.instance_id,
+            score=0.5,
+            correct=True,
+            status=GRADE_STATUS_GRADED,
+            effisql=EffiSqlGrade(matched=True, credit=0.5),
+        )
 
     def close(self) -> None:
         self.closed = True
@@ -155,6 +155,6 @@ def fake_wiring(root: Path) -> FakeWiring:
         paths=lambda: paths,
         llm=llm,
         solving=open_solving,
-        grader=lambda _root, _check: grader,
+        grader=lambda _root, _check, _instances: grader,
     )
     return FakeWiring(wiring, client, solving, grader, shares)

@@ -28,7 +28,7 @@ from goaly.contracts.gen.manifest_pb2 import ModelSettings, RunManifest
 from goaly.contracts.gen.task_pb2 import Split
 from goaly.contracts.interfaces import Benchmark, Environment, Instance, Policy
 from goaly.harness.core.eval_cache import EvalCache
-from goaly.harness.core.grading import Grader
+from goaly.harness.core.grading import HostRunner, SolveOptions
 from goaly.harness.core.isolation import SolveLauncher
 from goaly.harness.core.runner import (
     ContextFactory,
@@ -42,7 +42,6 @@ from goaly.harness.core.runner import (
 )
 
 __all__ = [
-    "GradesRuns",
     "Harness",
     "HarnessFactory",
     "HarnessOptions",
@@ -54,6 +53,7 @@ __all__ = [
     "RegistryError",
     "RunnableHarness",
     "RunnableHost",
+    "RunsHost",
     "RunsTasks",
 ]
 
@@ -86,6 +86,9 @@ class HarnessOptions:
     # In the solve container, the read-only directory of inputs its benchmark's launcher staged
     # (--inputs); None elsewhere.
     inputs_dir: Path | None = None
+    # How --in-process grades: as HostOptions's.
+    grading_priority: str | None = None
+    grading_instances: str = "grading"
 
 
 class RunsTasks(Protocol):
@@ -103,6 +106,7 @@ class RunsTasks(Protocol):
         retry_errors: bool = False,
         lock: RunLock | None = None,
         grading: bool = True,
+        tasks: Collection[tuple[str, int]] | None = None,
     ) -> RunSummary:
         """Run the tasks and record them, as Runner.run does."""
 
@@ -178,13 +182,37 @@ class HostOptions:
     split: Split.ValueType
     # As HarnessOptions.budget_phase.
     budget_phase: str | None
+    # The priority of the run's grading among the grader's work (--grading-priority), such as
+    # "smoke"; None for the one its split and budget phase give. The benchmark checks the name.
+    grading_priority: str | None = None
+    # Which database instances grade (--grading-instances): "grading", those kept for it, or
+    # "all", the solving ones too, while no solve phase uses them.
+    grading_instances: str = "grading"
 
 
-class GradesRuns(Protocol):
-    """A Grader, whatever its types."""
+class RunsHost(Protocol):
+    """A HostRunner, whatever its types."""
 
-    async def grade(self, run_dir: Path, *, lock: RunLock | None = None) -> RunSummary:
-        """Grade the run's ungraded tasks, as Grader.grade does."""
+    async def run(
+        self,
+        run_dir: Path,
+        manifest: RunManifest,
+        *,
+        split: Split.ValueType,
+        seeds: list[int],
+        instance_ids: Collection[str] | None,
+        solve: SolveOptions,
+        resume: bool = False,
+        retry_errors: bool = False,
+        lock: RunLock | None = None,
+        grading: bool = True,
+    ) -> RunSummary:
+        """Solve the run in the container, then grade it, as HostRunner.run does."""
+
+    async def grade(
+        self, run_dir: Path, *, lock: RunLock | None = None, retry_errors: bool = False
+    ) -> RunSummary:
+        """Grade the run's solved tasks, as HostRunner.grade does."""
 
 
 class RunnableHost(Protocol):
@@ -206,8 +234,8 @@ class RunnableHost(Protocol):
     def launcher(self) -> SolveLauncher | None:
         """The launcher of the benchmark's isolated solve phase; None if it has none."""
 
-    def grader(self, *, cache: EvalCache | None) -> GradesRuns:
-        """Return the Grader of this benchmark, with this cache."""
+    def host_runner(self, *, cache: EvalCache | None) -> RunsHost:
+        """Return the host side of this benchmark's runs, with this cache."""
 
 
 @dataclass(frozen=True)
@@ -236,9 +264,9 @@ class HostBenchmark[InstanceT: Instance, EnvT: Environment]:
         """The benchmark adapter's name."""
         return self.benchmark.name
 
-    def grader(self, *, cache: EvalCache | None) -> Grader[InstanceT, EnvT]:
-        """Return the Grader of this benchmark, with this cache."""
-        return Grader(self.benchmark, cache=cache)
+    def host_runner(self, *, cache: EvalCache | None) -> HostRunner[InstanceT, EnvT]:
+        """Return the host side of this benchmark's runs, with this cache."""
+        return HostRunner(self.benchmark, launcher=self.launcher, cache=cache)
 
 
 # Opens a benchmark's host side for one run, and closes what it holds when the run is over.
