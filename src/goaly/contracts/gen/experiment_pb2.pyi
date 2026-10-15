@@ -293,10 +293,10 @@ class _RejectionReasonEnumTypeWrapper(_enum_type_wrapper._EnumTypeWrapper[_Rejec
     REJECTION_REASON_GUARD_FAILED: _RejectionReason.ValueType  # 2
     """A guard failed; guards says which."""
     REJECTION_REASON_HARD_CODED: _RejectionReason.ValueType  # 11
-    """A check against hard-coded results flagged one of its predictions in the screen, the
-    validation or the confirmation (spec §4.1, §8.2 step 4). This covers both flags: hard_coded,
-    which is EffiSqlGrade.alt_matched false, and literal_result. That phase's
-    flagged_instance_ids lists the flagged tasks.
+    """It made a matched prediction that a check flagged, in the screen, the validation or the
+    confirmation (spec §4.1, §8.2 step 4). The checks are those against hard-coded results, and
+    this covers both flags: hard_coded, which is EffiSqlGrade.alt_matched false, and
+    literal_result. That phase's flagged_instance_ids lists the flagged tasks.
     """
     REJECTION_REASON_NO_SCREEN_GAIN: _RejectionReason.ValueType  # 3
     """The screen showed no net gain over the best."""
@@ -329,10 +329,10 @@ REJECTION_REASON_IMPLEMENTATION_FAILED: RejectionReason.ValueType  # 1
 REJECTION_REASON_GUARD_FAILED: RejectionReason.ValueType  # 2
 """A guard failed; guards says which."""
 REJECTION_REASON_HARD_CODED: RejectionReason.ValueType  # 11
-"""A check against hard-coded results flagged one of its predictions in the screen, the
-validation or the confirmation (spec §4.1, §8.2 step 4). This covers both flags: hard_coded,
-which is EffiSqlGrade.alt_matched false, and literal_result. That phase's
-flagged_instance_ids lists the flagged tasks.
+"""It made a matched prediction that a check flagged, in the screen, the validation or the
+confirmation (spec §4.1, §8.2 step 4). The checks are those against hard-coded results, and
+this covers both flags: hard_coded, which is EffiSqlGrade.alt_matched false, and
+literal_result. That phase's flagged_instance_ids lists the flagged tasks.
 """
 REJECTION_REASON_NO_SCREEN_GAIN: RejectionReason.ValueType  # 3
 """The screen showed no net gain over the best."""
@@ -821,10 +821,12 @@ class PhaseResult(_message.Message):
     """Its mean wall time per task over v0's on the same split, which the efficiency cap checks."""
     @_builtins.property
     def flagged_instance_ids(self) -> _containers.RepeatedScalarFieldContainer[_builtins.str]:
-        """The tasks on which a check against hard-coded results flagged the candidate's prediction, in
-        any seed, each listed once (spec §4.1): hard_coded, which is EffiSqlGrade.alt_matched false,
-        or literal_result. Each task's grade, in the runs candidate_run_ids names, says which check
-        flagged it. One flagged task fails the candidate outright, as REJECTION_REASON_HARD_CODED.
+        """The tasks on which the candidate made a matched prediction that a check flagged, in any
+        seed, each listed once (spec §4.1). The checks are those against hard-coded results, and the
+        flags are hard_coded, which is EffiSqlGrade.alt_matched false, and literal_result. An
+        unmatched prediction is never checked, so it is never listed. Each task's grade, in the runs
+        candidate_run_ids names, says which check flagged it. One flagged task fails the candidate
+        outright, as REJECTION_REASON_HARD_CODED.
         """
 
     @_builtins.property

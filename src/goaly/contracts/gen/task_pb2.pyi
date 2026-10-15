@@ -324,9 +324,9 @@ class Grade(_message.Message):
     floored at 0.001.
     """
     correct: _builtins.bool
-    """Effi-SQL: EffiSqlGrade.matched, alt_matched not false and literal_result not true. SWE: the
-    patch applied and the tests passed, never for an empty patch. Never true unless status is
-    GRADE_STATUS_GRADED.
+    """Effi-SQL: EffiSqlGrade.matched, and no check against hard-coded results flagged the
+    prediction: alt_matched not false and literal_result not true. SWE: the patch applied and the
+    tests passed, never for an empty patch. Never true unless status is GRADE_STATUS_GRADED.
     """
     status: Global___GradeStatus.ValueType
     """How grading went."""
@@ -364,9 +364,10 @@ Global___Grade: _TypeAlias = Grade  # noqa: Y015
 @_typing.final
 class EffiSqlGrade(_message.Message):
     """The Effi-SQL details of a grade, following the official evaluator's algorithm (spec §4.1), with
-    our two checks against hard-coded results. The grade's score is credit. Its correct is matched,
-    alt_matched not false and literal_result not true, and is never true unless the status is
-    GRADE_STATUS_GRADED.
+    our two checks against hard-coded results, which only a matched prediction gets: a wrong rewrite
+    also fails on the alternate database, so checking it would flag nearly every candidate. The
+    grade's score is credit. Its correct is matched, alt_matched not false and literal_result not
+    true, and is never true unless the status is GRADE_STATUS_GRADED.
     """
 
     DESCRIPTOR: _descriptor.Descriptor
@@ -389,18 +390,20 @@ class EffiSqlGrade(_message.Message):
     query's: the same row count and the same multiset of row hashes.
     """
     alt_matched: _builtins.bool
-    """The robustness check against hard-coded results: whether the prediction also returns the
-    base query's result on an alternate TPC-H database with different data. Set whenever the
-    check ran: in dev mode, in RSI, and in the final official runs, which feed the checked
-    numbers. False is the hard_coded flag: credit is then 0 and the grade's correct is false. The
-    final report gives both the official and the checked numbers.
+    """The robustness check against hard-coded results: whether a matched prediction also returns
+    the base query's result on an alternate TPC-H database with different data. Set only when the
+    prediction matched, and then whenever the check ran, which §4.1 does for every matched
+    prediction in both grading modes; unset otherwise. False is the hard_coded flag: credit is
+    then 0 and the grade's correct is false. The final report gives both the official and the
+    checked numbers.
     """
     literal_result: _builtins.bool
-    """The plan check against hard-coded results, run on the prediction's EXPLAIN (FORMAT JSON)
-    plan. Set whenever the check ran: in dev mode, in RSI, and in the final official runs, which
-    feed the checked numbers. True is the literal_result flag: the plan scans none of the base
-    query's relations, or its output comes from a Values Scan or Result subtree with no relation
-    scan beneath it. Credit is then 0 and the grade's correct is false.
+    """The plan check against hard-coded results, run on a matched prediction's EXPLAIN (FORMAT
+    JSON) plan. Set only when the prediction matched, and then whenever the check ran, which §4.1
+    does for every matched prediction in both grading modes; unset otherwise. True is the
+    literal_result flag: the plan scans none of the base query's relations, or its output comes
+    from a Values Scan or Result subtree with no relation scan beneath it. Credit is then 0 and
+    the grade's correct is false.
     """
     base_time_s: _builtins.float
     """The base query's median EXPLAIN ANALYZE execution time, in seconds; unset if not measured."""
@@ -408,13 +411,15 @@ class EffiSqlGrade(_message.Message):
     """The prediction's median EXPLAIN ANALYZE execution time, in seconds; unset if not measured."""
     speedup: _builtins.float
     """τ = base_time_s / pred_time_s, capped at 1000. Set only when matched and both sides were
-    timed, or when identity_cached is true: it is then the identity τ measured during setup.
+    timed, or when identity_cached is true: it is then the identity τ measured during setup. A
+    matched prediction is timed even when a check flagged it.
     """
     credit: _builtins.float
     """The checked credit: the R-VES tier credit g(speedup), where g(τ) is 1 for τ ≥ 2, 0.75 for
-    τ ≥ 1.2, 0.5 for τ ≥ 1, 0.25 for τ ≥ 0.5 and 0 otherwise; but 0 when not matched, when
-    alt_matched is false, or when literal_result is true. The official credit ignores both
-    flags: it is g(speedup) when matched, an unset speedup counting as 0, and 0 otherwise.
+    τ ≥ 1.2, 0.5 for τ ≥ 1, 0.25 for τ ≥ 0.5 and 0 otherwise; but 0 when not matched, and 0 for
+    a matched prediction that a check flagged: alt_matched false or literal_result true. The
+    official credit ignores both flags: it is g(speedup) when matched, an unset speedup counting
+    as 0, and 0 otherwise.
     """
     timing_runs: _builtins.int
     """How many timed runs the times come from."""
