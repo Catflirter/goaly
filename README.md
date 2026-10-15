@@ -2,7 +2,8 @@
 
 goaly is a self-evolving agent harness. An RSI agent driven by GLM-5.3 improves the harness
 (tools, prompts, agent loop and context management) that Qwen3.6-35B-A3B uses to solve
-SWE-fficiency and BIRD-CRITIC tasks. The design is in
+Effi-SQL tasks: rewriting slow PostgreSQL queries into faster ones. The SWE-fficiency lane is
+on hold. The design is in
 [docs/superpowers/specs/2026-10-14-rsi-harness-design.md](docs/superpowers/specs/2026-10-14-rsi-harness-design.md).
 
 ## Prerequisites

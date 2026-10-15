@@ -87,12 +87,12 @@ def test_live_timestamps_match_the_format(capture: Capture) -> None:
 
 
 def test_extras_follow_the_core_keys(capture: Capture) -> None:
-    capture.logger.info("solved", extra={"task_id": "bird-17", "steps": 12, "ok": True})
+    capture.logger.info("solved", extra={"task_id": "effisql-17", "steps": 12, "ok": True})
 
     entry = capture.entry()
 
     assert list(entry) == [*CORE_KEYS, "task_id", "steps", "ok"]
-    assert (entry["task_id"], entry["steps"], entry["ok"]) == ("bird-17", 12, True)
+    assert (entry["task_id"], entry["steps"], entry["ok"]) == ("effisql-17", 12, True)
 
 
 def test_extras_never_overwrite_the_core_keys(capture: Capture) -> None:
