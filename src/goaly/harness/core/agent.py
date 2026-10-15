@@ -8,16 +8,21 @@ it returns. When a budget runs out first, it returns the pack's fallback, marked
 
 Bad model output never raises: it becomes an error result or a nudge, and the reply counts
 toward the error streak unless one of its calls gave a result that is no error. A call fails
-when its tool is unknown, its arguments do not parse or validate, or its tool failed. A reply
+when its tool is unknown, its arguments do not parse or validate, or its tool failed; a call
+that repeats the one that ran before it still runs, but says so and counts as failed. A reply
 cut off at the output limit runs none of its calls, and only the first 16 calls of a reply
 run. A call parsed from the reasoning never submits: Qwen drafts calls while it thinks. After
 3 failed replies in a row the model is reminded of the tool schemas, and after 5 the loop
 stops.
 
+The prompt is kept within the model's context (context_window): past a threshold, older tool
+outputs fold. A prompt the gateway still says is too long folds as far as it may and goes once
+more; a second overflow, or one with nothing left to fold, ends in the fallback.
+
 What raises is what the Policy.solve docstring lets through: an EnvironmentFailure, an LLM
 failure that outlasted the client's retries, and cancellation; so does a bug in the pack's
 hooks. No exception becomes a result or the fallback, an exception group included, apart from
-the loop's own wall-clock timeout and a context overflow, which both end in the fallback.
+the loop's own wall-clock timeout and a context overflow.
 
 The context records every chat and step of the task in memory, with why the agent stopped, and
 the runner reads it with :meth:`AgentContext.trajectory` once the policy returns or raises (T06).
@@ -35,6 +40,7 @@ from goaly.contracts.gen.task_pb2 import Prediction
 from goaly.contracts.gen.trajectory_pb2 import (
     ChatMessage,
     ChatRole,
+    ContextFold,
     Step,
     StopReason,
     ToolCall,
@@ -44,6 +50,7 @@ from goaly.contracts.gen.trajectory_pb2 import (
 )
 from goaly.contracts.interfaces import Environment
 from goaly.harness.core.budgets import CALLS_PER_REPLY, Budgets, BudgetUse, ErrorStreak
+from goaly.harness.core.context_window import ChatPrompt, ContextWindow
 from goaly.harness.core.llm import BoundLlm, LlmReply
 from goaly.harness.core.llm_errors import ContextOverflow, LlmError
 from goaly.harness.core.llm_models import ModelParams
@@ -56,9 +63,6 @@ __all__ = ["AgentContext", "AgentHooks", "run_agent"]
 # The finish_reason of a reply that max_tokens cut off.
 _CUT_OFF: Final = "length"
 _REASONING_XML: Final = ToolCallSource.TOOL_CALL_SOURCE_REASONING_XML
-# The replay window (spec §5.1): a prompt's last 8 replies go out with their reasoning, older
-# ones without it. Every chat records it, as Chat.keep_turns.
-_KEEP_TURNS: Final = 8
 
 # What the loop tells the model. {tools} lists the tools' names.
 _CUT_OFF_CALL: Final = (
@@ -71,6 +75,12 @@ _CUT_OFF_NO_CALL: Final = (
 )
 _NO_CALL: Final = (
     "Error: your reply called no tool. Each reply must call one of the tools: {tools}."
+)
+# The tool runs again, so the result may differ in timing, e.g. a statement's elapsed time.
+_REPEATED: Final = (
+    "Note: this call repeats your previous one, the same tool with the same arguments, so its "
+    "result is unchanged, apart from timing. Repeating a call does not help: change the "
+    "arguments or try another approach."
 )
 _OVER_CAP: Final = (
     f"Error: a reply may make at most {CALLS_PER_REPLY} tool calls, so this call was not run. "
@@ -95,23 +105,29 @@ _REMINDER: Final = (
 class AgentContext:
     """One task's context for the agent loop: its model, budgets and trajectory (spec §5.1).
 
-    The runner's context factory builds one for each task and replicate seed (T06), and T11
-    wires in the pack's config, its ``budgets`` and request ``params``, and ``llm``: the client
-    bound to purpose exec, the executor model, and the task's run, instance and seed
-    (LlmClient.bind). A pack reaches the model only through :func:`run_agent`, so it can choose
-    neither the purpose nor the model, and every call it makes is held to the budgets and
-    recorded (spec §8.5).
+    The runner's context factory builds one for each task and replicate seed (T06). T11 wires
+    in the pack's config, its ``budgets``, request ``params`` and context ``window``
+    (ContextWindow's defaults if none), and ``llm``: the client bound to purpose exec, the
+    executor model, and the task's run, instance and seed (LlmClient.bind). A pack reaches the
+    model only through :func:`run_agent`, so it can choose neither the purpose nor the model,
+    and every call it makes is held to the budgets and recorded (spec §8.5).
 
     The context is the task's: every loop a policy runs with it adds a chat to one trajectory
     and spends the same budgets, whose wall clock starts with the first loop.
     """
 
     def __init__(
-        self, llm: BoundLlm, *, budgets: Budgets, params: ModelParams | None = None
+        self,
+        llm: BoundLlm,
+        *,
+        budgets: Budgets,
+        params: ModelParams | None = None,
+        window: ContextWindow | None = None,
     ) -> None:
         self._llm = llm
         self._budgets = budgets
         self._params = params
+        self._window = ContextWindow() if window is None else window
         self._recorder = TrajectoryRecorder()
         self._started: float | None = None  # The event loop's time when the first loop started.
 
@@ -183,6 +199,15 @@ class _Outcome(NamedTuple):
     error_message: str = ""
 
 
+class _Sent(NamedTuple):
+    """A model call that got a reply: the reply, the folds made for it, and the estimate that
+    the folding threshold compared, before any fold (Step.estimated_prompt_tokens)."""
+
+    reply: LlmReply
+    folds: list[ContextFold]
+    estimated_tokens: int
+
+
 class _Chat[E: Environment]:
     """One loop of :func:`run_agent`: a chat with the model, recorded in the task's trajectory."""
 
@@ -195,13 +220,14 @@ class _Chat[E: Environment]:
         self._tool_names = ", ".join(tool.name for tool in hooks.tools) or "none"
         self._label = label
         self._chat = -1  # The chat's index in the trajectory, once run() opens it.
-        # The next call's messages; the recorder holds its own copies.
-        self._prompt = [
+        self._opening = [
             ChatMessage(role=ChatRole.CHAT_ROLE_SYSTEM, content=hooks.system_prompt),
             ChatMessage(role=ChatRole.CHAT_ROLE_USER, content=hooks.task_prompt),
         ]
+        self._prompt = ChatPrompt(self._opening, self._tools, ctx._window)
         self._streak = ErrorStreak()
-        self._replies: list[int] = []  # Where the prompt holds each reply, oldest first.
+        # The last call that ran: its tool and normalized arguments, for repeat detection.
+        self._previous: tuple[str, str] | None = None
         self._last: Step | None = None  # The step the next call follows.
         self._notes: list[str] = []  # The loop's own messages to send after that step.
 
@@ -209,7 +235,7 @@ class _Chat[E: Environment]:
         """Open the chat and converse; every exit, an exception's included, sets a stop reason."""
         try:
             self._chat = self._recorder.start_chat(
-                self._label, self._prompt, keep_turns=_KEEP_TURNS
+                self._label, self._opening, keep_turns=self._ctx._window.keep_turns
             )
             outcome = await self._converse_in_time()
             prediction = outcome.submission
@@ -250,11 +276,11 @@ class _Chat[E: Environment]:
                 return _Outcome(stop)
             self._send_guidance()
             try:
-                reply = await self._complete()
+                sent = await self._send()
             except ContextOverflow as error:
                 stop = StopReason.STOP_REASON_TOKEN_BUDGET_EXHAUSTED
                 return _Outcome(stop, error_message=_describe(error))
-            submission = await self._take_step(reply)
+            submission = await self._take_step(sent)
             if submission is not None:
                 return _Outcome(StopReason.STOP_REASON_SUBMITTED, submission)
 
@@ -273,27 +299,50 @@ class _Chat[E: Environment]:
             cost_usd=usage.cost_usd,
         )
 
+    async def _send(self) -> _Sent:
+        """Call the model with the chat's prompt, folded to fit its context (spec §5.1).
+
+        A prompt that the gateway says does not fit folds every older output it may and goes
+        once more. With nothing more to fold, or a second overflow, ContextOverflow propagates.
+        """
+        estimate = self._prompt.estimated_tokens  # What the threshold compares.
+        folds = self._prompt.fold()
+        try:
+            reply = await self._complete()
+        except ContextOverflow:
+            more = self._prompt.fold(everything_older=True)
+            if not more:
+                raise
+            folds += more
+            reply = await self._complete()
+        self._prompt.sent(reply.usage.input_tokens)
+        return _Sent(reply, folds, estimate)
+
     async def _complete(self) -> LlmReply:
         try:
             return await self._ctx._llm.complete(
-                list(self._prompt), tools=self._tools, params=self._ctx._params
+                self._prompt.messages(), tools=self._tools, params=self._ctx._params
             )
         except LlmError as error:
             if error.record is not None:  # The gateway may have billed a call that failed.
                 self._recorder.add_usage(error.record.usage)
             raise
 
-    async def _take_step(self, reply: LlmReply) -> Prediction | None:
-        """Record ``reply``'s step and run its calls, in order; return the first submission."""
+    async def _take_step(self, sent: _Sent) -> Prediction | None:
+        """Record the step of ``sent``'s reply and run its calls, in order.
+
+        Return the first submission, if a call makes one.
+        """
+        reply = sent.reply
         calls = parse_tool_calls(reply.message, self._tools)
         assistant = _with_calls(reply.message, calls)
         step = self._recorder.add_step(self._chat, reply.record, assistant)
+        step.estimated_prompt_tokens = sent.estimated_tokens
+        step.folds.extend(sent.folds)
         self._last = step
-        self._prompt.append(_replayed(assistant))
-        self._replies.append(len(self._prompt) - 1)
-        if len(self._replies) > _KEEP_TURNS:  # The reply that has just left the window.
-            leaving = self._replies[-_KEEP_TURNS - 1]
-            self._prompt[leaving] = _without_reasoning(self._prompt[leaving])
+        # A window of 0 marks a chat whose replies replay unchanged (Chat.keep_turns).
+        replay = _replayed(assistant) if self._ctx._window.keep_turns > 0 else assistant
+        self._prompt.add_turn(step.index, replay)
         if reply.finish_reason == _CUT_OFF:
             for call in calls:  # A cut-off call may be a wrong submit: none runs.
                 self._answer(step, _not_run(call, _CUT_OFF_CALL))
@@ -308,9 +357,13 @@ class _Chat[E: Environment]:
         worked = False  # Whether a call gave a result that is no error.
         for call in calls[:CALLS_PER_REPLY]:
             result = await self._hooks.tools.execute(call, self._env)
-            if result.HasField("submission") and call.source == _REASONING_XML:
+            drafted = result.HasField("submission") and call.source == _REASONING_XML
+            if drafted:  # A call drafted in the reasoning is no call of the model's to repeat.
                 result = _drafted(call, result)
-            worked = worked or not result.is_error
+            repeated = not drafted and self._repeats(call)
+            if repeated:
+                result.content = _appended(result.content, _REPEATED)
+            worked = worked or not (result.is_error or repeated)
             self._add_guidance(call, result)
             self._answer(step, result)
             if result.HasField("submission"):  # The episode ends: later calls do not run.
@@ -320,15 +373,28 @@ class _Chat[E: Environment]:
         self._streak.add(error=not worked)  # One count for the reply, however many calls failed.
         return None
 
+    def _repeats(self, call: ToolCall) -> bool:
+        """Whether ``call``, which ran, repeats the call that ran before it in this chat.
+
+        Calls are compared by tool and normalized arguments, never by ID: an XML call's ID is
+        only unique within its reply. A repeat counts toward the error streak, but its result
+        keeps ``is_error`` as the tool gave it, since the call itself did not fail: the note in
+        its content marks it, in the trajectory as for the model.
+        """
+        key = (call.name, _normalized_arguments(call))
+        repeated = key == self._previous
+        self._previous = key
+        return repeated
+
     def _add_guidance(self, call: ToolCall, result: ToolResult) -> None:
         hook = self._hooks.on_tool_result
         guidance = hook(_copy(call), _copy(result)) if hook is not None else None
         if guidance:
-            result.content = f"{result.content}\n\n{guidance}" if result.content else guidance
+            result.content = _appended(result.content, guidance)
 
     def _answer(self, step: Step, result: ToolResult) -> None:
         step.tool_results.append(result)
-        self._prompt.append(
+        self._prompt.add(
             ChatMessage(
                 role=ChatRole.CHAT_ROLE_TOOL,
                 content=result.content,
@@ -352,7 +418,7 @@ class _Chat[E: Environment]:
         for text in texts:
             message = ChatMessage(role=ChatRole.CHAT_ROLE_USER, content=text)
             step.injected.append(message)
-            self._prompt.append(message)
+            self._prompt.add(message)
 
     def _answer_the_rest(self, content: str) -> None:
         """Answer the last step's calls that have no result yet, with ``content``.
@@ -382,12 +448,12 @@ def _with_calls(message: ChatMessage, calls: Sequence[ToolCall]) -> ChatMessage:
 def _replayed(assistant: ChatMessage) -> ChatMessage:
     """``assistant`` as later prompts carry it: no call markup, its calls only as structured calls.
 
-    An executor chat replays no Qwen3-Coder XML call markup (spec §5.1, and Step's rebuild rule
-    in trajectory.proto). Its content and its reasoning both lose it, whichever field its calls
-    came from, the standard one included. A call drafted in one field and written again in the
-    other then reaches the model once; a drafted call that never ran cannot look as if it ran;
-    and markup the parser took for no call never reaches the model either. The trajectory
-    keeps every reply as it came.
+    An executor chat, one with a replay window, replays no Qwen3-Coder XML call markup (spec
+    §5.1, and Step's rebuild rule in trajectory.proto). Its content and its reasoning both lose
+    it, whichever field its calls came from, the standard one included. A call drafted in one
+    field and written again in the other then reaches the model once; a drafted call that never
+    ran cannot look as if it ran; and markup the parser took for no call never reaches the model
+    either. The trajectory keeps every reply as it came.
     """
     message = _copy(assistant)
     message.content = _without_markup(message.content)
@@ -400,13 +466,6 @@ def _without_markup(text: str) -> str:
     # strip_tool_call_markup takes the <tool_call> blocks of a text that has some, or else its
     # bare blocks: a second pass takes the bare blocks left beside <tool_call> ones.
     return strip_tool_call_markup(strip_tool_call_markup(text))
-
-
-def _without_reasoning(message: ChatMessage) -> ChatMessage:
-    """A copy of ``message`` with no reasoning: a caller may still hold the message itself."""
-    plain = _copy(message)
-    plain.reasoning_content = ""
-    return plain
 
 
 def _drafted(call: ToolCall, result: ToolResult) -> ToolResult:
@@ -426,6 +485,20 @@ def _drafted(call: ToolCall, result: ToolResult) -> ToolResult:
 def _not_run(call: ToolCall, content: str) -> ToolResult:
     """The error result of a call that the loop did not run, telling the model why."""
     return ToolResult(tool_call_id=call.id, name=call.name, content=content, is_error=True)
+
+
+def _normalized_arguments(call: ToolCall) -> str:
+    """``call``'s arguments, in one layout: sorted keys, no spaces; as written if not JSON."""
+    text = call.repaired_arguments_json or call.arguments_json
+    try:
+        value = json.loads(text)
+    except (ValueError, RecursionError):  # RecursionError: nested too deep to parse.
+        return text.strip()
+    return json.dumps(value, ensure_ascii=False, sort_keys=True, separators=(",", ":"))
+
+
+def _appended(content: str, note: str) -> str:
+    return f"{content}\n\n{note}" if content else note
 
 
 def _copy[M: Message](message: M) -> M:
