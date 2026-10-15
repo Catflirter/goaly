@@ -75,6 +75,8 @@ class ConfigureArgs(BaseModel):
     mode: Mode
     note: str | None = None
     limit: int | None = None
+    columns: list[str] | None = None
+    frame: Window | None = None
 
 
 class Configure:
@@ -86,6 +88,21 @@ class Configure:
 
     async def run(self, args: ConfigureArgs, env: Environment) -> ToolResult:
         return ToolResult(content="configured")
+
+
+class NoParams(BaseModel):
+    """No parameters."""
+
+
+class ListTables:
+    """A tool with no parameters."""
+
+    name = "list_tables"
+    description = "List the tables."
+    args_model = NoParams
+
+    async def run(self, args: NoParams, env: Environment) -> ToolResult:
+        return ToolResult(content="customer, orders")
 
 
 # The tools offered to the model, as the LLM client sends them.
@@ -336,6 +353,38 @@ def test_xml_parameters_take_the_types_the_tools_json_schema_gives_them() -> Non
         "extra": "7",  # Not a parameter of the tool, so it stays a string.
     }
     ConfigureArgs.model_validate_json(call.arguments_json)  # The tool accepts them.
+
+
+@pytest.mark.parametrize(
+    ("parameter", "written", "value"),
+    [
+        ("limit", "5", 5),
+        ("limit", "null", None),
+        ("columns", '["a", "b"]', ["a", "b"]),
+        ("columns", "null", None),
+        ("window", '{"start": 1, "end": 2}', {"start": 1, "end": 2}),
+        ("frame", '{"start": 1, "end": 2}', {"start": 1, "end": 2}),
+        ("frame", "null", None),
+    ],
+    ids=[
+        "int | None, a number",
+        "int | None, null",
+        "list[str] | None, a list",
+        "list[str] | None, null",
+        "nested model",
+        "nested model | None, an object",
+        "nested model | None, null",
+    ],
+)
+def test_optional_and_nested_parameters_are_typed_through_any_of_and_ref(
+    parameter: str, written: str, value: object
+) -> None:
+    # pydantic writes X | None as anyOf [X, null], and a nested model as a $ref into $defs.
+    message = assistant(content=xml_call("configure", **{parameter: written}))
+
+    [call] = parse_tool_calls(message, OFFERED)
+
+    assert arguments(call) == {parameter: value}
 
 
 def test_an_xml_value_that_does_not_parse_as_its_type_stays_a_string() -> None:
@@ -603,3 +652,26 @@ def test_a_malformed_tools_list_leaves_what_it_cannot_read_as_strings() -> None:
     [call] = parse_tool_calls(message, tools)
 
     assert arguments(call) == {"count": 3, "loop": "1", "lost": "2"}
+
+
+@pytest.mark.parametrize("written", ["", " \n"], ids=["empty", "blank"])
+async def test_empty_arguments_to_a_tool_with_no_parameters_run_it(written: str) -> None:
+    registry = ToolRegistry([bind(ListTables())])
+    message = assistant(calls=[ToolCall(id="call_a", name="list_tables", arguments_json=written)])
+
+    [call] = parse_tool_calls(message, registry.json_schemas())
+    result = await registry.execute(call, FakeSqlEnvironment())
+
+    assert call.repaired_arguments_json == "{}"
+    assert (result.content, result.is_error) == ("customer, orders", False)
+
+
+async def test_an_xml_call_with_no_parameters_has_empty_arguments() -> None:
+    registry = ToolRegistry([bind(ListTables())])
+    message = assistant(content="<tool_call>\n<function=list_tables>\n</function>\n</tool_call>")
+
+    [call] = parse_tool_calls(message, registry.json_schemas())
+    result = await registry.execute(call, FakeSqlEnvironment())
+
+    assert call.arguments_json == "{}"
+    assert (result.content, result.is_error) == ("customer, orders", False)
