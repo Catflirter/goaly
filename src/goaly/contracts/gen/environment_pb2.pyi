@@ -82,14 +82,17 @@ class ShellResult(_message.Message):
     EXIT_CODE_FIELD_NUMBER: _builtins.int
     STDOUT_FIELD_NUMBER: _builtins.int
     STDERR_FIELD_NUMBER: _builtins.int
+    TRUNCATED_FIELD_NUMBER: _builtins.int
     TIMED_OUT_FIELD_NUMBER: _builtins.int
     ELAPSED_S_FIELD_NUMBER: _builtins.int
     exit_code: _builtins.int
     """The command's exit status; 0 means success."""
     stdout: _builtins.str
-    """What the command wrote to standard output."""
+    """What the command wrote to standard output, as UTF-8; invalid bytes become U+FFFD."""
     stderr: _builtins.str
-    """What the command wrote to standard error."""
+    """What the command wrote to standard error, as UTF-8; invalid bytes become U+FFFD."""
+    truncated: _builtins.bool
+    """True if the environment capped stdout or stderr, so it holds only part of the output."""
     timed_out: _builtins.bool
     """True if the command ran past its timeout and was stopped; exit_code then means nothing."""
     elapsed_s: _builtins.float
@@ -100,12 +103,13 @@ class ShellResult(_message.Message):
         exit_code: _builtins.int = ...,
         stdout: _builtins.str = ...,
         stderr: _builtins.str = ...,
+        truncated: _builtins.bool = ...,
         timed_out: _builtins.bool = ...,
         elapsed_s: _builtins.float = ...,
     ) -> None: ...
     _HasFieldArgType: _TypeAlias = _Never  # noqa: Y015
     def HasField(self, field_name: _HasFieldArgType) -> _builtins.bool: ...
-    _ClearFieldArgType: _TypeAlias = _typing.Literal["elapsed_s", b"elapsed_s", "exit_code", b"exit_code", "stderr", b"stderr", "stdout", b"stdout", "timed_out", b"timed_out"]  # noqa: Y015
+    _ClearFieldArgType: _TypeAlias = _typing.Literal["elapsed_s", b"elapsed_s", "exit_code", b"exit_code", "stderr", b"stderr", "stdout", b"stdout", "timed_out", b"timed_out", "truncated", b"truncated"]  # noqa: Y015
     def ClearField(self, field_name: _ClearFieldArgType) -> None: ...
     def WhichOneof(self, oneof_group: _Never) -> None: ...
 

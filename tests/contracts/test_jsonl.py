@@ -51,6 +51,7 @@ def test_writes_a_compact_line_with_the_proto_field_names() -> None:
         "exit_code": 1,
         "stdout": "hi",
         "stderr": "",
+        "truncated": False,
         "timed_out": True,
         "elapsed_s": 0.5,
     }

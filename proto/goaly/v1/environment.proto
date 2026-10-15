@@ -30,10 +30,12 @@ message SqlResult {
 message ShellResult {
   // The command's exit status; 0 means success.
   int32 exit_code = 1;
-  // What the command wrote to standard output.
+  // What the command wrote to standard output, as UTF-8; invalid bytes become U+FFFD.
   string stdout = 2;
-  // What the command wrote to standard error.
+  // What the command wrote to standard error, as UTF-8; invalid bytes become U+FFFD.
   string stderr = 3;
+  // True if the environment capped stdout or stderr, so it holds only part of the output.
+  bool truncated = 6;
   // True if the command ran past its timeout and was stopped; exit_code then means nothing.
   bool timed_out = 4;
   // How long the command ran, in seconds.
