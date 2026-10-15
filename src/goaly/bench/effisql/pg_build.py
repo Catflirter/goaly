@@ -201,13 +201,15 @@ def ensure_dbgen(dbgen_dir: Path, *, run: Runner = run_command) -> DbgenBuild:
     """Check out the pinned tpch-kit commit under ``dbgen_dir`` and build dbgen, unless done."""
     source = dbgen_dir / "tpch-kit"
     git = ["git", "-C", str(source)]
-    if not (source / ".git").is_dir():
+    if not (source / ".git").is_dir() or _head(run, git) != DBGEN_COMMIT:
+        # Missing, or left at another commit or half-fetched by an interrupted build: the
+        # checkout is ours, under the data root, so start it over.
         if source.exists():
-            raise BuildError(f"{source} exists but is not a git checkout; remove it")
+            shutil.rmtree(source)
         run(["git", "init", "-q", str(source)])
         run([*git, "fetch", "-q", "--depth", "1", DBGEN_REPOSITORY, DBGEN_COMMIT])
         run([*git, "checkout", "-q", "--detach", "FETCH_HEAD"])
-    head = run([*git, "rev-parse", "HEAD"]).strip()
+    head = _head(run, git)
     if head != DBGEN_COMMIT:
         raise BuildError(f"{source} is at {head}, not the pinned commit {DBGEN_COMMIT}")
     try:
@@ -224,6 +226,14 @@ def ensure_dbgen(dbgen_dir: Path, *, run: Runner = run_command) -> DbgenBuild:
         version=DBGEN_VERSION,
         binary_sha256=inspect_table_file(binary).sha256,
     )
+
+
+def _head(run: Runner, git: Sequence[str]) -> str | None:
+    """The commit the checkout is at, or None if it has none yet."""
+    try:
+        return run([*git, "rev-parse", "--verify", "--quiet", "HEAD^{commit}"]).strip() or None
+    except BuildError:
+        return None
 
 
 def inspect_table_file(path: Path) -> TableFile:
@@ -339,6 +349,7 @@ def build_golden(
     """
     existing = read_golden_record(config.golden_record)
     if existing is not None:
+        _check_record(existing, config, datasets)
         return existing
     dbgen = ensure_dbgen(config.dbgen_dir, run=run)
     binary = dbgen_binary(config.dbgen_dir)
@@ -364,6 +375,36 @@ def build_golden(
     write_private(config.golden_record, record.model_dump_json(indent=2) + "\n")
     _log.info("golden build complete", extra={"pgdata": str(pgdata)})
     return record
+
+
+def _check_record(record: GoldenRecord, config: PgEnvConfig, datasets: Sequence[Dataset]) -> None:
+    """Fail unless the finished build ``record`` describes is the one this setup asks for."""
+    problems = []
+    if record.image != config.image:
+        problems.append(f"it used the image {record.image}, not {config.image}")
+    if record.dbgen.commit != DBGEN_COMMIT:
+        problems.append(f"it used dbgen {record.dbgen.commit}, not {DBGEN_COMMIT}")
+    expected = {dataset.db: dataset.record() for dataset in datasets}
+    for db in sorted(record.databases.keys() | expected.keys()):
+        built, wanted = record.databases.get(db), expected.get(db)
+        if built is None or wanted is None:
+            problems.append(f"it {'lacks' if built is None else 'has an extra'} database {db}")
+        elif built != wanted:
+            tables = sorted(
+                t
+                for t in built.tables.keys() | wanted.tables.keys()
+                if built.tables.get(t) != wanted.tables.get(t)
+            )
+            problems.append(
+                f"its {db} (SF {built.scale_factor}) differs in {', '.join(tables) or 'scale'}"
+            )
+    if not config.golden_pgdata.is_dir():
+        problems.append(f"its data directory {config.golden_pgdata} is missing")
+    if problems:
+        raise BuildError(
+            f"the golden build recorded in {config.golden_record} does not match this setup: "
+            f"{'; '.join(problems)}. Delete {config.golden_record.parent} to rebuild it."
+        )
 
 
 @contextmanager

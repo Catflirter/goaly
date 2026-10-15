@@ -182,11 +182,13 @@ class FakeRunner:
         head: str = DBGEN_COMMIT,
         dirty: bool = False,
         tables: Mapping[str, bytes] | None = None,
+        checked_out: bool = False,
     ) -> None:
         self.calls: list[list[str]] = []
         self.head = head
         self.dirty = dirty
         self.tables = dict(tables or {})
+        self.checked_out = checked_out  # HEAD resolves only once a checkout has happened.
 
     def __call__(
         self,
@@ -199,7 +201,11 @@ class FakeRunner:
         if args[:2] == ["git", "init"]:
             (Path(args[3]) / ".git").mkdir(parents=True)
         elif "rev-parse" in args:
+            if not self.checked_out:
+                raise BuildError("git rev-parse failed with exit code 1: ")
             return self.head + "\n"
+        elif "checkout" in args:
+            self.checked_out = True
         elif "diff" in args and self.dirty:
             raise BuildError("git diff failed with exit code 1")
         elif args[0] == "make":
@@ -238,11 +244,24 @@ def test_ensure_dbgen_checks_out_and_builds_the_pinned_commit(tmp_path: Path) ->
 
 def test_ensure_dbgen_reuses_an_existing_build(tmp_path: Path) -> None:
     ensure_dbgen(tmp_path, run=FakeRunner())
-    runner = FakeRunner()
+    runner = FakeRunner(checked_out=True)
 
     ensure_dbgen(tmp_path, run=runner)
 
     assert not any(call[0] == "make" or "fetch" in call for call in runner.calls)
+
+
+def test_an_interrupted_checkout_is_started_over(tmp_path: Path) -> None:
+    source = tmp_path / "tpch-kit"
+    (source / ".git").mkdir(parents=True)  # git init ran; the fetch never finished.
+    (source / "stale").write_text("left by the interrupted build")
+    runner = FakeRunner()
+
+    assert ensure_dbgen(tmp_path, run=runner).commit == DBGEN_COMMIT
+
+    assert not (source / "stale").exists()
+    assert any("fetch" in call for call in runner.calls)
+    assert any("checkout" in call for call in runner.calls)
 
 
 def test_ensure_dbgen_refuses_a_checkout_at_another_commit(tmp_path: Path) -> None:
@@ -298,7 +317,7 @@ def test_ensure_generated_rejects_output_that_differs_from_the_pinned_build(
 
 def _record() -> GoldenRecord:
     return GoldenRecord(
-        image="postgres@sha256:" + "0" * 64,
+        image=PgEnvConfig().image,
         dbgen=DbgenBuild(
             repository=DBGEN_REPOSITORY,
             commit=DBGEN_COMMIT,
@@ -326,16 +345,52 @@ def test_an_unreadable_golden_record_is_reported(tmp_path: Path) -> None:
         read_golden_record(path)
 
 
-def test_build_golden_returns_an_existing_record_without_building(tmp_path: Path) -> None:
+def _refuse(*args: object, **kwargs: object) -> str:
+    raise AssertionError("nothing may run when the golden build is complete")
+
+
+def _finished(tmp_path: Path, record: GoldenRecord) -> PgEnvConfig:
     config = PgEnvConfig(data_root=tmp_path)
-    config.golden_record.parent.mkdir(parents=True)
-    config.golden_record.write_text(_record().model_dump_json())
+    config.golden_pgdata.mkdir(parents=True)
+    config.golden_record.write_text(record.model_dump_json())
+    return config
 
-    def refuse(*args: object, **kwargs: object) -> str:
-        raise AssertionError("nothing may run when the golden record exists")
 
-    run: Callable[..., str] = refuse
+def test_build_golden_returns_a_matching_record_without_building(tmp_path: Path) -> None:
+    config = _finished(tmp_path, _record())
+
+    run: Callable[..., str] = _refuse
     assert build_golden(config, SecretStr("unused"), run=run) == _record()
+
+
+@pytest.mark.parametrize(
+    ("change", "named"),
+    [
+        ({"image": "postgres@sha256:" + "9" * 64}, "used the image postgres@sha256:999"),
+        ({"databases": {TPCH.db: TPCH.record()}}, "lacks database tpch_alt"),
+        (
+            {"databases": {TPCH.db: TPCH_ALT.record(), TPCH_ALT.db: TPCH_ALT.record()}},
+            "its tpch (SF 0.3) differs in customer, lineitem, orders, part, partsupp, supplier",
+        ),
+    ],
+    ids=["image", "missing database", "other data"],
+)
+def test_a_record_of_another_build_is_refused_naming_the_difference(
+    tmp_path: Path, change: dict[str, object], named: str
+) -> None:
+    config = _finished(tmp_path, _record().model_copy(update=change))
+
+    with pytest.raises(BuildError, match="does not match this setup") as caught:
+        build_golden(config, SecretStr("unused"), run=_refuse)
+    assert named in str(caught.value)
+
+
+def test_a_record_whose_data_directory_is_gone_is_refused(tmp_path: Path) -> None:
+    config = _finished(tmp_path, _record())
+    config.golden_pgdata.rmdir()
+
+    with pytest.raises(BuildError, match=r"data directory .* is missing"):
+        build_golden(config, SecretStr("unused"), run=_refuse)
 
 
 def test_run_command_returns_standard_output() -> None:
@@ -551,8 +606,9 @@ def test_the_connector_opens_autocommit_connections_with_the_given_role(
     ]
 
 
-def test_a_dbgen_checkout_that_is_not_a_git_repository_is_refused(tmp_path: Path) -> None:
+def test_a_directory_that_is_not_a_git_checkout_is_replaced(tmp_path: Path) -> None:
     (tmp_path / "tpch-kit").mkdir()
+    runner = FakeRunner()
 
-    with pytest.raises(BuildError, match="not a git checkout"):
-        ensure_dbgen(tmp_path, run=FakeRunner())
+    assert ensure_dbgen(tmp_path, run=runner).commit == DBGEN_COMMIT
+    assert ["git", "init", "-q", str(tmp_path / "tpch-kit")] in runner.calls
