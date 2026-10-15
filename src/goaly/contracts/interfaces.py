@@ -200,8 +200,8 @@ class Benchmark[InstanceT: Instance, EnvT: Environment](Protocol):
     bounds how many tasks run at once (spec §6.2).
 
     The organizers' task file (``goaly run --instances``) reaches an adapter when it is
-    constructed, and SPLIT_EXTERNAL then selects its tasks. Those tasks have no gold answers, so
-    runs on SPLIT_EXTERNAL are not graded; they still get one official record per task.
+    constructed, and SPLIT_EXTERNAL then selects its tasks. Runs on SPLIT_EXTERNAL are not
+    graded; they still get one official record per task.
     """
 
     @property
@@ -228,12 +228,14 @@ class Benchmark[InstanceT: Instance, EnvT: Environment](Protocol):
         """Copy out what the agent may see of ``inst``, which is never a gold answer."""
 
     async def grade(self, inst: InstanceT, prediction: Prediction) -> Grade:
-        """Grade ``prediction`` against ``inst``'s gold answers.
+        """Grade ``prediction`` for ``inst`` with the benchmark's grader.
 
-        Grading uses its own environment, never the one the task was solved in (spec §4.1).
-        Grading trouble does not raise: the returned Grade's ``status`` says what went wrong,
-        such as a prediction that failed to run, a timeout, or the grader's own failure. Runs on
-        SPLIT_EXTERNAL have no gold answers, so callers skip ``grade`` for them.
+        Effi-SQL compares the prediction's result with ``base_sql``'s and needs no gold answer;
+        SWE runs the task's PASS_TO_PASS tests and compares the workload's speedup with the expert
+        patch's. Grading uses its own environment, never the one the task was solved in (spec
+        §4.1). Grading trouble does not raise: the returned Grade's ``status`` says what went
+        wrong, such as a prediction that failed to run, a timeout, or the grader's own failure.
+        Runs on SPLIT_EXTERNAL are not graded, so callers never call ``grade`` for them.
 
         A prediction with no benchmark branch set, as after a crash, is graded as the
         benchmark's empty answer, the one :meth:`to_official` writes for it: Effi-SQL's
