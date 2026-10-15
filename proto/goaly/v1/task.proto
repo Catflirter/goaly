@@ -159,7 +159,8 @@ message EffiSqlGrade {
   bool base_cached = 9;
 }
 
-// The SWE-fficiency details of a grade, as spec §4.2 scores it.
+// The SWE-fficiency details of a grade, as spec §4.2 scores it. For metrics, an SWE task counts as
+// solved when the grade is correct and sr > 1 / gold_speedup: a real speedup.
 message SweGrade {
   // True if the patch applied to base_commit.
   bool patch_applied = 1;
@@ -170,10 +171,10 @@ message SweGrade {
   bool empty_patch = 3;
   // The agent's speedup, T_pre / T_post. A patch that is empty, does not apply or fails the
   // tests counts as 1: no speedup.
-  double speedup = 4;
+  double agent_speedup = 4;
   // The expert patch's speedup on this machine, T_pre / T_post_gold.
   double gold_speedup = 5;
-  // SR_i = speedup / gold_speedup, before the grade's score floors it at 0.001.
+  // SR_i = agent_speedup / gold_speedup, before the grade's score floors it at 0.001.
   double sr = 6;
   // How long the workload ran before the patch (T_pre), in seconds.
   double t_pre_s = 7;
@@ -185,7 +186,7 @@ message SweGrade {
   // How much CPU time the evaluation run used, in seconds (spec §9). 0 for an empty patch, which
   // is never evaluated; a cached grade keeps the original run's times.
   double eval_cpu_s = 11;
-  // True if the result came from the evaluation cache, keyed by patch hash and task, instead of
-  // a new evaluation run.
+  // True if the result came from the grading cache, keyed by (patch hash, task), instead of a
+  // new evaluation run.
   bool cached = 9;
 }

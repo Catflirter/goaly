@@ -91,7 +91,7 @@ def test_writes_keys_in_the_order_the_proto_declares_them_whatever_is_set() -> N
         swe=SweGrade(
             patch_applied=True,
             tests_passed=True,
-            speedup=2.0,
+            agent_speedup=2.0,
             gold_speedup=4.0,
             sr=0.5,
             t_pre_s=4.0,
@@ -102,7 +102,7 @@ def test_writes_keys_in_the_order_the_proto_declares_them_whatever_is_set() -> N
         ),
     )
     swe_keys = [
-        *("patch_applied", "tests_passed", "empty_patch", "speedup", "gold_speedup", "sr"),
+        *("patch_applied", "tests_passed", "empty_patch", "agent_speedup", "gold_speedup", "sr"),
         *("t_pre_s", "t_post_s", "eval_wall_s", "eval_cpu_s", "cached"),
     ]
 

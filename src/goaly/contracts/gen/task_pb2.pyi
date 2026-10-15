@@ -427,14 +427,16 @@ Global___EffiSqlGrade: _TypeAlias = EffiSqlGrade  # noqa: Y015
 
 @_typing.final
 class SweGrade(_message.Message):
-    """The SWE-fficiency details of a grade, as spec §4.2 scores it."""
+    """The SWE-fficiency details of a grade, as spec §4.2 scores it. For metrics, an SWE task counts as
+    solved when the grade is correct and sr > 1 / gold_speedup: a real speedup.
+    """
 
     DESCRIPTOR: _descriptor.Descriptor
 
     PATCH_APPLIED_FIELD_NUMBER: _builtins.int
     TESTS_PASSED_FIELD_NUMBER: _builtins.int
     EMPTY_PATCH_FIELD_NUMBER: _builtins.int
-    SPEEDUP_FIELD_NUMBER: _builtins.int
+    AGENT_SPEEDUP_FIELD_NUMBER: _builtins.int
     GOLD_SPEEDUP_FIELD_NUMBER: _builtins.int
     SR_FIELD_NUMBER: _builtins.int
     T_PRE_S_FIELD_NUMBER: _builtins.int
@@ -450,14 +452,14 @@ class SweGrade(_message.Message):
     """True if the patch was empty, so the task was scored without an evaluation run. Then
     patch_applied, tests_passed and the grade's correct are all false.
     """
-    speedup: _builtins.float
+    agent_speedup: _builtins.float
     """The agent's speedup, T_pre / T_post. A patch that is empty, does not apply or fails the
     tests counts as 1: no speedup.
     """
     gold_speedup: _builtins.float
     """The expert patch's speedup on this machine, T_pre / T_post_gold."""
     sr: _builtins.float
-    """SR_i = speedup / gold_speedup, before the grade's score floors it at 0.001."""
+    """SR_i = agent_speedup / gold_speedup, before the grade's score floors it at 0.001."""
     t_pre_s: _builtins.float
     """How long the workload ran before the patch (T_pre), in seconds."""
     t_post_s: _builtins.float
@@ -471,8 +473,8 @@ class SweGrade(_message.Message):
     is never evaluated; a cached grade keeps the original run's times.
     """
     cached: _builtins.bool
-    """True if the result came from the evaluation cache, keyed by patch hash and task, instead of
-    a new evaluation run.
+    """True if the result came from the grading cache, keyed by (patch hash, task), instead of a
+    new evaluation run.
     """
     def __init__(
         self,
@@ -480,7 +482,7 @@ class SweGrade(_message.Message):
         patch_applied: _builtins.bool = ...,
         tests_passed: _builtins.bool = ...,
         empty_patch: _builtins.bool = ...,
-        speedup: _builtins.float = ...,
+        agent_speedup: _builtins.float = ...,
         gold_speedup: _builtins.float = ...,
         sr: _builtins.float = ...,
         t_pre_s: _builtins.float = ...,
@@ -491,7 +493,7 @@ class SweGrade(_message.Message):
     ) -> None: ...
     _HasFieldArgType: _TypeAlias = _Never  # noqa: Y015
     def HasField(self, field_name: _HasFieldArgType) -> _builtins.bool: ...
-    _ClearFieldArgType: _TypeAlias = _typing.Literal["cached", b"cached", "empty_patch", b"empty_patch", "eval_cpu_s", b"eval_cpu_s", "eval_wall_s", b"eval_wall_s", "gold_speedup", b"gold_speedup", "patch_applied", b"patch_applied", "speedup", b"speedup", "sr", b"sr", "t_post_s", b"t_post_s", "t_pre_s", b"t_pre_s", "tests_passed", b"tests_passed"]  # noqa: Y015
+    _ClearFieldArgType: _TypeAlias = _typing.Literal["agent_speedup", b"agent_speedup", "cached", b"cached", "empty_patch", b"empty_patch", "eval_cpu_s", b"eval_cpu_s", "eval_wall_s", b"eval_wall_s", "gold_speedup", b"gold_speedup", "patch_applied", b"patch_applied", "sr", b"sr", "t_post_s", b"t_post_s", "t_pre_s", b"t_pre_s", "tests_passed", b"tests_passed"]  # noqa: Y015
     def ClearField(self, field_name: _ClearFieldArgType) -> None: ...
     def WhichOneof(self, oneof_group: _Never) -> None: ...
 
