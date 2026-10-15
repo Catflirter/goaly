@@ -12,6 +12,7 @@ agent sees a plan in one shape whatever its source: its root node, as indented J
 """
 
 import json
+import re
 from collections.abc import Mapping
 from pathlib import Path
 from types import MappingProxyType
@@ -148,21 +149,26 @@ def render_schema(snapshot: SchemaSnapshot) -> str:
     """Return the schema text the agent reads (spec §4.1): the DDL, the row counts and indexes.
 
     Tables and each table's indexes are listed by name, so the text depends only on what the
-    snapshot holds, not on the order the setup wrote it in. An index whose statement the DDL
-    already holds, whatever its spacing or case, is not listed again.
+    snapshot holds, not on the order the setup wrote it in. An index the DDL already creates is
+    not listed again: one whose statement the DDL holds, whatever its spacing or case, and one
+    the DDL declares as a constraint of its name, as pg_dump declares a primary key.
     """
     tables = sorted(snapshot.tables, key=lambda table: table.name)
-    definitions = [
-        index.definition.strip().removesuffix(";").rstrip()
+    indexes = [
+        (index.name, index.definition.strip().removesuffix(";").rstrip())
         for table in tables
         for index in sorted(table.indexes, key=lambda index: index.name)
     ]
     ddl = _normalized(snapshot.ddl)
-    statements = [f"{sql};" for sql in definitions if _normalized(sql) not in ddl]
+    statements = [
+        f"{sql};"
+        for name, sql in indexes
+        if _normalized(sql) not in ddl and not _declares_constraint(snapshot.ddl, name)
+    ]
     if statements:
-        indexes = ["-- Indexes:", *statements]
+        listed = ["-- Indexes:", *statements]
     else:
-        indexes = ["-- Indexes: all in the DDL above" if definitions else "-- Indexes: none"]
+        listed = ["-- Indexes: all in the DDL above" if indexes else "-- Indexes: none"]
     lines = [
         f"-- Database {snapshot.db} on PostgreSQL {snapshot.server_version}.",
         "",
@@ -171,9 +177,15 @@ def render_schema(snapshot: SchemaSnapshot) -> str:
         "-- Rows per table:",
         *(f"--   {table.name}: {table.row_count:,}" for table in tables),
         "",
-        *indexes,
+        *listed,
     ]
     return "\n".join(lines) + "\n"
+
+
+def _declares_constraint(ddl: str, name: str) -> bool:
+    """Say whether ``ddl`` declares a constraint named ``name``, quoted or not, in any case."""
+    pattern = rf'\bconstraint\s+"?{re.escape(name)}"?(?![\w$])'
+    return re.search(pattern, ddl, flags=re.IGNORECASE) is not None
 
 
 def _normalized(sql: str) -> str:
