@@ -55,7 +55,12 @@ from goaly.bench.effisql.grading_pool import (
 )
 from goaly.bench.effisql.grading_service import EffiSqlGrader
 from goaly.bench.effisql.inputs import load_plans, load_schema_snapshot
-from goaly.bench.effisql.pg_settings import MAIN_DB, PgEnvConfig, load_agent_credentials
+from goaly.bench.effisql.pg_settings import (
+    MAIN_DB,
+    AgentCredentials,
+    PgEnvConfig,
+    load_credentials,
+)
 from goaly.bench.effisql.splits import load_exclusions, load_splits
 from goaly.bench.effisql.sql_env import SolvingPool, SqlEnvOptions
 from goaly.contracts.gen.llm_call_pb2 import CALL_PURPOSE_EXEC, LlmCallRecord
@@ -264,9 +269,15 @@ def _full_shares(shares: Mapping[str, int]) -> dict[str, int]:
 SOLVING_STATEMENT_TIMEOUT_S = 120.0
 
 
+def _agent_credentials() -> AgentCredentials:
+    """The agent role's password alone, from the host's credentials file, which holds every
+    password: only the agent's goes on, to the solving pool (T09)."""
+    return load_credentials().agent_only()
+
+
 async def _real_solving() -> SolvingPool:
     """The solving instances, as the agent role only: no admin or grader password is read."""
-    credentials = await asyncio.to_thread(load_agent_credentials)
+    credentials = await asyncio.to_thread(_agent_credentials)
     return SolvingPool(
         PgEnvConfig(), credentials, SqlEnvOptions(timeout_s=SOLVING_STATEMENT_TIMEOUT_S)
     )
