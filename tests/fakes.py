@@ -256,4 +256,10 @@ class ToyBenchmark:
         )
 
     def to_official(self, inst: ToyInstance, prediction: Prediction) -> dict[str, JsonValue]:
-        return {"instance_id": inst.instance_id, "pred_sqls": list(prediction.bird.sqls)}
+        # A prediction with no branch, as after a crash, gets the empty answer: the base query.
+        return {
+            "instance_id": inst.instance_id,
+            "pred_sqls": list(prediction.bird.sqls)
+            if prediction.HasField("bird")
+            else [inst.issue_sql],
+        }

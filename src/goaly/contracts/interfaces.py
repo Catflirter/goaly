@@ -165,6 +165,10 @@ class Benchmark[InstanceT: Instance, EnvT: Environment](Protocol):
     ``InstanceT`` is the benchmark's own record of a task and may hold gold answers. Only the
     copy that :meth:`agent_input` makes reaches the agent, so the types keep gold answers away
     from it. The runner identifies each instance by its ``instance_id``.
+
+    The organizers' task file (``goaly run --instances``) reaches an adapter when it is
+    constructed, and SPLIT_EXTERNAL then selects its tasks. Those tasks have no gold answers, so
+    runs on SPLIT_EXTERNAL are not graded; they still get one official record per task.
     """
 
     @property
@@ -172,7 +176,11 @@ class Benchmark[InstanceT: Instance, EnvT: Environment](Protocol):
         """The adapter's name, as --bench and RunManifest.benchmark give it, e.g. "birdcritic"."""
 
     def load_instances(self, split: Split.ValueType) -> Sequence[InstanceT]:
-        """Return the instances in ``split``."""
+        """Return the instances in ``split``.
+
+        For SPLIT_EXTERNAL, an adapter constructed with an organizer task file returns that
+        file's tasks, and an adapter constructed without one raises ValueError.
+        """
 
     def provision(self, inst: InstanceT) -> AbstractAsyncContextManager[EnvT]:
         """Create the environment to solve ``inst`` in. Leaving the context closes it.
@@ -191,11 +199,14 @@ class Benchmark[InstanceT: Instance, EnvT: Environment](Protocol):
 
         Grading uses its own environment, never the one the task was solved in (spec §4.1).
         Grading trouble does not raise: the returned Grade's ``status`` says what went wrong,
-        such as a prediction that failed to run, a timeout, or the grader's own failure.
+        such as a prediction that failed to run, a timeout, or the grader's own failure. Runs on
+        SPLIT_EXTERNAL have no gold answers, so callers skip ``grade`` for them.
         """
 
     def to_official(self, inst: InstanceT, prediction: Prediction) -> dict[str, JsonValue]:
         """Convert ``prediction`` to one record of the official submission format.
 
-        The record keeps the official field names exactly, such as BIRD's ``pred_sqls``.
+        The record keeps the official field names exactly. A prediction with no benchmark branch
+        set, as after a crash, gets the benchmark's empty answer: Effi-SQL's ``base_sql``
+        unchanged, or an empty SWE patch. Every task therefore still gets one official record.
         """

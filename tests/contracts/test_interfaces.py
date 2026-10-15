@@ -504,6 +504,15 @@ def test_toy_benchmark_writes_the_official_bird_format() -> None:
     assert json.loads(json.dumps(record)) == {"instance_id": "toy-1", "pred_sqls": ["SELECT 1"]}
 
 
+def test_toy_benchmark_writes_the_empty_answer_for_a_prediction_with_no_branch() -> None:
+    benchmark: Benchmark[ToyInstance, SqlEnvironment] = ToyBenchmark()
+    inst = TOY_INSTANCES[0]
+
+    record = benchmark.to_official(inst, Prediction())  # As after a crash.
+
+    assert record == {"instance_id": "toy-1", "pred_sqls": [inst.issue_sql]}
+
+
 async def solve_and_grade[InstanceT: Instance, EnvT: Environment, CtxT](
     benchmark: Benchmark[InstanceT, EnvT], policy: Policy[EnvT, CtxT], inst: InstanceT, ctx: CtxT
 ) -> tuple[Prediction, Grade]:
