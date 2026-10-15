@@ -251,7 +251,9 @@ class ToyBenchmark:
     only the task's base query, with TOY_BASE_RESULT, so it reveals nothing of the gold rewrite,
     which only ``grade`` uses. ``grade`` times nothing: the gold rewrite earns R-VES's top credit
     of 1, the base query unchanged earns 0.5, as a speedup of 1 does, and any other query does
-    not match. ``environments`` records each environment provisioned.
+    not match. A prediction with no branch set, as after a crash, stands for the empty answer,
+    the base query unchanged, in both ``grade`` and ``to_official``. ``environments`` records
+    each environment provisioned.
     """
 
     name = "toy"
@@ -287,7 +289,7 @@ class ToyBenchmark:
         return TaskInput(effisql=EffiSqlTaskInput(db="toy", base_sql=inst.base_sql))
 
     async def grade(self, inst: ToyInstance, prediction: Prediction) -> Grade:
-        sql = prediction.effisql.sql
+        sql = self._answer(inst, prediction)
         if sql == inst.gold_sql:
             credit = 1.0
         elif sql == inst.base_sql:
@@ -304,6 +306,9 @@ class ToyBenchmark:
         )
 
     def to_official(self, inst: ToyInstance, prediction: Prediction) -> dict[str, JsonValue]:
-        # A prediction with no branch, as after a crash, gets the empty answer: the base query.
-        sql = prediction.effisql.sql if prediction.HasField("effisql") else inst.base_sql
-        return {"instance_id": inst.instance_id, "sql": sql}
+        return {"instance_id": inst.instance_id, "sql": self._answer(inst, prediction)}
+
+    @staticmethod
+    def _answer(inst: ToyInstance, prediction: Prediction) -> str:
+        """The SQL ``prediction`` submits, or the base query unchanged if it has no branch."""
+        return prediction.effisql.sql if prediction.HasField("effisql") else inst.base_sql

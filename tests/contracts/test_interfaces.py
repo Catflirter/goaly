@@ -728,6 +728,24 @@ def test_toy_benchmark_writes_the_empty_answer_for_a_prediction_with_no_branch()
     assert record == {"instance_id": "toy-1", "sql": inst.base_sql}
 
 
+def test_toy_benchmark_grades_a_prediction_with_no_branch_as_its_empty_answer() -> None:
+    benchmark: Benchmark[ToyInstance, SqlEnvironment] = ToyBenchmark()
+    inst = TOY_INSTANCES[0]
+    base_query = Prediction(instance_id="toy-1", effisql=EffiSqlPrediction(sql=inst.base_sql))
+
+    async def scenario() -> tuple[Grade, Grade]:
+        return (
+            await benchmark.grade(inst, Prediction(instance_id="toy-1")),  # As after a crash.
+            await benchmark.grade(inst, base_query),
+        )
+
+    empty, base = asyncio.run(scenario())
+
+    # The same answer to_official writes for it, so the grade and the record agree.
+    assert empty == base
+    assert (empty.correct, empty.score) == (True, 0.5)
+
+
 async def solve_and_grade[InstanceT: Instance, EnvT: Environment, CtxT](
     benchmark: Benchmark[InstanceT, EnvT], policy: Policy[EnvT, CtxT], inst: InstanceT, ctx: CtxT
 ) -> tuple[Prediction, Grade]:
