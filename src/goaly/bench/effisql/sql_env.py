@@ -43,27 +43,27 @@ Timeouts. A call's timeout is its ``timeout_s`` capped at ``SqlEnvOptions.timeou
 trusted wiring sets. A session can change its own ``statement_timeout``, so a statement that
 runs past its timeout is stopped from the client:
 
-1. libpq's cancel request;
-2. if it still runs after a grace period, the pool ends its backend from another agent session
-   (``pg_terminate_backend``, matching the backend's PID and start time), and the next
-   statement opens a new session;
-3. if even that fails, the statement is abandoned: its socket is closed. Its backend then
-   runs on outside the cap until the server notices: the agent role's sessions check their
-   client every 5 s (client_connection_check_interval) and stop any statement at 130 s
-   (statement_timeout), backstops a statement cannot lift for itself once it runs.
+1. libpq's cancel request, with the session's cancel key;
+2. if it still runs after a grace period, the client closes the session's socket, and the next
+   statement opens a new session. The server then ends the backend: a backend blocked sending
+   rows fails at once, the agent role's sessions check their client every 5 s
+   (client_connection_check_interval, which a statement could turn off for itself), and
+   statement_timeout ends any statement at 130 s, a limit no running statement can lift.
+
+No session ever ends another one: no role here may call pg_cancel_backend or
+pg_terminate_backend, so one task cannot stop another task's, or another run's, statements.
 
 A cancelled ``execute``, and ``close()`` with a statement in flight, stop the statement the
-same way, within the grace periods, before they return or CancelledError propagates. A cancel
-or terminate that fails is logged at WARNING with its cause, an abandon at ERROR.
+same way, within the grace period and psycopg's own cleanup, before they return or
+CancelledError propagates. A cancel that fails is logged at WARNING with its cause, and so is
+a session closed under its statement.
 
 Other sessions. Every task shares the agent role, and PostgreSQL shows a role the query text of
 its own sessions. So the instances revoke pg_stat_activity and the functions behind it from
 PUBLIC, and the agent role is no member of pg_read_all_stats: a task cannot read another task's
-statements. What privileges do not stop: the agent role may end its own role's sessions, which
-the terminate above needs, so one task's statement could end another task's session on the
-same instance (that task sees an error, then a new session); and within one statement,
-``set_config`` can raise settings such as ``work_mem`` for queries the statement itself runs
-later, through ``query_to_xml`` and the like. PL/pgSQL is revoked, so no DO block runs many.
+statements. What privileges do not stop: within one statement, ``set_config`` can raise
+settings such as ``work_mem`` for queries the statement itself runs later, through
+``query_to_xml`` and the like. PL/pgSQL is revoked, so no DO block runs many.
 """
 
 import asyncio
@@ -73,7 +73,6 @@ import time
 from collections.abc import AsyncIterator, Awaitable, Callable, Coroutine, Mapping, Sequence
 from contextlib import asynccontextmanager
 from dataclasses import dataclass
-from datetime import datetime
 from pathlib import Path
 from typing import Any, Protocol
 
@@ -91,7 +90,6 @@ from goaly.bench.effisql.pg_instances import (
     AGENT_STATEMENT_TIMEOUT_S,
     ROLE_DEFAULTS,
     SOLVING,
-    TERMINATE_FUNCTION,
     Instance,
 )
 from goaly.bench.effisql.pg_settings import (
@@ -136,14 +134,15 @@ _NON_FINITE = frozenset({"NaN", "Infinity", "-Infinity"})
 # Errors after which the session is gone: connection exceptions, server shutdowns, a dropped
 # database, and the idle-session and idle-in-transaction timeouts, which end the session.
 _LOST = frozenset({"57P01", "57P02", "57P03", "57P04", "57P05", "25P03"})
-_ABANDON_WAIT_S = 15.0  # psycopg's own cleanup of a cancelled wait takes up to 10 s.
+# How long psycopg may take to let go of a session whose runner was cancelled: one more
+# cancel request and a wait for the statement, up to 5 s each.
+_CLOSE_WAIT_S = 15.0
 _NO_COPY_OUT = "COPY to the client is not supported here; run a SELECT instead"
 _NO_COPY_IN = b"COPY from the client is not supported here"
 
-# Its parameters: the terminate function, then the names of the role defaults to read.
+# Its parameter: the names of the role defaults to read, in order.
 _PREFLIGHT_SQL = (
     "SELECT has_table_privilege('public.lineitem', 'SELECT'), "
-    "has_function_privilege(%s::text, 'EXECUTE'), "
     "ARRAY(SELECT current_setting(name) FROM unnest(%s::text[]) WITH ORDINALITY AS s(name, i) "
     "ORDER BY i)"
 )
@@ -151,16 +150,6 @@ _ROLE_SETTINGS_SQL = (
     "SELECT d.datname, s.setconfig FROM pg_db_role_setting s "
     "LEFT JOIN pg_database d ON d.oid = s.setdatabase "
     "WHERE s.setrole = (SELECT oid FROM pg_roles WHERE rolname = current_user)"
-)
-# The agent role sees its own role's backends here, though not what they run.
-_BACKEND_START_SQL = (
-    "SELECT pg_stat_get_backend_start(id) FROM pg_stat_get_backend_idset() AS id "
-    "WHERE pg_stat_get_backend_pid(id) = pg_backend_pid()"
-)
-_TERMINATE_SQL = (
-    "SELECT pg_terminate_backend(pid) FROM (SELECT pg_stat_get_backend_pid(id) AS pid, "
-    "pg_stat_get_backend_start(id) AS started FROM pg_stat_get_backend_idset() AS id) AS b "
-    "WHERE pid = %s AND started = %s"
 )
 # The role defaults only a superuser may set: the agent's RESET ALL leaves them, and only
 # setup can restore them. The agent role restores every other one itself.
@@ -416,14 +405,7 @@ type _Runner = Callable[
     [psycopg.AsyncConnection[Any], str, ResultBuilder], Coroutine[Any, Any, None]
 ]
 type _Connect = Callable[[], Awaitable[psycopg.AsyncConnection[Any]]]
-# Ends the backend with this PID that started at this time, from another session.
-type _Terminate = Callable[[int, datetime], Awaitable[None]]
-
-
-@dataclass(frozen=True)
-class _Session:
-    conn: psycopg.AsyncConnection[Any]
-    started: datetime  # When its backend started: with the PID, it names the backend.
+type _Conn = psycopg.AsyncConnection[Any]
 
 
 class PgSqlEnvironment:
@@ -436,16 +418,14 @@ class PgSqlEnvironment:
         cap: asyncio.Semaphore,
         options: SqlEnvOptions,
         connect: _Connect,
-        terminate: _Terminate,
         runner: _Runner = run_statement,
     ) -> None:
         self._instance = instance
         self._cap = cap
         self._options = options
         self._connect = connect
-        self._terminate = terminate
         self._runner = runner
-        self._session: _Session | None = None
+        self._conn: _Conn | None = None
         self._running: asyncio.Task[None] | None = None  # The statement in flight, if any.
         self._stopping: tuple[asyncio.Task[None], asyncio.Future[None]] | None = None
         self._lock = asyncio.Lock()  # One statement at a time on the task's session.
@@ -458,7 +438,7 @@ class PgSqlEnvironment:
     async def open(self) -> None:
         """Open the task's session; raise EnvironmentFailure if the instance refuses it."""
         async with self._lock:
-            await self._current_session()
+            await self._session()
 
     async def execute(self, sql: str, *, timeout_s: float | None = None) -> SqlResult:
         """Run one statement and return its result; see SqlEnvironment.execute.
@@ -472,10 +452,10 @@ class PgSqlEnvironment:
         if (problem := statement_text_problem(sql)) is not None:
             return SqlResult(error=problem)
         async with self._lock:
-            session = await self._current_session()  # Outside the cap: not a statement's time.
+            conn = await self._session()  # Outside the cap: not a statement's time.
             queued = time.monotonic()
             async with self._cap:
-                return await self._run(session, sql, timeout, time.monotonic() - queued)
+                return await self._run(conn, sql, timeout, time.monotonic() - queued)
 
     async def close(self) -> None:
         """Stop any statement in flight and close the session; it completes even while its
@@ -494,51 +474,49 @@ class PgSqlEnvironment:
         return min(timeout_s, cap)
 
     async def _shut_down(self) -> None:
-        session, self._session = self._session, None
-        if session is None:
+        conn, self._conn = self._conn, None
+        if conn is None:
             return
         running = self._running
         if running is not None and not running.done():
-            await self._stopper(session, running)  # Its backend must not run on, uncapped.
-        await _close_quietly(session.conn)
+            await self._stopper(conn, running)  # Its backend must not run on, uncapped.
+        await _close_quietly(conn)
 
-    async def _current_session(self) -> _Session:
+    async def _session(self) -> _Conn:
         """The task's session, opened anew if it has none or its connection broke."""
         if self._closed:
             raise RuntimeError("the SQL environment is closed")
-        if self._session is not None and not self._session.conn.closed:
-            return self._session
-        if self._session is not None:
-            await _close_quietly(self._session.conn)
-            self._session = None
-        self._session = await self._open()
-        return self._session
+        if self._conn is not None and not self._conn.closed:
+            return self._conn
+        if self._conn is not None:
+            await _close_quietly(self._conn)
+            self._conn = None
+        self._conn = await self._open()
+        return self._conn
 
-    async def _run(
-        self, session: _Session, sql: str, timeout_s: float, queue_wait_s: float
-    ) -> SqlResult:
+    async def _run(self, conn: _Conn, sql: str, timeout_s: float, queue_wait_s: float) -> SqlResult:
         builder = ResultBuilder(self._options.row_limit)
         started = time.monotonic()
-        task = asyncio.create_task(self._runner(session.conn, sql, builder))
+        task = asyncio.create_task(self._runner(conn, sql, builder))
         self._running = task
         try:
             try:
                 done, _ = await asyncio.wait({task}, timeout=timeout_s)
             except asyncio.CancelledError:
-                await self._stop_fully(session, task)
+                await self._stop_fully(conn, task)
                 raise
             elapsed_s = time.monotonic() - started
             if not done:
-                await self._stop_fully(session, task)
+                await self._stop_fully(conn, task)
                 return SqlResult(
                     error=STATEMENT_TIMEOUT, elapsed_s=elapsed_s, queue_wait_s=queue_wait_s
                 )
         finally:
             self._running = None
         failure = _failure(task)
-        if failure is not None or session.conn.closed or connection_lost(builder.sqlstate):
+        if failure is not None or conn.closed or connection_lost(builder.sqlstate):
             reason = str(failure) if failure is not None else builder.result().error
-            await self._drop(session, failure)
+            await self._drop(conn, failure)
             return SqlResult(
                 error=f"the session ended: {reason or 'its connection closed'}; the next "
                 "statement opens a new one",
@@ -549,11 +527,11 @@ class PgSqlEnvironment:
         result.elapsed_s, result.queue_wait_s = elapsed_s, queue_wait_s
         return result
 
-    async def _drop(self, session: _Session, failure: BaseException | None) -> None:
+    async def _drop(self, conn: _Conn, failure: BaseException | None) -> None:
         """Forget a session that ended or broke, so the next statement opens a new one."""
-        if self._session is session:
-            self._session = None
-        await _close_quietly(session.conn)
+        if self._conn is conn:
+            self._conn = None
+        await _close_quietly(conn)
         if failure is not None and not isinstance(
             failure, psycopg.OperationalError | asyncio.CancelledError
         ):
@@ -561,9 +539,9 @@ class PgSqlEnvironment:
                 "a statement on %s broke its session", self._instance.name, exc_info=failure
             )
 
-    async def _stop_fully(self, session: _Session, task: asyncio.Task[None]) -> None:
+    async def _stop_fully(self, conn: _Conn, task: asyncio.Task[None]) -> None:
         """Stop the statement ``task`` runs, even if this coroutine is cancelled meanwhile."""
-        stopping = self._stopper(session, task)
+        stopping = self._stopper(conn, task)
         cancelled = False
         while not stopping.done():
             try:
@@ -574,47 +552,39 @@ class PgSqlEnvironment:
         if cancelled:
             raise asyncio.CancelledError
 
-    def _stopper(self, session: _Session, task: asyncio.Task[None]) -> asyncio.Future[None]:
+    def _stopper(self, conn: _Conn, task: asyncio.Task[None]) -> asyncio.Future[None]:
         """The one stop of ``task``'s statement, shared by everyone who asks for it."""
         if self._stopping is None or self._stopping[0] is not task:
-            self._stopping = (task, asyncio.ensure_future(self._stop(session, task)))
+            self._stopping = (task, asyncio.ensure_future(self._stop(conn, task)))
         return self._stopping[1]
 
-    async def _stop(self, session: _Session, task: asyncio.Task[None]) -> None:
-        name, grace, conn = self._instance.name, self._options.cancel_grace_s, session.conn
+    async def _stop(self, conn: _Conn, task: asyncio.Task[None]) -> None:
+        name, grace = self._instance.name, self._options.cancel_grace_s
         try:
             await conn.cancel_safe(timeout=grace)
         except psycopg.Error:
             _log.warning("the cancel request to %s failed", name, exc_info=True)
         if await _finished(task, grace):
             return
-        # The cancel did not take: end the backend, and open a new session next time.
-        if self._session is session:
-            self._session = None
+        # The cancel did not take: close the socket, which the server notices within 5 s, and
+        # open a new session next time. Cancelling the runner first lets psycopg let go of the
+        # socket itself: it tries one more cancel, then closes the connection.
+        if self._conn is conn:
+            self._conn = None
         pid = conn.info.backend_pid
-        _log.warning("terminating backend %s on %s, which ignored its cancel", pid, name)
-        try:
-            async with asyncio.timeout(grace):
-                await self._terminate(pid, session.started)
-        except Exception:  # noqa: BLE001  # Logged with its cause; then the abandon below.
-            _log.warning("terminating backend %s on %s failed", pid, name, exc_info=True)
-        if not await _finished(task, grace):
-            _log.error(
-                "abandoning a statement on %s that neither cancel nor terminate stopped: "
-                "backend %s may run on until it next writes to its closed socket",
-                name,
-                pid,
-            )
-            task.cancel()  # psycopg then closes the connection itself, within about 10 s.
-            await _finished(task, _ABANDON_WAIT_S)
+        _log.warning("closing the session of backend %s on %s, which ignored its cancel", pid, name)
+        task.cancel()
+        if not await _finished(task, _CLOSE_WAIT_S):
+            _log.error("the statement on %s kept its session; closing its socket under it", name)
+            conn.pgconn.finish()
         await _close_quietly(conn)
 
-    async def _open(self) -> _Session:
+    async def _open(self) -> _Conn:
         """Open a session with the agent role's own defaults, restoring them first if an earlier
         session changed them. Raise EnvironmentFailure if the instance refuses a session, or
         if the defaults cannot be restored from the agent role."""
         name = self._instance.name
-        conn: psycopg.AsyncConnection[Any] | None = None
+        conn: _Conn | None = None
         try:
             conn = await self._connect()
             rows = await _role_settings(conn)
@@ -630,7 +600,7 @@ class PgSqlEnvironment:
                         f"agent role cannot restore them: {left}. `pgenv.py start` reapplies "
                         "the roles."
                     )
-            return _Session(conn, await _backend_start(conn))
+            return conn
         except BaseException as error:
             if conn is not None:
                 await asyncio.shield(_close_quietly(conn))
@@ -663,13 +633,6 @@ async def _restore_role_defaults(
                         Identifier(setting), Literal(value)
                     )
                 )
-
-
-async def _backend_start(conn: psycopg.AsyncConnection[Any]) -> datetime:
-    row = await (await conn.execute(_BACKEND_START_SQL)).fetchone()
-    if row is None or not isinstance(row[0], datetime):
-        raise psycopg.OperationalError("the session cannot see when its own backend started")
-    return row[0]
 
 
 def _failure(task: asyncio.Task[None]) -> BaseException | None:
@@ -742,9 +705,8 @@ class SolvingPool:
         """Check every solving instance before a run, and fail fast if one is not ready.
 
         The agent role must log in, start with the setup's defaults (read-only transactions,
-        its temp-file cap and its timeout backstops), read the TPC-H tables, and be able to end
-        its own sessions, which stopping a stuck statement needs. Raise EnvironmentFailure
-        naming every problem found.
+        its temp-file cap and its timeout backstops) and read the TPC-H tables. Raise
+        EnvironmentFailure naming every problem found.
         """
         defaults = ROLE_DEFAULTS[AGENT_ROLE]
         problems: list[str] = []
@@ -756,12 +718,12 @@ class SolvingPool:
                 problems.append(f"{name}: the agent role cannot log in: {error}")
                 continue
             try:
-                cursor = await conn.execute(_PREFLIGHT_SQL, [TERMINATE_FUNCTION, list(defaults)])
+                cursor = await conn.execute(_PREFLIGHT_SQL, [list(defaults)])
                 row = await cursor.fetchone()
             except psycopg.Error as error:
                 problems.append(f"{name}: the agent's session failed: {error}")
             else:
-                can_read, can_end, settings = row if row is not None else (False, False, [])
+                can_read, settings = row if row is not None else (False, [])
                 found = dict(zip(defaults, settings or [], strict=False))
                 problems += [
                     f"{name}: the agent's {setting} is {found.get(setting)}, not {wanted}"
@@ -770,8 +732,6 @@ class SolvingPool:
                 ]
                 if not can_read:
                     problems.append(f"{name}: the agent role cannot read the TPC-H tables")
-                if not can_end:
-                    problems.append(f"{name}: the agent role cannot end its own sessions")
             finally:
                 await _close_quietly(conn)
         if problems:
@@ -787,11 +747,7 @@ class SolvingPool:
         slot.environments += 1
         try:
             environment = PgSqlEnvironment(
-                slot.instance,
-                slot.cap,
-                self.options,
-                connect=lambda: self._connect(slot.instance),
-                terminate=lambda pid, started: self._terminate(slot.instance, pid, started),
+                slot.instance, slot.cap, self.options, connect=lambda: self._connect(slot.instance)
             )
             try:
                 await environment.open()
@@ -815,9 +771,3 @@ class SolvingPool:
             application_name="goaly-effisql-agent",
             prepare_threshold=None,  # Nothing prepared for DISCARD ALL to pull away.
         )
-
-    async def _terminate(self, instance: Instance, pid: int, started: datetime) -> None:
-        """End the agent backend ``pid`` that started at ``started``, from another agent
-        session; nothing happens if it is gone, or its PID now names another backend."""
-        async with await self._connect(instance) as conn:
-            await conn.execute(_TERMINATE_SQL, [pid, started])
