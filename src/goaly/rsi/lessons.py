@@ -17,7 +17,7 @@ from itertools import groupby
 
 from google.protobuf.timestamp_pb2 import Timestamp
 
-from goaly.contracts.gen.experiment_pb2 import ExperimentRecord, Lane, Lesson
+from goaly.contracts.gen.experiment_pb2 import DECISION_ABORTED, ExperimentRecord, Lane, Lesson
 from goaly.rsi.ids import check_id
 from goaly.rsi.lanes import lane_info
 from goaly.rsi.ledger import EXPERIMENTS, LESSONS, LESSONS_MARKDOWN, Ledger, LedgerFiles
@@ -49,9 +49,11 @@ class LessonStore:
     ) -> Lesson:
         """Add a lesson that cites ``experiment_ids`` as its evidence, and return it.
 
-        The text is stripped, and evidence cited twice is kept once. Raises ValueError, writing
-        nothing, for an invalid ID or lane, a blank text, evidence that is not one of the lane's
-        experiments in the ledger, or a lesson_id already used, even by a deleted lesson.
+        The text is stripped, and evidence cited twice is kept once. Adding the same lesson again,
+        with the same lane, text and evidence, changes nothing but regenerating lessons.md, so a
+        lane can retry an add whose page write failed. Raises ValueError, writing nothing, for an
+        invalid ID or lane, a blank text, evidence that is not one of the lane's experiments in the
+        ledger, or a lesson_id already used for another lesson, or by a deleted one.
         """
         check_id(lesson_id, "lesson_id")
         lane_info(lane)
@@ -64,6 +66,15 @@ class LessonStore:
         with self._ledger.session(write=True) as files:
             lessons = _latest(files)
             if lesson_id in lessons:
+                stored = lessons[lesson_id]
+                retried = (stored.lane, stored.text, list(stored.experiment_ids)) == (
+                    lane,
+                    text,
+                    evidence,
+                )
+                if retried and _stands(stored):
+                    _write_page(files, lessons)
+                    return stored
                 raise ValueError(f"lesson_id {lesson_id} is already used; IDs are never reused")
             _check_experiments(files, lane, evidence)
             now = self._now()
@@ -83,7 +94,8 @@ class LessonStore:
 
         Recording an experiment again changes nothing, so a resumed lane cannot count it twice.
         Raises LessonNotFoundError for an unknown or deleted lesson, and ValueError if the
-        experiment is not one of the lesson's lane in the ledger, or already hurt the lesson.
+        experiment is not one of the lesson's lane in the ledger, was aborted, which says nothing
+        about its hypothesis (experiment.proto), or already hurt the lesson.
         """
         return self._mark(lesson_id, experiment_id, helped=True)
 
@@ -140,7 +152,11 @@ class LessonStore:
             lesson = lessons[lesson_id]
             if not _stands(lesson):
                 raise LessonNotFoundError(f"lesson {lesson_id} was deleted")
-            _check_experiments(files, lesson.lane, [experiment_id])
+            if _check_experiments(files, lesson.lane, [experiment_id]) & {experiment_id}:
+                raise ValueError(
+                    f"experiment {experiment_id} was aborted, which says nothing about its "
+                    "hypothesis, so it can neither help nor hurt a lesson"
+                )
             marked, other = (
                 (lesson.helped_by, lesson.hurt_by) if helped else (lesson.hurt_by, lesson.helped_by)
             )
@@ -173,18 +189,26 @@ def _latest(files: LedgerFiles) -> dict[str, Lesson]:
     return lessons
 
 
-def _check_experiments(files: LedgerFiles, lane: Lane.ValueType, experiment_ids: list[str]) -> None:
-    """Raise ValueError unless each of ``experiment_ids`` is an experiment of ``lane``."""
-    known = {
-        record.experiment_id
-        for record in files.read(EXPERIMENTS, ExperimentRecord)
-        if record.lane == lane
-    }
-    unknown = [experiment_id for experiment_id in experiment_ids if experiment_id not in known]
+def _check_experiments(
+    files: LedgerFiles, lane: Lane.ValueType, experiment_ids: list[str]
+) -> set[str]:
+    """Raise ValueError unless each of ``experiment_ids`` is an experiment of ``lane``, and return
+    those that were aborted.
+    """
+    latest: dict[str, ExperimentRecord] = {}
+    for record in files.read(EXPERIMENTS, ExperimentRecord):
+        if record.lane == lane:
+            latest[record.experiment_id] = record
+    unknown = [experiment_id for experiment_id in experiment_ids if experiment_id not in latest]
     if unknown:
         raise ValueError(
             f"{', '.join(unknown)}: not experiments of {_lane_title(lane)} in the ledger"
         )
+    return {
+        experiment_id
+        for experiment_id in experiment_ids
+        if latest[experiment_id].decision == DECISION_ABORTED
+    }
 
 
 def _stands(lesson: Lesson) -> bool:

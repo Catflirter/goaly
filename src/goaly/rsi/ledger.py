@@ -5,7 +5,7 @@ The ledger is one directory of JSONL files, shared by the lanes, which run as se
 
 - ``experiments.jsonl``, one ExperimentRecord per line. A lane writes an experiment's record as it
   goes (spec §8.7), and the last line for an experiment wins. An experiment ID belongs to one lane
-  and one round for good, and a decided experiment never goes back to pending.
+  and one round for good, and a decision, once made, never changes.
 - ``lessons.jsonl`` and the ``lessons.md`` generated from it (goaly.rsi.lessons).
 - ``lane_events.jsonl``, one LaneEvent per line: what happens to a lane outside any one
   experiment, such as starts, restarts, stops, results PRs and notifications (spec §8.7).
@@ -19,6 +19,7 @@ they never see a line half written. A torn last line left by a crash is skipped,
 write cuts it off (goaly.contracts.jsonl).
 """
 
+import errno
 import logging
 import os
 import secrets
@@ -37,6 +38,7 @@ from goaly.contracts.gen.experiment_pb2 import (
     LANE_EVENT_KIND_RESULTS_PR,
     LANE_EVENT_KIND_UNSPECIFIED,
     REJECTION_REASON_UNSPECIFIED,
+    Decision,
     ExperimentRecord,
     Lane,
     LaneEvent,
@@ -72,6 +74,9 @@ _FILES: dict[str, type[Message]] = {
 }
 
 _FINAL = frozenset({DECISION_ACCEPTED, DECISION_REJECTED, DECISION_ABORTED})
+# Why a lock file can be missing and impossible to create: a reader without write access, or a
+# read-only file system, such as a mounted copy of the ledger.
+_NO_WRITE_ACCESS = frozenset({errno.EACCES, errno.EPERM, errno.EROFS})
 
 _logger = logging.getLogger(__name__)
 
@@ -166,8 +171,9 @@ class Ledger:
         Sessions are not reentrant: one opened inside another in the same process waits for the
         first and times out. Raises goaly.rsi.locks.LockTimeoutError if another process holds the
         lock too long. A read of a ledger whose lock file is missing and cannot be created, as in
-        a directory without write access, goes ahead without the lock, so it can see a write in
-        progress as a torn last line, which it skips.
+        a directory without write access or on a read-only file system, goes ahead without the
+        lock, so it can see a write in progress as a torn last line, which it skips. Any other
+        failure to open the lock file is raised, and so is every failure of a write.
         """
         if not write and not self.directory.exists():
             yield LedgerFiles(self.directory, writable=False, present=False)  # Nothing to read.
@@ -178,8 +184,8 @@ class Ledger:
         with ExitStack() as held:
             try:
                 held.enter_context(file_lock(lock, shared=not write, timeout_s=self.lock_timeout_s))
-            except PermissionError:
-                if write:
+            except OSError as error:
+                if write or error.errno not in _NO_WRITE_ACCESS:
                     raise
                 _logger.warning("reading the ledger without the lock", extra={"lock": str(lock)})
             yield LedgerFiles(self.directory, writable=write)
@@ -195,8 +201,9 @@ class Ledger:
         - it is rejected without a rejection reason, gives a reason with another decision, or
           gives an unset or unknown reason;
         - its experiment ID already belongs to another lane, or to another round;
-        - it would put a decided experiment back to pending.
+        - it would change a decided experiment's decision, back to pending or to another one.
         """
+        _check_experiment(record, [])  # So that a record wrong on its own creates no ledger.
         with self.session(write=True) as files:
             files.append(EXPERIMENTS, record)
 
@@ -264,6 +271,7 @@ class Ledger:
         occurred_at, an experiment ID it names is not a valid ID, or it is a results PR without
         its pr_number, which keeps a restarted lane from opening the PR again (spec §8.7).
         """
+        _check_lane_event(event)  # So that an invalid event creates no ledger.
         with self.session(write=True) as files:
             files.append(LANE_EVENTS, event)
 
@@ -300,8 +308,11 @@ def _check_experiment(record: ExperimentRecord, earlier: Sequence[ExperimentReco
         last = previous[-1]
         if last.round != record.round:
             raise ValueError(f"experiment {name} ran in round {last.round}, not {record.round}")
-        if last.decision in _FINAL and record.decision == DECISION_PENDING:
-            raise ValueError(f"experiment {name} is decided, so it cannot be pending again")
+        if last.decision in _FINAL and record.decision != last.decision:
+            raise ValueError(
+                f"experiment {name} was decided as {Decision.Name(last.decision)}, and a decision "
+                f"never changes, so it cannot become {Decision.Name(record.decision)}"
+            )
 
 
 def _check_rejection_reasons(record: ExperimentRecord) -> None:

@@ -16,6 +16,7 @@ import pytest
 from goaly.contracts.gen.experiment_pb2 import LANE_EFFISQL
 from goaly.rsi.sandbox import (
     LABEL_EXPERIMENT,
+    SandboxConfig,
     SandboxResult,
     ensure_image,
     remove_containers,
@@ -40,7 +41,9 @@ def worktree(tmp_path: Path) -> Iterator[Worktree]:
     workspace = Workspace(make_repo(tmp_path / "repo"), root=tmp_path / "worktrees")
     worktree = workspace.create(LANE_EFFISQL, f"it-{secrets.token_hex(4)}")
     yield worktree
-    assert containers_of(worktree) == [], "a sandbox container outlived its test"
+    leftovers = containers_of(worktree)
+    remove_containers(experiment_id=worktree.experiment_id)  # Even after a failed test.
+    assert leftovers == [], "a sandbox container outlived its test"
 
 
 def containers_of(worktree: Worktree) -> list[str]:
@@ -190,3 +193,23 @@ def test_leftover_containers_are_removed_by_label(image: str, worktree: Worktree
     assert len(containers_of(worktree)) == 1
 
     assert remove_containers(lane=LANE_EFFISQL, experiment_id=worktree.experiment_id) == 1
+
+
+def test_a_file_past_the_size_limit_cannot_be_written(image: str, worktree: Worktree) -> None:
+    pack = worktree.path / "src/goaly/harness/packs/effisql"
+    config = SandboxConfig(max_file_bytes=1024 * 1024)
+
+    result = run_once(
+        image,
+        worktree.path,
+        LANE_EFFISQL,
+        experiment_id=worktree.experiment_id,
+        purpose="implementer",
+        command=f"head -c 2000000 /dev/zero > {pack}/big; echo status=$?",
+        timeout_s=60,
+        writable_packs=True,
+        config=config,
+    )
+
+    assert "status=0" not in result.output, result.output
+    assert (pack / "big").stat().st_size <= 1024 * 1024

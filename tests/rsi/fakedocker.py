@@ -26,7 +26,13 @@ for arg in args:
     if arg.startswith("--env-file="):
         path = Path(arg.removeprefix("--env-file="))
         env_file = {{"text": path.read_text(), "mode": oct(path.stat().st_mode & 0o777)}}
-record = {{"args": args, "env": dict(os.environ), "context": context, "env_file": env_file}}
+record = {{
+    "command": command,
+    "args": args,
+    "env": dict(os.environ),
+    "context": context,
+    "env_file": env_file,
+}}
 with (here / "calls.jsonl").open("a") as calls:
     calls.write(json.dumps(record) + "\\n")
 answer = json.loads((here / "script.json").read_text()).get(command, {{}})
@@ -63,7 +69,4 @@ class FakeDocker:
 
     def commands(self) -> list[str]:
         """The subcommand of each call so far, as ``run``, ``wait`` or ``image ls``."""
-        return [
-            " ".join(call["args"][:2]) if call["args"][:1] == ["image"] else call["args"][0]
-            for call in self.calls()
-        ]
+        return [call["command"] for call in self.calls()]

@@ -35,6 +35,8 @@ SOLVE_OPTIONS = [
     "--cap-drop=ALL",
     "--security-opt=no-new-privileges",
     "--pids-limit=512",
+    "--ulimit=fsize=67108864:67108864",
+    "--ulimit=nofile=1024:1024",
     "--memory=4g",
     "--memory-swap=4g",
     "--cpuset-cpus=0,1,12,13",

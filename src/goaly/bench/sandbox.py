@@ -13,16 +13,19 @@ The builder lives in goaly.bench, so that goaly run can use it without loading g
 §3.1).
 
 Every container runs as the host user with ``--network=host``, the only mode that works on this
-machine (spec §1.3). It gets a read-only root, a tmpfs ``/tmp``, no capabilities,
-``no-new-privileges``, and process, memory and CPU limits. No host environment variable reaches
-it, and the docker CLI itself gets none but its own. Each command runs under ``timeout`` inside the
-container, because stopping ``docker exec`` on the host leaves the command running. A one-shot run
-removes its container before it returns, whatever happens. Containers carry labels, so that
-leftovers of a crash can be found and removed.
+machine (spec §1.3), so it can reach every port on localhost. It gets a read-only root, a tmpfs
+``/tmp``, no capabilities, ``no-new-privileges``, and process, memory, CPU, file-size and
+open-file limits. Every limit must be above 0, since docker reads 0 as no limit. The file-size
+limit bounds each file a writable mount can hold, not their total, which the guards bound. No
+host environment variable reaches it, and the docker CLI itself gets none but its own. Each
+command runs under ``timeout`` inside the container, because stopping ``docker exec`` on the host
+leaves the command running. A one-shot run removes its container before it returns, whatever
+happens. Containers carry labels, so that leftovers of a crash can be found and removed.
 """
 
 import hashlib
 import logging
+import math
 import os
 import re
 import secrets
@@ -50,6 +53,7 @@ __all__ = [
     "ensure_image",
     "hardened_options",
     "image_tag",
+    "list_containers",
     "mount_path",
     "remove_containers",
     "remove_solve_containers",
@@ -66,7 +70,7 @@ LABEL_RUN = "goaly.bench.run"
 _LABEL_DOCKERFILE = "goaly.rsi.dockerfile-sha256"  # On the image: the Dockerfile it came from.
 
 _CPUSET = re.compile(r"\d+(-\d+)?(,\d+(-\d+)?)*")
-_SIZE = re.compile(r"\d+[bkmg]")
+_SIZE = re.compile(r"[1-9]\d*[bkmg]")  # Never 0, which docker and tmpfs read as no limit.
 _LABEL_VALUE = re.compile(r"[A-Za-z0-9][A-Za-z0-9_.-]{0,127}")
 _VARIABLE = re.compile(r"[A-Z_][A-Z0-9_]*")
 _LOOPBACK = frozenset({"127.0.0.1", "localhost", "::1"})
@@ -94,7 +98,10 @@ class SandboxConfig(BaseModel):
     memory: str = "4g"
     tmp_size: str = "1g"
     pids_limit: int = Field(default=512, gt=0)
-    kill_after_s: float = Field(default=5, ge=0)  # From timeout's TERM to its KILL.
+    max_file_bytes: int = Field(default=64 * 1024 * 1024, gt=0)  # The largest file it can write.
+    max_open_files: int = Field(default=1024, gt=0)
+    # From timeout's TERM to its KILL; never 0, which would turn the KILL off.
+    kill_after_s: float = Field(default=5, gt=0)
     docker_timeout_s: float = Field(default=120, gt=0)  # For each docker call but the command.
     build_timeout_s: float = Field(default=1800, gt=0)
     output_limit: int = Field(default=64 * 1024, gt=0)  # The characters of output kept: the end.
@@ -126,12 +133,16 @@ class SandboxResult:
 
 
 def mount_path(path: Path, what: str = "path") -> str:
-    """``path`` as a --mount value. Raises ValueError, naming ``what``, for a relative path or
-    one that docker's CSV parsing could misread.
+    """``path`` as a --mount value. Raises ValueError, naming ``what``, for a relative path, one
+    that docker's CSV parsing could misread, a ``..`` that docker would resolve, or a ``:``, which
+    would split PYTHONPATH.
     """
     text = str(path)
-    if not path.is_absolute() or any(char in ',"' or not char.isprintable() for char in text):
-        raise ValueError(f"the {what} must be absolute, without commas or quotes: {text!r}")
+    misread = any(char in ',":' or not char.isprintable() for char in text)
+    if not path.is_absolute() or misread or ".." in path.parts:
+        raise ValueError(
+            f"the {what} must be absolute, without .., commas, colons or quotes: {text!r}"
+        )
     return text
 
 
@@ -162,6 +173,8 @@ def hardened_options(
         "--cap-drop=ALL",
         "--security-opt=no-new-privileges",
         f"--pids-limit={config.pids_limit}",
+        f"--ulimit=fsize={config.max_file_bytes}:{config.max_file_bytes}",
+        f"--ulimit=nofile={config.max_open_files}:{config.max_open_files}",
         f"--memory={config.memory}",
         f"--memory-swap={config.memory}",  # No swap beyond the memory limit.
         f"--cpuset-cpus={config.cpus}",
@@ -179,7 +192,12 @@ def hardened_options(
 def timed_shell(timeout_s: float, config: SandboxConfig = SandboxConfig()) -> list[str]:  # noqa: B008
     """Return the in-container command prefix that runs a bash command for at most
     ``timeout_s``: timeout sends TERM, then KILL ``config.kill_after_s`` later.
+
+    Raises ValueError unless ``timeout_s`` is a finite number of seconds above 0: timeout reads 0
+    as no limit.
     """
+    if not math.isfinite(timeout_s) or timeout_s <= 0:
+        raise ValueError(f"the timeout must be finite and above 0 s; got {timeout_s!r}")
     return ["timeout", f"--kill-after={config.kill_after_s:g}s", f"{timeout_s:g}s", "bash", "-c"]
 
 
@@ -194,17 +212,19 @@ def run_container(
     config: SandboxConfig = SandboxConfig(),  # noqa: B008  (frozen, so one default is safe)
 ) -> SandboxResult:
     """Run the bash ``command`` once in a container of ``image`` started with ``options``, and
-    return how it ended. The container is removed before this returns, whatever happens.
+    return how it ended.
 
-    ``environment``'s variables reach the container through a private env file, deleted as soon
-    as the container has started, never through the command line. Raises SandboxError if docker
-    fails or hangs, or after ``timeout_s`` plus the docker timeouts. A command that fails or
-    times out is a result, not an error.
+    The container is removed before this returns. If removing it fails while another error is
+    already on its way, that failure is only logged, and removal by label, which a lane runs when
+    it starts, is the backstop. ``environment``'s variables reach the container through a private
+    env file, deleted as soon as the container has started, never through the command line.
+    Raises SandboxError if docker fails or hangs, or after ``timeout_s`` plus the docker
+    timeouts, and ValueError for a timeout that would not stop the command. A command that fails
+    or times out is a result, not an error.
     """
     shell = [*timed_shell(timeout_s, config), f"exec 2>&1\n{command}"]
     env_file = _env_file(environment or {})
     env_options = [] if env_file is None else [f"--env-file={env_file}"]
-    started = time.monotonic()
     try:
         try:
             _docker(
@@ -212,6 +232,7 @@ def run_container(
             )
         finally:
             _discard(env_file)  # The container holds its variables now.
+        started = time.monotonic()  # The container, and its timeout, have started.
         status = _docker(
             config,
             ["wait", name],
@@ -219,7 +240,8 @@ def run_container(
         )
         elapsed = time.monotonic() - started
         exit_code = _exit_code(status)
-        output = _docker(config, ["logs", name])
+        # The command's stderr goes to its stdout; timeout's and the init's messages do not.
+        output = _docker(config, ["logs", name], merge_stderr=True)
     except BaseException:
         _remove_quietly(config, name)
         raise
@@ -236,11 +258,20 @@ def remove_containers(
     """Remove every container, running or not, that carries all of ``labels``, and return how
     many there were.
     """
-    filters = [f"--filter=label={key}={value}" for key, value in labels.items()]
-    containers = _docker(config, ["ps", "--all", "--quiet", *filters]).split()
+    containers = list_containers(labels, config=config)
     if containers:
         _docker(config, ["rm", "--force", *containers])
     return len(containers)
+
+
+def list_containers(
+    labels: Mapping[str, str],
+    *,
+    config: SandboxConfig = SandboxConfig(),  # noqa: B008
+) -> list[str]:
+    """Return the IDs of every container, running or not, that carries all of ``labels``."""
+    filters = [f"--filter=label={key}={value}" for key, value in labels.items()]
+    return _docker(config, ["ps", "--all", "--quiet", *filters]).split()
 
 
 # The solve phase (spec §6.1).
@@ -401,9 +432,16 @@ def remove_solve_containers(
 
 
 def image_tag(repo: Path) -> str:
-    """Return the sandbox image's tag for ``repo``: ``goaly-rsi-sandbox:<sha256 of uv.lock>``."""
-    lock = hashlib.sha256((repo / "uv.lock").read_bytes()).hexdigest()
-    return f"{IMAGE_REPOSITORY}:{lock}"
+    """Return the sandbox image's tag for ``repo``: ``goaly-rsi-sandbox:<hash>``, where the hash
+    covers uv.lock and the Dockerfile, so that the tag names what the image was built from.
+
+    The apt packages, git and ripgrep, are not pinned, so two builds with one tag can differ by
+    Debian's updates to them. Raises SandboxError if either file cannot be read.
+    """
+    lock = _sha256(repo / "uv.lock")
+    recipe = _sha256(repo / DOCKERFILE)
+    both = hashlib.sha256(f"uv.lock {lock}\nDockerfile {recipe}\n".encode()).hexdigest()
+    return f"{IMAGE_REPOSITORY}:{both}"
 
 
 def ensure_image(
@@ -415,16 +453,19 @@ def ensure_image(
     and came from the current Dockerfile.
 
     The build context holds only pyproject.toml and uv.lock. Raises SandboxError if the build
-    fails.
+    fails, or if a file it needs cannot be read.
     """
     tag = image_tag(repo)
     dockerfile = repo / DOCKERFILE
-    recipe = hashlib.sha256(dockerfile.read_bytes()).hexdigest()
+    recipe = _sha256(dockerfile)
     if _image_recipe(config, tag) == recipe:
         return tag
     with tempfile.TemporaryDirectory(prefix="goaly-rsi-sandbox-") as context:
         for name in ("pyproject.toml", "uv.lock"):
-            shutil.copyfile(repo / name, Path(context) / name)
+            try:
+                shutil.copyfile(repo / name, Path(context) / name)
+            except OSError as error:
+                raise SandboxError(f"cannot read {repo / name}: {error}") from error
         _docker(
             config,
             [
@@ -452,15 +493,31 @@ def _image_recipe(config: SandboxConfig, tag: str) -> str | None:
 # The docker CLI.
 
 
-def _docker(config: SandboxConfig, args: list[str], *, timeout_s: float | None = None) -> str:
-    """Run the docker CLI and return its output; raise SandboxError if it fails or hangs."""
+def _sha256(path: Path) -> str:
+    try:
+        return hashlib.sha256(path.read_bytes()).hexdigest()
+    except OSError as error:
+        raise SandboxError(f"cannot read {path}: {error}") from error
+
+
+def _docker(
+    config: SandboxConfig,
+    args: list[str],
+    *,
+    timeout_s: float | None = None,
+    merge_stderr: bool = False,
+) -> str:
+    """Run the docker CLI and return its output, with its stderr if ``merge_stderr``; raise
+    SandboxError if it fails or hangs.
+    """
     limit = config.docker_timeout_s if timeout_s is None else timeout_s
     try:
         completed = subprocess.run(  # noqa: S603  (the docker CLI, with arguments built here)
             [config.docker, *args],
             env=_docker_environment(),
             stdin=subprocess.DEVNULL,
-            capture_output=True,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.STDOUT if merge_stderr else subprocess.PIPE,
             timeout=limit,
             check=False,
         )
@@ -469,7 +526,7 @@ def _docker(config: SandboxConfig, args: list[str], *, timeout_s: float | None =
     except OSError as error:
         raise SandboxError(f"cannot run {config.docker}: {error}") from error
     if completed.returncode != 0:
-        reason = completed.stderr.decode("utf-8", "replace").strip()
+        reason = (completed.stderr or completed.stdout).decode("utf-8", "replace").strip()
         raise SandboxError(f"docker {args[0]} failed ({completed.returncode}): {reason}")
     return completed.stdout.decode("utf-8", "replace")
 
