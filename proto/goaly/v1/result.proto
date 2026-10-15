@@ -1,0 +1,59 @@
+// The per-task record of a run (spec §3.3, §6.1).
+syntax = "proto3";
+
+package goaly.v1;
+
+import "goaly/v1/llm_call.proto";
+import "goaly/v1/task.proto";
+import "goaly/v1/trajectory.proto";
+import "google/protobuf/timestamp.proto";
+
+// How one task went in a run (spec §6.1): one line of the run's results file. Its score and
+// correctness are in its grade.
+message TaskResult {
+  // The run it belongs to.
+  string run_id = 1;
+  // The task.
+  string instance_id = 2;
+  // The replicate index (spec §6.1): which of the run's independent repeats this is.
+  int32 seed = 3;
+  // How the prediction was graded; absent if it was not, as in the organizers' runs, which have
+  // no gold answers.
+  Grade grade = 4;
+  // How long the task took, in seconds, from started_at to finished_at: the wall time the
+  // efficiency rules compare (spec §8.3).
+  double wall_time_s = 5;
+  // The tokens and cost of every model call made for the task.
+  Usage usage = 6;
+  // How many steps the agent took.
+  int32 steps = 7;
+  // Why the agent stopped.
+  StopReason stop_reason = 8;
+  // What kind of error ended the task, if any.
+  TaskErrorType error_type = 9;
+  // The error's message; empty when error_type is TASK_ERROR_TYPE_NONE.
+  string error_message = 10;
+  // When the runner started the task.
+  google.protobuf.Timestamp started_at = 11;
+  // When the policy returned or the task failed. Grading comes after and is not counted.
+  google.protobuf.Timestamp finished_at = 12;
+}
+
+// What kind of error ended a task.
+enum TaskErrorType {
+  // Not set.
+  TASK_ERROR_TYPE_UNSPECIFIED = 0;
+  // No error: the task ran to the end, though its grade may still fail it.
+  TASK_ERROR_TYPE_NONE = 1;
+  // The policy raised an unexpected exception.
+  TASK_ERROR_TYPE_POLICY_CRASH = 2;
+  // The task's environment failed: it could not be provisioned, or it broke during the run.
+  TASK_ERROR_TYPE_ENVIRONMENT = 3;
+  // A model call failed after all its retries; its LlmCallRecord says how.
+  TASK_ERROR_TYPE_LLM = 4;
+  // The grader failed, so the task has no usable grade.
+  TASK_ERROR_TYPE_GRADER = 5;
+  // The task ran past its time limit and was cancelled. A budget running out is not an error,
+  // but a stop_reason.
+  TASK_ERROR_TYPE_TIMEOUT = 6;
+}

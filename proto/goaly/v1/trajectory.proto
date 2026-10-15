@@ -1,0 +1,160 @@
+// The trajectory contracts (spec §3.3, §5.1): every step the agent took on a task, with the
+// messages, tool calls and results, usage and timing of each.
+syntax = "proto3";
+
+package goaly.v1;
+
+import "goaly/v1/llm_call.proto";
+import "goaly/v1/task.proto";
+import "google/protobuf/timestamp.proto";
+
+// Everything the agent did on one task in one run (spec §5.1): one line of the run's
+// trajectories file.
+message Trajectory {
+  // The run it belongs to.
+  string run_id = 1;
+  // The task.
+  string instance_id = 2;
+  // The replicate index (spec §6.1): which of the run's independent repeats this is.
+  int32 seed = 3;
+  // What the agent was given.
+  TaskInput task = 4;
+  // The messages the first model call was sent: the system prompt and the task.
+  repeated ChatMessage initial_messages = 5;
+  // The steps, in order.
+  repeated Step steps = 6;
+  // What the policy returned; absent if it returned nothing, as when it crashed.
+  Prediction prediction = 7;
+  // How the prediction was graded; absent until it is graded.
+  Grade grade = 8;
+  // Why the agent stopped.
+  StopReason stop_reason = 9;
+  // What went wrong, if the agent stopped on an error; empty otherwise.
+  string error = 10;
+  // The tokens and cost of every model call made for the task.
+  Usage usage = 11;
+  // When the agent started on the task.
+  google.protobuf.Timestamp started_at = 12;
+  // When it stopped.
+  google.protobuf.Timestamp finished_at = 13;
+}
+
+// Why the agent stopped working on a task.
+enum StopReason {
+  // Not set.
+  STOP_REASON_UNSPECIFIED = 0;
+  // The agent submitted its answer.
+  STOP_REASON_SUBMITTED = 1;
+  // The step budget ran out (spec §5.1), so the policy's fallback answered (spec §5.4).
+  STOP_REASON_STEP_BUDGET_EXHAUSTED = 2;
+  // The wall-clock budget ran out, so the policy's fallback answered.
+  STOP_REASON_TIME_BUDGET_EXHAUSTED = 3;
+  // The token budget ran out, so the policy's fallback answered.
+  STOP_REASON_TOKEN_BUDGET_EXHAUSTED = 4;
+  // The cost budget ran out, so the policy's fallback answered.
+  STOP_REASON_COST_BUDGET_EXHAUSTED = 5;
+  // The model made too many errors in a row (spec §5.1).
+  STOP_REASON_CONSECUTIVE_ERRORS = 6;
+  // An exception stopped the agent; error says what it was.
+  STOP_REASON_CRASHED = 7;
+}
+
+// One model call and the tool calls it made (spec §5.1). A step holds only what it adds to the
+// chat, never the history before it. Before any folding, a call's prompt is the trajectory's
+// initial_messages, then each earlier step's assistant message, its tool results as tool
+// messages, and its injected messages.
+message Step {
+  // The step's position in the trajectory, from 0.
+  int32 index = 1;
+  // The call_id of the LlmCallRecord of this step's model call.
+  string call_id = 2;
+  // When the model call started.
+  google.protobuf.Timestamp started_at = 3;
+  // How long the model call took, in seconds, as LlmCallRecord.latency_s counts it.
+  double latency_s = 4;
+  // The tokens and cost of the model call.
+  Usage usage = 5;
+  // The context size at this call: how many tokens its prompt held.
+  int64 prompt_tokens = 6;
+  // True if older tool outputs were folded into summaries before this call (spec §5.1). The
+  // trajectory keeps them unfolded.
+  bool context_folded = 7;
+  // The message the model returned.
+  ChatMessage assistant = 8;
+  // The results of the assistant's tool calls, in the order of its tool_calls.
+  repeated ToolResult tool_results = 9;
+  // Guidance the policy added after the tool results, such as a hint or a reminder of the tool
+  // schemas (spec §5.1, §5.3).
+  repeated ChatMessage injected = 10;
+}
+
+// One message of a chat with the model, in the OpenAI chat format.
+message ChatMessage {
+  // Who the message is from.
+  ChatRole role = 1;
+  // The message's text; may be empty, as when an assistant message only calls tools.
+  string content = 2;
+  // The model's thinking, on an assistant message; empty otherwise.
+  string reasoning_content = 3;
+  // The tools an assistant message calls, in order.
+  repeated ToolCall tool_calls = 4;
+  // On a tool message, the ID of the tool call it answers; empty otherwise.
+  string tool_call_id = 5;
+}
+
+// Who a chat message is from.
+enum ChatRole {
+  // Not set.
+  CHAT_ROLE_UNSPECIFIED = 0;
+  // The system prompt.
+  CHAT_ROLE_SYSTEM = 1;
+  // The user: the task, and guidance the policy adds during the run.
+  CHAT_ROLE_USER = 2;
+  // The model.
+  CHAT_ROLE_ASSISTANT = 3;
+  // A tool's result.
+  CHAT_ROLE_TOOL = 4;
+}
+
+// A tool call the model made.
+message ToolCall {
+  // The call's ID, which the tool message answering it repeats. The parser makes one up for a
+  // call parsed from XML.
+  string id = 1;
+  // The name of the tool called.
+  string name = 2;
+  // The arguments, a JSON object as text, exactly as the model wrote it: possibly malformed or
+  // truncated (spec §5.1). For a call parsed from XML, the parser writes it from the parameters.
+  string arguments_json = 3;
+  // Where the call was parsed from.
+  ToolCallSource source = 4;
+}
+
+// Where a tool call was parsed from (spec §5.1).
+enum ToolCallSource {
+  // Not set.
+  TOOL_CALL_SOURCE_UNSPECIFIED = 0;
+  // The response's standard tool_calls field.
+  TOOL_CALL_SOURCE_STANDARD = 1;
+  // Qwen3-Coder XML (<tool_call><function=...>) in the reasoning_content.
+  TOOL_CALL_SOURCE_REASONING_XML = 2;
+  // Qwen3-Coder XML in the content.
+  TOOL_CALL_SOURCE_CONTENT_XML = 3;
+}
+
+// The result of one tool call. The model sees it as a tool message: tool_call_id and content.
+// Tool.run returns content and is_error; the tool executor fills in the rest.
+message ToolResult {
+  // The ID of the tool call this answers.
+  string tool_call_id = 1;
+  // The name of the tool called.
+  string name = 2;
+  // The text shown to the model, after any truncation.
+  string content = 3;
+  // True if the call failed: its arguments were invalid, it timed out, or the tool failed.
+  bool is_error = 4;
+  // True if the executor cut long output down to its start and end (spec §5.1).
+  bool truncated = 5;
+  // How long the tool ran, in seconds.
+  double elapsed_s = 6;
+}
