@@ -47,8 +47,8 @@ message TaskResult {
   string error_message = 11;
   // When the task got its slot, after any queueing.
   google.protobuf.Timestamp started_at = 12;
-  // When the policy returned its prediction, or the task failed. Grading has its own timing,
-  // such as SweGrade.eval_wall_s.
+  // When the policy returned its prediction, or the task failed. Grading has its own timing:
+  // eval_wall_s in the grade's EffiSqlGrade or SweGrade.
   google.protobuf.Timestamp finished_at = 13;
 }
 

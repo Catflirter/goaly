@@ -146,8 +146,8 @@ class TaskResult(_message.Message):
 
     @_builtins.property
     def finished_at(self) -> _timestamp_pb2.Timestamp:
-        """When the policy returned its prediction, or the task failed. Grading has its own timing,
-        such as SweGrade.eval_wall_s.
+        """When the policy returned its prediction, or the task failed. Grading has its own timing:
+        eval_wall_s in the grade's EffiSqlGrade or SweGrade.
         """
 
     def __init__(
