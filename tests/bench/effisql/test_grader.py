@@ -28,6 +28,7 @@ from goaly.bench.effisql.grader import (
     row_hash,
     speedup,
     statement_body,
+    time_base,
     time_interleaved,
     time_prediction,
 )
@@ -576,3 +577,22 @@ class TestPgSession:
         session = PgSession.open(lambda _db: conn, "tpch")  # type: ignore[arg-type,return-value]  # A structural fake.
         assert session.connection is cast(Any, conn)
         session.close()
+
+
+class TestTimeBase:
+    def test_the_median_of_three_base_runs(self) -> None:
+        log: list[str] = []
+        assert time_base(RecordingTimer("base", log, [9.0, 7.0, 8.0])) == (8.0, 3)
+
+    def test_a_long_second_run_stops_after_two(self) -> None:
+        log: list[str] = []
+        assert time_base(RecordingTimer("base", log, [1.0, LONG_RUN_MS, 1.0])) == (
+            (1.0 + LONG_RUN_MS) / 2,
+            2,
+        )
+
+    def test_a_failed_run_is_the_bases(self) -> None:
+        log: list[str] = []
+        with pytest.raises(TimingError) as caught:
+            time_base(RecordingTimer("base", log, [QueryError("boom")]))
+        assert caught.value.side == "base"

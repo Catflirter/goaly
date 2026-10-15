@@ -1,0 +1,659 @@
+"""Grading an Effi-SQL prediction in dev or official mode (spec §4.1), on the grading instances.
+
+One evaluation (:func:`evaluate`, run in a worker thread) goes:
+
+1. **Plan.** ``EXPLAIN (FORMAT JSON)`` on the prediction. A plan that fails is a failed
+   prediction, and a plan that modifies data is refused before it runs: not matched, with the
+   PREDICTION_FAILED status.
+2. **Comparison.** The prediction runs fully, and its result's digest is compared with the
+   base query's: cached in dev mode, measured in official mode, after the prediction and up to
+   its row count, as the official evaluator does.
+3. **Checks**, only on a matched prediction: the plan check and the robustness check on the
+   alternate database (goaly.bench.effisql.checks). An unmatched prediction leaves both unset.
+4. **Timing**, even when a check flags it: dev mode times only the prediction against the
+   cached base median, official mode runs the interleaved protocol. A timing that fails
+   leaves the prediction matched, with no speedup and credit 0.
+
+``credit`` is the checked credit: g(τ) for a matched prediction no check flagged, else 0.
+
+**Dev mode** reads the base cache that the setup run writes (:class:`BaseCache`) and measures
+any task missing from it. A prediction identical to ``base_sql`` after :func:`normalize_sql`
+gets the setup's identity τ and its credit, with no timing at all. **Official mode** measures
+everything every time and never reads or writes a cache, so no dev measurement can reach an
+official grade. Each mode has its own directory under the grader's cache root.
+
+:class:`EffiSqlGrader` is the async face that the Benchmark adapter's ``grade`` calls. It never
+raises for grading trouble: the Grade's status says what went wrong.
+"""
+
+import asyncio
+import contextlib
+import enum
+import hashlib
+import logging
+import random
+import re
+import threading
+import time
+from collections.abc import Awaitable, Callable, Sequence
+from datetime import UTC, datetime
+from pathlib import Path
+from typing import Self
+
+from pydantic import BaseModel, ConfigDict, ValidationError
+
+from goaly.bench.effisql.checks import alt_matches, inspect_plan, read_only_problems
+from goaly.bench.effisql.data import EffiSqlInstance
+from goaly.bench.effisql.grader import (
+    GraderError,
+    PgSession,
+    QueryError,
+    QueryTimeoutError,
+    ResultDigest,
+    TimingError,
+    time_base,
+    time_interleaved,
+    time_prediction,
+)
+from goaly.bench.effisql.grading_pool import GradingInstance, GradingPool, Priority
+from goaly.bench.effisql.metrics import tier_credit
+from goaly.bench.effisql.pg_build import Connect
+from goaly.bench.effisql.pg_settings import ALT_DB, MAIN_DB, write_private
+from goaly.contracts.gen.task_pb2 import (
+    GRADE_STATUS_GRADED,
+    GRADE_STATUS_GRADER_ERROR,
+    GRADE_STATUS_PREDICTION_FAILED,
+    GRADE_STATUS_TIMEOUT,
+    EffiSqlGrade,
+    Grade,
+    GradeStatus,
+    Prediction,
+)
+
+__all__ = [
+    "BaseCache",
+    "BaseEntry",
+    "EffiSqlGrader",
+    "GradingSessions",
+    "GradingSlot",
+    "Mode",
+    "evaluate",
+    "measure_base",
+    "normalize_sql",
+    "prediction_sql",
+]
+
+_log = logging.getLogger(__name__)
+
+
+class Mode(enum.StrEnum):
+    DEV = "dev"  # RSI screening and validation: the base side cached, identity τ reused.
+    OFFICIAL = "official"  # The reported held-out numbers: everything measured every time.
+
+
+_DOLLAR_TAG = re.compile(r"\$(?:[A-Za-z_][A-Za-z0-9_]*)?\$")
+_TIGHT = frozenset("(),;")
+
+
+def normalize_sql(sql: str) -> str:
+    """Return ``sql`` with comments dropped, whitespace collapsed and unquoted text lowercased.
+
+    Quoted strings, quoted identifiers and dollar-quoted bodies stay exactly as written, so two
+    queries with the same normal form are the same query to PostgreSQL. Trailing semicolons go.
+    """
+    out: list[str] = []
+    space = False
+    i, n = 0, len(sql)
+    while i < n:
+        char = sql[i]
+        if char.isspace():
+            space, i = True, i + 1
+            continue
+        if sql.startswith("--", i):
+            end = sql.find("\n", i)
+            space, i = True, n if end < 0 else end
+            continue
+        if sql.startswith("/*", i):
+            space, i = True, _block_comment_end(sql, i)
+            continue
+        end = _quoted_end(sql, i)
+        token = sql[i:end] if end > i else char.lower()
+        end = max(end, i + 1)
+        if space and out and out[-1][-1] not in _TIGHT and token[0] not in _TIGHT:
+            out.append(" ")
+        out.append(token)
+        space, i = False, end
+    text = "".join(out)
+    while text.endswith(";"):
+        text = text[:-1].rstrip()
+    return text
+
+
+def _block_comment_end(sql: str, start: int) -> int:
+    depth, i = 0, start
+    while i < len(sql):
+        if sql.startswith("/*", i):
+            depth, i = depth + 1, i + 2
+        elif sql.startswith("*/", i):
+            depth, i = depth - 1, i + 2
+            if depth == 0:
+                return i
+        else:
+            i += 1
+    return len(sql)
+
+
+def _quoted_end(sql: str, i: int) -> int:
+    """Return where the quoted token starting at ``i`` ends, or ``i`` if none starts there."""
+    char = sql[i]
+    word_before = i > 0 and (sql[i - 1].isalnum() or sql[i - 1] in "_$")
+    if char in "eE" and sql.startswith("'", i + 1) and not word_before:
+        j = i + 2
+        while j < len(sql):
+            if sql[j] == "\\" or sql.startswith("''", j):
+                j += 2
+            elif sql[j] == "'":
+                return j + 1
+            else:
+                j += 1
+        return len(sql)
+    if char in "'\"":
+        j = i + 1
+        while j < len(sql):
+            if sql.startswith(char * 2, j):
+                j += 2
+            elif sql[j] == char:
+                return j + 1
+            else:
+                j += 1
+        return len(sql)
+    if char == "$" and not word_before and (tag := _DOLLAR_TAG.match(sql, i)):
+        close = sql.find(tag.group(), tag.end())
+        return len(sql) if close < 0 else close + len(tag.group())
+    return i
+
+
+def prediction_sql(inst: EffiSqlInstance, prediction: Prediction) -> str | None:
+    """Return the prediction's query: ``base_sql`` unchanged if it has no benchmark branch, as
+    after a crash; None if it is not an Effi-SQL answer."""
+    branch = prediction.WhichOneof("benchmark")
+    if branch is None:
+        return inst.base_sql
+    return prediction.effisql.sql if branch == "effisql" else None
+
+
+class BaseEntry(BaseModel):
+    """What the setup measured of one task's base query; dev mode grades against it."""
+
+    model_config = ConfigDict(frozen=True, extra="forbid")
+
+    instance_id: str
+    base_sql_sha256: str  # The entry belongs to this base_sql only.
+    row_count: int
+    row_hash_sum: str
+    alt_row_count: int
+    alt_row_hash_sum: str
+    base_ms: float  # The median of the base's timed runs.
+    timing_runs: int
+    relations: tuple[str, ...]  # The tables the base query's plan scans.
+    identity_speedup: float | None = None  # The setup's identity τ; None until measured.
+    measured_on: str
+    measured_at: datetime
+
+    @property
+    def digest(self) -> ResultDigest:
+        return ResultDigest(self.row_count, int(self.row_hash_sum, 16))
+
+    @property
+    def alt_digest(self) -> ResultDigest:
+        return ResultDigest(self.alt_row_count, int(self.alt_row_hash_sum, 16))
+
+
+def _sql_sha256(sql: str) -> str:
+    return hashlib.sha256(sql.encode("utf-8")).hexdigest()
+
+
+class BaseCache:
+    """One JSON file per task under ``directory``, each written atomically."""
+
+    def __init__(self, directory: Path) -> None:
+        self.directory = directory
+
+    def path(self, instance_id: str) -> Path:
+        return self.directory / f"{instance_id}.json"
+
+    def get(self, inst: EffiSqlInstance) -> BaseEntry | None:
+        """Return the task's entry, or None if it has none for this ``base_sql``."""
+        path = self.path(inst.instance_id)
+        try:
+            entry = BaseEntry.model_validate_json(path.read_bytes())
+        except FileNotFoundError:
+            return None
+        except (OSError, ValidationError) as error:
+            _log.warning("ignoring an unreadable base cache entry", extra={"path": str(path)})
+            _log.debug("base cache error", exc_info=error)
+            return None
+        return entry if entry.base_sql_sha256 == _sql_sha256(inst.base_sql) else None
+
+    def put(self, entry: BaseEntry) -> None:
+        write_private(self.path(entry.instance_id), entry.model_dump_json(indent=2) + "\n")
+
+
+class _BaseQueryError(Exception):
+    """The base query failed or timed out, so the task cannot be graded."""
+
+    def __init__(self, error: QueryError | QueryTimeoutError) -> None:
+        super().__init__(str(error))
+        self.timed_out = isinstance(error, QueryTimeoutError)
+
+
+def _base[T](step: Callable[[], T]) -> T:
+    try:
+        return step()
+    except (QueryError, QueryTimeoutError) as error:
+        raise _BaseQueryError(error) from error
+
+
+class _AbortedError(Exception):
+    """The grading was cancelled while its worker thread ran."""
+
+
+class GradingSessions:
+    """A grading instance's two sessions, on the main and the alternate database."""
+
+    def __init__(self, main: PgSession, alt: PgSession, *, instance: str) -> None:
+        self.main = main
+        self.alt = alt
+        self.instance = instance
+        self.aborted = threading.Event()
+
+    def check_abort(self) -> None:
+        if self.aborted.is_set():
+            raise _AbortedError
+
+    def abort(self) -> None:
+        """Stop the running evaluation: flag it, and cancel any statement in flight."""
+        self.aborted.set()
+        for session in (self.main, self.alt):
+            with contextlib.suppress(Exception):
+                session.connection.cancel_safe()
+
+    def close(self) -> None:
+        for session in (self.main, self.alt):
+            with contextlib.suppress(Exception):
+                session.close()
+
+
+def measure_base(sessions: GradingSessions, inst: EffiSqlInstance) -> BaseEntry:
+    """Measure what dev mode caches of the task's base query; no identity τ yet.
+
+    Raise QueryError or QueryTimeoutError if the base query fails, GraderError if the grader does.
+    """
+    base_sql = inst.base_sql
+    relations = inspect_plan(sessions.main.plan(base_sql), frozenset()).relations
+    sessions.check_abort()
+    digest = sessions.main.digest(base_sql)
+    sessions.check_abort()
+    alt = sessions.alt.digest(base_sql)
+    sessions.check_abort()
+    try:
+        base_ms, runs = time_base(lambda: sessions.main.execution_ms(base_sql))
+    except TimingError as error:
+        cause = error.__cause__
+        assert isinstance(cause, QueryError | QueryTimeoutError)  # noqa: S101  # TimingError's contract.
+        raise cause from None
+    return BaseEntry(
+        instance_id=inst.instance_id,
+        base_sql_sha256=_sql_sha256(base_sql),
+        row_count=digest.row_count,
+        row_hash_sum=f"{digest.row_hash_sum:064x}",
+        alt_row_count=alt.row_count,
+        alt_row_hash_sum=f"{alt.row_hash_sum:064x}",
+        base_ms=base_ms,
+        timing_runs=runs,
+        relations=tuple(sorted(relations)),
+        measured_on=sessions.instance,
+        measured_at=datetime.now(UTC),
+    )
+
+
+type _Result = tuple[EffiSqlGrade, GradeStatus.ValueType, str]
+
+
+def evaluate(
+    sessions: GradingSessions,
+    inst: EffiSqlInstance,
+    sql: str | None,
+    mode: Mode,
+    *,
+    cache: BaseCache | None,
+    rng: random.Random,
+) -> Grade:
+    """Grade ``sql`` for ``inst`` in ``mode``; blocking, so run it in a worker thread.
+
+    ``cache`` is dev mode's base cache; official mode ignores it. Only an abort raises.
+    """
+    started = time.monotonic()
+    try:
+        details, status, feedback = _evaluate(sessions, inst, sql, mode, cache, rng)
+    except _BaseQueryError as error:
+        status = GRADE_STATUS_TIMEOUT if error.timed_out else GRADE_STATUS_GRADER_ERROR
+        details, feedback = EffiSqlGrade(), f"the base query failed, so nothing was graded: {error}"
+    except GraderError as error:
+        details, status, feedback = EffiSqlGrade(), GRADE_STATUS_GRADER_ERROR, f"grader: {error}"
+    if not details.identity_cached:
+        details.eval_wall_s = time.monotonic() - started
+    flagged = (details.HasField("alt_matched") and not details.alt_matched) or (
+        details.literal_result
+    )
+    correct = status == GRADE_STATUS_GRADED and details.matched and not flagged
+    return Grade(
+        instance_id=inst.instance_id,
+        score=details.credit,
+        correct=correct,
+        status=status,
+        feedback=feedback,
+        effisql=details,
+    )
+
+
+def _evaluate(
+    sessions: GradingSessions,
+    inst: EffiSqlInstance,
+    sql: str | None,
+    mode: Mode,
+    cache: BaseCache | None,
+    rng: random.Random,
+) -> _Result:
+    if sql is None:
+        return EffiSqlGrade(), GRADE_STATUS_PREDICTION_FAILED, "not an Effi-SQL prediction"
+    if not sql.strip():
+        return EffiSqlGrade(), GRADE_STATUS_PREDICTION_FAILED, "the prediction is empty"
+    main, base_sql = sessions.main, inst.base_sql
+    entry = cache.get(inst) if mode is Mode.DEV and cache is not None else None
+    identical = normalize_sql(sql) == normalize_sql(base_sql)
+    if entry is not None and entry.identity_speedup is not None and identical:
+        return _identity(entry)
+
+    try:
+        plan = main.plan(sql)
+    except QueryError as error:
+        return EffiSqlGrade(), GRADE_STATUS_PREDICTION_FAILED, f"the prediction failed: {error}"
+    except QueryTimeoutError as error:
+        return EffiSqlGrade(), GRADE_STATUS_TIMEOUT, f"planning the prediction timed out: {error}"
+    cached = entry is not None
+    if mode is Mode.DEV and entry is None:
+        entry = _base(lambda: measure_base(sessions, inst))
+        if cache is not None:
+            cache.put(entry)
+    if entry is not None:
+        relations = frozenset(entry.relations)
+    else:
+        relations = inspect_plan(_base(lambda: main.plan(base_sql)), frozenset()).relations
+    verdict = inspect_plan(plan, relations)
+    if verdict.modifies_data:
+        feedback = "the prediction's plan modifies data, so it was refused before it ran"
+        return EffiSqlGrade(), GRADE_STATUS_PREDICTION_FAILED, feedback
+    sessions.check_abort()
+
+    details = EffiSqlGrade(base_cached=cached)
+    try:
+        pred = main.digest(sql, row_limit=None if entry is None else entry.row_count)
+    except QueryError as error:
+        return details, GRADE_STATUS_PREDICTION_FAILED, f"the prediction failed: {error}"
+    except QueryTimeoutError as error:
+        return details, GRADE_STATUS_TIMEOUT, f"the prediction timed out: {error}"
+    sessions.check_abort()
+    if entry is not None:
+        base = entry.digest
+    else:
+        base = _base(lambda: main.digest(base_sql, row_limit=pred.row_count))
+    details.pred_row_count, details.base_row_count = pred.row_count, base.row_count
+    if not pred.matches(base):
+        more = "" if pred.complete else "more than "
+        feedback = (
+            f"not matched: the prediction returned {more}{pred.row_count} rows, the base "
+            f"{base.row_count}" + (", with different values" if pred.complete else "")
+        )
+        return details, GRADE_STATUS_GRADED, feedback
+
+    details.matched = True
+    details.literal_result = verdict.literal_result
+    base_alt = (
+        entry.alt_digest if entry is not None else _base(lambda: sessions.alt.digest(base_sql))
+    )
+    sessions.check_abort()
+    details.alt_matched = alt_matches(sessions.alt, sql, base_alt)
+    sessions.check_abort()
+    return _timed(sessions, details, sql, base_sql, entry, rng)
+
+
+def _timed(
+    sessions: GradingSessions,
+    details: EffiSqlGrade,
+    sql: str,
+    base_sql: str,
+    entry: BaseEntry | None,
+    rng: random.Random,
+) -> _Result:
+    main = sessions.main
+
+    def time_pred() -> float:
+        sessions.check_abort()
+        return main.execution_ms(sql)
+
+    def time_the_base() -> float:
+        sessions.check_abort()
+        return main.execution_ms(base_sql)
+
+    try:
+        if entry is not None:
+            timing = time_prediction(time_pred, base_ms=entry.base_ms)
+        else:
+            timing = time_interleaved(time_pred, time_the_base, rng=rng)
+    except TimingError as error:
+        cause = error.__cause__
+        if error.side == "base":
+            assert isinstance(cause, QueryError | QueryTimeoutError)  # noqa: S101  # TimingError's contract.
+            raise _BaseQueryError(cause) from error
+        status = GRADE_STATUS_TIMEOUT if error.timed_out else GRADE_STATUS_PREDICTION_FAILED
+        return details, status, f"matched, but timing the prediction failed: {cause}"
+    details.base_time_s = timing.base_ms / 1000
+    details.pred_time_s = timing.pred_ms / 1000
+    details.timing_runs = timing.runs
+    details.speedup = timing.speedup
+    flags = _flags(details)
+    details.credit = 0.0 if flags else tier_credit(details.speedup)
+    feedback = (
+        f"matched; speedup {details.speedup:.3g}x (base {timing.base_ms:.1f} ms, prediction "
+        f"{timing.pred_ms:.1f} ms, {timing.runs} runs); credit {details.credit:g}"
+    )
+    return details, GRADE_STATUS_GRADED, feedback + "".join(f"; {flag}" for flag in flags)
+
+
+def _flags(details: EffiSqlGrade) -> list[str]:
+    flags = []
+    if details.HasField("alt_matched") and not details.alt_matched:
+        flags.append("hard_coded: the result differs from the base's on the alternate database")
+    if details.literal_result:
+        flags.append("literal_result: the plan computes the result from no table data")
+    return flags
+
+
+def _identity(entry: BaseEntry) -> _Result:
+    assert entry.identity_speedup is not None  # noqa: S101  # The caller checks it.
+    details = EffiSqlGrade(
+        matched=True,
+        base_time_s=entry.base_ms / 1000,
+        speedup=entry.identity_speedup,
+        credit=tier_credit(entry.identity_speedup),
+        timing_runs=0,
+        pred_row_count=entry.row_count,
+        base_row_count=entry.row_count,
+        base_cached=True,
+        identity_cached=True,
+    )
+    feedback = (
+        f"identical to base_sql: the setup's identity speedup {entry.identity_speedup:.3g}x, "
+        f"credit {details.credit:g}, without timing it again"
+    )
+    return details, GRADE_STATUS_GRADED, feedback
+
+
+# Checks a grading instance before it grades: T09's catalog fingerprint, once it lands.
+type InstanceCheck = Callable[[GradingSessions], None]
+
+
+class GradingSlot:
+    """One grading instance's sessions, opened on first use and reopened after a failure.
+
+    Every evaluation on it runs in a worker thread, one at a time (the pool sees to that).
+    """
+
+    def __init__(
+        self,
+        instance: GradingInstance,
+        connect: Callable[[GradingInstance], Connect],
+        *,
+        check: InstanceCheck | None = None,
+    ) -> None:
+        self.instance = instance
+        self._connect = connect
+        self._check = check
+        self._sessions: GradingSessions | None = None
+        self.rng = random.Random()  # noqa: S311  # Shuffles timing order; not a secret.
+
+    def sessions(self) -> GradingSessions:
+        """Return the slot's sessions, opening them if needed, and check the instance."""
+        if self._sessions is None:
+            connect = self._connect(self.instance)
+            main = PgSession.open(connect, MAIN_DB)
+            try:
+                alt = PgSession.open(connect, ALT_DB)
+            except GraderError:
+                main.close()
+                raise
+            sessions = GradingSessions(main, alt, instance=self.instance.name)
+            problems = [
+                f"{db}: {problem}"
+                for db, session in ((MAIN_DB, main), (ALT_DB, alt))
+                for problem in read_only_problems(session.connection)
+            ]
+            if problems:
+                sessions.close()
+                raise GraderError(f"{self.instance.name} is unsafe to grade on: {problems}")
+            self._sessions = sessions
+        self._sessions.aborted.clear()
+        if self._check is not None:
+            self._check(self._sessions)
+        return self._sessions
+
+    @property
+    def open_sessions(self) -> GradingSessions | None:
+        return self._sessions
+
+    def reset(self) -> None:
+        """Close the sessions, so the next evaluation reconnects."""
+        if self._sessions is not None:
+            self._sessions.close()
+            self._sessions = None
+
+    def evaluate(
+        self, inst: EffiSqlInstance, sql: str | None, mode: Mode, cache: BaseCache | None
+    ) -> Grade:
+        try:
+            grade = evaluate(self.sessions(), inst, sql, mode, cache=cache, rng=self.rng)
+        except GraderError as error:  # Opening or checking the instance failed.
+            self.reset()
+            return _grader_error(inst, f"grader: {error}")
+        if grade.status == GRADE_STATUS_GRADER_ERROR:
+            self.reset()  # A failed connection is reopened for the next evaluation.
+        return grade
+
+
+def _grader_error(inst: EffiSqlInstance, feedback: str) -> Grade:
+    return Grade(
+        instance_id=inst.instance_id,
+        status=GRADE_STATUS_GRADER_ERROR,
+        feedback=feedback,
+        effisql=EffiSqlGrade(),
+    )
+
+
+class EffiSqlGrader:
+    """Grades predictions on a pool of grading slots, in dev or official mode.
+
+    Each mode has its own directory under ``cache_root``: dev mode's holds the base cache it
+    reads, and official mode reads and writes none.
+    """
+
+    def __init__(self, pool: GradingPool[GradingSlot], *, cache_root: Path) -> None:
+        self._pool = pool
+        self._caches = {mode: BaseCache(cache_root / mode.value) for mode in Mode}
+
+    @classmethod
+    def on_instances(
+        cls,
+        instances: Sequence[GradingInstance],
+        connect: Callable[[GradingInstance], Connect],
+        *,
+        cache_root: Path,
+        check: InstanceCheck | None = None,
+    ) -> Self:
+        slots = [GradingSlot(instance, connect, check=check) for instance in instances]
+        return cls(GradingPool(slots), cache_root=cache_root)
+
+    def cache(self, mode: Mode) -> BaseCache:
+        return self._caches[mode]
+
+    async def grade(
+        self,
+        inst: EffiSqlInstance,
+        prediction: Prediction,
+        mode: Mode,
+        *,
+        priority: Priority = Priority.RSI,
+    ) -> Grade:
+        """Grade ``prediction`` for ``inst``. Grading trouble sets the status; it never raises."""
+        sql = prediction_sql(inst, prediction)
+        cache = self._caches[Mode.DEV] if mode is Mode.DEV else None
+        try:
+            async with self._pool.lease(priority) as slot:
+                return await _in_thread(slot, lambda: slot.evaluate(inst, sql, mode, cache))
+        except asyncio.CancelledError:
+            raise
+        except Exception as error:  # noqa: BLE001  # Never raise for grading trouble.
+            _log.exception("grading failed", extra={"instance_id": inst.instance_id})
+            return _grader_error(inst, f"grader: {type(error).__name__}: {error}")
+
+    def benchmark_grade(
+        self, mode: Mode, *, priority: Priority = Priority.RSI
+    ) -> Callable[[EffiSqlInstance, Prediction], Awaitable[Grade]]:
+        """Return ``Benchmark.grade`` for the adapter: this grader in one mode and priority."""
+
+        async def grade(inst: EffiSqlInstance, prediction: Prediction) -> Grade:
+            return await self.grade(inst, prediction, mode, priority=priority)
+
+        return grade
+
+
+async def _in_thread(slot: GradingSlot, work: Callable[[], Grade]) -> Grade:
+    """Run ``work`` in a worker thread; on cancellation, stop it before giving up the slot."""
+    future = asyncio.get_running_loop().run_in_executor(None, work)
+    try:
+        return await asyncio.shield(future)
+    except asyncio.CancelledError:
+        sessions = slot.open_sessions
+        if sessions is not None:
+            await _finish(asyncio.get_running_loop().run_in_executor(None, sessions.abort))
+        await _finish(future)
+        raise
+
+
+async def _finish[T](future: asyncio.Future[T]) -> None:
+    """Wait for ``future`` however often the waiting task is cancelled meanwhile."""
+    while not future.done():
+        with contextlib.suppress(asyncio.CancelledError):
+            await asyncio.shield(future)
+    with contextlib.suppress(Exception):  # The cancelled grading's result is discarded.
+        future.result()
