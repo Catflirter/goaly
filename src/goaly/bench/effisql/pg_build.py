@@ -54,6 +54,7 @@ __all__ = [
     "dbgen_binary",
     "ensure_dbgen",
     "ensure_generated",
+    "hba_problems",
     "inspect_table_file",
     "load_dataset",
     "read_golden_record",
@@ -483,6 +484,9 @@ def _build_server(config: PgEnvConfig, password: SecretStr, pgdata: Path) -> Ite
         try:
             connect = connector(config.host, config.build_port, password)
             _wait_until_ready(connect, name)
+            problems = hba_problems((pgdata / "pg_hba.conf").read_text(encoding="utf-8"))
+            if problems:
+                raise BuildError(f"{pgdata}/pg_hba.conf lets in without a password: {problems}")
             yield connect
             with connect("postgres") as conn:
                 conn.execute("CHECKPOINT")
@@ -491,6 +495,36 @@ def _build_server(config: PgEnvConfig, password: SecretStr, pgdata: Path) -> Ite
                 raise BuildError(f"the build server exited with code {exit_code}, not cleanly")
         finally:
             pg_containers.remove(name, force=True)
+
+
+def hba_problems(text: str) -> list[str]:
+    """Say what in a pg_hba.conf would let a connection in without a password.
+
+    Every server shares the host network, so every rule, local socket and TCP alike, must be
+    scram-sha-256: never trust, peer, ident, md5 or password. An include directive is refused
+    too, since its rules cannot be checked here.
+    """
+    problems = []
+    rules = 0
+    for number, line in enumerate(text.splitlines(), start=1):
+        fields = line.split("#", 1)[0].split()
+        if not fields:
+            continue
+        rules += 1
+        kind = fields[0]
+        if kind.startswith("include"):
+            problems.append(f"line {number}: {kind} pulls in rules that are not checked")
+            continue
+        # local DATABASE USER METHOD; host* DATABASE USER ADDRESS [MASK] METHOD [OPTIONS].
+        method_at = 3 if kind == "local" else 5 if len(fields) > 5 and "/" not in fields[3] else 4
+        method = fields[method_at] if len(fields) > method_at else "?"
+        if method != "scram-sha-256":
+            problems.append(
+                f"line {number}: {kind} rule authenticates by {method}, not scram-sha-256"
+            )
+    if rules == 0:
+        problems.append("it has no rule")
+    return problems
 
 
 def connector(host: str, port: int, password: SecretStr, *, user: str = ADMIN_ROLE) -> Connect:
