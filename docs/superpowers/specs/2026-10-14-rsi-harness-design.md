@@ -509,8 +509,8 @@ The first option costs more tokens, although the gateway's prefix cache absorbs 
 3. **The solve container** is made by the same builder as the implementer's sandbox (§8.8). The project lead decided that this builder lives in `goaly.bench`, so `goaly run` can use it without loading `goaly.rsi` (§3.1). T18 owns it, including the solve container's mount layout and the seccomp profile below.
    - **No IP networking** (V28). This machine forces `--network=host` (§1.3): `--network=none` and bridge networking both fail in runc. Host networking would put the container next to the host's unauthenticated loopback services, such as code-server on port 13337 and the Coder agent's debug and pprof ports. Every sandbox container, the solve container and the implementer's alike, therefore runs with a seccomp profile that denies `socket()` for AF_INET, AF_INET6, AF_NETLINK and AF_PACKET, and denies `io_uring_setup`. Everything else follows Docker's default profile. The container can neither reach nor squat a loopback port; it uses Unix sockets only.
    - Mounts: the harness as a snapshot, fully read-only and without `.git`, whether it is a candidate's (§8.2 step 3) or a tag or repository harness, such as the organizers' `--harness final`; `<run>/inputs/`, read-only, where the host stages the gold-free runtime file for the run's tasks, written from the split or from the `--instances` file, with the schema snapshot and the plans the agent sees; the proxy's per-run socket directory and the 2 solving instances' socket directories, read-only; and `<run>/solve/`, writable. The grading instances are never mounted, and nothing else is.
-   - Environment: an explicit allowlist with a per-run dummy token; `GOALY_LLM_UDS`, the proxy's socket (below); `GOALY_PG_SOCKET_DIRS`, the solving instances' socket directories; and the agent role's PostgreSQL password. That role is `SELECT`-only on `tpch`, and it can log in only on the 2 solving instances: it has no CONNECT on the grading instances or on the alternate database (§4.1), and their sockets are never mounted. It connects with `host=<socket dir>`, and the instances require scram passwords on `local` connections too.
-   - It runs on CPUs 0, 1, 12 and 13 with a 4 GB memory limit, like the implementer sandbox (§6.2, §8.8).
+   - Environment: an explicit allowlist with a per-run dummy token; `GOALY_LLM_UDS`, the proxy's socket (below); `GOALY_PG_SOCKET_DIRS`, the solving instances' socket directories and ports (§11 gives the format); and the agent role's PostgreSQL password, `GOALY_PG_AGENT_PASSWORD`. That role is `SELECT`-only on `tpch`, and it can log in only on the 2 solving instances: it has no CONNECT on the grading instances or on the alternate database (§4.1), and their sockets are never mounted. It connects with `host=<socket dir>`, and the instances require scram passwords on `local` connections too.
+   - It runs on the sandbox CPU set, by default CPUs 0, 1, 12 and 13, with a 4 GB memory limit, like the implementer sandbox (§6.2, §8.8).
    - Never present: `~/.config`, the real API key, grader credentials and gold.
 4. **A key-injecting LLM proxy runs on the host,** in the trusted parent process.
    - It listens on 127.0.0.1 and on a Unix socket in a per-run host directory, which is mounted into the container. It requires the per-run token on both.
@@ -525,7 +525,7 @@ The first option costs more tokens, although the gateway's prefix cache absorbs 
    - `<run>/solve/`, which the grade phase reads only for predictions.
 6. **The guards are unchanged.** Paths, checksums, the hard-coding scan, the AST allowlist and the unit-test guard still run first (§8.2 step 3).
 
-The organizers' entry point (§6.4) needs only the solve phase, and it runs that phase in the same container. Reproducing our results therefore needs Docker, by the project lead's decision, and there is no non-Docker fallback for official runs (§11). Their database also needs the agent role, and its Unix socket directory must be on the same machine, because the container opens no IP socket. The environment setup creates both along with the PostgreSQL instances (`make final`, §10). For a database they provide, `GOALY_PG_SOCKET_DIRS` names its socket directory, and the README gives the statements that create the role and the `pg_hba.conf` line it needs (§11).
+The organizers' entry point (§6.4) needs only the solve phase, and it runs that phase in the same container. Reproducing our results therefore needs Docker, by the project lead's decision, and there is no non-Docker fallback for official runs (§11). Their database also needs the agent role, and its Unix socket directory must be on the same machine, because the container opens no IP socket. The environment setup creates both along with the PostgreSQL instances (`make final`, §10). For a database they provide, `GOALY_PG_SOCKET_DIRS` names its socket directory and port, `GOALY_PG_AGENT_PASSWORD` in `~/.config/goaly/pg.env` holds the agent role's password, and the README gives the role statements and the `pg_hba.conf` line (§11). T11's launcher and solving pool therefore accept any configured port, not only the solving instances' 55432 and 55433.
 
 **Seeds and reproducibility.** In this document a *seed* means one independent replicate run, not a sampler seed.
 
@@ -638,6 +638,8 @@ A solving instance that grades, in setup or after final solving, also holds the 
 | 2–5 | 2–5, 14–17 | 2 solving instances, 2 physical cores each |
 | 6–11 | 6–11, 18–23 | 3 grading instances, 2 physical cores each |
 
+**The CPU sets are config values.** The table gives the defaults, which fit this machine: they need at least 24 logical CPUs, with SMT siblings at N and N+12. On another machine, set the sandbox CPU set (T18) and the instances' CPU sets (T09) in config; `make final` and the organizers' entry point read the same config (T23).
+
 Each PostgreSQL instance is pinned with cpuset to both SMT siblings of its physical cores: physical core N is logical CPUs N and N+12. Solving and grading never share an instance, so no SWE-style waves are needed. cpuset does not isolate the L3 cache, memory bandwidth or the disk, though, so heavy solving can still slow grading a little. T10 therefore measures identity τ with the solving instances idle and under load, and runs periodic identity probes during grading.
 
 **SWE (on hold, 2026-10-15).** The SWE plan used cores 4–11 in waves: each wave either solved (8 slots, 1 core each) or ran official evaluation (4 workers, 2 cores each), never both at once. Solving agents run tests and workloads that keep their cores fully busy; if official timing ran next to them, the measured speedups would be distorted, and so would every accept/reject decision based on them. Effi-SQL now uses those cores, so the partition has to be planned again if SWE resumes.
@@ -689,7 +691,7 @@ Each PostgreSQL instance is pinned with cpuset to both SMT siblings of its physi
 
   The official predictions land in the run directory as `official/seed-<k>.jsonl`, one file per seed, written by the host. Each is the official prediction file: every input record plus its `prediction` field, which holds both the SQL and the diff, in that order (§3.3).
 
-  This needs the executor API, a PostgreSQL database for Effi-SQL with the agent role, on the same machine and reachable through its Unix socket directory, which `GOALY_PG_SOCKET_DIRS` names (§6.1, §11), and Docker on a Linux host. The solve phase always runs in its container (§6.1), so there is no non-Docker fallback for official runs (§11). SWE (on hold) would need Docker for its task containers too.
+  This needs the executor API, a PostgreSQL database for Effi-SQL with the agent role, on the same machine and reachable through its Unix socket directory, which `GOALY_PG_SOCKET_DIRS` names (§6.1, §11), and Docker Engine on a Linux host, not Docker Desktop. The default CPU sets need at least 24 logical CPUs; on a smaller machine, set them in config (§6.2). The solve phase always runs in its container (§6.1), so there is no non-Docker fallback for official runs (§11). SWE (on hold) would need Docker for its task containers too.
 
 ## 7. Data splits
 
@@ -894,17 +896,17 @@ The implementer is mini-swe-agent's `DefaultAgent` (`mini-swe-agent==2.4.6`, MIT
 
 - The image is `goaly-rsi-sandbox:<uv.lock hash>`: Python 3.12, git, ripgrep and the locked dev dependencies.
 - Mounts: the worktree, read-only, at its own path; the lane's two pack directories, `src/goaly/harness/packs/<lane>/` and `tests/harness/packs/<lane>/`, read-write; and the main repository's `.git`, read-only, so `git diff` works but nothing can be committed. Nothing else from the host is mounted: no `~/data`, no `runs/`, no other worktree and no `~/.config`.
-- The container runs as the host user's uid and gid, with a read-only root filesystem, a tmpfs `/tmp`, no capabilities, `no-new-privileges`, and process, memory and CPU limits, on cores 0–1 (§6.2).
+- The container runs as the host user's uid and gid, with a read-only root filesystem, a tmpfs `/tmp`, no capabilities, `no-new-privileges`, and process, memory and CPU limits, on the sandbox CPU set, by default cores 0–1 (§6.2).
 - No host environment variable is passed in, and no key reaches the sandbox.
 - It gets no sockets at all: no proxy socket and no database socket is mounted, and the profile denies IP sockets. Its model calls are made by the lane process, and `goaly-smoke` is intercepted on the host (below). Nothing in it needs the network.
 - Every command runs under `timeout` inside the container, because a timed-out `docker exec` leaves its command running. Containers carry the experiment ID as a label, and a lane removes any it finds left over when it starts.
-- The shared builder in `goaly.bench` makes this container and the solve container of every evaluation (§6.1, Isolated evaluation). Both get the same image, the host user's uid and gid, a read-only root, a tmpfs `/tmp`, no capabilities, `no-new-privileges`, the same limits, on CPUs 0, 1, 12 and 13, and the same seccomp profile, a file in `goaly.bench`. The solve container's layout is its own, set by T18's `solve_options`, and shares nothing writable with this one:
+- The shared builder in `goaly.bench` makes this container and the solve container of every evaluation (§6.1, Isolated evaluation). Both get the same image, the host user's uid and gid, a read-only root, a tmpfs `/tmp`, no capabilities, `no-new-privileges`, the same limits, on the sandbox CPU set (by default CPUs 0, 1, 12 and 13), and the same seccomp profile, a file in `goaly.bench`. The solve container's layout is its own, set by T18's `solve_options`, and shares nothing writable with this one:
   - the harness as a snapshot, fully read-only, pack directories included: a candidate's (§8.2 step 3), or one of a tag or repository harness, such as `--harness final`;
   - no `.git`;
   - `<run>/solve/`, its only writable mount;
   - `<run>/inputs/`, read-only: the gold-free runtime file for the run's tasks, from the split or the `--instances` file, with the schema snapshot and the plans;
   - the proxy's per-run socket directory and the 2 solving instances' socket directories, read-only. The grading instances' are never mounted;
-  - an explicit environment allowlist: the per-run proxy token, `GOALY_LLM_UDS`, `GOALY_PG_SOCKET_DIRS` and the agent role's password.
+  - an explicit environment allowlist: the per-run proxy token, `GOALY_LLM_UDS`, `GOALY_PG_SOCKET_DIRS` and the agent role's password, `GOALY_PG_AGENT_PASSWORD`.
 
 **`goaly-smoke`.** `goaly-smoke <instance_id>` is the only command the sandbox does not run itself. The host:
 
@@ -983,19 +985,25 @@ Pinning a snapshot for `goaly-smoke` follows the same steps 1–3.
 
 **Requirements for running goaly**
 
-- Docker is required, the organizers' reproduction included. Every real run's solve phase runs in the sandbox container (§6.1), and there is no non-Docker fallback for official runs; the project lead decided this. The README lists Docker among its prerequisites.
+- Docker Engine on a Linux host is required, the organizers' reproduction included. Every real run's solve phase runs in the sandbox container (§6.1), and there is no non-Docker fallback for official runs; the project lead decided this. The solve container reaches PostgreSQL and the proxy only through Unix sockets on the host. Docker Desktop runs the engine in a VM, on macOS, Windows and Linux alike, and cannot pass a host Unix socket into a container, so it cannot be used.
 - On this machine Docker works only with `--network=host` (§1.3). The sandboxes still open no IP socket: a seccomp profile denies them, and the solve container reaches the proxy and PostgreSQL over Unix sockets (§6.1).
-- A Linux host. The solve container reaches PostgreSQL and the proxy only through Unix sockets on the host (§6.1), and Docker Desktop on macOS or Windows cannot pass a host Unix socket into a container.
-- PostgreSQL 16 on the same machine, with TPC-H SF3, which `make final` prepares. For a database the organizers provide:
-  - `GOALY_PG_SOCKET_DIRS` names its Unix socket directory, which the launcher mounts read-only into the solve container;
-  - it needs the agent role, `effisql_agent`, and this `pg_hba.conf` line, placed before any `peer` line: `local tpch effisql_agent scram-sha-256`. Stock Debian and Ubuntu packages ship `local all all peer`, under which the agent role's socket login fails;
-  - the README gives both.
+- At least 24 logical CPUs, with SMT siblings at N and N+12, for the default CPU sets. On a smaller machine, set the CPU sets in config (§6.2).
+- **`make final`'s database setup** runs its PostgreSQL 16 instances as Docker containers from the pinned `postgres:16` image, so it needs no host PostgreSQL. It needs:
+  - git, a C compiler and make, to build TPC-H's dbgen from `tpch-kit`, and network access to GitHub to fetch it;
+  - about 50 GB of free disk: the 5 instances, the alternate database, the raw data and a golden copy took 44 GB here;
+  - optionally, reserved ports, `sysctl net.ipv4.ip_local_reserved_ports=55432-55439`, which removes a start-up race.
+- **A database the organizers provide** instead must be PostgreSQL 16 on the same machine, named `tpch` and holding TPC-H SF3:
+  - `GOALY_PG_SOCKET_DIRS` names its socket directory and port as `<dir>:<port>`, for example `/var/run/postgresql:5432`. The server's socket file is then `<dir>/.s.PGSQL.<port>`, and the port is the server's `port` setting. The variable is a comma-separated list of such entries: `make final` gives two, one per solving instance, and a provided database gives one. The launcher mounts each directory read-only into the solve container;
+  - `GOALY_PG_AGENT_PASSWORD`, in `~/.config/goaly/pg.env` with mode 0600, holds the agent role's password;
+  - the agent role, `effisql_agent`, is created as a superuser with the statements the README gives: `CREATE ROLE` with `LOGIN` and the password, `ALTER ROLE … SET` for its defaults (`default_transaction_read_only = on`, `temp_file_limit = 5GB`, `statement_timeout = 130s` and `client_connection_check_interval = 5s`) and a connection limit of 64, `REVOKE ALL` on the database and on schema `public` from PUBLIC, and `GRANT` of `CONNECT`, `USAGE` on `public` and `SELECT` on its tables;
+  - `pg_hba.conf` needs the line `local tpch effisql_agent scram-sha-256`, placed before any `peer` line and followed by a reload. Stock Debian and Ubuntu packages ship `local all all peer`, under which the agent role's socket login fails.
 - Also required: uv with Python 3.12, and the executor API's key.
+- Some of this arrives with the evaluation stack: the `final` target, the PostgreSQL settings and the CPU-set config land with T09, T11, T18 and T24, and do nothing on `main` before then.
 
 **Config and logging**
 
 - Configs are validated with pydantic.
-- Secrets are read only from environment variables or `~/.config/goaly/.env`.
+- Secrets are read only from environment variables or `~/.config/goaly/.env`, and the PostgreSQL passwords from `~/.config/goaly/pg.env` (mode 0600).
 - Logs are structured JSON.
 
 **Third-party agent framework (RSI only)**

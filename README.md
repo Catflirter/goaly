@@ -10,20 +10,67 @@ SWE-fficiency and BIRD-CRITIC tasks. The design is in
 - [uv](https://docs.astral.sh/uv/). It installs Python 3.12 (pinned in `.python-version`) and
   every dependency at the version locked in `uv.lock`.
 - GNU make.
-- Docker. Every real run's solve phase runs in a sandbox container, the organizers' official
-  runs included, and there is no non-Docker fallback (design spec §6.1 and §11). Inside a
-  nested container, Docker may work only with `--network=host`.
-- A Linux host. The solve container reaches PostgreSQL and the LLM proxy only through Unix
-  sockets on the host, and Docker Desktop on macOS or Windows cannot pass a host Unix socket
-  into a container.
-- PostgreSQL 16 on the same machine. `make final` sets up the TPC-H instances. For a database
-  you provide, set `GOALY_PG_SOCKET_DIRS` to its Unix socket directory, create the agent role
-  `effisql_agent`, and put this line in `pg_hba.conf` before any `peer` line. Stock Debian and
-  Ubuntu packages ship `local all all peer`, under which the agent role's login fails:
+- Docker Engine on a Linux host, not Docker Desktop. Every real run's solve phase runs in a
+  sandbox container, the organizers' official runs included, and there is no non-Docker
+  fallback (design spec §6.1 and §11). The container reaches PostgreSQL and the LLM proxy only
+  through Unix sockets on the host, and Docker Desktop, which runs the engine in a VM on every
+  OS, cannot pass those in. Inside a nested container, Docker may work only with
+  `--network=host`.
 
-  ```
-  local   tpch   effisql_agent   scram-sha-256
-  ```
+The items below come with the evaluation stack (T09, T11, T18 and T24) and do nothing on `main`
+before it lands:
+
+- At least 24 logical CPUs, with SMT siblings at N and N+12, for the default CPU sets (design
+  spec §6.2). On a smaller machine, set the CPU sets in config.
+- For `make final`'s database setup: git, a C compiler and make, to build TPC-H's dbgen;
+  network access to GitHub; and about 50 GB of free disk. Its PostgreSQL 16 instances run in
+  Docker, so you need no host PostgreSQL. Reserving their ports removes a start-up race:
+  `sudo sysctl net.ipv4.ip_local_reserved_ports=55432-55439`.
+- Or a PostgreSQL 16 database you provide, on the same machine: see below.
+
+### A database you provide
+
+It must be named `tpch` and hold TPC-H SF3. As a superuser, create the agent role:
+
+```sql
+CREATE ROLE effisql_agent LOGIN NOSUPERUSER NOCREATEDB NOCREATEROLE NOREPLICATION NOBYPASSRLS
+  CONNECTION LIMIT 64 PASSWORD '<agent password>';
+ALTER ROLE effisql_agent SET default_transaction_read_only = on;
+ALTER ROLE effisql_agent SET temp_file_limit = '5GB';
+ALTER ROLE effisql_agent SET statement_timeout = '130s';
+ALTER ROLE effisql_agent SET client_connection_check_interval = '5s';
+REVOKE ALL ON DATABASE tpch FROM PUBLIC;
+GRANT CONNECT ON DATABASE tpch TO effisql_agent;
+\connect tpch
+REVOKE ALL ON SCHEMA public FROM PUBLIC;
+GRANT USAGE ON SCHEMA public TO effisql_agent;
+GRANT SELECT ON ALL TABLES IN SCHEMA public TO effisql_agent;
+```
+
+Add this line to `pg_hba.conf`, before any `peer` line, then reload the server with
+`SELECT pg_reload_conf();`. Stock Debian and Ubuntu packages ship `local all all peer`, under
+which the agent role's login fails:
+
+```
+local   tpch   effisql_agent   scram-sha-256
+```
+
+Put the agent's password in `~/.config/goaly/pg.env` (`chmod 600`):
+
+```sh
+GOALY_PG_AGENT_PASSWORD=<agent password>
+```
+
+Then set `GOALY_PG_SOCKET_DIRS` to the server's socket directory and port, as `<dir>:<port>`.
+The server's socket file is `<dir>/.s.PGSQL.<port>`, and the port is its `port` setting. For a
+stock Debian or Ubuntu server, that is:
+
+```sh
+GOALY_PG_SOCKET_DIRS=/var/run/postgresql:5432
+```
+
+The variable is a comma-separated list of such entries. `make final`'s setup uses two, one per
+solving instance; a database you provide uses one.
 
 ## Configuration
 
@@ -31,7 +78,7 @@ SWE-fficiency and BIRD-CRITIC tasks. The design is in
 |---|---|---|
 | `GOALY_API_KEY` | yes | none |
 | `GOALY_BASE_URL` | no | `https://api.goaly.ai/inference/v1` |
-| `GOALY_PG_SOCKET_DIRS` | no | the solving instances that `make final` sets up |
+| `GOALY_PG_SOCKET_DIRS` | no, and only with the evaluation stack | the solving instances that `make final` sets up |
 
 Set them as environment variables, or as lines in `~/.config/goaly/.env`
 (keep that file private, e.g. `chmod 600`):
