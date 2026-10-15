@@ -306,6 +306,16 @@ async def test_refuses_messages_once_closed_and_closing_again_does_nothing(path:
     assert instance_ids(path) == ["task-1"]
 
 
+async def test_closing_a_writer_never_entered_closes_it_for_good(path: Path) -> None:
+    writer = JsonlWriter[TaskResult](path)
+
+    await writer.aclose()
+
+    with pytest.raises(RuntimeError, match="already"):
+        await writer.__aenter__()
+    assert not path.exists()
+
+
 async def test_cannot_be_entered_twice(path: Path) -> None:
     writer = JsonlWriter[TaskResult](path)
     async with writer:
