@@ -10,8 +10,9 @@ evaluator = "goaly.bench.effisql.evaluate:make_evaluator"
 hooks = "goaly.rsi.hooks:lane_hooks"
 
 [lane]
-# The freeze (spec §13), absolute, so a restart never moves it.
-deadline = "2026-10-15T20:00:00Z"
+# Absolute, so a restart never moves it. Set far out on 2026-10-15 at the user's call: the lane
+# stops only after max_rounds_without_accept.
+deadline = "2026-10-20T00:00:00Z"
 max_rounds_without_accept = 4
 infrastructure_backoff_s = 120
 task_concurrency = 16

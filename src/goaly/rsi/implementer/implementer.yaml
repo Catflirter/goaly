@@ -4,7 +4,7 @@
 # x-litellm-response-cost of each call) and the wall time; the agent stops after the format errors;
 # the sandbox stops each command after its timeout; goaly-smoke refuses calls after its limit.
 limits:
-  step_limit: 60
+  step_limit: 150
   cost_limit_usd: 10.0
   wall_time_limit_s: 1800
   max_consecutive_format_errors: 3
