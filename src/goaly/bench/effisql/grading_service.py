@@ -50,6 +50,7 @@ from goaly.bench.effisql.grading_pool import GradingInstance, GradingPool, Prior
 from goaly.bench.effisql.pg_build import Connect, connector
 from goaly.bench.effisql.pg_settings import GRADER_ROLE, load_credentials
 from goaly.contracts.gen.task_pb2 import GRADE_STATUS_GRADER_ERROR, Grade, Prediction
+from goaly.contracts.interfaces import JsonValue
 
 __all__ = [
     "EffiSqlGrader",
@@ -304,9 +305,23 @@ def probe_identity(slot: GradingSlot, inst: EffiSqlInstance) -> float:
 
 def grade_on_slot(
     slot: GradingSlot, inst: EffiSqlInstance, sql: str | None, mode: Mode, cache: BaseCache | None
-) -> Grade:
-    """Grade on ``slot``: the work a runner runs for :meth:`EffiSqlGrader.grade`."""
-    return slot.evaluate(inst, sql, mode, cache)
+) -> tuple[Grade, dict[str, Any] | None]:
+    """Grade on ``slot``: the work a runner runs for :meth:`EffiSqlGrader.grade`. Return the
+    grade and the prediction's plan document, or None if no plan was taken."""
+    plans: list[dict[str, Any]] = []
+    grade = slot.evaluate(inst, sql, mode, cache, plans)
+    return grade, plans[-1] if plans else None
+
+
+def _report_plan(
+    on_plan: Callable[[str, JsonValue], None], instance_id: str, plan: dict[str, Any]
+) -> None:
+    """Hand the plan root to the caller's hook; a failing hook never fails the grade."""
+    root = plan.get("Plan", plan)
+    try:
+        on_plan(instance_id, root)
+    except Exception:  # noqa: BLE001  # The audit trail is the caller's; the grade stands.
+        _log.exception("the plan hook failed", extra={"instance_id": instance_id})
 
 
 class EffiSqlGrader:
@@ -355,8 +370,14 @@ class EffiSqlGrader:
         mode: Mode,
         *,
         priority: Priority = Priority.RSI,
+        on_plan: Callable[[str, JsonValue], None] | None = None,
     ) -> Grade:
-        """Grade ``prediction`` for ``inst``. Grading trouble sets the status; it never raises."""
+        """Grade ``prediction`` for ``inst``. Grading trouble sets the status; it never raises.
+
+        ``on_plan`` is called once, with the instance ID and the prediction's ``EXPLAIN (FORMAT
+        JSON)`` plan root, when the graded attempt took the plan; a prediction graded without
+        one, such as an empty answer or an identity submission in dev mode, gives none.
+        """
         sql = prediction_sql(inst, prediction)
         cache = self._dev_cache if mode is Mode.DEV else None
         try:
@@ -365,8 +386,10 @@ class EffiSqlGrader:
                 return quick
             for attempt in range(1, _GRADER_ERROR_ATTEMPTS + 1):
                 async with self._pool.lease(priority) as runner:
-                    grade = await runner.call(grade_on_slot, inst, sql, mode, cache)
+                    grade, plan = await runner.call(grade_on_slot, inst, sql, mode, cache)
                 if grade.status != GRADE_STATUS_GRADER_ERROR or attempt == _GRADER_ERROR_ATTEMPTS:
+                    if on_plan is not None and plan is not None:
+                        _report_plan(on_plan, inst.instance_id, plan)
                     return grade
                 _log.warning(
                     "retrying a grader failure",
