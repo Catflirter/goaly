@@ -13,6 +13,9 @@ dependencies = [
     "pydantic-settings>=2",
 ]
 
+[project.scripts]
+goaly = "goaly.cli:main"
+
 [dependency-groups]
 dev = [
     "anyio>=4", # Its pytest plugin runs the async tests (tests/conftest.py)
@@ -92,8 +95,8 @@ show_missing = true
 [tool.importlinter]
 root_package = "goaly"
 
-# T06 adds goaly.cli above goaly.rsi.
+# goaly.cli is the composition root (spec §3.1): the one module that may import every layer.
 [[tool.importlinter.contracts]]
-name = "Layers: rsi > bench > harness > contracts"
+name = "Layers: cli > rsi > bench > harness > contracts"
 type = "layers"
-layers = ["goaly.rsi", "goaly.bench", "goaly.harness", "goaly.contracts"]
+layers = ["goaly.cli", "goaly.rsi", "goaly.bench", "goaly.harness", "goaly.contracts"]

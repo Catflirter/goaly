@@ -47,6 +47,9 @@ def analyzed(result: subprocess.CompletedProcess[str]) -> tuple[int, int]:
         ("goaly.rsi", "goaly.bench", "kept"),
         ("goaly.contracts", "goaly.harness", "broken"),
         ("goaly.harness", "goaly.contracts", "kept"),
+        # goaly.cli, the composition root, is the top layer: nothing below may import it.
+        ("goaly.rsi", "goaly.cli", "broken"),
+        ("goaly.harness", "goaly.cli", "broken"),
     ],
 )
 def test_layers_contract(
