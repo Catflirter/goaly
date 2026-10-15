@@ -357,7 +357,7 @@ These are the file's own timings. Some come from plans recorded at SF10, includi
 **LLM client**
 
 - Async, httpx-based, OpenAI-compatible.
-- Each call times out after 300 s. 429s, 5xx errors, timeouts and connection errors get up to 5 retries with exponential backoff. Concurrency limits and adaptive backoff follow §6.2.
+- Each call times out after 300 s. 429s, 5xx errors, timeouts and connection errors get up to 5 retries with exponential backoff. A gateway 408 counts as a timeout. Concurrency limits and adaptive backoff follow §6.2.
 - Reads usage, including reasoning tokens, and the `x-litellm-response-cost` response header.
 - Writes one JSONL record per call, labeled with the purpose of the call.
 - Turns context overflow and similar failures into specific exception types.
@@ -369,11 +369,13 @@ These are the file's own timings. Some come from plans recorded at SF10, includi
 
 A call to a model its purpose does not allow raises an error.
 
+**Who holds which client.** The runner hands the harness an LLM client bound to purpose `exec`. Harness and pack code cannot choose a purpose, and only `goaly.rsi` builds clients with `rsi-*` purposes. Pack code also cannot import `settings` or the LLM client modules: the pack-code allowlist admits only an explicit list of `goaly.harness.core` modules (§8.5). So pack code can neither load the key nor build a client of its own.
+
 **Model-specific handling**
 
 - Qwen:
   - `chat_template_kwargs.enable_thinking` turns thinking on or off. `preserve_thinking` is optional.
-  - The gateway rejects `reasoning_effort` and a top-level `enable_thinking`.
+  - The gateway rejects `reasoning_effort`. The client never sends a top-level `enable_thinking`, although a probe found that the gateway accepts it: thinking is switched only through `chat_template_kwargs.enable_thinking`.
   - Known issue: tool calls sometimes end up in `reasoning_content`. When that happens, the parser falls back to Qwen3-Coder XML (`<tool_call><function=…><parameter=…>`).
   - Known issue: argument JSON can be truncated or malformed. We repair it where possible and otherwise send the error back to the model.
 - GLM (used only by RSI):
@@ -509,10 +511,11 @@ In the RSI phase a lane's GLM share covers its analyst, its implementers and its
 
 **Adaptive limiting** (in the LLM client, T03)
 
-- On a 429 or 503, wait for `Retry-After` if the response has one. Otherwise back off exponentially with full jitter: 1 s base, 60 s cap.
+- On a 429 or 503, wait for `Retry-After` if the response has one, up to the 60 s backoff cap; every attempt still records the server's own value. Otherwise back off exponentially with full jitter: 1 s base, 60 s cap.
+- A gateway 408, which LiteLLM returns when its upstream times out, counts as a timeout and is retried.
 - AIMD:
-  - after a burst of 429s, 503s or timeouts, the process halves its concurrency for that model;
-  - after every 20 consecutive successes, it adds 1 back;
+  - on a 429, 502, 503, 504 or timeout, the process halves its concurrency for that model. 500s and connection errors do not lower it; they count only toward the circuit breaker;
+  - after every 20 consecutive successes, it adds 1 back. Any failure resets the run of successes;
   - concurrency never exceeds the process's configured share.
 - Circuit breaker: if more than half of a model's calls fail within 2 minutes, the process stops starting new tasks for 60 s and logs a warning. Calls already in flight finish or time out as usual.
 - Every throttling event is logged with the call's purpose, so the report can show how much time the gateway cost us.
@@ -545,6 +548,8 @@ In the RSI phase a lane's GLM share covers its analyst, its implementers and its
 
 A solving instance that grades, in setup or after final solving, also holds the alternate database. The agent's role cannot connect to it.
 
+**`goaly-smoke` gradings go first.** They jump the queue ahead of every phase above. There are at most 2 per hypothesis, graded in dev mode, and each waits at most for the evaluation already running on its instance. The grading-instance pool (T09's API) carries these priorities, and T10's scheduler drives it.
+
 **Inside a process**
 
 - Each process runs one asyncio event loop.
@@ -569,7 +574,7 @@ Each PostgreSQL instance is pinned with cpuset to both SMT siblings of its physi
 | Resource | Limit | How it is enforced |
 |---|---|---|
 | Solving instances | 2, each running at most 2 statements at once; every agent session reaches them through the read-only role | psycopg async pools with a per-instance statement queue (T09). Client-side cancellation enforces the 120 s statement timeout |
-| Grading instances | 3, each running one evaluation at a time, so evaluations never disturb each other's timings. Each holds the main and the alternate database | The grader's instance pool (T10), which checks each instance's catalog fingerprint before every batch (§8.5) |
+| Grading instances | 3, each running one evaluation at a time, so evaluations never disturb each other's timings. Each holds the main and the alternate database | The grading-instance pool (T09's API), which serves work by priority, `goaly-smoke` gradings first. T10's scheduler drives it and checks each instance's catalog fingerprint before every batch (§8.5) |
 | SWE solving and evaluation (on hold) | 8 solving slots or 4 evaluation workers, never both at once | The slot scheduler (T14) pins containers with cpuset and switches mode between waves |
 | Disk (SWE, on hold) | Image budget | Images are pruned in batches (T13) |
 
@@ -672,7 +677,7 @@ Every external call has a timeout. Every agent run has step, cost and time limit
    - the diff stays inside the allowed paths;
    - the `bench/`, `harness/core/` and `contracts/` checksums are unchanged;
    - the hard-coding scan passes (§8.5);
-   - the static AST allowlist passes on the candidate's pack code (§8.5);
+   - the static AST allowlist passes on the candidate's pack code (§8.5). It also keeps pack code away from the key and from building an LLM client (§5.1);
    - the pack's unit tests pass. They run in a fresh sandbox with the whole worktree read-only, never on the host, because the agent may have written them.
 4. **Screen.** The candidate's results are compared with the best's cached results on the same tasks. No net gain means rejection. In screening, validation and confirmation alike, a candidate with any prediction flagged `hard_coded` or `literal_result` (§4.1) fails outright.
    - Effi-SQL: up to 15 train failures the hypothesis targets, plus 5 train tasks the best already solves, 1 seed. Solved and failed are as defined in §6.3.
@@ -719,15 +724,15 @@ A lane that stops writes a stop record to the ledger, opens its final results PR
 | Risk | Defense |
 |---|---|
 | Editing the grader, core or contracts | **Prevented.** The implementer works in a Docker sandbox in which only its lane's two pack directories are writable. Every other write fails with a read-only filesystem error, and the sandbox cannot commit. **Detected.** A candidate whose commit touches any other path is rejected. The `bench/`, `harness/core/` and `contracts/` checksums are verified before every evaluation |
-| Reading val or held-out data, or gold answers | The sandbox mounts only the candidate's worktree, which holds split ID lists but no gold answers: benchmark files with gold answers are never committed. `goaly-smoke` accepts train tasks only. The data files loaded while a candidate is evaluated hold only agent-visible and grading fields; Effi-SQL grading compares against `base_sql`, so it needs no gold at all. The full dataset, gold included, is read only by the setup and exclusion tools, and by the analyst for train only |
+| Reading val or held-out data, or gold answers | The sandbox mounts only the candidate's worktree, which holds split ID lists but no gold answers: benchmark files with gold answers are never committed. `goaly-smoke` accepts train tasks only. A candidate's evaluation loads only the gold-free runtime file, which holds agent-visible and grading fields; Effi-SQL grading compares against `base_sql`, so it needs no gold at all. The full dataset, gold included, is read only by the setup and exclusion tools, and by the analyst for train only |
 | Leaking or misusing the API key | The key never enters the sandbox: no host environment variable is passed in, and `~/.config` is not mounted. Model calls are made by the lane process, outside the sandbox. mini-swe-agent's local environment, which passes on the parent's environment and protects nothing, is never used for the implementer |
-| Running code the agent wrote | Agent-written tests run only in sandboxes, during implementation and in the unit-test guard. Candidate pack code also runs on the host, in the runner, during smoke tests, screening and validation, so a static AST allowlist checks it first. Imports must come from an approved list: `goaly.contracts`, `goaly.harness.core`, pydantic, and pure stdlib modules such as json, re, typing, dataclasses, math, statistics, collections, itertools, functools, textwrap and enum. `open`, `eval`, `exec`, `compile` and `__import__` are banned, and so are `importlib`, `subprocess`, `os`, `sys`, `socket`, `pathlib`, `shutil`, `ctypes` and attribute access to dunder internals |
+| Running code the agent wrote | Agent-written tests run only in sandboxes, during implementation and in the unit-test guard. Candidate pack code also runs on the host, in the runner, during smoke tests, screening and validation, so a static AST allowlist checks it first. **Allowed imports:** relative imports; the lane's own pack, `goaly.harness.packs.<lane>`; `goaly.contracts`; an explicit list of `goaly.harness.core` modules, which excludes `settings` and the LLM client modules, so pack code can neither load the key nor build a client (§5.1); pydantic; `asyncio`, for its concurrency primitives; and pure stdlib modules such as json, re, typing, dataclasses, math, statistics, collections, itertools, functools, textwrap and enum. **Banned:** the builtins `open`, `eval`, `exec`, `compile` and `__import__`; the modules `importlib`, `subprocess`, `os`, `sys`, `socket`, `pathlib`, `shutil` and `ctypes`; attribute access to dunder internals; and attribute names that start processes, open sockets or pipes, or reach modules. Those are `sys`, `os`, `modules`, `builtins`, `__builtins__` and `subprocess`, and asyncio's `create_subprocess_exec`, `create_subprocess_shell`, `open_connection`, `open_unix_connection`, `start_server`, `start_unix_server`, `subprocess_exec`, `subprocess_shell`, `create_connection`, `create_server`, `create_unix_connection`, `create_unix_server`, `create_datagram_endpoint`, `connect_read_pipe`, `connect_write_pipe` and `sock_*` |
 | The sandbox reaching other services | Host networking is the only mode that works here, so the sandbox can reach localhost and the internet. It holds no secret: PostgreSQL requires a password the sandbox never gets, the gateway is useless without the key, and the Docker socket is never mounted |
-| Hard-coded answers | A scan of the diff rejects it if it contains a gold-only fragment of any split's gold answer, at least 40 characters after normalization: gold `optimized_sql` for Effi-SQL, the gold patch for SWE (on hold). A gold-only fragment is a window of the gold that occurs in no `base_sql` and not in the schema DDL. The setup tools compute these windows and keep them outside the repository, like the dataset, so the sandbox never sees them. Scanning every gold window would reject legitimate skills: 147 of the 238 golds share such a window with their own `base_sql`, and standard TPC-H joins recur across many golds. The scan also rejects pack changes that embed large literal lists, above a size set in config. Effi-SQL instance ids are not scanned: they are small integers, so a match would mean nothing. There is no database-name rule either, since every task runs on the one `tpch` database. The SWE scan (on hold) also rejects an instance_id from any split |
+| Hard-coded answers | A scan of the diff rejects it if it contains a gold-only fragment of any split's gold answer, at least 40 characters after normalization: gold `optimized_sql` for Effi-SQL, the gold patch for SWE (on hold). A gold-only fragment is a window of the gold that occurs in no `base_sql` and not in the schema DDL. They are built from the full dataset and the schema DDL and stored outside the repository, as hashes, so the sandbox never sees them. Scanning every gold window would reject legitimate skills: 147 of the 238 golds share such a window with their own `base_sql`, and standard TPC-H joins recur across many golds. The scan also rejects pack changes that embed large literal lists, above a size set in config. Effi-SQL instance ids are not scanned: they are small integers, so a match would mean nothing. There is no database-name rule either, since every task runs on the one `tpch` database. The SWE scan (on hold) also rejects an instance_id from any split |
 | Hard-coded results: a prediction that returns the base query's result as constants | The grader's robustness check, on the alternate database, and its plan check give such a prediction credit 0 and flag it (§4.1). A flagged prediction fails its candidate outright, and the ledger and the lessons record it. The report gives both the official and the checked R-VES |
 | Changing the database: indexes or data | Agent sessions use a role with only the `SELECT` privilege and no `CREATE` (§4.1), and client-side cancellation enforces their timeout. Grading runs on its own instances, and the official evaluation runs on the pristine database |
 | Tampering with the grading instances | Before each grading batch, the grader verifies the instance's catalog fingerprint: its indexes, its relation sizes (`relpages`) and its write counters. Every instance requires password authentication. Grading credentials never enter the repository or the implementer sandbox, which has host networking but no credentials |
-| Relying on the improvement model | The per-purpose model allowlist lives in core, which RSI cannot edit: executor calls may use only Qwen (§5.1) |
+| Relying on the improvement model | The per-purpose model allowlist lives in core, which RSI cannot edit: executor calls may use only Qwen (§5.1). The runner hands the harness a client bound to purpose `exec`, and pack code can neither import the client modules nor load the key, so it cannot reach GLM |
 | Special-casing the workload or caching between timing runs (SWE, on hold) | The official grader times each repetition in a fresh process and checks for stack inspection; the prompt and skills forbid both; held-out results expose this kind of overfitting |
 | Editing test files (SWE, on hold) | The official grader resets test files before it runs them |
 | Overfitting to val | The analyst never sees per-task val results or val trajectories, and lessons cite only the aggregate decision (§7). Held-out is used only for v0's baseline run and the final runs |
@@ -785,7 +790,12 @@ The implementer is mini-swe-agent's `DefaultAgent` (`mini-swe-agent==2.4.6`, MIT
 - The assistant message goes into the history exactly as returned, `reasoning_content` and `tool_calls` included.
 - A step's cost is the gateway's `x-litellm-response-cost`, so the agent's cost limit counts real spend. mini-swe-agent's litellm model is not used, and litellm is not installed; its price table has no entry for `glm-5.3` anyway.
 - Each step records its call ID, which joins it to its `LlmCallRecord`.
-- **Fallback.** If T03's client is late, a small subclass of mini-swe-agent's `LitellmModel` that reads the gateway's cost header stands in. It needs litellm only while it is used, and switching back to core's client changes one class.
+- **Fallback.** If T03's client is late, a small subclass of mini-swe-agent's `LitellmModel` that reads the gateway's cost header stands in. Switching back to core's client changes one class. While the fallback is in use, three claims in this section and §11 do not hold:
+  - litellm stays out of the process that holds the key;
+  - GLM calls go through core's client;
+  - core records every call and enforces the lane's GLM share.
+
+  litellm is then installed only for the fallback, pinned exactly to a vetted version, never 1.82.7 or 1.82.8.
 
 **Sandbox.** One Docker container per hypothesis, with `--network=host`, the only mode that works on this machine (§1.3):
 
@@ -799,7 +809,7 @@ The implementer is mini-swe-agent's `DefaultAgent` (`mini-swe-agent==2.4.6`, MIT
 
 1. refuses any instance that is not in train, and any call after the second;
 2. runs the step-3 guards on the worktree as it stands;
-3. runs the candidate on that task with the bench runner, with one seed;
+3. runs the candidate on that task with the bench runner, with one seed. Its grading goes ahead of every other phase on the grading instances (§6.2);
 4. returns the score, the stop reason, the step count, the cost and the last tool error.
 
 **Limits.** These are config values. Our adapter enforces 60 steps, $3 of GLM and 30 minutes per hypothesis; the agent also stops after 3 format errors in a row, and each command times out after 120 s.
@@ -874,7 +884,7 @@ The implementer is mini-swe-agent's `DefaultAgent` (`mini-swe-agent==2.4.6`, MIT
 **Third-party agent framework (RSI only)**
 
 - `mini-swe-agent==2.4.6` (MIT) is pinned exactly, in a separate `rsi` dependency group. The adapter relies on its message format and helper functions, so every upgrade is a deliberate PR. 2.4.6 was released on 2026-07-23, so it satisfies the lock's `exclude-newer` cutoff of 2026-10-11.
-- A `[tool.uv] exclude-dependencies` entry scoped to mini-swe-agent drops its unused heavy dependencies: `litellm`, `openai`, `datasets`, `textual` and `prompt-toolkit`. The group then adds about 12 small packages, and the classes we use never import the excluded ones. This also keeps litellm, whose 1.82.7 and 1.82.8 releases were compromised in March 2026, out of the process that holds the API key.
+- A `[tool.uv] exclude-dependencies` entry scoped to mini-swe-agent drops its unused heavy dependencies: `litellm`, `openai`, `datasets`, `textual` and `prompt-toolkit`. The group then adds about 12 small packages, and the classes we use never import the excluded ones. This also keeps litellm, whose 1.82.7 and 1.82.8 releases were compromised in March 2026, out of the process that holds the API key, except while the §8.8 fallback is in use.
 - `make setup` and CI install every group. The organizers' plain `uv sync --locked` leaves the `rsi` group out.
 - An import-linter contract lets only `goaly.rsi` import `minisweagent` (§3.1).
 - Before the first import, goaly sets `MSWEA_SILENT_STARTUP=1` and points `MSWEA_GLOBAL_CONFIG_DIR` at an empty directory it owns. mini-swe-agent then neither prints a banner nor loads a `.env` file into the environment. Its logger is routed into our JSON logs.
@@ -907,9 +917,9 @@ The implementer is mini-swe-agent's `DefaultAgent` (`mini-swe-agent==2.4.6`, MIT
 | SWE on hold: the PDF's "gains on more than one benchmark" is at risk (§2) | Nothing within this deadline; the report states the gap plainly. The SWE design stays in this document and the RSI machinery has no benchmark-specific code, so the lane can resume without a redesign |
 | Tight schedule: 21 hours from 2026-10-15 03:00 UTC to the deadline | One active lane. Contracts come first, then component PRs in parallel; stacked PRs keep review from blocking work. RSI must be running by about 16:00 UTC, and the plan counts on 1 round, with a second as upside (§13) |
 | The implementer writes outside its pack: bash can write anywhere | The Docker sandbox with read-only mounts prevents it (§8.8), and the guards and checksums detect it. A unit-tested function builds the mount arguments, and an integration test asserts the read-only refusal |
-| Candidate pack code runs on the host during smoke tests, screening and validation | The static AST allowlist (§8.5) checks it before every run, and the checksums are verified before every evaluation |
+| Candidate pack code runs on the host during smoke tests, screening and validation | The static AST allowlist (§8.5) checks it before every run, and the checksums are verified before every evaluation. The runner hands it only a client bound to purpose `exec`, and it cannot import the key or the client modules (§5.1) |
 | mini-swe-agent changes or breaks | An exact pin. The adapter uses only `DefaultAgent`, `DockerEnvironment`, its exceptions and two helper functions. Vendoring them, about 450 lines under MIT, is the fallback |
-| T03's client is late for the implementer | The fallback model, a small `LitellmModel` subclass that reads the gateway's cost header (§8.8). Switching back to core's client later changes one class |
+| T03's client is late for the implementer | The fallback model, a small `LitellmModel` subclass that reads the gateway's cost header (§8.8). While it is used, litellm runs in the process that holds the key, with a vetted version pinned, and core neither sees the GLM calls nor enforces the lane's GLM share. Switching back to core's client later changes one class |
 | A lane hangs or crashes during the unattended run | Heartbeats, bounded restarts with backoff, and resuming from the ledger (§8.7). A notification when recovery fails |
 | The Coder workspace stops during the run | The project lead manages its auto-stop. Running `goaly rsi run` again after a restart resumes every lane from the ledger |
 | GitHub or ntfy.sh is down | Retries, and nothing in the loop waits for them. Notifications are also logged and listed in the next results PR |
