@@ -22,10 +22,12 @@ from goaly.contracts.errors import EnvironmentFailure
 from goaly.contracts.gen.environment_pb2 import ShellResult, SqlResult
 from goaly.contracts.gen.task_pb2 import (
     GRADE_STATUS_GRADED,
+    SPLIT_EXTERNAL,
     SPLIT_TRAIN,
     SPLIT_VAL,
-    BirdPrediction,
-    BirdTaskInput,
+    EffiSqlGrade,
+    EffiSqlPrediction,
+    EffiSqlTaskInput,
     Grade,
     Prediction,
     Split,
@@ -162,8 +164,30 @@ class EchoTool:
         return ToolResult(content=args.text)
 
 
+class SubmitArgs(BaseModel):
+    """SubmitTool's arguments."""
+
+    sql: str
+
+
+class SubmitTool:
+    """A Tool that ends the episode by submitting its ``sql`` argument as an Effi-SQL answer.
+
+    It works in any environment. Like any tool that submits, it returns a result with
+    ``submission`` set.
+    """
+
+    name = "submit"
+    description = "Submit the optimized query as the answer."
+    args_model = SubmitArgs
+
+    async def run(self, args: SubmitArgs, env: Environment) -> ToolResult:
+        submission = Prediction(effisql=EffiSqlPrediction(sql=args.sql))
+        return ToolResult(content="Submitted.", submission=submission)
+
+
 class DoNothingPolicy:
-    """A Policy that submits the do-nothing answer: BIRD's issue_sql unchanged, or no SWE patch.
+    """A Policy that submits the do-nothing answer: the base query unchanged, or no SWE patch.
 
     It works in any environment and with any context. ``tasks`` records each task it solved.
     Like every policy, it leaves the prediction's ``instance_id`` to the runner.
@@ -176,21 +200,21 @@ class DoNothingPolicy:
         self.tasks.append(task)
         if task.HasField("swe"):
             return Prediction(swe=SwePrediction())
-        return Prediction(bird=BirdPrediction(sqls=task.bird.issue_sql))
+        return Prediction(effisql=EffiSqlPrediction(sql=task.effisql.base_sql))
 
 
 @dataclass(frozen=True)
 class ToyInstance:
     """A ToyBenchmark task: the benchmark's own record, so it holds the gold answer.
 
-    Being a frozen dataclass with an ``instance_id``, it satisfies the Instance Protocol.
+    A task from an organizer task file has no gold answer, so its ``gold_sql`` is None. Being a
+    frozen dataclass with an ``instance_id``, a ToyInstance satisfies the Instance Protocol.
     """
 
     instance_id: str
     split: Split.ValueType
-    query: str
-    issue_sql: str
-    gold_sql: str
+    base_sql: str
+    gold_sql: str | None
 
 
 # What a toy task's base query returns in its solving environment: one row, one column.
@@ -201,48 +225,57 @@ TOY_INSTANCES = (
     ToyInstance(
         instance_id="toy-1",
         split=SPLIT_TRAIN,
-        query="How many users are there?",
-        issue_sql="SELECT count(*) FROM user",
-        gold_sql="SELECT count(*) FROM users",
+        base_sql="SELECT count(*) FROM users WHERE id IN (SELECT id FROM users)",
+        gold_sql="SELECT count(id) FROM users",  # id is the key, so it is never NULL.
     ),
-    ToyInstance(  # Its issue SQL is already right, so the do-nothing answer passes.
+    ToyInstance(  # Its base query is already as fast as it gets.
         instance_id="toy-2",
         split=SPLIT_TRAIN,
-        query="What are the users' names?",
-        issue_sql="SELECT name FROM users",
-        gold_sql="SELECT name FROM users",
+        base_sql="SELECT count(*) FROM orders",
+        gold_sql="SELECT count(*) FROM orders",
     ),
     ToyInstance(
         instance_id="toy-3",
         split=SPLIT_VAL,
-        query="Who joined first?",
-        issue_sql="SELECT min(name) FROM users",
-        gold_sql="SELECT name FROM users ORDER BY id LIMIT 1",
+        base_sql="SELECT count(*) FROM (SELECT DISTINCT user_id FROM orders) AS buyers",
+        gold_sql="SELECT count(DISTINCT user_id) FROM orders",
     ),
 )
 
 
 class ToyBenchmark:
-    """A Benchmark of BIRD-style SQL tasks held in memory, each solved in a FakeSqlEnvironment.
+    """A Benchmark of Effi-SQL-style tasks held in memory, each solved in a FakeSqlEnvironment.
 
-    A task's solving environment answers only the task's base query (its issue SQL), with
-    TOY_BASE_RESULT, so it reveals nothing of the gold answer, which only ``grade`` uses. A
-    prediction is correct if its last statement is the gold SQL. ``environments`` records each
-    environment provisioned.
+    ``external`` stands in for an organizer task file: ``load_instances(SPLIT_EXTERNAL)``
+    returns it, or raises ValueError if there is none. A task's solving environment answers
+    only the task's base query, with TOY_BASE_RESULT, so it reveals nothing of the gold rewrite,
+    which only ``grade`` uses. ``grade`` times nothing: the gold rewrite earns R-VES's top credit
+    of 1, the base query unchanged earns 0.5, as a speedup of 1 does, and any other query does
+    not match. ``environments`` records each environment provisioned.
     """
 
     name = "toy"
 
-    def __init__(self, instances: Sequence[ToyInstance] = TOY_INSTANCES) -> None:
+    def __init__(
+        self,
+        instances: Sequence[ToyInstance] = TOY_INSTANCES,
+        *,
+        external: Sequence[ToyInstance] | None = None,
+    ) -> None:
         self.instances = tuple(instances)
+        self.external = None if external is None else tuple(external)
         self.environments: list[FakeSqlEnvironment] = []
 
     def load_instances(self, split: Split.ValueType) -> list[ToyInstance]:
-        return [inst for inst in self.instances if inst.split == split]
+        if split != SPLIT_EXTERNAL:
+            return [inst for inst in self.instances if inst.split == split]
+        if self.external is None:
+            raise ValueError("this toy benchmark was constructed without a task file")
+        return list(self.external)
 
     @asynccontextmanager
     async def provision(self, inst: ToyInstance) -> AsyncIterator[FakeSqlEnvironment]:
-        env = FakeSqlEnvironment({inst.issue_sql: TOY_BASE_RESULT})
+        env = FakeSqlEnvironment({inst.base_sql: TOY_BASE_RESULT})
         self.environments.append(env)
         try:
             yield env
@@ -250,24 +283,27 @@ class ToyBenchmark:
             await env.close()
 
     def agent_input(self, inst: ToyInstance) -> TaskInput:
-        bird = BirdTaskInput(db_id="toy", query=inst.query, issue_sql=[inst.issue_sql])
-        return TaskInput(bird=bird)  # No instance ID: the agent sees no ID (Instance).
+        # No instance ID and no gold: the agent sees only what Instance and agent_input allow.
+        return TaskInput(effisql=EffiSqlTaskInput(db="toy", base_sql=inst.base_sql))
 
     async def grade(self, inst: ToyInstance, prediction: Prediction) -> Grade:
-        sqls = prediction.bird.sqls
-        correct = len(sqls) > 0 and sqls[-1] == inst.gold_sql
+        sql = prediction.effisql.sql
+        if sql == inst.gold_sql:
+            credit = 1.0
+        elif sql == inst.base_sql:
+            credit = 0.5
+        else:
+            credit = 0.0
+        matched = credit > 0
         return Grade(
             instance_id=inst.instance_id,
-            score=float(correct),
-            correct=correct,
+            score=credit,
+            correct=matched,
             status=GRADE_STATUS_GRADED,
+            effisql=EffiSqlGrade(matched=matched, credit=credit),
         )
 
     def to_official(self, inst: ToyInstance, prediction: Prediction) -> dict[str, JsonValue]:
         # A prediction with no branch, as after a crash, gets the empty answer: the base query.
-        return {
-            "instance_id": inst.instance_id,
-            "pred_sqls": list(prediction.bird.sqls)
-            if prediction.HasField("bird")
-            else [inst.issue_sql],
-        }
+        sql = prediction.effisql.sql if prediction.HasField("effisql") else inst.base_sql
+        return {"instance_id": inst.instance_id, "sql": sql}

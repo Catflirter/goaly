@@ -37,10 +37,12 @@ from goaly.contracts.errors import EnvironmentFailure
 from goaly.contracts.gen.environment_pb2 import ShellResult, SqlResult
 from goaly.contracts.gen.task_pb2 import (
     GRADE_STATUS_GRADED,
+    SPLIT_EXTERNAL,
     SPLIT_TRAIN,
     SPLIT_VAL,
-    BirdPrediction,
-    BirdTaskInput,
+    EffiSqlGrade,
+    EffiSqlPrediction,
+    EffiSqlTaskInput,
     Grade,
     Prediction,
     SwePrediction,
@@ -70,6 +72,8 @@ from tests.fakes import (
     FakeEnvironment,
     FakeShellEnvironment,
     FakeSqlEnvironment,
+    SubmitArgs,
+    SubmitTool,
     ToyBenchmark,
     ToyInstance,
 )
@@ -553,19 +557,30 @@ def test_echo_tool_answers_with_its_text_in_any_environment() -> None:
     assert (sql_tool.name, sql_tool.description) == ("echo", "Reply with the given text.")
 
 
+def test_submit_tool_ends_the_episode_with_its_submission() -> None:
+    tool: Tool[SubmitArgs, SqlEnvironment] = SubmitTool()
+    args = tool.args_model.model_validate_json('{"sql": "SELECT 1"}')
+
+    result = asyncio.run(tool.run(args, FakeSqlEnvironment()))
+
+    assert result == ToolResult(
+        content="Submitted.", submission=Prediction(effisql=EffiSqlPrediction(sql="SELECT 1"))
+    )
+
+
 class StandInContext:
     """Stands in for harness core's AgentContext, which contracts cannot import."""
 
 
-def test_do_nothing_policy_submits_the_issue_sql_of_a_bird_task() -> None:
+def test_do_nothing_policy_submits_the_base_query_of_an_effisql_task() -> None:
     fake = DoNothingPolicy()
     # EnvT and CtxT are contravariant, so a policy for any environment and context fits here.
     policy: Policy[SqlEnvironment, StandInContext] = fake
-    task = TaskInput(bird=BirdTaskInput(issue_sql=["SELECT 1", "SELECT 2"]))
+    task = TaskInput(effisql=EffiSqlTaskInput(db="tpch", base_sql="SELECT 1"))
 
     prediction = asyncio.run(policy.solve(task, FakeSqlEnvironment(), StandInContext()))
 
-    assert prediction == Prediction(bird=BirdPrediction(sqls=["SELECT 1", "SELECT 2"]))
+    assert prediction == Prediction(effisql=EffiSqlPrediction(sql="SELECT 1"))
     assert fake.tasks == [task]
 
 
@@ -597,15 +612,28 @@ def test_toy_benchmark_loads_the_instances_of_a_split() -> None:
     assert benchmark.name == "toy"
 
 
+def test_toy_benchmark_loads_the_organizers_tasks_for_the_external_split() -> None:
+    external = [ToyInstance("ext-1", SPLIT_EXTERNAL, base_sql="SELECT 1", gold_sql=None)]
+    benchmark: Benchmark[ToyInstance, SqlEnvironment] = ToyBenchmark(external=external)
+
+    assert benchmark.load_instances(SPLIT_EXTERNAL) == external
+
+
+def test_toy_benchmark_without_a_task_file_refuses_the_external_split() -> None:
+    benchmark: Benchmark[ToyInstance, SqlEnvironment] = ToyBenchmark()
+
+    with pytest.raises(ValueError, match="without a task file"):
+        benchmark.load_instances(SPLIT_EXTERNAL)
+
+
 def test_toy_benchmark_shows_the_agent_no_gold_answer() -> None:
     benchmark: Benchmark[ToyInstance, SqlEnvironment] = ToyBenchmark()
     inst = TOY_INSTANCES[0]
 
     task = benchmark.agent_input(inst)
 
-    assert task == TaskInput(
-        bird=BirdTaskInput(db_id="toy", query=inst.query, issue_sql=[inst.issue_sql])
-    )
+    assert task == TaskInput(effisql=EffiSqlTaskInput(db="toy", base_sql=inst.base_sql))
+    assert inst.gold_sql is not None
     assert inst.gold_sql not in to_json_line(task)
 
 
@@ -613,20 +641,22 @@ def test_toy_benchmark_solves_in_an_environment_that_reveals_no_gold() -> None:
     fake = ToyBenchmark()
     benchmark: Benchmark[ToyInstance, SqlEnvironment] = fake
     inst = TOY_INSTANCES[0]
+    gold_sql = inst.gold_sql
+    assert gold_sql is not None
 
     async def scenario() -> tuple[SqlResult, SqlResult]:
         async with benchmark.provision(inst) as env:
             return (
-                await env.execute(inst.issue_sql, timeout_s=1.0),
-                await env.execute(inst.gold_sql, timeout_s=1.0),
+                await env.execute(inst.base_sql, timeout_s=1.0),
+                await env.execute(gold_sql, timeout_s=1.0),
             )
 
     base, gold = asyncio.run(scenario())
 
     assert base == TOY_BASE_RESULT
     # The gold answer gets what any query the environment does not know gets.
-    assert gold == SqlResult(error=f"no canned result for {inst.gold_sql!r}")
-    assert list(fake.environments[0].results) == [inst.issue_sql]
+    assert gold == SqlResult(error=f"no canned result for {gold_sql!r}")
+    assert list(fake.environments[0].results) == [inst.base_sql]
     assert [env.closed for env in fake.environments] == [True]
 
 
@@ -657,32 +687,36 @@ def test_toy_benchmark_closes_the_environment_when_the_task_is_cancelled() -> No
 
 
 @pytest.mark.parametrize(
-    ("sqls", "correct"),
+    ("sql", "credit"),
     [
-        (["SELECT count(*) FROM users"], True),
-        (["SELECT 1", "SELECT count(*) FROM users"], True),
-        (["SELECT count(*) FROM users", "SELECT 1"], False),
-        ([], False),
+        ("SELECT count(id) FROM users", 1.0),  # The gold rewrite.
+        ("SELECT count(*) FROM users WHERE id IN (SELECT id FROM users)", 0.5),  # The base query.
+        ("SELECT 3", 0.0),  # A query that does not match.
     ],
 )
-def test_toy_benchmark_grades_the_last_statement(sqls: list[str], correct: bool) -> None:
+def test_toy_benchmark_credits_a_prediction_as_r_ves_does(sql: str, credit: float) -> None:
     benchmark: Benchmark[ToyInstance, SqlEnvironment] = ToyBenchmark()
-    prediction = Prediction(instance_id="toy-1", bird=BirdPrediction(sqls=sqls))
+    prediction = Prediction(instance_id="toy-1", effisql=EffiSqlPrediction(sql=sql))
 
     grade = asyncio.run(benchmark.grade(TOY_INSTANCES[0], prediction))
 
+    matched = credit > 0
     assert grade == Grade(
-        instance_id="toy-1", score=float(correct), correct=correct, status=GRADE_STATUS_GRADED
+        instance_id="toy-1",
+        score=credit,
+        correct=matched,
+        status=GRADE_STATUS_GRADED,
+        effisql=EffiSqlGrade(matched=matched, credit=credit),
     )
 
 
-def test_toy_benchmark_writes_the_official_bird_format() -> None:
+def test_toy_benchmark_writes_its_official_record() -> None:
     benchmark: Benchmark[ToyInstance, SqlEnvironment] = ToyBenchmark()
-    prediction = Prediction(instance_id="toy-1", bird=BirdPrediction(sqls=["SELECT 1"]))
+    prediction = Prediction(instance_id="toy-1", effisql=EffiSqlPrediction(sql="SELECT 1"))
 
     record = benchmark.to_official(TOY_INSTANCES[0], prediction)
 
-    assert json.loads(json.dumps(record)) == {"instance_id": "toy-1", "pred_sqls": ["SELECT 1"]}
+    assert json.loads(json.dumps(record)) == {"instance_id": "toy-1", "sql": "SELECT 1"}
 
 
 def test_toy_benchmark_writes_the_empty_answer_for_a_prediction_with_no_branch() -> None:
@@ -691,7 +725,7 @@ def test_toy_benchmark_writes_the_empty_answer_for_a_prediction_with_no_branch()
 
     record = benchmark.to_official(inst, Prediction())  # As after a crash.
 
-    assert record == {"instance_id": "toy-1", "pred_sqls": [inst.issue_sql]}
+    assert record == {"instance_id": "toy-1", "sql": inst.base_sql}
 
 
 async def solve_and_grade[InstanceT: Instance, EnvT: Environment, CtxT](
@@ -716,8 +750,12 @@ def test_the_fakes_run_a_split_end_to_end() -> None:
 
     results = asyncio.run(run_split())
 
+    # The do-nothing answer matches, but only toy-2's base query is already the fast one.
     assert [
-        (prediction.instance_id, grade.instance_id, grade.correct) for prediction, grade in results
-    ] == [("toy-1", "toy-1", False), ("toy-2", "toy-2", True)]
-    assert [task.bird.query for task in policy.tasks] == [inst.query for inst in TOY_INSTANCES[:2]]
+        (prediction.instance_id, grade.instance_id, grade.correct, grade.score)
+        for prediction, grade in results
+    ] == [("toy-1", "toy-1", True, 0.5), ("toy-2", "toy-2", True, 1.0)]
+    assert [task.effisql.base_sql for task in policy.tasks] == [
+        inst.base_sql for inst in TOY_INSTANCES[:2]
+    ]
     assert [env.closed for env in benchmark.environments] == [True, True]

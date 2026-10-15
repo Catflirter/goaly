@@ -142,9 +142,12 @@ class Tool[ArgsT: BaseModel, EnvT: Environment](Protocol):
     async def run(self, args: ArgsT, env: EnvT) -> ToolResult:
         """Run the tool on validated ``args`` in ``env``.
 
-        Set ``content``, the text the model sees, and ``is_error``; the executor fills in the
-        other fields. A tool may raise. The executor re-raises EnvironmentFailure and turns every
-        other exception into an error result.
+        Set ``content``, the text the model sees. A tool ends the episode by returning a result
+        with ``submission`` set: the agent loop stops, and the policy decides whether to return
+        it. The executor fills in the other fields. A statement or command that ran and failed is
+        a normal result; a tool that cannot do its job raises instead. The executor re-raises
+        EnvironmentFailure and turns every other exception into an error result, with
+        ``is_error`` set.
         """
 
 
@@ -202,7 +205,7 @@ class Benchmark[InstanceT: Instance, EnvT: Environment](Protocol):
 
     @property
     def name(self) -> str:
-        """The adapter's name, as --bench and RunManifest.benchmark give it, e.g. "birdcritic"."""
+        """The adapter's name, as --bench and RunManifest.benchmark give it, e.g. "effisql"."""
 
     def load_instances(self, split: Split.ValueType) -> Sequence[InstanceT]:
         """Return the instances in ``split``.
