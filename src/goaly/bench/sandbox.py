@@ -16,10 +16,14 @@ The builder lives in goaly.bench, so that goaly run can use it without loading g
 Every container runs as the host user with ``--network=host``, the only mode that works on this
 machine (spec §1.3). Host networking would put it next to every service on the host's loopback,
 some of them unauthenticated, so every container also runs under :data:`SECCOMP_PROFILE`:
-Docker's default seccomp profile, with ``socket()`` also refused for IP, netlink and packet
-sockets and the 32-bit ``socketcall`` refused, which leaves no way to open a TCP or UDP socket
-(V28). Unix sockets still work: the solve container reaches the proxy and PostgreSQL through
-socket files in the directories mounted into it. What remains is the host's abstract Unix socket
+Docker's default seccomp profile, with ``socket()`` allowed for Unix sockets alone, which leaves
+no way to open a TCP or UDP socket (V28). The one rule that allows ``socket()`` matches AF_UNIX
+exactly on the low 32 bits of the family, which is all the kernel reads of it, so no family with
+high bits set slips through. On x86_64 the profile has no 32-bit subarchitecture, unlike
+Docker's, so an i386 or x32 syscall, such as the ``socketcall`` that no rule here covers, stops
+the process instead of running. Unix sockets
+still work: the solve container reaches the proxy and PostgreSQL through socket files in the
+directories mounted into it. What remains is the host's abstract Unix socket
 namespace, which a shared network namespace shares too; nothing on this machine listens there.
 
 Each container gets a read-only root, a tmpfs ``/tmp``, no capabilities, ``no-new-privileges``,
@@ -81,8 +85,8 @@ IMAGE_REPOSITORY = "goaly-rsi-sandbox"
 DOCKERFILE = Path("docker/rsi-sandbox.Dockerfile")  # Relative to the repository root.
 LABEL_SOLVE = "goaly.bench.solve"  # "1" on every solve container.
 LABEL_RUN = "goaly.bench.run"
-# Docker's default profile with IP, netlink and packet sockets refused too (V28). It is derived from
-# Docker 29.7.1's, and tests/bench/test_seccomp.py checks it against that one.
+# Docker's default profile with Unix sockets alone and no 32-bit syscalls on x86_64 (V28). It is
+# derived from Docker 29.7.1's, and tests/bench/test_seccomp.py checks it against that one.
 SECCOMP_PROFILE = Path(__file__).with_name("sandbox-seccomp.json")
 # The host-only files of a run directory (V27): a directory that holds one is never the solve
 # directory.

@@ -489,6 +489,19 @@ class PgSession:
             raise GraderError("EXPLAIN ANALYZE gave no Execution Time")
         return float(value)
 
+    def column_types(self, sql: str) -> list[str]:
+        """Return the type name of each column ``sql`` returns, without fetching a row."""
+        with self._statement():
+            cursor = self._conn.cursor()
+            # Only the fixed wrapper is added to the query, which runs as one statement.
+            cursor.execute(f"SELECT * FROM ({statement_body(sql)}) AS q LIMIT 0", binary=True)  # noqa: S608
+            description = cursor.description or []
+        names = []
+        for column in description:
+            info = self._conn.adapters.types.get(column.type_code)
+            names.append(info.name if info is not None else "unknown")
+        return names
+
     def plan(self, sql: str) -> dict[str, Any]:
         """Return ``EXPLAIN (FORMAT JSON)``'s document for ``sql``: planned, never run."""
         return self._explain("FORMAT JSON", sql)

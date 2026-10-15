@@ -35,12 +35,6 @@ def pytest_collection_modifyitems(config: pytest.Config, items: list[pytest.Item
             item.add_marker(skip_integration)
 
 
-@pytest.fixture(scope="session")
-def anyio_backend() -> str:
-    """Run every test marked ``anyio`` once, on asyncio: each process runs one asyncio loop."""
-    return "asyncio"
-
-
 @pytest.fixture(autouse=True)
 def _isolate_from_real_secrets(
     request: pytest.FixtureRequest, monkeypatch: pytest.MonkeyPatch, tmp_path: Path
