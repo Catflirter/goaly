@@ -58,6 +58,7 @@ __all__ = [
     "read_golden_record",
     "run_command",
     "tpch_ddl",
+    "wait_until_ready",
     "without_trailing_delimiter",
 ]
 
@@ -391,7 +392,7 @@ def _build_server(config: PgEnvConfig, password: SecretStr, pgdata: Path) -> Ite
         pg_containers.start(spec)
         try:
             connect = connector(config.host, config.build_port, password)
-            _wait_until_ready(connect, name)
+            wait_until_ready(connect, name)
             yield connect
             with connect("postgres") as conn:
                 conn.execute("CHECKPOINT")
@@ -419,7 +420,8 @@ def connector(host: str, port: int, password: SecretStr, *, user: str = ADMIN_RO
     return connect
 
 
-def _wait_until_ready(connect: Connect, container: str) -> None:
+def wait_until_ready(connect: Connect, container: str) -> None:
+    """Wait until the server in ``container`` accepts connections; fail if the container stops."""
     deadline = time.monotonic() + _READY_TIMEOUT_S
     while True:
         try:

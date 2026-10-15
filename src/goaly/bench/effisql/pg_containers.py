@@ -6,24 +6,31 @@ it writes stays ours to copy. Only containers named with :data:`CONTAINER_PREFIX
 started, stopped or removed here; no other container on this machine is touched.
 """
 
+import hashlib
+import json
 import re
 import shutil
 import subprocess
 from collections.abc import Mapping
 from dataclasses import dataclass, field
 from pathlib import Path
+from typing import Literal
 
 __all__ = [
     "CONTAINER_PREFIX",
     "LABEL",
     "PGDATA",
     "SHM_SIZE",
+    "SPEC_LABEL",
     "ContainerError",
     "ContainerSpec",
     "Mount",
+    "ensure",
+    "inspect",
     "logs",
     "remove",
     "run_args",
+    "spec_digest",
     "start",
     "state",
     "stop",
@@ -31,6 +38,7 @@ __all__ = [
 
 CONTAINER_PREFIX = "goaly-effisql-"
 LABEL = "goaly.component=effisql-postgres"
+SPEC_LABEL = "goaly.spec"  # A digest of the run arguments, so a changed spec is noticed.
 PGDATA = "/var/lib/postgresql/data"  # Where the postgres image keeps its data directory.
 # The official TPC-H container sets no --shm-size, so Docker's default applies. We pin that
 # default, so a different Docker cannot change the shared memory that parallel queries use.
@@ -73,6 +81,17 @@ class ContainerSpec:
 
 def run_args(spec: ContainerSpec) -> list[str]:
     """Return the ``docker run`` command line that starts the server ``spec`` describes."""
+    args = _run_args(spec)
+    return [*args[:-5], "--label", f"{SPEC_LABEL}={spec_digest(spec)}", *args[-5:]]
+
+
+def spec_digest(spec: ContainerSpec) -> str:
+    """A short digest of everything in ``spec`` that shapes the server."""
+    encoded = json.dumps(_run_args(spec)).encode()
+    return hashlib.sha256(encoded).hexdigest()[:16]
+
+
+def _run_args(spec: ContainerSpec) -> list[str]:
     _check_name(spec.name)
     args = ["docker", "run", "--detach", "--name", spec.name, "--network=host"]
     args += ["--shm-size", SHM_SIZE, "--user", spec.user, "--label", LABEL]
@@ -95,12 +114,49 @@ def start(spec: ContainerSpec) -> None:
     _docker(run_args(spec)[1:])
 
 
+def ensure(
+    spec: ContainerSpec, *, stop_timeout_s: int = 600
+) -> Literal["created", "started", "running", "replaced"]:
+    """Make the container ``spec`` describes run, and say what that took. Idempotent.
+
+    A matching container that runs is left alone, and one that stopped is started again, so
+    its data directory is reused. A container whose spec changed is shut down cleanly and
+    replaced; the data directory, a bind mount, survives.
+    """
+    current = state(spec.name)
+    if current is None:
+        start(spec)
+        return "created"
+    inspected = _docker(
+        [
+            "container",
+            "inspect",
+            "--format",
+            f'{{{{index .Config.Labels "{SPEC_LABEL}"}}}}',
+            spec.name,
+        ]
+    )
+    if inspected.stdout.strip() == spec_digest(spec):
+        if current == "running":
+            return "running"
+        _docker(["start", spec.name])
+        return "started"
+    if current == "running":
+        _docker(["stop", "--time", str(stop_timeout_s), spec.name])
+    _docker(["rm", spec.name])
+    start(spec)
+    return "replaced"
+
+
 def state(name: str) -> str | None:
     """Return the container's state, such as "running" or "exited", or None if it is absent."""
+    return inspect(name, "{{.State.Status}}")
+
+
+def inspect(name: str, template: str) -> str | None:
+    """Return ``docker inspect``'s Go ``template`` for the container, or None if it is absent."""
     _check_name(name)
-    completed = _docker(
-        ["container", "inspect", "--format", "{{.State.Status}}", name], check=False
-    )
+    completed = _docker(["container", "inspect", "--format", template, name], check=False)
     if completed.returncode != 0:
         if "no such container" in completed.stderr.lower():
             return None
