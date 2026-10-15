@@ -2,6 +2,7 @@
 
 import asyncio
 import json
+import re
 import threading
 import time
 from collections.abc import AsyncIterator
@@ -471,8 +472,8 @@ async def test_no_lesson_prompt_ever_holds_a_val_task_id(world: World, llm: LlmC
     assert len(lessons) >= 5
     for body in lessons:
         text = json.dumps(body)
-        for val_id in VAL:
-            assert val_id not in text
+        for val_id in VAL:  # As a whole token: random experiment IDs may hold the digits.
+            assert not re.search(rf"(?<![0-9A-Za-z]){val_id}(?![0-9A-Za-z])", text), val_id
 
 
 async def test_infrastructure_failures_in_the_reference_never_help_a_candidate(

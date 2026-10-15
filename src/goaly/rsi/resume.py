@@ -89,14 +89,13 @@ def reconcile_best(
         workspace.set_best(lane, recorded, expected=None)
         _logger.warning("set the missing best tag to %s", recorded)
         return recorded
-    # The tag is the truth: an experiment it marks passed its confirmation and became the best,
-    # whatever the ledger says of it, pending or even aborted after a failed write.
+    # The tag is the truth: a pending experiment it marks passed its confirmation and became the
+    # best, its acceptance unrecorded. The round never aborts an experiment once the tag is on it,
+    # and a decided record never changes (the ledger), so no other record can be under the tag.
     confirmed = [
         record
-        for record in ledger.latest_experiments(lane).values()
-        if record.candidate_commit == tag
-        and record.HasField("confirmation")
-        and record.decision != DECISION_ACCEPTED
+        for record in ledger.pending_experiments(lane)
+        if record.candidate_commit == tag and record.HasField("confirmation")
     ]
     if confirmed:
         record = confirmed[-1]

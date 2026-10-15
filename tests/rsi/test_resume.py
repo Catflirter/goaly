@@ -141,15 +141,16 @@ def test_remove_worktrees_clears_the_lanes_leftovers(world: World) -> None:
     assert "rsi/effisql/e1" in git(world.repo, "branch", "--list", "rsi/*")
 
 
-def test_an_aborted_record_under_the_tag_is_repaired(world: World) -> None:
-    # A failed acceptance write once let the round abort the best; the tag is the truth.
+def test_a_decided_record_under_the_tag_is_an_error(world: World) -> None:
+    # A decided record never changes, and the round never aborts once the tag moved, so a tag
+    # on an aborted candidate is no crash's doing.
     candidate = commit(world, "candidate")
     entry = record(world, "e1", candidate_commit=candidate, confirmation=PhaseResult(delta=0.1))
     entry.decision = DECISION_ABORTED
     world.ledger.record_experiment(entry)
     world.workspace.set_best(LANE_EFFISQL, candidate, expected=world.v0)
-    assert reconcile(world) == candidate
-    assert world.ledger.latest_experiments(LANE_EFFISQL)["e1"].decision == DECISION_ACCEPTED
+    with pytest.raises(LaneStateError):
+        reconcile(world)
 
 
 def test_outranks_do_not_count_toward_the_requeue_cap(world: World) -> None:
