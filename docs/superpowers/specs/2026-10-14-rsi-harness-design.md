@@ -103,7 +103,8 @@ src/goaly/
     gen/             Python code generated from proto/ (committed; CI checks it is up to date)
     interfaces.py    Environment, SqlEnvironment, ShellEnvironment, Policy, Tool, Benchmark
   harness/
-    core/            llm.py, tools.py, agent.py, policy.py, context.py, trajectory.py, config.py
+    core/            llm.py, llm_proxy.py, tools.py, agent.py, policy.py, context.py, trajectory.py,
+                     config.py
     packs/
       effisql/       prompt.md, skills/, tools.py, policy.py, config.yaml
       swefficiency/  (same files; on hold)
@@ -111,16 +112,17 @@ src/goaly/
     effisql/         data.py, env.py, grader.py, adapter.py
     swefficiency/    data.py, env.py, grader.py, adapter.py (on hold)
     runner.py, metrics.py, manifest.py
+    sandbox.py       the shared container builder: the isolated solve phase (§6.1) and the implementer (§8.8)
     splits/          split ID lists
   rsi/
-    ledger.py, workspace.py, guards.py, sandbox.py, analyst.py, decide.py, lane.py,
+    ledger.py, workspace.py, guards.py, analyst.py, decide.py, lane.py,
     supervisor.py, results.py, notify.py
     implementer/     mini-swe-agent adapter: model.py (GLM through core's client), environment.py
                      (the sandbox as a mini-swe-agent environment, goaly-smoke), run.py (run, commit,
                      record), implementer.yaml (prompt and limits)
   cli.py             `goaly run …` and `goaly rsi …`
 tests/               mirrors src/; tests that need Docker, a database or the real API are marked `integration`
-docker/rsi-sandbox.Dockerfile     the implementer's sandbox image (§8.8)
+docker/rsi-sandbox.Dockerfile     the sandbox image, for the solve phase (§6.1) and the implementer (§8.8)
 docs/superpowers/specs/           design docs (the Linear tickets serve as the implementation plan)
 docs/results/                     experiment results
 runs/                             run artifacts (not committed)
@@ -373,9 +375,9 @@ These are the file's own timings. Some come from plans recorded at SF10, includi
 - Executor calls (purpose `exec`) may use only `qwen3.6-35b-a3b`, so at runtime the harness calls nothing else.
 - RSI calls (purposes `rsi-*`) use `glm-5.3`.
 
-A call to a model its purpose does not allow raises an error.
+A call to a model its purpose does not allow raises an error. In isolated runs, the host's LLM proxy enforces the same rule for the solve container: it forwards only the executor model (§6.1).
 
-**Who holds which client.** The runner hands the harness an LLM client bound to purpose `exec`. Harness and pack code cannot choose a purpose, and only `goaly.rsi` builds clients with `rsi-*` purposes. Pack code also may not import `settings` or the LLM client modules, nor reach private attributes such as the bound client's internals: the pack-code allowlist admits only an explicit list of `goaly.harness.core` modules and bans the known escapes (§8.5). An import-linter contract keeps those core modules from importing `settings` or the LLM client modules, so they cannot re-export the key or a client. That allowlist is a static check, not a sandbox. Pack code runs in the same process that holds the key, so these rules are defense in depth, and §12 names the residual risk.
+**Who holds which client.** The runner hands the harness an LLM client bound to purpose `exec`. Harness and pack code cannot choose a purpose, and only `goaly.rsi` builds clients with `rsi-*` purposes. Pack code also may not import `settings` or the LLM client modules, nor reach private attributes such as the bound client's internals: the pack-code allowlist admits only an explicit list of `goaly.harness.core` modules and bans the known escapes (§8.5). An import-linter contract keeps those core modules from importing `settings` or the LLM client modules, so they cannot re-export the key or a client. That allowlist is a static check, not a sandbox. In every real run, pack code runs only in the solve container (§6.1, Isolated evaluation). There the client talks to the host's proxy with a per-run dummy token, so the key never enters pack code's process; only the one-process mode, for unit tests and the toy benchmark, runs pack code next to the client's real configuration. The allowlist stays as a second layer, a static defense in depth, and §12 names the residual risk.
 
 **Model-specific handling**
 
@@ -460,6 +462,30 @@ The first option costs more tokens, although the gateway's prefix cache absorbs 
 - Built on asyncio, with separate resource pools for: LLM concurrency, the solving and grading database instances, and, for SWE (on hold), solving CPU slots and evaluation workers (at most 4).
 - An exception in one task never affects the others. Each task's result is written to disk as soon as it's done, so an interrupted run can resume.
 - Evaluations are cached by (harness content hash, task, seed).
+
+**Isolated evaluation.** The project lead decided on 2026-10-15 to isolate candidate code. The static allowlist (§8.5) kept leaking, and pack code shared a process with the API key, the LLM client and the grader. One bypass could therefore steal the key, patch the grader in memory, or call GLM. The isolation closes this structurally, and the allowlist stays as a second layer.
+
+1. **Two phases, two processes.** `goaly run` has a solve phase and a grade phase (`--phase solve|grade|all`, §6.4).
+   - The solve phase runs the pack's policy. It writes predictions, the official records, trajectories, ungraded `TaskResult`s and `llm_calls.jsonl` to the run directory.
+   - The grade phase runs on the host, as a separate process. It reads the run directory and grades with the grader role, and it never imports pack code: only `bench` and `core` are loaded. It then writes the grades into the `TaskResult`s.
+   - Every real Effi-SQL run takes the two-phase path, so v0 and candidates are measured the same way. That covers the T12 baseline, every RSI evaluation (smoke, screening, validation and confirmation) and the final runs. The one-process mode stays for unit tests and the toy benchmark only.
+2. **The solve phase runs in the sandbox container,** with `--network=host`. It is built by the same builder as the implementer's sandbox (§8.8), which lives in `goaly.bench` so that `goaly run` can use it without loading `goaly.rsi` (§3.1).
+   - Mounts: the candidate's worktree and the gold-free runtime data file, both read-only, and the run directory, writable.
+   - Environment: a per-run dummy token; `GOALY_BASE_URL`, pointing at the local proxy (below); and the agent role's PostgreSQL password. That role is `SELECT`-only on `tpch` and cannot connect to the alternate database.
+   - Never present: `~/.config`, the real API key, grader credentials and gold.
+3. **A key-injecting LLM proxy runs on the host,** in the trusted parent process.
+   - It listens on 127.0.0.1 and requires the per-run token.
+   - It forwards each request to the gateway with the real key, and passes the response back unchanged, `x-litellm-response-cost` included.
+   - It allows only the executor model, `qwen3.6-35b-a3b`. Any other model gets a 403, which is logged.
+   - Inside the container, the client is core's LLM client (T03), configured with the proxy's URL and the dummy token, so throttling and call records work as before.
+   - Files written in the container are untrusted, so the decision rules take their cost and token numbers from the proxy, which sees every call.
+4. **What this closes.** Pack code can no longer see the key, reach GLM, or touch the grader or the grading data. A bypass inside the container reaches only three things:
+   - the read-only agent role;
+   - Qwen, through the proxy;
+   - the run directory, from which the grader reads only predictions, never code.
+5. **The guards are unchanged.** Paths, checksums, the hard-coding scan, the AST allowlist and the unit-test guard still run first (§8.2 step 3).
+
+The organizers' entry point (§6.4) needs only the solve phase. Whether it also requires the container, and so Docker on their machine, is an open question for the project lead.
 
 **Seeds and reproducibility.** In this document a *seed* means one independent replicate run, not a sampler seed.
 
@@ -606,16 +632,19 @@ Each PostgreSQL instance is pinned with cpuset to both SMT siblings of its physi
 
 ### 6.4 CLI
 
-- `goaly run --bench {effisql,swefficiency} --split {train,val,heldout} --harness <path|tag> --seeds N --out runs/<id>`
-- `--instances <official-format jsonl>` runs any task file. The organizers use this for their held-out set, and the README documents it as the official entry point:
+- `goaly run --bench {effisql,swefficiency} --split {train,val,heldout} --harness <path|tag> --seeds N --phase {solve,grade,all} --out runs/<id>`
+  - `--phase solve` runs the isolated solve phase and leaves ungraded results.
+  - `--phase grade` grades a run directory on the host.
+  - `--phase all`, the default, runs both in turn (§6.1).
+- `--instances <official-format jsonl>` runs any task file. The organizers use this for their held-out set, and the README documents it as the official entry point. They need only the solve phase:
 
   ```
-  goaly run --bench effisql --instances heldout.jsonl --harness final --out predictions.jsonl
+  goaly run --bench effisql --instances heldout.jsonl --harness final --phase solve --out predictions.jsonl
   ```
 
   The output is the official prediction file: each input record plus its `prediction` field, which holds both the diff and the SQL (§3.3).
 
-  This needs only the executor API and the matching environment: a PostgreSQL database for Effi-SQL, Docker for SWE (on hold).
+  This needs only the executor API and the matching environment: a PostgreSQL database for Effi-SQL, Docker for SWE (on hold). Whether the organizers' solve phase also needs the container, and so Docker, is open (§6.1).
 
 ## 7. Data splits
 
@@ -685,7 +714,7 @@ Every external call has a timeout. Every agent run has step, cost and time limit
    - the hard-coding scan passes (§8.5);
    - the static AST allowlist passes on the candidate's pack code (§8.5). As defense in depth, it bans the known ways for pack code to reach the key or build an LLM client (§5.1);
    - the pack's unit tests pass. They run in a fresh sandbox with the whole worktree read-only, never on the host, because the agent may have written them.
-4. **Screen.** The candidate's results are compared with the best's cached results on the same tasks. No net gain means rejection. In screening, validation and confirmation alike, a candidate with any prediction flagged `hard_coded` or `literal_result` (§4.1) fails outright.
+4. **Screen.** The candidate's results are compared with the best's cached results on the same tasks. No net gain means rejection. In screening, validation and confirmation alike, a candidate with any prediction flagged `hard_coded` or `literal_result` (§4.1) fails outright. Every candidate evaluation, smoke tests included, takes the isolated two-phase path (§6.1).
    - Effi-SQL: up to 15 train failures the hypothesis targets, plus 5 train tasks the best already solves, 1 seed. Solved and failed are as defined in §6.3.
    - SWE (on hold): the 3 train tasks the hypothesis targets.
 5. **Validate.** Effi-SQL runs all 30 val tasks with 1 seed. SWE (on hold) runs all 12 val tasks with 1 seed.
@@ -740,14 +769,14 @@ A lane that stops after 4 rounds with no accepted change does steps 3–6. The s
 |---|---|
 | Editing the grader, core or contracts | **Prevented.** The implementer works in a Docker sandbox in which only its lane's two pack directories are writable. Every other write fails with a read-only filesystem error, and the sandbox cannot commit. **Detected.** A candidate whose commit touches any other path is rejected. The `bench/`, `harness/core/` and `contracts/` checksums are verified before every evaluation |
 | Reading val or held-out data, or gold answers | The sandbox mounts only the candidate's worktree, which holds split ID lists but no gold answers: benchmark files with gold answers are never committed. `goaly-smoke` accepts train tasks only. A candidate's evaluation loads only the gold-free runtime file, which holds agent-visible and grading fields; Effi-SQL grading compares against `base_sql`, so it needs no gold at all. The full dataset, gold included, is read only by the setup and exclusion tools, and by the analyst for train only |
-| Leaking or misusing the API key | The key never enters the sandbox: no host environment variable is passed in, and `~/.config` is not mounted. Model calls are made by the lane process, outside the sandbox. mini-swe-agent's local environment, which passes on the parent's environment and protects nothing, is never used for the implementer |
-| Running code the agent wrote | Agent-written tests run only in sandboxes, during implementation and in the unit-test guard. Candidate pack code also runs on the host, in the runner, during smoke tests, screening and validation, in the same process that holds the key. A static AST allowlist checks it first. It is a static check, not a sandbox: defense in depth, with the residual risk named in §12. **Allowed imports:** relative imports; the lane's own pack, `goaly.harness.packs.<lane>`; `goaly.contracts`; an explicit list of `goaly.harness.core` modules, which excludes `settings` and the LLM client modules (§5.1); pydantic; `asyncio`, for its concurrency primitives; and exactly these stdlib modules: json, re, typing, dataclasses, math, statistics, collections, itertools, functools, textwrap and enum. **Banned:** the builtins `open`, `eval`, `exec`, `compile`, `__import__`, `getattr`, `setattr`, `delattr`, `vars`, `globals`, `locals`, `dir` and `type`; the modules `importlib`, `subprocess`, `os`, `sys`, `socket`, `pathlib`, `shutil` and `ctypes`, and `__future__`, whose `annotations` feature turns every annotation into a string; every attribute name with a leading `_`, on any object, `self` included, because an exemption by name could be claimed by any parameter called `self`. The one exception is a name-mangled private attribute, `self.__x`, inside a class the pack defines, and dunders are always banned. Also banned: the attribute names `format` and `format_map`, anywhere, since they can reach attributes from inside a string; the frame and coroutine attributes `f_*`, `gi_*`, `cr_*`, `ag_*` and `tb_*`; any attribute of an imported module that is itself a module, resolved at check time, such as `dataclasses.inspect`; and attribute names that start processes, open sockets or pipes, or reach modules. Those are `sys`, `os`, `modules`, `builtins`, `__builtins__` and `subprocess`, and asyncio's `create_subprocess_exec`, `create_subprocess_shell`, `open_connection`, `open_unix_connection`, `start_server`, `start_unix_server`, `subprocess_exec`, `subprocess_shell`, `create_connection`, `create_server`, `create_unix_connection`, `create_unix_server`, `create_datagram_endpoint`, `connect_read_pipe`, `connect_write_pipe` and `sock_*`. **String evaluation is banned too:** any `str` constant in an annotation position, `typing.get_type_hints`, `typing.ForwardRef`, `pydantic.create_model`, and `TypeAdapter` called with a string, since each of them evaluates a string as code. Every attribute-name rule also applies to the keyword attributes of a `match` class pattern (`MatchClass.kwd_attrs`), such as `case object(_client=c)`, which read attributes without an attribute node. **Re-exported names:** at check time, a name imported from an allowed core module is rejected if its `__module__` is `settings` or an `llm*` module, and an import-linter contract keeps the allowed core modules from importing those modules at all |
-| The sandbox reaching other services | Host networking is the only mode that works here, so the sandbox can reach localhost and the internet. It holds no secret: PostgreSQL requires a password the sandbox never gets, the gateway is useless without the key, and the Docker socket is never mounted |
+| Leaking or misusing the API key | The key never enters a sandbox: no host environment variable is passed in, and `~/.config` is not mounted. The implementer's model calls are made by the lane process, outside the sandbox. In the solve container, the client holds only a per-run dummy token for the host's proxy, which adds the real key (§6.1). mini-swe-agent's local environment, which passes on the parent's environment and protects nothing, is never used for the implementer |
+| Running code the agent wrote | Agent-written tests run only in sandboxes, during implementation and in the unit-test guard. Candidate pack code runs only in the solve phase, inside the sandbox container (§6.1, Isolated evaluation), which holds no key, no grader credentials and no gold. A static AST allowlist checks it first, as a second layer: a static check, not a sandbox, so defense in depth, with the residual risk named in §12. **Allowed imports:** relative imports; the lane's own pack, `goaly.harness.packs.<lane>`; `goaly.contracts`; an explicit list of `goaly.harness.core` modules, which excludes `settings` and the LLM client modules (§5.1); pydantic; `asyncio`, for its concurrency primitives; and exactly these stdlib modules: json, re, typing, dataclasses, math, statistics, collections, itertools, functools, textwrap and enum. **Banned:** the builtins `open`, `eval`, `exec`, `compile`, `__import__`, `getattr`, `setattr`, `delattr`, `vars`, `globals`, `locals`, `dir`, `type`, `breakpoint`, `input` and `memoryview`; the modules `importlib`, `subprocess`, `os`, `sys`, `socket`, `pathlib`, `shutil` and `ctypes`, and `__future__`, whose `annotations` feature turns every annotation into a string; every attribute name with a leading `_`, on any object, `self` included, because an exemption by name could be claimed by any parameter called `self`. The one exception is a name-mangled private attribute, `self.__x`, inside a class the pack defines, and dunders are always banned. Also banned: the attribute names `format` and `format_map`, anywhere, since they can reach attributes from inside a string; the frame and coroutine attributes `f_*`, `gi_*`, `cr_*`, `ag_*` and `tb_*`; any attribute of an imported module that is itself a module, resolved at check time, such as `dataclasses.inspect`; and attribute names that start processes, open sockets or pipes, or reach modules. Those are `sys`, `os`, `modules`, `builtins`, `__builtins__` and `subprocess`, and asyncio's `create_subprocess_exec`, `create_subprocess_shell`, `open_connection`, `open_unix_connection`, `start_server`, `start_unix_server`, `subprocess_exec`, `subprocess_shell`, `create_connection`, `create_server`, `create_unix_connection`, `create_unix_server`, `create_datagram_endpoint`, `connect_read_pipe`, `connect_write_pipe` and `sock_*`. **String evaluation is banned too:** any `str` constant in an annotation position, `typing.get_type_hints`, `typing.ForwardRef`, `pydantic.create_model`, and `TypeAdapter` called with a string, since each of them evaluates a string as code. Every attribute-name rule also applies to the keyword attributes of a `match` class pattern (`MatchClass.kwd_attrs`), such as `case object(_client=c)`, which read attributes without an attribute node. **Re-exported names:** at check time, a name imported from an allowed core module is rejected if its `__module__` is `settings` or an `llm*` module, and an import-linter contract keeps the allowed core modules from importing those modules at all |
+| The sandboxes reaching other services | Host networking is the only mode that works here, so the sandboxes can reach localhost and the internet. The implementer sandbox holds no secret: PostgreSQL requires a password it never gets, and the gateway is useless without the key. The solve container holds only a per-run proxy token and the agent role's password, for a `SELECT`-only role on `tpch` (§6.1). The Docker socket is never mounted in either |
 | Hard-coded answers | A scan of the diff rejects it if it contains a gold-only fragment of any split's gold answer, at least 40 characters after normalization: gold `optimized_sql` for Effi-SQL, the gold patch for SWE (on hold). A gold-only fragment is a window of the gold that occurs in no `base_sql` and not in the schema DDL. They are built from the full dataset and the schema DDL and stored outside the repository, as hashes, so the sandbox never sees them. Scanning every gold window would reject legitimate skills: 147 of the 238 golds share such a window with their own `base_sql`, and standard TPC-H joins recur across many golds. The scan also rejects pack changes that embed large literal lists, above a size set in config. Effi-SQL instance ids are not scanned: they are small integers, so a match would mean nothing. There is no database-name rule either, since every task runs on the one `tpch` database. The SWE scan (on hold) also rejects an instance_id from any split |
 | Hard-coded results: a prediction that returns the base query's result as constants | The grader's robustness check, on the alternate database, and its plan check give such a prediction credit 0 and flag it (§4.1). A flagged prediction fails its candidate outright, and the ledger and the lessons record it. The report gives both the official and the checked R-VES |
 | Changing the database: indexes or data | Agent sessions use a role with only the `SELECT` privilege and no `CREATE` (§4.1), and client-side cancellation enforces their timeout. Grading runs on its own instances, and the official evaluation runs on the pristine database |
-| Tampering with the grading instances | Before each grading batch, the grader verifies the instance's catalog fingerprint: its indexes, its relation sizes (`relpages`) and its write counters. Every instance requires password authentication. Grading credentials never enter the repository or the implementer sandbox, which has host networking but no credentials |
-| Relying on the improvement model | The per-purpose model allowlist lives in core, which RSI cannot edit: executor calls may use only Qwen (§5.1). The runner hands the harness a client bound to purpose `exec`, and the static allowlist bans importing the client modules, loading the key and reaching the client's internals. This is defense in depth, not a sandbox (§12) |
+| Tampering with the grading instances | Before each grading batch, the grader verifies the instance's catalog fingerprint: its indexes, its relation sizes (`relpages`) and its write counters. Every instance requires password authentication. Grading credentials never enter the repository or a sandbox. The implementer sandbox has host networking but no credentials, and the solve container has only the agent role, which cannot connect to the alternate database (§6.1) |
+| Relying on the improvement model | The per-purpose model allowlist lives in core, which RSI cannot edit: executor calls may use only Qwen (§5.1). In the solve container, the client reaches the gateway only through the host's proxy, which forwards only the executor model and refuses anything else with a 403 (§6.1). The static allowlist, which bans importing the client modules, loading the key and reaching the client's internals, is a second layer: defense in depth, not a sandbox (§12) |
 | Special-casing the workload or caching between timing runs (SWE, on hold) | The official grader times each repetition in a fresh process and checks for stack inspection; the prompt and skills forbid both; held-out results expose this kind of overfitting |
 | Editing test files (SWE, on hold) | The official grader resets test files before it runs them |
 | Overfitting to val | The analyst never sees per-task val results or val trajectories, and lessons cite only the aggregate decision (§7). Held-out is used only for v0's baseline run and the final runs |
@@ -819,12 +848,13 @@ The implementer is mini-swe-agent's `DefaultAgent` (`mini-swe-agent==2.4.6`, MIT
 - The container runs as the host user's uid and gid, with a read-only root filesystem, a tmpfs `/tmp`, no capabilities, `no-new-privileges`, and process, memory and CPU limits, on cores 0–1 (§6.2).
 - No host environment variable is passed in, and no key reaches the sandbox.
 - Every command runs under `timeout` inside the container, because a timed-out `docker exec` leaves its command running. Containers carry the experiment ID as a label, and a lane removes any it finds left over when it starts.
+- The shared builder in `goaly.bench` makes this container and the solve-phase container of every evaluation (§6.1, Isolated evaluation). The solve container differs in three ways: an extra writable mount for the run directory, the gold-free runtime file mounted read-only, and an explicit environment allowlist.
 
 **`goaly-smoke`.** `goaly-smoke <instance_id>` is the only command the sandbox does not run itself. The host:
 
 1. refuses any instance that is not in train, and any call after the second;
 2. runs the step-3 guards on the worktree as it stands;
-3. runs the candidate on that task with the bench runner, with one seed. Its grading goes ahead of every other phase on the grading instances (§6.2);
+3. runs the candidate on that task through the isolated two-phase path (§6.1), with one seed. Its grading goes ahead of every other phase on the grading instances (§6.2);
 4. returns the score, the stop reason, the step count, the cost and the last tool error.
 
 **Limits.** These are config values. Our adapter enforces 60 steps, $3 of GLM and 30 minutes per hypothesis; the agent also stops after 3 format errors in a row, and each command times out after 120 s.
@@ -850,7 +880,7 @@ The implementer is mini-swe-agent's `DefaultAgent` (`mini-swe-agent==2.4.6`, MIT
 
 ## 9. Cost and efficiency accounting
 
-- Every LLM call records its purpose (exec, rsi-analyst, rsi-impl or rsi-lesson), model, tokens, cost from the response header, and latency.
+- Every LLM call records its purpose (exec, rsi-analyst, rsi-impl or rsi-lesson), model, tokens, cost from the response header, and latency. In isolated runs, the host's proxy also records every call it forwards. The decision rules use its numbers, because files written in the solve container are untrusted (§6.1).
 - The report shows two costs separately:
   - what the final harness costs, in money and time, to run on the held-out set;
   - what the RSI experiments cost in total, by lane and by purpose.
@@ -932,7 +962,8 @@ The implementer is mini-swe-agent's `DefaultAgent` (`mini-swe-agent==2.4.6`, MIT
 | SWE on hold: the PDF's "gains on more than one benchmark" is at risk (§2) | Nothing within this deadline; the report states the gap plainly. The SWE design stays in this document and the RSI machinery has no benchmark-specific code, so the lane can resume without a redesign |
 | Tight schedule: 21 hours from 2026-10-15 03:00 UTC to the deadline | One active lane. Contracts come first, then component PRs in parallel; stacked PRs keep review from blocking work. RSI must be running by about 16:00 UTC, and the plan counts on 1 round, with a second as upside (§13) |
 | The implementer writes outside its pack: bash can write anywhere | The Docker sandbox with read-only mounts prevents it (§8.8), and the guards and checksums detect it. A unit-tested function builds the mount arguments, and an integration test asserts the read-only refusal |
-| Candidate pack code runs on the host during smoke tests, screening and validation, in the same process that holds the API key. The allowlist is a static check, not a sandbox, so an escape it misses could read the key or call GLM directly: this residual risk stays open | Defense in depth. The static AST allowlist (§8.5) bans the known escapes, and T18 tests each of them as a reject case. They are private attributes on any object, reflection builtins, `format` attributes, frame and coroutine attributes, module-valued attributes, string annotations and the functions that evaluate them, `match` class patterns, and names that allowed core modules re-export. Each review round has found new escapes, so this list may still be incomplete. The runner hands pack code only a client bound to purpose `exec` (§5.1). Checksums are verified before every evaluation, and the project lead reviews every results PR before it merges. Running candidate code in a keyless sandbox would close the gap; it is not planned within this deadline |
+| Candidate pack code escapes the static allowlist. Each review round has found new escapes, so the list may still be incomplete | Isolation closes the structural gap (§6.1, Isolated evaluation). Pack code runs only in the solve container, which holds no key, no grader credentials and no gold, and the grader never imports pack code. The residual risk inside the container is limited to Qwen calls through the proxy and the read-only agent role, plus writing the run directory, which the grader reads only as data. The allowlist (§8.5) stays as a second layer, a static defense in depth that T18 tests against every known escape. Those are private attributes on any object, reflection builtins, `format` attributes, frame and coroutine attributes, module-valued attributes, string annotations and the functions that evaluate them, `match` class patterns, and names that allowed core modules re-export. Checksums are verified before every evaluation, and the project lead reviews every results PR before it merges |
+| The solve container adds start-up time to every run | About 2 s per run, which is negligible next to solving and grading |
 | mini-swe-agent changes or breaks | An exact pin. The adapter uses only `DefaultAgent`, `DockerEnvironment`, its exceptions and two helper functions. Vendoring them, about 450 lines under MIT, is the fallback |
 | T03's client is late for the implementer | The fallback model, a small `LitellmModel` subclass that reads the gateway's cost header (§8.8). While it is used, litellm runs in the process that holds the key, with a vetted version pinned, and core neither sees the GLM calls nor enforces the lane's GLM share. Switching back to core's client later changes one class |
 | A lane hangs or crashes during the unattended run | Heartbeats, bounded restarts with backoff, and resuming from the ledger (§8.7). A notification when recovery fails |
@@ -983,6 +1014,8 @@ The fast case assumes 4-minute tasks, 55 s of dev grading per task, 1 candidate 
 - The freeze does not wait for a round that is still running. That round is reported as incomplete, and the best stays as it was before it.
 
 The project lead's review latency is budgeted. PRs stack, so no slot waits for a review, and the 14:30–16:00 slot leaves time to review the code the lane runs on before it starts.
+
+Isolated evaluation (§6.1) adds about 2–3 hours of work across T03 (the proxy), T06 (the phases), T11 (the Effi-SQL pipeline), T18 (the solve-mode sandbox) and T21 (using it for every candidate evaluation). That work has already started, inside the slots above.
 
 ## Appendix A: Ticket mapping
 
