@@ -76,10 +76,11 @@ _CUT_OFF_NO_CALL: Final = (
 _NO_CALL: Final = (
     "Error: your reply called no tool. Each reply must call one of the tools: {tools}."
 )
+# The tool runs again, so the result may differ in timing, e.g. a statement's elapsed time.
 _REPEATED: Final = (
     "Note: this call repeats your previous one, the same tool with the same arguments, so its "
-    "result is unchanged. Repeating a call does not help: change the arguments or try another "
-    "approach."
+    "result is unchanged, apart from timing. Repeating a call does not help: change the "
+    "arguments or try another approach."
 )
 _OVER_CAP: Final = (
     f"Error: a reply may make at most {CALLS_PER_REPLY} tool calls, so this call was not run. "
@@ -356,9 +357,10 @@ class _Chat[E: Environment]:
         worked = False  # Whether a call gave a result that is no error.
         for call in calls[:CALLS_PER_REPLY]:
             result = await self._hooks.tools.execute(call, self._env)
-            if result.HasField("submission") and call.source == _REASONING_XML:
+            drafted = result.HasField("submission") and call.source == _REASONING_XML
+            if drafted:  # A call drafted in the reasoning is no call of the model's to repeat.
                 result = _drafted(call, result)
-            repeated = self._repeats(call)
+            repeated = not drafted and self._repeats(call)
             if repeated:
                 result.content = _appended(result.content, _REPEATED)
             worked = worked or not (result.is_error or repeated)
@@ -375,7 +377,9 @@ class _Chat[E: Environment]:
         """Whether ``call``, which ran, repeats the call that ran before it in this chat.
 
         Calls are compared by tool and normalized arguments, never by ID: an XML call's ID is
-        only unique within its reply.
+        only unique within its reply. A repeat counts toward the error streak, but its result
+        keeps ``is_error`` as the tool gave it, since the call itself did not fail: the note in
+        its content marks it, in the trajectory as for the model.
         """
         key = (call.name, _normalized_arguments(call))
         repeated = key == self._previous

@@ -1373,8 +1373,8 @@ async def test_a_prompt_too_long_with_nothing_to_fold_is_not_sent_again() -> Non
 
 REPEATED = (
     "Note: this call repeats your previous one, the same tool with the same arguments, so its "
-    "result is unchanged. Repeating a call does not help: change the arguments or try another "
-    "approach."
+    "result is unchanged, apart from timing. Repeating a call does not help: change the "
+    "arguments or try another approach."
 )
 
 
@@ -1395,6 +1395,25 @@ async def test_a_call_that_repeats_the_one_before_runs_with_a_note_and_counts_as
     # The three repeats are three failed replies in a row: the reminder came after them.
     assert injected(ctx.trajectory())[:3] == [[], [], []]
     assert steps[3].injected[0].content.startswith("You have made 3 errors in a row.")
+
+
+async def test_a_drafted_submission_is_not_the_call_a_real_one_repeats() -> None:
+    drafted = reply(reasoning=f"Submit it.\n{tool_call_block('submit', FAST)}")
+    ctx = context(FakeLLM([drafted, reply(submit(FAST))]))
+
+    prediction = await run_agent(environment(), ctx, hooks())
+
+    assert prediction == SUBMISSION
+    assert ctx.trajectory().steps[1].tool_results[0].content == "Submitted."  # No repeat note.
+
+
+async def test_a_repaired_call_and_the_same_call_written_well_repeat() -> None:
+    truncated = tool_call("execute_sql", '{"sql": "' + FAST + '"')  # Repaired to {"sql": FAST}.
+    ctx = context(FakeLLM([reply(truncated), reply(execute_sql(FAST)), reply(submit())]))
+
+    await run_agent(environment(), ctx, hooks())
+
+    assert ctx.trajectory().steps[1].tool_results[0].content.endswith(REPEATED)
 
 
 async def test_arguments_that_differ_only_in_layout_repeat() -> None:
