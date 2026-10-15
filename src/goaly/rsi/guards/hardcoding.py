@@ -13,8 +13,8 @@ Two scans of what the candidate adds, file by file:
   - In JSON, JSONL and TOML, an array or mapping counts its constants the same way, and a JSONL
     file counts its records. In YAML, the longest run of sequence items or mapping keys at one
     indentation counts, and so does the largest flow collection on a line.
-  - In CSV, the rows count, and in Markdown and plain text, the longest run of list items or
-    table rows does.
+  - In CSV, the rows count; in SQL, the items of the largest list, such as IN (...) or VALUES;
+    and in Markdown and plain text, the longest run of list items or table rows.
 
   Only a collection larger than config allows, and larger than the parent's largest in the same
   file, fails: a table the best version already had is not the candidate's. A long single string
@@ -46,7 +46,7 @@ __all__ = ["HardCodingConfig", "check_hard_coding"]
 _DELETED = "D"
 _ADDED = "A"
 _DISPLAYS = (ast.List, ast.Tuple, ast.Set, ast.Dict)
-_DATA = frozenset({".json", ".jsonl", ".yaml", ".yml", ".toml", ".csv"})
+_DATA = frozenset({".json", ".jsonl", ".yaml", ".yml", ".toml", ".csv", ".sql"})
 _TEXT = frozenset({".md", ".txt"})
 # A Markdown or text line that is one item of a list or one row of a table.
 _ROW = re.compile(r"^\s*(?:[-*+]\s|\d+[.)]\s|\|)")
@@ -273,6 +273,8 @@ def _largest(suffix: str, source: str) -> int:
             return _largest_value(tomllib.loads(source))
         if suffix == ".csv":
             return sum(1 for row in csv.reader(io.StringIO(source)) if row)
+        if suffix == ".sql":
+            return _sql_largest(source)
     except (ValueError, csv.Error, RecursionError, MemoryError):
         return _UNPARSABLE
     return _longest_run(source)
@@ -328,6 +330,33 @@ def _flow_elements(line: str) -> int:
         elif char == "," and counts:
             counts[-1] += 1
     return max([largest, *counts])
+
+
+def _sql_largest(text: str) -> int:
+    """The largest list in SQL, counted by its commas outside strings: the items of a
+    parenthesized list, as in IN (...) or one row of VALUES, or the rows of a VALUES list.
+    """
+    largest = 0
+    counts: list[int] = [1]  # The items so far at each depth of parentheses; 0 is the top.
+    statement: list[str] = []
+    quote = ""
+    for char in [*text, ";"]:
+        statement.append(char)
+        if quote:
+            quote = "" if char == quote else quote
+        elif char in "'\"":
+            quote = char
+        elif char == "(":
+            counts.append(1)
+        elif char == ")" and len(counts) > 1:
+            largest = max(largest, counts.pop())
+        elif char == ",":
+            counts[-1] += 1
+        elif char == ";":  # Rows count only in a VALUES list, not a SELECT's columns.
+            if "values" in "".join(statement).lower():
+                largest = max(largest, counts[0])
+            counts, statement = [1], []
+    return largest
 
 
 def _longest_run(text: str) -> int:

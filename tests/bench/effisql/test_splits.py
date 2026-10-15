@@ -16,7 +16,6 @@ from pydantic import ValidationError
 
 from goaly.bench.effisql.data import DATASET_SHA256, Difficulty, EffiSqlInstance
 from goaly.bench.effisql.splits import (
-    EXCLUSIONS_PATH,
     SPLIT_SEED,
     SPLITS_PATH,
     EffiSqlSplits,
@@ -262,9 +261,13 @@ def write_exclusions(path: Path, entries: object) -> Path:
     return path
 
 
-def test_the_committed_exclusion_list_is_empty_until_t10_fills_it() -> None:
-    assert EXCLUSIONS_PATH.read_text(encoding="utf-8") == "[]\n"
-    assert load_exclusions() == ()
+def test_the_committed_exclusion_list_is_t10s_setup_run() -> None:
+    exclusions = load_exclusions()
+    assert len(exclusions) == 36  # The setup run of 2026-10-15: 15.1% of the 238 TPC-H tasks.
+    ids = {exclusion.instance_id for exclusion in exclusions}
+    splits = load_splits()
+    assert ids <= {*splits.train, *splits.val, *splits.heldout}
+    assert all(exclusion.reason for exclusion in exclusions)
 
 
 def test_load_exclusions_reads_each_task_with_its_reason(tmp_path: Path) -> None:

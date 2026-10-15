@@ -324,6 +324,12 @@ class TestPlanCheck:
             "SELECT inet_server_port(), pg_backend_pid(), version()",
             "SELECT pg_total_relation_size('lineitem'), pg_stat_get_live_tuples(1)",
             "SELECT 'lineitem'::regclass::oid, tableoid FROM lineitem",
+            "SELECT (SELECT catalog_name FROM information_schema.information_schema_catalog_name)",
+            'SELECT U&"current_d\\0061tabase"()',
+            "SELECT query_to_xml('select current_database()', true, true, '')",
+            "SELECT database_to_xml(true, true, ''), table_to_xmlschema('x', true, true, '')",
+            "SELECT * FROM ts_stat('select 1')",
+            "SELECT setting FROM pg_settings WHERE name = 'port'",
         ],
     )
     def test_an_environment_probe_is_flagged(self, sql: str) -> None:
@@ -340,6 +346,8 @@ class TestPlanCheck:
             "SELECT $$ current_setting('x') $$, E'it\\'s version()' FROM lineitem",
             "SELECT 'it''s version()' FROM lineitem",
             "SELECT l_conversion, versioned FROM lineitem",
+            "SELECT xmlagg(xmlelement(name x, l_comment)) FROM lineitem",
+            "SELECT 'pg_class', 'U&\"x\"' FROM lineitem",
         ],
     )
     def test_names_in_strings_comments_or_other_words_are_not_probes(self, sql: str) -> None:
