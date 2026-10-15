@@ -10,9 +10,9 @@ evaluator = "goaly.bench.effisql.evaluate:make_evaluator"
 hooks = "goaly.rsi.hooks:lane_hooks"
 
 [lane]
-# Absolute, so a restart never moves it. 16:00 PDT, set on 2026-10-15 at the user's call, so the
+# Absolute, so a restart never moves it. 17:00 PDT, set on 2026-10-15 at the user's call, so the
 # final runs can start then; 6 rounds, so the candidates the grader-lock bug aborted get evaluated.
-deadline = "2026-10-15T23:00:00Z"
+deadline = "2026-10-16T00:00:00Z"
 max_rounds_without_accept = 6
 infrastructure_backoff_s = 120
 task_concurrency = 16
