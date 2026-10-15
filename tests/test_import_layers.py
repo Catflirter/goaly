@@ -79,6 +79,7 @@ def test_layers_contract(
     else:
         assert result.returncode == 0, output
         # One more file and one more import prove that the probe's import was analysed. A
-        # third-party package the copy never imported enters the graph as one more module.
-        new_modules = 1 if imported.startswith("goaly.") else 2
-        assert analyzed(result) == (files + new_modules, imports + 1), output
+        # third-party package also enters the graph as a module, unless the copy imported it.
+        new_files, new_imports = analyzed(result)
+        assert new_imports == imports + 1, output
+        assert new_files - files in ((1,) if imported.startswith("goaly.") else (1, 2)), output
