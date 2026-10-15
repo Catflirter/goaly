@@ -480,8 +480,12 @@ async def run_phase(
     cache: BaseCache,
     *,
     val: Iterable[str] = (),
+    manual: Iterable[str] = (),
 ) -> int:
     """Run ``phase`` on every task that still needs it, on all the pool's runners at once.
+
+    ``manual`` names the reviewed exclusions, which the official phase and the negative
+    sample leave out, as the summary does.
 
     ``tasks`` carry their gold. Each record is saved as its task finishes, so a rerun resumes;
     a task whose work raises, a grader failure included, is logged and left unrecorded for the
@@ -489,6 +493,7 @@ async def run_phase(
     tasks were recorded.
     """
     records = store.load()
+    reviewed = set(manual)
     jobs: list[tuple[EffiSqlInstance, _Job]] = []
     if phase == "measure":
         pending = [t for t in tasks if _needs_measuring(records.get(t.instance_id))]
@@ -509,6 +514,7 @@ async def run_phase(
             and task.optimized_sql is not None
             and (record := records.get(task.instance_id)) is not None
             and exclusion_reason(record) is None
+            and task.instance_id not in reviewed
             and _needs_official(record)
         ]
     else:
@@ -518,7 +524,7 @@ async def run_phase(
                 "the negative sample waits for every task's record: %d missing", len(missing)
             )
             return 0
-        sample = set(negative_sample(records))
+        sample = set(negative_sample(_without(records, reviewed)))
         jobs = [
             (task, _negative_job(task))
             for task in tasks
@@ -542,6 +548,10 @@ async def run_phase(
 
     done = await asyncio.gather(*(run(task, job) for task, job in jobs))
     return sum(done)
+
+
+def _without(records: Mapping[str, SetupRecord], ids: set[str]) -> dict[str, SetupRecord]:
+    return {task: record for task, record in records.items() if task not in ids}
 
 
 def _needs_measuring(record: SetupRecord | None) -> bool:
@@ -758,7 +768,7 @@ def summarize(
         check = records[task].data
         if check is not None:
             data[check.outcome].append(task)
-    sample = negative_sample({t: r for t, r in records.items() if t not in manual_ids})
+    sample = negative_sample(_without(records, manual_ids))
     negatives = [task for task in present if records[task].negatives is not None]
     negative_failures = {
         task: [

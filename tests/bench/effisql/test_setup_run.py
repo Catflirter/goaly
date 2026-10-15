@@ -700,3 +700,32 @@ class TestRulingsOfTheTail:
         }
         assert summary.exclusions_by_split == {"heldout": 1, "train": 1}
         assert "by split" in to_markdown(summary)
+
+
+def test_the_negative_sample_leaves_out_reviewed_exclusions_as_the_summary_does(
+    tmp_path: Path,
+) -> None:
+    store = RecordStore(tmp_path / "records")
+    for i in range(1, 13):
+        store.save(record(str(i)))
+    records = store.load()
+    reviewed = ["3"]
+    manual = [Exclusion(instance_id="3", reason="review")]
+    expected = summarize(list(records), records, val=[], manual=manual).negative_sample
+    ran: list[str] = []
+
+    class Runner:
+        instance = GradingInstance("fake", 1)
+
+        async def call(self, _work: Any, task: EffiSqlInstance, *_: Any) -> dict[str, bool]:
+            ran.append(task.instance_id)
+            return {"control": True}
+
+        def close(self) -> None:
+            pass
+
+    pool: GradingPool[SlotRunner] = GradingPool([Runner()])  # type: ignore[list-item]  # A fake.
+    tasks = [instance(str(i)) for i in range(1, 13)]
+    asyncio.run(run_phase("negatives", pool, tasks, store, BaseCache(tmp_path), manual=reviewed))
+    assert sorted(ran, key=int) == expected
+    assert "3" not in ran
