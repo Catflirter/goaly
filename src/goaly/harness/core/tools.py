@@ -24,7 +24,7 @@ from goaly.contracts.gen.task_pb2 import Prediction
 from goaly.contracts.gen.trajectory_pb2 import ToolCall, ToolResult
 from goaly.contracts.interfaces import Environment, JsonValue, Tool
 
-__all__ = ["DEFAULT_TIMEOUT_S", "BoundTool", "ToolRegistry", "bind"]
+__all__ = ["DEFAULT_TIMEOUT_S", "BoundTool", "ToolRegistry", "bind", "environment_failure_in"]
 
 # How long a call may run when the tool's config sets no timeout.
 DEFAULT_TIMEOUT_S = 60.0
@@ -33,6 +33,8 @@ DEFAULT_TIMEOUT_S = 60.0
 _CONTENT_KEEP = 4_000
 # The model sees this many characters at each end of an exception's message.
 _MESSAGE_KEEP = 250
+# An invalid-arguments error lists this many of pydantic's errors, and counts the rest.
+_LISTED_ERRORS = 10
 
 _logger = logging.getLogger(__name__)
 
@@ -66,13 +68,19 @@ class BoundTool[E: Environment](ABC):
           covers the whole invocation, validation included.
         - Content longer than 8,000 characters keeps its first and last 4,000, with a marker
           between them that says how many were cut, and ``truncated`` is set.
-        - ``is_error`` is set when the call itself failed, and only then. Arguments that fail
-          validation get pydantic's errors listed, and the tool does not run. A call that runs
-          past ``timeout_s`` is stopped. A tool that raised gets its exception's type and
-          message, never a traceback; the traceback goes to the log. A statement or command
-          that ran and failed is a normal result.
-        - EnvironmentFailure propagates, never as a result, and so does an exception group that
-          holds one, as a TaskGroup raises. Cancellation propagates too.
+        - ``is_error`` is set when the call itself failed, and only then:
+          - arguments that fail validation get pydantic's first 10 errors listed, or the type
+            and message of what a validator raised, and the tool does not run;
+          - a call that runs past ``timeout_s`` is stopped;
+          - a tool that raised, or returned something other than a ToolResult, gets the
+            exception's type and message, and an exception group each of its leaves', never a
+            traceback; the traceback goes to the log, at WARNING.
+
+          A statement or command that ran and failed is a normal result.
+        - EnvironmentFailure propagates, from a validator too, and never becomes a result. When
+          an exception group holds one, as a TaskGroup raises, the first is raised from the
+          group (:func:`environment_failure_in`), so that ``except EnvironmentFailure`` catches
+          it. Cancellation propagates too.
         """
 
 
@@ -126,20 +134,36 @@ class _Binding[A: BaseModel, E: Environment](BoundTool[E]):
             args = self.tool.args_model.model_validate_json(arguments_json)
         except ValidationError as error:
             return _result(self.name, _invalid_arguments(self.name, error), is_error=True)
+        except Exception as error:  # A validator raised what pydantic does not wrap.
+            _reraise_environment_failure(error)
+            _logger.warning(
+                "validating the arguments of the tool %s raised an exception",
+                self.name,
+                extra={"tool": self.name},
+                exc_info=error,
+            )
+            content = f"Error: invalid arguments for {self.name}: {_describe(error)}"
+            return _result(self.name, content, is_error=True)
         timeout = asyncio.timeout(self.timeout_s)
         try:
             async with timeout:
-                returned = await self.tool.run(args, env)
+                # Typed as object: pack code, which RSI writes, can break the Tool contract.
+                returned: object = await self.tool.run(args, env)
+            if not isinstance(returned, ToolResult):
+                kind = type(returned).__name__
+                raise TypeError(f"{self.name} returned {kind}, not a ToolResult")
         except Exception as error:
-            if _environment_failed(error):
-                raise
+            _reraise_environment_failure(error)
             if timeout.expired():
                 content = (
                     f"Error: {self.name} timed out after {self.timeout_s:g} s and was stopped."
                 )
             else:
                 _logger.warning(
-                    "a tool raised an exception", extra={"tool": self.name}, exc_info=error
+                    "the tool %s raised an exception",
+                    self.name,
+                    extra={"tool": self.name},
+                    exc_info=error,
                 )
                 content = f"Error: {self.name} failed with {_describe(error)}"
             return _result(self.name, content, is_error=True)
@@ -201,24 +225,65 @@ def _result(
     )
 
 
+def environment_failure_in(error: BaseException) -> EnvironmentFailure | None:
+    """Return ``error`` if it is an EnvironmentFailure, or else the first one inside it.
+
+    The first one is looked for depth first, through the exception groups that a TaskGroup
+    raises; there is none, and the result is None, when no leaf is an EnvironmentFailure. The
+    executor raises what it finds, and the runner can apply it to a group that a pack's own
+    TaskGroup raised, so that the task is recorded as an environment failure.
+    """
+    return next((leaf for leaf in _leaves(error) if isinstance(leaf, EnvironmentFailure)), None)
+
+
+def _reraise_environment_failure(error: Exception) -> None:
+    """Raise the EnvironmentFailure that ``error`` is or holds, if there is one.
+
+    A failure inside a group is raised from the group, so that a caller's ``except
+    EnvironmentFailure`` catches it, as the contract asks, and the group stays its __cause__.
+    """
+    failure = environment_failure_in(error)
+    if failure is error:
+        raise error
+    if failure is not None:
+        raise failure from error
+
+
+def _leaves(error: BaseException) -> Iterator[BaseException]:
+    """Yield ``error``, or if it is an exception group, each exception at its leaves, in order."""
+    if isinstance(error, BaseExceptionGroup):
+        for inner in error.exceptions:
+            yield from _leaves(inner)
+    else:
+        yield error
+
+
 def _invalid_arguments(name: str, error: ValidationError) -> str:
+    details = error.errors(include_url=False, include_context=False, include_input=False)
     lines = [f"Error: invalid arguments for {name}:"]
-    for detail in error.errors(include_url=False, include_context=False, include_input=False):
+    for detail in details[:_LISTED_ERRORS]:
         where = ".".join(str(part) for part in detail["loc"])
         lines.append(f"- {where}: {detail['msg']}" if where else f"- {detail['msg']}")
+    if len(details) > _LISTED_ERRORS:
+        lines.append(f"- and {len(details) - _LISTED_ERRORS} more")
     return "\n".join(lines)
 
 
-def _environment_failed(error: Exception) -> bool:
-    """Whether ``error`` is an EnvironmentFailure, or a group holding one, as a TaskGroup raises."""
-    if isinstance(error, ExceptionGroup):
-        return error.subgroup(EnvironmentFailure) is not None
-    return isinstance(error, EnvironmentFailure)
+def _describe(error: BaseException) -> str:
+    """Name ``error``'s type and give its message, never a traceback; a group lists its leaves."""
+    text = _type_and_message(error)
+    if isinstance(error, BaseExceptionGroup):
+        text += ":" + "".join(f"\n- {_type_and_message(leaf)}" for leaf in _leaves(error))
+    return text
 
 
-def _describe(error: Exception) -> str:
-    """Name ``error``'s type and give its message, cut short: never a traceback."""
-    message, _ = _truncate(str(error), _MESSAGE_KEEP)
+def _type_and_message(error: BaseException) -> str:
+    """``error``'s type and its message, cut short; the type alone if it has no message."""
+    try:
+        message = str(error)
+    except Exception:  # noqa: BLE001 - A broken __str__ must not take the executor down.
+        message = ""
+    message, _ = _truncate(message, _MESSAGE_KEEP)
     return f"{type(error).__name__}: {message}" if message else type(error).__name__
 
 

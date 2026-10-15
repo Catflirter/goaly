@@ -11,7 +11,7 @@ import math
 from collections.abc import Callable
 
 import pytest
-from pydantic import BaseModel
+from pydantic import BaseModel, field_validator, model_validator
 from pydantic.errors import PydanticInvalidForJsonSchema
 
 from goaly.contracts.errors import EnvironmentFailure
@@ -19,7 +19,7 @@ from goaly.contracts.gen.environment_pb2 import SqlResult
 from goaly.contracts.gen.task_pb2 import EffiSqlPrediction, Prediction
 from goaly.contracts.gen.trajectory_pb2 import ToolCall, ToolResult
 from goaly.contracts.interfaces import Environment, JsonValue, SqlEnvironment
-from goaly.harness.core.tools import BoundTool, ToolRegistry, bind
+from goaly.harness.core.tools import BoundTool, ToolRegistry, bind, environment_failure_in
 from tests.fakes import EchoTool, FakeSqlEnvironment, SubmitTool
 
 pytestmark = pytest.mark.anyio
@@ -113,6 +113,72 @@ class PairTool:
             for sql in (args.first, args.second):
                 group.create_task(env.execute(sql, timeout_s=120.0))
         return ToolResult(content="Both ran.")
+
+
+class KeyedArgs(BaseModel):
+    """Arguments that a before-validator reads by key, so a missing key raises KeyError."""
+
+    sql: str
+
+    @model_validator(mode="before")
+    @classmethod
+    def _read_sql(cls, data: dict[str, object]) -> dict[str, object]:
+        return {"sql": data["sql"]}
+
+
+class BoundedArgs(BaseModel):
+    """Arguments whose field validator raises TypeError, which pydantic does not wrap."""
+
+    limit: int
+
+    @field_validator("limit")
+    @classmethod
+    def _bound(cls, limit: int) -> int:
+        if limit > 1000:
+            raise TypeError("limit must be at most 1000")
+        return limit
+
+
+class LiveArgs(BaseModel):
+    """Arguments whose validator finds the environment dead."""
+
+    sql: str
+
+    @field_validator("sql")
+    @classmethod
+    def _check(cls, sql: str) -> str:
+        raise EnvironmentFailure("the database connection died")
+
+
+class ValidatedTool:
+    """Answers "ok" once its arguments validate."""
+
+    description = "Check the arguments."
+
+    def __init__(self, args_model: type[BaseModel]) -> None:
+        self.name = "validated"
+        self.args_model = args_model
+
+    async def run(self, args: BaseModel, env: Environment) -> ToolResult:
+        return ToolResult(content="ok")
+
+
+class WrongResultTool:
+    """Breaks the Tool contract: its run returns a string."""
+
+    name = "wrong"
+    description = "Return the wrong type."
+    args_model = NoArgs
+
+    async def run(self, args: NoArgs, env: Environment) -> ToolResult:
+        return "done"  # type: ignore[return-value]  # The contract violation under test.
+
+
+class UnreadableError(Exception):
+    """An exception whose message cannot be read: its __str__ raises."""
+
+    def __str__(self) -> str:
+        raise RuntimeError("no message")
 
 
 class CallbackArgs(BaseModel):
@@ -416,11 +482,18 @@ async def test_a_timeout_error_the_tool_raises_itself_is_not_the_calls_timeout()
         (ValueError("no column named price"), "ValueError: no column named price"),
         (KeyError("rows"), "KeyError: 'rows'"),
         (RuntimeError(), "RuntimeError"),
+        (UnreadableError(), "UnreadableError"),
         (
             ExceptionGroup("two checks failed", [ValueError("a"), KeyError("b")]),
-            "ExceptionGroup: two checks failed (2 sub-exceptions)",
+            "ExceptionGroup: two checks failed (2 sub-exceptions):\n"
+            "- ValueError: a\n- KeyError: 'b'",
+        ),
+        (
+            ExceptionGroup("outer", [ValueError("a"), ExceptionGroup("inner", [KeyError("b")])]),
+            "ExceptionGroup: outer (2 sub-exceptions):\n- ValueError: a\n- KeyError: 'b'",
         ),
     ],
+    ids=["value", "key", "no message", "unreadable message", "group", "nested group"],
 )
 async def test_an_exception_becomes_an_error_result_with_its_type_and_message(
     error: Exception, content: str
@@ -454,6 +527,10 @@ async def test_the_traceback_of_an_exception_goes_to_the_log(
         await bind(RaisingTool(error)).invoke("{}", FakeSqlEnvironment())
 
     [record] = caplog.records
+    assert (record.levelno, record.getMessage()) == (
+        logging.WARNING,
+        "the tool fragile raised an exception",
+    )
     assert record.exc_info is not None
     assert record.exc_info[1] is error
     assert vars(record)["tool"] == "fragile"
@@ -475,11 +552,28 @@ async def test_an_environment_failure_inside_an_exception_group_propagates() -> 
     env = FakeSqlEnvironment({"SELECT pg_sleep(60)": SqlResult(elapsed_s=60.0), "SELECT 1": died})
     arguments_json = '{"first": "SELECT pg_sleep(60)", "second": "SELECT 1"}'
 
-    with pytest.raises(ExceptionGroup) as raised:
+    with pytest.raises(EnvironmentFailure) as raised:
         await bind(PairTool()).invoke(arguments_json, env)
 
-    assert raised.value.exceptions == (died,)
+    # The failure itself, so that a caller's `except EnvironmentFailure` catches it; the
+    # TaskGroup's group stays reachable as its cause.
+    assert raised.value is died
+    group = raised.value.__cause__
+    assert isinstance(group, ExceptionGroup)
+    assert group.exceptions == (died,)
     assert env.stopped == ["SELECT pg_sleep(60)"]  # The TaskGroup cancelled the other statement.
+
+
+def test_environment_failure_in_finds_the_failure_itself_or_the_first_inside_a_group() -> None:
+    died, also_died = EnvironmentFailure("died"), EnvironmentFailure("also died")
+    nested = ExceptionGroup("outer", [ValueError("a"), ExceptionGroup("inner", [died, also_died])])
+    with_cancellation = BaseExceptionGroup("tasks", [asyncio.CancelledError(), died])
+
+    assert environment_failure_in(died) is died
+    assert environment_failure_in(nested) is died
+    assert environment_failure_in(with_cancellation) is died
+    assert environment_failure_in(ExceptionGroup("checks", [ValueError("a")])) is None
+    assert environment_failure_in(ValueError("a")) is None
 
 
 async def test_a_cancelled_call_stops_its_tool_and_raises_cancelled_error() -> None:
@@ -537,14 +631,69 @@ async def test_longer_content_keeps_its_first_and_last_4000_characters(
     )
 
 
-async def test_a_long_error_result_is_cut_down_like_any_other() -> None:
-    arguments_json = json.dumps({"pattern": "x", "paths": list(range(500))})
+async def test_the_error_lists_the_first_10_invalid_arguments_and_counts_the_rest() -> None:
+    arguments_json = json.dumps({"pattern": "x", "paths": list(range(15))})
 
     result = await bind(SearchTool()).invoke(arguments_json, FakeSqlEnvironment())
 
+    assert (
+        result.content
+        == "Error: invalid arguments for search:\n"
+        + "".join(f"- paths.{index}: Input should be a valid string\n" for index in range(10))
+        + "- and 5 more"
+    )
+
+
+async def test_a_long_error_result_is_cut_down_like_any_other() -> None:
+    group = ExceptionGroup("checks failed", [ValueError("x" * 400) for _ in range(30)])
+
+    result = await bind(RaisingTool(group)).invoke("{}", FakeSqlEnvironment())
+
     assert (result.is_error, result.truncated) == (True, True)
     assert result.content.startswith(
-        "Error: invalid arguments for search:\n- paths.0: Input should be a valid string\n"
+        "Error: fragile failed with ExceptionGroup: checks failed (30 sub-exceptions):\n"
+        "- ValueError: xxx"
     )
     assert "\n[... " in result.content
-    assert result.content.endswith("\n- paths.499: Input should be a valid string")
+
+
+@pytest.mark.parametrize(
+    ("args_model", "arguments_json", "content"),
+    [
+        (KeyedArgs, '{"query": "SELECT 1"}', "KeyError: 'sql'"),
+        (BoundedArgs, '{"limit": 5000}', "TypeError: limit must be at most 1000"),
+    ],
+    ids=["before-validator", "field validator"],
+)
+async def test_an_exception_a_validator_raises_gives_an_error_result(
+    args_model: type[BaseModel], arguments_json: str, content: str, caplog: pytest.LogCaptureFixture
+) -> None:
+    with caplog.at_level(logging.WARNING, logger="goaly.harness.core.tools"):
+        result = await bind(ValidatedTool(args_model)).invoke(arguments_json, FakeSqlEnvironment())
+
+    assert without_elapsed(result) == ToolResult(
+        name="validated",
+        is_error=True,
+        content=f"Error: invalid arguments for validated: {content}",
+    )
+    [record] = caplog.records
+    assert (record.levelno, record.getMessage()) == (
+        logging.WARNING,
+        "validating the arguments of the tool validated raised an exception",
+    )
+    assert record.exc_info is not None
+
+
+async def test_an_environment_failure_a_validator_raises_propagates() -> None:
+    with pytest.raises(EnvironmentFailure, match="the database connection died"):
+        await bind(ValidatedTool(LiveArgs)).invoke('{"sql": "SELECT 1"}', FakeSqlEnvironment())
+
+
+async def test_a_tool_that_returns_something_other_than_a_result_gives_an_error_result() -> None:
+    result = await bind(WrongResultTool()).invoke("{}", FakeSqlEnvironment())
+
+    assert without_elapsed(result) == ToolResult(
+        name="wrong",
+        is_error=True,
+        content="Error: wrong failed with TypeError: wrong returned str, not a ToolResult",
+    )
