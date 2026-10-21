@@ -107,6 +107,29 @@ def test_wrapper_runs_the_package_from_the_venv_with_env_loaded(repo, tmp_path_f
     ]
 
 
+KUBECONFIG_PYTHON = """#!/usr/bin/env bash
+printf 'KUBECONFIG=%s\\n' "${KUBECONFIG-unset}"
+"""
+
+
+@pytest.mark.parametrize("env_text, ambient, expected", [
+    ("LAMBDA_API_KEY=k-123\n", None, "{home}/.kube/hybrid-gpu.yaml"),
+    ("LAMBDA_API_KEY=k-123\n", "/home/op/.kube/work-cluster", "{home}/.kube/hybrid-gpu.yaml"),
+    ("LAMBDA_API_KEY=k-123\nKUBECONFIG=/srv/kc.yaml\n", "/home/op/.kube/work-cluster", "/srv/kc.yaml"),
+])
+def test_wrapper_pins_the_cluster_kubeconfig(repo, env_text, ambient, expected):
+    """Spec section 11: gpuctl's kubectl reaches ~/.kube/hybrid-gpu.yaml, not an ambient KUBECONFIG; .env overrides."""
+    write_env(repo, env_text)
+    (repo / ".venv/bin/python").write_text(KUBECONFIG_PYTHON)
+    env = {k: v for k, v in os.environ.items() if k not in ("LAMBDA_API_KEY", "REPO_ROOT", "KUBECONFIG")}
+    env["HOME"] = "/home/op"
+    if ambient is not None:
+        env["KUBECONFIG"] = ambient
+    proc = subprocess.run([str(repo / "scripts/gpuctl"), "status"], cwd=repo, env=env, capture_output=True, text=True)
+    assert proc.returncode == 0, proc.stderr
+    assert proc.stdout == f"KUBECONFIG={expected.format(home='/home/op')}\n"
+
+
 def test_wrapper_refuses_without_a_private_env(repo):
     write_env(repo, mode=0o644)
     proc = run([str(repo / "scripts/gpuctl"), "status"], repo)

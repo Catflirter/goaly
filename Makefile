@@ -69,3 +69,7 @@ gpu-plan: ## Show what gpu-apply would create/delete on Lambda and the hourly co
 
 gpu-status: ## Show Lambda GPU capacity and this cluster's GPU instances (read-only)
 	$(ROOT)/scripts/gpuctl status
+
+.PHONY: sync-peers
+sync-peers: ## Rewrite the peer allow-lists (cp k3s_peers set, Lambda firewall) from the current node IPs
+	$(ROOT)/scripts/gpuctl sync-peers
