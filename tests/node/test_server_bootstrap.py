@@ -1,12 +1,13 @@
-"""node/server-bootstrap.sh and node/common.sh.
+"""node/server-bootstrap.sh, node/common.sh and node/guard/k3s-guard-peers.sh.
 
 Everything here runs on the operator workstation. server-bootstrap runs either in --render-only
 mode or, for the host sequence, with K3S_BOOTSTRAP_TEST_ROOT pointing at a scratch tree; the
-common.sh helpers that touch the system run only against stub binaries on PATH plus a fake
-K3S_BOOTSTRAP_TEST_ROOT / SYSFS_NET. No test runs a real sysctl, apt-get, systemctl, ip, netplan,
-nft, curl or k3s.
+common.sh helpers and k3s-guard-peers that touch the system run only against stub binaries on PATH
+plus a fake K3S_BOOTSTRAP_TEST_ROOT / SYSFS_NET; the k3s-guard.service hooks run with their paths
+rewritten to the scratch tree and the stub. No test runs a real sysctl, apt-get, systemctl, ip,
+netplan, nft, curl or k3s.
 """
-import os, re, subprocess
+import os, re, shlex, subprocess
 from pathlib import Path
 import pytest
 import yaml
@@ -149,7 +150,7 @@ def test_renders_exactly_the_expected_files(tmp_path):
     assert files == {"etc/rancher/k3s/config.yaml", "etc/rancher/k3s/psa.yaml",
                      "etc/rancher/k3s/audit-policy.yaml", "etc/sysctl.d/90-kubelet.conf",
                      "etc/k3s-guard/k3s-guard.nft", "etc/systemd/system/k3s-guard.service",
-                     "etc/systemd/system/k3s.service.d/10-guard.conf"}
+                     "etc/systemd/system/k3s.service.d/10-guard.conf", "usr/local/sbin/k3s-guard-peers"}
 
 
 # --- argument handling and preflight -------------------------------------------------------
@@ -431,15 +432,163 @@ def test_render_template_read_failure_dies(tmp_path):
     assert not (tmp_path / "out/o").exists()
 
 
-def test_guard_unit_restores_persisted_peers(tmp_path):
-    # A reboot or reload reloads the table seeded with the CP addresses only; the unit re-adds the
-    # list sync-peers persisted in peers.nft, ignoring a missing/broken file (k3s still starts).
-    assert run_server(tmp_path).returncode == 0
+# --- persisted peers: k3s-guard-peers (sync-peers' entry point on k3s-cp) and the unit hooks ----
+
+PEERS_HELPER = ROOT / "node/guard/k3s-guard-peers.sh"
+# Exactly what gpuctl.peers.nft_replace_script() produces (Task 4).
+REPLACE = ("flush set inet k3s_guard k3s_peers\n"
+           "add element inet k3s_guard k3s_peers { 10.10.0.2, 34.82.10.10, 129.80.30.30 }\n")
+
+
+def nft_loader_stub(tmp):
+    """nft stub: appends what it loads (a file, or stdin for "-f -") to nft-loaded and fails when
+    that contains "broken" or while fail-nft exists."""
+    return {"nft": f'if [[ $2 == - ]]; then c=$(cat); else c=$(cat "$2"); fi; '
+                   f'printf "%s" "$c" >> "{tmp}/nft-loaded"; '
+                   f'[[ $c != *broken* && ! -e "{tmp}/fail-nft" ]]'}
+
+
+def run_peers(tmp, script, bindir):
+    env = {**os.environ, "K3S_BOOTSTRAP_TEST_ROOT": str(tmp / "sys"), "PATH": f"{bindir}:{os.environ['PATH']}"}
+    return subprocess.run(["bash", str(PEERS_HELPER)], input=script, capture_output=True, text=True, env=env)
+
+
+def guard_dir(tmp):
+    return tmp / "sys/etc/k3s-guard"
+
+
+def test_peers_helper_applies_then_persists(tmp_path):
+    bindir, log = make_stubs(tmp_path, nft_loader_stub(tmp_path), names=["nft"])
+    r = run_peers(tmp_path, REPLACE, bindir)
+    assert r.returncode == 0, r.stderr
+    [call] = calls(log)
+    assert re.fullmatch(rf"nft -f {guard_dir(tmp_path)}/\.peers\.nft\.\w+", call)
+    assert (tmp_path / "nft-loaded").read_text() == REPLACE.rstrip("\n")
+    peers = guard_dir(tmp_path) / "peers.nft"
+    assert peers.read_text() == REPLACE
+    assert peers.stat().st_mode & 0o777 == 0o644
+    assert sorted(p.name for p in guard_dir(tmp_path).iterdir()) == ["peers.nft"]
+
+
+def test_peers_helper_removal_replaces_the_whole_persisted_list(tmp_path):
+    # gpu-down/cpu-remove: the removed IP must not come back on the next CP reboot or reload.
+    bindir, _ = make_stubs(tmp_path, nft_loader_stub(tmp_path), names=["nft"])
+    assert run_peers(tmp_path, REPLACE, bindir).returncode == 0
+    smaller = REPLACE.replace(", 129.80.30.30", "")
+    r = run_peers(tmp_path, smaller, bindir)
+    assert r.returncode == 0, r.stderr
+    assert (guard_dir(tmp_path) / "peers.nft").read_text() == smaller
+
+
+def test_peers_helper_nft_failure_keeps_the_persisted_list(tmp_path):
+    bindir, _ = make_stubs(tmp_path, nft_loader_stub(tmp_path), names=["nft"])
+    assert run_peers(tmp_path, REPLACE, bindir).returncode == 0
+    (tmp_path / "fail-nft").touch()
+    r = run_peers(tmp_path, REPLACE.replace(", 129.80.30.30", ""), bindir)
+    assert r.returncode == 1 and "nft" in r.stderr
+    assert (guard_dir(tmp_path) / "peers.nft").read_text() == REPLACE
+    assert sorted(p.name for p in guard_dir(tmp_path).iterdir()) == ["peers.nft"]
+
+
+@pytest.mark.parametrize("script", [
+    "",
+    "add element inet k3s_guard k3s_peers { 10.10.0.2 }\n",          # no flush: the list would only grow
+    "flush set inet k3s_guard k3s_peers\n",                            # empty set: CP loses its own hairpin
+    REPLACE + "delete table inet k3s_guard\n",
+    REPLACE + REPLACE,
+    REPLACE.replace("10.10.0.2", "010.10.0.2"),
+    REPLACE.replace("10.10.0.2", "10.10.0.0/16"),
+    REPLACE.replace("add element inet k3s_guard", "add element inet filter"),
+    REPLACE.replace("\n", "\r\n"),
+])
+def test_peers_helper_accepts_only_a_full_replace(tmp_path, script):
+    bindir, log = make_stubs(tmp_path, nft_loader_stub(tmp_path), names=["nft"])
+    r = run_peers(tmp_path, script, bindir)
+    assert r.returncode == 2 and "nft_replace_script" in r.stderr
+    assert calls(log) == []
+    assert not (guard_dir(tmp_path) / "peers.nft").exists()
+
+
+@pytest.mark.skipif(os.geteuid() == 0, reason="the root check only bites for non-root users")
+def test_peers_helper_requires_root(tmp_path):
+    bindir, log = make_stubs(tmp_path, names=["nft"])
+    env = {**os.environ, "PATH": f"{bindir}:{os.environ['PATH']}"}
+    env.pop("K3S_BOOTSTRAP_TEST_ROOT", None)
+    r = subprocess.run(["bash", str(PEERS_HELPER)], input=REPLACE, capture_output=True, text=True, env=env)
+    assert r.returncode == 1 and "run as root" in r.stderr
+    assert calls(log) == []
+
+
+def test_host_installs_peers_helper_executable(tmp_path):
+    bindir, _ = host_stubs(tmp_path)
+    assert run_host(tmp_path, bindir).returncode == 0
+    helper = tmp_path / "sys/usr/local/sbin/k3s-guard-peers"
+    assert helper.read_text() == PEERS_HELPER.read_text()
+    assert helper.stat().st_mode & 0o777 == 0o755
+
+
+def run_unit_hook(tmp, key, bindir):
+    """Run the rendered unit's KEY= shell command with /etc/k3s-guard and /usr/sbin/nft pointed at
+    the scratch tree and the nft stub."""
+    unit = rendered(tmp, "etc/systemd/system/k3s-guard.service").splitlines()
+    [line] = [x for x in unit if x.startswith(f"{key}=")]
+    argv = shlex.split(line[len(key) + 1:].removeprefix("-"))
+    assert argv[:2] == ["/bin/sh", "-c"] and len(argv) == 3
+    script = argv[2].replace("/etc/k3s-guard", str(guard_dir(tmp))).replace("/usr/sbin/nft", str(bindir / "nft"))
+    return subprocess.run(["/bin/sh", "-c", script], capture_output=True, text=True)
+
+
+def unit_with_guard_files(tmp, peers=None):
+    assert run_server(tmp).returncode == 0
+    guard_dir(tmp).mkdir(parents=True)
+    (guard_dir(tmp) / "k3s-guard.nft").write_text("TABLE\n")
+    if peers is not None:
+        (guard_dir(tmp) / "peers.nft").write_text(peers)
+    return make_stubs(tmp, nft_loader_stub(tmp), names=["nft"])
+
+
+def test_guard_unit_start_restores_persisted_peers(tmp_path):
+    # A boot (or kernel.panic reboot) loads the table seeded with the CP addresses only; the unit
+    # then re-adds the list k3s-guard-peers persisted.
+    bindir, log = unit_with_guard_files(tmp_path, REPLACE)
+    r = run_unit_hook(tmp_path, "ExecStartPost", bindir)
+    assert r.returncode == 0 and r.stderr == ""
+    assert calls(log) == [f"nft -f {guard_dir(tmp_path)}/peers.nft"]
+
+
+def test_guard_unit_start_without_peers_is_quiet(tmp_path):
+    bindir, log = unit_with_guard_files(tmp_path)
+    r = run_unit_hook(tmp_path, "ExecStartPost", bindir)
+    assert r.returncode == 0 and r.stderr == "" and calls(log) == []
+
+
+def test_guard_unit_start_with_broken_peers_warns_but_does_not_fail_the_unit(tmp_path):
+    bindir, _ = unit_with_guard_files(tmp_path, "broken\n")
+    r = run_unit_hook(tmp_path, "ExecStartPost", bindir)
+    assert r.returncode != 0 and "WARNING" in r.stderr and "make sync-peers" in r.stderr
     unit = rendered(tmp_path, "etc/systemd/system/k3s-guard.service").splitlines()
-    assert ("ExecStartPost=-/bin/sh -c 'if [ -s /etc/k3s-guard/peers.nft ]; then "
-            "exec /usr/sbin/nft -f /etc/k3s-guard/peers.nft; fi'") in unit
-    assert ("ExecReload=/bin/sh -c 'cat /etc/k3s-guard/k3s-guard.nft /etc/k3s-guard/peers.nft 2>/dev/null "
-            "| /usr/sbin/nft -f - || exec /usr/sbin/nft -f /etc/k3s-guard/k3s-guard.nft'") in unit
+    assert any(x.startswith("ExecStartPost=-/bin/sh ") for x in unit)   # "-": k3s still starts
+
+
+def test_guard_unit_reload_loads_table_and_peers_in_one_transaction(tmp_path):
+    bindir, log = unit_with_guard_files(tmp_path, REPLACE)
+    r = run_unit_hook(tmp_path, "ExecReload", bindir)
+    assert r.returncode == 0 and r.stderr == ""
+    assert calls(log) == ["nft -f -"]
+    assert (tmp_path / "nft-loaded").read_text() == ("TABLE\n" + REPLACE).rstrip("\n")
+
+
+def test_guard_unit_reload_without_peers_is_quiet(tmp_path):
+    bindir, log = unit_with_guard_files(tmp_path)
+    r = run_unit_hook(tmp_path, "ExecReload", bindir)
+    assert r.returncode == 0 and r.stderr == "" and calls(log) == ["nft -f -"]
+
+
+def test_guard_unit_reload_with_broken_peers_warns_and_loads_the_table_alone(tmp_path):
+    bindir, log = unit_with_guard_files(tmp_path, "broken\n")
+    r = run_unit_hook(tmp_path, "ExecReload", bindir)
+    assert r.returncode == 0 and "WARNING" in r.stderr and "make sync-peers" in r.stderr
+    assert calls(log) == ["nft -f -", f"nft -f {guard_dir(tmp_path)}/k3s-guard.nft"]
 
 
 # --- host sequence (stubbed binaries, scratch K3S_BOOTSTRAP_TEST_ROOT) ----------------------

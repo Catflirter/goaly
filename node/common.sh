@@ -45,10 +45,11 @@ render_template() {
 # file_differs A B: true unless both files exist with identical bytes.
 file_differs() { ! cmp -s -- "$1" "$2"; }
 
-# install_file SRC DST: install SRC as DST (0644, parent dirs created) only if the bytes differ.
+# install_file SRC DST [MODE]: install SRC as DST (MODE, default 0644; parent dirs created) only if
+# the bytes differ.
 install_file() {
   if file_differs "$1" "$2"; then
-    install -D -m 0644 -- "$1" "$2"
+    install -D -m "${3:-0644}" -- "$1" "$2"
   fi
 }
 

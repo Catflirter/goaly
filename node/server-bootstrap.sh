@@ -60,6 +60,7 @@ PEERS=$(printf '%s\n' "$CP_INTERNAL_IP" "$CP_IP" | sort -u -t. -k1,1n -k2,2n -k3
 PEERS=${PEERS// /, }
 
 K3S_FILES=(etc/rancher/k3s/config.yaml etc/rancher/k3s/psa.yaml etc/rancher/k3s/audit-policy.yaml)
+PEERS_HELPER=usr/local/sbin/k3s-guard-peers
 
 render_all() {
   local root=$1
@@ -70,6 +71,8 @@ render_all() {
   render_template "$HERE/guard/k3s-guard-server.nft.tmpl" "$root/etc/k3s-guard/k3s-guard.nft" PEERS
   render_template "$HERE/guard/k3s-guard.service" "$root/etc/systemd/system/k3s-guard.service"
   render_template "$HERE/k3s/10-guard.conf" "$root/etc/systemd/system/k3s.service.d/10-guard.conf"
+  # sync-peers' entry point on this host: replaces k3s_peers and persists it in peers.nft.
+  render_template "$HERE/guard/k3s-guard-peers.sh" "$root/$PEERS_HELPER"
 }
 
 if (( RENDER_ONLY )); then
@@ -109,6 +112,7 @@ if [[ $(k3s_installed_version) == "$K3S_VERSION" ]]; then k3s_already_current=1;
 for rel in "${K3S_FILES[@]}" etc/sysctl.d/90-kubelet.conf; do
   install_file "$STAGE/$rel" "$HOST/$rel"
 done
+install_file "$STAGE/$PEERS_HELPER" "$HOST/$PEERS_HELPER" 0755
 
 sysctl --system
 set_mtu "$IFACE" "$UNDERLAY_MTU"
