@@ -5,6 +5,7 @@ Files are discovered by glob, so stacks added later (workers, gpu-access) are ch
 import ipaddress, re, subprocess
 from pathlib import Path
 import pytest
+import yaml
 
 ROOT = Path(__file__).resolve().parents[1]
 INFRA = ROOT / "infra"
@@ -252,3 +253,18 @@ def test_stack_pins_terraform_and_provider_versions(stack):
         google = blocks(text, r"\bgoogle\s*=")
         assert len(google) == 1, f"infra/{stack}/versions.tf must declare the google provider once"
         assert re.search(r'version\s*=\s*"= 8\.7\.0"', google[0])
+
+def test_gpu_access_max_nodes_default_matches_gpu_nodes_yaml():
+    """infra/gpu-access caps gpu_ips at var.max_nodes; its default must follow the YAML cap.
+
+    Otherwise raising max_nodes in lambda/gpu-nodes.yaml launches nodes whose IPs the
+    gpu-access apply rejects, so they bill but can never join.
+    """
+    text = (INFRA / "gpu-access" / "variables.tf").read_text()
+    var = blocks(text, r'variable\s+"max_nodes"')
+    assert len(var) == 1, "infra/gpu-access/variables.tf must declare max_nodes once"
+    m = re.search(r"(?<![\w.])default\s*=\s*(\d+)", code_only(var[0]))
+    assert m, "variable max_nodes needs a numeric default"
+    spec = yaml.safe_load((ROOT / "lambda" / "gpu-nodes.yaml").read_text())
+    assert int(m.group(1)) == spec["max_nodes"], (
+        f"infra/gpu-access max_nodes default {m.group(1)} != lambda/gpu-nodes.yaml max_nodes {spec['max_nodes']}")
