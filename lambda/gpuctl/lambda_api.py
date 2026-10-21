@@ -320,5 +320,10 @@ class LambdaClient:
     def update_ruleset(self, ruleset_id: str, rules: Iterable[FirewallRule]) -> None:
         self._request("PATCH", f"/firewall-rulesets/{_segment(ruleset_id)}", {"rules": _serialise_rules(rules)})
 
+    def get_global_rules(self) -> list[FirewallRule]:
+        """The account-wide rules that apply to every instance (read side of update_global_rules)."""
+        data = self._request("GET", "/firewall-rulesets/global")
+        return self._parse("global firewall rules", lambda: [_parse_rule(raw) for raw in data["rules"]])
+
     def update_global_rules(self, rules: Iterable[FirewallRule]) -> None:
         self._request("PATCH", "/firewall-rulesets/global", {"rules": _serialise_rules(rules)})

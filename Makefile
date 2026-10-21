@@ -57,3 +57,10 @@ lint: ## Run all pre-commit hooks, the repo secret scan, the Terraform tests, th
 	$(MAKE) secrets
 	$(MAKE) tf-test
 	$(MAKE) test
+
+.PHONY: gpu-plan gpu-status
+gpu-plan: ## Show what gpu-apply would create/delete on Lambda and the hourly cost (read-only)
+	$(ROOT)/scripts/gpuctl plan
+
+gpu-status: ## Show Lambda GPU capacity and this cluster's GPU instances (read-only)
+	$(ROOT)/scripts/gpuctl status
