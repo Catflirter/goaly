@@ -7,13 +7,17 @@ plus a fake K3S_BOOTSTRAP_TEST_ROOT / SYSFS_NET; the k3s-guard.service hooks run
 rewritten to the scratch tree and the stub. No test runs a real sysctl, apt-get, systemctl, ip,
 netplan, nft, curl or k3s.
 """
-import fcntl, os, re, shlex, subprocess
+import fcntl, ipaddress, os, re, shlex, subprocess
 from pathlib import Path
 import pytest
 import yaml
 
+from gpuctl import peers as gpuctl_peers
+
 ROOT = Path(__file__).resolve().parents[2]
 COMMON = ROOT / "node/common.sh"
+# The everyone-CIDR is built, never written out: global constraints forbid the literal in any file.
+ANY_IPV4 = str(ipaddress.IPv4Network((0, 0)))
 SYSTEM_TOOLS = ["sysctl", "apt-get", "dpkg-query", "systemctl", "ip", "netplan", "nft", "curl", "k3s"]
 
 
@@ -119,7 +123,7 @@ def test_server_guard_rules(tmp_path):
     # The file replaces the whole table atomically on every load.
     assert text.splitlines()[:3] == ["table inet k3s_guard", "delete table inet k3s_guard",
                                      "table inet k3s_guard {"]
-    assert "0.0.0.0/0" not in text
+    assert ANY_IPV4 not in text
 
 
 def test_guard_peers_sorted_numerically(tmp_path):
@@ -288,13 +292,15 @@ def test_install_packages_installs_without_upgrading(tmp_path):
                           "  DEBIAN_FRONTEND=noninteractive"]
 
 
-GUARD_FILES = ["etc/k3s-guard/k3s-guard.nft", "etc/systemd/system/k3s-guard.service",
-               "etc/systemd/system/k3s.service.d/10-guard.conf"]
+SERVER_DROPIN = "etc/systemd/system/k3s.service.d/10-guard.conf"
+AGENT_DROPIN = "etc/systemd/system/k3s-agent.service.d/10-guard.conf"
+GUARD_FILES = ["etc/k3s-guard/k3s-guard.nft", "etc/systemd/system/k3s-guard.service", SERVER_DROPIN]
+AGENT_GUARD_FILES = [*GUARD_FILES[:2], AGENT_DROPIN]
 
 
-def guard_stage(tmp, nft_text):
+def guard_stage(tmp, nft_text, files=GUARD_FILES):
     stage = tmp / "stage"
-    for rel in GUARD_FILES:
+    for rel in files:
         (stage / rel).parent.mkdir(parents=True, exist_ok=True)
         (stage / rel).write_text(nft_text if rel.endswith(".nft") else f"# {rel}\n")
     return stage
@@ -321,6 +327,34 @@ def test_install_guard_first_run_enables(tmp_path):
     for rel in GUARD_FILES:
         assert (tmp_path / "sys" / rel).read_text() == (stage / rel).read_text()
     assert not (tmp_path / "sys/run/k3s-guard.reload-pending").exists()
+
+
+def test_install_guard_agent_stage_installs_the_agent_drop_in(tmp_path):
+    # Task 12's node-bootstrap.sh renders k3s-agent.service.d/10-guard.conf and calls
+    # install_guard "$STAGE" exactly as server-bootstrap.sh does (Ruling R16).
+    bindir, log = make_stubs(tmp_path, systemctl_stub(tmp_path))
+    stage = guard_stage(tmp_path, "table inet k3s_guard\n", AGENT_GUARD_FILES)
+    r = common(f"install_guard {stage}", bindir, K3S_BOOTSTRAP_TEST_ROOT=str(tmp_path / "sys"))
+    assert r.returncode == 0, r.stderr
+    assert calls(log) == [f"nft -c -f {stage}/etc/k3s-guard/k3s-guard.nft",
+                          "systemctl mask nftables.service", "systemctl daemon-reload",
+                          "systemctl is-active --quiet k3s-guard", "systemctl enable --now k3s-guard"]
+    for rel in AGENT_GUARD_FILES:
+        assert (tmp_path / "sys" / rel).read_text() == (stage / rel).read_text()
+    assert not (tmp_path / "sys/etc/systemd/system/k3s.service.d").exists()
+
+
+@pytest.mark.parametrize("dropins, message", [
+    ([], "no guard drop-in"),
+    ([SERVER_DROPIN, AGENT_DROPIN], "both"),
+])
+def test_install_guard_needs_exactly_one_drop_in(tmp_path, dropins, message):
+    bindir, log = make_stubs(tmp_path, systemctl_stub(tmp_path))
+    stage = guard_stage(tmp_path, "table inet k3s_guard\n", [*GUARD_FILES[:2], *dropins])
+    r = common(f"install_guard {stage}", bindir, K3S_BOOTSTRAP_TEST_ROOT=str(tmp_path / "sys"))
+    assert r.returncode != 0 and message in r.stderr, r.stderr
+    assert calls(log) == []
+    assert not (tmp_path / "sys").exists()
 
 
 def test_install_guard_inactive_unit_is_started_even_if_unchanged(tmp_path):
@@ -710,13 +744,12 @@ def test_peers_lock_wait_is_bounded(tmp_path, who, message):
 
 def test_peers_helper_accepts_what_gpuctl_sync_peers_sends(tmp_path):
     # Ruling R14: Task 13's sync_peers sends nft_replace_script(cp_guard_elements(p)) (Task 6) to
-    # this helper. gpuctl.peers is not on this branch's base (task/02); the test runs once it is.
-    peers = pytest.importorskip("gpuctl.peers")
+    # this helper.
     bindir, log = make_stubs(tmp_path, nft_loader_stub(tmp_path), names=["nft"])
     for workers, gpus in [((), ()), (("34.29.20.20",), ("129.80.30.30", "9.9.9.9"))]:
-        p = peers.PeerSet(cp_ip="34.82.10.10", cp_internal_ip="10.10.0.2", worker_ips=workers,
-                          gpu_ips=gpus, operator_ip="73.15.40.40")
-        script = peers.nft_replace_script(peers.cp_guard_elements(p))
+        p = gpuctl_peers.PeerSet(cp_ip="34.82.10.10", cp_internal_ip="10.10.0.2", worker_ips=workers,
+                                 gpu_ips=gpus, operator_ip="73.15.40.40")
+        script = gpuctl_peers.nft_replace_script(gpuctl_peers.cp_guard_elements(p))
         r = run_peers(tmp_path, script, bindir)
         assert r.returncode == 0, r.stderr
         assert (guard_dir(tmp_path) / "peers.nft").read_text() == script

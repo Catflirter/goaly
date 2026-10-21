@@ -92,6 +92,10 @@ def test_autoscale_bounds_may_reach_max_nodes():
 
 REPO_YAML = (ROOT / "lambda/gpu-nodes.yaml").read_text(encoding="utf-8")
 
+def test_repo_spec_file_is_english():
+    # Spec section 0.3: deliverables are in English; the operator edits this file live (chapter 6).
+    assert REPO_YAML.isascii()
+
 @pytest.mark.parametrize("text, message", [
     (REPO_YAML + "  a6000:\n    count: 0\n    instance_type: gpu_1x_a10\n    fallback_types: []\n"
                  "    regions: [us-west-1]\n    image_family: lambda-stack-22-04\n", "duplicate key 'a6000'"),

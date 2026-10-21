@@ -1,10 +1,10 @@
-budget_usd_per_hour: 3.0     # 计划里所有 GPU 节点按实时价格加起来，超过就拒绝执行
-max_nodes: 3                 # GPU 节点总数上限
+budget_usd_per_hour: 3.0     # refuse any plan whose GPU nodes, at live hourly prices, add up to more than this
+max_nodes: 3                 # total GPU node cap
 pools:
   a6000:
-    count: 1                 # 手动模式下的目标数量
+    count: 1                 # target count in manual mode
     instance_type: gpu_1x_a6000
     fallback_types: [gpu_1x_a10, gpu_1x_a100]
     regions: [us-west-1, us-west-2, us-east-1]
     image_family: lambda-stack-22-04
-    autoscale: {min: 1, max: 2, idle_minutes: 5}   # 只给 stretch 的 autoscaler 用
+    autoscale: {min: 1, max: 2, idle_minutes: 5}   # used only by the stretch autoscaler

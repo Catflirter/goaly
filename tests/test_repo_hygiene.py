@@ -12,7 +12,9 @@ def ignored(path):
 
 @pytest.mark.parametrize("path", [
     ".env", ".env.local", ".env.bak", "kubeconfig", "kubeconfig.yaml", "x.tfvars",
-    "infra/base/terraform.tfstate", "verification/run1.txt"])
+    "infra/base/terraform.tfstate", "verification/run1.txt",
+    # The workflow makes .venv a symlink to a shared venv; ".venv/" would match only a directory.
+    ".venv"])
 def test_secret_and_state_files_are_ignored(path):
     assert ignored(path)
 

@@ -9,6 +9,7 @@ import urllib.request
 
 import pytest
 
+from fakes import ANY_IPV4
 from gpuctl import lambda_api
 from gpuctl.lambda_api import (
     BASE_URL, FirewallRule, Instance, InstanceType, InsufficientCapacity, LambdaAPIError, LambdaClient, Ruleset,
@@ -240,11 +241,6 @@ def test_rules_serialisation():
     assert body == {"rules": [
         {"protocol": "tcp", "port_range": [22, 22], "source_network": "1.2.3.4/32", "description": "ssh"},
         {"protocol": "icmp", "source_network": "1.2.3.4/32", "description": "icmp"}]}
-
-
-# The everyone-CIDR is built, never written out: global constraints forbid the literal in any file.
-ANY_IPV4 = str(ipaddress.IPv4Network((0, 0)))
-assert ipaddress.ip_network(ANY_IPV4).num_addresses == 2**32  # really the whole IPv4 space (IPv4Network(0) is a /32)
 
 
 @pytest.mark.parametrize("source", [ANY_IPV4, "::/0", "not-a-cidr", "0.0.0.0/1", "128.0.0.0/1", "1.2.3.4/8",

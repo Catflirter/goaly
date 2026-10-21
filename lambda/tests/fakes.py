@@ -2,11 +2,16 @@
 
 from __future__ import annotations
 
+import ipaddress
 from collections.abc import Iterable, Mapping
 
 from gpuctl.lambda_api import (
     FirewallRule, Instance, InstanceType, LambdaAPIError, Ruleset, _serialise_rules,
 )
+
+# The everyone-CIDR is built, never written out: global constraints forbid the literal in any file.
+ANY_IPV4 = str(ipaddress.IPv4Network((0, 0)))
+assert ipaddress.ip_network(ANY_IPV4).num_addresses == 2**32  # really the whole IPv4 space (IPv4Network(0) is a /32)
 
 
 def _not_found(what: str) -> LambdaAPIError:

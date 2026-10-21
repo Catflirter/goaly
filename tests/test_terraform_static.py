@@ -2,12 +2,14 @@
 
 Files are discovered by glob, so stacks added later (workers, gpu-access) are checked too.
 """
-import re
+import ipaddress, re, subprocess
 from pathlib import Path
 import pytest
 
 ROOT = Path(__file__).resolve().parents[1]
 INFRA = ROOT / "infra"
+# The everyone-CIDR is built, never written out: global constraints forbid the literal in any file.
+ANY_IPV4 = str(ipaddress.IPv4Network((0, 0)))
 
 def tf_files():
     # .terraform/ holds downloaded providers and modules, not our code.
@@ -128,6 +130,24 @@ def resource_blocks(rtype):
 def squash(s):
     return re.sub(r"\s+", "", s)
 
+def attr_string(block, name):
+    """The literal value of `name = "..."` in block, or None if it is not set to a plain string.
+
+    The argument is found on code_only(block), so a comment or string cannot fake it. code_only
+    blanks the string's contents but keeps its quotes and every offset, so the value is read back
+    from the same span of the original block. An interpolated value is not a plain string: None.
+    """
+    code = code_only(block)
+    m = re.search(rf'(?<![\w.]){re.escape(name)}\s*=\s*"', code)
+    if m is None:
+        return None
+    value = block[m.end():code.index('"', m.end())]
+    return None if "${" in value else value
+
+def is_egress(block):
+    # GCP opens a sourceless INGRESS rule to everyone; only a real EGRESS rule may omit its source.
+    return attr_string(block, "direction") == "EGRESS"
+
 def test_infra_has_terraform_files():
     # Guards every glob-driven test below against passing vacuously.
     assert tf_files(), "no *.tf under infra/"
@@ -160,8 +180,18 @@ def test_code_only_hides_keywords_in_comments_and_strings():
     assert not has_block(code, "log_config")
     assert has_attr(code, "description") and has_attr(code, "network")
 
+def checked_files():
+    """Every tracked file plus every Terraform file (a new .tf counts before it is staged)."""
+    out = subprocess.run(["git", "ls-files", "-z"], cwd=ROOT, capture_output=True, check=True).stdout
+    tracked = {ROOT / name for name in out.decode().split("\0") if name}
+    return sorted(p for p in tracked | set(tf_files()) if p.is_file() and not p.is_symlink())
+
 def test_no_open_internet_source_anywhere():
-    offenders = [str(p.relative_to(ROOT)) for p in tf_files() if "0.0.0.0/0" in p.read_text()]
+    # Global constraints: the everyone-CIDR may appear in no file and no rule, not only under infra/.
+    assert ipaddress.ip_network(ANY_IPV4).num_addresses == 2**32
+    files = checked_files()
+    assert ROOT / "node/common.sh" in files and set(tf_files()) <= set(files)
+    offenders = [str(p.relative_to(ROOT)) for p in files if ANY_IPV4.encode() in p.read_bytes()]
     assert offenders == []
 
 def test_no_iam_resources():
@@ -170,9 +200,28 @@ def test_no_iam_resources():
                  if re.search(r'resource\s+"google_\w*_iam_', p.read_text())]
     assert offenders == []
 
+FW = 'resource "google_compute_firewall" "x" {\n%s  source_ranges_missing = true\n}\n'
+
+@pytest.mark.parametrize("body, egress", [
+    ('  direction = "EGRESS"\n', True),
+    ('  direction    =   "EGRESS" # outbound only\n', True),
+    ('  direction = "INGRESS"\n', False),
+    ('', False),
+    # Neither a comment nor a string may fake the exemption: GCP opens a sourceless ingress rule.
+    ('  # direction = "EGRESS" is for the other rule\n', False),
+    ('  // direction = "EGRESS"\n', False),
+    ('  /* direction = "EGRESS" */\n', False),
+    ('  description = <<EOT\n  direction = "EGRESS"\n  EOT\n', False),
+    ('  description = "see ${local.direction == "EGRESS" ? 1 : 2}"\n', False),
+    ('  name = "direction = EGRESS"\n', False),
+])
+def test_is_egress_reads_only_the_direction_argument(body, egress):
+    assert is_egress(FW % body) is egress
+    assert has_attr(code_only(FW % body), "source_ranges") is False
+
 def test_firewall_rules_log_and_target_service_accounts():
     # Spec section 3.2: rule 3 (log_config on; target by service account, never by tag) and
-    # rule 1 (an ingress rule always declares its source; GCP defaults a missing one to 0.0.0.0/0).
+    # rule 1 (an ingress rule always declares its source; GCP opens a missing one to everyone).
     rules = resource_blocks("google_compute_firewall")
     assert rules, "no google_compute_firewall resources found"
     for path, block in rules:
@@ -181,7 +230,7 @@ def test_firewall_rules_log_and_target_service_accounts():
         assert has_block(code, "log_config"), where
         assert has_attr(code, "target_service_accounts"), where
         assert not has_attr(code, "target_tags"), where
-        if not re.search(r'(?<![\w.])direction\s*=\s*"EGRESS"', block):
+        if not is_egress(block):
             assert has_attr(code, "source_ranges"), where
             assert not has_attr(code, "source_tags"), where
 
