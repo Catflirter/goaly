@@ -11,7 +11,7 @@ import subprocess
 from collections.abc import Iterable, Mapping, Sequence
 from dataclasses import dataclass
 
-from gpuctl.infra import CommandError, operator_ip
+from gpuctl.infra import CommandError, check_join_args, normalise_gpu_ips, operator_ip
 from gpuctl.lambda_api import (
     FirewallRule, Instance, InstanceType, LambdaAPIError, Ruleset, _serialise_rules,
 )
@@ -195,10 +195,12 @@ DEFAULT_OUTPUTS = {
 class FakeInfra:
     """Terraform outputs, cp SSH, kubectl and join-node in memory.
 
-    `outputs[stack]` is what tf_output returns; a stack missing from it raises CommandError (as terraform does for a
-    stack that was never initialised). `events` records the side effects in order: "tf:<sorted gpu ips>" for
-    apply_gpu_access, "nft" for the cp peer-set push, "ssh:<command>" for any other cp_ssh, "join:<name>:<type>".
-    detect_operator_ip validates env["OPERATOR_IP"] exactly like Infra; there is no network fallback.
+    `outputs[stack]` is what tf_output returns; a stack missing from it raises CommandError (as Infra does for a
+    stack that is not in the checkout or cannot be read). `events` records the side effects in order:
+    "tf:<gpu ips>" for apply_gpu_access, "nft" for the cp peer-set push, "ssh:<command>" for any other cp_ssh,
+    "join:<name>:<type>". Arguments are validated and normalised exactly like Infra (shared helpers in gpuctl.infra):
+    apply_gpu_access records normalise_gpu_ips(), join_node runs check_join_args(), detect_operator_ip validates
+    env["OPERATOR_IP"] (there is no network fallback).
     """
 
     def __init__(self, *, outputs: Mapping[str, Mapping] | None = None, env: Mapping[str, str] | None = None,
@@ -229,7 +231,7 @@ class FakeInfra:
         return dict(self.outputs[stack])
 
     def apply_gpu_access(self, gpu_ips: Sequence[str]) -> None:
-        ips = sorted(gpu_ips)
+        ips = normalise_gpu_ips(gpu_ips)  # ValueError on a null or non-public IP, like Infra (Review Focus #2)
         self.applied_gpu_ips.append(ips)
         self.events.append(f"tf:{ips}")
 
@@ -250,6 +252,7 @@ class FakeInfra:
         self.cluster_nodes.pop(name, None)
 
     def join_node(self, name: str, ip: str, gpu_type: str) -> None:
+        ip = check_join_args(name, ip, gpu_type)
         self.joined.append((name, ip, gpu_type))
         self.events.append(f"join:{name}:{gpu_type}")
         if name in self.join_fail:

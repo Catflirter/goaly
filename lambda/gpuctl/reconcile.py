@@ -77,10 +77,14 @@ class Reconciler:
         return Ruleset(first.id, first.name, first.region, rules)
 
     def _worker_ips(self) -> tuple[str, ...]:
+        # ensure_init first: a checkout without infra/workers/.terraform (fresh clone, git worktree) must not look
+        # like "no workers". A stack that was never applied initialises and has no outputs: an empty list.
         try:
+            self.infra.ensure_init("workers")
             outputs = self.infra.tf_output("workers")
         except CommandError as e:
-            self._emit(f"warning: cannot read infra/workers outputs, treating the CPU worker list as empty ({e})")
+            sys.stderr.write(_clean(f"warning: cannot read infra/workers outputs, treating the CPU worker list as "
+                                    f"empty ({e})") + "\n")
             return ()
         workers = outputs.get("worker_ips") or {}
         if isinstance(workers, dict):

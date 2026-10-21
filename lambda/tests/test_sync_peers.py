@@ -95,19 +95,39 @@ def test_sync_pushes_full_peer_set_to_cp():
 
 def test_sync_order_is_cp_then_global_then_regions():
     fake, infra = FakeLambda(instances=[GPU]), FakeInfra()
+    cp_ssh = infra.cp_ssh
+
+    def logged_cp_ssh(command, input=None):  # one ordered log for both sides
+        fake.calls.append(("cp_ssh", command))
+        return cp_ssh(command, input)
+
+    infra.cp_ssh = logged_cp_ssh
     rec(fake, infra).sync_peers(SPEC)
-    writes = [c[0] for c in fake.calls if c[0] in ("update_global_rules", "create_ruleset", "update_ruleset")]
-    assert infra.events == ["nft"]
-    assert writes == ["update_global_rules", "create_ruleset", "create_ruleset", "create_ruleset"]
+    writes = [c[0] for c in fake.calls if c[0] in ("cp_ssh", "update_global_rules", "create_ruleset", "update_ruleset")]
+    assert writes == ["cp_ssh", "update_global_rules", "create_ruleset", "create_ruleset", "create_ruleset"]
+    assert ("cp_ssh", "sudo /usr/local/sbin/k3s-guard-peers") in fake.calls
 
 
-def test_sync_tolerates_uninitialised_workers_stack():
+def test_sync_initialises_the_workers_stack_before_reading_it():  # X0-1: a missing .terraform is not "no workers"
+    calls = []
+    infra = FakeInfra()
+    ensure_init, tf_output = infra.ensure_init, infra.tf_output
+    infra.ensure_init = lambda stack: (calls.append(("init", stack)), ensure_init(stack))[1]
+    infra.tf_output = lambda stack: (calls.append(("output", stack)), tf_output(stack))[1]
+    p = rec(FakeLambda(instances=[GPU]), infra).sync_peers(SPEC)
+    assert calls == [("output", "base"), ("init", "workers"), ("output", "workers")]
+    assert p.worker_ips == ("34.29.20.20",)
+
+
+def test_sync_tolerates_a_workers_stack_it_cannot_read(capsys):  # brief step 2: CommandError -> empty + warning
     out = io.StringIO()
     fake, infra = FakeLambda(instances=[GPU]), FakeInfra(outputs={"base": DEFAULT_OUTPUTS["base"]})
     p = rec(fake, infra, out).sync_peers(SPEC)
     assert p.worker_ips == ()
     assert infra.ssh_calls[-1][1] == nft_replace_script(["10.10.0.2", "34.82.10.10", "129.80.30.30"])
-    assert "warning" in out.getvalue().lower() and "workers" in out.getvalue()
+    err = capsys.readouterr().err
+    assert "warning" in err.lower() and "infra/workers" in err
+    assert "warning" not in out.getvalue().lower()  # the summary stream stays clean
 
 
 def test_sync_treats_a_workers_stack_without_workers_as_empty():

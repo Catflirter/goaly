@@ -1,13 +1,15 @@
 """gpuctl.infra: every subprocess the reconciler runs, checked through a scripted FakeShell (no cloud, no cluster)."""
 import inspect
 import json
+import os
 import sys
 from pathlib import Path
 
 import pytest
 
 from fakes import FakeInfra, FakeShell, fail, ok
-from gpuctl.infra import CommandError, Infra, SubprocessShell
+from gpuctl.infra import CP_SSH_TIMEOUT_S, TF_READ_TIMEOUT_S, CommandError, Infra, SubprocessShell
+from gpuctl.planner import gpu_type_label
 
 ROOT = Path("/srv/goaly")
 ENV = {"GCP_PROJECT": "demo-proj"}
@@ -55,31 +57,71 @@ def test_tf_output_refuses_unknown_stacks():
 
 
 def test_ensure_init_runs_init_once_per_uninitialised_stack(tmp_path):
+    (tmp_path / "infra/gpu-access").mkdir(parents=True)
     sh = FakeShell([ok()])
     infra = Infra(sh, tmp_path, ENV)
     infra.ensure_init("gpu-access")
     assert sh.calls[0].args == ["terraform", f"-chdir={tmp_path}/infra/gpu-access", "init", "-input=false",
                                 "-backend-config=bucket=demo-proj-k3s-tfstate", "-backend-config=prefix=gpu-access"]
     assert sh.calls[0].env["TF_VAR_state_bucket"] == "demo-proj-k3s-tfstate"
-    (tmp_path / "infra/gpu-access/.terraform").mkdir(parents=True)
+    (tmp_path / "infra/gpu-access/.terraform").mkdir()
     infra.ensure_init("gpu-access")
     assert len(sh.calls) == 1
 
 
 def test_ensure_init_needs_gcp_project(tmp_path):
+    (tmp_path / "infra/base").mkdir(parents=True)
     sh = FakeShell([])
     with pytest.raises(ValueError, match="GCP_PROJECT"):
         Infra(sh, tmp_path, {}).ensure_init("base")
     assert sh.calls == []
 
 
+def test_ensure_init_of_a_stack_missing_from_the_checkout_raises_command_error(tmp_path):
+    sh = FakeShell([])
+    with pytest.raises(CommandError, match="infra/workers does not exist"):
+        Infra(sh, tmp_path, ENV).ensure_init("workers")
+    assert sh.calls == []
+
+
 def test_apply_gpu_access_sorted_compact_json(tmp_path):
+    (tmp_path / "infra/gpu-access").mkdir(parents=True)
     sh = FakeShell([ok(), ok()])
     Infra(sh, tmp_path, ENV).apply_gpu_access(["129.80.30.31", "129.80.30.30"])
     assert [c.args[2] for c in sh.calls] == ["init", "apply"]
     assert sh.calls[-1].args[:2] == ["terraform", f"-chdir={tmp_path}/infra/gpu-access"]
     assert sh.calls[-1].args[-1] == '-var=gpu_ips=["129.80.30.30","129.80.30.31"]'
     assert "-auto-approve" in sh.calls[-1].args and "-input=false" in sh.calls[-1].args
+
+
+def test_apply_gpu_access_deduplicates_and_sorts_numerically(tmp_path):
+    (tmp_path / "infra/gpu-access/.terraform").mkdir(parents=True)
+    sh = FakeShell([ok()])
+    Infra(sh, tmp_path, ENV).apply_gpu_access(["129.80.30.30", "9.1.1.1", "129.80.30.30"])
+    assert sh.calls[-1].args[-1] == '-var=gpu_ips=["9.1.1.1","129.80.30.30"]'
+
+
+def test_fake_infra_normalises_gpu_ips_like_infra():  # S0-2: same list as the real adapter passes to Terraform
+    infra = FakeInfra()
+    infra.apply_gpu_access(["129.80.30.30", "9.1.1.1", "129.80.30.30"])
+    assert infra.applied_gpu_ips == [["9.1.1.1", "129.80.30.30"]]
+    assert infra.events == ["tf:['9.1.1.1', '129.80.30.30']"]
+
+
+@pytest.mark.parametrize("bad", [None, "10.0.0.5", "not-an-ip"])
+def test_fake_infra_refuses_bad_gpu_ips_like_infra(bad):  # Review Focus #2
+    infra = FakeInfra()
+    with pytest.raises(ValueError):
+        infra.apply_gpu_access([bad])
+    with pytest.raises(ValueError):
+        infra.join_node("k3s-gpu-a6000-1", bad, "a6000")
+    assert infra.applied_gpu_ips == [] and infra.joined == [] and infra.events == []
+
+
+def test_fake_infra_join_node_accepts_underscore_gpu_types():
+    infra = FakeInfra()
+    infra.join_node("k3s-gpu-a100-1", "129.80.30.30", gpu_type_label("gpu_8x_a100_80gb_sxm4"))
+    assert infra.joined == [("k3s-gpu-a100-1", "129.80.30.30", "a100_80gb_sxm4")]
 
 
 def test_apply_gpu_access_empty_list(tmp_path):
@@ -119,6 +161,52 @@ def test_cp_ssh_uses_iap_and_zone():
     assert len(sh.calls) == 3 and sh.calls[2].args[-1] == "uptime"  # the zone is read once
 
 
+def test_reading_base_outputs_caches_the_cp_zone():  # C0-4: sync-peers reads infra/base once
+    sh = FakeShell([BASE_OUTPUTS, ok("hello\n")])
+    infra = Infra(sh, ROOT, ENV)
+    assert infra.tf_output("base")["cp_zone"] == "us-west1-b"
+    infra.cp_ssh("sudo true")
+    assert len(sh.calls) == 2 and sh.calls[1].args[:4] == ["gcloud", "compute", "ssh", "k3s-cp"]
+
+
+def test_an_invalid_cp_zone_in_base_outputs_is_not_cached():
+    bad = ok(json.dumps({"cp_zone": {"value": "us-west1-b; id", "type": "string"}}))
+    sh = FakeShell([bad, bad])
+    infra = Infra(sh, ROOT, ENV)
+    infra.tf_output("base")
+    with pytest.raises(ValueError, match="cp_zone"):
+        infra.cp_ssh("sudo true")
+
+
+def test_reads_are_bounded_by_a_timeout_and_apply_is_not(tmp_path):  # X0-4
+    (tmp_path / "infra/gpu-access").mkdir(parents=True)
+    sh = FakeShell([BASE_OUTPUTS, ok(), ok(), ok()])
+    infra = Infra(sh, tmp_path, ENV)
+    infra.cp_ssh("sudo true")
+    infra.apply_gpu_access(["129.80.30.30"])
+    assert [(c.args[0], c.args[2], c.timeout) for c in sh.calls] == [
+        ("terraform", "output", TF_READ_TIMEOUT_S), ("gcloud", "ssh", CP_SSH_TIMEOUT_S),
+        ("terraform", "init", TF_READ_TIMEOUT_S), ("terraform", "apply", None),
+    ]
+
+
+def test_child_processes_never_get_the_lambda_api_key(tmp_path):  # X0-3
+    (tmp_path / "infra/gpu-access/.terraform").mkdir(parents=True)
+    env = {**ENV, "HOME": "/h", "PATH": "/usr/bin", "LAMBDA_API_KEY": "secret_abc"}
+    sh = FakeShell([BASE_OUTPUTS, ok(), ok(), ok(), ok(), ok("73.15.40.40\n")])
+    infra = Infra(sh, tmp_path, env)
+    infra.cp_ssh("sudo true")
+    infra.apply_gpu_access(["129.80.30.30"])
+    infra.kubectl("get", "nodes")
+    infra.join_node("k3s-gpu-a6000-1", "129.80.30.30", "a6000")
+    infra.detect_operator_ip()
+    assert [c.args[0] for c in sh.calls] == ["terraform", "gcloud", "terraform", "kubectl",
+                                             f"{tmp_path}/scripts/join-node.sh", "curl"]
+    for call in sh.calls:
+        assert "LAMBDA_API_KEY" not in call.env and call.env["PATH"] == "/usr/bin", call.args
+    assert env["LAMBDA_API_KEY"] == "secret_abc"  # the caller's mapping is untouched
+
+
 def test_cp_ssh_failure_raises():
     sh = FakeShell([BASE_OUTPUTS, fail(255, "ssh: connect to host failed")])
     with pytest.raises(CommandError):
@@ -131,6 +219,13 @@ def test_kubectl_uses_the_cluster_kubeconfig():
     Infra(sh, ROOT, {"HOME": "/home/op", "KUBECONFIG": "/tmp/kc"}).kubectl("get", "nodes")
     assert sh.calls[0].args == ["kubectl", "--kubeconfig", "/home/op/.kube/hybrid-gpu.yaml", "get", "nodes"]
     assert sh.calls[1].args == ["kubectl", "--kubeconfig", "/tmp/kc", "get", "nodes"]
+
+
+def test_kubectl_refuses_a_kubeconfig_list():  # X0-2: kubectl --kubeconfig takes one file
+    sh = FakeShell([])
+    with pytest.raises(ValueError, match="KUBECONFIG"):
+        Infra(sh, ROOT, {"KUBECONFIG": f"/home/op/.kube/a.yaml{os.pathsep}/home/op/.kube/b.yaml"}).kubectl("version")
+    assert sh.calls == []
 
 
 def test_cluster_gpu_nodes_maps_gpu_nodes_to_their_external_ip():
@@ -174,6 +269,27 @@ def test_delete_other_errors_raise():
         Infra(sh, ROOT, {}).drain_and_delete_node("x")
 
 
+@pytest.mark.parametrize("stderr", [
+    "Error from server (NotFound): the server could not find the requested resource",  # e.g. a stale tunnel
+    'Error from server (NotFound): nodes "k3s-gpu-other-9" not found',                   # another node
+    'Error from server (NotFound): nodes "k3s-gpu-a6000-10" not found',                  # a longer name
+])
+@pytest.mark.parametrize("step", ["drain", "delete"])
+def test_only_this_node_being_gone_counts_as_success(step, stderr):  # C0-1
+    results = [fail(1, stderr)] if step == "drain" else [ok(), fail(1, stderr)]
+    sh = FakeShell(results)
+    with pytest.raises(CommandError):
+        Infra(sh, ROOT, {}).drain_and_delete_node("k3s-gpu-a6000-1")
+    assert len(sh.calls) == len(results)
+
+
+def test_this_node_not_found_is_tolerated_by_both_steps():
+    gone = 'Error from server (NotFound): nodes "k3s-gpu-a6000-1" not found'
+    sh = FakeShell([fail(1, gone), fail(1, gone)])
+    Infra(sh, ROOT, {}).drain_and_delete_node("k3s-gpu-a6000-1")
+    assert [c.args[3] for c in sh.calls] == ["drain", "delete"]
+
+
 # --- join-node, host keys, operator IP, cp guard ------------------------------------------------
 
 def test_join_node_runs_the_script_and_raises_on_failure():
@@ -186,12 +302,28 @@ def test_join_node_runs_the_script_and_raises_on_failure():
         infra.join_node("k3s-gpu-a6000-1", "129.80.30.30", "a6000")
 
 
+@pytest.mark.parametrize("instance_type, label", [
+    ("gpu_8x_a100_80gb_sxm4", "a100_80gb_sxm4"), ("gpu_1x_h100_pcie", "h100_pcie"), ("gpu_1x_a6000", "a6000"),
+])
+def test_join_node_accepts_every_gpu_type_label(instance_type, label):  # S0-1: Task 20 passes gpu_type_label()
+    sh = FakeShell([ok()])
+    Infra(sh, ROOT, {}).join_node("k3s-gpu-a100-1", "129.80.30.30", gpu_type_label(instance_type))
+    args = sh.calls[0].args
+    assert args[args.index("--gpu-type") + 1] == label
+
+
 @pytest.mark.parametrize("name, ip, gpu_type", [
     ("k3s-gpu-a6000-1", "1.2.3.4 -oProxyCommand=evil", "a6000"),
     ("k3s-gpu-a6000-1", None, "a6000"),
     ("k3s-gpu-a6000-1", "10.0.0.5", "a6000"),
     ("--help", "129.80.30.30", "a6000"),
     ("k3s-gpu-a6000-1", "129.80.30.30", "a6000; id"),
+    ("k3s-gpu-a6000-1", "129.80.30.30", "--help"),
+    ("k3s-gpu-a6000-1", "129.80.30.30", "_a100"),
+    ("k3s-gpu-a6000-1", "129.80.30.30", "a100_"),
+    ("k3s-gpu-a6000-1", "129.80.30.30", "A100"),
+    ("k3s-gpu-a6000-1", "129.80.30.30", "a" * 64),  # longer than a K8s label value
+    ("k3s-gpu-a6000-1", "129.80.30.30", None),
 ])
 def test_join_node_refuses_bad_arguments(name, ip, gpu_type):
     sh = FakeShell([])
@@ -270,6 +402,15 @@ def test_subprocess_shell_failure_raises_unless_unchecked():
     assert (e.value.args, e.value.returncode, e.value.stderr) == (tuple(args), 3, "boom")
     assert "boom" in str(e.value) and "exit code 3" in str(e.value)
     assert SubprocessShell().run(args, check=False).returncode == 3
+
+
+def test_subprocess_shell_non_executable_file_raises_command_error(tmp_path):  # X0-5: exit 1, not a traceback
+    script = tmp_path / "join-node.sh"
+    script.write_text("#!/usr/bin/env bash\nexit 0\n")
+    script.chmod(0o644)
+    with pytest.raises(CommandError) as e:
+        SubprocessShell().run([str(script)])
+    assert e.value.returncode == 126 and "cannot run" in e.value.stderr
 
 
 def test_subprocess_shell_missing_program_and_timeout_raise_command_error():
