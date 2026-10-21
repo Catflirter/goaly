@@ -33,7 +33,18 @@ secrets: ## Scan committed history and uncommitted tracked changes for secrets
 	$(GITLEAKS) --pre-commit --staged .
 	$(GITLEAKS) --pre-commit .
 
-lint: ## Run all pre-commit hooks, the repo secret scan, then the tests
+# Offline only: -backend=false and the tests' mock provider need no cloud credentials.
+.PHONY: tf-test
+tf-test: ## terraform init + validate every infra/ stack, then terraform test where it has tests/
+	@for d in $(ROOT)/infra/*/; do \
+	  d=$${d%/}; echo "==> $$d"; \
+	  terraform -chdir="$$d" init -backend=false -input=false; \
+	  terraform -chdir="$$d" validate; \
+	  if [ -d "$$d/tests" ]; then terraform -chdir="$$d" test; fi; \
+	done
+
+lint: ## Run all pre-commit hooks, the repo secret scan, the Terraform tests, then the tests
 	$(PY) -m pre_commit run --all-files
 	$(MAKE) secrets
+	$(MAKE) tf-test
 	$(MAKE) test
