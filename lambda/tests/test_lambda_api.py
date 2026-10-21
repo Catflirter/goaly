@@ -1,4 +1,9 @@
+import http.client
+import http.server
 import io
+import ipaddress
+import threading
+import time
 import urllib.error
 
 import pytest
@@ -129,9 +134,70 @@ def test_unexpected_response_shape_raises_api_error():
         client.list_instances()
 
 
-def test_empty_api_key_is_rejected():
-    with pytest.raises(ValueError):
-        LambdaClient("", transport=FakeTransport({}))
+@pytest.mark.parametrize("data", [
+    {"instance_ids": "i-123"},  # a string would make launch return "i"
+    {"instance_ids": [123]},
+    {"instance_ids": [""]},
+    {"instance_ids": None},
+])
+def test_launch_rejects_malformed_instance_ids(data):
+    client, _ = make_client({("POST", "/instance-operations/launch"): (200, {"data": data})})
+    with pytest.raises(LambdaAPIError) as e:
+        client.launch(**LAUNCH_ARGS)
+    assert e.value.code == "gpuctl/unexpected-response"
+
+
+@pytest.mark.parametrize("field, value", [("region", None), ("instance_type", None), ("region", {"name": None}),
+                                          ("region", 7), ("id", None), ("ip", 7)])
+def test_instance_with_wrongly_typed_field_is_unexpected(field, value):
+    client, _ = make_client({("GET", "/instances"): (200, {"data": [{**INSTANCE_JSON, field: value}]})})
+    with pytest.raises(LambdaAPIError) as e:
+        client.list_instances()
+    assert e.value.code == "gpuctl/unexpected-response"
+
+
+@pytest.mark.parametrize("port_range", ["22", [22], [22, 22, 22], ["22", "22"], [True, False]])
+def test_rule_with_malformed_port_range_is_unexpected(port_range):
+    rule = {"protocol": "tcp", "port_range": port_range, "source_network": "1.2.3.4/32"}
+    client, _ = make_client({("GET", "/firewall-rulesets"): (200, {"data": [
+        {"id": "rs-1", "name": "k3s-gpu-us-west-1", "region": "us-west-1", "rules": [rule]}]})})
+    with pytest.raises(LambdaAPIError) as e:
+        client.list_rulesets()
+    assert e.value.code == "gpuctl/unexpected-response"
+
+
+@pytest.mark.parametrize("key", ["", "  ", "\r\n"])
+def test_empty_api_key_is_rejected(key):
+    with pytest.raises(ValueError, match="empty"):
+        LambdaClient(key, transport=FakeTransport({}))
+
+
+@pytest.mark.parametrize("key", ["secret_abc123.XYZ\r", "secret_abc123.XYZ\n", "secret_abc123.XYZ ",
+                                 "\tsecret_abc123.XYZ\r\n"])
+def test_surrounding_whitespace_is_stripped_from_key(key):
+    client, t = make_client({("GET", "/instances"): (200, {"data": []})}, api_key=key)
+    client.list_instances()
+    assert t.calls[-1][3]["Authorization"] == "Bearer secret_abc123.XYZ"
+
+
+@pytest.mark.parametrize("key", ["secret_abc\r123", "secret abc123", "secret_abc123\x00", "sekrit:123", "ключ"])
+def test_key_with_invalid_characters_is_refused_without_echo(key):
+    with pytest.raises(ValueError, match="invalid characters") as e:
+        LambdaClient(key, transport=FakeTransport({}))
+    assert "abc" not in str(e.value) and "sekrit" not in str(e.value) and "ключ" not in str(e.value)
+
+
+@pytest.mark.parametrize("base_url", ["http://cloud.lambda.ai/api/v1", "ftp://cloud.lambda.ai/api/v1",
+                                      "cloud.lambda.ai/api/v1", "http://127.0.0.1.evil.example/api"])
+def test_base_url_must_be_https(base_url):
+    with pytest.raises(ValueError, match="https"):
+        LambdaClient("k", transport=FakeTransport({}), base_url=base_url)
+
+
+@pytest.mark.parametrize("base_url", ["https://example.test/api/v1", "http://127.0.0.1:8080/api/v1",
+                                      "http://localhost:8080", "http://[::1]:8080"])
+def test_https_or_loopback_http_base_url_is_accepted(base_url):
+    LambdaClient("k", transport=FakeTransport({}), base_url=base_url)
 
 
 def test_rules_serialisation():
@@ -145,12 +211,39 @@ def test_rules_serialisation():
         {"protocol": "icmp", "source_network": "1.2.3.4/32", "description": "icmp"}]}
 
 
-@pytest.mark.parametrize("source", ["0.0.0.0/0", "::/0", "not-a-cidr"])
+# The everyone-CIDR is built, never written out: global constraints forbid the literal in any file.
+ANY_IPV4 = str(ipaddress.IPv4Network((0, 0)))
+assert ipaddress.ip_network(ANY_IPV4).num_addresses == 2**32  # really the whole IPv4 space (IPv4Network(0) is a /32)
+
+
+@pytest.mark.parametrize("source", [ANY_IPV4, "::/0", "not-a-cidr", "0.0.0.0/1", "128.0.0.0/1", "1.2.3.4/8",
+                                    "1.2.3.4/31", "2001:db8::1/128"])
 def test_open_or_invalid_sources_are_never_sent(source):
     client, t = make_client({("PATCH", "/firewall-rulesets/global"): (200, {"data": {}})})
     with pytest.raises(ValueError, match="source_network"):
         client.update_global_rules([FirewallRule("tcp", source, (6443, 6443))])
     assert t.calls == []
+
+
+@pytest.mark.parametrize("rule, match", [
+    (FirewallRule("sctp", "1.2.3.4/32", (1, 1)), "protocol"),
+    (FirewallRule("tcp", "1.2.3.4/32", (22, 21)), "port_range"),
+    (FirewallRule("tcp", "1.2.3.4/32", (0, 22)), "port_range"),
+    (FirewallRule("tcp", "1.2.3.4/32", (1, 65536)), "port_range"),
+    (FirewallRule("tcp", "1.2.3.4/32", (22,)), "port_range"),
+    (FirewallRule("tcp", "1.2.3.4/32", ("22", "22")), "port_range"),
+])
+def test_invalid_protocol_or_port_range_is_never_sent(rule, match):
+    client, t = make_client({("PATCH", "/firewall-rulesets/global"): (200, {"data": {}})})
+    with pytest.raises(ValueError, match=match):
+        client.update_global_rules([rule])
+    assert t.calls == []
+
+
+def test_bare_ip_source_is_sent_as_slash_32():
+    client, t = make_client({("PATCH", "/firewall-rulesets/global"): (200, {"data": {}})})
+    client.update_global_rules([FirewallRule("all", "1.2.3.4", None, "op")])
+    assert t.calls[-1][2] == {"rules": [{"protocol": "all", "source_network": "1.2.3.4/32", "description": "op"}]}
 
 
 def test_global_rules_path():
@@ -241,6 +334,34 @@ def test_rate_limits():
     assert fc.sleeps[-1] >= 11.0  # waited on the launch window, not just the 1 s window
 
 
+def test_no_op_sleep_with_frozen_clock_never_spins():
+    sleeps = []
+    t = FakeTransport({("GET", "/instances"): (200, {"data": []}),
+                       ("POST", "/instance-operations/launch"): LAUNCH_OK})
+    client = LambdaClient("k", transport=t, clock=lambda: 0.0, sleep=sleeps.append)
+    start = time.monotonic()
+    client.list_instances()
+    client.list_instances()
+    client.launch(**LAUNCH_ARGS)
+    client.launch(**LAUNCH_ARGS)
+    assert time.monotonic() - start < 0.5
+    # Scheduled sends: 0, 1, 2 (1 s window), 14 (12 s after the first launch at 2).
+    assert sleeps == [1.0, 2.0, 14.0]
+
+
+def test_brief_idiom_real_clock_and_no_op_sleep_returns_immediately():
+    t = FakeTransport({("GET", "/instances"): (200, {"data": []}),
+                       ("POST", "/instance-operations/launch"): LAUNCH_OK})
+    client = LambdaClient("k", transport=t, sleep=lambda s: None)
+    wall, cpu = time.monotonic(), time.process_time()
+    client.list_instances()
+    client.list_instances()
+    client.launch(**LAUNCH_ARGS)
+    client.launch(**LAUNCH_ARGS)
+    assert time.monotonic() - wall < 0.5 and time.process_time() - cpu < 0.5
+    assert len(t.calls) == 4
+
+
 def test_failed_launch_still_counts_toward_launch_window():
     fc = FakeClock()
     sent_at = []
@@ -295,7 +416,7 @@ def test_urllib_transport_builds_request(monkeypatch):
                     auth=req.get_header("Authorization"), ctype=req.get_header("Content-type"))
         return FakeResponse(200, b'{"data": {"ok": true}}')
 
-    monkeypatch.setattr(lambda_api.urllib.request, "urlopen", fake_urlopen)
+    monkeypatch.setattr(lambda_api._OPENER, "open", fake_urlopen)
     status, payload = lambda_api.urllib_transport("POST", BASE_URL + "/x", {"a": 1}, {"Authorization": "Bearer k"})
     assert (status, payload) == (200, {"data": {"ok": True}})
     assert seen == {"method": "POST", "url": BASE_URL + "/x", "data": b'{"a": 1}', "timeout": 30,
@@ -307,7 +428,7 @@ def test_urllib_transport_returns_http_errors_as_status(monkeypatch):
         body = io.BytesIO(b'{"error": {"code": "global/not-found", "message": "nope"}}')
         raise urllib.error.HTTPError(req.full_url, 404, "Not Found", {}, body)
 
-    monkeypatch.setattr(lambda_api.urllib.request, "urlopen", fake_urlopen)
+    monkeypatch.setattr(lambda_api._OPENER, "open", fake_urlopen)
     assert lambda_api.urllib_transport("GET", BASE_URL + "/x", None, {}) == (
         404, {"error": {"code": "global/not-found", "message": "nope"}})
 
@@ -316,7 +437,7 @@ def test_urllib_transport_tolerates_non_json_error_body(monkeypatch):
     def fake_urlopen(req, timeout):
         raise urllib.error.HTTPError(req.full_url, 503, "Unavailable", {}, io.BytesIO(b"<html>busy</html>"))
 
-    monkeypatch.setattr(lambda_api.urllib.request, "urlopen", fake_urlopen)
+    monkeypatch.setattr(lambda_api._OPENER, "open", fake_urlopen)
     assert lambda_api.urllib_transport("GET", BASE_URL + "/x", None, {}) == (503, {})
 
 
@@ -324,7 +445,7 @@ def test_urllib_transport_wraps_network_errors(monkeypatch):
     def fake_urlopen(req, timeout):
         raise urllib.error.URLError("connection refused")
 
-    monkeypatch.setattr(lambda_api.urllib.request, "urlopen", fake_urlopen)
+    monkeypatch.setattr(lambda_api._OPENER, "open", fake_urlopen)
     with pytest.raises(LambdaAPIError) as e:
         lambda_api.urllib_transport("GET", BASE_URL + "/x", None, {"Authorization": "Bearer sekrit-123"})
     assert e.value.status == 0 and "sekrit-123" not in str(e.value)
@@ -333,3 +454,95 @@ def test_urllib_transport_wraps_network_errors(monkeypatch):
 def test_default_transport_is_urllib():
     assert BASE_URL == "https://cloud.lambda.ai/api/v1"
     assert LambdaClient("k")._transport is lambda_api.urllib_transport
+
+
+class UnreadableBody(io.BytesIO):
+    def read(self, *args):
+        raise TimeoutError("timed out")
+
+
+class TruncatedResponse(FakeResponse):
+    def read(self, *args):
+        raise http.client.IncompleteRead(b'{"data": [', 100)
+
+
+def _raises(exc_factory):
+    def fake_open(req, timeout):
+        raise exc_factory(req)
+    return fake_open
+
+
+@pytest.mark.parametrize("fake_open", [
+    _raises(lambda req: urllib.error.HTTPError(req.full_url, 500, "Error", {}, UnreadableBody(b""))),
+    lambda req, timeout: TruncatedResponse(200, b""),
+    _raises(lambda req: http.client.BadStatusLine("garbage")),
+    _raises(lambda req: http.client.InvalidURL("bad url")),
+], ids=["httperror-unreadable-body", "incomplete-read", "bad-status-line", "invalid-url"])
+def test_urllib_transport_wraps_every_transport_failure(monkeypatch, fake_open):
+    monkeypatch.setattr(lambda_api._OPENER, "open", fake_open)
+    with pytest.raises(LambdaAPIError) as e:
+        lambda_api.urllib_transport("GET", BASE_URL + "/x", None, {"Authorization": "Bearer sekrit-123"})
+    assert e.value.status == 0 and "sekrit-123" not in str(e.value)
+
+
+def test_urllib_transport_header_rejection_does_not_echo_the_key():
+    # http.client refuses a CR in a header value before connecting, quoting the value in its ValueError.
+    # Loopback port 9 (discard): nothing is ever sent anywhere.
+    with pytest.raises(LambdaAPIError) as e:
+        lambda_api.urllib_transport("GET", "http://127.0.0.1:9/x", None, {"Authorization": "Bearer sekrit-123\r"})
+    assert e.value.code == "gpuctl/transport-error" and "sekrit-123" not in str(e.value)
+    assert e.value.__cause__ is None and e.value.__suppress_context__
+
+
+class _Recorder(http.server.BaseHTTPRequestHandler):
+    """Loopback server: records each request's method, path and Authorization header; replies as configured."""
+
+    seen: list
+    location: str | None = None
+
+    def _reply(self):
+        self.seen.append((self.command, self.path, self.headers.get("Authorization")))
+        self.rfile.read(int(self.headers.get("Content-Length") or 0))
+        body = b"" if self.location else b'{"data": {}}'
+        self.send_response(302 if self.location else 200)
+        if self.location:
+            self.send_header("Location", self.location)
+        self.send_header("Content-Length", str(len(body)))
+        self.end_headers()
+        self.wfile.write(body)
+
+    do_GET = do_POST = _reply
+
+    def log_message(self, *args):
+        pass
+
+
+def _serve(seen, location=None):
+    handler = type("Handler", (_Recorder,), {"seen": seen, "location": location})
+    server = http.server.ThreadingHTTPServer(("127.0.0.1", 0), handler)
+    threading.Thread(target=server.serve_forever, daemon=True).start()
+    return server
+
+
+@pytest.mark.parametrize("method, body", [("GET", None), ("POST", {"a": 1})])
+def test_urllib_transport_refuses_redirects_and_never_forwards_the_key(method, body):
+    other_seen, api_seen = [], []
+    other = _serve(other_seen)  # a different host:port that the redirect points at
+    api = _serve(api_seen, location=f"http://127.0.0.1:{other.server_address[1]}/stolen")
+    try:
+        status, payload = lambda_api.urllib_transport(
+            method, f"http://127.0.0.1:{api.server_address[1]}/x", body, {"Authorization": "Bearer sekrit-123"})
+    finally:
+        for server in (api, other):
+            server.shutdown()
+            server.server_close()
+    assert (status, payload) == (302, {})
+    assert api_seen == [(method, "/x", "Bearer sekrit-123")]
+    assert other_seen == []
+
+
+def test_client_turns_a_redirect_into_an_error():
+    client, _ = make_client({("GET", "/instances"): (302, {})})
+    with pytest.raises(LambdaAPIError) as e:
+        client.list_instances()
+    assert (e.value.code, e.value.status) == ("http/302", 302)

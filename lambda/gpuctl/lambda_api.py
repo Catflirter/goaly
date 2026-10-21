@@ -8,8 +8,10 @@ the live API.
 
 from __future__ import annotations
 
+import http.client
 import ipaddress
 import json
+import re
 import time
 import urllib.error
 import urllib.parse
@@ -23,6 +25,9 @@ TIMEOUT_S = 30
 MIN_REQUEST_INTERVAL_S = 1.0
 MIN_LAUNCH_INTERVAL_S = 12.0
 USER_AGENT = "gpuctl"
+PROTOCOLS = frozenset({"tcp", "udp", "icmp", "all"})
+_API_KEY_RE = re.compile(r"[A-Za-z0-9._-]+")
+_LOOPBACK_HOSTS = frozenset({"127.0.0.1", "localhost", "::1"})
 
 Transport = Callable[[str, str, dict | None, dict[str, str]], tuple[int, dict]]
 
@@ -81,60 +86,102 @@ def _read_json(raw: bytes) -> dict:
     return payload if isinstance(payload, dict) else {}
 
 
+class _RefuseRedirects(urllib.request.HTTPRedirectHandler):
+    """Never follow a 3xx: urllib would re-send the Authorization header to any Location, even plain http."""
+
+    def redirect_request(self, req, fp, code, msg, headers, newurl):
+        return None  # urllib then raises HTTPError(3xx), which the transport returns as a status
+
+
+_OPENER = urllib.request.build_opener(_RefuseRedirects)
+
+
 def urllib_transport(method: str, url: str, json_body: dict | None, headers: dict[str, str]) -> tuple[int, dict]:
-    """Default transport: one HTTPS request, 30 s timeout, JSON in and out."""
+    """Default transport: one HTTPS request, 30 s timeout, JSON in and out, redirects refused."""
     data = None
     headers = dict(headers)
+    auth = headers.pop("Authorization", None)
     if json_body is not None:
         data = json.dumps(json_body).encode()
         headers["Content-Type"] = "application/json"
-    req = urllib.request.Request(url, data=data, headers=headers, method=method)
     try:
-        with urllib.request.urlopen(req, timeout=TIMEOUT_S) as resp:
-            return resp.status, _read_json(resp.read())
-    except urllib.error.HTTPError as e:
-        with e:
-            return e.code, _read_json(e.read())
+        req = urllib.request.Request(url, data=data, headers=headers, method=method)
+        if auth is not None:
+            req.add_unredirected_header("Authorization", auth)
+        try:
+            with _OPENER.open(req, timeout=TIMEOUT_S) as resp:
+                return resp.status, _read_json(resp.read())
+        except urllib.error.HTTPError as e:
+            with e:
+                return e.code, _read_json(e.read())
     except (urllib.error.URLError, OSError) as e:
         # The key travels only in a header, which neither the URL nor the reason contains.
         raise LambdaAPIError("gpuctl/network-error", 0, str(getattr(e, "reason", e))) from None
+    except http.client.HTTPException as e:
+        # IncompleteRead, BadStatusLine, LineTooLong, InvalidURL: their text can quote raw bytes, so name the type.
+        raise LambdaAPIError("gpuctl/network-error", 0, type(e).__name__) from None
+    except ValueError as e:
+        # e.g. http.client refusing a header value: its message quotes the value, which may be the key.
+        raise LambdaAPIError("gpuctl/transport-error", 0, type(e).__name__) from None
+
+
+def _str(value: Any) -> str:
+    """A field that must be a string; anything else is an unexpected shape (TypeError, turned into one by _parse)."""
+    if not isinstance(value, str):
+        raise TypeError(f"expected a string, got {type(value).__name__}")
+    return value
 
 
 def _name(value: Any) -> str:
     """Lambda returns some references as {"name": ...} objects and some as plain strings."""
-    return value["name"] if isinstance(value, dict) else value
+    return _str(value["name"] if isinstance(value, dict) else value)
+
+
+def _is_int(value: Any) -> bool:
+    return isinstance(value, int) and not isinstance(value, bool)
 
 
 def _parse_instance(raw: dict) -> Instance:
-    return Instance(id=raw["id"], name=raw["name"], status=raw["status"], ip=raw.get("ip"),
+    ip = raw.get("ip")
+    return Instance(id=_str(raw["id"]), name=_str(raw["name"]), status=_str(raw["status"]),
+                    ip=None if ip is None else _str(ip),
                     region=_name(raw["region"]), instance_type=_name(raw["instance_type"]))
 
 
 def _parse_rule(raw: dict) -> FirewallRule:
     port_range = raw.get("port_range")
-    return FirewallRule(protocol=raw["protocol"], source_network=raw["source_network"],
-                        port_range=tuple(port_range) if port_range is not None else None,
-                        description=raw.get("description", ""))
+    if port_range is not None:
+        if not (isinstance(port_range, list) and len(port_range) == 2 and all(_is_int(p) for p in port_range)):
+            raise TypeError(f"port_range must be a list of two ints, got {port_range!r}")
+        port_range = (port_range[0], port_range[1])
+    return FirewallRule(protocol=_str(raw["protocol"]), source_network=_str(raw["source_network"]),
+                        port_range=port_range, description=_str(raw.get("description", "")))
 
 
 def _parse_ruleset(raw: dict) -> Ruleset:
-    return Ruleset(id=raw["id"], name=raw["name"], region=_name(raw["region"]),
+    return Ruleset(id=_str(raw["id"]), name=_str(raw["name"]), region=_name(raw["region"]),
                    rules=tuple(_parse_rule(r) for r in raw["rules"]))
 
 
 def _serialise_rules(rules: Iterable[FirewallRule]) -> list[dict]:
+    """The last check before any rule reaches Lambda: every source is a single IPv4 /32 (global constraints)."""
     out = []
     for rule in rules:
         try:
             network = ipaddress.ip_network(rule.source_network, strict=False)
         except ValueError:
             raise ValueError(f"source_network {rule.source_network!r} is not a CIDR") from None
-        if network.prefixlen == 0:
-            raise ValueError(f"source_network {rule.source_network!r} opens the rule to everyone")
+        if network.version != 4 or network.prefixlen != 32:
+            raise ValueError(f"source_network {rule.source_network!r} is not a single IPv4 address (/32)")
+        if rule.protocol not in PROTOCOLS:
+            raise ValueError(f"protocol {rule.protocol!r} is not one of {sorted(PROTOCOLS)}")
         item: dict[str, Any] = {"protocol": rule.protocol}
         if rule.port_range is not None:
-            item["port_range"] = list(rule.port_range)
-        item["source_network"] = rule.source_network
+            pr = rule.port_range
+            if not (len(pr) == 2 and all(_is_int(p) for p in pr) and 1 <= pr[0] <= pr[1] <= 65535):
+                raise ValueError(f"port_range {pr!r} must be (lo, hi) with 1 <= lo <= hi <= 65535")
+            item["port_range"] = [pr[0], pr[1]]
+        item["source_network"] = str(network)
         item["description"] = rule.description
         out.append(item)
     return out
@@ -148,8 +195,17 @@ class LambdaClient:
     def __init__(self, api_key: str, *, transport: Transport | None = None,
                  clock: Callable[[], float] = time.monotonic, sleep: Callable[[float], None] = time.sleep,
                  base_url: str = BASE_URL) -> None:
+        # Surrounding whitespace (a trailing CR from a CRLF .env, a pasted newline) is never part of a key, so it
+        # is stripped. Any other character outside the charset is refused with a message that never quotes the
+        # key: http.client would otherwise reject the header with a ValueError that prints it in full.
+        api_key = api_key.strip()
         if not api_key:
             raise ValueError("Lambda API key is empty")
+        if not _API_KEY_RE.fullmatch(api_key):
+            raise ValueError("Lambda API key contains invalid characters (allowed: letters, digits, '.', '_', '-')")
+        parts = urllib.parse.urlsplit(base_url)
+        if not (parts.scheme == "https" or (parts.scheme == "http" and parts.hostname in _LOOPBACK_HOSTS)):
+            raise ValueError("base_url must be https:// (plain http only for a loopback host)")
         self._api_key = api_key
         self._transport = transport or urllib_transport
         self._clock = clock
@@ -164,20 +220,21 @@ class LambdaClient:
     # --- plumbing ---
 
     def _wait_turn(self, is_launch: bool) -> None:
-        while True:
-            now = self._clock()
-            ready = []
-            if self._last_request is not None:
-                ready.append(self._last_request + MIN_REQUEST_INTERVAL_S)
-            if is_launch and self._last_launch is not None:
-                ready.append(self._last_launch + MIN_LAUNCH_INTERVAL_S)
-            wait = max(ready, default=now) - now
-            if wait <= 0:
-                break
+        # Read the clock once, sleep once, and record the scheduled send time. Re-reading the clock in a loop
+        # would turn an injected no-op sleep (the tests' idiom) into a busy-spin on the real clock.
+        now = self._clock()
+        ready = []
+        if self._last_request is not None:
+            ready.append(self._last_request + MIN_REQUEST_INTERVAL_S)
+        if is_launch and self._last_launch is not None:
+            ready.append(self._last_launch + MIN_LAUNCH_INTERVAL_S)
+        wait = max(ready, default=now) - now
+        if wait > 0:
             self._sleep(wait)
-        self._last_request = now
+        sent = now + max(wait, 0.0)
+        self._last_request = sent
         if is_launch:
-            self._last_launch = now
+            self._last_launch = sent
 
     def _redact(self, text: str) -> str:
         return text.replace(self._api_key, "***")
@@ -224,12 +281,18 @@ class LambdaClient:
 
     def launch(self, *, name: str, region: str, instance_type: str, ssh_key_name: str, image_family: str,
                ruleset_id: str) -> str:
+        """Launch one instance and return its id.
+
+        InsufficientCapacity means nothing was launched. Any other error (a timeout or lost response after
+        Lambda accepted the request, a 5xx, an unexpected body) leaves the outcome unknown: before retrying,
+        callers must call list_instances() and look for `name`, or they may start a second billable instance.
+        """
         body = {"region_name": region, "instance_type_name": instance_type, "ssh_key_names": [ssh_key_name],
                 "name": name, "hostname": name, "image": {"family": image_family},
                 "firewall_rulesets": [{"id": ruleset_id}]}
         data = self._request("POST", "/instance-operations/launch", body, is_launch=True)
-        ids = self._parse("launch", lambda: list(data["instance_ids"]))
-        if not ids:
+        ids = self._parse("launch", lambda: data["instance_ids"])
+        if not isinstance(ids, list) or not ids or not isinstance(ids[0], str) or not ids[0]:
             raise LambdaAPIError("gpuctl/unexpected-response", 200, "launch returned no instance id")
         return ids[0]
 
