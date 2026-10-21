@@ -51,10 +51,20 @@ def test_plan_prints_creates_and_cost(capsys):
     assert rc == 0 and "create k3s-gpu-a6000-1" in out and "$1.99/h" in out
 
 
-def test_plan_set_count_is_preview_only():
+def test_plan_set_count_is_preview_only(tmp_path):
+    # budget 5.0: two new a6000 nodes ($3.98 worst case) fit, so the preview runs to completion
     fake = FakeLambda(types=TYPES)
-    main(["plan", "--set-count", "a6000=2"], env=ENV, client=fake)
+    rc = main(["--spec", spec_file(tmp_path, budget_usd_per_hour=5.0), "plan", "--set-count", "a6000=2"],
+              env=ENV, client=fake)
+    assert rc == 0 and fake.calls
     assert all(c[0] in ("instance_types", "list_instances") for c in fake.calls)
+
+
+def test_plan_set_count_over_the_repo_budget_is_refused_and_still_read_only(capsys):
+    fake = FakeLambda(types=TYPES)
+    rc = main(["plan", "--set-count", "a6000=2"], env=ENV, client=fake)
+    assert rc == 2 and "budget" in capsys.readouterr().err
+    assert fake.calls and all(c[0] in ("instance_types", "list_instances") for c in fake.calls)
 
 
 def test_plan_set_count_changes_the_target(tmp_path, capsys):
@@ -132,9 +142,17 @@ def test_missing_api_key_exits_2(env, capsys):
     assert rc == 2 and "LAMBDA_API_KEY" in captured.err and fake.calls == []
 
 
-@pytest.mark.parametrize("argv", [[], ["frobnicate"], ["ip"], ["status", "extra"]])
-def test_usage_errors_exit_2(argv, capsys):
+@pytest.mark.parametrize("argv, message", [
+    ([], "gpuctl: the following arguments are required: COMMAND"),
+    (["frobnicate"], "gpuctl: argument COMMAND: invalid choice: 'frobnicate'"),
+    (["ip"], "gpuctl: ip: the following arguments are required: NAME"),
+    (["status", "extra"], "gpuctl: unrecognized arguments: extra"),
+    (["--bogus", "status"], "gpuctl: unrecognized arguments: --bogus"),
+])
+def test_usage_errors_exit_2(argv, message, capsys):
     assert main(argv, env=ENV, client=FakeLambda(types=TYPES)) == 2
+    err = capsys.readouterr().err
+    assert message in err and "gpuctl: gpuctl" not in err
 
 
 def test_client_is_built_from_the_env_key(monkeypatch):
@@ -253,6 +271,25 @@ def test_ip_of_node_without_address_exits_1(capsys):
     assert main(["ip", "k3s-gpu-a6000-1"], env=ENV, client=fake) == 1
     captured = capsys.readouterr()
     assert captured.out == "" and "booting" in captured.err
+
+
+BAD_IPS = ["1.2.3.4 -oProxyCommand=evil", "1.2.3.4;id", "-oX", "2001:db8::1", "1.2.3", "01.2.3.4", " 1.2.3.4"]
+
+
+@pytest.mark.parametrize("bad_ip", BAD_IPS)
+def test_ip_refuses_an_address_that_is_not_ipv4(bad_ip, capsys):
+    fake = FakeLambda(instances=[inst("k3s-gpu-a6000-1", ip=bad_ip)])
+    assert main(["ip", "k3s-gpu-a6000-1"], env=ENV, client=fake) == 1
+    captured = capsys.readouterr()
+    assert captured.out == "" and "invalid IP" in captured.err and "k3s-gpu-a6000-1" in captured.err
+
+
+@pytest.mark.parametrize("command", [["list-nodes"], ["status"], ["plan"]])
+def test_node_lines_refuse_an_address_that_is_not_ipv4(command, capsys):
+    fake = FakeLambda(types=TYPES, instances=[inst("k3s-gpu-a6000-1", ip="1.2.3.4 -oX")])
+    assert main(command, env=ENV, client=fake) == 1
+    captured = capsys.readouterr()
+    assert "-oX" not in captured.out and "invalid IP" in captured.err
 
 
 def test_ip_with_duplicate_names_uses_the_instance_the_planner_keeps(capsys):

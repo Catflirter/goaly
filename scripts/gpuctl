@@ -6,4 +6,6 @@ set -euo pipefail
 source "$(dirname -- "${BASH_SOURCE[0]}")/lib/common.sh"
 load_env
 [[ -x "$REPO_ROOT/.venv/bin/python" ]] || die "$REPO_ROOT/.venv/bin/python not found: run make venv"
-exec env PYTHONPATH="$REPO_ROOT/lambda" "$REPO_ROOT/.venv/bin/python" -m gpuctl "$@"
+# -P (safe path, Python >= 3.11): `-m` would otherwise put the caller's cwd first on sys.path, so a stray
+# argparse.py or yaml.py there would run with the .env secrets in its environment.
+exec env PYTHONPATH="$REPO_ROOT/lambda" "$REPO_ROOT/.venv/bin/python" -P -m gpuctl "$@"

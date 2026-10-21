@@ -3,6 +3,7 @@ import os
 import shutil
 import stat
 import subprocess
+import sys
 from pathlib import Path
 
 import pytest
@@ -63,7 +64,8 @@ def test_load_env_exports_the_file(repo):
 
 def test_load_env_without_file_fails(repo):
     proc = lib(repo, "load_env; echo reached")
-    assert proc.returncode != 0 and "reached" not in proc.stdout
+    # 2 = refused, the same code `gpuctl` itself uses when LAMBDA_API_KEY is missing
+    assert proc.returncode == 2 and "reached" not in proc.stdout
     assert ".env" in proc.stderr and "chmod 600" in proc.stderr
 
 
@@ -71,7 +73,7 @@ def test_load_env_without_file_fails(repo):
 def test_load_env_refuses_any_mode_but_600(repo, mode):
     write_env(repo, mode=mode)
     proc = lib(repo, "load_env; echo reached")
-    assert proc.returncode != 0 and "reached" not in proc.stdout
+    assert proc.returncode == 2 and "reached" not in proc.stdout
     assert "600" in proc.stderr and "k-123" not in proc.stdout + proc.stderr
 
 
@@ -80,13 +82,18 @@ def test_load_env_checks_the_target_of_a_symlink(repo, tmp_path_factory):
     real.write_text("LAMBDA_API_KEY=k-123\n")
     real.chmod(0o644)
     (repo / ".env").symlink_to(real)
-    assert lib(repo, "load_env").returncode != 0
+    assert lib(repo, "load_env").returncode == 2
 
 
 def test_die_exits_1_and_log_writes_stderr(repo):
     proc = lib(repo, 'log "hello"; die "boom"; echo reached')
     assert proc.returncode == 1 and proc.stdout == ""
     assert "hello" in proc.stderr and "boom" in proc.stderr
+
+
+def test_die_takes_an_optional_exit_code(repo):
+    proc = lib(repo, 'die "refused" 2; echo reached')
+    assert proc.returncode == 2 and proc.stdout == "" and "error: refused" in proc.stderr
 
 
 def test_wrapper_runs_the_package_from_the_venv_with_env_loaded(repo, tmp_path_factory):
@@ -96,14 +103,14 @@ def test_wrapper_runs_the_package_from_the_venv_with_env_loaded(repo, tmp_path_f
     assert proc.returncode == 0, proc.stderr
     assert proc.stdout.splitlines() == [
         f"PYTHONPATH={repo.resolve()}/lambda", "KEY=k-123",
-        "ARG=-m", "ARG=gpuctl", "ARG=plan", "ARG=--set-count", "ARG=a6000=2", "ARG=two words",
+        "ARG=-P", "ARG=-m", "ARG=gpuctl", "ARG=plan", "ARG=--set-count", "ARG=a6000=2", "ARG=two words",
     ]
 
 
 def test_wrapper_refuses_without_a_private_env(repo):
     write_env(repo, mode=0o644)
     proc = run([str(repo / "scripts/gpuctl"), "status"], repo)
-    assert proc.returncode != 0 and "PYTHONPATH" not in proc.stdout
+    assert proc.returncode == 2 and "PYTHONPATH" not in proc.stdout
 
 
 def test_wrapper_without_venv_says_how_to_fix(repo):
@@ -111,3 +118,17 @@ def test_wrapper_without_venv_says_how_to_fix(repo):
     shutil.rmtree(repo / ".venv")
     proc = run([str(repo / "scripts/gpuctl"), "status"], repo)
     assert proc.returncode != 0 and "make venv" in proc.stderr
+
+
+def test_wrapper_never_imports_modules_from_the_callers_cwd(repo, tmp_path_factory):
+    """`python -m` would put the cwd first on sys.path: a stray argparse.py there must not run with .env loaded."""
+    write_env(repo)
+    shutil.copytree(ROOT / "lambda/gpuctl", repo / "lambda/gpuctl")
+    (repo / ".venv/bin/python").write_text(f'#!/usr/bin/env bash\nexec "{sys.executable}" "$@"\n')
+    hostile = tmp_path_factory.mktemp("hostile")
+    marker = hostile / "imported"
+    for module in ("argparse.py", "yaml.py", "gpuctl.py"):
+        (hostile / module).write_text(f"open({str(marker)!r}, 'a').write({module!r})\n")
+    proc = run([str(repo / "scripts/gpuctl"), "--help"], repo, cwd=hostile)
+    assert proc.returncode == 0, proc.stderr
+    assert "list-nodes" in proc.stdout and not marker.exists()

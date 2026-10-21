@@ -9,6 +9,7 @@ Exit codes: 0 success; 1 an operation failed or the target was not found; 2 refu
 from __future__ import annotations
 
 import argparse
+import ipaddress
 import os
 import sys
 from collections.abc import Iterable, Mapping
@@ -41,7 +42,9 @@ class _Failed(Exception):
 class _ArgumentParser(argparse.ArgumentParser):
     def error(self, message: str) -> None:  # argparse would sys.exit(2); main returns codes instead
         self.print_usage(sys.stderr)
-        raise _Refused(f"{self.prog}: {message}")
+        # main() adds "gpuctl: "; a subcommand parser's prog is "gpuctl <command>", so keep only the command
+        command = self.prog.removeprefix("gpuctl").strip()
+        raise _Refused(f"{command}: {message}" if command else message)
 
 
 def _clean(text: str) -> str:
@@ -69,8 +72,24 @@ def _set_counts(items: Iterable[str]) -> dict[str, int]:
     return counts
 
 
+def _checked_ip(instance: Instance) -> str | None:
+    """The instance's IP, refused unless it is a plain dotted-quad IPv4 address.
+
+    `ip` and `list-nodes` output feeds scripts (ssh targets, Terraform gpu_ips): an API-supplied value such as
+    "1.2.3.4 -oProxyCommand=..." must never reach them.
+    """
+    if instance.ip is None:
+        return None
+    try:
+        ipaddress.IPv4Address(instance.ip)
+    except ValueError:
+        raise _Failed(f"{instance.name} has an invalid IP from the API: {instance.ip!r}") from None
+    return instance.ip
+
+
 def _node_line(instance: Instance) -> str:
-    return f"{instance.name} {instance.ip or '-'} {instance.status} {instance.instance_type} {instance.region}"
+    ip = _checked_ip(instance) or "-"
+    return f"{instance.name} {ip} {instance.status} {instance.instance_type} {instance.region}"
 
 
 def _owned_sorted(instances: Iterable[Instance]) -> list[Instance]:
@@ -108,7 +127,7 @@ def _plan(args: argparse.Namespace, spec: Spec, client, out: TextIO) -> int:
         why = "duplicate name" if instance.id in duplicate_ids else instance.status
         _emit(out, f"delete {instance.name} {instance.id} ({why})")
     for instance in plan.keep:
-        _emit(out, f"keep {instance.name} {instance.ip or '-'} ({instance.status})")
+        _emit(out, f"keep {instance.name} {_checked_ip(instance) or '-'} ({instance.status})")
     if not plan.create and not plan.delete:
         _emit(out, "No instance changes")
     nodes = len(plan.keep) + len(plan.create)
@@ -170,9 +189,10 @@ def _ip(args: argparse.Namespace, client, out: TextIO) -> int:
     if not matches:
         raise _Failed(f"no running GPU node named {args.name!r}")
     instance = matches[0]
-    if instance.ip is None:
+    ip = _checked_ip(instance)
+    if ip is None:
         raise _Failed(f"{args.name} has no IP yet (status {instance.status})")
-    _emit(out, instance.ip)
+    _emit(out, ip)
     return EXIT_OK
 
 
