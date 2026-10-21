@@ -132,6 +132,11 @@ def _str(value: Any) -> str:
     return value
 
 
+def _optional_str(value: Any) -> str:
+    """An optional display field (instance name, rule description): absent or null reads as "", other types fail."""
+    return "" if value is None else _str(value)
+
+
 def _name(value: Any) -> str:
     """Lambda returns some references as {"name": ...} objects and some as plain strings."""
     return _str(value["name"] if isinstance(value, dict) else value)
@@ -143,7 +148,7 @@ def _is_int(value: Any) -> bool:
 
 def _parse_instance(raw: dict) -> Instance:
     ip = raw.get("ip")
-    return Instance(id=_str(raw["id"]), name=_str(raw["name"]), status=_str(raw["status"]),
+    return Instance(id=_str(raw["id"]), name=_optional_str(raw.get("name")), status=_str(raw["status"]),
                     ip=None if ip is None else _str(ip),
                     region=_name(raw["region"]), instance_type=_name(raw["instance_type"]))
 
@@ -155,7 +160,7 @@ def _parse_rule(raw: dict) -> FirewallRule:
             raise TypeError(f"port_range must be a list of two ints, got {port_range!r}")
         port_range = (port_range[0], port_range[1])
     return FirewallRule(protocol=_str(raw["protocol"]), source_network=_str(raw["source_network"]),
-                        port_range=port_range, description=_str(raw.get("description", "")))
+                        port_range=port_range, description=_optional_str(raw.get("description")))
 
 
 def _parse_ruleset(raw: dict) -> Ruleset:
@@ -220,8 +225,10 @@ class LambdaClient:
     # --- plumbing ---
 
     def _wait_turn(self, is_launch: bool) -> None:
-        # Read the clock once, sleep once, and record the scheduled send time. Re-reading the clock in a loop
-        # would turn an injected no-op sleep (the tests' idiom) into a busy-spin on the real clock.
+        # Read the clock, sleep once, then read it once more and record the later of the scheduled and the
+        # actual send time: a real sleep oversleeps by a varying amount, and timing the next wait from the
+        # scheduled time could then space two real sends under the minimum. Never loop: with an injected no-op
+        # sleep (the tests' idiom) re-reading until the time is reached would busy-spin on the real clock.
         now = self._clock()
         ready = []
         if self._last_request is not None:
@@ -231,7 +238,7 @@ class LambdaClient:
         wait = max(ready, default=now) - now
         if wait > 0:
             self._sleep(wait)
-        sent = now + max(wait, 0.0)
+        sent = max(now + max(wait, 0.0), self._clock())
         self._last_request = sent
         if is_launch:
             self._last_launch = sent

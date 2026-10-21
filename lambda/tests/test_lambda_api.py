@@ -5,6 +5,7 @@ import ipaddress
 import threading
 import time
 import urllib.error
+import urllib.request
 
 import pytest
 
@@ -154,6 +155,36 @@ def test_instance_with_wrongly_typed_field_is_unexpected(field, value):
     with pytest.raises(LambdaAPIError) as e:
         client.list_instances()
     assert e.value.code == "gpuctl/unexpected-response"
+
+
+@pytest.mark.parametrize("name", [None, "absent"])
+def test_unnamed_foreign_instance_does_not_break_listing(name):
+    # Lambda names are optional (e.g. dashboard launches); one foreign unnamed instance must not block gpu-down.
+    foreign = {**INSTANCE_JSON, "id": "i-2"}
+    if name == "absent":
+        del foreign["name"]
+    else:
+        foreign["name"] = name
+    client, _ = make_client({("GET", "/instances"): (200, {"data": [INSTANCE_JSON, foreign]})})
+    assert client.list_instances() == [
+        Instance("i-1", "k3s-gpu-a6000-1", "booting", None, "us-west-2", "gpu_1x_a6000"),
+        Instance("i-2", "", "booting", None, "us-west-2", "gpu_1x_a6000")]
+
+
+@pytest.mark.parametrize("value", [7, ["x"]])
+def test_instance_name_of_wrong_type_is_unexpected(value):
+    client, _ = make_client({("GET", "/instances"): (200, {"data": [{**INSTANCE_JSON, "name": value}]})})
+    with pytest.raises(LambdaAPIError) as e:
+        client.list_instances()
+    assert e.value.code == "gpuctl/unexpected-response"
+
+
+def test_rule_with_null_description_parses():
+    rule = {"protocol": "tcp", "port_range": [22, 22], "source_network": "1.2.3.4/32", "description": None}
+    client, _ = make_client({("GET", "/firewall-rulesets"): (200, {"data": [
+        {"id": "rs-1", "name": "k3s-gpu-us-west-1", "region": "us-west-1", "rules": [rule]}]})})
+    assert client.list_rulesets() == [
+        Ruleset("rs-1", "k3s-gpu-us-west-1", "us-west-1", (FirewallRule("tcp", "1.2.3.4/32", (22, 22), ""),))]
 
 
 @pytest.mark.parametrize("port_range", ["22", [22], [22, 22, 22], ["22", "22"], [True, False]])
@@ -362,6 +393,39 @@ def test_brief_idiom_real_clock_and_no_op_sleep_returns_immediately():
     assert len(t.calls) == 4
 
 
+class OversleepingClock(FakeClock):
+    """A real sleep returns late by a varying amount; a later, shorter overshoot must not shrink the next gap."""
+
+    def __init__(self, overshoots):
+        super().__init__()
+        self.overshoots = iter(overshoots)
+
+    def sleep(self, seconds):
+        self.sleeps.append(seconds)
+        self.now += seconds + next(self.overshoots, 0.0)
+
+
+def test_rate_limits_hold_when_sleep_oversleeps():
+    fc = OversleepingClock([0.05, 0.0, 0.3, 0.0, 0.2, 0.0, 0.4, 0.0])
+    sent, launches = [], []
+
+    def transport(method, url, body, headers):
+        sent.append(fc.now)
+        if url.endswith("/launch"):
+            launches.append(fc.now)
+            return LAUNCH_OK
+        return (200, {"data": []})
+
+    client = LambdaClient("k", transport=transport, clock=fc.clock, sleep=fc.sleep)
+    for _ in range(3):
+        client.list_instances()
+    for _ in range(3):
+        client.launch(**LAUNCH_ARGS)
+        client.list_instances()
+    assert all(b - a >= 1.0 for a, b in zip(sent, sent[1:])), sent
+    assert all(b - a >= 12.0 for a, b in zip(launches, launches[1:])), launches
+
+
 def test_failed_launch_still_counts_toward_launch_window():
     fc = FakeClock()
     sent_at = []
@@ -525,7 +589,11 @@ def _serve(seen, location=None):
 
 
 @pytest.mark.parametrize("method, body", [("GET", None), ("POST", {"a": 1})])
-def test_urllib_transport_refuses_redirects_and_never_forwards_the_key(method, body):
+def test_urllib_transport_refuses_redirects_and_never_forwards_the_key(monkeypatch, method, body):
+    # The module opener honours HTTP(S)_PROXY from the environment; this test must reach the loopback servers
+    # directly, so it runs the real redirect-refusal handler in an opener without proxies.
+    monkeypatch.setattr(lambda_api, "_OPENER",
+                        urllib.request.build_opener(urllib.request.ProxyHandler({}), lambda_api._RefuseRedirects))
     other_seen, api_seen = [], []
     other = _serve(other_seen)  # a different host:port that the redirect points at
     api = _serve(api_seen, location=f"http://127.0.0.1:{other.server_address[1]}/stolen")
