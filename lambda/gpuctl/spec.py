@@ -15,6 +15,9 @@ POOL_NAME_RE = re.compile(r"[a-z0-9]{1,20}")
 INSTANCE_TYPE_RE = re.compile(r"gpu_[0-9]+x_[a-z0-9_]+")
 # Region names are interpolated into resource names (ruleset k3s-gpu-<region>).
 REGION_RE = re.compile(r"[a-z0-9]+(?:-[a-z0-9]+)*")
+REGION_MAX_LEN = 32
+# image_family goes to the Lambda API and into operator output; keep it to one plain token.
+IMAGE_FAMILY_RE = re.compile(r"[a-z0-9][a-z0-9._-]{0,62}")
 FORBIDDEN_REGIONS = frozenset({"us-south-1"})
 ARM_MARKER = "gh200"
 
@@ -90,10 +93,13 @@ def _str_list(value: Any, where: str) -> tuple[str, ...]:
 
 
 def _instance_type(value: Any, where: str) -> str:
-    if not isinstance(value, str) or not INSTANCE_TYPE_RE.fullmatch(value):
-        raise SpecError(f"{where}: {value!r} does not match {INSTANCE_TYPE_RE.pattern}")
-    if ARM_MARKER in value:
+    if not isinstance(value, str):
+        raise SpecError(f"{where}: must be a string, got {value!r}")
+    # Checked before the pattern so any name containing gh200 reports arm64, not a pattern error.
+    if ARM_MARKER in value.lower():
         raise SpecError(f"{where}: {value!r} is an arm64 (GH200) instance type; only x86_64 is supported")
+    if not INSTANCE_TYPE_RE.fullmatch(value):
+        raise SpecError(f"{where}: {value!r} does not match {INSTANCE_TYPE_RE.pattern}")
     return value
 
 
@@ -124,14 +130,17 @@ def _pool(name: Any, value: Any) -> Pool:
     if not regions:
         raise SpecError(f"{where}.regions: must not be empty")
     for region in regions:
-        if not REGION_RE.fullmatch(region):
-            raise SpecError(f"{where}.regions: invalid region {region!r}")
+        if len(region) > REGION_MAX_LEN or not REGION_RE.fullmatch(region):
+            raise SpecError(
+                f"{where}.regions: invalid region {region!r}: must match {REGION_RE.pattern}, "
+                f"at most {REGION_MAX_LEN} characters"
+            )
         if region in FORBIDDEN_REGIONS:
             raise SpecError(f"{where}.regions: region {region!r} is not allowed")
 
     image_family = data["image_family"]
-    if not isinstance(image_family, str) or not image_family:
-        raise SpecError(f"{where}.image_family: must be a non-empty string, got {image_family!r}")
+    if not isinstance(image_family, str) or not IMAGE_FAMILY_RE.fullmatch(image_family):
+        raise SpecError(f"{where}.image_family: must match {IMAGE_FAMILY_RE.pattern}, got {image_family!r}")
 
     return Pool(
         name=name,
@@ -162,14 +171,63 @@ def parse_spec(data: Mapping) -> Spec:
     if total > max_nodes:
         raise SpecError(f"pools: total count {total} exceeds max_nodes {max_nodes}")
 
+    # Autoscale bounds that max_nodes can never honour are config errors; catch them at load time.
+    # `count` stays independent of autoscale.min: gpu-down sets every target to 0.
+    for pool in pools.values():
+        if pool.autoscale is not None and pool.autoscale.max > max_nodes:
+            raise SpecError(
+                f"pools.{pool.name}.autoscale.max: {pool.autoscale.max} exceeds max_nodes {max_nodes}"
+            )
+    min_total = sum(pool.autoscale.min for pool in pools.values() if pool.autoscale is not None)
+    if min_total > max_nodes:
+        raise SpecError(f"pools: total autoscale.min {min_total} exceeds max_nodes {max_nodes}")
+
     return Spec(budget_usd_per_hour=float(budget), max_nodes=max_nodes, pools=pools)
+
+
+class _UniqueKeyLoader(yaml.SafeLoader):
+    """SafeLoader that rejects a mapping key repeated in the same mapping.
+
+    Plain safe_load keeps the last value, so a copied pool block or a doubled `count`
+    would silently replace the first one.
+    """
+
+    def construct_mapping(self, node: yaml.MappingNode, deep: bool = False) -> dict:
+        seen: set[Any] = set()
+        for key_node, _ in node.value:
+            if key_node.tag == "tag:yaml.org,2002:merge":
+                continue  # `<<:` merges are resolved (and may be overridden) by the base class
+            key = self.construct_object(key_node, deep=deep)
+            try:
+                duplicate = key in seen
+            except TypeError:
+                continue  # unhashable key: the base class raises its own error
+            if duplicate:
+                raise yaml.constructor.ConstructorError(
+                    "while constructing a mapping", node.start_mark,
+                    f"found duplicate key {key!r}", key_node.start_mark,
+                )
+            seen.add(key)
+        return super().construct_mapping(node, deep=deep)
+
+
+def _load_yaml(text: str) -> Any:
+    loader = _UniqueKeyLoader(text)
+    try:
+        return loader.get_single_data()
+    finally:
+        loader.dispose()
 
 
 def load_spec(path: str | Path) -> Spec:
     """Read a YAML spec file and validate it. Raises SpecError (or OSError if unreadable)."""
     path = Path(path)
     try:
-        data = yaml.safe_load(path.read_text(encoding="utf-8"))
+        text = path.read_bytes().decode("utf-8")
+    except UnicodeDecodeError as exc:
+        raise SpecError(f"{path}: not valid UTF-8: {exc}") from exc
+    try:
+        data = _load_yaml(text)
     except yaml.YAMLError as exc:
         raise SpecError(f"{path}: invalid YAML: {exc}") from exc
     try:
