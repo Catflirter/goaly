@@ -288,13 +288,15 @@ def test_install_packages_installs_without_upgrading(tmp_path):
                           "  DEBIAN_FRONTEND=noninteractive"]
 
 
-GUARD_FILES = ["etc/k3s-guard/k3s-guard.nft", "etc/systemd/system/k3s-guard.service",
-               "etc/systemd/system/k3s.service.d/10-guard.conf"]
+SERVER_DROPIN = "etc/systemd/system/k3s.service.d/10-guard.conf"
+AGENT_DROPIN = "etc/systemd/system/k3s-agent.service.d/10-guard.conf"
+GUARD_FILES = ["etc/k3s-guard/k3s-guard.nft", "etc/systemd/system/k3s-guard.service", SERVER_DROPIN]
+AGENT_GUARD_FILES = [*GUARD_FILES[:2], AGENT_DROPIN]
 
 
-def guard_stage(tmp, nft_text):
+def guard_stage(tmp, nft_text, files=GUARD_FILES):
     stage = tmp / "stage"
-    for rel in GUARD_FILES:
+    for rel in files:
         (stage / rel).parent.mkdir(parents=True, exist_ok=True)
         (stage / rel).write_text(nft_text if rel.endswith(".nft") else f"# {rel}\n")
     return stage
@@ -321,6 +323,34 @@ def test_install_guard_first_run_enables(tmp_path):
     for rel in GUARD_FILES:
         assert (tmp_path / "sys" / rel).read_text() == (stage / rel).read_text()
     assert not (tmp_path / "sys/run/k3s-guard.reload-pending").exists()
+
+
+def test_install_guard_agent_stage_installs_the_agent_drop_in(tmp_path):
+    # Task 12's node-bootstrap.sh renders k3s-agent.service.d/10-guard.conf and calls
+    # install_guard "$STAGE" exactly as server-bootstrap.sh does (Ruling R16).
+    bindir, log = make_stubs(tmp_path, systemctl_stub(tmp_path))
+    stage = guard_stage(tmp_path, "table inet k3s_guard\n", AGENT_GUARD_FILES)
+    r = common(f"install_guard {stage}", bindir, K3S_BOOTSTRAP_TEST_ROOT=str(tmp_path / "sys"))
+    assert r.returncode == 0, r.stderr
+    assert calls(log) == [f"nft -c -f {stage}/etc/k3s-guard/k3s-guard.nft",
+                          "systemctl mask nftables.service", "systemctl daemon-reload",
+                          "systemctl is-active --quiet k3s-guard", "systemctl enable --now k3s-guard"]
+    for rel in AGENT_GUARD_FILES:
+        assert (tmp_path / "sys" / rel).read_text() == (stage / rel).read_text()
+    assert not (tmp_path / "sys/etc/systemd/system/k3s.service.d").exists()
+
+
+@pytest.mark.parametrize("dropins, message", [
+    ([], "no guard drop-in"),
+    ([SERVER_DROPIN, AGENT_DROPIN], "both"),
+])
+def test_install_guard_needs_exactly_one_drop_in(tmp_path, dropins, message):
+    bindir, log = make_stubs(tmp_path, systemctl_stub(tmp_path))
+    stage = guard_stage(tmp_path, "table inet k3s_guard\n", [*GUARD_FILES[:2], *dropins])
+    r = common(f"install_guard {stage}", bindir, K3S_BOOTSTRAP_TEST_ROOT=str(tmp_path / "sys"))
+    assert r.returncode != 0 and message in r.stderr, r.stderr
+    assert calls(log) == []
+    assert not (tmp_path / "sys").exists()
 
 
 def test_install_guard_inactive_unit_is_started_even_if_unchanged(tmp_path):

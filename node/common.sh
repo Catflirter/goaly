@@ -116,6 +116,12 @@ install_packages() {
 # into. It must be a staging directory, never the install destination (/) itself, otherwise the
 # rendered rules could not be compared with the installed ones; that case dies.
 #
+# Both bootstraps call it the same way (Ruling R16): `install_guard "$STAGE"`. The unit the guard
+# drop-in belongs to follows from what STAGE holds: server-bootstrap.sh renders
+# etc/systemd/system/k3s.service.d/10-guard.conf, node-bootstrap.sh renders
+# etc/systemd/system/k3s-agent.service.d/10-guard.conf. Exactly one of the two must be present;
+# none or both dies before anything is checked, installed or started.
+#
 # - The rendered nft file is syntax-checked (nft -c) before it replaces the installed copy.
 # - The table is reloaded only when the rendered rules changed: a reload resets k3s_peers to the
 #   rendered CP addresses (k3s-guard.service then restores the peers sync-peers persisted, if any).
@@ -126,18 +132,27 @@ install_packages() {
 #   the new rules and reloading them still reloads on the re-run. /run is the right place: after a
 #   reboot the unit loads the installed file anyway.
 install_guard() {
-  local stage=$1 dest="${K3S_BOOTSTRAP_TEST_ROOT:-}" nft=etc/k3s-guard/k3s-guard.nft rel pending
+  local stage=$1 dest="${K3S_BOOTSTRAP_TEST_ROOT:-}" nft=etc/k3s-guard/k3s-guard.nft rel pending unit
+  local -a units=()
   [[ -d $stage ]] || die "install_guard: staging directory $stage not found"
   if [[ $(cd -- "$stage" && pwd -P) == "$(cd -- "${dest:-/}" && pwd -P)" ]]; then
     die "install_guard: $stage is the install destination; pass the directory the files were rendered into"
   fi
+  for unit in k3s k3s-agent; do
+    if [[ -f $stage/etc/systemd/system/$unit.service.d/10-guard.conf ]]; then units+=("$unit"); fi
+  done
+  case ${#units[@]} in
+    1) ;;
+    0) die "install_guard: no guard drop-in under $stage (expected etc/systemd/system/k3s.service.d/10-guard.conf or k3s-agent.service.d/10-guard.conf)" ;;
+    *) die "install_guard: $stage holds guard drop-ins for both k3s and k3s-agent; render exactly one" ;;
+  esac
   pending="$dest/run/k3s-guard.reload-pending"
   if file_differs "$stage/$nft" "$dest/$nft"; then
     nft -c -f "$stage/$nft" || die "install_guard: rendered $nft fails nft -c; installed rules left unchanged"
     mkdir -p -- "${pending%/*}"
     : > "$pending"
   fi
-  for rel in etc/systemd/system/k3s-guard.service etc/systemd/system/k3s.service.d/10-guard.conf "$nft"; do
+  for rel in etc/systemd/system/k3s-guard.service "etc/systemd/system/${units[0]}.service.d/10-guard.conf" "$nft"; do
     install_file "$stage/$rel" "$dest/$rel"
   done
   systemctl mask nftables.service
