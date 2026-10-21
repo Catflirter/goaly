@@ -4,16 +4,21 @@
 #
 # Exit codes: 3 = MTU preflight failed, 4 = unresolved @PLACEHOLDER@ in a rendered template.
 # Test seams: SYSFS_NET (default /sys/class/net) is where interface MTU/MAC are read;
-# SYSROOT (default empty, i.e. /) prefixes what set_mtu reads and install_guard writes.
+# K3S_BOOTSTRAP_TEST_ROOT (default empty, i.e. /) prefixes every host path these helpers and the
+# bootstrap scripts read or write. It exists only for the offline tests; never set it on a node.
 
 log() { printf '[%s] %s\n' "${0##*/}" "$*" >&2; }
 die() { log "ERROR: $*"; exit 1; }
 
-# valid_ipv4 ADDR: dotted quad, each octet 0-255.
+# valid_ipv4 ADDR: a unicast host address in canonical dotted-quad form. Octets are 0-255 without
+# leading zeros (nft/inet_aton would read "034" as octal 28; Go's net.ParseIP rejects it), and
+# 0.0.0.0/8, 127.0.0.0/8 and 224.0.0.0 and up (multicast, reserved, broadcast) are refused.
 valid_ipv4() {
-  [[ $1 =~ ^([0-9]{1,3})\.([0-9]{1,3})\.([0-9]{1,3})\.([0-9]{1,3})$ ]] || return 1
+  local octet='(0|[1-9][0-9]{0,2})'
+  [[ $1 =~ ^${octet}\.${octet}\.${octet}\.${octet}$ ]] || return 1
   local -a o=("${BASH_REMATCH[@]:1}")
-  (( 10#${o[0]} <= 255 && 10#${o[1]} <= 255 && 10#${o[2]} <= 255 && 10#${o[3]} <= 255 ))
+  (( o[0] <= 255 && o[1] <= 255 && o[2] <= 255 && o[3] <= 255 )) || return 1
+  (( o[0] != 0 && o[0] != 127 && o[0] < 224 ))
 }
 
 # render_template SRC DST VAR...: copy SRC to DST, replacing each @VAR@ with the value of $VAR.
@@ -22,7 +27,9 @@ render_template() {
   local src=$1 dst=$2 content="" var
   shift 2
   [[ -r $src ]] || die "render_template: cannot read $src"
-  IFS= read -r -d '' content < "$src" || true
+  # The trailing x keeps trailing newlines through $(...); && makes a failed cat fail the assignment.
+  content=$(cat -- "$src" && printf x) || die "render_template: cannot read $src"
+  content=${content%x}
   for var in "$@"; do
     [[ -v $var ]] || die "render_template: \$$var is not set"
     content=${content//"@${var}@"/"${!var}"}
@@ -76,7 +83,7 @@ mtu_preflight() {
 set_mtu() {
   local iface=$1 target=$2 dir mac="" f id
   local -a ids=()
-  dir="${SYSROOT:-}/run/systemd/network"
+  dir="${K3S_BOOTSTRAP_TEST_ROOT:-}/run/systemd/network"
   if [[ -r ${SYSFS_NET:-/sys/class/net}/$iface/address ]]; then
     mac=$(< "${SYSFS_NET:-/sys/class/net}/$iface/address")
   fi
@@ -95,18 +102,40 @@ set_mtu() {
 }
 
 # install_packages: nftables (guard) and wireguard-tools (tunnel evidence). Never upgrades.
+# `apt-get update` only refreshes the package lists: fresh cloud images can ship with them empty,
+# and `install` then fails with "Unable to locate package". It upgrades nothing.
 install_packages() {
   DEBIAN_FRONTEND=noninteractive apt-get update -q
   DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends nftables wireguard-tools
 }
 
-# install_guard STAGE: install the guard files rendered under STAGE into ${SYSROOT}/ and keep
-# Ubuntu's nftables.service masked (it flushes the whole ruleset, k3s's rules included).
-# The table is (re)loaded only when it is not loaded yet or the rendered rules changed: a reload
-# resets k3s_peers to the rendered CP addresses and drops every node sync-peers had added.
+# install_guard STAGE: install the guard files freshly rendered under STAGE into
+# ${K3S_BOOTSTRAP_TEST_ROOT}/ and keep Ubuntu's nftables.service masked (it flushes the whole
+# ruleset, k3s's rules included). STAGE is the brief's "ROOT": the directory the caller rendered
+# into. It must be a staging directory, never the install destination (/) itself, otherwise the
+# rendered rules could not be compared with the installed ones; that case dies.
+#
+# - The rendered nft file is syntax-checked (nft -c) before it replaces the installed copy.
+# - The table is reloaded only when the rendered rules changed: a reload resets k3s_peers to the
+#   rendered CP addresses (k3s-guard.service then restores the peers sync-peers persisted, if any).
+# - An inactive unit is always enabled and started, changed or not: its table is absent (ExecStop
+#   deleted it, or it never ran), so there is no k3s_peers to lose, and leaving it down would leave
+#   6443/10250 open.
+# - A pending reload is remembered in /run until it succeeds, so a run that fails between installing
+#   the new rules and reloading them still reloads on the re-run. /run is the right place: after a
+#   reboot the unit loads the installed file anyway.
 install_guard() {
-  local stage=$1 dest="${SYSROOT:-}" nft=etc/k3s-guard/k3s-guard.nft changed=0 rel
-  if file_differs "$stage/$nft" "$dest/$nft"; then changed=1; fi
+  local stage=$1 dest="${K3S_BOOTSTRAP_TEST_ROOT:-}" nft=etc/k3s-guard/k3s-guard.nft rel pending
+  [[ -d $stage ]] || die "install_guard: staging directory $stage not found"
+  if [[ $(cd -- "$stage" && pwd -P) == "$(cd -- "${dest:-/}" && pwd -P)" ]]; then
+    die "install_guard: $stage is the install destination; pass the directory the files were rendered into"
+  fi
+  pending="$dest/run/k3s-guard.reload-pending"
+  if file_differs "$stage/$nft" "$dest/$nft"; then
+    nft -c -f "$stage/$nft" || die "install_guard: rendered $nft fails nft -c; installed rules left unchanged"
+    mkdir -p -- "${pending%/*}"
+    : > "$pending"
+  fi
   for rel in etc/systemd/system/k3s-guard.service etc/systemd/system/k3s.service.d/10-guard.conf "$nft"; do
     install_file "$stage/$rel" "$dest/$rel"
   done
@@ -114,12 +143,14 @@ install_guard() {
   systemctl daemon-reload
   if ! systemctl is-active --quiet k3s-guard; then
     systemctl enable --now k3s-guard
-  elif (( changed )); then
-    log "k3s-guard rules changed: reloading; k3s_peers now holds only the CP addresses, run make sync-peers"
+  elif [[ -e $pending ]]; then
+    log "k3s-guard rules changed: reloading (k3s_peers is reset to the CP addresses plus the peers" \
+        "sync-peers persisted; run make sync-peers if a node is missing)"
     systemctl reload k3s-guard
   else
     log "k3s-guard rules unchanged: not reloading (that would reset k3s_peers)"
   fi
+  rm -f -- "$pending"
 }
 
 # k3s_installed_version: e.g. v1.36.5+k3s1, or empty when k3s is not installed.

@@ -79,38 +79,54 @@ if (( RENDER_ONLY )); then
 fi
 
 # ---- Everything below modifies the host. ------------------------------------------------------
-(( EUID == 0 )) || die "run as root, or use --render-only DIR"
+# HOST is "" (i.e. /) on a node; the offline tests point K3S_BOOTSTRAP_TEST_ROOT at a scratch tree
+# and put stub binaries first on PATH (common.sh).
+HOST=${K3S_BOOTSTRAP_TEST_ROOT:-}
+if [[ -n $HOST ]]; then
+  log "WARNING: K3S_BOOTSTRAP_TEST_ROOT=$HOST: test mode, host paths are prefixed with it"
+else
+  (( EUID == 0 )) || die "run as root, or use --render-only DIR"
+fi
 
 STAGE=$(mktemp -d)
 trap 'rm -rf -- "$STAGE"' EXIT
 render_all "$STAGE"
 
 # An apiserver config change needs a restart, unless install.sh is about to (re)start k3s anyway.
-k3s_config_changed=0
+# The marker is written before the new files are installed and removed only once k3s has been
+# (re)started with them, so a run that fails in between still restarts k3s on the re-run (the
+# files no longer differ by then).
+RESTART_PENDING="$HOST/var/lib/rancher/k3s/bootstrap-restart-pending"
 for rel in "${K3S_FILES[@]}"; do
-  if file_differs "$STAGE/$rel" "/$rel"; then k3s_config_changed=1; fi
+  if file_differs "$STAGE/$rel" "$HOST/$rel"; then
+    mkdir -p -- "${RESTART_PENDING%/*}"
+    : > "$RESTART_PENDING"
+  fi
 done
 k3s_already_current=0
 if [[ $(k3s_installed_version) == "$K3S_VERSION" ]]; then k3s_already_current=1; fi
 
 for rel in "${K3S_FILES[@]}" etc/sysctl.d/90-kubelet.conf; do
-  install_file "$STAGE/$rel" "/$rel"
+  install_file "$STAGE/$rel" "$HOST/$rel"
 done
 
 sysctl --system
 set_mtu "$IFACE" "$UNDERLAY_MTU"
 install_packages
 install_guard "$STAGE"
-mkdir -p /var/lib/rancher/k3s/server/logs
+mkdir -p "$HOST/var/lib/rancher/k3s/server/logs"
 install_k3s server "$K3S_VERSION" false
-if (( k3s_config_changed && k3s_already_current )); then
+if [[ -e $RESTART_PENDING ]] && (( k3s_already_current )); then
   log "k3s config changed: restarting k3s"
   systemctl restart k3s
 fi
+# Either restarted above or (re)started by install.sh with the new files.
+rm -f -- "$RESTART_PENDING"
 
 log "waiting up to 180s for the apiserver to report /readyz"
 deadline=$((SECONDS + 180))
-until k3s kubectl get --raw /readyz > /dev/null 2>&1; do
+# --request-timeout bounds each probe, so a hung connection cannot stretch the 180s.
+until k3s kubectl --request-timeout=5s get --raw /readyz > /dev/null 2>&1; do
   (( SECONDS < deadline )) || die "apiserver not ready after 180s; see journalctl -u k3s"
   sleep 5
 done

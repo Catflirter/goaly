@@ -8,8 +8,14 @@ Before=k3s.service k3s-agent.service
 Type=oneshot
 RemainAfterExit=yes
 ExecStart=/usr/sbin/nft -f /etc/k3s-guard/k3s-guard.nft
-# The file deletes and recreates the table in one transaction, so a reload leaves no gap.
-ExecReload=/usr/sbin/nft -f /etc/k3s-guard/k3s-guard.nft
+# k3s-guard.nft seeds k3s_peers with the CP's own addresses only. peers.nft, written by sync-peers
+# (spec 3.3; content "flush set inet k3s_guard k3s_peers" + "add element ..."), holds the last
+# synced list, so a reboot (kernel.panic=10 reboots on its own) or a reload does not lock the
+# joined nodes out until the next sync-peers. Missing or broken peers.nft: CP addresses only.
+ExecStartPost=-/bin/sh -c 'if [ -s /etc/k3s-guard/peers.nft ]; then exec /usr/sbin/nft -f /etc/k3s-guard/peers.nft; fi'
+# Table and peers go in as one transaction (k3s-guard.nft deletes and recreates the table), so a
+# reload leaves no gap; if peers.nft is missing or broken, load the table alone.
+ExecReload=/bin/sh -c 'cat /etc/k3s-guard/k3s-guard.nft /etc/k3s-guard/peers.nft 2>/dev/null | /usr/sbin/nft -f - || exec /usr/sbin/nft -f /etc/k3s-guard/k3s-guard.nft'
 ExecStop=/usr/sbin/nft delete table inet k3s_guard
 
 [Install]
