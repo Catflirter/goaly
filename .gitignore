@@ -11,7 +11,7 @@ kubeconfig*
 !scripts/kubeconfig.sh
 
 # Python
-.venv/
+.venv
 __pycache__/
 .pytest_cache/
 
