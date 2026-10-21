@@ -77,6 +77,14 @@ def test_operator_ip_change_leaves_no_trace_of_old_ip():  # Review Focus #1
     ("cp_ip", "10.0.0.1"), ("operator_ip", "192.168.1.5"), ("gpu_ips", ("not-an-ip",)),
     ("cp_internal_ip", "34.82.10.10"), ("worker_ips", ("100.64.0.1",)), ("cp_ip", "192.0.2.1"),
     ("operator_ip", "2001:4860:4860::8888"), ("cp_ip", ""), ("worker_ips", (None,)),
+    # multicast is is_global on Python >= 3.13 but can never be a peer (C0-2)
+    ("cp_ip", "224.0.0.1"), ("gpu_ips", ("239.1.1.1",)),
+    # a bare list/str must not be accepted (a str would be iterated per character) (C0-3)
+    ("worker_ips", ["34.29.20.20"]), ("gpu_ips", "129.80.30.30"),
+    # cp_internal_ip must be a host in the k3s-core subnet 10.10.0.0/24 (C0-1, X0-1)
+    ("cp_internal_ip", "0.0.0.0"), ("cp_internal_ip", "127.0.0.1"), ("cp_internal_ip", "169.254.169.254"),
+    ("cp_internal_ip", "255.255.255.255"), ("cp_internal_ip", "10.42.0.5"), ("cp_internal_ip", "10.43.0.1"),
+    ("cp_internal_ip", "10.20.0.2"), ("cp_internal_ip", "10.10.0.0"), ("cp_internal_ip", "10.10.0.255"),
 ])
 def test_invalid_addresses_rejected(field, value):
     with pytest.raises(ValueError):

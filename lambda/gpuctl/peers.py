@@ -12,6 +12,8 @@ from dataclasses import dataclass
 from gpuctl.lambda_api import FirewallRule
 
 NFT_SET = "inet k3s_guard k3s_peers"
+# The cp lives in VPC k3s-core, 10.10.0.0/24 (global constraints); its internal IP must be a host there.
+CP_SUBNET = ipaddress.IPv4Network("10.10.0.0/24")
 
 
 def _ipv4(value: object, field: str) -> ipaddress.IPv4Address:
@@ -28,8 +30,8 @@ def _ipv4(value: object, field: str) -> ipaddress.IPv4Address:
 
 def _global_ipv4(value: object, field: str) -> ipaddress.IPv4Address:
     ip = _ipv4(value, field)
-    if not ip.is_global:
-        raise ValueError(f"{field}: {value!r} is not a global (public) address")
+    if not ip.is_global or ip.is_multicast:  # 224.0.0.0/4 is is_global on Python >= 3.13
+        raise ValueError(f"{field}: {value!r} is not a global (public) unicast address")
     return ip
 
 
@@ -48,8 +50,11 @@ class PeerSet:
     def __post_init__(self) -> None:
         _global_ipv4(self.cp_ip, "cp_ip")
         _global_ipv4(self.operator_ip, "operator_ip")
-        if not _ipv4(self.cp_internal_ip, "cp_internal_ip").is_private:
+        internal = _ipv4(self.cp_internal_ip, "cp_internal_ip")
+        if not internal.is_private:
             raise ValueError(f"cp_internal_ip: {self.cp_internal_ip!r} is not a private address")
+        if internal not in CP_SUBNET or internal in (CP_SUBNET.network_address, CP_SUBNET.broadcast_address):
+            raise ValueError(f"cp_internal_ip: {self.cp_internal_ip!r} is not a host in {CP_SUBNET}")
         for field in ("worker_ips", "gpu_ips"):
             values = getattr(self, field)
             if not isinstance(values, tuple):
