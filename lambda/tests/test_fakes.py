@@ -16,7 +16,8 @@ def public_methods(cls):
 
 
 def test_fake_has_exactly_the_client_methods_with_the_same_signatures():
-    assert public_methods(FakeLambda) == public_methods(LambdaClient)
+    assert public_methods(FakeLambda) - FakeLambda.TEST_HELPERS == public_methods(LambdaClient)
+    assert not FakeLambda.TEST_HELPERS & public_methods(LambdaClient)
     for name in public_methods(LambdaClient):
         assert inspect.signature(getattr(FakeLambda, name)) == inspect.signature(getattr(LambdaClient, name)), name
 
@@ -83,3 +84,31 @@ def test_fake_refuses_rules_the_real_client_would_never_send(source):
         with pytest.raises(ValueError):
             call()
     assert fake.global_rules == [] and fake.rulesets == []
+
+
+def test_launched_instance_becomes_active_with_the_next_launch_ip():
+    fake = FakeLambda(launch_ips=["129.80.30.40", "129.80.30.41"])
+    first = fake.launch(**LAUNCH)
+    second = fake.launch(**{**LAUNCH, "name": "k3s-gpu-a6000-2"})
+    assert (first, second) == ("i-1", "i-2")
+    assert fake.get_instance(second) == Instance(second, "k3s-gpu-a6000-2", "active", "129.80.30.41", "us-west-2",
+                                                 "gpu_1x_a6000")
+    assert fake.list_instances()[0].status == "booting"  # not polled yet
+
+
+def test_instance_and_ruleset_ids_count_separately():
+    fake = FakeLambda()
+    assert fake.create_ruleset("k3s-gpu-us-west-2", "us-west-2", [RULE]).id == "rs-1"
+    assert fake.launch(**LAUNCH) == "i-1"
+
+
+def test_launched_records_every_successful_launch_and_ruleset_by_name_finds_rulesets():
+    fake = FakeLambda()
+    created = fake.create_ruleset("k3s-gpu-us-west-2", "us-west-2", [RULE])
+    fake.launch(**LAUNCH)
+    [launched] = fake.launched
+    assert (launched.name, launched.region, launched.ruleset_id, launched.ssh_key_name) == (
+        "k3s-gpu-a6000-1", "us-west-2", "rs-1", "op")
+    assert fake.ruleset_by_name("k3s-gpu-us-west-2") == created
+    with pytest.raises(KeyError):
+        fake.ruleset_by_name("k3s-gpu-us-east-1")

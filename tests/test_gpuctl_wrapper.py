@@ -155,3 +155,23 @@ def test_wrapper_never_imports_modules_from_the_callers_cwd(repo, tmp_path_facto
     proc = run([str(repo / "scripts/gpuctl"), "--help"], repo, cwd=hostile)
     assert proc.returncode == 0, proc.stderr
     assert "list-nodes" in proc.stdout and not marker.exists()
+
+
+@pytest.mark.parametrize("target, variables, expected", [
+    ("gpu-apply", [], "apply"),
+    ("gpu-apply", ["AUTO_APPROVE=1"], "apply --auto-approve"),
+    ("gpu-apply", ["AUTO_APPROVE=0"], "apply"),
+    ("gpu-down", [], "down"),
+    ("gpu-down", ["AUTO_APPROVE=yes"], "down --auto-approve"),
+])
+def test_make_gpu_apply_and_down_pass_auto_approve_through(target, variables, expected):
+    proc = subprocess.run(["make", "-s", "-n", "-f", str(ROOT / "Makefile"), target, *variables],
+                          cwd="/", capture_output=True, text=True)
+    assert proc.returncode == 0, proc.stderr
+    assert proc.stdout.strip() == f"{ROOT}/scripts/gpuctl {expected}"
+
+
+def test_gpu_apply_and_down_follow_gpu_plan_in_the_makefile():
+    targets = [line.split(":")[0] for line in (ROOT / "Makefile").read_text().splitlines()
+               if line.startswith("gpu-")]
+    assert targets[targets.index("gpu-plan"):][:3] == ["gpu-plan", "gpu-apply", "gpu-down"]

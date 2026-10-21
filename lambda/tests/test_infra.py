@@ -122,24 +122,42 @@ def test_a_failed_init_leaves_no_partial_terraform_dir(tmp_path, error):  # C1-1
 def test_apply_gpu_access_sorted_compact_json(tmp_path):
     (tmp_path / "infra/gpu-access").mkdir(parents=True)
     sh = FakeShell([ok(), ok()])
-    Infra(sh, tmp_path, ENV).apply_gpu_access(["129.80.30.31", "129.80.30.30"])
+    Infra(sh, tmp_path, ENV).apply_gpu_access(["129.80.30.31", "129.80.30.30"], max_nodes=3)
     assert [c.args[2] for c in sh.calls] == ["init", "apply"]
     assert sh.calls[-1].args[:2] == ["terraform", f"-chdir={tmp_path}/infra/gpu-access"]
     assert sh.calls[-1].args[-1] == '-var=gpu_ips=["129.80.30.30","129.80.30.31"]'
     assert "-auto-approve" in sh.calls[-1].args and "-input=false" in sh.calls[-1].args
 
 
+def test_apply_gpu_access_passes_max_nodes_alongside_gpu_ips(tmp_path):  # Ruling R27
+    (tmp_path / "infra/gpu-access/.terraform").mkdir(parents=True)
+    sh = FakeShell([ok()])
+    Infra(sh, tmp_path, ENV).apply_gpu_access(["129.80.30.30"], max_nodes=5)
+    assert sh.calls[-1].args[-2:] == ["-var=max_nodes=5", '-var=gpu_ips=["129.80.30.30"]']
+
+
+@pytest.mark.parametrize("bad", [0, -1, True, 2.0, "3", None])
+def test_apply_gpu_access_refuses_a_bad_max_nodes(tmp_path, bad):
+    sh = FakeShell([])
+    with pytest.raises(ValueError, match="max_nodes"):
+        Infra(sh, tmp_path, ENV).apply_gpu_access(["129.80.30.30"], max_nodes=bad)
+    with pytest.raises(ValueError, match="max_nodes"):
+        FakeInfra().apply_gpu_access(["129.80.30.30"], max_nodes=bad)
+    assert sh.calls == []
+
+
 def test_apply_gpu_access_deduplicates_and_sorts_numerically(tmp_path):
     (tmp_path / "infra/gpu-access/.terraform").mkdir(parents=True)
     sh = FakeShell([ok()])
-    Infra(sh, tmp_path, ENV).apply_gpu_access(["129.80.30.30", "9.1.1.1", "129.80.30.30"])
+    Infra(sh, tmp_path, ENV).apply_gpu_access(["129.80.30.30", "9.1.1.1", "129.80.30.30"], max_nodes=3)
     assert sh.calls[-1].args[-1] == '-var=gpu_ips=["9.1.1.1","129.80.30.30"]'
 
 
 def test_fake_infra_normalises_gpu_ips_like_infra():  # S0-2: same list as the real adapter passes to Terraform
     infra = FakeInfra()
-    infra.apply_gpu_access(["129.80.30.30", "9.1.1.1", "129.80.30.30"])
+    infra.apply_gpu_access(["129.80.30.30", "9.1.1.1", "129.80.30.30"], max_nodes=3)
     assert infra.applied_gpu_ips == [["9.1.1.1", "129.80.30.30"]]
+    assert infra.applied_max_nodes == [3]
     assert infra.events == ["tf:['9.1.1.1', '129.80.30.30']"]
 
 
@@ -147,7 +165,7 @@ def test_fake_infra_normalises_gpu_ips_like_infra():  # S0-2: same list as the r
 def test_fake_infra_refuses_bad_gpu_ips_like_infra(bad):  # Review Focus #2
     infra = FakeInfra()
     with pytest.raises(ValueError):
-        infra.apply_gpu_access([bad])
+        infra.apply_gpu_access([bad], max_nodes=3)
     with pytest.raises(ValueError):
         infra.join_node("k3s-gpu-a6000-1", bad, "a6000")
     assert infra.applied_gpu_ips == [] and infra.joined == [] and infra.events == []
@@ -162,7 +180,7 @@ def test_fake_infra_join_node_accepts_underscore_gpu_types():
 def test_apply_gpu_access_empty_list(tmp_path):
     (tmp_path / "infra/gpu-access/.terraform").mkdir(parents=True)
     sh = FakeShell([ok()])
-    Infra(sh, tmp_path, ENV).apply_gpu_access([])
+    Infra(sh, tmp_path, ENV).apply_gpu_access([], max_nodes=3)
     assert sh.calls[-1].args[-1] == "-var=gpu_ips=[]"
 
 
@@ -170,7 +188,7 @@ def test_apply_gpu_access_empty_list(tmp_path):
 def test_apply_gpu_access_never_passes_a_bad_ip_to_terraform(tmp_path, bad):  # Review Focus #2
     sh = FakeShell([])
     with pytest.raises(ValueError):
-        Infra(sh, tmp_path, ENV).apply_gpu_access(["129.80.30.30", bad])
+        Infra(sh, tmp_path, ENV).apply_gpu_access(["129.80.30.30", bad], max_nodes=3)
     assert sh.calls == []
 
 
@@ -178,7 +196,7 @@ def test_terraform_failure_raises_command_error(tmp_path):
     (tmp_path / "infra/gpu-access/.terraform").mkdir(parents=True)
     sh = FakeShell([fail(1, "Error: Invalid value for variable")])
     with pytest.raises(CommandError) as e:
-        Infra(sh, tmp_path, ENV).apply_gpu_access(["129.80.30.30"])
+        Infra(sh, tmp_path, ENV).apply_gpu_access(["129.80.30.30"], max_nodes=3)
     assert e.value.returncode == 1 and "Invalid value" in e.value.stderr and e.value.args[0] == "terraform"
 
 
@@ -218,7 +236,7 @@ def test_reads_are_bounded_by_a_timeout_and_apply_is_not(tmp_path):  # X0-4
     sh = FakeShell([BASE_OUTPUTS, ok(), ok(), ok()])
     infra = Infra(sh, tmp_path, ENV)
     infra.cp_ssh("sudo true")
-    infra.apply_gpu_access(["129.80.30.30"])
+    infra.apply_gpu_access(["129.80.30.30"], max_nodes=3)
     assert [(c.args[0], c.args[2], c.timeout) for c in sh.calls] == [
         ("terraform", "output", TF_READ_TIMEOUT_S), ("gcloud", "ssh", CP_SSH_TIMEOUT_S),
         ("terraform", "init", TF_INIT_TIMEOUT_S), ("terraform", "apply", None),
@@ -231,7 +249,7 @@ def test_child_processes_never_get_the_lambda_api_key(tmp_path):  # X0-3
     sh = FakeShell([BASE_OUTPUTS, ok(), ok(), ok(), ok(), ok("73.15.40.40\n")])
     infra = Infra(sh, tmp_path, env)
     infra.cp_ssh("sudo true")
-    infra.apply_gpu_access(["129.80.30.30"])
+    infra.apply_gpu_access(["129.80.30.30"], max_nodes=3)
     infra.kubectl("get", "nodes")
     infra.join_node("k3s-gpu-a6000-1", "129.80.30.30", "a6000")
     infra.detect_operator_ip()

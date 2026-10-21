@@ -1,4 +1,5 @@
 import copy
+import io
 import os
 import subprocess
 import sys
@@ -8,7 +9,7 @@ import pytest
 import yaml
 
 import gpuctl.__main__ as cli
-from fakes import FakeLambda
+from fakes import FakeInfra, FakeLambda
 from gpuctl.__main__ import main
 from gpuctl.lambda_api import FirewallRule, Instance, InstanceType, LambdaAPIError, Ruleset
 from test_spec import VALID
@@ -41,6 +42,22 @@ def spec_file(tmp_path, **changes):
 
 def assert_read_only(fake):
     assert fake.calls and all(c[0] in READS for c in fake.calls), fake.calls
+
+
+@pytest.fixture(autouse=True)
+def overrides(monkeypatch, tmp_path):
+    """The autoscaler's override file for this test (absent unless the test writes it), never the checkout's."""
+    path = tmp_path / ".autoscale-state.json"
+    monkeypatch.setattr(cli, "OVERRIDES_PATH", path)
+    return path
+
+
+def in_sync(*nodes):
+    """FakeInfra whose cluster, gpu-access state and k3s_peers set all match these instances (no drift)."""
+    ips = [n.ip for n in nodes]
+    return FakeInfra(outputs={"base": {"cp_ip": "34.82.10.10", "cp_internal_ip": "10.10.0.2", "cp_zone": "us-west1-b"},
+                              "workers": {}, "gpu-access": {"gpu_ips": ips}},
+                     cluster_nodes={n.name: n.ip for n in nodes}, nft_elements=["10.10.0.2", "34.82.10.10", *ips])
 
 
 # --- plan ---------------------------------------------------------------------------------------
@@ -188,7 +205,7 @@ def test_api_error_exits_1(capsys):
 
 def test_status_shows_capacity_rows(capsys):
     fake = FakeLambda(types=TYPES, instances=[NODE])
-    rc = main(["status"], env=ENV, client=fake)
+    rc = main(["status"], env=ENV, client=fake, infra=in_sync(NODE))
     lines = [line.split() for line in capsys.readouterr().out.splitlines()]
     assert rc == 0
     for t in ("gpu_1x_a6000", "gpu_1x_a10", "gpu_1x_a100"):
@@ -201,7 +218,7 @@ def test_status_shows_capacity_rows(capsys):
 
 def test_status_lists_owned_instances_and_counts_them(capsys):
     fake = FakeLambda(types=TYPES, instances=[NODE, FOREIGN, inst("k3s-gpu-a6000-2", status="terminated")])
-    rc = main(["status"], env=ENV, client=fake)
+    rc = main(["status"], env=ENV, client=fake, infra=in_sync(NODE))
     out = capsys.readouterr().out
     assert rc == 0
     assert "GPU instances (k3s-gpu-*): 1" in out
@@ -211,9 +228,10 @@ def test_status_lists_owned_instances_and_counts_them(capsys):
 
 
 def test_status_with_no_instances_reports_zero(capsys):
-    rc = main(["status"], env=ENV, client=FakeLambda(types=TYPES))
+    rc = main(["status"], env=ENV, client=FakeLambda(types=TYPES), infra=in_sync())
     out = capsys.readouterr().out
-    assert rc == 0 and "GPU instances (k3s-gpu-*): 0" in out and "other running" not in out
+    assert rc == 3 and "GPU instances (k3s-gpu-*): 0" in out and "other running" not in out
+    assert "pool a6000 has 0, wants 1" in out  # count 1 in the spec: that is drift
 
 
 # --- list-nodes / ip ----------------------------------------------------------------------------
@@ -287,7 +305,7 @@ def test_ip_refuses_an_address_that_is_not_ipv4(bad_ip, capsys):
 @pytest.mark.parametrize("command", [["list-nodes"], ["status"], ["plan"]])
 def test_node_lines_refuse_an_address_that_is_not_ipv4(command, capsys):
     fake = FakeLambda(types=TYPES, instances=[inst("k3s-gpu-a6000-1", ip="1.2.3.4 -oX")])
-    assert main(command, env=ENV, client=fake) == 1
+    assert main(command, env=ENV, client=fake, infra=FakeInfra()) == 1
     captured = capsys.readouterr()
     assert "-oX" not in captured.out and "invalid IP" in captured.err
 
@@ -338,3 +356,137 @@ def test_rules_with_nothing_configured(capsys):
     assert main(["rules"], env=ENV, client=FakeLambda()) == 0
     out = capsys.readouterr().out
     assert "global" in out and "(no rules)" in out and "ruleset" not in out
+
+
+# --- overrides (Ruling R20) ---------------------------------------------------------------------
+
+def test_plan_reads_the_override_file(tmp_path, overrides, capsys):
+    overrides.write_text('{"pools": {"a6000": 2}}')
+    rc = main(["--spec", spec_file(tmp_path, budget_usd_per_hour=5.0), "plan"], env=ENV,
+              client=FakeLambda(types=TYPES, instances=[NODE]))
+    out = capsys.readouterr().out
+    assert rc == 0 and "create k3s-gpu-a6000-2" in out
+
+
+def test_plan_set_count_beats_the_override_file(tmp_path, overrides, capsys):
+    overrides.write_text('{"pools": {"a6000": 2}}')
+    rc = main(["plan", "--set-count", "a6000=1"], env=ENV, client=FakeLambda(types=TYPES, instances=[NODE]))
+    assert rc == 0 and "No instance changes" in capsys.readouterr().out
+
+
+@pytest.mark.parametrize("command", [["plan"], ["apply", "--auto-approve"]])
+def test_malformed_override_file_exits_2(command, overrides, capsys):
+    overrides.write_text("{not json")
+    fake, infra = FakeLambda(types=TYPES), FakeInfra()
+    assert main(command, env=APPLY_ENV, client=fake, infra=infra) == 2
+    assert str(overrides) in capsys.readouterr().err
+    assert all(c[0] in READS for c in fake.calls) and infra.events == []
+
+
+def _changes(out):
+    """The create/delete set a plan printed: {("create", name)} and {("delete", name, id)}."""
+    changes = set()
+    for line in out.splitlines():
+        words = line.split()
+        if words and words[0] == "create":
+            changes.add(("create", words[1]))
+        elif words and words[0] == "delete":
+            changes.add(("delete", words[1], words[2]))
+    return changes
+
+
+def test_plan_and_apply_agree_when_an_override_file_exists(tmp_path, overrides, capsys):  # Ruling R20
+    overrides.write_text('{"pools": {"a6000": 2}}')
+    spec = spec_file(tmp_path, budget_usd_per_hour=5.0)
+    kept = inst("k3s-gpu-a6000-2", ip="129.80.30.32")
+    old = inst("k3s-gpu-old-1", ip="129.80.30.33", id="id-old")
+    assert main(["--spec", spec, "plan"], env=ENV, client=FakeLambda(types=TYPES, instances=[kept, old])) == 0
+    planned = _changes(capsys.readouterr().out)
+    assert planned == {("create", "k3s-gpu-a6000-1"), ("delete", "k3s-gpu-old-1", "id-old")}  # count 1 alone: none
+
+    fake = FakeLambda(types=TYPES, instances=[kept, old])
+    assert main(["--spec", spec, "apply", "--auto-approve"], env=APPLY_ENV, client=fake, infra=FakeInfra()) == 0
+    done = {("create", l.name) for l in fake.launched} | {
+        ("delete", i.name, i.id) for i in [kept, old] if i.id in fake.terminated}
+    assert done == planned
+
+
+# --- apply / down -------------------------------------------------------------------------------
+
+APPLY_ENV = {"LAMBDA_API_KEY": "k", "LAMBDA_SSH_KEY_NAME": "operator"}
+
+
+def test_cli_apply_auto_approve(capsys):
+    fake, infra = FakeLambda(types=TYPES), FakeInfra()
+    assert main(["apply", "--auto-approve"], env=APPLY_ENV, client=fake, infra=infra) == 0
+    assert [l.ssh_key_name for l in fake.launched] == ["operator"]
+    assert infra.joined == [("k3s-gpu-a6000-1", "129.80.30.30", "a6000")]
+    assert "create k3s-gpu-a6000-1" in capsys.readouterr().out
+
+
+@pytest.mark.parametrize("answer, rc, launched", [("y\n", 0, 1), ("yes\n", 0, 1), ("n\n", 2, 0), ("\n", 2, 0),
+                                                  ("", 2, 0)])
+def test_cli_apply_asks_for_confirmation(answer, rc, launched, monkeypatch, capsys):
+    monkeypatch.setattr(sys, "stdin", io.StringIO(answer))
+    fake = FakeLambda(types=TYPES)
+    assert main(["apply"], env=APPLY_ENV, client=fake, infra=FakeInfra()) == rc
+    assert len(fake.launched) == launched
+
+
+def test_cli_apply_keep_on_failure(capsys):
+    fake, infra = FakeLambda(types=TYPES), FakeInfra(join_fail={"k3s-gpu-a6000-1"})
+    assert main(["apply", "--auto-approve", "--keep-on-failure"], env=APPLY_ENV, client=fake, infra=infra) == 1
+    assert fake.terminated == []
+
+
+def test_cli_apply_join_failure_exits_1_and_cleans_up(capsys):
+    fake, infra = FakeLambda(types=TYPES), FakeInfra(join_fail={"k3s-gpu-a6000-1"})
+    assert main(["apply", "--auto-approve"], env=APPLY_ENV, client=fake, infra=infra) == 1
+    assert fake.terminated == fake.launched_ids
+
+
+def test_cli_apply_needs_the_ssh_key_name(capsys):
+    fake, infra = FakeLambda(types=TYPES), FakeInfra()
+    assert main(["apply", "--auto-approve"], env=ENV, client=fake, infra=infra) == 2
+    assert "LAMBDA_SSH_KEY_NAME" in capsys.readouterr().err
+    assert fake.calls == [] and infra.events == []
+
+
+def test_cli_apply_over_budget_exits_2(tmp_path, capsys):
+    fake, infra = FakeLambda(types=TYPES), FakeInfra()
+    rc = main(["--spec", spec_file(tmp_path, budget_usd_per_hour=1.0), "apply", "--auto-approve"], env=APPLY_ENV,
+              client=fake, infra=infra)
+    assert rc == 2 and "budget" in capsys.readouterr().err
+    assert all(c[0] in READS for c in fake.calls) and infra.events == []
+
+
+def test_cli_apply_infra_error_exits_1(capsys):
+    fake = FakeLambda(types=TYPES, instances=[NODE, inst("k3s-gpu-a6000-2", ip="129.80.30.31")])
+    infra = FakeInfra()
+
+    def drain_fails(name):
+        raise cli.CommandError(["kubectl", "drain", name], 1, "connection refused")
+
+    infra.drain_and_delete_node = drain_fails
+    assert main(["apply", "--auto-approve"], env=APPLY_ENV, client=fake, infra=infra) == 1
+    assert "connection refused" in capsys.readouterr().err
+    assert fake.terminated == []  # never terminate a node that was not drained
+
+
+def test_cli_down(overrides, capsys):
+    overrides.write_text('{"pools": {"a6000": 2}}')
+    fake, infra = FakeLambda(types=TYPES, instances=[NODE, FOREIGN]), FakeInfra()
+    assert main(["down", "--auto-approve"], env=ENV, client=fake, infra=infra) == 0  # no ssh key needed
+    assert fake.terminated == ["id-k3s-gpu-a6000-1"] and not overrides.exists()
+    assert infra.applied_gpu_ips[-1] == []
+
+
+def test_cli_down_twice_exits_0(capsys):
+    fake, infra = FakeLambda(types=TYPES, instances=[NODE]), FakeInfra()
+    assert main(["down", "--auto-approve"], env=ENV, client=fake, infra=infra) == 0
+    assert main(["down", "--auto-approve"], env=ENV, client=fake, infra=infra) == 0
+    assert fake.terminated == ["id-k3s-gpu-a6000-1"]
+
+
+def test_cli_down_has_no_keep_on_failure_flag(capsys):
+    assert main(["down", "--keep-on-failure"], env=ENV, client=FakeLambda(), infra=FakeInfra()) == 2

@@ -101,6 +101,13 @@ def normalise_gpu_ips(gpu_ips: Sequence[object]) -> list[str]:
     return [str(ip) for ip in sorted({ipaddress.IPv4Address(gpu_ip(ip)) for ip in gpu_ips})]
 
 
+def check_max_nodes(value: object) -> int:
+    """The gpu-access stack's max_nodes (Ruling R27): spec max_nodes, a plain integer >= 1."""
+    if isinstance(value, bool) or not isinstance(value, int) or value < 1:
+        raise ValueError(f"max_nodes must be an integer >= 1, got {value!r}")
+    return value
+
+
 def check_join_args(name: object, ip: object, gpu_type: object) -> str:
     """Validate join_node's arguments (they reach a command line and a node label) and return the IP."""
     if not isinstance(name, str) or not _NODE_NAME_RE.fullmatch(name):
@@ -189,11 +196,17 @@ class Infra:
             self._cp_zone = zone
         return outputs
 
-    def apply_gpu_access(self, gpu_ips: Sequence[str]) -> None:
-        """Apply the gpu-access stack for exactly these GPU IPs (sorted, deduplicated; [] removes every rule)."""
+    def apply_gpu_access(self, gpu_ips: Sequence[str], *, max_nodes: int) -> None:
+        """Apply the gpu-access stack for exactly these GPU IPs (sorted, deduplicated; [] removes every rule).
+
+        `max_nodes` is the spec's max_nodes (Ruling R27): the stack refuses more IPs than its own copy allows, so
+        a spec that raises the cap would otherwise launch nodes the firewall never admits.
+        """
         value = json.dumps(normalise_gpu_ips(gpu_ips), separators=(",", ":"))
+        max_nodes = check_max_nodes(max_nodes)
         self.ensure_init("gpu-access")
-        self._terraform("gpu-access", "apply", "-auto-approve", "-input=false", f"-var=gpu_ips={value}")
+        self._terraform("gpu-access", "apply", "-auto-approve", "-input=false", f"-var=max_nodes={max_nodes}",
+                        f"-var=gpu_ips={value}")
 
     # --- k3s-cp over IAP ---
 
