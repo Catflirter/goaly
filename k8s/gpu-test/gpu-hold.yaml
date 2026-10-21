@@ -1,0 +1,32 @@
+# Check D6: occupies one GPU (sleep 600, restarted) until deleted. generateName (no fixed name) lets `kubectl create -f`
+# make one holder per allocatable GPU; the check and demo-reset delete them by the app=gpu-hold label.
+# restartPolicy stays the default (Always; the brief sets Never only on gpu-smoke, vectoradd and
+# gpu-overflow), so a holder keeps its GPU however long D6 or a demo takes, until it is deleted by label.
+# GPU wiring as in gpu-smoke.yaml: runtimeClassName nvidia-gpu plus one nvidia.com/gpu, no NVIDIA_VISIBLE_DEVICES.
+apiVersion: v1
+kind: Pod
+metadata:
+  generateName: gpu-hold-
+  namespace: gpu-test
+  labels:
+    app: gpu-hold
+spec:
+  runtimeClassName: nvidia-gpu
+  automountServiceAccountToken: false
+  securityContext:
+    runAsNonRoot: true
+    runAsUser: 1000
+    runAsGroup: 1000
+    seccompProfile:
+      type: RuntimeDefault
+  containers:
+    - name: cuda
+      image: docker.io/nvidia/cuda:12.8.1-base-ubuntu24.04@sha256:133c78a0575303be34164d0b90137a042172bdf60696af01a3c424ab402d86e2
+      command: ["sleep", "600"]
+      resources:
+        limits:
+          nvidia.com/gpu: 1
+      securityContext:
+        allowPrivilegeEscalation: false
+        capabilities:
+          drop: [ALL]

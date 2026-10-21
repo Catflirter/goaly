@@ -93,6 +93,7 @@ _PODSPEC = {"containers": [{"name": "c"}], "initContainers": [{"name": "i"}]}
     {"kind": "Deployment", "spec": {"template": {"spec": _PODSPEC}}},
     {"kind": "DaemonSet", "spec": {"template": {"spec": _PODSPEC}}},
     {"kind": "Job", "spec": {"template": {"spec": _PODSPEC}}},
+    {"kind": "CronJob", "spec": {"jobTemplate": {"spec": {"template": {"spec": _PODSPEC}}}}},
 ])
 def test_helpers_reach_the_pod_spec(doc):
     assert [c["name"] for c in all_containers(pod_spec(doc))] == ["i", "c"]
