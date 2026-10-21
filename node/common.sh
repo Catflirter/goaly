@@ -58,11 +58,13 @@ k3s_install_url() {
   printf 'https://raw.githubusercontent.com/k3s-io/k3s/%s/install.sh\n' "${1//+/%2B}"
 }
 
-# default_iface: the interface carrying the default route.
+# default_iface: the interface carrying the default route. Its name must pass the same check as an
+# explicit --iface (Linux allows e.g. "$" and "(" in interface names); anything else dies.
 default_iface() {
   local iface
   iface=$(ip -o route get 1.1.1.1 | awk '{for (i = 1; i < NF; i++) if ($i == "dev") {print $(i + 1); exit}}')
   [[ -n $iface ]] || die "cannot determine the default-route interface"
+  [[ $iface =~ ^[A-Za-z0-9_.:-]+$ ]] || die "unexpected default-route interface name: $iface (pass --iface)"
   printf '%s\n' "$iface"
 }
 
@@ -174,10 +176,14 @@ install_guard() {
 # output. A failing probe (tool or file missing) is recorded with its exit status and does not stop
 # the audit. Every probe only reads; in particular the FORWARD policy is recorded, never changed.
 # FILE is appended to, never truncated, so a re-run keeps the first run's evidence (the NIC MTU
-# before set_mtu changed it). IFACE must already be validated (it is interpolated into probes).
+# before set_mtu changed it). IFACE and the paths are shell-quoted (%q) into the probe text, so
+# any value is safe. Each probe gets GPU_AUDIT_TIMEOUT seconds (default 60; nvidia-smi can hang on
+# a GPU in a bad state); one that runs out is recorded as "[exit 124]" and the audit goes on.
 gpu_audit() {
-  local file=$1 iface=$2 label=$3 cmd rc
-  local nvcfg sysfs_mtu
+  local file=$1 iface=$2 label=$3 limit=${GPU_AUDIT_TIMEOUT:-60} cmd rc
+  local nvcfg sysfs_mtu iface_q
+  [[ $limit =~ ^[1-9][0-9]*$ ]] || die "gpu_audit: GPU_AUDIT_TIMEOUT must be a number of seconds: $limit"
+  iface_q=$(printf '%q' "$iface")
   nvcfg=$(printf '%q' "${K3S_BOOTSTRAP_TEST_ROOT:-}/etc/nvidia-container-runtime/config.toml")
   sysfs_mtu=$(printf '%q' "${SYSFS_NET:-/sys/class/net}/$iface/mtu")
   local -a probes=(
@@ -191,7 +197,7 @@ gpu_audit() {
     "dpkg -l | grep -E 'nvidia-container|libnvidia-container'"
     "iptables -V"
     "iptables -S FORWARD | head -3"
-    "ip -4 addr show $iface"
+    "ip -4 addr show $iface_q"
     "cat $sysfs_mtu"
     "systemctl is-enabled lambda-jupyter docker"
   )
@@ -200,10 +206,11 @@ gpu_audit() {
     printf '===== gpu-audit %s\n' "$label"
     for cmd in "${probes[@]}"; do
       printf '$ %s\n' "$cmd"
-      # Without pipefail a pipeline reports its last command (grep: 1 = no match; head never
-      # fails), not a SIGPIPE in iptables.
+      # bash -c runs without pipefail: a pipeline reports its last command (grep: 1 = no match;
+      # head never fails), not a SIGPIPE in iptables. timeout signals the probe's whole process
+      # group (TERM, then KILL 10 s later) and exits 124 when the limit is hit.
       rc=0
-      ( set +o pipefail; eval "$cmd" ) 2>&1 || rc=$?
+      timeout -k 10 "$limit" bash -c "$cmd" 2>&1 || rc=$?
       if (( rc != 0 )); then printf '[exit %d]\n' "$rc"; fi
     done
   } >> "$file"
@@ -217,7 +224,10 @@ k3s_installed_version() {
 }
 
 # install_k3s EXEC VERSION SKIP_START: run the tag-pinned install.sh unless k3s VERSION is already
-# installed. SKIP_START=true installs without starting the service.
+# installed. SKIP_START=true installs without starting the service. install.sh writes every K3S_*
+# variable in its environment into the service's env file (and K3S_URL/K3S_TOKEN change its mode),
+# so join credentials inherited from the caller are removed: the token only ever reaches
+# token-file (spec §5.1).
 install_k3s() {
   local exec=$1 version=$2 skip_start=$3
   local -a vars=(INSTALL_K3S_VERSION="$version" INSTALL_K3S_EXEC="$exec")
@@ -226,5 +236,6 @@ install_k3s() {
     return 0
   fi
   if [[ $skip_start == true ]]; then vars+=(INSTALL_K3S_SKIP_START=true); fi
-  curl -fsSL "$(k3s_install_url "$version")" | env "${vars[@]}" sh -
+  curl -fsSL "$(k3s_install_url "$version")" \
+    | env -u K3S_TOKEN -u K3S_AGENT_TOKEN -u K3S_TOKEN_FILE -u K3S_URL "${vars[@]}" sh -
 }

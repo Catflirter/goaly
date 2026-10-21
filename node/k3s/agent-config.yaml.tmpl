@@ -4,7 +4,7 @@
 # (k3s#12942). The join token reaches token-file later, piped in by scripts/join-node.sh.
 server: https://@SERVER_IP@:6443
 token-file: /etc/rancher/k3s/token
-node-name: @NODE_NAME@
+node-name: "@NODE_NAME@"
 node-external-ip: @EXTERNAL_IP@
 protect-kernel-defaults: true
 @GPU_CONFIG@

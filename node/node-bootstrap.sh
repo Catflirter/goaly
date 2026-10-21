@@ -8,7 +8,8 @@
 #                     [--render-only DIR]
 #
 # Without --gpu/--no-gpu the node is a GPU node when nvidia-smi is on PATH; a GPU node needs
-# --gpu-type (exit 2 without it). k3s-agent is installed but not started: join-node.sh pipes the
+# --gpu-type (exit 2 without it); --gpu-type alone on a host without nvidia-smi exits 2 as well
+# (pass --gpu to force a GPU node). k3s-agent is installed but not started: join-node.sh pipes the
 # join token into /etc/rancher/k3s/token and then starts it. The token never passes through an
 # environment variable, because install.sh would write it into the service's env file.
 #
@@ -61,7 +62,9 @@ done
 [[ -n $EXTERNAL_IP ]] || usage "--external-ip is required"
 valid_ipv4 "$SERVER_IP" || usage "--server-ip is not an IPv4 address: $SERVER_IP"
 valid_ipv4 "$EXTERNAL_IP" || usage "--external-ip is not an IPv4 address: $EXTERNAL_IP"
-# An RFC 1123 label: valid as a K8s node name and as a hostname, and safe to write into YAML bare.
+# An RFC 1123 label: valid as a K8s node name and as a hostname. It holds no quote or backslash, so
+# the template writes it as a double-quoted YAML string (bare, "null", "true" or "123" would load as
+# null, a bool or an int).
 [[ $NODE_NAME =~ ^[a-z0-9]([-a-z0-9]{0,61}[a-z0-9])?$ ]] \
   || usage "--node-name must be a lowercase RFC 1123 label (at most 63 characters): $NODE_NAME"
 [[ $UNDERLAY_MTU =~ ^[1-9][0-9]{2,3}$ ]] || usage "--underlay-mtu must be an MTU in bytes (100-9999): $UNDERLAY_MTU"
@@ -75,10 +78,13 @@ case $GPU_FLAG in
     [[ -z $GPU_TYPE ]] || usage "--gpu-type contradicts --no-gpu"
     GPU=0 ;;
   *)
-    # --gpu-type alone states a GPU node; otherwise nvidia-smi on PATH makes it one.
-    if [[ -n $GPU_TYPE ]] || command -v nvidia-smi > /dev/null 2>&1; then GPU=1; else GPU=0; fi
+    # The brief's detection: nvidia-smi on PATH makes it a GPU node, nothing else does.
+    if command -v nvidia-smi > /dev/null 2>&1; then GPU=1; else GPU=0; fi
     if (( GPU )) && [[ -z $GPU_TYPE ]]; then
       usage "nvidia-smi found: this is a GPU node, pass --gpu --gpu-type T (or --no-gpu)"
+    fi
+    if (( ! GPU )) && [[ -n $GPU_TYPE ]]; then
+      usage "--gpu-type given but nvidia-smi is not on PATH: pass --gpu --gpu-type T for a GPU node"
     fi ;;
 esac
 if (( GPU )); then

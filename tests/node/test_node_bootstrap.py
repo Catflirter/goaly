@@ -5,7 +5,7 @@ the host sequence, with K3S_BOOTSTRAP_TEST_ROOT pointing at a scratch tree and s
 on PATH (the Task 9 seams in node/common.sh). No test runs a real sysctl, apt-get, systemctl, ip,
 netplan, nft, curl, k3s, iptables or nvidia-smi.
 """
-import ipaddress, os, re, subprocess
+import ipaddress, os, re, subprocess, time
 from pathlib import Path
 import pytest
 import yaml
@@ -194,6 +194,43 @@ def test_no_nvidia_smi_means_cpu(tmp_path):
     assert load_cfg(tmp_path) == BASE
 
 
+def test_gpu_type_alone_without_nvidia_smi_is_usage_error(tmp_path):
+    # Detection is nvidia-smi only (brief): --gpu-type without --gpu does not make a GPU node.
+    env = {"PATH": "/usr/bin:/bin", "SYSFS_NET": str(fake_sysfs(tmp_path, "ens4", 1460))}
+    r = subprocess.run(["bash", str(SCRIPT), "--render-only", str(tmp_path / "root"), "--server-ip", "34.82.10.10",
+                        "--node-name", "k3s-gpu-a6000-1", "--external-ip", "129.80.30.30", "--iface", "ens4",
+                        "--gpu-type", "a6000"], capture_output=True, text=True, env=env)
+    assert r.returncode == 2 and "nvidia-smi" in r.stderr and "--gpu" in r.stderr
+    assert not (tmp_path / "root").exists()
+
+
+@pytest.mark.parametrize("name", ["null", "true", "yes", "123", "0x1f"])
+def test_node_name_that_looks_like_a_yaml_scalar_stays_a_string(tmp_path, name):
+    # Valid RFC 1123 labels that bare YAML would load as null, a bool or a number.
+    r = run_agent(tmp_path, "--no-gpu", node=name)
+    assert r.returncode == 0, r.stderr
+    assert load_cfg(tmp_path) == {**BASE, "node-name": name}
+
+
+def test_default_iface_is_used_when_iface_omitted(tmp_path):
+    bindir, _ = make_stubs(tmp_path, {"ip": "echo '1.1.1.1 via 10.10.0.1 dev ens4 src 10.10.0.2 uid 0'"},
+                           names=["ip"])
+    r = run_agent(tmp_path, "--no-gpu", path=bindir,
+                  args=["--server-ip", "34.82.10.10", "--node-name", "k3s-cpu-1", "--external-ip", "34.29.20.20"])
+    assert r.returncode == 0, r.stderr
+    assert load_cfg(tmp_path) == BASE
+
+
+def test_unsafe_default_iface_name_is_refused(tmp_path):
+    # Linux allows "$", "(" and ")" in interface names; the auto-detected name gets the --iface check
+    # before it reaches mtu_preflight, set_mtu or gpu_audit.
+    bindir, _ = make_stubs(tmp_path, {"ip": "echo '1.1.1.1 via 10.10.0.1 dev e$(id) src 10.10.0.2'"}, names=["ip"])
+    r = run_agent(tmp_path, "--no-gpu", path=bindir,
+                  args=["--server-ip", "34.82.10.10", "--node-name", "k3s-cpu-1", "--external-ip", "34.29.20.20"])
+    assert r.returncode == 1 and "unexpected default-route interface name: e$(id)" in r.stderr
+    assert not (tmp_path / "root").exists()
+
+
 def test_no_gpu_overrides_detection(tmp_path):
     bindir, _ = make_stubs(tmp_path, names=["nvidia-smi"])
     assert run_agent(tmp_path, "--no-gpu", path=bindir).returncode == 0
@@ -269,14 +306,14 @@ def audit_stubs(tmp):
     }, names=["nvidia-smi", "lsb_release", "uname", "dpkg", "iptables", "ip", "systemctl"])
 
 
-def run_audit(tmp, bindir, label):
+def run_audit(tmp, bindir, label, iface="eno1", extra_env=None):
     sysroot = tmp / "sys"
     (sysroot / "etc/nvidia-container-runtime").mkdir(parents=True, exist_ok=True)
     (sysroot / "etc/nvidia-container-runtime/config.toml").write_text('#debug = "x"\nmode = "auto"\n')
     env = {**os.environ, "K3S_BOOTSTRAP_TEST_ROOT": str(sysroot), "SYSFS_NET": str(fake_sysfs(tmp, "eno1", 1500)),
-           "PATH": f"{bindir}:{os.environ['PATH']}"}
-    return subprocess.run(["bash", "-c", f"set -euo pipefail; source {COMMON}; "
-                                         f"gpu_audit {sysroot}/var/log/gpu-audit.txt eno1 {label}"],
+           "PATH": f"{bindir}:{os.environ['PATH']}", **(extra_env or {})}
+    return subprocess.run(["bash", "-c", f'set -euo pipefail; source {COMMON}; '
+                                         f'gpu_audit {sysroot}/var/log/gpu-audit.txt "$1" {label}', "audit", iface],
                           capture_output=True, text=True, env=env)
 
 
@@ -313,6 +350,29 @@ def test_gpu_audit_appends_and_records_failures(tmp_path):
     assert "[exit 1]" in text             # command -v nvidia-container-runtime: not on PATH
 
 
+def test_gpu_audit_quotes_the_interface_name(tmp_path):
+    # gpu_audit is safe whatever its caller passes: the name is a literal argument, never code.
+    marker = tmp_path / "PWNED"
+    bindir, log = audit_stubs(tmp_path)
+    r = run_audit(tmp_path, bindir, "before", iface=f"e$(touch {marker})")
+    assert r.returncode == 0, r.stderr
+    assert not marker.exists()
+    assert f"ip -4 addr show e$(touch {marker})" in calls(log)
+
+
+def test_gpu_audit_bounds_a_hung_probe(tmp_path):
+    # nvidia-smi can hang on a GPU in a bad state: the probe is cut off, recorded, and the audit goes on.
+    bindir, _ = make_stubs(tmp_path, {"nvidia-smi": "sleep 30"},
+                           names=["nvidia-smi", "lsb_release", "uname", "dpkg", "iptables", "ip", "systemctl"])
+    start = time.monotonic()
+    r = run_audit(tmp_path, bindir, "before", extra_env={"GPU_AUDIT_TIMEOUT": "1"})
+    assert r.returncode == 0, r.stderr
+    assert time.monotonic() - start < 15
+    text = (tmp_path / "sys/var/log/gpu-audit.txt").read_text()
+    assert text.count("[exit 124]") == 2   # both nvidia-smi probes
+    assert "$ systemctl is-enabled lambda-jupyter docker" in text
+
+
 # --- host sequence (stubbed binaries, scratch K3S_BOOTSTRAP_TEST_ROOT) ----------------------
 
 def host_stubs(tmp, gpu=False, units=("lambda-jupyter", "docker.socket", "docker.service")):
@@ -340,13 +400,14 @@ def host_stubs(tmp, gpu=False, units=("lambda-jupyter", "docker.socket", "docker
     return make_stubs(tmp, bodies, names=names)
 
 
-def run_host(tmp, bindir, *flags, node="k3s-cpu-1", ext="34.29.20.20"):
+def run_host(tmp, bindir, *flags, node="k3s-cpu-1", ext="34.29.20.20", extra_env=None):
     sysroot = tmp / "sys"
     nd = sysroot / "run/systemd/network"; nd.mkdir(parents=True, exist_ok=True)
     (nd / "10-netplan-ens4.network").write_text("[Match]\nName=ens4\n")
     env = {**os.environ, "SYSFS_NET": str(fake_sysfs(tmp, "ens4", 1500)),
            "K3S_BOOTSTRAP_TEST_ROOT": str(sysroot), "PATH": f"{bindir}:/usr/bin:/bin"}
     env.pop("K3S_TOKEN", None)
+    env.update(extra_env or {})
     return subprocess.run(["bash", str(SCRIPT), "--server-ip", "34.82.10.10", "--node-name", node,
                            "--external-ip", ext, "--iface", "ens4", *flags],
                           capture_output=True, text=True, env=env)
@@ -457,6 +518,34 @@ def test_host_failed_run_still_restarts_the_agent_on_rerun(tmp_path):
     log.write_text("")
     assert run_host(tmp_path, bindir, "--no-gpu", ext="34.29.20.21").returncode == 0
     assert "systemctl restart k3s-agent" in calls(log)
+
+
+def test_host_version_only_upgrade_restarts_a_running_agent(tmp_path):
+    # Same flags (config unchanged), older k3s installed: install.sh replaces the binary, and the
+    # running k3s-agent must be restarted to run it.
+    bindir, log = host_stubs(tmp_path)
+    assert run_host(tmp_path, bindir, "--no-gpu").returncode == 0
+    (tmp_path / "agent-active").touch()
+    (tmp_path / "k3s-version").write_text("v1.35.0+k3s1")
+    log.write_text("")
+    r = run_host(tmp_path, bindir, "--no-gpu")
+    assert r.returncode == 0, r.stderr
+    assert host_calls(log)[-6:] == ["k3s --version", *INSTALL, "systemctl is-active --quiet k3s-agent",
+                                    "systemctl restart k3s-agent"]
+    assert not (tmp_path / "sys/var/lib/rancher/k3s/bootstrap-restart-pending").exists()
+
+
+def test_host_inherited_join_credentials_never_reach_install_sh(tmp_path):
+    # install.sh copies every K3S_* variable into k3s-agent.service.env (spec §5.1: the token only
+    # reaches token-file), and K3S_URL/K3S_TOKEN would change its mode.
+    bindir, log = host_stubs(tmp_path)
+    seen = tmp_path / "install-env"
+    (bindir / "curl").write_text(f'#!/bin/bash\nprintf "%s\\n" "curl $*" >> "{log}"\n'
+                                 f'echo "env | grep ^K3S_ | sort > {seen}; echo {CURRENT} > {tmp_path}/k3s-version"\n')
+    leak = {"K3S_TOKEN": "leak", "K3S_AGENT_TOKEN": "leak", "K3S_TOKEN_FILE": "/leak", "K3S_URL": "https://leak:6443"}
+    r = run_host(tmp_path, bindir, "--no-gpu", extra_env=leak)
+    assert r.returncode == 0, r.stderr
+    assert seen.read_text().splitlines() == ["K3S_BOOTSTRAP_TEST_ROOT=" + str(tmp_path / "sys")]
 
 
 def test_host_writes_no_token(tmp_path):
