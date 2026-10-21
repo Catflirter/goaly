@@ -33,7 +33,27 @@ secrets: ## Scan committed history and uncommitted tracked changes for secrets
 	$(GITLEAKS) --pre-commit --staged .
 	$(GITLEAKS) --pre-commit .
 
-lint: ## Run all pre-commit hooks, the repo secret scan, then the tests
+# Offline only: -backend=false and the tests' mock provider need no cloud credentials.
+# -lockfile=readonly: init verifies providers against the committed .terraform.lock.hcl and
+# never rewrites it. To change providers, run tf-lock deliberately and commit the result.
+.PHONY: tf-test tf-lock
+tf-test: ## terraform init + validate every infra/ stack, then terraform test where it has tests/
+	@for d in $(ROOT)/infra/*/; do \
+	  d=$${d%/}; echo "==> $$d"; \
+	  terraform -chdir="$$d" init -backend=false -input=false -lockfile=readonly; \
+	  terraform -chdir="$$d" validate; \
+	  if [ -d "$$d/tests" ]; then terraform -chdir="$$d" test; fi; \
+	done
+
+TF_LOCK_PLATFORMS := linux_amd64 linux_arm64 darwin_amd64 darwin_arm64
+tf-lock: ## Regenerate every infra/ stack's .terraform.lock.hcl with hashes for all supported platforms
+	@for d in $(ROOT)/infra/*/; do \
+	  d=$${d%/}; echo "==> $$d"; \
+	  terraform -chdir="$$d" providers lock $(addprefix -platform=,$(TF_LOCK_PLATFORMS)); \
+	done
+
+lint: ## Run all pre-commit hooks, the repo secret scan, the Terraform tests, then the tests
 	$(PY) -m pre_commit run --all-files
 	$(MAKE) secrets
+	$(MAKE) tf-test
 	$(MAKE) test
