@@ -1,0 +1,17 @@
+# /etc/rancher/k3s/config.yaml on k3s-cp (spec §2.1). Rendered by node/server-bootstrap.sh.
+# All flannel settings live here only: setting them on agents makes nodes NotReady (k3s#12942).
+node-external-ip: @CP_IP@
+flannel-backend: wireguard-native
+flannel-external-ip: true
+secrets-encryption: true
+write-kubeconfig-mode: "0600"
+protect-kernel-defaults: true
+node-taint: ["CriticalAddonsOnly=true:NoExecute"]
+disable: [traefik, servicelb, metrics-server]
+kube-apiserver-arg:
+  - admission-control-config-file=/etc/rancher/k3s/psa.yaml
+  - audit-policy-file=/etc/rancher/k3s/audit-policy.yaml
+  - audit-log-path=/var/lib/rancher/k3s/server/logs/audit.log
+  - audit-log-maxage=30
+  - audit-log-maxbackup=10
+  - audit-log-maxsize=100

@@ -1,0 +1,7 @@
+# Audit every request at Metadata level only (no request/response bodies, so Secret
+# contents never reach the log) and skip the RequestReceived stage (spec §4.3).
+apiVersion: audit.k8s.io/v1
+kind: Policy
+omitStages: ["RequestReceived"]
+rules:
+  - level: Metadata
