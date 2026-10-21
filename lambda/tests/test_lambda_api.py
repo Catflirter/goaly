@@ -286,6 +286,24 @@ def test_global_rules_path():
                                "description": "wg"}]}
 
 
+def test_get_global_rules_path_and_parse():
+    client, t = make_client({("GET", "/firewall-rulesets/global"): (200, {"data": {
+        "id": "global", "name": "Global Firewall Rules", "rules": [
+            {"protocol": "tcp", "port_range": [22, 22], "source_network": "73.15.40.40/32",
+             "description": "operator ssh"},
+            {"protocol": "icmp", "source_network": "73.15.40.40/32", "description": None}]}})})
+    assert client.get_global_rules() == [FirewallRule("tcp", "73.15.40.40/32", (22, 22), "operator ssh"),
+                                          FirewallRule("icmp", "73.15.40.40/32", None, "")]
+    method, url, body, _ = t.calls[-1]
+    assert (method, url, body) == ("GET", BASE_URL + "/firewall-rulesets/global", None)
+
+
+def test_get_global_rules_with_unexpected_shape_is_an_api_error():
+    client, _ = make_client({("GET", "/firewall-rulesets/global"): (200, {"data": {"rules": "nope"}})})
+    with pytest.raises(LambdaAPIError, match="unexpected"):
+        client.get_global_rules()
+
+
 def test_terminate_body():
     client, t = make_client({("POST", "/instance-operations/terminate"): (200, {"data": {
         "terminated_instances": [INSTANCE_JSON]}})})

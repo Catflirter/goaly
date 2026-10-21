@@ -1,0 +1,9 @@
+#!/usr/bin/env bash
+# Run gpuctl (lambda/gpuctl) from the repo's venv with .env loaded: scripts/gpuctl <command> [args...]
+set -euo pipefail
+
+# shellcheck disable=SC1091  # common.sh is linted on its own
+source "$(dirname -- "${BASH_SOURCE[0]}")/lib/common.sh"
+load_env
+[[ -x "$REPO_ROOT/.venv/bin/python" ]] || die "$REPO_ROOT/.venv/bin/python not found: run make venv"
+exec env PYTHONPATH="$REPO_ROOT/lambda" "$REPO_ROOT/.venv/bin/python" -m gpuctl "$@"
