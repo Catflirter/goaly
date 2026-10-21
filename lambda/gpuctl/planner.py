@@ -20,6 +20,10 @@ LIVE_STATUSES = frozenset({"booting", "active", "unhealthy"})
 # Canonical names only (index >= 1, no leading zeros), so a name and its (pool, index) map one to one.
 _NODE_NAME_RE = re.compile(rf"{re.escape(PREFIX)}({POOL_NAME_RE.pattern})-([1-9][0-9]*)")
 _TYPE_PREFIX_RE = re.compile(r"gpu_[0-9]+x_")
+# make_plan refuses to materialise more nodes than this (or max_nodes, if larger). check_limits rejects anything
+# above max_nodes anyway; the ceiling only stops a --set-count typo (a6000=1000000000) from allocating one create
+# entry per requested node before that check can run.
+PLAN_NODE_CEILING = 1000
 
 
 class PlanError(Exception):
@@ -32,10 +36,19 @@ class BudgetExceeded(PlanError):
 
 @dataclass(frozen=True)
 class Plan:
+    """What to change on Lambda.
+
+    `duplicates` is the subset of `delete` that shares its name with another owned instance (the one with the
+    smallest id, which is in `keep` or earlier in `delete`). The name is also the K8s node name and the host-key
+    entry, so an executor must terminate a duplicate by id only: never drain/delete the node or forget the host
+    key for it. That is done once, for the name's own instance, if and only if that instance is deleted.
+    """
+
     create: tuple[tuple[str, str], ...]  # (node name, pool)
     delete: tuple[Instance, ...]
     keep: tuple[Instance, ...]
     hourly_usd: float
+    duplicates: tuple[Instance, ...] = ()
 
 
 def node_name(pool: str, index: int) -> str:
@@ -94,8 +107,9 @@ def choose_placement(pool: Pool, types: Mapping[str, InstanceType],
 
 
 def gpu_type_label(instance_type: str) -> str:
-    """gpu_1x_a6000 -> a6000; gpu_8x_a100_80gb_sxm4 -> a100_80gb_sxm4."""
-    return _TYPE_PREFIX_RE.sub("", instance_type, count=1)
+    """gpu_1x_a6000 -> a6000; gpu_8x_a100_80gb_sxm4 -> a100_80gb_sxm4. Only a leading gpu_<n>x_ is stripped."""
+    match = _TYPE_PREFIX_RE.match(instance_type)
+    return instance_type[match.end():] if match else instance_type
 
 
 def _worst_case_cents(pool: Pool, types: Mapping[str, InstanceType]) -> int:
@@ -111,6 +125,9 @@ def make_plan(spec: Spec, instances: Iterable[Instance], types: Mapping[str, Ins
     if set(counts) != set(spec.pools):
         raise PlanError(f"counts must name exactly the spec's pools {sorted(spec.pools)}, got {sorted(counts)}")
     counts = {name: _count(counts[name], f"pools.{name}") for name in spec.pools}
+    total = sum(counts.values())
+    if total > max(spec.max_nodes, PLAN_NODE_CEILING):  # keep + create == total, so fail before building it
+        raise PlanError(f"max_nodes: counts ask for {total} GPU nodes, limit is {spec.max_nodes}")
 
     # One instance per name: the smallest id wins, the rest are deleted.
     by_name: dict[str, Instance] = {}
@@ -160,7 +177,8 @@ def make_plan(spec: Spec, instances: Iterable[Instance], types: Mapping[str, Ins
             raise PlanError(f"{instance.name}: no price for instance type {instance.instance_type!r}")
         cents += instance_type.price_cents_per_hour
 
-    return Plan(create=tuple(create), delete=tuple(delete), keep=tuple(keep), hourly_usd=cents / 100)
+    return Plan(create=tuple(create), delete=tuple(delete), keep=tuple(keep), hourly_usd=cents / 100,
+                duplicates=tuple(duplicates))
 
 
 def check_limits(plan: Plan, spec: Spec) -> None:

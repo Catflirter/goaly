@@ -98,6 +98,31 @@ def test_duplicate_names_keep_smallest_id():
     a = inst("k3s-gpu-a6000-1", id="a")
     plan = make_plan(SPEC, [b, a], TYPES, {"a6000": 1})
     assert plan.keep == (a,) and plan.delete == (b,) and plan.create == ()
+    assert plan.duplicates == (b,)
+
+
+def test_duplicates_are_marked_so_the_executor_spares_the_shared_name():
+    # Duplicates share a name (= K8s node name, host key) with another instance: Plan.duplicates tells the
+    # executor to terminate them by id only. Ordinary deletes and keeps are never marked.
+    b = inst("k3s-gpu-a6000-1", id="b", status="active")
+    a = inst("k3s-gpu-a6000-1", id="a", status="booting", ip=None)
+    extra = inst("k3s-gpu-a6000-2")
+    plan = make_plan(SPEC, [b, a, extra], TYPES, {"a6000": 1})
+    assert plan.keep == (a,) and plan.delete == (extra, b) and plan.duplicates == (b,)
+    assert {i.name for i in plan.duplicates} <= {i.name for i in plan.keep}
+
+
+def test_duplicates_of_a_deleted_name_are_marked_too():
+    # The smallest id carries the name (drain + forget once); the other copy is terminated by id only.
+    first = inst("k3s-gpu-old-1", id="a")
+    second = inst("k3s-gpu-old-1", id="b")
+    plan = make_plan(SPEC, [second, first], TYPES, {"a6000": 0})
+    assert plan.delete == (first, second) and plan.duplicates == (second,) and plan.keep == ()
+
+
+def test_plan_without_duplicates_has_none_marked():
+    plan = make_plan(SPEC, [inst("k3s-gpu-a6000-1"), inst("k3s-gpu-a6000-2")], TYPES, {"a6000": 1})
+    assert plan.duplicates == ()
 
 
 def test_override_is_clamped_to_autoscale_bounds():
@@ -133,6 +158,10 @@ def test_choose_placement_respects_exclude():
         "gpu_1x_a100", "us-west-1")
 
 
+def test_choose_placement_skips_a_candidate_type_lambda_does_not_list():
+    assert choose_placement(POOL, {"gpu_1x_a100": TYPES["gpu_1x_a100"]}) == ("gpu_1x_a100", "us-west-1")
+
+
 def test_choose_placement_none_without_capacity():
     no_capacity = {name: InstanceType(t.name, t.price_cents_per_hour, ()) for name, t in TYPES.items()}
     assert choose_placement(POOL, no_capacity) is None
@@ -162,6 +191,22 @@ def test_max_nodes_enforced():
     assert not isinstance(excinfo.value, BudgetExceeded)
 
 
+def test_max_nodes_equal_is_allowed():
+    spec = spec_with(budget_usd_per_hour=100.0)
+    plan = make_plan(spec, [], TYPES, {"a6000": 3})
+    assert len(plan.create) == spec.max_nodes == 3
+    check_limits(plan, spec)
+
+
+@pytest.mark.parametrize("count", [1001, 10**9])
+def test_absurd_count_fails_fast_without_building_the_plan(count):
+    # A --set-count typo must not allocate one create entry per requested node before check_limits runs.
+    counts = target_counts(SPEC, set_counts={"a6000": count})
+    with pytest.raises(PlanError, match="max_nodes") as excinfo:
+        make_plan(SPEC, [], TYPES, counts)
+    assert not isinstance(excinfo.value, BudgetExceeded)
+
+
 def test_max_nodes_checked_before_budget():
     plan = make_plan(SPEC, [], TYPES, target_counts(SPEC, set_counts={"a6000": 4}))
     with pytest.raises(PlanError, match="max_nodes"):
@@ -171,6 +216,11 @@ def test_max_nodes_checked_before_budget():
 def test_gpu_type_label():
     assert gpu_type_label("gpu_1x_a6000") == "a6000"
     assert gpu_type_label("gpu_8x_a100_80gb_sxm4") == "a100_80gb_sxm4"
+
+
+@pytest.mark.parametrize("name", ["xgpu_1x_a6000", "cpu_gpu_2x_a", "a6000", "gpu_x_a6000"])
+def test_gpu_type_label_strips_only_a_leading_prefix(name):
+    assert gpu_type_label(name) == name
 
 
 def test_node_name_roundtrip():
@@ -189,6 +239,19 @@ def test_scale_up_fills_lowest_free_index():
     existing = inst("k3s-gpu-a6000-2")
     plan = make_plan(SPEC, [existing], TYPES, {"a6000": 2})
     assert plan.create == (("k3s-gpu-a6000-1", "a6000"),) and plan.keep == (existing,)
+
+
+def test_scale_up_from_one_creates_the_next_index():
+    existing = inst("k3s-gpu-a6000-1")
+    plan = make_plan(SPEC, [existing], TYPES, {"a6000": 2})
+    assert plan.create == (("k3s-gpu-a6000-2", "a6000"),) and plan.keep == (existing,)
+    assert plan.hourly_usd == pytest.approx(1.09 + 1.99)
+
+
+def test_scale_up_fills_a_gap_between_existing_indices():
+    existing = [inst("k3s-gpu-a6000-1"), inst("k3s-gpu-a6000-3")]
+    plan = make_plan(spec_with(budget_usd_per_hour=100.0), existing, TYPES, {"a6000": 3})
+    assert plan.create == (("k3s-gpu-a6000-2", "a6000"),) and plan.keep == tuple(existing)
 
 
 def test_owned_name_outside_the_naming_scheme_is_deleted():
