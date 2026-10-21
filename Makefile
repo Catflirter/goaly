@@ -45,7 +45,25 @@ tf-test: ## terraform init + validate every infra/ stack, then terraform test wh
 	  if [ -d "$$d/tests" ]; then terraform -chdir="$$d" test; fi; \
 	done
 
-TF_LOCK_PLATFORMS := linux_amd64 linux_arm64 darwin_amd64 darwin_arm64
+# Cloud entry points (spec §8, §11). Every terraform apply shows its plan and asks first;
+# AUTO_APPROVE=1 skips the question but never lets a plan destroy or replace a resource.
+.PHONY: init up kubeconfig tunnel tunnel-stop
+init: ## Create the Terraform state bucket and enable the GCP APIs (infra/bootstrap; one-time, billable)
+	$(ROOT)/scripts/up.sh init
+
+up: ## Bring the cluster up: base stack, k3s on k3s-cp, kubeconfig, API tunnel (safe to re-run)
+	$(ROOT)/scripts/up.sh all
+
+kubeconfig: ## Fetch the kubeconfig over IAP SSH into ~/.kube/hybrid-gpu.yaml (0600)
+	$(ROOT)/scripts/kubeconfig.sh
+
+tunnel: ## Start the IAP SSH tunnel to the API server at https://127.0.0.1:6443
+	$(ROOT)/scripts/tunnel.sh start
+
+tunnel-stop: ## Stop the API tunnel
+	$(ROOT)/scripts/tunnel.sh stop
+
+TF_LOCK_PLATFORMS :=linux_amd64 linux_arm64 darwin_amd64 darwin_arm64
 tf-lock: ## Regenerate every infra/ stack's .terraform.lock.hcl with hashes for all supported platforms
 	@for d in $(ROOT)/infra/*/; do \
 	  d=$${d%/}; echo "==> $$d"; \
