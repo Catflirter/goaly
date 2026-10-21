@@ -2,12 +2,14 @@
 
 Files are discovered by glob, so stacks added later (workers, gpu-access) are checked too.
 """
-import re
+import ipaddress, re, subprocess
 from pathlib import Path
 import pytest
 
 ROOT = Path(__file__).resolve().parents[1]
 INFRA = ROOT / "infra"
+# The everyone-CIDR is built, never written out: global constraints forbid the literal in any file.
+ANY_IPV4 = str(ipaddress.IPv4Network((0, 0)))
 
 def tf_files():
     # .terraform/ holds downloaded providers and modules, not our code.
@@ -160,8 +162,18 @@ def test_code_only_hides_keywords_in_comments_and_strings():
     assert not has_block(code, "log_config")
     assert has_attr(code, "description") and has_attr(code, "network")
 
+def checked_files():
+    """Every tracked file plus every Terraform file (a new .tf counts before it is staged)."""
+    out = subprocess.run(["git", "ls-files", "-z"], cwd=ROOT, capture_output=True, check=True).stdout
+    tracked = {ROOT / name for name in out.decode().split("\0") if name}
+    return sorted(p for p in tracked | set(tf_files()) if p.is_file() and not p.is_symlink())
+
 def test_no_open_internet_source_anywhere():
-    offenders = [str(p.relative_to(ROOT)) for p in tf_files() if "0.0.0.0/0" in p.read_text()]
+    # Global constraints: the everyone-CIDR may appear in no file and no rule, not only under infra/.
+    assert ipaddress.ip_network(ANY_IPV4).num_addresses == 2**32
+    files = checked_files()
+    assert ROOT / "node/common.sh" in files and set(tf_files()) <= set(files)
+    offenders = [str(p.relative_to(ROOT)) for p in files if ANY_IPV4.encode() in p.read_bytes()]
     assert offenders == []
 
 def test_no_iam_resources():
@@ -172,7 +184,7 @@ def test_no_iam_resources():
 
 def test_firewall_rules_log_and_target_service_accounts():
     # Spec section 3.2: rule 3 (log_config on; target by service account, never by tag) and
-    # rule 1 (an ingress rule always declares its source; GCP defaults a missing one to 0.0.0.0/0).
+    # rule 1 (an ingress rule always declares its source; GCP opens a missing one to everyone).
     rules = resource_blocks("google_compute_firewall")
     assert rules, "no google_compute_firewall resources found"
     for path, block in rules:

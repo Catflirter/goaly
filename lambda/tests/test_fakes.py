@@ -3,7 +3,7 @@ import inspect
 
 import pytest
 
-from fakes import FakeLambda
+from fakes import ANY_IPV4, FakeLambda
 from gpuctl.lambda_api import FirewallRule, Instance, InsufficientCapacity, LambdaAPIError, LambdaClient
 
 RULE = FirewallRule("tcp", "73.15.40.40/32", (22, 22), "operator ssh")
@@ -75,7 +75,7 @@ def test_rulesets_and_global_rules_are_stored():
     assert fake.global_rules == [RULE] and fake.get_global_rules() == [RULE]
 
 
-@pytest.mark.parametrize("source", ["0.0.0.0/0", "10.0.0.0/8", "2001:db8::1/128"])
+@pytest.mark.parametrize("source", [ANY_IPV4, "10.0.0.0/8", "2001:db8::1/128"])
 def test_fake_refuses_rules_the_real_client_would_never_send(source):
     fake = FakeLambda()
     bad = [FirewallRule("tcp", source, (22, 22), "x")]

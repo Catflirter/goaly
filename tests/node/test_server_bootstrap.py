@@ -7,13 +7,15 @@ plus a fake K3S_BOOTSTRAP_TEST_ROOT / SYSFS_NET; the k3s-guard.service hooks run
 rewritten to the scratch tree and the stub. No test runs a real sysctl, apt-get, systemctl, ip,
 netplan, nft, curl or k3s.
 """
-import fcntl, os, re, shlex, subprocess
+import fcntl, ipaddress, os, re, shlex, subprocess
 from pathlib import Path
 import pytest
 import yaml
 
 ROOT = Path(__file__).resolve().parents[2]
 COMMON = ROOT / "node/common.sh"
+# The everyone-CIDR is built, never written out: global constraints forbid the literal in any file.
+ANY_IPV4 = str(ipaddress.IPv4Network((0, 0)))
 SYSTEM_TOOLS = ["sysctl", "apt-get", "dpkg-query", "systemctl", "ip", "netplan", "nft", "curl", "k3s"]
 
 
@@ -119,7 +121,7 @@ def test_server_guard_rules(tmp_path):
     # The file replaces the whole table atomically on every load.
     assert text.splitlines()[:3] == ["table inet k3s_guard", "delete table inet k3s_guard",
                                      "table inet k3s_guard {"]
-    assert "0.0.0.0/0" not in text
+    assert ANY_IPV4 not in text
 
 
 def test_guard_peers_sorted_numerically(tmp_path):
