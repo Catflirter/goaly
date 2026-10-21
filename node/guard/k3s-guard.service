@@ -1,0 +1,32 @@
+# Loads the k3s_guard nft table (spec §4.2). Ubuntu's nftables.service stays masked:
+# it flushes the whole ruleset when it starts, including the rules k3s writes.
+[Unit]
+Description=k3s host firewall (nft table inet k3s_guard)
+Before=k3s.service k3s-agent.service
+
+[Service]
+Type=oneshot
+RemainAfterExit=yes
+ExecStart=/usr/sbin/nft -f /etc/k3s-guard/k3s-guard.nft
+# k3s-guard.nft seeds k3s_peers with the CP's own addresses only. peers.nft holds the last list
+# sync-peers set (spec 3.3). Only /usr/local/sbin/k3s-guard-peers (node/guard/k3s-guard-peers.sh)
+# writes it, and Task 13's sync-peers pipes its list into that helper (Ruling R14). Each write is a
+# full "flush set" + "add element", 0644, atomic, so a reboot (kernel.panic=10 reboots on its own)
+# or a reload does not lock the joined nodes out until the next sync-peers. Missing peers.nft: CP
+# addresses only. Broken peers.nft: CP addresses only, a WARNING in `journalctl -u k3s-guard`,
+# and the unit still starts ("-"), so k3s still starts.
+# Both hooks take k3s-guard-peers' lock, so they never replay the previous peers.nft over a
+# sync-peers that has applied a new list but not yet renamed it into peers.nft. The lock lives in
+# /run/k3s-guard, which install -d keeps root-only (0700), so no unprivileged process can hold
+# it. Each hook waits at most 60 s. If the lock is still held then, start skips the restore with a
+# WARNING (the unit and k3s still start) and reload fails with an ERROR (install_guard retries on
+# its next run), so k3s is never stuck waiting.
+ExecStartPost=-/bin/sh -c 'install -d -m 0700 /run/k3s-guard && exec 9>/run/k3s-guard/peers.lock && /usr/bin/flock -w 60 9 || { echo "k3s-guard: WARNING: no lock on /run/k3s-guard/peers.lock within 60s; /etc/k3s-guard/peers.nft not restored, k3s_peers holds only the CP addresses until make sync-peers" >&2; exit 1; }; if [ -s /etc/k3s-guard/peers.nft ] && ! /usr/sbin/nft -f /etc/k3s-guard/peers.nft; then echo "k3s-guard: WARNING: /etc/k3s-guard/peers.nft did not load; k3s_peers holds only the CP addresses until make sync-peers" >&2; exit 1; fi'
+# Table and peers go in as one transaction (k3s-guard.nft deletes and recreates the table), so a
+# reload leaves no gap; if peers.nft is missing the table loads alone, if it is broken the table
+# is loaded alone after a WARNING.
+ExecReload=/bin/sh -c 'install -d -m 0700 /run/k3s-guard && exec 9>/run/k3s-guard/peers.lock && /usr/bin/flock -w 60 9 || { echo "k3s-guard: ERROR: no lock on /run/k3s-guard/peers.lock within 60s; rules not reloaded" >&2; exit 1; }; cat /etc/k3s-guard/k3s-guard.nft /etc/k3s-guard/peers.nft 2>/dev/null | /usr/sbin/nft -f - || { echo "k3s-guard: WARNING: k3s-guard.nft + peers.nft did not load together; loading k3s-guard.nft alone, k3s_peers holds only the CP addresses until make sync-peers" >&2; exec /usr/sbin/nft -f /etc/k3s-guard/k3s-guard.nft; }'
+ExecStop=/usr/sbin/nft delete table inet k3s_guard
+
+[Install]
+WantedBy=multi-user.target
