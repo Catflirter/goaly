@@ -1,0 +1,38 @@
+repos:
+  - repo: https://github.com/gitleaks/gitleaks
+    rev: 2ca41cc1372d1e939a6a879f18cdc19fc1cac1ce  # frozen: v8.30.0
+    hooks:
+      - id: gitleaks
+        args: [--config, .gitleaks.toml]
+
+  - repo: https://github.com/shellcheck-py/shellcheck-py
+    rev: a6564f5d57444e123433a5c9af733e3975c77229  # frozen: v0.11.0.1-1
+    hooks:
+      # Upstream default file set (types: [shell], i.e. *.sh/*.bash and executable shell shebangs) ...
+      - id: shellcheck
+      # ... plus the extensionless bash wrapper scripts/gpuctl (Task 7), even if not yet executable.
+      - id: shellcheck
+        name: shellcheck (scripts/gpuctl)
+        types: [text]
+        files: ^scripts/gpuctl$
+
+  - repo: https://github.com/pre-commit/pre-commit-hooks
+    rev: 3e8a8703264a2f4a69428a0aa4dcb512790b2c8c  # frozen: v6.0.0
+    hooks:
+      - id: check-yaml
+        args: [--allow-multiple-documents]
+
+  - repo: local
+    hooks:
+      - id: terraform-fmt
+        name: terraform fmt
+        entry: terraform fmt -check -recursive infra
+        language: system
+        pass_filenames: false
+        files: ^infra/
+      - id: kubeconform
+        name: kubeconform
+        entry: kubeconform -strict -summary -ignore-missing-schemas
+        language: system
+        files: ^k8s/.*\.ya?ml$
+        exclude: values\.yaml$

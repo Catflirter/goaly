@@ -1,0 +1,3 @@
+# Synthetic test fixture (not a real key) committed in 3987374 before the lambda-api-key prefix
+# rule existed; the current test file splits the literal so it no longer matches.
+398737453e3e4ee4e6813d74c054b5f84fca26b3:tests/test_gitleaks_rules.py:lambda-api-key:26
