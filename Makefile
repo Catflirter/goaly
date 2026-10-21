@@ -58,6 +58,11 @@ lint: ## Run all pre-commit hooks, the repo secret scan, the Terraform tests, th
 	$(MAKE) tf-test
 	$(MAKE) test
 
+# RESILIENCE=1 (make verify RESILIENCE=1) reaches verify.sh through the environment and adds group E.
+.PHONY: verify
+verify: ## Run verification checks A-D (RESILIENCE=1 adds E) into verification/<timestamp>/
+	$(ROOT)/scripts/verify.sh
+
 .PHONY: gpu-plan gpu-status
 gpu-plan: ## Show what gpu-apply would create/delete on Lambda and the hourly cost (read-only)
 	$(ROOT)/scripts/gpuctl plan
