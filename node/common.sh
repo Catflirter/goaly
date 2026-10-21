@@ -178,11 +178,18 @@ install_guard() {
 # FILE is appended to, never truncated, so a re-run keeps the first run's evidence (the NIC MTU
 # before set_mtu changed it). IFACE and the paths are shell-quoted (%q) into the probe text, so
 # any value is safe. Each probe gets GPU_AUDIT_TIMEOUT seconds (default 60; nvidia-smi can hang on
-# a GPU in a bad state); one that runs out is recorded as "[exit 124]" and the audit goes on.
+# a GPU in a bad state), then TERM, then KILL GRACE = min(10, limit) seconds later; one cut off this
+# way is recorded as "[exit 124]" (or 137 after KILL) and the audit goes on. A probe stuck in
+# uninterruptible sleep (an nvidia-smi on a GPU that fell off the bus) survives KILL, so timeout
+# would wait for it forever: the audit stops waiting at limit + 2 * GRACE, records
+# "[exit 124 abandoned: ...]" and goes on, leaving that process behind. The probe stays in the
+# caller's process group (timeout --foreground), so Ctrl-C stops the probe and the bootstrap
+# together; only the probe itself is timed out, not processes it started (a pipeline's stages).
 gpu_audit() {
-  local file=$1 iface=$2 label=$3 limit=${GPU_AUDIT_TIMEOUT:-60} cmd rc
+  local file=$1 iface=$2 label=$3 limit=${GPU_AUDIT_TIMEOUT:-60} cmd rc pid start grace
   local nvcfg sysfs_mtu iface_q
   [[ $limit =~ ^[1-9][0-9]*$ ]] || die "gpu_audit: GPU_AUDIT_TIMEOUT must be a number of seconds: $limit"
+  grace=$(( limit < 10 ? limit : 10 ))
   iface_q=$(printf '%q' "$iface")
   nvcfg=$(printf '%q' "${K3S_BOOTSTRAP_TEST_ROOT:-}/etc/nvidia-container-runtime/config.toml")
   sysfs_mtu=$(printf '%q' "${SYSFS_NET:-/sys/class/net}/$iface/mtu")
@@ -207,10 +214,23 @@ gpu_audit() {
     for cmd in "${probes[@]}"; do
       printf '$ %s\n' "$cmd"
       # bash -c runs without pipefail: a pipeline reports its last command (grep: 1 = no match;
-      # head never fails), not a SIGPIPE in iptables. timeout signals the probe's whole process
-      # group (TERM, then KILL 10 s later) and exits 124 when the limit is hit.
-      rc=0
-      timeout -k 10 "$limit" bash -c "$cmd" 2>&1 || rc=$?
+      # head never fails), not a SIGPIPE in iptables; it execs a simple command (nvidia-smi), so
+      # that is timeout's direct child. Started in the background so the audit can stop waiting.
+      timeout --foreground -k "$grace" "$limit" bash -c "$cmd" 2>&1 &
+      pid=$! start=$SECONDS rc=0
+      while kill -0 "$pid" 2> /dev/null; do
+        if (( SECONDS - start > limit + 2 * grace )); then
+          kill -KILL "$pid" 2> /dev/null || true
+          rc=abandoned
+          break
+        fi
+        sleep 0.1
+      done
+      if [[ $rc == abandoned ]]; then
+        printf '[exit 124 abandoned: still running after %d s]\n' "$(( limit + 2 * grace ))"
+        continue
+      fi
+      wait "$pid" || rc=$?
       if (( rc != 0 )); then printf '[exit %d]\n' "$rc"; fi
     done
   } >> "$file"

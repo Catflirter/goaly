@@ -5,7 +5,7 @@ the host sequence, with K3S_BOOTSTRAP_TEST_ROOT pointing at a scratch tree and s
 on PATH (the Task 9 seams in node/common.sh). No test runs a real sysctl, apt-get, systemctl, ip,
 netplan, nft, curl, k3s, iptables or nvidia-smi.
 """
-import ipaddress, os, re, subprocess, time
+import ipaddress, os, re, shutil, signal, subprocess, time
 from pathlib import Path
 import pytest
 import yaml
@@ -371,6 +371,63 @@ def test_gpu_audit_bounds_a_hung_probe(tmp_path):
     text = (tmp_path / "sys/var/log/gpu-audit.txt").read_text()
     assert text.count("[exit 124]") == 2   # both nvidia-smi probes
     assert "$ systemctl is-enabled lambda-jupyter docker" in text
+
+
+def test_gpu_audit_abandons_a_probe_that_cannot_be_reaped(tmp_path):
+    # An nvidia-smi in uninterruptible sleep survives SIGKILL, so timeout would wait for it forever.
+    # Simulated by a timeout that never exits on TERM: the audit gives up on it at its own deadline
+    # (limit + 2 * kill-after), records that, and goes on.
+    real_timeout = shutil.which("timeout")
+    bindir, _ = make_stubs(tmp_path, {
+        "timeout": f'if [[ "$*" == *nvidia-smi* ]]; then trap "" TERM INT; exec sleep 300; fi\n'
+                   f'exec {real_timeout} "$@"'},
+        names=["nvidia-smi", "lsb_release", "uname", "dpkg", "iptables", "ip", "systemctl"])
+    start = time.monotonic()
+    r = run_audit(tmp_path, bindir, "before", extra_env={"GPU_AUDIT_TIMEOUT": "1"})
+    assert r.returncode == 0, r.stderr
+    assert time.monotonic() - start < 15
+    text = (tmp_path / "sys/var/log/gpu-audit.txt").read_text()
+    assert text.count("[exit 124 abandoned: still running after 3 s]") == 2   # both nvidia-smi probes
+    assert "$ systemctl is-enabled lambda-jupyter docker" in text
+
+
+def test_gpu_audit_stops_on_ctrl_c(tmp_path):
+    # Ctrl-C reaches the whole foreground process group: the probe and the bootstrap stop, nothing
+    # after the audit runs (a probe in its own process group would let the root bootstrap carry on).
+    probe_pid = tmp_path / "probe.pid"
+    bindir, _ = make_stubs(tmp_path, {"nvidia-smi": f'echo $$ > "{probe_pid}"; exec sleep 30'},
+                           names=["nvidia-smi", "lsb_release", "uname", "dpkg", "iptables", "ip", "systemctl"])
+    sysroot = tmp_path / "sys"
+    env = {**os.environ, "K3S_BOOTSTRAP_TEST_ROOT": str(sysroot), "SYSFS_NET": str(fake_sysfs(tmp_path, "eno1", 1500)),
+           "PATH": f"{bindir}:{os.environ['PATH']}", "GPU_AUDIT_TIMEOUT": "20"}
+    p = subprocess.Popen(["bash", "-c", f'set -euo pipefail; source {COMMON}; '
+                                        f'gpu_audit {sysroot}/var/log/gpu-audit.txt eno1 before; echo AFTER-AUDIT'],
+                         stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True, env=env, start_new_session=True)
+    try:
+        deadline = time.monotonic() + 10
+        while not probe_pid.exists() and time.monotonic() < deadline:
+            time.sleep(0.05)
+        time.sleep(0.5)
+        os.killpg(p.pid, signal.SIGINT)
+        out, _ = p.communicate(timeout=5)
+        assert p.returncode != 0
+        assert "AFTER-AUDIT" not in out
+        time.sleep(0.5)
+        with pytest.raises(ProcessLookupError):   # the probe stopped too
+            os.kill(int(probe_pid.read_text()), 0)
+        with pytest.raises(ProcessLookupError):   # nothing of the run is left
+            os.killpg(p.pid, 0)
+    finally:
+        if probe_pid.exists():
+            try:
+                os.kill(int(probe_pid.read_text()), signal.SIGKILL)
+            except ProcessLookupError:
+                pass
+        try:
+            os.killpg(p.pid, signal.SIGKILL)
+        except ProcessLookupError:
+            pass
+        p.wait()
 
 
 # --- host sequence (stubbed binaries, scratch K3S_BOOTSTRAP_TEST_ROOT) ----------------------
