@@ -5,7 +5,8 @@
 #
 # Without arguments it runs A B C D, plus E when RESILIENCE=1 (E reboots nodes; slow and costly).
 # Exit status: 0 when no check failed (SKIP is not a failure) and gitleaks found nothing in the
-# run directory, 1 otherwise, 2 for an unknown group.
+# run directory, 1 otherwise, 2 for an unknown group or when the run directory already holds files (a
+# second run in the same minute: its name has minute resolution; wait and run again).
 set -euo pipefail
 
 # checks.sh is linted on its own; pre-commit runs shellcheck without -x, so don't follow it.

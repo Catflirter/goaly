@@ -3,6 +3,7 @@
 Fake secrets are assembled from pieces ("K10" + "f" * 64, ...) so that this file itself never
 matches the repo's gitleaks rules; the strings the scripts see at run time are the full shapes.
 """
+import base64
 import os
 import re
 import shutil
@@ -16,9 +17,12 @@ LA_ENV = {**os.environ, "TZ": "America/Los_Angeles"}
 HEX20 = "01234567" + "89abcdef" + "0123"
 
 
-def bash(script):
+UTC_ENV = {**os.environ, "TZ": "UTC"}
+
+
+def bash(script, env=LA_ENV):
     return subprocess.run(["bash", "-c", f"set -euo pipefail; source {ROOT}/scripts/lib/checks.sh; {script}"],
-                          capture_output=True, text=True, cwd=ROOT, env=LA_ENV)
+                          capture_output=True, text=True, cwd=ROOT, env=env)
 
 
 def redact(text):
@@ -62,7 +66,8 @@ def test_all_pass_is_success_and_zero_checks_is_success(tmp_path):
 
 
 def test_check_file_header_has_started_timestamp_in_los_angeles(tmp_path):
-    bash(f"vr_init {tmp_path}; ok(){{ :; }}; run_check A1 'ok check' ok")
+    # The operator's shell may run in UTC; the harness forces America/Los_Angeles itself.
+    bash(f"vr_init {tmp_path}; ok(){{ :; }}; run_check A1 'ok check' ok", env=UTC_ENV)
     lines = (tmp_path / "01-A1.txt").read_text().splitlines()
     m = re.fullmatch(r"# started: \d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}([+-]\d{2}:\d{2})", lines[1])
     assert m, lines[1]
@@ -107,8 +112,92 @@ def test_summary_escapes_pipes_in_titles(tmp_path):
 def test_vr_init_refuses_a_directory_that_already_holds_files(tmp_path):
     (tmp_path / "old.txt").write_text("previous run\n")
     r = bash(f"vr_init {tmp_path}")
-    assert r.returncode != 0
+    assert r.returncode == 2
+    assert "already holds files" in r.stderr
     assert not (tmp_path / "SUMMARY.md").exists()
+    assert (tmp_path / "old.txt").read_text() == "previous run\n"
+
+
+def test_run_directory_and_evidence_are_private_to_the_operator(tmp_path):
+    d = tmp_path / "run"
+    bash(f"umask 022; vr_init {d}; ok(){{ echo hi; }}; run_check A1 ok ok; vr_finish")
+    assert d.stat().st_mode & 0o777 == 0o700
+    for f in ("SUMMARY.md", "01-A1.txt"):
+        assert (d / f).stat().st_mode & 0o077 == 0, f
+
+
+def test_vr_init_does_not_change_the_callers_umask(tmp_path):
+    r = bash(f"umask 022; vr_init {tmp_path}/run; umask")
+    assert r.stdout.split()[-1] == "0022"
+
+
+def test_footer_is_on_its_own_line_after_output_without_newline(tmp_path):
+    bash(f"vr_init {tmp_path}; ok(){{ printf abc; }}; run_check A1 ok ok")
+    lines = (tmp_path / "01-A1.txt").read_text().splitlines()
+    assert lines[2] == "abc"
+    assert lines[3].startswith("# finished: ") and lines[3].endswith("PASS (exit 0)")
+
+
+def test_failed_redact_filter_records_fail_not_pass(tmp_path):
+    # A broken filter loses the check's evidence; that must never count as a PASS.
+    r = bash(f"vr_init {tmp_path}; _VR_SED=(sh -c 'cat >/dev/null; exit 3'); ok(){{ echo fine; }}; "
+             "run_check A1 ok ok; vr_finish")
+    assert r.returncode == 1
+    assert "| 1 | A1 | ok | FAIL |" in (tmp_path / "SUMMARY.md").read_text()
+    assert "# redact failed (exit 3); output incomplete" in (tmp_path / "01-A1.txt").read_text()
+
+
+def test_vr_cmd_does_not_run_the_command_when_redact_fails(tmp_path):
+    r = bash(f"_VR_SED=(sh -c 'cat >/dev/null; exit 3'); rc=0; vr_cmd touch {tmp_path}/ran || rc=$?; echo rc=$rc")
+    assert r.stdout.splitlines()[-1] == "rc=3"
+    assert not (tmp_path / "ran").exists()
+
+
+def test_background_jobs_of_a_check_do_not_block_the_run(tmp_path):
+    # A check that leaves e.g. `kubectl port-forward &` running must not hang make verify.
+    r = subprocess.run(["bash", "-c", f"set -euo pipefail; source {ROOT}/scripts/lib/checks.sh; vr_init {tmp_path}; "
+                        "bg(){ sleep 30 & echo started; }; run_check A1 bg bg; vr_finish"],
+                       capture_output=True, text=True, env=LA_ENV, timeout=15)
+    assert r.returncode == 0, r.stderr
+    assert "started" in (tmp_path / "01-A1.txt").read_text()
+
+
+def wg_key(seed):
+    """A WireGuard-shaped key (44 base64 chars); built at run time so this file holds no key literal."""
+    return base64.b64encode(bytes((seed * 37 + i * 11) % 256 for i in range(32))).decode()
+
+
+WG_SHOW = """interface: flannel-wg
+  public key: {pub}
+  private key: (hidden)
+  listening port: 51820
+
+peer: {peer}
+  endpoint: 34.120.1.2:51820
+  allowed ips: 10.42.1.0/24
+  latest handshake: 12 seconds ago
+  transfer: 1.20 KiB received, 3.40 KiB sent
+  persistent keepalive: every 25 seconds
+"""
+
+
+def test_vr_finish_accepts_wg_show_output(tmp_path):
+    # Spec 9 B3 runs `wg show flannel-wg`; its public keys are not secrets and must not fail the run.
+    if not shutil.which("gitleaks"):
+        pytest.skip("gitleaks not installed")
+    (tmp_path / "wg.txt").write_text(WG_SHOW.format(pub=wg_key(1), peer=wg_key(2)))
+    r = bash(f"vr_init {tmp_path}/run; b3(){{ cat {tmp_path}/wg.txt; }}; run_check B3 wg b3; vr_finish")
+    assert r.returncode == 0, r.stdout + r.stderr
+    assert wg_key(2) in (tmp_path / "run/01-B3.txt").read_text()
+
+
+def test_vr_finish_still_flags_a_wireguard_private_key(tmp_path):
+    if not shutil.which("gitleaks"):
+        pytest.skip("gitleaks not installed")
+    # Written straight into the run directory, bypassing redact, as a buggy check could.
+    r = bash(f"vr_init {tmp_path}; leak(){{ echo 'private key: {wg_key(3)}' > {tmp_path}/raw.txt; }}; "
+             "run_check A1 leak leak; vr_finish")
+    assert r.returncode == 1
 
 
 def test_vr_finish_fails_when_gitleaks_finds_a_secret(tmp_path):
@@ -143,11 +232,40 @@ def test_redaction_covers_all_secret_shapes():
     ("  Private Key: " + "UFJJVkFU" + "RQ==", "UFJJVkFU"),
     ("PRIVATE KEY: " + "VVBQRVI" + "=", "VVBQRVI"),
     ("curl -u " + "secret_ops_" + HEX20 + ": https://cloud.lambda.ai/", HEX20),
+    ("token: '" + "c2luZ2xl" + "UXVvdGVk'", "c2luZ2xl"),
+    ("  client-key-data: '" + "TFMwdExT" + "MUNSVQ=='", "TFMwdExT"),
+    ("  'token': '" + "cXVvdGVk" + "S2V5'", "cXVvdGVk"),
+    ('Authorization: Bearer "' + "cXVvdGVk" + 'QmVhcmVy"', "cXVvdGVk"),
+    ("private key: '" + "c3FQcml2" + "S2V5'", "c3FQcml2"),
+    ('  "LAMBDA_API_KEY": "' + "anNvbkxh" + 'bWJkYUtleQ",', "anNvbkxh"),
+    ("LAMBDA_API_KEY: " + "eWFtbExh" + "bWJkYQ", "eWFtbExh"),
+    ("  tls.key: " + "TFMwdExT" + "MUNSVUdK", "TFMwdExT"),
+    ("    password: " + "aHVudGVy" + "Mg==", "aHVudGVy"),
+    ("kubectl --token=" + "YXJndkVx" + "dWFscw get pods", "YXJndkVx"),
+    ("kubectl --token " + "YXJndlNw" + "YWNl get pods", "YXJndlNw"),
+    ('{"t": "' + "K10" + "c" * 64 + "::server:abc" + ',def"}', ",def"),
 ])
 def test_redaction_variants(line, secret):
     out = redact(line + "\n")
     assert secret not in out
     assert "<redacted>" in out
+
+
+def test_redaction_replaces_pem_private_key_bodies():
+    body = ["TUlJRXZn" + "SUJBREFO", "QmdrcWhr" + "aUc5dzBC"]
+    pem = ("  private key: -----BEGIN " + "PRIVATE KEY-----\n" + "".join(f"    {b}\n" for b in body)
+           + "    -----END " + "PRIVATE KEY-----\nafter\n")
+    out = redact(pem)
+    for b in body:
+        assert b not in out
+    assert out.splitlines()[1:] == ["    <redacted>", "    <redacted>", "    -----END " + "PRIVATE KEY-----", "after"]
+
+
+def test_redaction_survives_non_utf8_bytes():
+    raw = b"\xff\xfe payload\ntoken: " + b"bm9uVXRm" + b"OA\n"
+    proc = subprocess.run(["bash", "-c", f"source {ROOT}/scripts/lib/checks.sh; redact"], input=raw,
+                          capture_output=True, check=True, env={**os.environ, "LC_ALL": "C.UTF-8"})
+    assert proc.stdout == b"\xff\xfe payload\ntoken: <redacted>\n"
 
 
 def test_redaction_keeps_the_key_name_and_ordinary_text():
@@ -228,7 +346,7 @@ def summary_ids(repo):
 
 
 def test_verify_with_no_registered_checks_succeeds(repo):
-    r = verify(repo)
+    r = verify(repo, TZ="UTC")                                 # the directory name is LA time regardless
     assert r.returncode == 0, r.stderr
     d = run_dir(repo)
     assert re.fullmatch(r"\d{4}-\d{2}-\d{2}T\d{4}-0[78]00", d.name), d.name

@@ -27,3 +27,13 @@ description = "Lambda Cloud API key by its own prefix (secret_<key-name>_<hex>[.
 # the Task 7 live check confirms it against the operator's real key (never printed).
 regex = '''\bsecret_[A-Za-z0-9_-]{1,64}?_[0-9a-f]{16,}(?:\.[A-Za-z0-9]{16,})?'''
 keywords = ["secret_"]
+
+# `wg show flannel-wg` (spec 9 B3) prints the interface's and peers' WireGuard PUBLIC keys, which
+# generic-api-key flags through the "key" in "public key:". Only that exact line shape is allowed:
+# the whole line must be `public key: <44-char key>` or `peer: <44-char key>`, so a private key
+# (`private key: …`, `PrivateKey = …`) is still reported.
+[[allowlists]]
+description = "WireGuard public keys in wg show output"
+targetRules = ["generic-api-key"]
+regexTarget = "line"
+regexes = ['''^\s*(public key|peer):[ \t]*[A-Za-z0-9+/]{43}=\s*$''']
