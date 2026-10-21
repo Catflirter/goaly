@@ -1,0 +1,30 @@
+# Process material (design spec, research, implementation plans) - kept local, not part of the deliverable
+docs/superpowers/
+.superpowers/
+
+# Secrets and local operator config
+.env
+kubeconfig*
+
+# Python
+.venv/
+__pycache__/
+.pytest_cache/
+
+# Runtime state
+.run/
+lambda/.autoscale-state.json
+*.pcap
+
+# Terraform
+.terraform/
+*.tfstate
+*.tfstate.*
+*.tfvars
+!*.auto.tfvars.json
+crash.log
+
+# Verification output: only the curated final/ set is committed
+verification/*
+!verification/.gitkeep
+!verification/final/

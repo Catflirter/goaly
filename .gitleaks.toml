@@ -1,0 +1,18 @@
+title = "hybrid-gpu-cluster gitleaks config"
+
+[extend]
+useDefault = true
+
+[[rules]]
+id = "k3s-join-token"
+description = "k3s cluster join token (K10<ca-hash>::<user>:<password>)"
+regex = '''K10[0-9a-f]{64}::[A-Za-z0-9:._-]{6,}'''
+keywords = ["K10"]
+
+[[rules]]
+id = "lambda-api-key-assignment"
+description = "Lambda Cloud API key assigned to LAMBDA_API_KEY"
+# [ \t]* instead of \s*: \s also matches newlines, which would flag an empty
+# `LAMBDA_API_KEY=` followed by the next KEY on the following line (.env.example).
+regex = '''LAMBDA_API_KEY[ \t]*[=:][ \t]*['"]?[A-Za-z0-9_.-]{16,}'''
+keywords = ["LAMBDA_API_KEY"]
