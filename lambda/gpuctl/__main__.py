@@ -1,6 +1,7 @@
 """gpuctl command line (design spec section 5.4): `PYTHONPATH=lambda python -m gpuctl <command>`.
 
 Read-only commands: plan, status, rules, list-nodes, ip. None of them changes anything on Lambda.
+sync-peers rewrites the peer allow-lists (k3s-cp's k3s_peers set, Lambda's global rules and k3s-gpu-<region> rulesets).
 
 Exit codes: 0 success; 1 an operation failed or the target was not found; 2 refused or a usage error
 (no LAMBDA_API_KEY, invalid spec, over budget, over max_nodes); 3 drift found (Task 20).
@@ -16,15 +17,19 @@ from collections.abc import Iterable, Mapping
 from pathlib import Path
 from typing import TextIO
 
+from gpuctl.infra import CommandError, Infra, SubprocessShell
 from gpuctl.lambda_api import FirewallRule, Instance, LambdaAPIError, LambdaClient
 from gpuctl.peers import ruleset_name
 from gpuctl.planner import (
     LIVE_STATUSES, PlanError, check_limits, make_plan, owned_instances, target_counts,
 )
+from gpuctl.reconcile import Reconciler, ReconcileError, Settings
 from gpuctl.spec import Spec, SpecError, load_spec
 from gpuctl.status import capacity_rows, render_capacity
 
-DEFAULT_SPEC = Path(__file__).resolve().parents[2] / "lambda" / "gpu-nodes.yaml"
+REPO_ROOT = Path(__file__).resolve().parents[2]
+DEFAULT_SPEC = REPO_ROOT / "lambda" / "gpu-nodes.yaml"
+OVERRIDES_PATH = REPO_ROOT / "lambda" / ".autoscale-state.json"
 API_KEY_ENV = "LAMBDA_API_KEY"
 RULESET_PREFIX = ruleset_name("")  # "k3s-gpu-": the rulesets gpuctl owns, one per region
 
@@ -196,6 +201,18 @@ def _ip(args: argparse.Namespace, client, out: TextIO) -> int:
     return EXIT_OK
 
 
+def _sync_peers(args: argparse.Namespace, spec: Spec, client, infra, env: Mapping[str, str], out: TextIO) -> int:
+    settings = Settings(spec_path=args.spec, overrides_path=OVERRIDES_PATH,
+                        ssh_key_name=env.get("LAMBDA_SSH_KEY_NAME", ""))
+    if infra is None:
+        infra = Infra(SubprocessShell(), REPO_ROOT, env)
+    try:
+        Reconciler(client, infra, settings, out=out).sync_peers(spec)
+    except (ReconcileError, CommandError, ValueError) as e:  # ValueError: an invalid IP from an output or OPERATOR_IP
+        raise _Failed(f"sync-peers: {e}") from None
+    return EXIT_OK
+
+
 # --- entry point --------------------------------------------------------------------------------
 
 def _parser() -> argparse.ArgumentParser:
@@ -211,6 +228,7 @@ def _parser() -> argparse.ArgumentParser:
     sub.add_parser("list-nodes", help="one line per GPU node: <name> <ip|-> <status> <type> <region>")
     ip = sub.add_parser("ip", help="print the public IP of GPU node NAME")
     ip.add_argument("name", metavar="NAME")
+    sub.add_parser("sync-peers", help="rewrite the peer allow-lists: cp k3s_peers set, Lambda global rules and rulesets")
     return parser
 
 
@@ -239,7 +257,7 @@ def main(argv: list[str] | None = None, *, env: Mapping[str, str] = os.environ, 
     """Run one gpuctl command and return its exit code.
 
     `client` replaces the LambdaClient built from env[LAMBDA_API_KEY] and `infra` the Terraform/SSH adapters
-    (Task 13; unused by the read-only commands). `out` defaults to the sys.stdout current at call time; errors
+    (gpuctl.infra.Infra over `env`; unused by the read-only commands). `out` defaults to the sys.stdout current at call time; errors
     go to sys.stderr.
     """
     out = sys.stdout if out is None else out
@@ -252,6 +270,9 @@ def main(argv: list[str] | None = None, *, env: Mapping[str, str] = os.environ, 
             spec = _load_spec(args.spec)
             api = _client(env, client)
             return (_plan if args.command == "plan" else _status)(args, spec, api, out)
+        if args.command == "sync-peers":
+            spec = _load_spec(args.spec)
+            return _sync_peers(args, spec, _client(env, client), infra, env, out)
         handler = {"rules": _rules, "list-nodes": _list_nodes, "ip": _ip}[args.command]
         return handler(args, _client(env, client), out)
     except _Refused as e:

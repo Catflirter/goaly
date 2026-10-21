@@ -1,13 +1,21 @@
-"""In-memory test doubles. FakeLambda mirrors LambdaClient's methods and signatures (test_fakes.py checks this)."""
+"""In-memory test doubles.
+
+FakeLambda mirrors LambdaClient's methods and signatures (test_fakes.py checks this); FakeInfra mirrors Infra's
+(test_infra.py checks this). FakeShell replays scripted results for the real Infra.
+"""
 
 from __future__ import annotations
 
 import ipaddress
-from collections.abc import Iterable, Mapping
+import subprocess
+from collections.abc import Iterable, Mapping, Sequence
+from dataclasses import dataclass
 
+from gpuctl.infra import CommandError, operator_ip
 from gpuctl.lambda_api import (
     FirewallRule, Instance, InstanceType, LambdaAPIError, Ruleset, _serialise_rules,
 )
+from gpuctl.reconcile import GUARD_PEERS_COMMAND
 
 # The everyone-CIDR is built, never written out: global constraints forbid the literal in any file.
 ANY_IPV4 = str(ipaddress.IPv4Network((0, 0)))
@@ -130,3 +138,129 @@ class FakeLambda:
         self.calls.append(("update_global_rules", rules))
         _serialise_rules(rules)
         self.global_rules = rules
+
+
+# --- shell and infra ----------------------------------------------------------------------------
+
+def ok(stdout: str = "", stderr: str = "") -> subprocess.CompletedProcess[str]:
+    """A scripted FakeShell result: exit code 0."""
+    return subprocess.CompletedProcess([], 0, stdout, stderr)
+
+
+def fail(returncode: int, stderr: str = "", stdout: str = "") -> subprocess.CompletedProcess[str]:
+    """A scripted FakeShell result: a non-zero exit code."""
+    return subprocess.CompletedProcess([], returncode, stdout, stderr)
+
+
+@dataclass(frozen=True)
+class ShellCall:
+    args: list[str]
+    input: str | None
+    check: bool
+    timeout: float | None
+    env: dict[str, str] | None
+
+
+class FakeShell:
+    """Replays `results` in order, one per run(), and records every call in `calls`.
+
+    Like SubprocessShell, a non-zero exit code raises CommandError when check=True. A result that is an exception
+    is raised instead. Running out of results fails the test: every command a test causes must be scripted.
+    """
+
+    def __init__(self, results: Iterable[subprocess.CompletedProcess[str] | Exception]) -> None:
+        self.results = list(results)
+        self.calls: list[ShellCall] = []
+
+    def run(self, args: Sequence[str], *, input: str | None = None, check: bool = True,
+            timeout: float | None = None, env: Mapping[str, str] | None = None) -> subprocess.CompletedProcess[str]:
+        args = list(args)
+        self.calls.append(ShellCall(args, input, check, timeout, None if env is None else dict(env)))
+        assert self.results, f"unexpected command (no scripted result left): {args}"
+        result = self.results.pop(0)
+        if isinstance(result, Exception):
+            raise result
+        result = subprocess.CompletedProcess(args, result.returncode, result.stdout, result.stderr)
+        if check and result.returncode != 0:
+            raise CommandError(args, result.returncode, result.stderr)
+        return result
+
+
+DEFAULT_OUTPUTS = {
+    "base": {"cp_ip": "34.82.10.10", "cp_internal_ip": "10.10.0.2", "cp_zone": "us-west1-b", "cp_name": "k3s-cp"},
+    "workers": {"worker_ips": {"k3s-cpu-1": "34.29.20.20"}},
+}
+
+
+class FakeInfra:
+    """Terraform outputs, cp SSH, kubectl and join-node in memory.
+
+    `outputs[stack]` is what tf_output returns; a stack missing from it raises CommandError (as terraform does for a
+    stack that was never initialised). `events` records the side effects in order: "tf:<sorted gpu ips>" for
+    apply_gpu_access, "nft" for the cp peer-set push, "ssh:<command>" for any other cp_ssh, "join:<name>:<type>".
+    detect_operator_ip validates env["OPERATOR_IP"] exactly like Infra; there is no network fallback.
+    """
+
+    def __init__(self, *, outputs: Mapping[str, Mapping] | None = None, env: Mapping[str, str] | None = None,
+                 cluster_nodes: Mapping[str, str | None] | None = None, nft_elements: Iterable[str] = (),
+                 join_fail: Iterable[str] = ()) -> None:
+        source = DEFAULT_OUTPUTS if outputs is None else outputs
+        self.outputs = {stack: dict(values) for stack, values in source.items()}
+        self.env = dict({"OPERATOR_IP": "73.15.40.40"} if env is None else env)
+        self.cluster_nodes = dict(cluster_nodes or {})
+        self.nft_elements = list(nft_elements)
+        self.join_fail = set(join_fail)
+        self.events: list[str] = []
+        self.initialised: list[str] = []
+        self.ssh_calls: list[tuple[str, str | None]] = []
+        self.kubectl_calls: list[tuple[str, ...]] = []
+        self.applied_gpu_ips: list[list[str]] = []
+        self.deleted_nodes: list[str] = []
+        self.joined: list[tuple[str, str, str]] = []
+        self.forgotten: list[str] = []
+
+    def ensure_init(self, stack: str) -> None:
+        self.initialised.append(stack)
+
+    def tf_output(self, stack: str) -> dict:
+        if stack not in self.outputs:
+            raise CommandError(["terraform", f"-chdir=infra/{stack}", "output", "-json"], 1,
+                               "Backend initialization required")
+        return dict(self.outputs[stack])
+
+    def apply_gpu_access(self, gpu_ips: Sequence[str]) -> None:
+        ips = sorted(gpu_ips)
+        self.applied_gpu_ips.append(ips)
+        self.events.append(f"tf:{ips}")
+
+    def cp_ssh(self, command: str, input: str | None = None) -> str:
+        self.ssh_calls.append((command, input))
+        self.events.append("nft" if command == GUARD_PEERS_COMMAND else f"ssh:{command}")
+        return ""
+
+    def kubectl(self, *args: str, check: bool = True) -> subprocess.CompletedProcess[str]:
+        self.kubectl_calls.append(args)
+        return subprocess.CompletedProcess(["kubectl", *args], 0, "", "")
+
+    def cluster_gpu_nodes(self) -> dict[str, str | None]:
+        return dict(self.cluster_nodes)
+
+    def drain_and_delete_node(self, name: str) -> None:
+        self.deleted_nodes.append(name)
+        self.cluster_nodes.pop(name, None)
+
+    def join_node(self, name: str, ip: str, gpu_type: str) -> None:
+        self.joined.append((name, ip, gpu_type))
+        self.events.append(f"join:{name}:{gpu_type}")
+        if name in self.join_fail:
+            raise CommandError(["join-node.sh", "--node", name], 1, "join failed")
+        self.cluster_nodes[name] = ip
+
+    def forget_host_key(self, name: str) -> None:
+        self.forgotten.append(name)
+
+    def detect_operator_ip(self) -> str:
+        return operator_ip(self.env.get("OPERATOR_IP", ""))
+
+    def cp_guard_elements(self) -> list[str]:
+        return list(self.nft_elements)
