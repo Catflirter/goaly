@@ -8,8 +8,12 @@ variable "state_bucket" {
   type        = string
 }
 
+# Second copy of the GPU node cap. It must equal max_nodes in lambda/gpu-nodes.yaml, which is
+# the source of truth: if the YAML allows more nodes than this default, gpuctl launches them but
+# this stack refuses their IPs and none of them can join. Callers should pass
+# -var=max_nodes=<spec max_nodes>; tests/test_terraform_static.py fails while the two differ.
 variable "max_nodes" {
-  description = "Upper bound on the number of GPU IPs (spec 3.2)."
+  description = "Upper bound on the number of GPU IPs (spec 3.2); must equal max_nodes in lambda/gpu-nodes.yaml."
   type        = number
   default     = 3
 }

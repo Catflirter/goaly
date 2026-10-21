@@ -88,6 +88,21 @@ run "output_is_sorted_and_distinct" {
   }
 }
 
+# Review Focus #4 for real: the last GPU goes offline and gpu_ips drops from N IPs back to [].
+# The previous run left two rule pairs in state; this apply must remove every one of them.
+run "back_to_empty_removes_all_rules" {
+  command = apply
+  variables { gpu_ips = [] }
+  assert {
+    condition     = length(google_compute_firewall.gpu_to_cp) == 0 && length(google_compute_firewall.gpu_to_workers) == 0
+    error_message = "dropping gpu_ips back to [] must remove every rule an earlier apply created"
+  }
+  assert {
+    condition     = length(output.gpu_ips) == 0
+    error_message = "gpu_ips output must be empty once every GPU is gone"
+  }
+}
+
 run "max_nodes_ips_accepted" {
   command = plan
   variables { gpu_ips = ["129.80.30.30", "150.136.9.9", "198.51.100.99"] }
