@@ -12,6 +12,8 @@ from pathlib import Path
 import pytest
 import yaml
 
+from gpuctl import peers as gpuctl_peers
+
 ROOT = Path(__file__).resolve().parents[2]
 COMMON = ROOT / "node/common.sh"
 # The everyone-CIDR is built, never written out: global constraints forbid the literal in any file.
@@ -742,13 +744,12 @@ def test_peers_lock_wait_is_bounded(tmp_path, who, message):
 
 def test_peers_helper_accepts_what_gpuctl_sync_peers_sends(tmp_path):
     # Ruling R14: Task 13's sync_peers sends nft_replace_script(cp_guard_elements(p)) (Task 6) to
-    # this helper. gpuctl.peers is not on this branch's base (task/02); the test runs once it is.
-    peers = pytest.importorskip("gpuctl.peers")
+    # this helper.
     bindir, log = make_stubs(tmp_path, nft_loader_stub(tmp_path), names=["nft"])
     for workers, gpus in [((), ()), (("34.29.20.20",), ("129.80.30.30", "9.9.9.9"))]:
-        p = peers.PeerSet(cp_ip="34.82.10.10", cp_internal_ip="10.10.0.2", worker_ips=workers,
-                          gpu_ips=gpus, operator_ip="73.15.40.40")
-        script = peers.nft_replace_script(peers.cp_guard_elements(p))
+        p = gpuctl_peers.PeerSet(cp_ip="34.82.10.10", cp_internal_ip="10.10.0.2", worker_ips=workers,
+                                 gpu_ips=gpus, operator_ip="73.15.40.40")
+        script = gpuctl_peers.nft_replace_script(gpuctl_peers.cp_guard_elements(p))
         r = run_peers(tmp_path, script, bindir)
         assert r.returncode == 0, r.stderr
         assert (guard_dir(tmp_path) / "peers.nft").read_text() == script
