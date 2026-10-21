@@ -1,7 +1,8 @@
 #!/usr/bin/env bash
 # k3s-guard-peers: replace k3s-cp's k3s_peers set and persist it for k3s-guard.service (spec §3.3).
 # server-bootstrap.sh installs it as /usr/local/sbin/k3s-guard-peers (root, 0755). gpuctl
-# sync-peers (Task 13) runs it over IAP SSH with gpuctl.peers.nft_replace_script() on stdin:
+# sync-peers runs it over IAP SSH with gpuctl.peers.nft_replace_script() on stdin. Ruling R14 makes
+# this Task 13's sync_peers step 5, in place of a bare `sudo nft -f -`:
 #
 #   sudo /usr/local/sbin/k3s-guard-peers <<'EOF'
 #   flush set inet k3s_guard k3s_peers
@@ -14,10 +15,13 @@
 # first (nft runs it as one transaction); only if that succeeds is it written to
 # /etc/k3s-guard/peers.nft (0644, temp file in the same directory, fsync, rename), which
 # k3s-guard.service loads after every start and reload. Concurrent runs, and the unit's start and
-# reload hooks, are serialised with flock on /run/lock/k3s-guard-peers.lock.
+# reload hooks, are serialised with flock on /run/k3s-guard/peers.lock. The directory is root-only
+# (0700), so no unprivileged process can create or open the lock and hold it. Every taker gives up
+# after 60 s, so a stuck holder produces an error and never an endless wait.
 #
-# Exit codes: 1 nft rejected the script or persisting failed (peers.nft is then unchanged),
-# 2 stdin is not an nft_replace_script() output (nothing applied or written).
+# Exit codes: 1 nft rejected the script, persisting failed, or the lock was not free within 60 s
+# (peers.nft is then unchanged), 2 stdin is not an nft_replace_script() output (nothing applied or
+# written).
 # Test seam: K3S_BOOTSTRAP_TEST_ROOT (see node/common.sh) prefixes /etc and /run; tests only.
 set -euo pipefail
 
@@ -27,7 +31,9 @@ die() { log "ERROR: $*"; exit 1; }
 HOST=${K3S_BOOTSTRAP_TEST_ROOT:-}
 DIR="$HOST/etc/k3s-guard"
 PEERS="$DIR/peers.nft"
-LOCK="$HOST/run/lock/k3s-guard-peers.lock"
+# Shared with k3s-guard.service's ExecStartPost/ExecReload, which take the same lock the same way.
+RUNDIR="$HOST/run/k3s-guard"
+LOCK="$RUNDIR/peers.lock"
 if [[ -z $HOST ]]; then
   (( EUID == 0 )) || die "run as root (sudo)"
 fi
@@ -47,9 +53,12 @@ if ! [[ $input =~ $shape ]]; then
   exit 2
 fi
 
-mkdir -p -- "$DIR" "${LOCK%/*}"
+mkdir -p -- "$DIR"
+# install -d (unlike mkdir -p) also tightens an existing $RUNDIR to 0700.
+install -d -m 0700 -- "$RUNDIR"
 exec 9> "$LOCK"
-flock 9
+flock -w 60 9 || die "no lock on $LOCK within 60s (a k3s-guard start/reload or another" \
+                     "k3s-guard-peers holds it); nothing applied, $PEERS unchanged"
 
 tmp=$(mktemp -- "$DIR/.peers.nft.XXXXXX")
 trap 'rm -f -- "$tmp"' EXIT

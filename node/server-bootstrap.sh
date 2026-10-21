@@ -71,7 +71,8 @@ render_all() {
   render_template "$HERE/guard/k3s-guard-server.nft.tmpl" "$root/etc/k3s-guard/k3s-guard.nft" PEERS
   render_template "$HERE/guard/k3s-guard.service" "$root/etc/systemd/system/k3s-guard.service"
   render_template "$HERE/k3s/10-guard.conf" "$root/etc/systemd/system/k3s.service.d/10-guard.conf"
-  # sync-peers' entry point on this host: replaces k3s_peers and persists it in peers.nft.
+  # sync-peers' entry point on this host (Ruling R14): replaces k3s_peers and persists it in
+  # peers.nft.
   render_template "$HERE/guard/k3s-guard-peers.sh" "$root/$PEERS_HELPER"
 }
 
