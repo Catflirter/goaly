@@ -1,0 +1,40 @@
+# Negative NetworkPolicy test (check C8): a client in a namespace other than nettest must time out
+# (curl exit 28) against hello. The check applies this file and deletes the namespace afterwards.
+apiVersion: v1
+kind: Namespace
+metadata:
+  name: np-denied
+  labels:
+    pod-security.kubernetes.io/enforce: restricted
+---
+apiVersion: v1
+kind: Pod
+metadata:
+  name: client
+  namespace: np-denied
+spec:
+  securityContext:
+    runAsNonRoot: true
+    runAsUser: 65532
+    runAsGroup: 65532
+    seccompProfile:
+      type: RuntimeDefault
+  containers:
+    - name: netshoot
+      image: docker.io/nicolaka/netshoot:v0.16@sha256:b09d9b21381f47a79b3cbcb30da25266dc17186ea00ae65e99fdc51396f48e70
+      command: ["sleep", "infinity"]
+      resources:
+        limits:
+          cpu: 500m
+          memory: 128Mi
+      securityContext:
+        allowPrivilegeEscalation: false
+        readOnlyRootFilesystem: true
+        capabilities:
+          drop: [ALL]
+      volumeMounts:
+        - name: tmp
+          mountPath: /tmp
+  volumes:
+    - name: tmp
+      emptyDir: {}

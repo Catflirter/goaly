@@ -1,0 +1,26 @@
+# Check D5: the CUDA vectorAdd sample runs on the GPU and logs "Test PASSED", then the Pod completes.
+# GPU wiring as in gpu-smoke.yaml: runtimeClassName nvidia-gpu plus one nvidia.com/gpu, no NVIDIA_VISIBLE_DEVICES.
+apiVersion: v1
+kind: Pod
+metadata:
+  name: vectoradd
+  namespace: gpu-test
+spec:
+  runtimeClassName: nvidia-gpu
+  restartPolicy: Never
+  securityContext:
+    runAsNonRoot: true
+    runAsUser: 1000
+    runAsGroup: 1000
+    seccompProfile:
+      type: RuntimeDefault
+  containers:
+    - name: vectoradd
+      image: nvcr.io/nvidia/k8s/cuda-sample:vectoradd-cuda12.5.0@sha256:7c7540bdf1f942d4fb6db97069fd6c289471b54ac29e3c7fcdf914cf77af7d41
+      resources:
+        limits:
+          nvidia.com/gpu: 1
+      securityContext:
+        allowPrivilegeEscalation: false
+        capabilities:
+          drop: [ALL]

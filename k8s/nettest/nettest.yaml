@@ -1,0 +1,116 @@
+# Connectivity test fixtures (spec §7, checks B1/B5): one echo and one probe Pod on every node.
+# Both DaemonSets tolerate every taint so the cp (CriticalAddonsOnly) and GPU nodes are covered too.
+# No NetworkPolicy here on purpose: this namespace exists to test reachability.
+apiVersion: v1
+kind: Namespace
+metadata:
+  name: nettest
+  labels:
+    pod-security.kubernetes.io/enforce: restricted
+---
+# whoami answers with its own hostname and IP on 8080; the probes curl it by Pod IP and via Service DNS.
+apiVersion: apps/v1
+kind: DaemonSet
+metadata:
+  name: echo
+  namespace: nettest
+  labels:
+    app: echo
+spec:
+  selector:
+    matchLabels:
+      app: echo
+  template:
+    metadata:
+      labels:
+        app: echo
+    spec:
+      tolerations:
+        - operator: Exists
+      securityContext:
+        runAsNonRoot: true
+        runAsUser: 65532
+        runAsGroup: 65532
+        seccompProfile:
+          type: RuntimeDefault
+      containers:
+        - name: whoami
+          image: docker.io/traefik/whoami:v1.12.0@sha256:c4717a8d1f0134a7444e24f881160e033991f23027c6c5a9a3f8fd22e70d1d44
+          env:
+            - name: WHOAMI_PORT_NUMBER
+              value: "8080"
+          ports:
+            - containerPort: 8080
+              name: http
+              protocol: TCP
+          readinessProbe:
+            httpGet:
+              path: /health
+              port: 8080
+          securityContext:
+            allowPrivilegeEscalation: false
+            readOnlyRootFilesystem: true
+            capabilities:
+              drop: [ALL]
+---
+# netshoot idles so checks can kubectl exec curl/ping/dig from every node. Without CAP_NET_RAW, ping
+# falls back to the ICMP datagram socket, which containerd 2.x opens to Pods by default
+# (enable_unprivileged_icmp sets net.ipv4.ping_group_range); the live run confirms it (check B1).
+apiVersion: apps/v1
+kind: DaemonSet
+metadata:
+  name: probe
+  namespace: nettest
+  labels:
+    app: probe
+spec:
+  selector:
+    matchLabels:
+      app: probe
+  template:
+    metadata:
+      labels:
+        app: probe
+    spec:
+      tolerations:
+        - operator: Exists
+      securityContext:
+        runAsNonRoot: true
+        runAsUser: 65532
+        runAsGroup: 65532
+        seccompProfile:
+          type: RuntimeDefault
+      containers:
+        - name: netshoot
+          image: docker.io/nicolaka/netshoot:v0.16@sha256:b09d9b21381f47a79b3cbcb30da25266dc17186ea00ae65e99fdc51396f48e70
+          command: ["sleep", "infinity"]
+          resources:
+            limits:
+              cpu: 500m
+              memory: 128Mi
+          securityContext:
+            allowPrivilegeEscalation: false
+            readOnlyRootFilesystem: true
+            capabilities:
+              drop: [ALL]
+          volumeMounts:
+            - name: tmp
+              mountPath: /tmp
+      volumes:
+        - name: tmp
+          emptyDir: {}
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: echo
+  namespace: nettest
+spec:
+  type: ClusterIP
+  selector:
+    app: echo
+  ports:
+    - name: http
+      port: 8080
+      targetPort: 8080
+      protocol: TCP

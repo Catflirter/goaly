@@ -1,0 +1,9 @@
+# GPU test namespace (spec §7). Restricted: the GPU Pods run non-root (runAsUser 1000). Whether
+# nvidia-smi works unprivileged is a live finding (spec §7); if it does not, this namespace drops to
+# baseline and the reason is recorded.
+apiVersion: v1
+kind: Namespace
+metadata:
+  name: gpu-test
+  labels:
+    pod-security.kubernetes.io/enforce: restricted

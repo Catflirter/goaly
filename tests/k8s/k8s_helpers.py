@@ -20,11 +20,15 @@ def one(docs, kind, name) -> dict:
     return found[0]
 
 
-def pod_spec(doc) -> dict:
-    """The PodSpec of a Pod, or of a workload that wraps one in spec.template (Deployment, DaemonSet, Job, ...)."""
+def pod_spec(doc) -> dict | None:
+    """The PodSpec of a Pod, or of a workload that wraps one in spec.template (Deployment, DaemonSet, Job, ...).
+
+    None for objects that carry no Pod (Namespace, Service, NetworkPolicy, ...).
+    """
     if doc["kind"] == "Pod":
         return doc["spec"]
-    return doc["spec"]["template"]["spec"]
+    template = doc.get("spec", {}).get("template")
+    return template["spec"] if template else None
 
 
 def all_containers(podspec) -> list[dict]:
