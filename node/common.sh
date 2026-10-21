@@ -169,6 +169,46 @@ install_guard() {
   rm -f -- "$pending"
 }
 
+# gpu_audit FILE IFACE LABEL: append a "===== gpu-audit LABEL" section to FILE recording the GPU
+# host's state (spec §6.2 step 1, §12 live checks #2 and #5): each probe as "$ CMD", then its
+# output. A failing probe (tool or file missing) is recorded with its exit status and does not stop
+# the audit. Every probe only reads; in particular the FORWARD policy is recorded, never changed.
+# FILE is appended to, never truncated, so a re-run keeps the first run's evidence (the NIC MTU
+# before set_mtu changed it). IFACE must already be validated (it is interpolated into probes).
+gpu_audit() {
+  local file=$1 iface=$2 label=$3 cmd rc
+  local nvcfg sysfs_mtu
+  nvcfg=$(printf '%q' "${K3S_BOOTSTRAP_TEST_ROOT:-}/etc/nvidia-container-runtime/config.toml")
+  sysfs_mtu=$(printf '%q' "${SYSFS_NET:-/sys/class/net}/$iface/mtu")
+  local -a probes=(
+    "date -Is"
+    "nvidia-smi"
+    "nvidia-smi --query-gpu=name,driver_version --format=csv"
+    "lsb_release -a"
+    "uname -r"
+    "command -v nvidia-container-runtime"
+    "grep -i mode $nvcfg"
+    "dpkg -l | grep -E 'nvidia-container|libnvidia-container'"
+    "iptables -V"
+    "iptables -S FORWARD | head -3"
+    "ip -4 addr show $iface"
+    "cat $sysfs_mtu"
+    "systemctl is-enabled lambda-jupyter docker"
+  )
+  mkdir -p -- "$(dirname -- "$file")"
+  {
+    printf '===== gpu-audit %s\n' "$label"
+    for cmd in "${probes[@]}"; do
+      printf '$ %s\n' "$cmd"
+      # Without pipefail a pipeline reports its last command (grep: 1 = no match; head never
+      # fails), not a SIGPIPE in iptables.
+      rc=0
+      ( set +o pipefail; eval "$cmd" ) 2>&1 || rc=$?
+      if (( rc != 0 )); then printf '[exit %d]\n' "$rc"; fi
+    done
+  } >> "$file"
+}
+
 # k3s_installed_version: e.g. v1.36.5+k3s1, or empty when k3s is not installed.
 k3s_installed_version() {
   if command -v k3s > /dev/null 2>&1; then
