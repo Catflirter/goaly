@@ -14,5 +14,16 @@ id = "lambda-api-key-assignment"
 description = "Lambda Cloud API key assigned to LAMBDA_API_KEY"
 # [ \t]* instead of \s*: \s also matches newlines, which would flag an empty
 # `LAMBDA_API_KEY=` followed by the next KEY on the following line (.env.example).
-regex = '''LAMBDA_API_KEY[ \t]*[=:][ \t]*['"]?[A-Za-z0-9_.-]{16,}'''
+# ['"]? after the name also catches the quoted-key forms {"LAMBDA_API_KEY": "..."} and
+# LAMBDA_API_KEY': '...'.
+regex = '''LAMBDA_API_KEY['"]?[ \t]*[=:][ \t]*['"]?[A-Za-z0-9_.-]{16,}'''
 keywords = ["LAMBDA_API_KEY"]
+
+[[rules]]
+id = "lambda-api-key"
+description = "Lambda Cloud API key by its own prefix (secret_<key-name>_<hex>[.<random>]), wherever it appears"
+# Spec 4.6: custom rule for the Lambda key prefix. Shape assumed from Lambda's key format
+# secret_<name>_<32 hex>.<32 alnum>; kept loose (hex run >= 16, dotted suffix optional) until
+# the Task 7 live check confirms it against the operator's real key (never printed).
+regex = '''\bsecret_[A-Za-z0-9_-]{1,64}?_[0-9a-f]{16,}(?:\.[A-Za-z0-9]{16,})?'''
+keywords = ["secret_"]

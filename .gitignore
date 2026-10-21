@@ -4,7 +4,11 @@ docs/superpowers/
 
 # Secrets and local operator config
 .env
+.env.*
+!.env.example
 kubeconfig*
+# kubeconfig* above would also swallow the `make kubeconfig` script (spec section 11).
+!scripts/kubeconfig.sh
 
 # Python
 .venv/
