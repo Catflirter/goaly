@@ -56,18 +56,33 @@ def test_nvdp_namespace_is_privileged():
     docs = load_docs(SYS / "nvidia-device-plugin-namespace.yaml")
     assert len(docs) == 1
     ns = one(docs, "Namespace", "nvidia-device-plugin")
-    assert ns["metadata"]["labels"]["pod-security.kubernetes.io/enforce"] == "privileged"
+    # warn and audit as well: otherwise they fall back to the cluster-wide restricted default (node/k3s/psa.yaml),
+    # and every helm upgrade of the hostPath DaemonSets prints PodSecurity warnings and writes audit annotations.
+    assert ns["metadata"]["labels"] == {f"pod-security.kubernetes.io/{mode}": "privileged"
+                                        for mode in ("enforce", "warn", "audit")}
+
+
+# Index digest of nvcr.io/nvidia/k8s-device-plugin:v0.20.1 (the chart 0.20.1 appVersion).
+NVDP_DIGEST = "sha256:27c1b2553a690ca3d29889dcd61df97525d46f58272c0be8dc63c2b18f120075"
 
 
 def test_nvdp_values():
     # Tolerations are explicit so the DaemonSet does not depend on the chart's defaults (spec §12 #10).
+    # The image is digest-pinned (spec §1.2). The chart renders repository:tag, so the digest goes in image.tag.
     assert load_docs(SYS / "nvdp-values.yaml") == [{
+        "image": {"tag": f"v0.20.1@{NVDP_DIGEST}"},
         "runtimeClassName": "nvidia-gpu",
         "tolerations": [
             {"key": "CriticalAddonsOnly", "operator": "Exists"},
             {"key": "nvidia.com/gpu", "operator": "Exists", "effect": "NoSchedule"},
         ],
     }]
+
+
+def test_nvdp_image_tag_is_digest_pinned():
+    # Spec §1.2: every image is pinned by digest; the tag stays the spec's v0.20.1.
+    tag = load_docs(SYS / "nvdp-values.yaml")[0]["image"]["tag"]
+    assert re.fullmatch(r"v0\.20\.1@sha256:[0-9a-f]{64}", tag)
 
 
 _PODSPEC = {"containers": [{"name": "c"}], "initContainers": [{"name": "i"}]}

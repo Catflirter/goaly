@@ -1,9 +1,14 @@
 # Helm values for nvdp/nvidia-device-plugin chart 0.20.1 (spec §6.2 step 4), release "nvdp" in
 # namespace nvidia-device-plugin.
+# image.tag: the chart renders "repository:tag", so the digest goes in the tag. That pins the plugin
+# DaemonSet and the mps-control-daemon (and its init container) to the multi-arch index of
+# nvcr.io/nvidia/k8s-device-plugin:v0.20.1 (spec §1.2: every image is digest-pinned).
 # runtimeClassName: the plugin pods run under the nvidia handler so they can see the GPUs.
 # tolerations: written out instead of relying on the chart defaults (spec §12 #10). The DaemonSet
 # controller only honours the tolerations in the pod template; the RuntimeClass's scheduling
 # tolerations do not help it.
+image:
+  tag: "v0.20.1@sha256:27c1b2553a690ca3d29889dcd61df97525d46f58272c0be8dc63c2b18f120075"
 runtimeClassName: nvidia-gpu
 tolerations:
   - {key: CriticalAddonsOnly, operator: Exists}
