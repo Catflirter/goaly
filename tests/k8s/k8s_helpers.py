@@ -20,15 +20,33 @@ def one(docs, kind, name) -> dict:
     return found[0]
 
 
-def pod_spec(doc) -> dict | None:
-    """The PodSpec of a Pod, or of a workload that wraps one in spec.template (Deployment, DaemonSet, Job, ...).
+# Kinds whose spec.template is a PodTemplateSpec.
+TEMPLATE_KINDS = frozenset({"Deployment", "DaemonSet", "StatefulSet", "ReplicaSet", "ReplicationController", "Job"})
+# Kinds that never carry a Pod. Any other kind makes pod_spec() fail, so a new workload kind (or a typo)
+# cannot slip past the image-pinning and Pod Security walks by being treated as Pod-less.
+PODLESS_KINDS = frozenset({
+    "Namespace", "Service", "ServiceAccount", "ConfigMap", "Secret", "NetworkPolicy", "RuntimeClass",
+    "Role", "RoleBinding", "ClusterRole", "ClusterRoleBinding", "APIService", "PodDisruptionBudget",
+    "PriorityClass", "ResourceQuota", "LimitRange",
+})
 
-    None for objects that carry no Pod (Namespace, Service, NetworkPolicy, ...).
+
+def pod_spec(doc) -> dict | None:
+    """The PodSpec of a Pod, of a workload that wraps one in spec.template (Deployment, DaemonSet, Job, ...),
+    or of a CronJob (spec.jobTemplate.spec.template).
+
+    None only for the explicitly Pod-less kinds (Namespace, Service, NetworkPolicy, ...); any other kind raises.
     """
-    if doc["kind"] == "Pod":
+    kind = doc["kind"]
+    if kind == "Pod":
         return doc["spec"]
-    template = doc.get("spec", {}).get("template")
-    return template["spec"] if template else None
+    if kind in TEMPLATE_KINDS:
+        return doc["spec"]["template"]["spec"]
+    if kind == "CronJob":
+        return doc["spec"]["jobTemplate"]["spec"]["template"]["spec"]
+    if kind in PODLESS_KINDS:
+        return None
+    raise ValueError(f"pod_spec: unknown kind {kind!r}; add it to TEMPLATE_KINDS or PODLESS_KINDS")
 
 
 def all_containers(podspec) -> list[dict]:

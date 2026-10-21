@@ -60,6 +60,18 @@ def test_pod_spec_is_none_for_objects_without_pods():
     assert pod_spec({"kind": "Service", "spec": {"ports": []}}) is None
 
 
+def test_pod_spec_rejects_unknown_kinds():
+    # An unlisted kind must fail loudly rather than be skipped by the digest and Pod Security walks.
+    with pytest.raises(ValueError, match="unknown kind 'Rollout'"):
+        pod_spec({"kind": "Rollout", "spec": {"template": {"spec": {"containers": []}}}})
+
+
+def test_all_images_walk_reaches_cronjob_templates():
+    cron = {"kind": "CronJob", "spec": {"jobTemplate": {"spec": {"template": {"spec": {
+        "containers": [{"name": "c", "image": "busybox:1.37"}]}}}}}}
+    assert [c["image"] for c in all_containers(pod_spec(cron))] == ["busybox:1.37"]
+
+
 @pytest.mark.parametrize("name", WORKLOAD_FILES)
 def test_restricted_security_context_everywhere(name):
     templates = pod_templates(name)
@@ -71,6 +83,8 @@ def test_restricted_security_context_everywhere(name):
         assert isinstance(psc["runAsUser"], int) and psc["runAsUser"] > 0, where
         assert isinstance(psc["runAsGroup"], int) and psc["runAsGroup"] > 0, where
         assert psc["seccompProfile"] == {"type": "RuntimeDefault"}, where
+        # No Pod uses the API: no projected ServiceAccount token in any container (least privilege).
+        assert spec["automountServiceAccountToken"] is False, where
         for key in ("hostNetwork", "hostPID", "hostIPC"):
             assert not spec.get(key), where
         assert all(set(v) <= {"name", "emptyDir"} for v in spec.get("volumes", [])), where
@@ -79,6 +93,8 @@ def test_restricted_security_context_everywhere(name):
             assert csc["allowPrivilegeEscalation"] is False, where
             assert csc["capabilities"] == {"drop": ["ALL"]}, where
             assert not csc.get("privileged"), where
+            # PSA restricted also rejects a container-level seccomp override to Unconfined.
+            assert csc.get("seccompProfile", {"type": "RuntimeDefault"})["type"] in {"RuntimeDefault", "Localhost"}, where
             assert "runAsUser" not in csc and "runAsNonRoot" not in csc, where  # the Pod-level values apply
             assert not any("hostPort" in p for p in c.get("ports", [])), where
 
@@ -104,6 +120,8 @@ def test_nettest_echo_contract():
     assert c["readinessProbe"]["httpGet"] == {"path": "/health", "port": 8080}
     assert {"containerPort": 8080, "name": "http", "protocol": "TCP"} in c["ports"]
     assert c["securityContext"]["readOnlyRootFilesystem"] is True
+    # It also runs on the e2-medium cp: bounded (Guaranteed) so no client can make it starve the API server.
+    assert c["resources"] == {"requests": {"cpu": "50m", "memory": "32Mi"}, "limits": {"cpu": "50m", "memory": "32Mi"}}
 
 
 def test_nettest_probe_contract():
@@ -188,7 +206,12 @@ def test_gpu_pods_contract(name):
     assert spec["runtimeClassName"] == "nvidia-gpu"
     assert c["resources"] == {"limits": {"nvidia.com/gpu": 1}}
     assert spec["securityContext"]["runAsUser"] == 1000
-    assert spec["restartPolicy"] == "Never"
+    if name == "gpu-hold":
+        # The brief sets Never only on gpu-smoke, vectoradd and gpu-overflow; a holder keeps the default
+        # (Always) so it holds its GPU until check D6 or demo reset deletes it by the app=gpu-hold label.
+        assert "restartPolicy" not in spec
+    else:
+        assert spec["restartPolicy"] == "Never"
     for ctr in all_containers(spec):  # the device plugin and runtime choose the GPU, never the Pod (spec §7)
         assert all(e["name"] != "NVIDIA_VISIBLE_DEVICES" for e in ctr.get("env", [])), name
 

@@ -13,6 +13,7 @@ metadata:
   name: client
   namespace: np-denied
 spec:
+  automountServiceAccountToken: false
   securityContext:
     runAsNonRoot: true
     runAsUser: 65532

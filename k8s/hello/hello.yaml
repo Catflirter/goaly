@@ -32,6 +32,7 @@ spec:
           labelSelector:
             matchLabels:
               app: hello
+      automountServiceAccountToken: false
       securityContext:
         runAsNonRoot: true
         runAsUser: 65532

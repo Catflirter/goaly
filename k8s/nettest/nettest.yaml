@@ -27,6 +27,7 @@ spec:
     spec:
       tolerations:
         - operator: Exists
+      automountServiceAccountToken: false
       securityContext:
         runAsNonRoot: true
         runAsUser: 65532
@@ -47,6 +48,14 @@ spec:
             httpGet:
               path: /health
               port: 8080
+          # Guaranteed and small: it also runs on the e2-medium cp, so no client can make it starve the API server.
+          resources:
+            requests:
+              cpu: 50m
+              memory: 32Mi
+            limits:
+              cpu: 50m
+              memory: 32Mi
           securityContext:
             allowPrivilegeEscalation: false
             readOnlyRootFilesystem: true
@@ -74,6 +83,7 @@ spec:
     spec:
       tolerations:
         - operator: Exists
+      automountServiceAccountToken: false
       securityContext:
         runAsNonRoot: true
         runAsUser: 65532

@@ -15,6 +15,7 @@ metadata:
 spec:
   # Never: the Pod stays Failed/OOMKilled for the check instead of crash-looping.
   restartPolicy: Never
+  automountServiceAccountToken: false
   securityContext:
     runAsNonRoot: true
     runAsUser: 65534
@@ -40,6 +41,7 @@ metadata:
   name: cpu-burn
   namespace: limits-demo
 spec:
+  automountServiceAccountToken: false
   securityContext:
     runAsNonRoot: true
     runAsUser: 65534

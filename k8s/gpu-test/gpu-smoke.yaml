@@ -10,6 +10,7 @@ metadata:
 spec:
   runtimeClassName: nvidia-gpu
   restartPolicy: Never
+  automountServiceAccountToken: false
   securityContext:
     runAsNonRoot: true
     runAsUser: 1000
