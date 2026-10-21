@@ -5,9 +5,12 @@ Every call appends one JSON line {"tool", "argv", "env"} to $FAKE_LOG. $FAKE_SCE
 file) steers the answers:
 
   outputs        {stack: {name: value}}   terraform output -raw/-json
+  init_rc        {stack: rc}              terraform init exit code (default 0). Like the real one, the fake
+                                          writes .terraform/terraform.tfstate before it fails
   plan_rc        {stack: rc}              terraform plan -detailed-exitcode (default 2: changes)
   deletes        {stack: [address]}       resource addresses the plan deletes or replaces
   ssh_failures   N                        first N `gcloud compute ssh --command true` calls fail
+  ssh_fail       [command]                `gcloud compute ssh --command C` exits 1 for each listed C
   kubeconfig     text                     answer to `sudo cat /etc/rancher/k3s/k3s.yaml`
   readyz         "ok" | anything else     kubectl get --raw /readyz (anything else: exit 1). Like the
                                           real API behind the tunnel, it answers ok only while a fake
@@ -25,7 +28,7 @@ from pathlib import Path
 TOOL = sys.argv[1]
 ARGS = sys.argv[2:]
 SCENARIO = json.loads(Path(os.environ["FAKE_SCENARIO"]).read_text())
-LOGGED_ENV = ("TF_VAR_project_id", "TF_VAR_state_bucket", "AUTO_APPROVE")
+LOGGED_ENV = ("TF_VAR_project_id", "TF_VAR_state_bucket", "AUTO_APPROVE", "LAMBDA_API_KEY")
 
 
 def log():
@@ -53,7 +56,7 @@ def terraform():
             state = chdir / ".terraform/terraform.tfstate"
             state.parent.mkdir(parents=True, exist_ok=True)
             state.write_text(json.dumps({"backend": {"type": "gcs", "config": cfg}}))
-        return 0
+        return SCENARIO.get("init_rc", {}).get(stack, 0)
     if sub == "output":
         value = SCENARIO["outputs"][stack][rest[-1]]
         sys.stdout.write(json.dumps(value) if "-json" in rest else str(value))
@@ -86,6 +89,8 @@ def gcloud():
         Path(os.environ["FAKE_LOG"] + ".tunnel").write_text(str(os.getpid()))
         time.sleep(300)
         return 0
+    if command in SCENARIO.get("ssh_fail", []):
+        return 1
     if command == "true":
         counter = Path(os.environ["FAKE_LOG"] + ".ssh-true")
         n = int(counter.read_text()) if counter.exists() else 0

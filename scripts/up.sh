@@ -5,8 +5,9 @@
 #   up.sh base   the base stack, k3s on k3s-cp, kubeconfig, API tunnel; waits for k3s-cp and CoreDNS
 #   up.sh all    make up: every stage below in order, init excepted (it is one-time, spec §3.1)
 #
-# Each terraform apply shows its plan and asks first (AUTO_APPROVE=1 skips the question, but never
-# lets a plan destroy or replace anything); a plan without changes applies nothing.
+# Each terraform apply shows its plan and asks first (AUTO_APPROVE=1 skips the question). The base
+# stage applies with --no-destroy: under AUTO_APPROVE=1 a plan that would destroy or replace
+# anything there (k3s-cp) is refused. A plan without changes applies nothing.
 set -euo pipefail
 
 # shellcheck disable=SC1091  # common.sh is linted on its own
@@ -34,17 +35,22 @@ stage_base() {
   [[ "$mtu" =~ ^[1-9][0-9]{2,3}$ ]] || die "UNDERLAY_MTU in .env must be an MTU in bytes (100-9999): '$mtu'" 2
   log "==> base: VPCs, k3s-cp, k3s server, kubeconfig, API tunnel"
   tf_init base
-  tf_apply base
+  tf_apply base --no-destroy
   cp_ip="$(tf_out base cp_ip)"
   cp_internal_ip="$(tf_out base cp_internal_ip)"
   for ip in "$cp_ip" "$cp_internal_ip"; do
     [[ "$ip" =~ ^[0-9]{1,3}(\.[0-9]{1,3}){3}$ ]] || die "base stack output is not an IPv4 address: '$ip'"
   done
+  # Resolved here, not first inside wait_for: a bad cp_zone output dies at once with its message.
+  cp_resolve
 
   wait_for 'cp_ssh true' 300 || die "IAP SSH to $CP_NAME not available after 300s"
-  # A fresh copy every run: scp -r into an existing directory would nest node/ inside it.
-  cp_ssh 'rm -rf /tmp/k3s-node'
-  cp_scp "$REPO_ROOT/node" /tmp/k3s-node
+  # A fresh staging directory every run, created by the operator's account with mode 0700. mkdir
+  # (no -p) fails if anything recreated the path after rm, and the owner check catches a mkdir
+  # that is not atomic, so nobody else on k3s-cp can place files there for root to run. node/'s
+  # entries go into it, so the script stays at /tmp/k3s-node/server-bootstrap.sh.
+  cp_ssh 'rm -rf /tmp/k3s-node && mkdir -m 0700 /tmp/k3s-node && [ ! -L /tmp/k3s-node ] && [ -O /tmp/k3s-node ]'
+  cp_scp "$REPO_ROOT"/node/* /tmp/k3s-node
   cp_ssh "sudo bash /tmp/k3s-node/server-bootstrap.sh --cp-ip $cp_ip --cp-internal-ip $cp_internal_ip --underlay-mtu $mtu"
 
   "$REPO_ROOT/scripts/kubeconfig.sh"
@@ -62,6 +68,9 @@ case "$1" in
   *) usage ;;
 esac
 load_env
+# No stage here needs the Lambda API key: keep it out of terraform, gcloud, kubectl and the tunnel
+# (scripts/gpuctl, should a later stage run it, loads .env itself).
+unset LAMBDA_API_KEY
 case "$1" in
   init) stage_init ;;
   base) stage_base ;;

@@ -8,6 +8,9 @@
 #   tunnel.sh stop     stop it (its whole process group: gcloud, ssh, the IAP helper); idempotent
 #   tunnel.sh status   0 if it runs and the API answers /readyz, 1 otherwise
 #
+# start and stop hold a lock (.run/tunnel.lock), so `make tunnel` during `make up`'s tunnel step
+# waits for it instead of launching a second tunnel that would orphan the first.
+#
 # The tunnel binds 127.0.0.1 explicitly, so a GatewayPorts setting in the operator's ssh config
 # cannot expose the API on the LAN. Test seam: K3S_TUNNEL_TEST_PORT replaces the local port 6443;
 # only the offline tests set it (the kubeconfig always points at 6443).
@@ -22,10 +25,39 @@ LOCAL_PORT="${K3S_TUNNEL_TEST_PORT:-6443}"
 # Also the marker that identifies our tunnel among running processes.
 FORWARD="127.0.0.1:$LOCAL_PORT:127.0.0.1:6443"
 TIMEOUT="${TUNNEL_TIMEOUT_S:-30}"
+LOCKFILE="$RUN_DIR/tunnel.lock"
 
 usage() {
   log "usage: ${0##*/} start|stop|status"
   exit 2
+}
+
+# lock: take $LOCKFILE (it holds this run's PID), released on exit. Created with bash's noclobber,
+# which opens with O_EXCL inside the shell: atomic everywhere, unlike flock (absent on macOS) or
+# mkdir (uutils coreutils' mkdir, Ubuntu's default from 25.10, is not atomic under contention). A
+# lock whose PID is gone (a killed run) is taken over; a live holder is waited for, at most as long
+# as a start can take, then this run gives up.
+lock() {
+  local deadline holder said=""
+  [[ "$TIMEOUT" =~ ^[0-9]+$ ]] || die "bad TUNNEL_TIMEOUT_S '$TIMEOUT'"
+  deadline=$((SECONDS + TIMEOUT + 30))
+  run_dir || die "cannot create $RUN_DIR"
+  until (set -o noclobber; printf '%s\n' "$$" > "$LOCKFILE") 2> /dev/null; do
+    holder="$(cat -- "$LOCKFILE" 2> /dev/null || true)"
+    if [[ "$holder" =~ ^[1-9][0-9]*$ ]] && ! kill -0 "$holder" 2> /dev/null; then
+      log "removing a stale tunnel lock (pid $holder is gone)"
+      rm -f -- "$LOCKFILE"
+      continue
+    fi
+    if [[ -z "$said" ]]; then
+      log "waiting for another tunnel.sh (pid ${holder:-unknown}) to finish"
+      said=1
+    fi
+    (( SECONDS < deadline )) \
+      || die "another tunnel.sh still holds $LOCKFILE (pid ${holder:-unknown}); if none is running, remove it"
+    sleep 0.2
+  done
+  trap 'rm -f -- "$LOCKFILE"' EXIT
 }
 
 # tunnel_pid: print the PID in $PIDFILE if that process is alive and is this tunnel (its command
@@ -63,6 +95,7 @@ kill_tunnel() {
 
 stop() {
   local pid
+  lock
   if pid="$(tunnel_pid)"; then
     kill_tunnel "$pid"
     log "tunnel stopped (pid $pid)"
@@ -89,7 +122,10 @@ start() {
   local pid deadline
   [[ "$TIMEOUT" =~ ^[0-9]+$ ]] || die "bad TUNNEL_TIMEOUT_S '$TIMEOUT'"
   load_env
+  # Not needed here, and the tunnel runs for days: keep the key out of its environment.
+  unset LAMBDA_API_KEY
   [[ -f "$KUBECONFIG_FILE" ]] || die "$KUBECONFIG_FILE not found: run make kubeconfig first"
+  lock
   if pid="$(tunnel_pid)"; then
     if api_ready; then
       log "tunnel already running (pid $pid); API ready"

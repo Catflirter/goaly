@@ -22,6 +22,9 @@ _file_mode() {
 
 # Export every variable in $REPO_ROOT/.env. The file holds the Lambda API key, so it must be private (600).
 # A missing or non-private .env exits 2 (refused), as gpuctl does when LAMBDA_API_KEY is missing.
+# A valid GCP_PROJECT also exports TF_VAR_project_id and TF_VAR_state_bucket (as tf_env does), so a
+# caller that runs terraform directly after load_env has them. An invalid one is left for tf_env to
+# refuse, so commands that never touch GCP still work.
 load_env() {
   local env_file="$REPO_ROOT/.env" mode
   [[ -f "$env_file" ]] \
@@ -33,6 +36,7 @@ load_env() {
   # shellcheck source=/dev/null
   source "$env_file"
   set +a
+  if _gcp_project_ok; then _export_tf_vars; fi
 }
 
 # ---- Terraform, IAP SSH, kubectl (Task 10) ----------------------------------------------------
@@ -48,14 +52,22 @@ run_dir() {
   mkdir -p -- "$RUN_DIR" && chmod 700 -- "$RUN_DIR"
 }
 
-# tf_env: export TF_VAR_project_id and TF_VAR_state_bucket from GCP_PROJECT (.env, so call load_env
-# first). Every Terraform helper below calls it. GCP_PROJECT must be a GCP project id (6-30
-# characters: lowercase letters, digits, hyphens; a letter first, no hyphen last). It ends up in
-# bucket names and gcloud arguments, so anything else is refused (exit 2).
-tf_env() {
-  [[ "${GCP_PROJECT:-}" =~ ^[a-z][a-z0-9-]{4,28}[a-z0-9]$ ]] \
-    || die "GCP_PROJECT='${GCP_PROJECT:-}' in .env is not a GCP project id" 2
+# GCP_PROJECT must be a GCP project id (6-30 characters: lowercase letters, digits, hyphens; a
+# letter first, no hyphen last). It ends up in bucket names and gcloud arguments.
+_gcp_project_ok() {
+  [[ "${GCP_PROJECT:-}" =~ ^[a-z][a-z0-9-]{4,28}[a-z0-9]$ ]]
+}
+
+_export_tf_vars() {
   export TF_VAR_project_id="$GCP_PROJECT" TF_VAR_state_bucket="$GCP_PROJECT-k3s-tfstate"
+}
+
+# tf_env: export TF_VAR_project_id and TF_VAR_state_bucket from GCP_PROJECT (.env, so call load_env
+# first; load_env already exports them for a valid id). Every Terraform helper below calls it. An
+# invalid GCP_PROJECT is refused (exit 2).
+tf_env() {
+  _gcp_project_ok || die "GCP_PROJECT='${GCP_PROJECT:-}' in .env is not a GCP project id" 2
+  _export_tf_vars
 }
 
 # tf_dir STACK: the stack's directory, $REPO_ROOT/infra/STACK; dies for anything else.
@@ -65,27 +77,32 @@ tf_dir() {
 }
 
 # tf_init STACK: init STACK on the gcs backend, bucket $GCP_PROJECT-k3s-tfstate, prefix STACK.
-# Skipped when the stack is already initialised for exactly that bucket and prefix. A stack
+# Skipped when the last init of this stack succeeded for exactly that bucket and prefix. A marker,
+# .terraform/k3s-tf-init.ok, is removed before every init and written only after it succeeds.
+# .terraform/terraform.tfstate cannot tell: terraform writes it before it installs the providers,
+# so a failed or interrupted init would otherwise be skipped on every later run. A stack
 # initialised for another bucket (GCP_PROJECT changed) is re-initialised with -reconfigure, which
 # switches to the new state without copying the old project's state into it. -lockfile=readonly:
 # providers are checked against the committed lock file, never rewritten (make tf-lock does that).
 # Terraform's output goes to stderr, so $(tf_out ...) stays clean when it initialises on the way.
 # The bootstrap stack keeps local state; `scripts/up.sh init` initialises it, not this.
 tf_init() {
-  local stack="$1" dir state
+  local stack="$1" dir marker want
   [[ "$stack" != bootstrap ]] \
     || die "tf_init: the bootstrap stack keeps local state; scripts/up.sh init initialises it"
   dir="$(tf_dir "$stack")" || exit
   tf_env
-  state="$dir/.terraform/terraform.tfstate"
-  if [[ -f "$state" ]] && jq -e --arg b "$TF_VAR_state_bucket" --arg p "$stack" \
-       '.backend.type == "gcs" and .backend.config.bucket == $b and .backend.config.prefix == $p' \
-       "$state" > /dev/null 2>&1; then
+  marker="$dir/.terraform/k3s-tf-init.ok"
+  want="gcs $TF_VAR_state_bucket $stack"
+  if [[ -f "$marker" && "$(cat -- "$marker")" == "$want" ]]; then
     return 0
   fi
+  rm -f -- "$marker"
   log "terraform init $stack (state in gs://$TF_VAR_state_bucket/$stack)"
   terraform -chdir="$dir" init -input=false -lockfile=readonly -reconfigure \
-    -backend-config="bucket=$TF_VAR_state_bucket" -backend-config="prefix=$stack" >&2
+    -backend-config="bucket=$TF_VAR_state_bucket" -backend-config="prefix=$stack" >&2 \
+    || die "terraform init failed for $stack; it is retried on the next run until it succeeds"
+  printf '%s\n' "$want" > "$marker" || die "cannot write $marker"
 }
 
 # tf_out STACK NAME / tf_out_json STACK NAME: one output of STACK, raw or as JSON. A stack on the
@@ -105,16 +122,17 @@ _tf_output() {
   terraform -chdir="$dir" output "$2" "$3"
 }
 
-# tf_apply STACK [--allow-delete]: plan STACK into a saved plan, then apply exactly that plan once
-# confirm agrees. No changes: nothing is asked or applied, so re-runs are quiet. A plan that
-# destroys or replaces anything lists those addresses first; under AUTO_APPROVE=1 it is refused
-# (exit 2) unless the caller passes --allow-delete (a deliberate scale-down), so an unattended
-# `make up` can never recreate the control plane. Declining exits 2. STACK must be initialised
-# already (tf_init; `terraform init` for bootstrap).
+# tf_apply STACK [--no-destroy]: plan STACK into a saved plan, then apply exactly that plan once
+# confirm agrees (under AUTO_APPROVE=1 confirm agrees outright, as the brief says). No changes:
+# nothing is asked or applied, so re-runs are quiet. A plan that destroys or replaces anything
+# lists those addresses first. --no-destroy is opt-in, for a stack that must never be recreated
+# unattended (up.sh base: k3s-cp). Under AUTO_APPROVE=1 it refuses such a plan (exit 2);
+# interactively it still asks. Declining exits 2. STACK must be initialised already (tf_init;
+# `terraform init` for bootstrap).
 tf_apply() {
   local stack="$1" opt="${2:-}" dir plan rc=0 doomed
+  [[ -z "$opt" || "$opt" == --no-destroy ]] || die "tf_apply: unknown option $opt"
   dir="$(tf_dir "$stack")" || exit
-  [[ -z "$opt" || "$opt" == --allow-delete ]] || die "tf_apply: unknown option $opt"
   tf_env
   run_dir || die "cannot create $RUN_DIR"
   plan="$RUN_DIR/$stack.tfplan"
@@ -131,7 +149,7 @@ tf_apply() {
   if [[ -n "$doomed" ]]; then
     log "WARNING: this plan DESTROYS or REPLACES in the $stack stack:"
     log "$(printf '%s\n' "$doomed" | sed 's/^/  - /')"
-    if [[ "${AUTO_APPROVE:-}" == 1 && "$opt" != --allow-delete ]]; then
+    if [[ "${AUTO_APPROVE:-}" == 1 && "$opt" == --no-destroy ]]; then
       rm -f -- "$plan"
       die "refusing to destroy or replace resources in $stack under AUTO_APPROVE=1; run it interactively to review" 2
     fi
@@ -169,12 +187,14 @@ cp_ssh() {
     --ssh-flag=-oConnectTimeout=20 --ssh-flag=-oServerAliveInterval=30 --command "$1"
 }
 
-# cp_scp SRC DST: copy local SRC (file or directory) to DST on k3s-cp over IAP. As with scp -r, a
-# directory SRC becomes DST if DST does not exist yet, and DST/<name> if it does.
+# cp_scp SRC... DST: copy local SRCs (files or directories) to DST on k3s-cp over IAP. As with
+# scp -r, a directory SRC becomes DST if DST does not exist yet, and DST/<name> if it does.
 cp_scp() {
+  (( $# >= 2 )) || die "usage: cp_scp SRC... DST"
+  local dst="${!#}"
   cp_resolve || return
   gcloud compute scp --project "$GCP_PROJECT" --zone "$CP_ZONE" --tunnel-through-iap --quiet \
-    --recurse --scp-flag=-oConnectTimeout=20 "$1" "$CP_NAME:$2"
+    --recurse --scp-flag=-oConnectTimeout=20 "${@:1:$#-1}" "$CP_NAME:$dst"
 }
 
 # confirm PROMPT: ask on stdin; only y or yes (any case) agrees, anything else or EOF refuses (1).
@@ -192,7 +212,9 @@ confirm() {
 
 # wait_for CMD TIMEOUT_S: eval CMD (a string, so shell functions such as kc and cp_ssh work) every
 # WAIT_INTERVAL_S seconds (default 5) until it succeeds. Returns 1 after TIMEOUT_S seconds, with
-# the last attempt's output on stderr. CMD must bound its own runtime (kubectl --timeout,
+# the last attempt's output on stderr. Each attempt runs in a subshell: a CMD that dies (cp_ssh ->
+# tf_out -> die) is a failed attempt whose message is shown, not a silent exit of the whole script;
+# variables CMD sets do not outlive the attempt. CMD must bound its own runtime (kubectl --timeout,
 # ConnectTimeout), or one hung attempt outlasts TIMEOUT_S.
 wait_for() {
   local cmd="$1" timeout="$2" interval="${WAIT_INTERVAL_S:-5}" deadline last
@@ -201,7 +223,7 @@ wait_for() {
   last="$(mktemp)" || die "wait_for: mktemp failed"
   deadline=$((SECONDS + timeout))
   log "waiting up to ${timeout}s for: $cmd"
-  until eval "$cmd" > "$last" 2>&1; do
+  until (eval "$cmd") > "$last" 2>&1; do
     if (( SECONDS >= deadline )); then
       log "timed out after ${timeout}s waiting for: $cmd; the last attempt said:"
       tail -n 20 -- "$last" >&2

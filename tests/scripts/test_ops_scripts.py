@@ -64,6 +64,8 @@ class Env:
             (self.bin / tool).chmod(0o755)
         self.log = tmp / "calls.jsonl"
         self.scenario_file = tmp / "scenario.json"
+        self.tmpdir = tmp / "tmp"  # TMPDIR of the scripts, so tests can see a leaked temp file
+        self.tmpdir.mkdir()
         self.scenario = {"outputs": OUTPUTS, "kubeconfig": KUBECONFIG}
         self.port = free_port()
         self.write_env(f"GCP_PROJECT={PROJECT}\nLAMBDA_API_KEY=x\nUNDERLAY_MTU=1460\n")
@@ -74,18 +76,26 @@ class Env:
         env.chmod(mode)
 
     def run(self, args, stdin="", **extra):
+        return subprocess.run(args, cwd=self.repo, env=self.environ(extra), input=stdin, capture_output=True,
+                              text=True, timeout=60)
+
+    def popen(self, args, **extra):
+        return subprocess.Popen(args, cwd=self.repo, env=self.environ(extra), stdin=subprocess.DEVNULL,
+                                stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
+
+    def environ(self, extra):
         self.scenario_file.write_text(json.dumps(self.scenario))
         env = {k: v for k, v in os.environ.items()
-               if k not in ("AUTO_APPROVE", "GCP_PROJECT", "UNDERLAY_MTU", "KUBECONFIG", "REPO_ROOT")
+               if k not in ("AUTO_APPROVE", "GCP_PROJECT", "UNDERLAY_MTU", "KUBECONFIG", "REPO_ROOT",
+                            "LAMBDA_API_KEY", "TUNNEL_TIMEOUT_S")
                and not k.startswith("TF_VAR_")}
         env.update(PATH=f"{self.bin}:{os.environ['PATH']}", HOME=str(self.home), FAKE_LOG=str(self.log),
                    FAKE_SCENARIO=str(self.scenario_file), WAIT_INTERVAL_S="0",
-                   K3S_TUNNEL_TEST_PORT=str(self.port))
+                   K3S_TUNNEL_TEST_PORT=str(self.port), TMPDIR=str(self.tmpdir))
         env.update(extra)
         for tool in ("terraform", "gcloud", "kubectl"):  # never the real CLIs
             assert shutil.which(tool, path=env["PATH"]) == str(self.bin / tool)
-        return subprocess.run(args, cwd=self.repo, env=env, input=stdin, capture_output=True, text=True,
-                              timeout=60)
+        return env
 
     def script(self, name, *args, **kw):
         return self.run([str(self.repo / "scripts" / name), *args], **kw)
@@ -112,6 +122,15 @@ class Env:
 
     def forward(self):
         return f"127.0.0.1:{self.port}:127.0.0.1:6443"
+
+    @property
+    def lockfile(self):
+        return self.repo / ".run/tunnel.lock"
+
+    def assert_no_lambda_key(self):
+        """No ops script needs the Lambda API key: terraform, gcloud and kubectl never get it (X0-3)."""
+        calls = self.calls()
+        assert calls and all("LAMBDA_API_KEY" not in c["env"] for c in calls)
 
 
 @pytest.fixture
@@ -167,6 +186,22 @@ def test_tf_env_exports_project_and_state_bucket(env):
     assert proc.stdout == f"{PROJECT} {BUCKET}"
 
 
+def test_load_env_exports_the_terraform_variables(env):
+    """Brief interface: common.sh exports both, so a later caller that runs terraform directly after
+    `source common.sh; load_env` (Task 20's down.sh) has them (S0-3)."""
+    proc = env.lib("load_env; printenv TF_VAR_project_id TF_VAR_state_bucket")
+    assert proc.returncode == 0, proc.stderr
+    assert proc.stdout.split() == [PROJECT, BUCKET]
+
+
+def test_load_env_with_a_bad_project_exports_nothing_and_does_not_fail(env):
+    """gpuctl commands that never touch GCP must keep working; tf_env still refuses the value."""
+    env.write_env("GCP_PROJECT='Not A Project'\n")
+    proc = env.lib('load_env; echo "${TF_VAR_project_id-unset} ${TF_VAR_state_bucket-unset}"')
+    assert proc.returncode == 0, proc.stderr
+    assert proc.stdout.strip() == "unset unset"
+
+
 def test_tf_env_accepts_a_30_character_project_id(env):
     env.write_env("GCP_PROJECT=project-7b009e6f-dae9-421d-a9f\n")
     proc = env.lib('load_env; tf_env; printf "%s" "$TF_VAR_state_bucket"')
@@ -193,6 +228,29 @@ def test_tf_init_skips_a_stack_already_initialised_for_this_bucket(env):
     assert env.lib("load_env; tf_init base").returncode == 0
     assert env.lib("load_env; tf_init base").returncode == 0
     assert len(env.calls("terraform")) == 1
+
+
+def test_tf_init_reruns_after_a_failed_init(env):
+    """terraform writes .terraform/terraform.tfstate before it installs providers: a failed or
+    interrupted init must not count as initialised (X0-1)."""
+    env.scenario["init_rc"] = {"base": 1}
+    proc = env.lib("load_env; tf_init base; echo reached")
+    assert proc.returncode != 0 and "reached" not in proc.stdout
+    assert "init" in proc.stderr and "base" in proc.stderr
+    assert (env.repo / "infra/base/.terraform/terraform.tfstate").exists(), "the fake behaves like terraform"
+    env.scenario["init_rc"] = {}
+    assert env.lib("load_env; tf_init base").returncode == 0
+    assert env.lib("load_env; tf_init base").returncode == 0
+    assert tf_subcommands(env) == ["init", "init"], "re-initialised once after the failure, then skipped"
+
+
+def test_tf_out_reinitialises_a_stack_whose_init_failed(env):
+    env.scenario["init_rc"] = {"base": 1}
+    assert env.lib("load_env; tf_init base").returncode != 0
+    env.scenario["init_rc"] = {}
+    proc = env.lib("load_env; tf_out base cp_ip")
+    assert proc.returncode == 0 and proc.stdout == "34.82.10.10"
+    assert tf_subcommands(env) == ["init", "init", "output"]
 
 
 def test_tf_init_reinitialises_when_the_project_changed(env):
@@ -249,6 +307,18 @@ def test_cp_scp_copies_recursively_through_iap(env):
         "--recurse", "--scp-flag=-oConnectTimeout=20", "node", "k3s-cp:/tmp/k3s-node"]]
 
 
+def test_cp_scp_copies_several_sources_into_one_destination(env):
+    assert env.lib("load_env; cp_scp node/k3s node/guard /tmp/k3s-node").returncode == 0
+    assert env.argvs("gcloud") == [[
+        "compute", "scp", "--project", PROJECT, "--zone", "us-west1-b", "--tunnel-through-iap", "--quiet",
+        "--recurse", "--scp-flag=-oConnectTimeout=20", "node/k3s", "node/guard", "k3s-cp:/tmp/k3s-node"]]
+
+
+def test_cp_scp_needs_a_source_and_a_destination(env):
+    proc = env.lib("load_env; cp_scp /tmp/k3s-node")
+    assert proc.returncode != 0 and env.calls("gcloud") == []
+
+
 def test_cp_ssh_refuses_an_unexpected_zone_output(env):
     env.scenario["outputs"] = {"base": {"cp_zone": "us-west1-b --command=evil"}}
     proc = env.lib("load_env; cp_ssh true")
@@ -271,8 +341,21 @@ def test_confirm_passes_without_reading_under_auto_approve(env):
 
 
 def test_wait_for_retries_until_the_command_succeeds(env):
-    proc = env.lib('n=0; wait_for "n=\\$((n + 1)); (( n >= 3 ))" 30; echo "tries=$n"')
-    assert proc.returncode == 0 and proc.stdout.strip() == "tries=3"
+    # Each attempt runs in a subshell, so the attempts are counted in a file, not a variable.
+    proc = env.lib('f="$TMPDIR/tries"; : > "$f"; wait_for "echo . >> $f; (( \\$(wc -l < $f) >= 3 ))" 30; '
+                   'echo "tries=$(( $(wc -l < "$f") ))"; rm -f "$f"')
+    assert proc.returncode == 0, proc.stderr
+    assert proc.stdout.strip() == "tries=3"
+    assert list(env.tmpdir.iterdir()) == []
+
+
+def test_wait_for_shows_a_die_inside_the_command_and_cleans_up(env):
+    """A CMD that dies (cp_ssh -> tf_out -> die) is a failed attempt, not a silent exit of the
+    whole script with its message hidden in a leaked temp file (C0-1)."""
+    proc = env.lib('if wait_for "die boom" 1; then echo ok; else echo timeout; fi', WAIT_INTERVAL_S="1")
+    assert proc.stdout.strip() == "timeout"
+    assert "error: boom" in proc.stderr
+    assert list(env.tmpdir.iterdir()) == [], "the attempt log is removed"
 
 
 def test_wait_for_gives_up_after_the_timeout(env):
@@ -323,24 +406,47 @@ def test_tf_apply_stops_on_a_failed_plan(env):
     assert proc.returncode == 1 and tf_subcommands(env) == ["plan"]
 
 
-def test_tf_apply_auto_approve_refuses_to_destroy_or_replace(env):
-    env.scenario["deletes"] = {"base": ["google_compute_instance.cp"]}
-    proc = env.lib("load_env; tf_apply base", AUTO_APPROVE="1")
-    assert proc.returncode == 2 and "apply" not in tf_subcommands(env)
-    assert "google_compute_instance.cp" in proc.stderr
+def test_tf_apply_auto_approve_applies_a_destroying_plan_but_lists_it(env):
+    """Brief contract (S0-1): under AUTO_APPROVE=1 confirm passes outright, so Task 14's
+    `AUTO_APPROVE=1 scripts/cpu-pool.sh scale 1` can remove a worker with a plain tf_apply."""
+    env.scenario["deletes"] = {"workers": ["google_compute_instance.cpu[1]"]}
+    (env.repo / "infra/workers").mkdir()
+    proc = env.lib("load_env; tf_apply workers", AUTO_APPROVE="1")
+    assert proc.returncode == 0, proc.stderr
+    assert tf_subcommands(env)[-1] == "apply"
+    assert "DESTROYS or REPLACES" in proc.stderr and "google_compute_instance.cpu[1]" in proc.stderr
 
 
 def test_tf_apply_interactive_shows_what_it_destroys_and_still_asks(env):
     env.scenario["deletes"] = {"base": ["google_compute_instance.cp"]}
     proc = env.lib("load_env; tf_apply base", stdin="y\n")
     assert proc.returncode == 0 and tf_subcommands(env)[-1] == "apply"
-    assert "google_compute_instance.cp" in proc.stderr
+    assert "google_compute_instance.cp" in proc.stderr and "[y/N]" in proc.stderr
 
 
-def test_tf_apply_allow_delete_lets_auto_approve_replace(env):
+def test_tf_apply_no_destroy_refuses_a_destroying_plan_under_auto_approve(env):
     env.scenario["deletes"] = {"base": ["google_compute_instance.cp"]}
-    proc = env.lib("load_env; tf_apply base --allow-delete", AUTO_APPROVE="1")
+    proc = env.lib("load_env; tf_apply base --no-destroy", AUTO_APPROVE="1")
+    assert proc.returncode == 2 and "apply" not in tf_subcommands(env)
+    assert "google_compute_instance.cp" in proc.stderr
+    assert not (env.repo / ".run/base.tfplan").exists()
+
+
+def test_tf_apply_no_destroy_still_asks_interactively(env):
+    env.scenario["deletes"] = {"base": ["google_compute_instance.cp"]}
+    proc = env.lib("load_env; tf_apply base --no-destroy", stdin="y\n")
     assert proc.returncode == 0 and tf_subcommands(env)[-1] == "apply"
+    assert "[y/N]" in proc.stderr
+
+
+def test_tf_apply_no_destroy_lets_a_plan_without_deletes_through(env):
+    proc = env.lib("load_env; tf_apply base --no-destroy", AUTO_APPROVE="1")
+    assert proc.returncode == 0 and tf_subcommands(env)[-1] == "apply"
+
+
+def test_tf_apply_refuses_an_unknown_option(env):
+    proc = env.lib("load_env; tf_apply base --allow-delete", AUTO_APPROVE="1")
+    assert proc.returncode != 0 and env.calls("terraform") == []
 
 
 # ---- kubeconfig.sh ---------------------------------------------------------------------------
@@ -354,6 +460,7 @@ def test_kubeconfig_writes_a_private_file_from_the_cp(env):
     assert env.argvs("gcloud") == [["compute", "ssh", "k3s-cp", *SSH_IAP, "--command",
                                     "sudo cat /etc/rancher/k3s/k3s.yaml"]]
     assert "client-key-data" not in proc.stdout + proc.stderr, "never print the credentials"
+    env.assert_no_lambda_key()
 
 
 def test_kubeconfig_replaces_an_existing_world_readable_file(env):
@@ -419,6 +526,9 @@ def test_tunnel_start_status_stop(env):
     assert stat.S_IMODE(env.pidfile.stat().st_mode) & 0o077 == 0
     assert ["--kubeconfig", str(env.kubeconfig), "--request-timeout=5s", "get", "--raw", "/readyz"] \
         in env.argvs("kubectl")
+    assert "waiting up to 30s for the API's /readyz" in proc.stderr, "brief: default wait 30s"
+    env.assert_no_lambda_key()  # also the long-lived tunnel's environment
+    assert not env.lockfile.exists(), "the start/stop lock is released"
 
     assert env.script("tunnel.sh", "status").returncode == 0
 
@@ -526,6 +636,50 @@ def test_tunnel_running_but_api_down_is_restarted(env):
     assert len(tunnels(env)) == 2
 
 
+def test_concurrent_starts_launch_one_tunnel(env):
+    """`make tunnel` while `make up` is in its tunnel step: without a lock both launch, the loser's
+    cleanup drops the PID file and the winner's tunnel is orphaned (C0-3). The race is real here:
+    repeat this test to see a non-atomic lock (e.g. uutils' mkdir) fail it."""
+    make_kubeconfig(env)
+    start = [str(env.repo / "scripts/tunnel.sh"), "start"]
+    procs = [env.popen(start), env.popen(start)]
+    results = [p.communicate(timeout=60) for p in procs]
+    assert [p.returncode for p in procs] == [0, 0], results
+    assert len(tunnels(env)) == 1, results
+    pid = int(env.pidfile.read_text())
+    assert alive(pid) and int(Path(f"{env.log}.tunnel").read_text()) == pid
+    assert not env.lockfile.exists()
+
+
+def test_tunnel_start_waits_for_a_held_lock(env):
+    make_kubeconfig(env)
+    holder = subprocess.Popen(["sleep", "30"])
+    try:
+        env.lockfile.parent.mkdir()
+        env.lockfile.write_text(f"{holder.pid}\n")
+        proc = env.popen([str(env.repo / "scripts/tunnel.sh"), "start"])
+        time.sleep(1.5)
+        assert proc.poll() is None and tunnels(env) == [], "waits while a live holder has the lock"
+        env.lockfile.unlink()
+        _, err = proc.communicate(timeout=60)
+        assert proc.returncode == 0, err
+        assert f"pid {holder.pid}" in err and len(tunnels(env)) == 1
+    finally:
+        holder.kill()
+        holder.wait()
+
+
+def test_tunnel_takes_over_a_stale_lock(env):
+    make_kubeconfig(env)
+    dead = subprocess.Popen(["true"])
+    dead.wait()
+    env.lockfile.parent.mkdir()
+    env.lockfile.write_text(f"{dead.pid}\n")
+    proc = env.script("tunnel.sh", "start")
+    assert proc.returncode == 0, proc.stderr
+    assert "stale" in proc.stderr and len(tunnels(env)) == 1 and not env.lockfile.exists()
+
+
 def test_tunnel_usage(env):
     proc = env.script("tunnel.sh", "bogus")
     assert proc.returncode == 2 and "usage" in proc.stderr
@@ -537,10 +691,14 @@ def base_sequence(env, mtu="1460"):
     """The gcloud/kubectl calls of a full `up.sh base`, without the tunnel and its /readyz probes (non_tf)."""
     return [
         ("gcloud", ["compute", "ssh", "k3s-cp", *SSH_IAP, "--command", "true"]),
-        ("gcloud", ["compute", "ssh", "k3s-cp", *SSH_IAP, "--command", "rm -rf /tmp/k3s-node"]),
+        # A fresh directory the operator creates 0700 (mkdir fails if anyone recreated the path after
+        # rm), then node/'s entries copied into it: root runs only what we put there (X0-2).
+        ("gcloud", ["compute", "ssh", "k3s-cp", *SSH_IAP, "--command",
+                    "rm -rf /tmp/k3s-node && mkdir -m 0700 /tmp/k3s-node && [ ! -L /tmp/k3s-node ]"
+                    " && [ -O /tmp/k3s-node ]"]),
         ("gcloud", ["compute", "scp", "--project", PROJECT, "--zone", "us-west1-b", "--tunnel-through-iap",
-                    "--quiet", "--recurse", "--scp-flag=-oConnectTimeout=20", f"{env.repo.resolve()}/node",
-                    "k3s-cp:/tmp/k3s-node"]),
+                    "--quiet", "--recurse", "--scp-flag=-oConnectTimeout=20",
+                    *sorted(str(p) for p in (env.repo.resolve() / "node").iterdir()), "k3s-cp:/tmp/k3s-node"]),
         ("gcloud", ["compute", "ssh", "k3s-cp", *SSH_IAP, "--command",
                     "sudo bash /tmp/k3s-node/server-bootstrap.sh --cp-ip 34.82.10.10 --cp-internal-ip 10.10.0.2"
                     f" --underlay-mtu {mtu}"]),
@@ -580,6 +738,36 @@ def test_up_base_runs_the_whole_sequence(env):
     assert non_tf(env) == base_sequence(env)
     assert env.kubeconfig.read_text() == KUBECONFIG
     assert alive(int(env.pidfile.read_text()))
+    # The brief's waits (C0-2): IAP SSH 300s, k3s-cp Ready 300s, CoreDNS Ready 300s, tunnel 30s.
+    for line in ("waiting up to 300s for: cp_ssh true",
+                 "waiting up to 300s for: kc wait --for=condition=Ready node/k3s-cp --timeout=10s",
+                 "waiting up to 300s for: kc -n kube-system wait --for=condition=Ready pod -l k8s-app=kube-dns"
+                 " --timeout=10s",
+                 "waiting up to 30s for the API's /readyz"):
+        assert line in proc.stderr
+    env.assert_no_lambda_key()
+    assert list(env.tmpdir.iterdir()) == []
+
+
+def test_up_base_stops_when_the_staging_directory_cannot_be_made_private(env):
+    """Someone else recreated /tmp/k3s-node (mkdir fails, or it is not ours): nothing is copied or run."""
+    staging = base_sequence(env)[1][1][-1]
+    env.scenario["ssh_fail"] = [staging]
+    proc = env.script("up.sh", "base", AUTO_APPROVE="1")
+    assert proc.returncode != 0
+    assert not [a for a in env.argvs("gcloud") if a[:2] == ["compute", "scp"]]
+    assert not [a for a in env.argvs("gcloud") if "server-bootstrap.sh" in a[-1]]
+
+
+def test_up_base_reports_a_bad_cp_zone_before_waiting_for_ssh(env):
+    """cp_zone is resolved outside wait_for: a bad output dies at once with its message (C0-1)."""
+    env.scenario["outputs"] = {"base": {**OUTPUTS["base"], "cp_zone": "bad zone"}}
+    start = time.time()
+    proc = env.script("up.sh", "base", AUTO_APPROVE="1")
+    assert proc.returncode != 0 and time.time() - start < 30
+    assert "unexpected cp_zone output: bad zone" in proc.stderr
+    assert "waiting up to" not in proc.stderr and env.calls("gcloud") == []
+    assert list(env.tmpdir.iterdir()) == []
 
 
 def test_up_base_waits_for_iap_ssh(env):

@@ -46,7 +46,8 @@ tf-test: ## terraform init + validate every infra/ stack, then terraform test wh
 	done
 
 # Cloud entry points (spec §8, §11). Every terraform apply shows its plan and asks first;
-# AUTO_APPROVE=1 skips the question but never lets a plan destroy or replace a resource.
+# AUTO_APPROVE=1 skips the question, but `make up` never lets it destroy or replace anything in
+# the base stack (k3s-cp).
 .PHONY: init up kubeconfig tunnel tunnel-stop
 init: ## Create the Terraform state bucket and enable the GCP APIs (infra/bootstrap; one-time, billable)
 	$(ROOT)/scripts/up.sh init
@@ -63,7 +64,7 @@ tunnel: ## Start the IAP SSH tunnel to the API server at https://127.0.0.1:6443
 tunnel-stop: ## Stop the API tunnel
 	$(ROOT)/scripts/tunnel.sh stop
 
-TF_LOCK_PLATFORMS :=linux_amd64 linux_arm64 darwin_amd64 darwin_arm64
+TF_LOCK_PLATFORMS := linux_amd64 linux_arm64 darwin_amd64 darwin_arm64
 tf-lock: ## Regenerate every infra/ stack's .terraform.lock.hcl with hashes for all supported platforms
 	@for d in $(ROOT)/infra/*/; do \
 	  d=$${d%/}; echo "==> $$d"; \

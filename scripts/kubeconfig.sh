@@ -8,6 +8,7 @@ set -euo pipefail
 # shellcheck disable=SC1091  # common.sh is linted on its own
 source "$(dirname -- "${BASH_SOURCE[0]}")/lib/common.sh"
 load_env
+unset LAMBDA_API_KEY # not needed here; kept out of gcloud's environment
 
 umask 077
 mkdir -p -- "${KUBECONFIG_FILE%/*}"
