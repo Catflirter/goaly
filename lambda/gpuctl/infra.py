@@ -11,6 +11,7 @@ import json
 import os
 import re
 import shlex
+import shutil
 import subprocess
 from collections.abc import Mapping, Sequence
 from pathlib import Path
@@ -28,6 +29,9 @@ CHILD_ENV_DENYLIST = frozenset({"LAMBDA_API_KEY"})
 # Reads that can stall (IAP tunnel, GCS backend) are bounded. apply never is: a killed apply would orphan the state lock.
 CP_SSH_TIMEOUT_S = 120.0
 TF_READ_TIMEOUT_S = 300.0
+# init downloads providers (the Google provider is large), so it gets longer. A failed or killed init removes the
+# .terraform it created, so the next ensure_init runs init again instead of trusting a half-initialised stack.
+TF_INIT_TIMEOUT_S = 900.0
 _ZONE_RE = re.compile(r"[a-z0-9]+(?:-[a-z0-9]+)*")
 _NODE_NAME_RE = re.compile(r"[a-z0-9]+(?:-[a-z0-9]+)*")
 # A GPU type label as gpu_type_label() returns it (a6000, a100_80gb_sxm4); also a valid K8s label value (<= 63).
@@ -48,6 +52,10 @@ class CommandError(Exception):
 
     def __str__(self) -> str:
         return self._message
+
+
+class MissingStackError(CommandError):
+    """infra/<stack> is not in this checkout, so there is nothing to init or read (unlike a stack that fails)."""
 
 
 class Shell(Protocol):
@@ -145,19 +153,26 @@ class Infra:
     def ensure_init(self, stack: str) -> None:
         """terraform init the stack against its GCS state prefix, unless infra/<stack>/.terraform already exists.
 
-        A stack that is not in this checkout raises CommandError, as terraform does for a missing -chdir directory.
+        A stack that is not in this checkout raises MissingStackError (a CommandError). If init fails or is
+        interrupted (a timeout included), the .terraform it created is removed: terraform writes the backend config
+        there before it downloads providers, and a leftover directory would make every later call skip init.
         """
         stack_dir = self._stack_dir(stack)
-        if (stack_dir / ".terraform").exists():
+        dot_terraform = stack_dir / ".terraform"
+        if dot_terraform.exists():
             return
         if not stack_dir.is_dir():
-            raise CommandError(["terraform", f"-chdir={stack_dir}", "init"], 1,
-                               f"infra/{stack} does not exist in this checkout")
+            raise MissingStackError(["terraform", f"-chdir={stack_dir}", "init"], 1,
+                                    f"infra/{stack} does not exist in this checkout")
         project = self._project()
         if not project:
             raise ValueError(f"GCP_PROJECT is not set: cannot locate the state bucket to init infra/{stack}")
-        self._terraform(stack, "init", "-input=false", f"-backend-config=bucket={project}-k3s-tfstate",
-                        f"-backend-config=prefix={stack}", timeout=TF_READ_TIMEOUT_S)
+        try:
+            self._terraform(stack, "init", "-input=false", f"-backend-config=bucket={project}-k3s-tfstate",
+                            f"-backend-config=prefix={stack}", timeout=TF_INIT_TIMEOUT_S)
+        except BaseException:  # CommandError, a timeout, or Ctrl-C mid-download
+            shutil.rmtree(dot_terraform, ignore_errors=True)
+            raise
 
     def tf_output(self, stack: str) -> dict:
         """The stack's outputs as {name: value}. Reading base also caches a valid cp_zone for cp_ssh."""
@@ -217,8 +232,10 @@ class Infra:
 
     def cluster_gpu_nodes(self) -> dict[str, str | None]:
         """GPU nodes (k3s-gpu-*) in the cluster, each with its ExternalIP (None if it reports none)."""
+        # kubectl runs outside the try: its own errors (CommandError, a KUBECONFIG list) surface unchanged.
+        stdout = self.kubectl("get", "nodes", "-o", "json").stdout
         try:
-            items = json.loads(self.kubectl("get", "nodes", "-o", "json").stdout)["items"]
+            items = json.loads(stdout)["items"]
             nodes: dict[str, str | None] = {}
             for item in items:
                 name = item["metadata"]["name"]

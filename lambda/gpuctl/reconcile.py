@@ -12,7 +12,7 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import TextIO
 
-from gpuctl.infra import CommandError
+from gpuctl.infra import CommandError, MissingStackError
 from gpuctl.lambda_api import FirewallRule, Ruleset
 from gpuctl.peers import (
     PeerSet, cp_guard_elements, global_rules, nft_replace_script, region_ruleset_rules, ruleset_name,
@@ -77,15 +77,26 @@ class Reconciler:
         return Ruleset(first.id, first.name, first.region, rules)
 
     def _worker_ips(self) -> tuple[str, ...]:
-        # ensure_init first: a checkout without infra/workers/.terraform (fresh clone, git worktree) must not look
-        # like "no workers". A stack that was never applied initialises and has no outputs: an empty list.
+        """The CPU worker IPs from infra/workers. Runs before any write, so a failure here changes nothing.
+
+        Empty only when there are provably no workers: infra/workers is not in this checkout (warning on stderr),
+        or the stack has no worker_ips (never applied: init succeeds and the outputs are {}). ensure_init comes
+        first, so a checkout without infra/workers/.terraform (fresh clone, git worktree) is not "no workers".
+        Any other CommandError (init, GCS, a timeout) fails the sync: treating it as empty would drop every CPU
+        worker from k3s-cp's k3s_peers and from the Lambda rulesets.
+        """
         try:
             self.infra.ensure_init("workers")
             outputs = self.infra.tf_output("workers")
-        except CommandError as e:
-            sys.stderr.write(_clean(f"warning: cannot read infra/workers outputs, treating the CPU worker list as "
-                                    f"empty ({e})") + "\n")
+        except MissingStackError as e:
+            sys.stderr.write(_clean(f"warning: infra/workers is not in this checkout, treating the CPU worker list "
+                                    f"as empty ({e})") + "\n")
             return ()
+        except CommandError as e:
+            raise ReconcileError(
+                f"cannot read infra/workers outputs ({e}); nothing was changed. An empty CPU worker list would cut "
+                "every worker off from k3s-cp, so fix the error (for example terraform init in infra/workers) and "
+                "re-run sync-peers") from e
         workers = outputs.get("worker_ips") or {}
         if isinstance(workers, dict):
             workers = list(workers.values())

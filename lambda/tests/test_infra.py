@@ -8,7 +8,9 @@ from pathlib import Path
 import pytest
 
 from fakes import FakeInfra, FakeShell, fail, ok
-from gpuctl.infra import CP_SSH_TIMEOUT_S, TF_READ_TIMEOUT_S, CommandError, Infra, SubprocessShell
+from gpuctl.infra import (
+    CP_SSH_TIMEOUT_S, TF_INIT_TIMEOUT_S, TF_READ_TIMEOUT_S, CommandError, Infra, MissingStackError, SubprocessShell,
+)
 from gpuctl.planner import gpu_type_label
 
 ROOT = Path("/srv/goaly")
@@ -79,9 +81,42 @@ def test_ensure_init_needs_gcp_project(tmp_path):
 
 def test_ensure_init_of_a_stack_missing_from_the_checkout_raises_command_error(tmp_path):
     sh = FakeShell([])
-    with pytest.raises(CommandError, match="infra/workers does not exist"):
+    with pytest.raises(MissingStackError, match="infra/workers does not exist") as raised:
         Infra(sh, tmp_path, ENV).ensure_init("workers")
+    assert isinstance(raised.value, CommandError)
     assert sh.calls == []
+
+
+class InitThenFail(FakeShell):
+    """terraform init that writes .terraform/terraform.tfstate (the backend config) and then fails or is killed."""
+
+    def __init__(self, stack_dir, error):
+        super().__init__([ok()])  # the retry succeeds
+        self.stack_dir, self.error = stack_dir, error
+
+    def run(self, args, **kwargs):
+        if self.error is not None:
+            (self.stack_dir / ".terraform").mkdir()
+            (self.stack_dir / ".terraform" / "terraform.tfstate").write_text("{}")
+            error, self.error = self.error, None
+            self.calls.append(args)
+            raise error
+        return super().run(args, **kwargs)
+
+
+@pytest.mark.parametrize("error", [CommandError(["terraform", "init"], -1, "timed out after 900.0s"),
+                                   KeyboardInterrupt()], ids=["timeout", "interrupt"])
+def test_a_failed_init_leaves_no_partial_terraform_dir(tmp_path, error):  # C1-1 / X1-1
+    stack_dir = tmp_path / "infra/gpu-access"
+    stack_dir.mkdir(parents=True)
+    (stack_dir / "main.tf").write_text("")
+    sh = InitThenFail(stack_dir, error)
+    infra = Infra(sh, tmp_path, ENV)
+    with pytest.raises(type(error)):
+        infra.ensure_init("gpu-access")
+    assert not (stack_dir / ".terraform").exists() and (stack_dir / "main.tf").exists()
+    infra.ensure_init("gpu-access")  # the next call runs init again instead of trusting the leftover
+    assert len(sh.calls) == 2 and sh.calls[1].args[2] == "init"
 
 
 def test_apply_gpu_access_sorted_compact_json(tmp_path):
@@ -186,7 +221,7 @@ def test_reads_are_bounded_by_a_timeout_and_apply_is_not(tmp_path):  # X0-4
     infra.apply_gpu_access(["129.80.30.30"])
     assert [(c.args[0], c.args[2], c.timeout) for c in sh.calls] == [
         ("terraform", "output", TF_READ_TIMEOUT_S), ("gcloud", "ssh", CP_SSH_TIMEOUT_S),
-        ("terraform", "init", TF_READ_TIMEOUT_S), ("terraform", "apply", None),
+        ("terraform", "init", TF_INIT_TIMEOUT_S), ("terraform", "apply", None),
     ]
 
 
@@ -226,6 +261,11 @@ def test_kubectl_refuses_a_kubeconfig_list():  # X0-2: kubectl --kubeconfig take
     with pytest.raises(ValueError, match="KUBECONFIG"):
         Infra(sh, ROOT, {"KUBECONFIG": f"/home/op/.kube/a.yaml{os.pathsep}/home/op/.kube/b.yaml"}).kubectl("version")
     assert sh.calls == []
+
+
+def test_cluster_gpu_nodes_reports_a_kubeconfig_list_as_such():  # S1-1: not as "unexpected output"
+    with pytest.raises(ValueError, match="^KUBECONFIG must name one file"):
+        Infra(FakeShell([]), ROOT, {"KUBECONFIG": f"/a{os.pathsep}/b"}).cluster_gpu_nodes()
 
 
 def test_cluster_gpu_nodes_maps_gpu_nodes_to_their_external_ip():

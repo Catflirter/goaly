@@ -11,7 +11,7 @@ import subprocess
 from collections.abc import Iterable, Mapping, Sequence
 from dataclasses import dataclass
 
-from gpuctl.infra import CommandError, check_join_args, normalise_gpu_ips, operator_ip
+from gpuctl.infra import CommandError, MissingStackError, check_join_args, normalise_gpu_ips, operator_ip
 from gpuctl.lambda_api import (
     FirewallRule, Instance, InstanceType, LambdaAPIError, Ruleset, _serialise_rules,
 )
@@ -195,8 +195,9 @@ DEFAULT_OUTPUTS = {
 class FakeInfra:
     """Terraform outputs, cp SSH, kubectl and join-node in memory.
 
-    `outputs[stack]` is what tf_output returns; a stack missing from it raises CommandError (as Infra does for a
-    stack that is not in the checkout or cannot be read). `events` records the side effects in order:
+    `outputs[stack]` is what tf_output returns; a stack missing from it raises CommandError (it cannot be read).
+    ensure_init raises MissingStackError for a stack in `missing` (not in the checkout, like Infra) and
+    CommandError for a stack in `init_fail`. `events` records the side effects in order:
     "tf:<gpu ips>" for apply_gpu_access, "nft" for the cp peer-set push, "ssh:<command>" for any other cp_ssh,
     "join:<name>:<type>". Arguments are validated and normalised exactly like Infra (shared helpers in gpuctl.infra):
     apply_gpu_access records normalise_gpu_ips(), join_node runs check_join_args(), detect_operator_ip validates
@@ -205,13 +206,15 @@ class FakeInfra:
 
     def __init__(self, *, outputs: Mapping[str, Mapping] | None = None, env: Mapping[str, str] | None = None,
                  cluster_nodes: Mapping[str, str | None] | None = None, nft_elements: Iterable[str] = (),
-                 join_fail: Iterable[str] = ()) -> None:
+                 join_fail: Iterable[str] = (), missing: Iterable[str] = (), init_fail: Iterable[str] = ()) -> None:
         source = DEFAULT_OUTPUTS if outputs is None else outputs
         self.outputs = {stack: dict(values) for stack, values in source.items()}
         self.env = dict({"OPERATOR_IP": "73.15.40.40"} if env is None else env)
         self.cluster_nodes = dict(cluster_nodes or {})
         self.nft_elements = list(nft_elements)
         self.join_fail = set(join_fail)
+        self.missing = set(missing)
+        self.init_fail = set(init_fail)
         self.events: list[str] = []
         self.initialised: list[str] = []
         self.ssh_calls: list[tuple[str, str | None]] = []
@@ -222,6 +225,11 @@ class FakeInfra:
         self.forgotten: list[str] = []
 
     def ensure_init(self, stack: str) -> None:
+        if stack in self.missing:
+            raise MissingStackError(["terraform", f"-chdir=infra/{stack}", "init"], 1,
+                                    f"infra/{stack} does not exist in this checkout")
+        if stack in self.init_fail:
+            raise CommandError(["terraform", f"-chdir=infra/{stack}", "init"], -1, "timed out after 900.0s")
         self.initialised.append(stack)
 
     def tf_output(self, stack: str) -> dict:
