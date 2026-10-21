@@ -7,7 +7,7 @@ plus a fake K3S_BOOTSTRAP_TEST_ROOT / SYSFS_NET; the k3s-guard.service hooks run
 rewritten to the scratch tree and the stub. No test runs a real sysctl, apt-get, systemctl, ip,
 netplan, nft, curl or k3s.
 """
-import os, re, shlex, subprocess
+import fcntl, os, re, shlex, subprocess
 from pathlib import Path
 import pytest
 import yaml
@@ -457,15 +457,21 @@ def guard_dir(tmp):
     return tmp / "sys/etc/k3s-guard"
 
 
-def test_peers_helper_applies_then_persists(tmp_path):
+SINGLE = ("flush set inet k3s_guard k3s_peers\n"
+          "add element inet k3s_guard k3s_peers { 10.10.0.2 }\n")
+
+
+@pytest.mark.parametrize("script, count", [(REPLACE, 3), (SINGLE, 1)])
+def test_peers_helper_applies_then_persists(tmp_path, script, count):
     bindir, log = make_stubs(tmp_path, nft_loader_stub(tmp_path), names=["nft"])
-    r = run_peers(tmp_path, REPLACE, bindir)
+    r = run_peers(tmp_path, script, bindir)
     assert r.returncode == 0, r.stderr
+    assert f"k3s_peers replaced ({count} addresses)" in r.stderr
     [call] = calls(log)
     assert re.fullmatch(rf"nft -f {guard_dir(tmp_path)}/\.peers\.nft\.\w+", call)
-    assert (tmp_path / "nft-loaded").read_text() == REPLACE.rstrip("\n")
+    assert (tmp_path / "nft-loaded").read_text() == script.rstrip("\n")
     peers = guard_dir(tmp_path) / "peers.nft"
-    assert peers.read_text() == REPLACE
+    assert peers.read_text() == script
     assert peers.stat().st_mode & 0o777 == 0o644
     assert sorted(p.name for p in guard_dir(tmp_path).iterdir()) == ["peers.nft"]
 
@@ -527,15 +533,27 @@ def test_host_installs_peers_helper_executable(tmp_path):
     assert helper.stat().st_mode & 0o777 == 0o755
 
 
-def run_unit_hook(tmp, key, bindir):
-    """Run the rendered unit's KEY= shell command with /etc/k3s-guard and /usr/sbin/nft pointed at
-    the scratch tree and the nft stub."""
+PEERS_LOCK = "/run/lock/k3s-guard-peers.lock"
+
+
+def peers_lock(tmp):
+    return tmp / "sys" / PEERS_LOCK.lstrip("/")
+
+
+def unit_hook_argv(tmp, key, bindir):
+    """The rendered unit's KEY= command, which must run under k3s-guard-peers' lock, with
+    /etc/k3s-guard, the lock and /usr/sbin/nft pointed at the scratch tree and the nft stub."""
     unit = rendered(tmp, "etc/systemd/system/k3s-guard.service").splitlines()
     [line] = [x for x in unit if x.startswith(f"{key}=")]
     argv = shlex.split(line[len(key) + 1:].removeprefix("-"))
-    assert argv[:2] == ["/bin/sh", "-c"] and len(argv) == 3
-    script = argv[2].replace("/etc/k3s-guard", str(guard_dir(tmp))).replace("/usr/sbin/nft", str(bindir / "nft"))
-    return subprocess.run(["/bin/sh", "-c", script], capture_output=True, text=True)
+    assert argv[:4] == ["/usr/bin/flock", PEERS_LOCK, "/bin/sh", "-c"] and len(argv) == 5
+    script = argv[4].replace("/etc/k3s-guard", str(guard_dir(tmp))).replace("/usr/sbin/nft", str(bindir / "nft"))
+    peers_lock(tmp).parent.mkdir(parents=True, exist_ok=True)
+    return ["flock", str(peers_lock(tmp)), "/bin/sh", "-c", script]
+
+
+def run_unit_hook(tmp, key, bindir):
+    return subprocess.run(unit_hook_argv(tmp, key, bindir), capture_output=True, text=True)
 
 
 def unit_with_guard_files(tmp, peers=None):
@@ -567,7 +585,7 @@ def test_guard_unit_start_with_broken_peers_warns_but_does_not_fail_the_unit(tmp
     r = run_unit_hook(tmp_path, "ExecStartPost", bindir)
     assert r.returncode != 0 and "WARNING" in r.stderr and "make sync-peers" in r.stderr
     unit = rendered(tmp_path, "etc/systemd/system/k3s-guard.service").splitlines()
-    assert any(x.startswith("ExecStartPost=-/bin/sh ") for x in unit)   # "-": k3s still starts
+    assert any(x.startswith("ExecStartPost=-/usr/bin/flock ") for x in unit)   # "-": k3s still starts
 
 
 def test_guard_unit_reload_loads_table_and_peers_in_one_transaction(tmp_path):
@@ -589,6 +607,31 @@ def test_guard_unit_reload_with_broken_peers_warns_and_loads_the_table_alone(tmp
     r = run_unit_hook(tmp_path, "ExecReload", bindir)
     assert r.returncode == 0 and "WARNING" in r.stderr and "make sync-peers" in r.stderr
     assert calls(log) == ["nft -f -", f"nft -f {guard_dir(tmp_path)}/k3s-guard.nft"]
+
+
+def test_guard_unit_hooks_share_the_peers_helper_lock():
+    # Same path in both, or a reload could replay the old peers.nft over a sync-peers in progress.
+    assert 'LOCK="$HOST' + PEERS_LOCK + '"' in PEERS_HELPER.read_text()
+
+
+@pytest.mark.parametrize("key", ["ExecStartPost", "ExecReload"])
+def test_guard_unit_hooks_wait_for_a_running_sync_peers(tmp_path, key):
+    # k3s-guard-peers applies the new list, then renames it into peers.nft; a reload in between
+    # must not put the old list back into the live set.
+    bindir, log = unit_with_guard_files(tmp_path, REPLACE)
+    argv = unit_hook_argv(tmp_path, key, bindir)
+    with open(peers_lock(tmp_path), "w") as held:
+        fcntl.flock(held, fcntl.LOCK_EX)
+        hook = subprocess.Popen(argv, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
+        try:
+            with pytest.raises(subprocess.TimeoutExpired):
+                hook.wait(timeout=0.5)
+            assert calls(log) == []
+        finally:
+            fcntl.flock(held, fcntl.LOCK_UN)
+    _, err = hook.communicate(timeout=10)
+    assert hook.returncode == 0, err
+    assert len(calls(log)) == 1
 
 
 # --- host sequence (stubbed binaries, scratch K3S_BOOTSTRAP_TEST_ROOT) ----------------------

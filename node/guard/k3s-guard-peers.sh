@@ -13,7 +13,8 @@
 # does not come back after a CP reboot or a guard reload. The script is applied to the live set
 # first (nft runs it as one transaction); only if that succeeds is it written to
 # /etc/k3s-guard/peers.nft (0644, temp file in the same directory, fsync, rename), which
-# k3s-guard.service loads after every start and reload. Concurrent runs are serialised with flock.
+# k3s-guard.service loads after every start and reload. Concurrent runs, and the unit's start and
+# reload hooks, are serialised with flock on /run/lock/k3s-guard-peers.lock.
 #
 # Exit codes: 1 nft rejected the script or persisting failed (peers.nft is then unchanged),
 # 2 stdin is not an nft_replace_script() output (nothing applied or written).
@@ -58,5 +59,5 @@ nft -f "$tmp" || die "nft rejected the new k3s_peers list; live set and $PEERS l
 sync -- "$tmp"
 mv -f -- "$tmp" "$PEERS"
 sync -- "$DIR"
-count=$(grep -o ', ' <<< "$input" | wc -l)
-log "k3s_peers replaced ($((count + 1)) addresses) and persisted to $PEERS"
+commas=${input//[^,]/}
+log "k3s_peers replaced ($(( ${#commas} + 1 )) addresses) and persisted to $PEERS"

@@ -14,11 +14,13 @@ ExecStart=/usr/sbin/nft -f /etc/k3s-guard/k3s-guard.nft
 # (kernel.panic=10 reboots on its own) or a reload does not lock the joined nodes out until the
 # next sync-peers. Missing peers.nft: CP addresses only. Broken peers.nft: CP addresses only, a
 # WARNING in `journalctl -u k3s-guard`, and the unit still starts ("-"), so k3s still starts.
-ExecStartPost=-/bin/sh -c 'if [ -s /etc/k3s-guard/peers.nft ] && ! /usr/sbin/nft -f /etc/k3s-guard/peers.nft; then echo "k3s-guard: WARNING: /etc/k3s-guard/peers.nft did not load; k3s_peers holds only the CP addresses until make sync-peers" >&2; exit 1; fi'
+# Both hooks hold k3s-guard-peers' lock, so they never replay the previous peers.nft over a
+# sync-peers that has applied a new list but not yet renamed it into peers.nft.
+ExecStartPost=-/usr/bin/flock /run/lock/k3s-guard-peers.lock /bin/sh -c 'if [ -s /etc/k3s-guard/peers.nft ] && ! /usr/sbin/nft -f /etc/k3s-guard/peers.nft; then echo "k3s-guard: WARNING: /etc/k3s-guard/peers.nft did not load; k3s_peers holds only the CP addresses until make sync-peers" >&2; exit 1; fi'
 # Table and peers go in as one transaction (k3s-guard.nft deletes and recreates the table), so a
 # reload leaves no gap; if peers.nft is missing the table loads alone, if it is broken the table
 # is loaded alone after a WARNING.
-ExecReload=/bin/sh -c 'cat /etc/k3s-guard/k3s-guard.nft /etc/k3s-guard/peers.nft 2>/dev/null | /usr/sbin/nft -f - || { echo "k3s-guard: WARNING: k3s-guard.nft + peers.nft did not load together; loading k3s-guard.nft alone, k3s_peers holds only the CP addresses until make sync-peers" >&2; exec /usr/sbin/nft -f /etc/k3s-guard/k3s-guard.nft; }'
+ExecReload=/usr/bin/flock /run/lock/k3s-guard-peers.lock /bin/sh -c 'cat /etc/k3s-guard/k3s-guard.nft /etc/k3s-guard/peers.nft 2>/dev/null | /usr/sbin/nft -f - || { echo "k3s-guard: WARNING: k3s-guard.nft + peers.nft did not load together; loading k3s-guard.nft alone, k3s_peers holds only the CP addresses until make sync-peers" >&2; exec /usr/sbin/nft -f /etc/k3s-guard/k3s-guard.nft; }'
 ExecStop=/usr/sbin/nft delete table inet k3s_guard
 
 [Install]
