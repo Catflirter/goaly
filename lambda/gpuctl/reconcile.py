@@ -81,6 +81,11 @@ def _clean(text: str) -> str:
 
 # A launched instance in these states will never become active.
 _GONE_STATUSES = frozenset({"terminating", "terminated"})
+
+
+def _is_transient(error: LambdaAPIError) -> bool:
+    """A poll error worth retrying: no HTTP answer (network/transport, status 0), rate limiting, or a 5xx."""
+    return error.status == 0 or error.status == 429 or error.status >= 500
 CONFIRM_PROMPT = "Apply these changes? [y/N] "
 
 
@@ -154,22 +159,30 @@ class Reconciler:
             raise ReconcileError(f"infra/base outputs lack {', '.join(missing)}: apply the base stack first")
         return base
 
-    def _peer_set(self) -> PeerSet:
+    def _live_gpu_ips(self, exclude_ids: Iterable[str] = ()) -> list[str]:
+        """The IPs of the owned live GPU instances, minus `exclude_ids`: instances this run terminated, which Lambda
+        may still list as active for a moment after the terminate call returns."""
+        gone = set(exclude_ids)
+        return sorted(i.ip for i in owned_instances(self.client.list_instances())
+                      if i.ip is not None and i.id not in gone)
+
+    def _peer_set(self, exclude_ids: Iterable[str] = ()) -> PeerSet:
         """Every peer's current IP: cp (Terraform), CPU workers (Terraform), live GPU instances, the operator."""
         base = self._base_outputs()
         worker_ips = self._worker_ips()
-        gpu_ips = tuple(sorted(i.ip for i in owned_instances(self.client.list_instances()) if i.ip is not None))
+        gpu_ips = tuple(self._live_gpu_ips(exclude_ids))
         operator_ip = self.infra.detect_operator_ip()
         return PeerSet(cp_ip=base["cp_ip"], cp_internal_ip=base["cp_internal_ip"], worker_ips=worker_ips,
                        gpu_ips=gpu_ips, operator_ip=operator_ip)
 
-    def sync_peers(self, spec: Spec) -> PeerSet:
+    def sync_peers(self, spec: Spec, *, exclude_ids: Iterable[str] = ()) -> PeerSet:
         """Rebuild every peer allow-list from the current IPs (spec section 3.3); safe to re-run.
 
         Order: cp's k3s_peers set (persisted by the guard helper), Lambda's global rules, then the k3s-gpu-<region>
-        ruleset of every spec region and of any other k3s-gpu-* ruleset still on the account.
+        ruleset of every spec region and of any other k3s-gpu-* ruleset still on the account. GPU instances in
+        `exclude_ids` (terminated by this run) are left out even if Lambda still lists them as live.
         """
-        peers = self._peer_set()
+        peers = self._peer_set(exclude_ids)
         elements = cp_guard_elements(peers)
         self.infra.cp_ssh(GUARD_PEERS_COMMAND, input=nft_replace_script(elements))
         self.client.update_global_rules(global_rules(peers.operator_ip))
@@ -195,10 +208,22 @@ class Reconciler:
 
     def wait_active(self, instance_id: str) -> Instance:
         """Poll get_instance every poll_s until the instance is active with an IP (Review Focus #2: never return a
-        null IP). TimeoutError after launch_timeout_s; LambdaAPIError if it is terminating or terminated."""
+        null IP). TimeoutError after launch_timeout_s; LambdaAPIError if it is terminating or terminated, or on a
+        permanent API error. A transient poll error (network, 429, 5xx) only logs a warning: the launch may still
+        come up, and a failure here would terminate it."""
         deadline = self.clock() + self.settings.launch_timeout_s
         while True:
-            instance = self.client.get_instance(instance_id)
+            try:
+                instance = self.client.get_instance(instance_id)
+            except LambdaAPIError as e:
+                if not _is_transient(e):
+                    raise
+                if self.clock() >= deadline:
+                    raise TimeoutError(f"{instance_id} has no IP after {self.settings.launch_timeout_s:.0f}s "
+                                       f"(last poll failed: {e})") from e
+                self._warn(f"warning: polling {instance_id} failed ({e}); retrying")
+                self.sleep(self.settings.poll_s)
+                continue
             if instance.status in _GONE_STATUSES:
                 raise LambdaAPIError("gpuctl/instance-gone", 200,
                                      f"{instance.name} ({instance_id}) is {instance.status}; it never became active")
@@ -214,7 +239,9 @@ class Reconciler:
 
         Returns 0 on success, 1 if a node failed (new nodes that failed are terminated again unless
         keep_on_failure), 2 if the plan is refused (invalid override file, over budget or max_nodes) or the operator
-        declines. Exceptions before any new instance exists (a failed delete, an unreadable account) propagate.
+        declines. A failed delete returns 1 without launching anything, after removing the IPs of the instances it
+        did terminate from every allow-list. Exceptions before any instance changes (an unreadable account)
+        propagate.
         """
         try:
             overrides = load_overrides(self.settings.overrides_path)
@@ -249,6 +276,7 @@ class Reconciler:
         # 2. show it; with no instance changes go straight to the firewall (step 7)
         for line in plan_lines(plan, spec):
             self._emit(line)
+        gone: set[str] = set()  # ids this run terminated
         if plan.create or plan.delete:
             # 3. confirm
             if not auto_approve:
@@ -259,25 +287,60 @@ class Reconciler:
                     self._warn("Cancelled: nothing was changed")
                     return 2
             # 4. deletes before creates
-            self._delete(plan)
-        return self._create_and_join(spec, plan, types, keep_on_failure=keep_on_failure)
+            gone, failures = self._delete(plan)
+            if failures:
+                return self._delete_failed(spec, gone, failures)
+        return self._create_and_join(spec, plan, types, keep_on_failure=keep_on_failure, gone=gone)
 
-    def _delete(self, plan: Plan) -> None:
+    def _delete(self, plan: Plan) -> tuple[set[str], list[str]]:
+        """Step 4, best effort: returns (ids terminated, failures). A failing delete does not stop the others;
+        Ctrl-C stops the remaining ones. Either way the caller still removes the terminated IPs from the firewalls.
+        """
         duplicate_ids = {i.id for i in plan.duplicates}
-        for instance in plan.delete:
-            if instance.id in duplicate_ids:
-                # Ruling R17: the node name and host key belong to the instance that is kept, so by id only
-                self.client.terminate([instance.id])
-                self._emit(f"Terminated duplicate {instance.name} {instance.id}")
-                continue
-            self.infra.drain_and_delete_node(instance.name)
-            self.client.terminate([instance.id])
-            self.infra.forget_host_key(instance.name)
-            self._emit(f"Deleted {instance.name} {instance.id}")
+        gone: set[str] = set()
+        failures: list[str] = []
+        try:
+            for instance in plan.delete:
+                try:
+                    if instance.id in duplicate_ids:
+                        # Ruling R17: the node name and host key belong to the instance that is kept, so by id only
+                        self.client.terminate([instance.id])
+                        gone.add(instance.id)
+                        self._emit(f"Terminated duplicate {instance.name} {instance.id}")
+                        continue
+                    self.infra.drain_and_delete_node(instance.name)
+                    self.client.terminate([instance.id])
+                    gone.add(instance.id)
+                    self.infra.forget_host_key(instance.name)
+                    self._emit(f"Deleted {instance.name} {instance.id}")
+                except Exception as e:
+                    failures.append(f"delete {instance.name} ({instance.id}): {e}")
+        except KeyboardInterrupt:
+            failures.append("deletes interrupted (KeyboardInterrupt); the remaining deletes were not attempted")
+        return gone, failures
+
+    def _delete_failed(self, spec: Spec, gone: set[str], failures: list[str]) -> int:
+        """A delete failed: launch nothing, but drop the IPs of the instances that were terminated from every
+        allow-list (step 7), since Lambda may hand those IPs to another tenant."""
+        for failure in failures:
+            self._warn(f"error: {failure}")
+        if gone:
+            try:
+                self._reconcile_firewall(spec, gone)
+            except (Exception, KeyboardInterrupt) as e:
+                self._warn(f"error: firewall reconcile after the failed delete failed: {str(e) or type(e).__name__}; "
+                           "re-run make gpu-apply or make sync-peers")
+        self._warn("No new GPU nodes were launched; fix the error and re-run")
+        return 1
 
     def _launch(self, pool: Pool, name: str, types: Mapping[str, InstanceType], rules: list[FirewallRule],
                 failures: list[str], unknown: list[str]) -> _Launched | None:
-        """Step 5 for one node: the first (type, region) with capacity, falling back on insufficient-capacity."""
+        """Step 5 for one node: the first (type, region) with capacity, falling back on insufficient-capacity.
+
+        While a launch request is in flight the name is in `unknown`, so if anything interrupts it (an API error,
+        Ctrl-C, a bug) the cleanup looks the name up. It stays there when this returns an instance: the caller
+        removes it once the instance is recorded in `launched`.
+        """
         exclude: set[tuple[str, str]] = set()
         while True:
             choice = choose_placement(pool, types, frozenset(exclude))
@@ -287,29 +350,37 @@ class Reconciler:
             instance_type, region = choice
             try:
                 ruleset = self.ensure_ruleset(region, rules)
+            except LambdaAPIError as e:  # nothing was launched
+                failures.append(f"{name}: cannot prepare the firewall ruleset {ruleset_name(region)}: {e}")
+                return None
+            unknown.append(name)
+            try:
                 instance_id = self.client.launch(name=name, region=region, instance_type=instance_type,
                                                  ssh_key_name=self.settings.ssh_key_name,
                                                  image_family=pool.image_family, ruleset_id=ruleset.id)
             except InsufficientCapacity:
+                unknown.remove(name)
                 self._emit(f"{name}: no capacity for {instance_type} in {region}, trying the next candidate")
                 exclude.add(choice)
                 continue
             except LambdaAPIError as e:
-                # The outcome is unknown (Lambda may have started it): the cleanup looks the name up.
+                # The outcome is unknown (Lambda may have started it): the name stays in `unknown`.
                 failures.append(f"{name}: launch failed: {e}")
-                unknown.append(name)
                 return None
             self._emit(f"Launched {name} {instance_id} ({instance_type} in {region})")
             return _Launched(instance_id, name, instance_type)
 
-    def _reconcile_firewall(self, spec: Spec) -> None:
-        """Step 7: the gpu-access stack and every peer allow-list, for exactly the live GPU instances that have IPs."""
-        ips = [i.ip for i in owned_instances(self.client.list_instances()) if i.ip is not None]
-        self.infra.apply_gpu_access(ips, max_nodes=spec.max_nodes)
-        self.sync_peers(spec)
+    def _reconcile_firewall(self, spec: Spec, gone: Iterable[str] = ()) -> None:
+        """Step 7: the gpu-access stack and every peer allow-list, for exactly the live GPU instances that have IPs.
+
+        `gone` holds the ids this run terminated: they are left out even if Lambda still lists them as active.
+        """
+        gone = set(gone)
+        self.infra.apply_gpu_access(self._live_gpu_ips(gone), max_nodes=spec.max_nodes)
+        self.sync_peers(spec, exclude_ids=gone)
 
     def _create_and_join(self, spec: Spec, plan: Plan, types: Mapping[str, InstanceType], *,
-                         keep_on_failure: bool) -> int:
+                         keep_on_failure: bool, gone: set[str]) -> int:
         launched: list[_Launched] = []
         unknown: list[str] = []  # names whose launch may or may not have started an instance
         joined: set[str] = set()
@@ -317,11 +388,12 @@ class Reconciler:
         try:
             # 5. launch, each node into its region's ruleset (rules from the peers as they are after the deletes)
             if plan.create:
-                rules = region_ruleset_rules(self._peer_set())
+                rules = region_ruleset_rules(self._peer_set(gone))
                 for name, pool_name in plan.create:
                     new = self._launch(spec.pools[pool_name], name, types, rules, failures, unknown)
                     if new is not None:
                         launched.append(new)
+                        unknown.remove(name)
             # 6. wait for each IP
             ready: list[tuple[_Launched, Instance]] = []
             for new in launched:
@@ -330,7 +402,7 @@ class Reconciler:
                 except (TimeoutError, LambdaAPIError) as e:
                     failures.append(f"{new.name}: {e}")
             # 7. firewalls for every live IP (also corrects them when nothing else changed)
-            self._reconcile_firewall(spec)
+            self._reconcile_firewall(spec, gone)
             # 8. join
             for new, instance in ready:
                 try:
@@ -352,33 +424,51 @@ class Reconciler:
                 self._warn(f"--keep-on-failure: kept {names} for troubleshooting; they bill until "
                            "make gpu-down (or a gpu-apply that no longer wants them)")
             return 1
-        self._clean_up(spec, failed, unknown)
+        self._clean_up(spec, failed, unknown, gone)
         return 1
 
-    def _clean_up(self, spec: Spec, failed: list[_Launched], unknown: list[str]) -> None:
+    def _find_unknown(self, unknown: list[str], known: set[str]) -> list[tuple[str, str]]:
+        """(id, name) of the live owned instances named in `unknown`, other than the ids in `known`."""
+        return [(i.id, i.name) for i in owned_instances(self.client.list_instances())
+                if i.name in unknown and i.id not in known]
+
+    def _clean_up(self, spec: Spec, failed: list[_Launched], unknown: list[str], gone: set[str]) -> None:
         """Step 9: terminate this run's failed new instances, drop their nodes and host keys, redo step 7.
 
-        Best effort: one failing step does not stop the others, and each is reported.
+        Best effort: one failing step does not stop the others, and each is reported. A launch whose outcome is
+        unknown is looked up by name; Lambda may list an accepted launch only a moment later, so names not found
+        are looked up once more after poll_s, and any still missing is reported for the operator to check.
         """
         victims = [(new.id, new.name) for new in failed]
         if unknown:
+            known = {new.id for new in failed}
             try:
-                known = {new.id for new in failed}
-                victims += [(i.id, i.name) for i in owned_instances(self.client.list_instances())
-                            if i.name in unknown and i.id not in known]
+                found = self._find_unknown(unknown, known)
+                missing = [name for name in unknown if name not in {n for _, n in found}]
+                if missing:
+                    self.sleep(self.settings.poll_s)
+                    found += self._find_unknown(missing, known | {i for i, _ in found})
+                    missing = [name for name in missing if name not in {n for _, n in found}]
+                victims += found
+                for name in missing:
+                    self._warn(f"cleanup: launch outcome of {name} unknown and no instance found yet; run "
+                               "make gpu-status in a minute and make gpu-down if it appears")
             except Exception as e:
-                self._warn(f"cleanup: cannot list instances to find {', '.join(unknown)}: {e}; check by hand")
+                self._warn(f"cleanup: cannot list instances to find {', '.join(unknown)}: {e}; check by hand "
+                           "(make gpu-status)")
         for instance_id, name in victims:
             for what, step in (("terminate", lambda: self.client.terminate([instance_id])),
                                ("delete node", lambda: self.infra.drain_and_delete_node(name)),
                                ("forget host key", lambda: self.infra.forget_host_key(name))):
                 try:
                     step()
+                    if what == "terminate":
+                        gone.add(instance_id)
                 except Exception as e:
                     self._warn(f"cleanup: {what} {name} ({instance_id}) failed: {e}")
             self._emit(f"Cleaned up {name} {instance_id}")
         try:
-            self._reconcile_firewall(spec)
+            self._reconcile_firewall(spec, gone)
         except Exception as e:
             self._warn(f"cleanup: firewall reconcile failed: {e}; re-run make gpu-apply or make sync-peers")
 

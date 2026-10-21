@@ -7,6 +7,7 @@ from pathlib import Path
 import pytest
 
 from fakes import FakeInfra, FakeLambda
+from gpuctl.infra import CommandError
 from gpuctl.lambda_api import Instance, InstanceType, InsufficientCapacity, LambdaAPIError
 from gpuctl.planner import PlanError
 from gpuctl.reconcile import OverridesError, Reconciler, Settings, load_overrides
@@ -399,3 +400,236 @@ def test_declined_down_changes_no_instances():
     fake, infra = FakeLambda(types=TYPES, instances=[inst()]), FakeInfra()
     assert make_rec(fake, infra, confirm=lambda prompt: False).down(SPEC, auto_approve=False) == 2
     assert mutations(fake) == [] and infra.events == []
+
+
+# --- review round 1: interrupted launches, failed deletes, transient polls, lagging status ------
+
+@pytest.mark.parametrize("error", [KeyboardInterrupt(), RuntimeError("socket closed")])
+def test_an_interrupted_launch_is_found_by_name_and_terminated(error):  # C0-1 / X0-2
+    fake, infra = FakeLambda(types=TYPES), FakeInfra()
+    launch = fake.launch
+
+    def interrupted(**kwargs):  # Lambda accepted the request, then Ctrl-C (or a bug) before the id came back
+        launch(**kwargs)
+        raise error
+
+    fake.launch = interrupted
+    assert make_rec(fake, infra).apply(SPEC, auto_approve=True, keep_on_failure=False) == 1
+    assert fake.launched_ids == ["i-1"] and fake.terminated == ["i-1"]
+    assert infra.joined == [] and infra.applied_gpu_ips[-1] == []
+
+
+def test_an_interrupt_after_launch_returns_still_cleans_up():  # X0-2: the window before `launched` records it
+    fake, infra = FakeLambda(types=TYPES), FakeInfra()
+    rec = make_rec(fake, infra)
+    emit = rec._emit
+
+    def interrupt_on_launched(line=""):
+        emit(line)
+        if line.startswith("Launched "):
+            raise KeyboardInterrupt
+
+    rec._emit = interrupt_on_launched
+    assert rec.apply(SPEC, auto_approve=True, keep_on_failure=False) == 1
+    assert fake.terminated == ["i-1"]
+
+
+def test_a_ruleset_error_is_not_an_unknown_launch(capsys):
+    fake, infra = FakeLambda(types=TYPES), FakeInfra()
+
+    def create_fails(name, region, rules):
+        raise LambdaAPIError("http/500", 500, "boom")
+
+    fake.create_ruleset = create_fails
+    assert make_rec(fake, infra).apply(SPEC, auto_approve=True, keep_on_failure=False) == 1
+    err = capsys.readouterr().err
+    assert "k3s-gpu-us-west-2" in err and "no instance found" not in err
+    assert not [c for c in fake.calls if c[0] == "launch"]
+
+
+def test_an_unknown_launch_with_no_instance_listed_warns_the_operator(capsys):  # X0-3
+    fake, infra = FakeLambda(types=TYPES), FakeInfra()
+
+    def lost(**kwargs):  # no instance appears, ever
+        raise LambdaAPIError("gpuctl/network-error", 0, "timed out")
+
+    fake.launch = lost
+    assert make_rec(fake, infra).apply(SPEC, auto_approve=True, keep_on_failure=False) == 1
+    err = capsys.readouterr().err
+    assert "k3s-gpu-a6000-1" in err and "no instance found" in err and "gpu-status" in err
+    assert fake.terminated == []
+
+
+def test_an_unknown_launch_that_shows_up_late_is_found_on_a_second_look(capsys):  # X0-3
+    clock = Clock()
+    fake, infra = FakeLambda(types=TYPES), FakeInfra()
+    launch, list_instances = fake.launch, fake.list_instances
+
+    def lost_response(**kwargs):
+        launch(**kwargs)
+        raise LambdaAPIError("http/504", 504, "gateway timeout")
+
+    def lagging_list():  # the accepted launch is listed only after the cleanup has waited once
+        return [i for i in list_instances() if i.id != "i-1" or clock.now > 0]
+
+    fake.launch, fake.list_instances = lost_response, lagging_list
+    assert make_rec(fake, infra, clock=clock).apply(SPEC, auto_approve=True, keep_on_failure=False) == 1
+    assert fake.terminated == ["i-1"] and clock.sleeps == [10.0]
+    assert "no instance found" not in capsys.readouterr().err
+
+
+def two_nodes_and_a_third():
+    return [inst("k3s-gpu-a6000-1", ip="129.80.30.30"), inst("k3s-gpu-a6000-2", ip="129.80.30.31"),
+            inst("k3s-gpu-a6000-3", ip="129.80.30.32")]
+
+
+def failing_drain(infra, bad):
+    drain = infra.drain_and_delete_node
+
+    def drain_or_fail(name):
+        if name == bad:
+            raise CommandError(["kubectl", "drain", name], 1, "Unable to connect to the server")
+        drain(name)
+
+    infra.drain_and_delete_node = drain_or_fail
+
+
+def test_a_failed_delete_still_removes_the_terminated_ips_from_every_allow_list(capsys):  # C0-2 / X0-1
+    fake, infra = FakeLambda(types=TYPES, instances=two_nodes_and_a_third()), FakeInfra()
+    failing_drain(infra, "k3s-gpu-a6000-2")
+    assert make_rec(fake, infra).down(SPEC, auto_approve=True) == 1
+    # the other deletes went ahead; the node whose drain failed is left running (and admitted)
+    assert sorted(fake.terminated) == ["id-k3s-gpu-a6000-1", "id-k3s-gpu-a6000-3"]
+    assert infra.applied_gpu_ips[-1] == ["129.80.30.31"] and infra.events[-2:] == ["tf:['129.80.30.31']", "nft"]
+    sources = {r.source_network for r in fake.ruleset_by_name("k3s-gpu-us-west-2").rules}
+    assert "129.80.30.31/32" in sources and not {"129.80.30.30/32", "129.80.30.32/32"} & sources
+    assert "Unable to connect" in capsys.readouterr().err
+
+
+def test_a_failed_delete_launches_nothing():
+    old = inst("k3s-gpu-old-1", ip="129.80.30.40", id="id-old")
+    stuck = inst("k3s-gpu-old-2", ip="129.80.30.41", id="id-stuck")
+    fake, infra = FakeLambda(types=TYPES, instances=[old, stuck]), FakeInfra()
+    failing_drain(infra, "k3s-gpu-old-2")
+    assert make_rec(fake, infra).apply(SPEC, auto_approve=True, keep_on_failure=False) == 1
+    assert fake.terminated == ["id-old"] and fake.launched == []
+    assert infra.applied_gpu_ips[-1] == ["129.80.30.41"]
+
+
+def test_a_failed_delete_with_nothing_terminated_changes_no_firewall():
+    fake, infra = FakeLambda(types=TYPES, instances=[inst()]), FakeInfra()
+    failing_drain(infra, "k3s-gpu-a6000-1")
+    assert make_rec(fake, infra).down(SPEC, auto_approve=True) == 1
+    assert fake.terminated == [] and infra.events == []
+
+
+def test_ctrl_c_during_deletes_still_reconciles_the_firewall():  # C0-2 / X0-1
+    fake, infra = FakeLambda(types=TYPES, instances=two_nodes_and_a_third()), FakeInfra()
+    forget = infra.forget_host_key
+
+    def interrupted_forget(name):  # Ctrl-C right after the first instance is terminated
+        forget(name)
+        raise KeyboardInterrupt
+
+    infra.forget_host_key = interrupted_forget
+    assert make_rec(fake, infra).down(SPEC, auto_approve=True) == 1
+    [first] = fake.terminated  # the remaining deletes stop
+    ips = {"id-k3s-gpu-a6000-1": "129.80.30.30", "id-k3s-gpu-a6000-2": "129.80.30.31",
+           "id-k3s-gpu-a6000-3": "129.80.30.32"}
+    assert infra.applied_gpu_ips[-1] == sorted(ip for i, ip in ips.items() if i != first)
+
+
+def test_a_forget_host_key_error_after_terminate_still_reconciles_the_firewall():
+    fake, infra = FakeLambda(types=TYPES, instances=[inst()]), FakeInfra()
+
+    def bad_name(name):
+        raise ValueError(f"refusing to edit known_hosts for {name!r}")
+
+    infra.forget_host_key = bad_name
+    assert make_rec(fake, infra).down(SPEC, auto_approve=True) == 1
+    assert fake.terminated == ["id-k3s-gpu-a6000-1"] and infra.applied_gpu_ips[-1] == []
+
+
+def lagging_terminate(fake):
+    """Lambda accepts the terminate but keeps listing the instance as active for a while (C0-4)."""
+    def terminate(instance_ids):
+        fake.calls.append(("terminate", list(instance_ids)))
+        fake.terminated.extend(instance_ids)
+
+    fake.terminate = terminate
+
+
+def test_down_drops_terminated_ips_even_while_lambda_still_lists_them_active():  # C0-4
+    fake, infra = FakeLambda(types=TYPES, instances=[inst()]), FakeInfra()
+    lagging_terminate(fake)
+    assert make_rec(fake, infra).down(SPEC, auto_approve=True) == 0
+    assert infra.applied_gpu_ips == [[]]
+    nft_payload = infra.ssh_calls[-1][1]
+    assert "129.80.30.30" not in nft_payload
+    sources = {r.source_network for r in fake.ruleset_by_name("k3s-gpu-us-west-2").rules}
+    assert "129.80.30.30/32" not in sources
+
+
+def test_replacement_launch_ruleset_excludes_the_just_terminated_ip():  # C0-4, step 5's peer set
+    old = inst("k3s-gpu-old-1", ip="129.80.30.40", id="id-old")
+    fake, infra = FakeLambda(types=TYPES, instances=[old]), FakeInfra()
+    lagging_terminate(fake)
+    assert make_rec(fake, infra).apply(SPEC, auto_approve=True, keep_on_failure=False) == 0
+    [launch] = [c for c in fake.calls if c[0] == "launch"]
+    [created] = [c for c in fake.calls[:fake.calls.index(launch)] if c[0] == "create_ruleset"]
+    assert "129.80.30.40/32" not in {rule.source_network for rule in created[3]}
+    assert infra.applied_gpu_ips[-1] == ["129.80.30.30"]
+
+
+def test_cleanup_drops_terminated_ips_even_while_lambda_still_lists_them_active():  # C0-4
+    fake, infra = FakeLambda(types=TYPES), FakeInfra(join_fail={"k3s-gpu-a6000-1"})
+    lagging_terminate(fake)
+    assert make_rec(fake, infra).apply(SPEC, auto_approve=True, keep_on_failure=False) == 1
+    assert fake.terminated == ["i-1"] and infra.applied_gpu_ips[-1] == []
+
+
+def flaky_get_instance(fake, errors):
+    get_instance = fake.get_instance
+
+    def get(instance_id):
+        if errors:
+            raise errors.pop(0)
+        return get_instance(instance_id)
+
+    fake.get_instance = get
+
+
+@pytest.mark.parametrize("error", [LambdaAPIError("gpuctl/network-error", 0, "timed out"),
+                                   LambdaAPIError("gpuctl/transport-error", 0, "OSError"),
+                                   LambdaAPIError("http/429", 429, "slow down"),
+                                   LambdaAPIError("http/502", 502, "bad gateway")])
+def test_wait_active_keeps_polling_through_a_transient_error(error, capsys):  # C0-3
+    fake = FakeLambda(instances=[booting()], instance_progress={"i-1": [booting(), active("129.80.30.30")]})
+    flaky_get_instance(fake, [error])
+    clock = Clock()
+    assert make_rec(fake, FakeInfra(), clock=clock).wait_active("i-1") == active("129.80.30.30")
+    assert clock.sleeps == [10.0, 10.0]
+    assert error.code in capsys.readouterr().err
+
+
+def test_wait_active_does_not_retry_a_permanent_error():  # C0-3
+    fake = FakeLambda(instances=[booting()])
+    flaky_get_instance(fake, [LambdaAPIError("global/object-does-not-exist", 404, "gone")])
+    with pytest.raises(LambdaAPIError, match="404"):
+        make_rec(fake, FakeInfra()).wait_active("i-1")
+
+
+def test_wait_active_gives_up_on_transient_errors_at_the_deadline():  # C0-3
+    fake = FakeLambda(instances=[booting()])
+    flaky_get_instance(fake, [LambdaAPIError("http/503", 503, "down")] * 100)
+    clock = Clock()
+    with pytest.raises(TimeoutError, match="http/503"):
+        make_rec(fake, FakeInfra(), clock=clock, launch_timeout_s=60.0, poll_s=10.0).wait_active("i-1")
+    assert 60.0 <= clock.now <= 70.0
+
+
+def test_a_transient_poll_error_does_not_terminate_a_healthy_launch():  # C0-3, end to end
+    fake, infra = FakeLambda(types=TYPES), FakeInfra()
+    flaky_get_instance(fake, [LambdaAPIError("gpuctl/network-error", 0, "timed out")])
+    assert make_rec(fake, infra).apply(SPEC, auto_approve=True, keep_on_failure=False) == 0
+    assert fake.terminated == [] and infra.joined == [("k3s-gpu-a6000-1", "129.80.30.30", "a6000")]

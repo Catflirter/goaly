@@ -71,7 +71,7 @@ gpu-apply: ## Create/delete Lambda GPU nodes to match lambda/gpu-nodes.yaml, the
 gpu-down: ## Delete every Lambda GPU node and the autoscaler overrides (AUTO_APPROVE=1 skips the prompt)
 	$(ROOT)/scripts/gpuctl down$(GPU_AUTO_APPROVE)
 
-gpu-status: ## Show Lambda GPU capacity, this cluster's GPU instances and a drift check (read-only; exit 3 on drift)
+gpu-status: ## Show GPU capacity, GPU instances and drift (changes no cloud state; may terraform init locally; exit 3 on drift)
 	$(ROOT)/scripts/gpuctl status
 
 .PHONY: sync-peers

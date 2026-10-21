@@ -64,6 +64,7 @@ def test_ensure_init_runs_init_once_per_uninitialised_stack(tmp_path):
     infra = Infra(sh, tmp_path, ENV)
     infra.ensure_init("gpu-access")
     assert sh.calls[0].args == ["terraform", f"-chdir={tmp_path}/infra/gpu-access", "init", "-input=false",
+                                "-lockfile=readonly",  # never rewrite the committed .terraform.lock.hcl (R26(b))
                                 "-backend-config=bucket=demo-proj-k3s-tfstate", "-backend-config=prefix=gpu-access"]
     assert sh.calls[0].env["TF_VAR_state_bucket"] == "demo-proj-k3s-tfstate"
     (tmp_path / "infra/gpu-access/.terraform").mkdir()

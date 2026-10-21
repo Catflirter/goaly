@@ -163,6 +163,8 @@ class Infra:
         A stack that is not in this checkout raises MissingStackError (a CommandError). If init fails or is
         interrupted (a timeout included), the .terraform it created is removed: terraform writes the backend config
         there before it downloads providers, and a leftover directory would make every later call skip init.
+        -lockfile=readonly (Ruling R26(b)): providers are verified against the committed .terraform.lock.hcl, which
+        init never rewrites, so even the read-only `gpuctl status` cannot change a tracked file.
         """
         stack_dir = self._stack_dir(stack)
         dot_terraform = stack_dir / ".terraform"
@@ -175,7 +177,8 @@ class Infra:
         if not project:
             raise ValueError(f"GCP_PROJECT is not set: cannot locate the state bucket to init infra/{stack}")
         try:
-            self._terraform(stack, "init", "-input=false", f"-backend-config=bucket={project}-k3s-tfstate",
+            self._terraform(stack, "init", "-input=false", "-lockfile=readonly",
+                            f"-backend-config=bucket={project}-k3s-tfstate",
                             f"-backend-config=prefix={stack}", timeout=TF_INIT_TIMEOUT_S)
         except BaseException:  # CommandError, a timeout, or Ctrl-C mid-download
             shutil.rmtree(dot_terraform, ignore_errors=True)
