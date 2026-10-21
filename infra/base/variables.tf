@@ -7,6 +7,12 @@ variable "cp_zone" {
   description = "Zone of the k3s-cp control-plane VM."
   type        = string
   default     = "us-west1-b"
+
+  # The static IP and core subnet live in cp_region; a zone elsewhere would fail mid-apply.
+  validation {
+    condition     = startswith(var.cp_zone, "${var.cp_region}-")
+    error_message = "cp_zone must be a zone of cp_region (e.g. us-west1-b for us-west1)."
+  }
 }
 
 variable "cp_region" {
