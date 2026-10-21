@@ -1,0 +1,16 @@
+# Loads the k3s_guard nft table (spec §4.2). Ubuntu's nftables.service stays masked:
+# it flushes the whole ruleset when it starts, including the rules k3s writes.
+[Unit]
+Description=k3s host firewall (nft table inet k3s_guard)
+Before=k3s.service k3s-agent.service
+
+[Service]
+Type=oneshot
+RemainAfterExit=yes
+ExecStart=/usr/sbin/nft -f /etc/k3s-guard/k3s-guard.nft
+# The file deletes and recreates the table in one transaction, so a reload leaves no gap.
+ExecReload=/usr/sbin/nft -f /etc/k3s-guard/k3s-guard.nft
+ExecStop=/usr/sbin/nft delete table inet k3s_guard
+
+[Install]
+WantedBy=multi-user.target
