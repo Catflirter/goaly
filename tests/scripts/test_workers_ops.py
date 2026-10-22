@@ -1012,6 +1012,7 @@ def leftovers(env):
 
 
 def test_scale_up_writes_applies_syncs_then_joins_the_new_worker(env):
+    set_pool(env, ["k3s-cpu-1"])  # not the committed inventory, whose machine types may change
     set_workers(env, {"k3s-cpu-1": "34.10.0.11", "k3s-cpu-2": "34.10.0.12"})
     env.scenario["ready"] = ["k3s-cpu-1"]
     proc = env.script("cpu-pool.sh", "scale", "2", AUTO_APPROVE="1")
