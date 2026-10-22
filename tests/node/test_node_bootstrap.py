@@ -134,8 +134,10 @@ def test_agent_dropin_orders_k3s_agent_after_the_guard(tmp_path):
 
 def test_sysctl_values(tmp_path):
     assert run_agent(tmp_path, "--no-gpu").returncode == 0
-    lines = {l.strip() for l in rendered(tmp_path, "etc/sysctl.d/90-kubelet.conf").splitlines() if l.strip()}
-    assert lines == {"vm.panic_on_oom=0", "vm.overcommit_memory=1", "kernel.panic=10", "kernel.panic_on_oops=1"}
+    lines = {l.strip() for l in rendered(tmp_path, "etc/sysctl.d/90-kubelet.conf").splitlines()
+             if l.strip() and not l.lstrip().startswith("#")}
+    assert lines == {"vm.panic_on_oom=0", "vm.overcommit_memory=1", "kernel.panic=10", "kernel.panic_on_oops=1",
+                     "net.ipv4.ip_forward=1", "net.ipv4.conf.all.forwarding=1"}
 
 
 def test_renders_exactly_the_expected_files(tmp_path):
