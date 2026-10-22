@@ -10,6 +10,9 @@
 #                            inventory, apply, sync-peers (k3s-cpu-1 is never removed)
 #   cpu-pool.sh stop|start   make cpu-stop / cpu-start: gcloud compute instances stop/start for
 #                            every worker; a stopped worker is NotReady and keeps its static IP
+#   cpu-pool.sh scale N --guarded / remove NAME --guarded
+#                            the same, for unattended use (the stretch autoscaler, spec §10.2): the
+#                            saved plan must also pass `gpuctl tfguard` before anything else happens
 #
 # render: new workers are k3s-cpu-<n> with the lowest free numbers, in ${CPU_ZONE:-us-central1-a}
 # with ${CPU_TYPE:-e2-small}; existing workers keep their settings; scaling down removes the highest
@@ -29,6 +32,27 @@
 # Every command is safe to re-run: a second `remove` of the same worker, or a `scale` to the current
 # size, changes nothing.
 #
+# --guarded (stretch S3, spec §10.2/§10.5): every plan is made into $RUN_DIR/workers.tfplan as above
+# (an add-only scale, too, plans the new inventory as a -var-file before the file is written) and
+# checked by tf_plan's --no-destroy / --destroy-only guards; then
+# `terraform show -json` of that saved plan goes through `scripts/gpuctl tfguard --add ... --remove
+# ...`: it may only create the four per-worker resources of each worker the scale adds and delete
+# those of each worker it removes (lambda/gpuctl/tfguard.py). The add and remove sets come from the
+# new inventory and what the stack has deployed (worker_ips); remove NAME removes exactly NAME. A
+# violation, or any failure of that pipe, exits 1 before anything is drained, written or applied;
+# only then does the run go on (ask, drain, write the inventory, apply exactly that plan). A plan
+# without changes is not checked (nothing is applied). A guarded run holds flock(1) on
+# $RUN_DIR/workers.lock from before the inventory is read until it exits, so two guarded runs (the
+# autoscaler and a guarded run by hand) never overlap: one that finds it held refuses (exit 2) and
+# changes nothing. The kernel releases the lock when the run dies (SIGKILL, a reboot), so there is no
+# stale lock; the file itself stays. Without flock(1) on PATH --guarded is refused (exit 2). Unguarded
+# runs neither take nor honour it (they behave as before), so the guarded run also binds its apply to
+# the plan it checked: the apply question is asked first (an interactive yes is logged as the
+# operator's), and only then must the saved plan still be the bytes the guard read (cksum), right
+# before terraform applies it, or nothing is applied (exit 1; another run replaced or removed
+# $RUN_DIR/workers.tfplan, and a re-run of the same command finishes the job). A declined apply
+# removes the saved plan only while it is still those bytes. Without --guarded nothing here changes.
+#
 # Scale step 4 joins every worker that has not joined: a new one always; one that was in the pool
 # before when the cluster has no Node of that name, or when its Node is NotReady and its VM is
 # RUNNING (a join that timed out: join-node.sh bootstraps it again). A NotReady worker whose VM is
@@ -47,6 +71,11 @@ MAX_WORKERS=100
 # between that plan and the drain; the EXIT trap cleans up and says what a failure there left behind.
 NEXT_TFVARS=""
 PLANNING=0
+# --guarded: 1 when the saved plan must also pass gpuctl tfguard before it is used; GUARD_SUM is the
+# cksum of the plan the guard passed.
+GUARDED=0
+GUARD_SUM=""
+LOCK_FILE="$RUN_DIR/workers.lock"
 
 on_exit() {
   local rc=$?
@@ -64,21 +93,129 @@ trap on_exit EXIT
 plan_removal() {
   local -a names=()
   while (( $# )) && [[ "$1" != -- ]]; do names+=("$1"); shift; done
+  if (( $# == 2 )); then
+    plan_next "$2" --destroy-only "${names[@]}"
+  else
+    tf_init workers
+    PLANNING=1
+    tf_plan workers --destroy-only "${names[@]}"
+    PLANNING=0
+  fi
+}
+
+# plan_next JSON GUARD...: tf_plan the workers stack with JSON (the new inventory) as a -var-file and
+# tf_plan's GUARD options, before anything is drained or the inventory file is written.
+plan_next() {
+  local json="$1"
+  shift
   tf_init workers
   PLANNING=1
-  if (( $# == 2 )); then
-    run_dir || die "cannot create $RUN_DIR"
-    NEXT_TFVARS="$RUN_DIR/workers.next.tfvars.json"
-    printf '%s\n' "$2" > "$NEXT_TFVARS" || die "cannot write $NEXT_TFVARS"
-    tf_plan workers --var-file "$NEXT_TFVARS" --destroy-only "${names[@]}"
-  else
-    tf_plan workers --destroy-only "${names[@]}"
-  fi
+  run_dir || die "cannot create $RUN_DIR"
+  NEXT_TFVARS="$RUN_DIR/workers.next.tfvars.json"
+  printf '%s\n' "$json" > "$NEXT_TFVARS" || die "cannot write $NEXT_TFVARS"
+  tf_plan workers --var-file "$NEXT_TFVARS" "$@"
   PLANNING=0
 }
 
+# take_lock: under --guarded, hold flock(1) on $LOCK_FILE for the rest of the run (Ruling SR8), or
+# refuse (exit 2) when another guarded run holds it. The descriptor stays open until this shell exits,
+# and the kernel drops the lock then, however the run ends: no stale lock, no PID check, nothing to
+# clean up. Its children inherit the descriptor; none of them outlives the run. The file is never
+# removed (removing it would let a waiting run lock an unlinked file). No flock(1): refused (exit 2).
+take_lock() {
+  local fd
+  (( GUARDED )) || return 0
+  command -v flock > /dev/null 2>&1 \
+    || die "--guarded needs flock(1) (util-linux) on PATH to keep guarded runs apart: nothing was changed (without --guarded the run is unguarded)" 2
+  run_dir || die "cannot create $RUN_DIR"
+  exec {fd}> "$LOCK_FILE" || die "cannot open $LOCK_FILE"
+  flock -n "$fd" \
+    || die "another guarded cpu-pool.sh run holds $LOCK_FILE: nothing was changed; it is released when that run exits" 2
+}
+
+# apply_plan: tf_apply_plan workers; under --guarded only when the saved plan is still the one the
+# guard passed (same cksum). Otherwise exit 1 without applying, and leave the file to whoever wrote it.
+# Under --guarded the apply question is asked here (confirm: AUTO_APPROVE=1 logs its own yes), BEFORE
+# the check, and the checked plan is then applied by apply_checked_plan, with no second question: no
+# human-length wait sits between the check and terraform reading the plan. A declined apply removes
+# the plan only while it is still this run's.
+apply_plan() {
+  if (( GUARDED )) && [[ -n "${TF_PLAN:-}" ]]; then
+    if ! confirm "Apply this plan to the workers stack?"; then
+      if plan_is_guarded; then
+        rm -f -- "$TF_PLAN"
+      else
+        log "$RUN_DIR/workers.tfplan is not this run's plan any more (another cpu-pool.sh run?): left where it is"
+      fi
+      TF_PLAN=""
+      die "not applied: workers" 2
+    fi
+    [[ "${AUTO_APPROVE:-}" == 1 ]] || log "the operator confirmed the apply of the workers plan"
+    if ! plan_is_guarded; then
+      TF_PLAN=""
+      die "the saved plan $RUN_DIR/workers.tfplan changed after the guard (another cpu-pool.sh run?): nothing was applied; a re-run of the same command finishes the job"
+    fi
+    apply_checked_plan
+    return
+  fi
+  tf_apply_plan workers
+}
+
+# plan_is_guarded: the saved plan ($TF_PLAN) is still the bytes the guard passed (cksum GUARD_SUM).
+plan_is_guarded() {
+  local sum
+  [[ -n "$GUARD_SUM" ]] || return 1
+  sum="$(cksum < "$TF_PLAN" 2> /dev/null)" || return 1
+  [[ "$sum" == "$GUARD_SUM" ]]
+}
+
+# apply_checked_plan: what tf_apply_plan workers does once its question is answered yes (apply_plan
+# asked it): terraform apply exactly $TF_PLAN, then remove it. It does not ask again, so an operator's
+# yes is never logged as AUTO_APPROVE's.
+apply_checked_plan() {
+  local dir rc=0
+  [[ "$TF_PLAN" == "$RUN_DIR/workers.tfplan" && -f "$TF_PLAN" ]] || die "no saved plan for workers"
+  dir="$(tf_dir workers)" || exit
+  tf_env
+  terraform -chdir="$dir" apply -input=false -lock-timeout=120s "$TF_PLAN" || rc=$?
+  rm -f -- "$TF_PLAN"
+  TF_PLAN=""
+  [[ "$rc" == 0 ]] || die "terraform apply failed for workers (exit $rc)"
+}
+
+# guard_plan ADD REMOVE (space-separated names): under --guarded, `terraform show -json` of the plan
+# tf_plan saved ($TF_PLAN) through `scripts/gpuctl tfguard --add ADD --remove REMOVE` (it prints each
+# violation). Any failure of that pipe exits 1 here, before anything is drained, written or applied;
+# the EXIT trap removes the plan. No saved plan (no changes): nothing will be applied, nothing to check.
+# The plan's cksum before and after the pipe must match; it becomes GUARD_SUM for apply_plan.
+guard_plan() {
+  local add="$1" remove="$2" dir sum
+  local -a args=()
+  (( GUARDED )) || return 0
+  [[ -n "${TF_PLAN:-}" ]] || return 0
+  # shellcheck disable=SC2206  # names are checked k3s-cpu-<n>: no spaces or globs
+  [[ -z "$add" ]] || args+=(--add $add)
+  # shellcheck disable=SC2206
+  [[ -z "$remove" ]] || args+=(--remove $remove)
+  dir="$(tf_dir workers)" || exit
+  PLANNING=1
+  log "checking the saved plan with gpuctl tfguard${args[*]:+ ${args[*]}}"
+  sum="$(cksum < "$TF_PLAN")" || die "cannot read the saved plan $TF_PLAN"
+  if ! terraform -chdir="$dir" show -json "$TF_PLAN" \
+      | "$REPO_ROOT/scripts/gpuctl" tfguard ${args[@]+"${args[@]}"} >&2; then
+    die "the workers plan failed the guard (gpuctl tfguard): nothing was applied"
+  fi
+  GUARD_SUM="$(cksum < "$TF_PLAN")" || GUARD_SUM=""
+  if [[ "$GUARD_SUM" != "$sum" ]]; then
+    TF_PLAN=""  # not this run's plan any more: the EXIT trap leaves it to whoever wrote it
+    die "the saved plan $RUN_DIR/workers.tfplan changed while the guard read it (another cpu-pool.sh run?): nothing was applied"
+  fi
+  PLANNING=0
+  log "the workers plan passed the guard"
+}
+
 usage() {
-  log "usage: ${0##*/} render N | scale N | remove NAME | stop | start"
+  log "usage: ${0##*/} render N | scale N [--guarded] | remove NAME [--guarded] | stop | start"
   [[ $# -eq 0 ]] || log "error: $*"
   exit 2
 }
@@ -146,8 +283,10 @@ not_in() {
 }
 
 cmd_scale() {
-  local new old_names new_names deployed current name state
+  local new old_names new_names deployed current name state guard_add="" guard_remove=""
   local -a removed=() join=() unsettled=()
+  check_n "$1"
+  take_lock
   new="$(render_pool "$1")" || exit
   load_env
   unset LAMBDA_API_KEY
@@ -165,6 +304,14 @@ cmd_scale() {
     [[ -n "$name" ]] && removed+=("$name")
   done <<< "$(not_in $current -- $new_names)"
 
+  if (( GUARDED )); then
+    # The guard's sets: what the plan must create and destroy, from what the stack has deployed.
+    # shellcheck disable=SC2086  # names are k3s-cpu-<n>: no spaces or globs
+    guard_add="$(not_in $new_names -- $deployed | tr '\n' ' ')"
+    # shellcheck disable=SC2086
+    guard_remove="$(not_in $deployed -- $new_names | tr '\n' ' ')"
+  fi
+
   if (( ${#removed[@]} )); then
     for name in "${removed[@]}"; do
       [[ "$name" =~ $CPU_NODE_RE ]] || die "unexpected worker name: '$name'"
@@ -176,13 +323,21 @@ cmd_scale() {
     # checked on the plan of the new inventory before anything is drained, and shown before the
     # question.
     plan_removal "${removed[@]}" -- "$new"
+    guard_plan "$guard_add" "$guard_remove"
     confirm "Drain and delete ${removed[*]}, then apply the workers stack (destroys their VMs)?" \
       || die "not changed: nothing was drained and $TFVARS is unchanged" 2
     for name in "${removed[@]}"; do
       drain_and_delete_node "$name"
     done
     write_pool "$new"
-    tf_apply_plan workers
+    apply_plan
+  elif (( GUARDED )); then
+    # Only adding workers (or none), guarded: the same --no-destroy plan, but of the new inventory as a
+    # -var-file, so a plan the guard refuses leaves the inventory file as it was.
+    plan_next "$new" --no-destroy
+    guard_plan "$guard_add" ""
+    write_pool "$new"
+    apply_plan
   else
     # Only adding workers (or none): nothing may be destroyed, unattended or not without a review.
     write_pool "$new"
@@ -233,6 +388,7 @@ cmd_remove() {
   [[ "$name" =~ $CPU_NODE_RE ]] || usage "NAME must be a CPU worker, k3s-cpu-<n>: '$name'"
   # Spec §10.2: k3s-cpu-1 stays (the workers stack refuses an inventory without it as well).
   [[ "$name" != k3s-cpu-1 ]] || die "k3s-cpu-1 is never removed (spec §10.2)" 2
+  take_lock
   [[ -f "$TFVARS" ]] || die "$TFVARS not found"
   in_pool="$(jq -r --arg n "$name" '.cpu_workers | has($n)' "$TFVARS")" || die "cannot read $TFVARS"
   load_env
@@ -242,6 +398,7 @@ cmd_remove() {
     # Only NAME may be destroyed: never k3s-cpu-1 or another worker, unattended. Checked on the plan
     # before the drain, and shown before the question.
     plan_removal "$name" -- "$new"
+    guard_plan "" "$name"
     confirm "Drain $name, delete it from the cluster, then apply the workers stack (destroys its VM)?" \
       || die "not changed: $name stays" 2
   else
@@ -249,12 +406,13 @@ cmd_remove() {
     # finish whatever is left, which is nothing when that run completed.
     log "$name is not in $TFVARS: making sure it is gone from the cluster and the workers stack"
     plan_removal "$name"
+    guard_plan "" "$name"
   fi
   drain_and_delete_node "$name"
   if [[ "$in_pool" == true ]]; then
     write_pool "$new"
   fi
-  tf_apply_plan workers
+  apply_plan
   "$REPO_ROOT/scripts/gpuctl" sync-peers || die "sync-peers failed"
   log "$name removed"
 }
@@ -283,6 +441,12 @@ cmd_power() {
 }
 
 (( $# >= 1 )) || usage
+# --guarded: only after scale N or remove NAME (spec §10.2: the autoscaler's unattended applies).
+if (( $# == 3 )) && [[ "$1" == scale || "$1" == remove ]]; then
+  [[ "$3" == --guarded ]] || usage "unknown option: '$3'"
+  GUARDED=1
+  set -- "$1" "$2"
+fi
 case "$1" in
   render)
     (( $# == 2 )) || usage

@@ -49,6 +49,25 @@ Workers and GPU nodes (Task 14). A remote command reaches the same handler wheth
 
 A plan run with -var-file=FILE copies FILE's text to $FAKE_LOG.var-file, so a test can see what it planned.
 
+The plan guardrail (stretch S3, cpu-pool.sh --guarded):
+
+  changes        {stack: [resource_change]} `terraform show -json` prints exactly these resource_changes
+                                          (instead of the `deletes` replaces plus one bucket create)
+  outputs_after_apply {stack: {name: value}} terraform output answers from these once an apply of that stack
+                                          ran (the workers a scale-up creates appear in worker_ips)
+  tfguard_rc     rc                       `scripts/gpuctl tfguard` exits rc. Without it the fake runs the real
+                                          `gpuctl tfguard` (lambda/gpuctl) on the plan it was piped. Its stdin
+                                          is logged as "stdin" either way
+  guard_show_rc  {stack: rc}              the second and later `terraform show` of that stack (the first is
+                                          tf_plan's own check; the next is the guard's) print as usual, then
+                                          exit rc
+  guard_show_replaces true                 ... and that later show overwrites the saved plan with other bytes
+                                          while it is read (another run's plan lands mid-guard)
+  drain_plan     "keep" | "replace" | "remove"  `kubectl drain` stands in for another cpu-pool.sh run during the
+                                          drain: it leaves the saved plan (the last plan -out file) alone,
+                                          overwrites it with other bytes, or deletes it, and writes "held" or
+                                          "free" (whether .run/workers.lock is flock(1)ed then) to $FAKE_LOG.lock_at_drain
+
 Verification checks (Task 18) script their answers instead, with rules tried before every handler above:
 
   answers        [rule, ...]              the first rule whose "tool" is this tool, whose "has" substrings
@@ -110,10 +129,11 @@ CONTAINERD_NVIDIA = "[plugins.'io.containerd.cri.v1.runtime'.containerd.runtimes
 
 def log():
     entry = {"tool": TOOL, "argv": ARGS, "env": {k: os.environ[k] for k in LOGGED_ENV if k in os.environ}}
-    if TOOL == "gpuctl" and ARGS[:1] in (["down"], ["list-nodes"]):
+    if TOOL == "gpuctl" and ARGS[:1] in (["down"], ["list-nodes"], ["tfguard"]):
         entry["stdin"] = sys.stdin.read()
     with open(os.environ["FAKE_LOG"], "a") as f:
         f.write(json.dumps(entry) + "\n")
+    return entry
 
 
 def counter(name):
@@ -145,23 +165,35 @@ def terraform():
             state.write_text(json.dumps({"backend": {"type": "gcs", "config": cfg}}))
         return SCENARIO.get("init_rc", {}).get(stack, 0)
     if sub == "output":
-        value = SCENARIO["outputs"][stack][rest[-1]]
+        outputs = SCENARIO["outputs"]
+        if Path(os.environ["FAKE_LOG"] + ".applied." + stack).exists():
+            outputs = {**outputs, **SCENARIO.get("outputs_after_apply", {})}
+        value = outputs[stack][rest[-1]]
         sys.stdout.write(json.dumps(value) if "-json" in rest else str(value))
         return 0
     if sub == "plan":
         out = next(a.split("=", 1)[1] for a in rest if a.startswith("-out="))
         Path(out).write_text("fake plan")
+        Path(os.environ["FAKE_LOG"] + ".plan_out").write_text(out)
         for a in rest:
             if a.startswith("-var-file="):
                 Path(os.environ["FAKE_LOG"] + ".var-file").write_text(Path(a.split("=", 1)[1]).read_text())
         return SCENARIO.get("plan_rc", {}).get(stack, 2)
     if sub == "show":
+        shown = counter("show." + stack)
+        if stack in SCENARIO.get("changes", {}):
+            print(json.dumps({"format_version": "1.2", "planned_values": {},
+                              "resource_changes": SCENARIO["changes"][stack]}))
+            if shown and SCENARIO.get("guard_show_replaces"):
+                Path(rest[-1]).write_text("another run's plan")
+            return SCENARIO.get("guard_show_rc", {}).get(stack, 0) if shown else 0
         changes = [{"address": a, "change": {"actions": ["delete", "create"]}}
                    for a in SCENARIO.get("deletes", {}).get(stack, [])]
         changes.append({"address": "google_storage_bucket.x", "change": {"actions": ["create"]}})
         print(json.dumps({"resource_changes": changes}))
         return 0
     if sub == "apply":
+        Path(os.environ["FAKE_LOG"] + ".applied." + stack).write_text("")
         return 0
     if sub == "destroy":
         return SCENARIO.get("destroy_rc", {}).get(stack, 0)
@@ -288,17 +320,44 @@ def kubectl():
     if node is not None:
         if node in SCENARIO.get("gone", []):
             return not_found(node)
+        if args[0] == "drain" and "drain_plan" in SCENARIO:
+            other_run()
         if args[0] == "drain" and node in SCENARIO.get("drain_fail", []):
             print("error: cannot evict pod as it would violate the pod's disruption budget", file=sys.stderr)
             return 1
     return 0
 
 
+def other_run():
+    """drain_plan: another cpu-pool.sh run touches the saved plan while this one drains."""
+    plan = Path(Path(os.environ["FAKE_LOG"] + ".plan_out").read_text())
+    lock = plan.parent / "workers.lock"
+    free = subprocess.run(["flock", "-n", str(lock), "true"]).returncode == 0
+    Path(os.environ["FAKE_LOG"] + ".lock_at_drain").write_text("free" if free else "held")
+    if SCENARIO["drain_plan"] == "replace":
+        plan.write_text("another run's plan")
+    elif SCENARIO["drain_plan"] == "remove":
+        plan.unlink()
+
+
 def helm():
     return SCENARIO.get("helm_rc", 0) if "upgrade" in ARGS else 0
 
 
-def gpuctl():
+def tfguard(stdin):
+    """The real `gpuctl tfguard` (it reads only stdin: no Lambda, no cluster), unless the scenario sets its exit code."""
+    if "tfguard_rc" in SCENARIO:
+        return SCENARIO["tfguard_rc"]
+    import io
+    sys.path.insert(0, str(Path(__file__).resolve().parents[2] / "lambda"))
+    from gpuctl.__main__ import main
+    sys.stdin = io.StringIO(stdin)
+    return main(ARGS, env={})
+
+
+def gpuctl(entry):
+    if ARGS[:1] == ["tfguard"]:
+        return tfguard(entry["stdin"])
     if ARGS[:1] == ["sync-peers"]:
         return SCENARIO.get("sync_rc", 0)
     if ARGS[:1] == ["ip"]:
@@ -379,12 +438,15 @@ def run_with(stubs):
 
 
 if __name__ == "__main__":
+    ENTRY = None
     if not READYZ_PROBE:  # a /readyz probe logs itself once it has its answer (kubectl)
-        log()
+        ENTRY = log()
     rc = scripted()
     if rc is not None:
         if READYZ_PROBE:  # a scripted answer to a /readyz probe: log it now that it is answered
             log()
         sys.exit(rc)
-    sys.exit({"terraform": terraform, "gcloud": gcloud, "kubectl": kubectl, "helm": helm, "ssh": ssh, "scp": scp,
-              "gpuctl": gpuctl}[TOOL]())
+    if TOOL == "gpuctl":  # never a /readyz probe, so ENTRY is set (gpuctl tfguard reads its logged stdin)
+        sys.exit(gpuctl(ENTRY))
+    sys.exit({"terraform": terraform, "gcloud": gcloud, "kubectl": kubectl, "helm": helm, "ssh": ssh,
+              "scp": scp}[TOOL]())
