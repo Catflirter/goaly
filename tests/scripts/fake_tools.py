@@ -32,6 +32,8 @@ Workers and GPU nodes (Task 14). A remote command reaches the same handler wheth
   ready          [node]                   `kubectl get node N -o jsonpath=...` prints True for these ...
   registered     [node]                   ... False for these, and NotFound (exit 1) for any other node
   api_down       true                     ... or fails like a dead tunnel, for every node
+  kubectl_stderr text                     ... and, when it succeeds, also prints this on stderr (a
+                                          warning or discovery error kubectl reports with exit 0)
   never_ready    [node]                   `kubectl wait ... node/N` times out (exit 1)
   gone           [node]                   `kubectl drain N` / `kubectl delete node N`: NotFound (exit 1)
   drain_fail     [node]                   `kubectl drain N` fails for another reason (exit 1)
@@ -187,6 +189,8 @@ def kubectl():
             print("Unable to connect to the server: dial tcp 127.0.0.1:6443: connect: connection refused",
                   file=sys.stderr)
             return 1
+        if SCENARIO.get("kubectl_stderr") and node in SCENARIO.get("ready", []) + SCENARIO.get("registered", []):
+            print(SCENARIO["kubectl_stderr"], file=sys.stderr)
         if node in SCENARIO.get("ready", []):
             sys.stdout.write("True")
         elif node in SCENARIO.get("registered", []):

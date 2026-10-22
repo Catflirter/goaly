@@ -130,16 +130,33 @@ _tf_output() {
   terraform -chdir="$dir" output "$2" "$3"
 }
 
-# tf_apply STACK [--no-destroy]: plan STACK into a saved plan, then apply exactly that plan once
-# confirm agrees (under AUTO_APPROVE=1 confirm agrees outright, as the brief says). No changes:
-# nothing is asked or applied, so re-runs are quiet. A plan that destroys or replaces anything
-# lists those addresses first. --no-destroy is opt-in, for a stack that must never be recreated
-# unattended (up.sh base: k3s-cp). Under AUTO_APPROVE=1 it refuses such a plan (exit 2);
-# interactively it still asks. Declining exits 2. STACK must be initialised already (tf_init;
-# `terraform init` for bootstrap).
+# tf_apply STACK [--no-destroy | --destroy-only NAME...]: plan STACK into a saved plan, then apply
+# exactly that plan once confirm agrees (under AUTO_APPROVE=1 confirm agrees outright, as the brief
+# says). No changes: nothing is asked or applied, so re-runs are quiet. A plan that destroys or
+# replaces anything lists those addresses first.
+#
+# The two options are opt-in guards for plans that spec §3.1 has a human review (base; workers when
+# scaled by hand). Under AUTO_APPROVE=1 they refuse a plan (exit 2) that destroys or replaces
+# anything they do not allow; interactively the unexpected addresses are listed again and the
+# question is still asked.
+#   --no-destroy           allows no destroy at all. Callers: up.sh base (k3s-cp), up.sh workers and
+#                          an add-only cpu-pool.sh scale (a worker that left the inventory without
+#                          cpu-pool.sh was never drained).
+#   --destroy-only NAME... allows only addresses keyed ["NAME"] (for_each keys: a worker's instance,
+#                          address and per-worker rules). Callers: cpu-pool.sh scale-down and remove,
+#                          with exactly the workers they drained, so k3s-cpu-1 or any other worker is
+#                          never destroyed or replaced unattended.
+# Declining exits 2. STACK must be initialised already (tf_init; `terraform init` for bootstrap).
 tf_apply() {
-  local stack="$1" opt="${2:-}" dir plan rc=0 doomed
-  [[ -z "$opt" || "$opt" == --no-destroy ]] || die "tf_apply: unknown option $opt"
+  local stack="$1" opt="${2:-}" dir plan rc=0 doomed unexpected addr name ok
+  local -a allowed=()
+  case "$opt" in
+    "" | --no-destroy) (( $# <= 2 )) || die "tf_apply: unexpected arguments after $opt" ;;
+    --destroy-only)
+      (( $# >= 3 )) || die "tf_apply: --destroy-only needs at least one name"
+      allowed=("${@:3}") ;;
+    *) die "tf_apply: unknown option $opt" ;;
+  esac
   dir="$(tf_dir "$stack")" || exit
   tf_env
   run_dir || die "cannot create $RUN_DIR"
@@ -157,9 +174,23 @@ tf_apply() {
   if [[ -n "$doomed" ]]; then
     log "WARNING: this plan DESTROYS or REPLACES in the $stack stack:"
     log "$(printf '%s\n' "$doomed" | sed 's/^/  - /')"
-    if [[ "${AUTO_APPROVE:-}" == 1 && "$opt" == --no-destroy ]]; then
-      rm -f -- "$plan"
-      die "refusing to destroy or replace resources in $stack under AUTO_APPROVE=1; run it interactively to review" 2
+    if [[ -n "$opt" ]]; then
+      unexpected=""
+      while read -r addr; do
+        ok=0
+        for name in ${allowed[@]+"${allowed[@]}"}; do
+          [[ "$addr" == *"[\"$name\"]"* ]] && ok=1
+        done
+        (( ok )) || unexpected+="  - $addr"$'\n'
+      done <<< "$doomed"
+      if [[ -n "$unexpected" ]]; then
+        log "WARNING: of these, NOT expected by this command (${allowed[*]:-no destroys allowed}):"
+        log "${unexpected%$'\n'}"
+        if [[ "${AUTO_APPROVE:-}" == 1 ]]; then
+          rm -f -- "$plan"
+          die "refusing to destroy or replace unexpected resources in $stack under AUTO_APPROVE=1; run it interactively to review" 2
+        fi
+      fi
     fi
   fi
   if ! confirm "Apply this plan to the $stack stack?"; then
@@ -325,8 +356,11 @@ _gpu_ssh_opts() {
   [[ -n "${SSH_PRIVATE_KEY_PATH:-}" && -f "$SSH_PRIVATE_KEY_PATH" ]] \
     || die "SSH_PRIVATE_KEY_PATH in .env must name the Lambda SSH private key: '${SSH_PRIVATE_KEY_PATH:-}'" 2
   run_dir || die "cannot create $RUN_DIR"
+  # BatchMode: never a password or passphrase prompt. IdentitiesOnly: only this key, not every key an
+  # ssh-agent holds (those could use up the server's MaxAuthTries first).
   _GPU_SSH_OPTS=(-i "$SSH_PRIVATE_KEY_PATH" -o StrictHostKeyChecking=accept-new
-    -o "UserKnownHostsFile=$RUN_DIR/known_hosts_$1" -o ConnectTimeout=20 -o ServerAliveInterval=30)
+    -o "UserKnownHostsFile=$RUN_DIR/known_hosts_$1" -o ConnectTimeout=20 -o ServerAliveInterval=30
+    -o BatchMode=yes -o IdentitiesOnly=yes)
 }
 
 # gpu_ssh NAME CMD: run CMD on GPU node NAME as ubuntu over plain SSH (Lambda admits tcp/22 from
@@ -366,16 +400,37 @@ node_scp() {
   esac
 }
 
-# node_ready NAME: 0 when node NAME is Ready, 1 when it is not Ready or not registered. Any other
-# kubectl failure (the tunnel is down, another cluster) dies: it says nothing about the node.
-node_ready() {
-  local out rc=0
-  out="$(kc get node "$1" -o 'jsonpath={.status.conditions[?(@.type=="Ready")].status}' 2>&1)" || rc=$?
+# KC_REQUEST_TIMEOUT: the bound of one kubectl request (get, apply, label, delete) through the API
+# tunnel, so a half-stalled tunnel fails instead of hanging. Waits carry their own --timeout.
+KC_REQUEST_TIMEOUT=60s
+
+# node_state NAME: prints Ready, NotReady (registered, not Ready) or Absent (not registered). Any
+# other kubectl failure (the tunnel is down, another cluster) dies: it says nothing about the node.
+# Only stdout is the jsonpath value: kubectl can succeed and still print a warning or a discovery
+# error on stderr, which must not make a Ready node look NotReady.
+node_state() {
+  local out err errf rc=0
+  errf="$(mktemp)" || die "node_state: mktemp failed"
+  out="$(kc get node "$1" --request-timeout="$KC_REQUEST_TIMEOUT" \
+    -o 'jsonpath={.status.conditions[?(@.type=="Ready")].status}' 2> "$errf")" || rc=$?
+  err="$(cat -- "$errf")"
+  rm -f -- "$errf"
   if (( rc != 0 )); then
-    [[ "$out" == *"nodes \"$1\" not found"* ]] && return 1
-    die "cannot read node $1 from the cluster (is the API tunnel up? make tunnel): $out"
+    if [[ "$err" == *"nodes \"$1\" not found"* ]]; then
+      echo Absent
+      return 0
+    fi
+    die "cannot read node $1 from the cluster (is the API tunnel up? make tunnel): $err"
   fi
-  [[ "$out" == True ]]
+  if [[ "$out" == True ]]; then echo Ready; else echo NotReady; fi
+}
+
+# node_ready NAME: 0 when node NAME is Ready, 1 when it is not Ready or not registered; dies as
+# node_state does.
+node_ready() {
+  local state
+  state="$(node_state "$1")" || exit
+  [[ "$state" == Ready ]]
 }
 
 # _kc_node_gone_ok NAME ARGS...: kc ARGS, where "node NAME not found" counts as success (Review
@@ -400,7 +455,7 @@ drain_and_delete_node() {
   log "draining $1 and deleting it from the cluster"
   _kc_node_gone_ok "$1" drain "$1" --ignore-daemonsets --delete-emptydir-data --force --timeout=120s \
     || die "cannot drain $1"
-  _kc_node_gone_ok "$1" delete node "$1" || die "cannot delete node $1"
+  _kc_node_gone_ok "$1" delete node "$1" --request-timeout="$KC_REQUEST_TIMEOUT" || die "cannot delete node $1"
 }
 
 # worker_ip_lines: "NAME IP" for every CPU worker in `tf_out_json workers worker_ips`, in numeric
@@ -418,16 +473,39 @@ worker_ip_lines() {
   done <<< "$lines" | sort -t- -k3,3n
 }
 
-# join_workers: sync the peer allow-lists once, so every worker IP is in k3s-cp's k3s_peers set
-# before its agent connects (spec §5.2 step 1), then join-node.sh --skip-sync for every worker in
-# the workers stack. join-node.sh leaves a Ready worker alone, so this is safe to re-run.
+# join_workers --all | join_workers [NAME...]: join-node.sh --skip-sync for every worker in the
+# workers stack's worker_ips (up.sh workers), or only for the NAMEs (cpu-pool.sh scale: the workers
+# that have not joined yet; none is fine), in numeric order. Each NAME must be in worker_ips. When
+# any worker is to be joined, sync-peers runs once first, so its IP is in k3s-cp's k3s_peers set
+# before its agent connects (spec §5.2 step 1); sync-peers also runs last, every time (Task 14
+# brief: the up.sh workers stage, scale step 5). join-node.sh leaves a Ready worker alone, so this
+# is safe to re-run.
 join_workers() {
-  local lines name ip
+  local lines name ip line want
+  local -a join=()
   lines="$(worker_ip_lines)" || exit
+  if [[ "${1:-}" == --all ]]; then
+    while read -r line; do
+      [[ -n "$line" ]] && join+=("$line")
+    done <<< "$lines"
+  else
+    for want in "$@"; do
+      [[ "$want" =~ $CPU_NODE_RE ]] || die "not a CPU worker name: '$want'"
+      grep -q "^$want " <<< "$lines" || die "$want is not in the workers stack's worker_ips: it cannot be joined"
+    done
+    while read -r name ip; do
+      for want in "$@"; do
+        [[ "$name" == "$want" ]] && join+=("$name $ip")
+      done
+    done <<< "$lines"
+  fi
+  if (( ${#join[@]} )); then
+    "$REPO_ROOT/scripts/gpuctl" sync-peers || die "sync-peers failed"
+    for line in "${join[@]}"; do
+      read -r name ip <<< "$line"
+      "$REPO_ROOT/scripts/join-node.sh" --node "$name" --external-ip "$ip" --skip-sync < /dev/null \
+        || die "join-node.sh failed for $name"
+    done
+  fi
   "$REPO_ROOT/scripts/gpuctl" sync-peers || die "sync-peers failed"
-  while read -r name ip; do
-    [[ -n "$name" ]] || continue
-    "$REPO_ROOT/scripts/join-node.sh" --node "$name" --external-ip "$ip" --skip-sync < /dev/null \
-      || die "join-node.sh failed for $name"
-  done <<< "$lines"
 }

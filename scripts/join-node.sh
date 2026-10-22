@@ -1,6 +1,7 @@
 #!/usr/bin/env bash
 # Join one node to the cluster (spec §5.2): a GCP CPU worker (k3s-cpu-<n>, over IAP SSH) or a Lambda
-# GPU node (k3s-gpu-<pool>-<n>, over plain SSH as ubuntu). Safe to re-run: a Ready node is left alone.
+# GPU node (k3s-gpu-<pool>-<n>, over plain SSH as ubuntu). Safe to re-run: a Ready node is left alone,
+# and a node whose earlier join failed is bootstrapped and joined again (step 4).
 #
 #   join-node.sh --node NAME --external-ip IP [--gpu-type T] [--skip-sync] [--force]
 #
@@ -10,8 +11,10 @@
 #      did (scripts/gpuctl apply, or `make up`/cpu-pool.sh, which sync once for all their nodes).
 #   2. NAME already Ready: done (exit 0), unless --force.
 #   3. node/ into a fresh private /tmp/k3s-node on the node, then node-bootstrap.sh as root.
-#   4. A join token (TTL 15m) is created on k3s-cp and piped straight into the node's token-file;
-#      then k3s-agent starts. The token is never in a variable, an argument, a log or a local file.
+#   4. k3s-agent is stopped (a no-op on a first join), so that it starts from the new token: an agent
+#      left running by an earlier join holds that join's token, which is deleted. A join token (TTL
+#      15m) is created on k3s-cp and piped straight into the node's token-file; then k3s-agent
+#      starts. The token is never in a variable, an argument, a log or a local file.
 #   5. Wait (at most 300s) for the node to be Ready.
 #   6. Delete the join token on k3s-cp (by its DESCRIPTION, NAME), also when a later step fails.
 #   7. GPU node only: the admin-only label node-restriction.kubernetes.io/accelerator=nvidia, then
@@ -109,9 +112,14 @@ cp_resolve
 log "==> joining $NODE ($IP) to the cluster at $cp_ip"
 # A fresh private staging directory (NODE_STAGING_CMD, as up.sh base does on k3s-cp). Exit 255 is
 # ssh's own failure, not the remote check: it gets its own message.
+if [[ "$KIND" == gpu ]]; then
+  SSH_HINT="if this is a new instance under an old name, check its host key and remove $RUN_DIR/known_hosts_$NODE"
+else
+  SSH_HINT="a worker stopped with make cpu-stop needs make cpu-start first"
+fi
 node_ssh "$NODE" "$NODE_STAGING_CMD" < /dev/null || {
   rc=$?
-  [[ $rc == 255 ]] && die "SSH to $NODE failed while preparing $STAGING (exit 255); re-run the join"
+  [[ $rc == 255 ]] && die "SSH to $NODE failed while preparing $STAGING (exit 255); re-run the join ($SSH_HINT)"
   die "cannot create a private $STAGING on $NODE (it exists, is a symlink, or is owned by another user): remove it on the node and re-run the join"
 }
 node_scp "$NODE" "$REPO_ROOT"/node/* "$STAGING" < /dev/null
@@ -119,11 +127,13 @@ node_ssh "$NODE" "sudo bash $STAGING/node-bootstrap.sh --server-ip $cp_ip --node
 
 # ---- 4.-6. the join token: created, piped, deleted (also on failure) -------------------------------
 # On k3s-cp: the id of every token whose DESCRIPTION column is exactly NODE, deleted there, so the
-# token list never leaves k3s-cp. A list without a DESCRIPTION header fails rather than deleting
-# nothing quietly. NODE is a checked node name, so it is safe in the command line.
+# token list never leaves k3s-cp. Only the id (the part of the TOKEN column before any "."): a full
+# id.secret in `sudo k3s token delete`'s argv would land in k3s-cp's sudo log. A list without a
+# DESCRIPTION header fails rather than deleting nothing quietly. NODE is a checked node name, so it
+# is safe in the command line.
 TOKEN_DELETE="list=\$(sudo k3s token list) && ids=\$(printf '%s\\n' \"\$list\" | awk -v d=$NODE"
 TOKEN_DELETE+=" '!h { if (!NF) next; h = 1; for (i = 1; i <= NF; i++) if (\$i == \"DESCRIPTION\") c = i; next }"
-TOKEN_DELETE+=" c && \$c == d { print \$1 } END { if (h && !c) exit 1 }') && for id in \$ids;"
+TOKEN_DELETE+=" c && \$c == d { split(\$1, t, \".\"); print t[1] } END { if (h && !c) exit 1 }') && for id in \$ids;"
 TOKEN_DELETE+=" do sudo k3s token delete \"\$id\" || exit 1; done"
 
 TOKEN_PENDING=0
@@ -142,6 +152,13 @@ cleanup() {
 trap cleanup EXIT
 trap 'exit 130' INT
 trap 'exit 143' TERM
+
+# k3s-agent reads its token-file only when it starts. An agent still running from an earlier join
+# (one that timed out, or a --force re-join) keeps retrying with the token that join's cleanup has
+# already deleted, and `systemctl enable --now` below does not restart an active unit. So it is
+# stopped first, and starts from the new token (a no-op on a first join: the unit is inactive).
+node_ssh "$NODE" 'sudo systemctl stop k3s-agent' < /dev/null \
+  || die "cannot stop k3s-agent on $NODE before handing it a new join token"
 
 # Set before the pipeline: k3s-cp may have made a token even if the node never received it.
 TOKEN_PENDING=1
@@ -170,7 +187,8 @@ containerd_has_nvidia() {
 }
 
 if [[ "$KIND" == gpu ]]; then
-  kc label node "$NODE" node-restriction.kubernetes.io/accelerator=nvidia --overwrite
+  kc label node "$NODE" node-restriction.kubernetes.io/accelerator=nvidia --overwrite \
+    --request-timeout="$KC_REQUEST_TIMEOUT"
   if ! containerd_has_nvidia; then
     # k3s detects the nvidia runtime only when it starts (spec §6.2 step 2).
     log "containerd on $NODE has no nvidia runtime: restarting k3s-agent once"

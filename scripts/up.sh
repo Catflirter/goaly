@@ -4,7 +4,7 @@
 #   up.sh init       make init: the Terraform state bucket and the GCP APIs (infra/bootstrap, local state)
 #   up.sh base       the base stack, k3s on k3s-cp, kubeconfig, API tunnel; waits for k3s-cp and CoreDNS
 #   up.sh workers    the workers stack (CPU worker VMs and their firewall rules), sync-peers, then
-#                    join-node.sh for every worker (a Ready worker is left alone)
+#                    join-node.sh for every worker (a Ready worker is left alone), sync-peers last
 #   up.sh system     metrics-server, the nvidia-gpu RuntimeClass, the NVIDIA device plugin (Helm)
 #   up.sh workloads  k8s/nettest, k8s/hello and the gpu-test namespace; waits for their rollouts
 #   up.sh all        make up: the stages in ALL_STAGES below, in order. init is not one of them: spec
@@ -16,10 +16,11 @@
 # refused, so an unattended make up never recreates the control plane. A deliberate replacement of
 # k3s-cp (a change Terraform can only make by recreating it, such as a new zone) runs `make up`
 # interactively, where the plan's destroys are listed and confirmed. A plan without changes applies
-# nothing. The workers stage applies with --no-destroy too: make up only ever adds workers, and a
-# worker that left the inventory without `make cpu-remove` was never drained, so an unattended run
-# refuses to destroy it (interactively the destroy is listed and asked). Scaling down is
-# scripts/cpu-pool.sh's job: it drains and deletes the node before its apply.
+# nothing. The workers stage applies with --no-destroy too (spec §3.1: workers plans that scale by
+# hand are reviewed by a human): make up only ever adds workers, and a worker that left the
+# inventory without `make cpu-remove` was never drained, so an unattended run refuses to destroy it
+# (interactively the destroy is listed and asked). Scaling down is scripts/cpu-pool.sh's job: it
+# drains and deletes the node before its apply, which may destroy only the drained workers.
 set -euo pipefail
 
 # shellcheck disable=SC1091  # common.sh is linted on its own
@@ -84,7 +85,7 @@ stage_workers() {
   log "==> workers: CPU worker VMs and their firewall rules (infra/workers), sync-peers, join each worker"
   tf_init workers
   tf_apply workers --no-destroy
-  join_workers
+  join_workers --all
   log "workers: every CPU worker is joined and Ready"
 }
 
@@ -94,9 +95,10 @@ stage_system() {
   local sys="$REPO_ROOT/k8s/system"
   log "==> system: metrics-server, RuntimeClass nvidia-gpu, NVIDIA device plugin"
   kc apply -f "$sys/metrics-server.yaml" -f "$sys/nvidia-gpu-runtimeclass.yaml" \
-    -f "$sys/nvidia-device-plugin-namespace.yaml"
-  helm repo add nvdp https://nvidia.github.io/k8s-device-plugin
-  helm repo update nvdp
+    -f "$sys/nvidia-device-plugin-namespace.yaml" --request-timeout="$KC_REQUEST_TIMEOUT"
+  # helm repo add/update have no timeout of their own.
+  timeout 120 helm repo add nvdp https://nvidia.github.io/k8s-device-plugin
+  timeout 120 helm repo update nvdp
   helm --kubeconfig "$KUBECONFIG_FILE" upgrade -i nvdp nvdp/nvidia-device-plugin --namespace nvidia-device-plugin \
     --version 0.20.1 -f "$sys/nvdp-values.yaml" --wait --timeout 5m
   kc -n kube-system rollout status deployment/metrics-server --timeout="$ROLLOUT_TIMEOUT"
@@ -107,7 +109,8 @@ stage_system() {
 stage_workloads() {
   local k8s="$REPO_ROOT/k8s"
   log "==> workloads: nettest, hello, the gpu-test namespace"
-  kc apply -f "$k8s/nettest/" -f "$k8s/hello/" -f "$k8s/gpu-test/namespace.yaml"
+  kc apply -f "$k8s/nettest/" -f "$k8s/hello/" -f "$k8s/gpu-test/namespace.yaml" \
+    --request-timeout="$KC_REQUEST_TIMEOUT"
   kc -n nettest rollout status daemonset/echo --timeout="$ROLLOUT_TIMEOUT"
   kc -n nettest rollout status daemonset/probe --timeout="$ROLLOUT_TIMEOUT"
   kc -n hello rollout status deployment/hello --timeout="$ROLLOUT_TIMEOUT"

@@ -20,6 +20,8 @@ STAGING = "rm -rf /tmp/k3s-node && mkdir -m 0700 /tmp/k3s-node && [ ! -L /tmp/k3
 INSTALL = "sudo install -m 600 /dev/stdin /etc/rancher/k3s/token && sudo systemctl enable --now k3s-agent"
 CONTAINERD_GREP = "sudo grep -A3 nvidia /var/lib/rancher/k3s/agent/etc/containerd/config.toml"
 READY = 'jsonpath={.status.conditions[?(@.type=="Ready")].status}'
+RT = "--request-timeout=60s"
+STOP_AGENT = "sudo systemctl stop k3s-agent"
 GPU = "k3s-gpu-a6000-1"
 GPU_IP = "129.80.1.2"
 NODE_TOOLS = ("gcloud", "kubectl", "gpuctl", "helm", "ssh", "scp")
@@ -35,7 +37,7 @@ def token_delete(name):
     token list never leaves k3s-cp (test_token_delete_command_deletes_only_this_nodes_tokens runs it)."""
     return ("list=$(sudo k3s token list) && ids=$(printf '%s\\n' \"$list\" | awk -v d=" + name
             + " '!h { if (!NF) next; h = 1; for (i = 1; i <= NF; i++) if ($i == \"DESCRIPTION\") c = i; next }"
-            " c && $c == d { print $1 } END { if (h && !c) exit 1 }') && for id in $ids;"
+            " c && $c == d { split($1, t, \".\"); print t[1] } END { if (h && !c) exit 1 }') && for id in $ids;"
             " do sudo k3s token delete \"$id\" || exit 1; done")
 
 
@@ -46,6 +48,11 @@ def env(tmp_path):
 
 def kc(env, *args):
     return ("kubectl", ["--kubeconfig", str(env.kubeconfig), *args])
+
+
+def get_node(env, name):
+    """node_state's one kubectl call: the Ready condition of NAME, bounded by --request-timeout."""
+    return kc(env, "get", "node", name, RT, "-o", READY)
 
 
 def cp(command):
@@ -63,7 +70,7 @@ def node_files(env):
 def gpu_opts(env, name=GPU):
     return ["-i", str(env.ssh_key), "-o", "StrictHostKeyChecking=accept-new",
             "-o", f"UserKnownHostsFile={env.repo.resolve()}/.run/known_hosts_{name}",
-            "-o", "ConnectTimeout=20", "-o", "ServerAliveInterval=30"]
+            "-o", "ConnectTimeout=20", "-o", "ServerAliveInterval=30", "-o", "BatchMode=yes", "-o", "IdentitiesOnly=yes"]
 
 
 def gpu(env, command, name=GPU, ip=GPU_IP):
@@ -84,12 +91,13 @@ def cpu_join(env, name="k3s-cpu-1", ip="34.10.0.11", zone="us-central1-a", mtu="
     """The calls of a full join-node.sh for CPU worker NAME (spec §5.2, Task 14 brief steps 1-6)."""
     return [
         *([("gpuctl", ["sync-peers"])] if sync else []),
-        kc(env, "get", "node", name, "-o", READY),
+        get_node(env, name),
         worker(name, STAGING, zone),
         ("gcloud", ["compute", "scp", "--project", PROJECT, "--zone", zone, "--tunnel-through-iap", "--quiet",
                     "--recurse", "--scp-flag=-oConnectTimeout=20", *node_files(env), f"{name}:/tmp/k3s-node"]),
         worker(name, f"sudo bash /tmp/k3s-node/node-bootstrap.sh --server-ip 34.82.10.10 --node-name {name}"
                      f" --external-ip {ip} --underlay-mtu {mtu} --no-gpu", zone),
+        worker(name, STOP_AGENT, zone),
         cp(f"sudo k3s token create --ttl 15m --description {name}"),
         worker(name, INSTALL, zone),
         kc(env, "wait", "--for=condition=Ready", f"node/{name}", "--timeout=10s"),
@@ -99,16 +107,17 @@ def cpu_join(env, name="k3s-cpu-1", ip="34.10.0.11", zone="us-central1-a", mtu="
 
 def gpu_join(env):
     return [
-        kc(env, "get", "node", GPU, "-o", READY),
+        get_node(env, GPU),
         gpu(env, STAGING),
         ("scp", ["-r", *gpu_opts(env), *node_files(env), f"ubuntu@{GPU_IP}:/tmp/k3s-node"]),
         gpu(env, f"sudo bash /tmp/k3s-node/node-bootstrap.sh --server-ip 34.82.10.10 --node-name {GPU}"
                  f" --external-ip {GPU_IP} --underlay-mtu 1460 --gpu --gpu-type a6000"),
+        gpu(env, STOP_AGENT),
         cp(f"sudo k3s token create --ttl 15m --description {GPU}"),
         gpu(env, INSTALL),
         kc(env, "wait", "--for=condition=Ready", f"node/{GPU}", "--timeout=10s"),
         cp(token_delete(GPU)),
-        kc(env, "label", "node", GPU, "node-restriction.kubernetes.io/accelerator=nvidia", "--overwrite"),
+        kc(env, "label", "node", GPU, "node-restriction.kubernetes.io/accelerator=nvidia", "--overwrite", RT),
         gpu(env, CONTAINERD_GREP),
     ]
 
@@ -170,7 +179,7 @@ def test_join_of_a_ready_node_only_syncs_and_exits(env):
     env.scenario["ready"] = ["k3s-cpu-1"]
     proc = join(env, "--node", "k3s-cpu-1", "--external-ip", "34.10.0.11")
     assert proc.returncode == 0, proc.stderr
-    assert calls(env) == [("gpuctl", ["sync-peers"]), kc(env, "get", "node", "k3s-cpu-1", "-o", READY)]
+    assert calls(env) == [("gpuctl", ["sync-peers"]), get_node(env, "k3s-cpu-1")]
     assert piped(env) == []
 
 
@@ -210,7 +219,7 @@ def test_join_stops_when_the_api_cannot_be_reached(env):
     env.scenario["api_down"] = True
     proc = join(env, "--node", "k3s-cpu-1", "--external-ip", "34.10.0.11", "--skip-sync")
     assert proc.returncode == 1 and "make tunnel" in proc.stderr
-    assert calls(env) == [kc(env, "get", "node", "k3s-cpu-1", "-o", READY)]
+    assert calls(env) == [get_node(env, "k3s-cpu-1")]
 
 
 def test_join_reports_an_ssh_failure_while_staging(env):
@@ -219,8 +228,18 @@ def test_join_reports_an_ssh_failure_while_staging(env):
     proc = join(env, "--node", "k3s-cpu-1", "--external-ip", "34.10.0.11", "--skip-sync")
     assert proc.returncode == 1
     assert "SSH to k3s-cpu-1 failed while preparing /tmp/k3s-node (exit 255)" in proc.stderr
+    assert "make cpu-start" in proc.stderr, "a stopped worker has no SSH"
     assert "cannot create a private" not in proc.stderr
     assert calls(env)[-1] == worker("k3s-cpu-1", STAGING)
+
+
+def test_join_gpu_node_ssh_failure_names_the_stale_host_key_file(env):
+    """Lambda reuses IPs and names: a host key mismatch in .run/known_hosts_NAME is exit 255 too (X0-6)."""
+    env.scenario["ssh_fail"] = [STAGING]
+    env.scenario["ssh_fail_rc"] = 255
+    proc = join(env, "--node", GPU, "--external-ip", GPU_IP, "--gpu-type", "a6000", "--skip-sync")
+    assert proc.returncode == 1
+    assert f"known_hosts_{GPU}" in proc.stderr
 
 
 def test_join_stops_when_the_staging_directory_cannot_be_made_private(env):
@@ -246,6 +265,52 @@ def test_join_deletes_the_token_when_the_node_never_becomes_ready(env):
     assert proc.returncode == 1 and "k3s-cpu-1 not Ready" in proc.stderr
     assert calls(env)[-1] == cp(token_delete("k3s-cpu-1"))
     assert [c for c in calls(env) if c == cp(token_delete("k3s-cpu-1"))] == [cp(token_delete("k3s-cpu-1"))]
+
+
+def test_join_rerun_after_a_ready_timeout_restarts_the_agent_from_the_new_token(env):
+    """A join that timed out leaves k3s-agent running with a token its cleanup deleted; k3s reads the
+    token-file only at start and `enable --now` does not restart an active unit. The re-run stops
+    the agent before the new token goes in, so `enable --now` starts it from that token."""
+    env.scenario["never_ready"] = ["k3s-cpu-1"]
+    first = join(env, "--node", "k3s-cpu-1", "--external-ip", "34.10.0.11", JOIN_READY_TIMEOUT_S="0")
+    assert first.returncode == 1 and "k3s-cpu-1 not Ready" in first.stderr
+    env.log.unlink()
+    env.scenario["never_ready"] = []
+    env.scenario["registered"] = ["k3s-cpu-1"]  # it registered, but never became Ready
+    proc = join(env, "--node", "k3s-cpu-1", "--external-ip", "34.10.0.11")
+    assert proc.returncode == 0, proc.stderr
+    assert calls(env) == cpu_join(env)
+    seq = calls(env)
+    stop = seq.index(worker("k3s-cpu-1", STOP_AGENT))
+    assert stop < seq.index(cp("sudo k3s token create --ttl 15m --description k3s-cpu-1")) < seq.index(
+        worker("k3s-cpu-1", INSTALL))
+
+
+def test_join_force_restarts_the_agent_from_the_new_token(env):
+    env.scenario["ready"] = ["k3s-cpu-1"]
+    assert join(env, "--node", "k3s-cpu-1", "--external-ip", "34.10.0.11", "--force").returncode == 0
+    seq = calls(env)
+    assert seq.index(worker("k3s-cpu-1", STOP_AGENT)) < seq.index(worker("k3s-cpu-1", INSTALL))
+
+
+def test_join_stops_when_the_agent_cannot_be_stopped(env):
+    """No new token is created for an agent that would keep running with the old one."""
+    env.scenario["ssh_fail"] = [STOP_AGENT]
+    proc = join(env, "--node", "k3s-cpu-1", "--external-ip", "34.10.0.11", "--skip-sync")
+    assert proc.returncode == 1 and "cannot stop k3s-agent" in proc.stderr
+    assert calls(env) == cpu_join(env, sync=False)[:5] and piped(env) == []
+
+
+def test_join_of_a_ready_node_ignores_kubectl_noise_on_stderr(env):
+    """kubectl can succeed and still print a discovery error or a warning on stderr: only stdout is
+    the Ready condition, so a Ready node is still left alone (C0-2)."""
+    env.scenario["ready"] = ["k3s-cpu-1"]
+    env.scenario["kubectl_stderr"] = ("E1022 10:00:00.000000 memcache.go:265] couldn't get current server API group"
+                                      " list: the server is currently unable to handle the request")
+    proc = join(env, "--node", "k3s-cpu-1", "--external-ip", "34.10.0.11")
+    assert proc.returncode == 0, proc.stderr
+    assert calls(env) == [("gpuctl", ["sync-peers"]), get_node(env, "k3s-cpu-1")]
+    assert piped(env) == []
 
 
 def test_join_deletes_the_token_when_installing_it_fails(env):
@@ -286,7 +351,8 @@ else exit 1; fi
     run_env = {**os.environ, "PATH": f"{stubs}:{os.environ['PATH']}"}
     proc = subprocess.run(["bash", "-c", token_delete("k3s-cpu-1")], env=run_env, capture_output=True, text=True)
     assert proc.returncode == 0, proc.stderr
-    assert deleted.read_text().split() == ["abc123.0123456789abcdef", "jkl012"]
+    # Only the id part of an id.secret TOKEN column: the secret never reaches sudo's log (X0-4).
+    assert deleted.read_text().split() == ["abc123", "jkl012"]
     deleted.unlink()
     proc = subprocess.run(["bash", "-c", token_delete("k3s-cpu-2")], env=run_env, capture_output=True, text=True)
     assert proc.returncode == 0 and not deleted.exists(), "no token of that node: nothing to delete"
@@ -374,7 +440,7 @@ def test_join_gpu_node_refuses_an_ip_without_firewall_rules(env):
 def test_join_gpu_node_ready_is_left_alone(env):
     env.scenario["ready"] = [GPU]
     proc = gpuctl_join(env)
-    assert proc.returncode == 0 and calls(env) == [kc(env, "get", "node", GPU, "-o", READY)]
+    assert proc.returncode == 0 and calls(env) == [get_node(env, GPU)]
 
 
 def test_join_gpu_node_needs_the_ssh_key(env):
@@ -495,10 +561,11 @@ def test_scale_up_writes_applies_syncs_then_joins_the_new_worker(env):
     assert proc.returncode == 0, proc.stderr
     assert json.loads(env.tfvars.read_text()) == pool(["k3s-cpu-1", "k3s-cpu-2"])
     assert tf(env) == ["init", "plan", "show", "apply"]
-    # One sync-peers after the apply (the new IP is in the peer set before its agent connects), then
-    # join-node --skip-sync for every worker: k3s-cpu-1 is Ready and left alone.
-    assert calls(env) == [("gpuctl", ["sync-peers"]), kc(env, "get", "node", "k3s-cpu-1", "-o", READY),
-                          *cpu_join(env, "k3s-cpu-2", "34.10.0.12", sync=False)]
+    # After the apply: k3s-cpu-1 was in the pool and is registered, so it is not joined again (scale
+    # step 4: only workers that have not joined). One sync-peers before the join (the new IP is in the
+    # peer set before its agent connects), join-node --skip-sync for k3s-cpu-2, sync-peers last (step 5).
+    assert calls(env) == [get_node(env, "k3s-cpu-1"), ("gpuctl", ["sync-peers"]),
+                          *cpu_join(env, "k3s-cpu-2", "34.10.0.12", sync=False), ("gpuctl", ["sync-peers"])]
     assert index_of(env, lambda c: c["argv"][1:2] == ["apply"]) < index_of(env, lambda c: c["tool"] == "gpuctl")
     assert_token_only_piped(env, proc, ["k3s-cpu-2"])
     env.assert_no_lambda_key()
@@ -523,13 +590,99 @@ def test_scale_down_drains_and_deletes_before_the_apply(env):
     drains = [c for c in calls(env) if c[1][2:3] in (["drain"], ["delete"])]
     assert drains == [
         kc(env, "drain", "k3s-cpu-2", "--ignore-daemonsets", "--delete-emptydir-data", "--force", "--timeout=120s"),
-        kc(env, "delete", "node", "k3s-cpu-2"),
+        kc(env, "delete", "node", "k3s-cpu-2", RT),
         kc(env, "drain", "k3s-cpu-3", "--ignore-daemonsets", "--delete-emptydir-data", "--force", "--timeout=120s"),
-        kc(env, "delete", "node", "k3s-cpu-3")]
+        kc(env, "delete", "node", "k3s-cpu-3", RT)]
     last_delete = max(i for i, c in enumerate(env.calls()) if c["argv"][2:4] == ["delete", "node"])
     assert last_delete < index_of(env, lambda c: c["argv"][1:2] == ["plan"]), "drain before the VM goes"
     assert tf(env) == ["init", "plan", "show", "apply"]
-    assert calls(env)[-2:] == [("gpuctl", ["sync-peers"]), kc(env, "get", "node", "k3s-cpu-1", "-o", READY)]
+    assert calls(env)[-2:] == [get_node(env, "k3s-cpu-1"), ("gpuctl", ["sync-peers"])]
+
+
+DRAIN_ARGS = ("--ignore-daemonsets", "--delete-emptydir-data", "--force", "--timeout=120s")
+
+
+def worker_resources(name):
+    """The workers stack's per-worker resources (for_each over var.cpu_workers, keyed by name)."""
+    return [f'google_compute_instance.worker["{name}"]', f'google_compute_address.worker["{name}"]',
+            f'google_compute_firewall.worker_to_cp["{name}"]', f'google_compute_firewall.worker_mesh["{name}"]']
+
+
+def test_scale_down_rerun_after_a_declined_apply_drains_again(env):
+    """The drain prompt said yes, the apply prompt no: k3s-cpu-2's VM keeps running (its kubelet
+    re-registers the Node) while the file already says 1. The re-run takes the workers to remove from
+    what the stack has deployed, so it drains and deletes k3s-cpu-2 again before the destroy."""
+    set_pool(env, ["k3s-cpu-1", "k3s-cpu-2"])
+    set_workers(env, {"k3s-cpu-1": "34.10.0.11", "k3s-cpu-2": "34.10.0.12"})
+    env.scenario["deletes"] = {"workers": worker_resources("k3s-cpu-2")}
+    env.scenario["ready"] = ["k3s-cpu-1", "k3s-cpu-2"]
+    first = env.script("cpu-pool.sh", "scale", "1", stdin="y\nn\n")
+    assert first.returncode == 2 and "apply" not in tf(env)
+    assert json.loads(env.tfvars.read_text()) == pool(["k3s-cpu-1"])
+    env.log.unlink()
+    proc = env.script("cpu-pool.sh", "scale", "1", AUTO_APPROVE="1")
+    assert proc.returncode == 0, proc.stderr
+    assert [c for c in calls(env) if c[1][2:3] in (["drain"], ["delete"])] == [
+        kc(env, "drain", "k3s-cpu-2", *DRAIN_ARGS), kc(env, "delete", "node", "k3s-cpu-2", RT)]
+    last_delete = max(i for i, c in enumerate(env.calls()) if c["argv"][2:4] == ["delete", "node"])
+    assert last_delete < index_of(env, lambda c: c["argv"][1:2] == ["plan"])
+    assert tf(env)[-1] == "apply"
+
+
+def test_scale_down_refuses_a_plan_that_also_destroys_k3s_cpu_1(env):
+    """Under AUTO_APPROVE=1 the apply may destroy only the workers just drained (X0-1)."""
+    set_pool(env, ["k3s-cpu-1", "k3s-cpu-2"])
+    env.scenario["deletes"] = {"workers": [*worker_resources("k3s-cpu-2"),
+                                           'google_compute_instance.worker["k3s-cpu-1"]']}
+    proc = env.script("cpu-pool.sh", "scale", "1", AUTO_APPROVE="1")
+    assert proc.returncode == 2 and "apply" not in tf(env)
+    unexpected = proc.stderr.split("NOT expected", 1)[1]
+    assert 'google_compute_instance.worker["k3s-cpu-1"]' in unexpected
+    assert 'worker["k3s-cpu-2"]' not in unexpected
+    assert not (env.repo / ".run/workers.tfplan").exists()
+
+
+def test_scale_down_with_an_unexpected_destroy_still_asks_interactively(env):
+    set_pool(env, ["k3s-cpu-1", "k3s-cpu-2"])
+    env.scenario["deletes"] = {"workers": ['google_compute_instance.worker["k3s-cpu-1"]']}
+    env.scenario["ready"] = ["k3s-cpu-1"]
+    proc = env.script("cpu-pool.sh", "scale", "1", stdin="y\ny\n")
+    assert proc.returncode == 0, proc.stderr
+    assert "NOT expected" in proc.stderr and tf(env)[-1] == "apply"
+
+
+def test_scale_never_removes_k3s_cpu_1(env):
+    """An inventory edited by hand without k3s-cpu-1: the deployed k3s-cpu-1 would be removed; refused."""
+    set_pool(env, ["k3s-cpu-2", "k3s-cpu-3"])
+    proc = env.script("cpu-pool.sh", "scale", "2", AUTO_APPROVE="1")
+    assert proc.returncode == 2 and "k3s-cpu-1 is never removed" in proc.stderr
+    assert calls(env) == [] and "plan" not in tf(env)
+
+
+def test_scale_does_not_join_a_stopped_worker(env):
+    """Scale step 4 joins only workers that have not joined: k3s-cpu-2, stopped with make cpu-stop, is
+    registered but NotReady and has no SSH; it is left alone and the new k3s-cpu-3 is joined."""
+    set_pool(env, ["k3s-cpu-1", "k3s-cpu-2"])
+    set_workers(env, {"k3s-cpu-1": "34.10.0.11", "k3s-cpu-2": "34.10.0.12", "k3s-cpu-3": "34.10.0.13"})
+    env.scenario["ready"] = ["k3s-cpu-1"]
+    env.scenario["registered"] = ["k3s-cpu-2"]
+    proc = env.script("cpu-pool.sh", "scale", "3", AUTO_APPROVE="1")
+    assert proc.returncode == 0, proc.stderr
+    assert calls(env) == [get_node(env, "k3s-cpu-1"), get_node(env, "k3s-cpu-2"), ("gpuctl", ["sync-peers"]),
+                          *cpu_join(env, "k3s-cpu-3", "34.10.0.13", sync=False), ("gpuctl", ["sync-peers"])]
+    assert "k3s-cpu-2 is registered but NotReady" in proc.stderr
+
+
+def test_scale_joins_a_pool_worker_the_cluster_does_not_know(env):
+    """A worker in the pool whose earlier join never registered it is joined again."""
+    set_pool(env, ["k3s-cpu-1", "k3s-cpu-2"])
+    set_workers(env, {"k3s-cpu-1": "34.10.0.11", "k3s-cpu-2": "34.10.0.12"})
+    env.scenario["ready"] = ["k3s-cpu-1"]
+    env.scenario["plan_rc"] = {"workers": 0}
+    proc = env.script("cpu-pool.sh", "scale", "2")
+    assert proc.returncode == 0, proc.stderr
+    assert calls(env) == [get_node(env, "k3s-cpu-1"), get_node(env, "k3s-cpu-2"), ("gpuctl", ["sync-peers"]),
+                          *cpu_join(env, "k3s-cpu-2", "34.10.0.12", sync=False), ("gpuctl", ["sync-peers"])]
 
 
 def test_scale_down_declined_changes_nothing(env):
@@ -537,7 +690,8 @@ def test_scale_down_declined_changes_nothing(env):
     before = env.tfvars.read_text()
     proc = env.script("cpu-pool.sh", "scale", "1", stdin="n\n")
     assert proc.returncode == 2
-    assert env.tfvars.read_text() == before and env.calls() == []
+    # Only the read of what the workers stack has deployed (terraform init/output): nothing else.
+    assert env.tfvars.read_text() == before and calls(env) == [] and tf(env) == ["init"]
 
 
 def test_scale_down_of_a_node_already_gone_from_the_cluster_succeeds(env):
@@ -568,7 +722,7 @@ def test_scale_to_the_current_size_is_quiet(env):
     assert proc.returncode == 0, proc.stderr
     assert env.tfvars.read_text() == before and env.tfvars.stat().st_mtime_ns == mtime
     assert "apply" not in tf(env)
-    assert calls(env) == [("gpuctl", ["sync-peers"]), kc(env, "get", "node", "k3s-cpu-1", "-o", READY)]
+    assert calls(env) == [get_node(env, "k3s-cpu-1"), ("gpuctl", ["sync-peers"])]
 
 
 def test_scale_joins_workers_in_numeric_order(env):
@@ -597,11 +751,45 @@ def test_remove_drains_deletes_then_applies_and_syncs(env):
     assert json.loads(env.tfvars.read_text()) == pool(["k3s-cpu-1", "k3s-cpu-3"])
     assert calls(env) == [
         kc(env, "drain", "k3s-cpu-2", "--ignore-daemonsets", "--delete-emptydir-data", "--force", "--timeout=120s"),
-        kc(env, "delete", "node", "k3s-cpu-2"),
+        kc(env, "delete", "node", "k3s-cpu-2", RT),
         ("gpuctl", ["sync-peers"])]
     assert tf(env) == ["init", "plan", "show", "apply"]
     assert index_of(env, lambda c: c["argv"][2:4] == ["delete", "node"]) < index_of(
         env, lambda c: c["argv"][1:2] == ["plan"])
+
+
+def test_remove_applies_every_resource_of_the_removed_worker_unattended(env):
+    set_pool(env, ["k3s-cpu-1", "k3s-cpu-2"])
+    env.scenario["deletes"] = {"workers": worker_resources("k3s-cpu-2")}
+    proc = env.script("cpu-pool.sh", "remove", "k3s-cpu-2", AUTO_APPROVE="1")
+    assert proc.returncode == 0, proc.stderr
+    assert tf(env)[-1] == "apply" and "NOT expected" not in proc.stderr
+
+
+@pytest.mark.parametrize("other", ['google_compute_instance.worker["k3s-cpu-1"]',
+                                   'google_compute_address.worker["k3s-cpu-3"]',
+                                   'google_compute_firewall.worker_mesh["k3s-cpu-20"]',
+                                   "google_compute_firewall.cp_to_workers"])
+def test_remove_refuses_a_plan_that_destroys_anything_else_unattended(env, other):
+    """X0-1: only k3s-cpu-2's own resources may go; k3s-cpu-20 is not k3s-cpu-2 (whole key match)."""
+    set_pool(env, ["k3s-cpu-1", "k3s-cpu-2", "k3s-cpu-3"])
+    env.scenario["deletes"] = {"workers": [*worker_resources("k3s-cpu-2"), other]}
+    proc = env.script("cpu-pool.sh", "remove", "k3s-cpu-2", AUTO_APPROVE="1")
+    assert proc.returncode == 2 and "apply" not in tf(env)
+    assert other in proc.stderr.split("NOT expected", 1)[1]
+    assert not env.calls("gpuctl")
+
+
+def test_tf_apply_destroy_only_needs_a_name(env):
+    (env.repo / "infra/workers").mkdir(exist_ok=True)
+    proc = env.lib("load_env; tf_apply workers --destroy-only", AUTO_APPROVE="1")
+    assert proc.returncode != 0 and env.calls("terraform") == []
+
+
+def test_join_workers_refuses_a_name_without_an_ip(env):
+    proc = env.lib("load_env; join_workers k3s-cpu-9")
+    assert proc.returncode != 0 and "k3s-cpu-9 is not in" in proc.stderr
+    assert calls(env) == []
 
 
 def test_remove_twice_the_second_run_changes_nothing(env):
@@ -664,7 +852,8 @@ def test_up_workers_applies_syncs_and_joins_every_worker(env):
     proc = env.script("up.sh", "workers", AUTO_APPROVE="1")
     assert proc.returncode == 0, proc.stderr
     assert tf(env) == ["init", "plan", "show", "apply"]
-    assert calls(env) == cpu_join(env)
+    # sync-peers before the joins (spec §5.2 step 1) and last (Task 14 brief, up.sh workers stage).
+    assert calls(env) == [*cpu_join(env), ("gpuctl", ["sync-peers"])]
     assert_token_only_piped(env, proc, ["k3s-cpu-1"])
     env.assert_no_lambda_key()
 
@@ -675,7 +864,7 @@ def test_up_workers_rerun_is_quiet(env):
     proc = env.script("up.sh", "workers")
     assert proc.returncode == 0, proc.stderr
     assert "apply" not in tf(env)
-    assert calls(env) == [("gpuctl", ["sync-peers"]), kc(env, "get", "node", "k3s-cpu-1", "-o", READY)]
+    assert calls(env) == [("gpuctl", ["sync-peers"]), get_node(env, "k3s-cpu-1"), ("gpuctl", ["sync-peers"])]
 
 
 def test_up_workers_never_destroys_a_worker_under_auto_approve(env):
@@ -689,7 +878,7 @@ def system_sequence(env):
     sys_dir = env.repo.resolve() / "k8s/system"
     return [
         kc(env, "apply", "-f", f"{sys_dir}/metrics-server.yaml", "-f", f"{sys_dir}/nvidia-gpu-runtimeclass.yaml",
-           "-f", f"{sys_dir}/nvidia-device-plugin-namespace.yaml"),
+           "-f", f"{sys_dir}/nvidia-device-plugin-namespace.yaml", RT),
         ("helm", ["repo", "add", "nvdp", "https://nvidia.github.io/k8s-device-plugin"]),
         ("helm", ["repo", "update", "nvdp"]),
         ("helm", ["--kubeconfig", str(env.kubeconfig), "upgrade", "-i", "nvdp", "nvdp/nvidia-device-plugin",
@@ -702,7 +891,7 @@ def system_sequence(env):
 def workloads_sequence(env):
     k8s = env.repo.resolve() / "k8s"
     return [
-        kc(env, "apply", "-f", f"{k8s}/nettest/", "-f", f"{k8s}/hello/", "-f", f"{k8s}/gpu-test/namespace.yaml"),
+        kc(env, "apply", "-f", f"{k8s}/nettest/", "-f", f"{k8s}/hello/", "-f", f"{k8s}/gpu-test/namespace.yaml", RT),
         kc(env, "-n", "nettest", "rollout", "status", "daemonset/echo", "--timeout=300s"),
         kc(env, "-n", "nettest", "rollout", "status", "daemonset/probe", "--timeout=300s"),
         kc(env, "-n", "hello", "rollout", "status", "deployment/hello", "--timeout=300s"),
@@ -715,6 +904,13 @@ def test_up_system_applies_the_manifests_and_the_device_plugin(env):
     assert calls(env) == system_sequence(env)
     assert env.calls("terraform") == []
     env.assert_no_lambda_key()
+
+
+def test_up_system_bounds_the_helm_repo_commands():
+    """helm repo add/update have no timeout of their own (X0-5); upgrade has --wait --timeout 5m."""
+    text = (ROOT / "scripts/up.sh").read_text()
+    assert "timeout 120 helm repo add nvdp https://nvidia.github.io/k8s-device-plugin\n" in text
+    assert "timeout 120 helm repo update nvdp\n" in text
 
 
 def test_up_system_stops_when_helm_fails(env):
@@ -737,7 +933,8 @@ def test_up_all_runs_base_workers_system_workloads_in_order(env):
     assert chdirs == [f"-chdir={env.repo.resolve()}/infra/base", f"-chdir={env.repo.resolve()}/infra/workers"]
     non_tf(env)  # its checks: one tunnel, started after the kubeconfig fetch and probed before the first wait
     everything = [c for c in calls(env) if c[1][2:] != READYZ and "-N" not in c[1]]
-    assert everything == [*base_sequence(env), *cpu_join(env), *system_sequence(env), *workloads_sequence(env)]
+    assert everything == [*base_sequence(env), *cpu_join(env), ("gpuctl", ["sync-peers"]), *system_sequence(env),
+                          *workloads_sequence(env)]
     assert env.kubeconfig.read_text() == KUBECONFIG
 
 
