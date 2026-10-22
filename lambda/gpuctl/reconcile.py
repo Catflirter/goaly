@@ -132,6 +132,7 @@ class Reconciler:
         # without a drain), or why an existing cluster cannot be drained now (later nodes are refused at once).
         self._gone: str | None = None
         self._refusal: str | None = None
+        self._cluster_checked = False  # _check_cluster ran in this apply or down (D-2)
 
     def _emit(self, line: str = "") -> None:
         # Flushed (L21-4: a piped stdout, make gpu-apply | tee, shows each line as it happens) and best effort: a
@@ -372,6 +373,7 @@ class Reconciler:
         self._command = command
         self._no_drain = no_drain
         self._gone = self._refusal = None
+        self._cluster_checked = False
         # 1. plan and limits: nothing has changed yet
         instances = self.client.list_instances()
         types = self.client.instance_types()
@@ -443,18 +445,91 @@ class Reconciler:
                            "deletes it, NotReady, before the next node of that name joins)")
         return gone, attempted, failures
 
+    def _how_to_go_on(self, fix: str) -> str:
+        """What the operator does after a refused drain: FIX and re-run, or (gpu-down only) --no-drain."""
+        if self._command != "down":
+            return f"{fix} and re-run make gpu-{self._command}"
+        return (f"{fix} and re-run make gpu-down, or pass --no-drain (scripts/gpuctl down --no-drain) to terminate "
+                "it anyway")
+
+    def _not_this_cluster(self, problem: str) -> str:
+        """A refusal for a cluster that is not, or may not be, this project's (D-2)."""
+        return (f"{problem}; gpuctl {self._command} never drains or deletes a node in another cluster, and does not "
+                "terminate a node it could not drain: "
+                + self._how_to_go_on("point the API tunnel at this project's k3s-cp (stop any other tunnel on "
+                                     "127.0.0.1:6443, then make tunnel)"))
+
+    def _unreachable(self, reason: str) -> str:
+        """The refusal for an API server that does not answer while the cluster may still exist (review F3-1)."""
+        return (f"{reason}, but the cluster may still exist (the kubeconfig is there and infra/base was not found "
+                f"destroyed), so gpuctl {self._command} does not terminate a node it could not drain: "
+                + self._how_to_go_on("start make tunnel"))
+
+    def _check_cluster(self) -> None:
+        """Before the first drain or node delete of this apply or down (D-2): is the cluster the kubeconfig reaches
+        this project's? The kubeconfig and the tunnel port are one per operator, not one per project, so it may be
+        another one. Checked as scripts/down.sh same_cluster does: Node k3s-cp's ExternalIP is infra/base's cp_ip.
+
+        Sets self._gone when the cluster is known to be gone (Ruling R54: no kubeconfig, or infra/base has no
+        cluster outputs; gpu-down then terminates without draining, never touching whatever cluster the kubeconfig
+        still reaches), or self._refusal when it is not, or may not be, this project's (handled like an API server
+        that does not answer: no drain, no node delete and no undrained terminate in this run). Neither when the
+        IPs match."""
+        self._cluster_checked = True
+        gone = self.infra.kubeconfig_missing()
+        base: Mapping = {}
+        if gone is None:
+            try:
+                base = self._read_base()
+            except (CommandError, ValueError, OSError) as e:  # not knowing is not "gone"
+                self._refusal = self._not_this_cluster(
+                    f"cannot read infra/base outputs ({e}), so nothing tells whether the cluster the kubeconfig "
+                    "reaches is this project's")
+                return
+            if self._base_destroyed(base):
+                gone = "infra/base has no cluster outputs (cp_ip, cp_internal_ip): the cluster was destroyed"
+        if gone is not None:
+            if self._command == "down":
+                self._gone = gone
+                self._warn(f"WARNING: {gone}. gpu-down terminates the gpuctl-owned instances without draining them, "
+                           "so they stop billing, and drains nothing through the kubeconfig (Ruling R54)")
+            else:
+                self._refusal = f"{gone}, so gpuctl {self._command} cannot drain a node: apply the base stack first"
+            return
+        cp_ip = base.get("cp_ip")
+        if not cp_ip:  # cp_internal_ip without cp_ip: a broken base stack, not a destroyed one
+            self._refusal = self._not_this_cluster("infra/base has no cp_ip output to check the cluster against")
+            return
+        try:
+            node_ip = self.infra.cp_external_ip()
+        except CommandError as read_error:
+            try:
+                reason = self.infra.api_unreachable()
+            except (CommandError, ValueError, OSError) as e:
+                reason, read_error = None, f"{read_error}; the cluster could not be probed either: {e}"
+            self._refusal = self._unreachable(reason) if reason is not None else self._not_this_cluster(
+                f"cannot read Node k3s-cp's ExternalIP ({read_error})")
+            return
+        if node_ip != cp_ip:
+            self._refusal = self._not_this_cluster(
+                f"the cluster the kubeconfig reaches is not this project's: Node k3s-cp has ExternalIP "
+                f"{node_ip or 'none'}, infra/base's cp_ip is {cp_ip}")
+
     def _drain(self, name: str) -> bool:
         """Drain and delete the node of an instance about to be terminated: True when done, False when gpu-down goes
         on without it (--no-drain, or the cluster is known to be gone: Ruling R54). Raises when the drain failed in
         gpu-apply, or in a cluster that still exists (its API server refused the drain, or does not answer, as when
-        `make tunnel` is not running: review F3-1): that instance is then not terminated."""
+        `make tunnel` is not running: review F3-1), or when the cluster the kubeconfig reaches is not this
+        project's (D-2): that instance is then not terminated."""
         if self._no_drain:
             self._warn(f"WARNING: --no-drain: terminating {name} without draining it or deleting its node")
             return False
-        if self._gone is not None:  # found out on an earlier node of this gpu-down: no second wait
+        if not self._cluster_checked:
+            self._check_cluster()
+        if self._gone is not None:  # found out before the first drain, or on an earlier node: no second wait
             self._warn(f"WARNING: terminating {name} without draining it: {self._gone}")
             return False
-        if self._refusal is not None:  # an earlier node's drain found the API server silent: no second wait
+        if self._refusal is not None:  # another cluster, or an earlier node found the API server silent
             raise CommandError(["kubectl", "drain", name], 1, f"not drained: {self._refusal}")
         try:
             self.infra.drain_and_delete_node(name)
@@ -481,12 +556,19 @@ class Reconciler:
             # Exactly what a destroyed cluster looks like to kubectl, but nothing says this one was destroyed (the
             # kubeconfig is there, infra/base was not found empty): terminating undrained would leave the Node object
             # and k3s's node-password secret for the next instance of this name (review F3-1, Ruling R54).
-            self._refusal = (f"{reason}, but the cluster may still exist (the kubeconfig is there and infra/base "
-                             "was not found destroyed), so gpu-down does not terminate a node it could not drain: "
-                             "start make tunnel and re-run make gpu-down, or pass --no-drain (scripts/gpuctl down "
-                             "--no-drain) to terminate it anyway")
+            self._refusal = self._unreachable(reason)
             raise CommandError(drain_error.args, drain_error.returncode,
                                f"{drain_error.stderr.strip()}; {self._refusal}") from None
+
+    def _delete_node(self, name: str) -> None:
+        """The cleanup's node delete (step 9), only in this project's cluster (D-2): raises CommandError instead
+        when the cluster the kubeconfig reaches is gone, or is not (or may not be) this project's."""
+        if not self._cluster_checked:
+            self._check_cluster()
+        reason = self._refusal or self._gone
+        if reason is not None:
+            raise CommandError(["kubectl", "delete", "node", name], 1, f"not deleted: {reason}")
+        self.infra.drain_and_delete_node(name)
 
     def _delete_failed(self, spec: Spec, gone: set[str], attempted: set[str], failures: list[str]) -> int:
         """A delete failed: launch nothing, but drop the IPs of the instances that were terminated from every
@@ -702,7 +784,7 @@ class Reconciler:
                     break
             steps = [("forget host key", lambda: self.infra.forget_host_key(name))]
             if interrupted is None:
-                steps.insert(0, ("delete node", lambda: self.infra.drain_and_delete_node(name)))
+                steps.insert(0, ("delete node", lambda: self._delete_node(name)))
             for what, step in steps:
                 try:
                     step()

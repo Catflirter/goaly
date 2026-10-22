@@ -62,13 +62,14 @@ def test_down_terminates_an_owned_instance_when_there_is_no_kubeconfig(capsys):
     assert "kubectl --kubeconfig ~/.kube/hybrid-gpu.yaml delete node k3s-gpu-a6000-1" in err
 
 
-def test_down_drains_a_gone_cluster_once_for_all_nodes():
+def test_down_drains_no_node_of_a_gone_cluster():
     fake, infra = FakeLambda(types=TYPES, instances=two_nodes()), FakeInfra()
     drains = failing_drain(infra)
     infra.no_kubeconfig = NO_KUBECONFIG
     assert make_rec(fake, infra).down(SPEC, auto_approve=True) == 0
     assert sorted(fake.terminated) == ["id-k3s-gpu-a6000-1", "id-k3s-gpu-a6000-2"]
-    assert len(drains) == 1  # the second node is not drained (and waited for) again
+    # Known gone before the first drain (D-2: checked first), so no node is drained or waited for at all
+    assert drains == []
 
 
 def test_down_unreachable_never_touches_a_foreign_instance():
@@ -175,7 +176,8 @@ def test_down_after_make_down_terminates_the_orphan_and_rewrites_the_lambda_rule
     fake, infra = gone_account(inst()), FakeInfra(outputs=GONE_OUTPUTS)
     drains = failing_drain(infra)
     assert main(["down", "--auto-approve"], env=ENV, client=fake, infra=infra) == 0
-    assert drains == ["k3s-gpu-a6000-1"] and fake.terminated == ["id-k3s-gpu-a6000-1"]
+    # D-2: the gone cluster is found before any drain, so nothing is drained through the leftover kubeconfig
+    assert drains == [] and fake.terminated == ["id-k3s-gpu-a6000-1"]
     assert infra.probes == 0
     assert infra.applied_gpu_ips == [[]]
     assert "nft" not in infra.events and infra.ssh_calls == []
@@ -282,3 +284,4 @@ def test_cli_down_no_drain_help_states_when_gpu_down_terminates_undrained(capsys
     assert "already does this when the API server does not answer" not in text
     assert "no kubeconfig" in text and "infra/base has no cluster outputs" in text
     assert "make tunnel" in text and "abandon" in text
+    assert "another cluster" in text  # D-2: a kubeconfig that reaches another project's cluster is refused too

@@ -585,6 +585,32 @@ def test_api_unreachable_raises_when_kubectl_cannot_run(tmp_path):
         Infra(sh, ROOT, kubeconfig(tmp_path)).api_unreachable()
 
 
+# --- cp_external_ip: is the cluster the kubeconfig reaches this project's? (minors 2b, D-2) ------
+
+CP_EXTERNAL_IP_QUERY = 'jsonpath={.status.addresses[?(@.type=="ExternalIP")].address}'
+
+
+def test_cp_external_ip_reads_node_k3s_cp_bounded():
+    """The same read as scripts/down.sh same_cluster, bounded like the /readyz probe."""
+    sh = FakeShell([ok("34.82.10.10")])
+    assert Infra(sh, ROOT, {"HOME": "/h"}).cp_external_ip() == "34.82.10.10"
+    [call] = sh.calls
+    assert call.args == ["kubectl", "--kubeconfig", "/h/.kube/hybrid-gpu.yaml", "get", "node", "k3s-cp", "-o",
+                         CP_EXTERNAL_IP_QUERY, "--request-timeout=15s"]
+    assert call.timeout == 30
+
+
+@pytest.mark.parametrize("stdout", ["", "  \n"])
+def test_cp_external_ip_is_none_when_node_k3s_cp_reports_none(stdout):
+    assert Infra(FakeShell([ok(stdout)]), ROOT, {"HOME": "/h"}).cp_external_ip() is None
+
+
+def test_cp_external_ip_raises_when_the_read_fails():
+    sh = FakeShell([fail(1, 'Error from server (NotFound): nodes "k3s-cp" not found')])
+    with pytest.raises(CommandError, match='nodes "k3s-cp" not found'):
+        Infra(sh, ROOT, {"HOME": "/h"}).cp_external_ip()
+
+
 # --- join-node, host keys, operator IP, cp guard ------------------------------------------------
 
 def test_join_node_runs_the_script_and_raises_on_failure():

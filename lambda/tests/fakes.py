@@ -238,6 +238,8 @@ class FakeShell:
         return result
 
 
+_BASE_CP_IP = object()  # FakeInfra.cp_node_ip's default: Node k3s-cp reports the base stack's cp_ip
+
 DEFAULT_OUTPUTS = {
     "base": {"cp_ip": "34.82.10.10", "cp_internal_ip": "10.10.0.2", "cp_zone": "us-west1-b", "cp_name": "k3s-cp"},
     "workers": {"worker_ips": {"k3s-cpu-1": "34.29.20.20"}},
@@ -255,6 +257,7 @@ class FakeInfra:
     "ssh:<command>" for any other cp_ssh, "join:<name>:<type>". Arguments are validated and normalised exactly
     like Infra (shared helpers in gpuctl.infra): apply_gpu_access records normalise_gpu_ips() and check_max_nodes(),
     join_node runs check_join_args(), detect_operator_ip validates env["OPERATOR_IP"] (there is no network fallback).
+    cp_external_ip answers `cp_node_ip` (default: outputs["base"]["cp_ip"], this project's own cluster).
     """
 
     def __init__(self, *, outputs: Mapping[str, Mapping] | None = None, env: Mapping[str, str] | None = None,
@@ -280,6 +283,10 @@ class FakeInfra:
         self.unreachable: str | None = None  # what api_unreachable returns (None: the API server answers)
         self.probes = 0
         self.no_kubeconfig: str | None = None  # what kubeconfig_missing returns (None: the kubeconfig is there)
+        # What cp_external_ip returns (an exception is raised); unset: the base stack's cp_ip, as in this
+        # project's own cluster. identity_reads counts the calls.
+        self.cp_node_ip: str | None | Exception = _BASE_CP_IP
+        self.identity_reads = 0
 
     def ensure_init(self, stack: str) -> None:
         if stack in self.missing:
@@ -315,6 +322,14 @@ class FakeInfra:
 
     def kubeconfig_missing(self) -> str | None:
         return self.no_kubeconfig
+
+    def cp_external_ip(self) -> str | None:
+        self.identity_reads += 1
+        if isinstance(self.cp_node_ip, Exception):
+            raise self.cp_node_ip
+        if self.cp_node_ip is _BASE_CP_IP:
+            return self.outputs.get("base", {}).get("cp_ip")
+        return self.cp_node_ip
 
     def cluster_gpu_nodes(self) -> dict[str, str | None]:
         return dict(self.cluster_nodes)
