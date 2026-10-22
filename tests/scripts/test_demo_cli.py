@@ -646,15 +646,16 @@ def test_chapter_6_plans_scales_up_in_the_background_back_down_and_previews_gpus
     gpuctl_ok(denv)
     terraform_plans(denv)
     denv.scenario["ready"] = ["k3s-cpu-2"]
-    # Like the real watch, it prints the nodes at once and keeps running until it is stopped.
-    denv.scenario["answers"].insert(0, {"tool": "kubectl", "has": ["get nodes -w"], "sleep": 60,
+    # Like the real watch, it prints the nodes and keeps running until it is stopped. It is slow to start (2 s before
+    # its first line), so the scale stub, which ends at once, has always ended before the watch has printed anything.
+    denv.scenario["answers"].insert(0, {"tool": "kubectl", "has": ["get nodes -w"], "delay": 2, "sleep": 60,
                                         "stdout": "NAME        STATUS     ROLES\nk3s-cpu-2   NotReady   <none>\n"})
     started = time.monotonic()
     r = run_demo(denv, "6")
     assert r.returncode == 0, (r.stdout, r.stderr)
     assert time.monotonic() - started < 30, "the watch was stopped, not left to end by itself"
-    # F25-1: the scale stub ends at once, yet the watch has started (its first lines are on the screen) before it is
-    # stopped: the step waits for its first line.
+    # F25-1: the scale stub has ended before the watch prints, yet the watch's first lines are on the screen before it
+    # is stopped: the step waits (at most 5 s) for its first line. Without that wait this assertion fails.
     assert "k3s-cpu-2   NotReady   <none>" in r.stdout
     # The plan of the inventory scaled to 2, before anything is scaled.
     plans = [a for a in tf_calls(denv) if a[1] == "plan"]
