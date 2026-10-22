@@ -491,6 +491,63 @@ def test_this_node_not_found_is_tolerated_by_both_steps():
     assert [c.args[3] for c in sh.calls] == ["drain", "delete"]
 
 
+# --- api_unreachable: may gpu-down terminate a node it could not drain? (review F2-3 / G-1) --------
+
+def kubeconfig(tmp_path):
+    path = tmp_path / "hybrid-gpu.yaml"
+    path.write_text("apiVersion: v1\n")
+    return {"KUBECONFIG": str(path)}
+
+
+def test_api_unreachable_without_a_kubeconfig_runs_nothing():
+    sh = FakeShell([])
+    reason = Infra(sh, ROOT, {"HOME": "/h"}).api_unreachable()
+    assert reason == "no kubeconfig at /h/.kube/hybrid-gpu.yaml" and sh.calls == []
+
+
+def test_api_unreachable_asks_the_api_server_bounded(tmp_path):
+    env = kubeconfig(tmp_path)
+    sh = FakeShell([ok("ok")])
+    assert Infra(sh, ROOT, env).api_unreachable() is None
+    [call] = sh.calls
+    assert call.args == ["kubectl", "--kubeconfig", env["KUBECONFIG"], "get", "--raw=/readyz",
+                         "--request-timeout=15s"]
+    assert call.timeout == 30 and call.check is False
+
+
+@pytest.mark.parametrize("stderr", [
+    "The connection to the server 127.0.0.1:6443 was refused - did you specify the right host or port?",
+    'Unable to connect to the server: dial tcp 127.0.0.1:6443: connect: connection refused',
+    "Unable to connect to the server: net/http: TLS handshake timeout",
+    'Get "https://127.0.0.1:6443/readyz?timeout=15s": dial tcp 127.0.0.1:6443: i/o timeout',
+    "Unable to connect to the server: net/http: request canceled (Client.Timeout exceeded while awaiting headers)",
+])
+def test_api_unreachable_when_nothing_answers(tmp_path, stderr):
+    reason = Infra(FakeShell([fail(1, stderr)]), ROOT, kubeconfig(tmp_path)).api_unreachable()
+    assert reason is not None and "API server" in reason and stderr[:30] in reason
+
+
+def test_api_unreachable_when_kubectl_hangs(tmp_path):
+    sh = FakeShell([CommandError(["kubectl"], -1, "timed out after 30s")])
+    assert "did not answer within 30s" in Infra(sh, ROOT, kubeconfig(tmp_path)).api_unreachable()
+
+
+@pytest.mark.parametrize("stderr", [
+    "Error from server (Forbidden): forbidden: User \"x\" cannot get path \"/readyz\"",
+    "Error from server (InternalError): an error on the server (\"[-]etcd failed\") has prevented the request",
+    "error: You must be logged in to the server (Unauthorized)",
+])
+def test_an_api_server_that_answers_is_reachable(tmp_path, stderr):
+    """An answer, even an error, means a cluster is there: gpu-down must not terminate an undrained node of it."""
+    assert Infra(FakeShell([fail(1, stderr)]), ROOT, kubeconfig(tmp_path)).api_unreachable() is None
+
+
+def test_api_unreachable_raises_when_kubectl_cannot_run(tmp_path):
+    sh = FakeShell([CommandError(["kubectl"], 127, "kubectl: command not found")])
+    with pytest.raises(CommandError):
+        Infra(sh, ROOT, kubeconfig(tmp_path)).api_unreachable()
+
+
 # --- join-node, host keys, operator IP, cp guard ------------------------------------------------
 
 def test_join_node_runs_the_script_and_raises_on_failure():

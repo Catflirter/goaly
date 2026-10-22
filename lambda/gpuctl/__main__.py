@@ -239,7 +239,7 @@ def _apply(args: argparse.Namespace, spec: Spec, client, infra, env: Mapping[str
     reconciler = _reconciler(args, client, infra, env, out)
     try:
         if args.command == "down":
-            return reconciler.down(spec, auto_approve=args.auto_approve)
+            return reconciler.down(spec, auto_approve=args.auto_approve, no_drain=args.no_drain)
         return reconciler.apply(spec, auto_approve=args.auto_approve, keep_on_failure=args.keep_on_failure)
     except (ReconcileError, CommandError, ValueError, OSError) as e:
         raise _Failed(f"{args.command}: {e}") from None
@@ -261,6 +261,9 @@ def _parser() -> argparse.ArgumentParser:
                        help="keep new nodes that failed to come up (they keep billing) instead of terminating them")
     down = sub.add_parser("down", help="remove the autoscaler overrides and delete every GPU node")
     down.add_argument("--auto-approve", action="store_true", help="do not ask for confirmation")
+    down.add_argument("--no-drain", action="store_true",
+                      help="terminate the GPU instances without draining or deleting their nodes (a cluster that "
+                           "is gone or broken; gpu-down already does this when the API server does not answer)")
     sub.add_parser("status", help="GPU capacity, this cluster's GPU instances and a drift check (exit 3 on drift)")
     sub.add_parser("rules", help="Lambda global firewall rules and the k3s-gpu-<region> rulesets")
     sub.add_parser("list-nodes", help="one line per GPU node: <name> <ip|-> <status> <type> <region>")

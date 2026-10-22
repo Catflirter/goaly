@@ -52,6 +52,16 @@ _STDERR_TAIL = 2000
 # finish (join-node.sh deletes its join token on the way out) once the reader stops before it is killed.
 STREAM_TAIL_LINES = 40
 STREAM_STOP_TIMEOUT_S = 60.0
+# api_unreachable's probe (review F2-3): kubectl's own bound for the request, and the process's, so a half-open
+# tunnel cannot hang gpu-down.
+API_PROBE_REQUEST_TIMEOUT_S = 15
+API_PROBE_TIMEOUT_S = 30
+# kubectl's words for "no API server answered": the connection was refused, reset or timed out, the name did not
+# resolve, TLS never completed. An HTTP error (Forbidden, Unauthorized, InternalError) is an answer.
+_API_UNREACHABLE_RE = re.compile(
+    r"Unable to connect to the server|The connection to the server \S+ was refused|connection refused"
+    r"|connection reset by peer|no route to host|network is unreachable|no such host|i/o timeout"
+    r"|TLS handshake timeout|Client\.Timeout exceeded")
 
 
 class CommandError(Exception):
@@ -391,6 +401,29 @@ class Infra:
         gone = re.compile(rf'\bnodes? "{re.escape(name)}" not found')
         if result.returncode != 0 and not gone.search(result.stderr):
             raise CommandError(result.args, result.returncode, result.stderr)
+
+    def api_unreachable(self) -> str | None:
+        """Why the cluster's API server provably cannot be reached, or None when it answers (review F2-3, G-1).
+
+        gpu-down terminates an owned instance it could not drain only when this says why: there is no kubeconfig
+        (make down removed it with the cluster), or GET /readyz got no answer at all (refused, timed out, no
+        route). Any answer, an HTTP error included, means a cluster is there, so None. A kubectl that cannot run
+        raises CommandError: that proves nothing about the cluster.
+        """
+        config = Path(self._kubeconfig())
+        if not config.is_file():
+            return f"no kubeconfig at {config}"
+        try:
+            result = self.shell.run(["kubectl", "--kubeconfig", str(config), "get", "--raw=/readyz",
+                                     f"--request-timeout={API_PROBE_REQUEST_TIMEOUT_S}s"],
+                                    check=False, timeout=API_PROBE_TIMEOUT_S, env=self._child_env())
+        except CommandError as e:
+            if e.returncode == -1:  # SubprocessShell's timeout
+                return f"the API server did not answer within {API_PROBE_TIMEOUT_S}s"
+            raise
+        if result.returncode != 0 and _API_UNREACHABLE_RE.search(result.stderr or ""):
+            return f"the API server does not answer: {(result.stderr or '').strip()[-_STDERR_TAIL:]}"
+        return None
 
     def drain_and_delete_node(self, name: str) -> None:
         """Drain then delete the node. A node that is already gone counts as success (Review Focus #3)."""

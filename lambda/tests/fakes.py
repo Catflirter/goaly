@@ -277,6 +277,8 @@ class FakeInfra:
         self.deleted_nodes: list[str] = []
         self.joined: list[tuple[str, str, str]] = []
         self.forgotten: list[str] = []
+        self.unreachable: str | None = None  # what api_unreachable returns (None: the API server answers)
+        self.probes = 0
 
     def ensure_init(self, stack: str) -> None:
         if stack in self.missing:
@@ -311,6 +313,10 @@ class FakeInfra:
 
     def cluster_gpu_nodes(self) -> dict[str, str | None]:
         return dict(self.cluster_nodes)
+
+    def api_unreachable(self) -> str | None:
+        self.probes += 1
+        return self.unreachable
 
     def drain_and_delete_node(self, name: str) -> None:
         self.deleted_nodes.append(name)
