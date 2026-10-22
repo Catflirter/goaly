@@ -2,6 +2,8 @@
 import inspect
 import json
 import os
+import shutil
+import subprocess
 import sys
 from pathlib import Path
 
@@ -10,11 +12,12 @@ import pytest
 from fakes import FakeInfra, FakeShell, fail, ok
 from gpuctl.infra import (
     CP_SSH_TIMEOUT_S, TF_INIT_MARKER, TF_INIT_TIMEOUT_S, TF_READ_TIMEOUT_S, CommandError, Infra, MissingStackError,
-    SubprocessShell,
+    SubprocessShell, posix_cksum,
 )
 from gpuctl.planner import gpu_type_label
 
 ROOT = Path("/srv/goaly")
+REPO = Path(__file__).resolve().parents[2]  # this checkout, for its committed lock files
 ENV = {"GCP_PROJECT": "demo-proj"}
 BASE_OUTPUTS = ok(json.dumps({
     "cp_ip": {"value": "34.82.10.10", "type": "string", "sensitive": False},
@@ -24,11 +27,19 @@ NOT_FOUND = 'Error from server (NotFound): nodes "x" not found'
 
 
 def initialised(root, *stacks, bucket="demo-proj-k3s-tfstate"):
-    """Mark infra/<stack> as initialised against `bucket`, the way a successful ensure_init (or tf_init) leaves it."""
+    """Mark infra/<stack> as initialised against `bucket`, the way a successful ensure_init (or tf_init) leaves it:
+    "gcs <bucket> <stack> lock <cksum of .terraform.lock.hcl>", here for a stack without a lock file."""
     for stack in stacks:
         (root / "infra" / stack / ".terraform").mkdir(parents=True, exist_ok=True)
-        (root / "infra" / stack / ".terraform" / TF_INIT_MARKER).write_text(f"gcs {bucket} {stack}\n")
+        marker = root / "infra" / stack / ".terraform" / TF_INIT_MARKER
+        marker.write_text(f"gcs {bucket} {stack} lock no-lock-file\n")
     return root
+
+
+def cksum_binary(path):
+    """What scripts/lib/common.sh tf_init records: `cksum < FILE`, its trailing newline stripped as $(...) does."""
+    with open(path, "rb") as f:
+        return subprocess.run(["cksum"], stdin=f, capture_output=True, text=True, check=True).stdout.rstrip("\n")
 
 
 def init_args(root, stack, bucket="demo-proj-k3s-tfstate"):
@@ -82,7 +93,7 @@ def test_ensure_init_runs_init_once_and_records_a_marker(tmp_path):
     assert sh.calls[0].env["TF_VAR_state_bucket"] == "demo-proj-k3s-tfstate"
     # the same file and text scripts/lib/common.sh tf_init writes, so both agree on "initialised"
     marker = tmp_path / "infra/gpu-access/.terraform" / TF_INIT_MARKER
-    assert marker.read_text() == "gcs demo-proj-k3s-tfstate gpu-access\n"
+    assert marker.read_text() == "gcs demo-proj-k3s-tfstate gpu-access lock no-lock-file\n"
     infra.ensure_init("gpu-access")
     Infra(sh, tmp_path, ENV).ensure_init("gpu-access")  # a later run trusts the marker too
     assert len(sh.calls) == 1
@@ -96,17 +107,87 @@ def test_a_terraform_dir_from_an_offline_validate_is_not_initialised(tmp_path): 
     sh = FakeShell([ok()])
     Infra(sh, tmp_path, ENV).ensure_init("workers")
     assert [c.args for c in sh.calls] == [init_args(tmp_path, "workers")]  # -reconfigure: whatever was there
-    assert (tmp_path / "infra/workers/.terraform" / TF_INIT_MARKER).read_text() == "gcs demo-proj-k3s-tfstate workers\n"
+    assert ((tmp_path / "infra/workers/.terraform" / TF_INIT_MARKER).read_text()
+            == "gcs demo-proj-k3s-tfstate workers lock no-lock-file\n")
 
 
-@pytest.mark.parametrize("marker", ["gcs other-proj-k3s-tfstate base", "gcs demo-proj-k3s-tfstate workers", ""])
-def test_a_marker_for_another_bucket_or_stack_triggers_a_reinit(tmp_path, marker):  # B-1
+@pytest.mark.parametrize("marker", [
+    "gcs other-proj-k3s-tfstate base lock no-lock-file",
+    "gcs demo-proj-k3s-tfstate workers lock no-lock-file",
+    "gcs demo-proj-k3s-tfstate base lock 4294967295 0",  # initialised with a lock file that is gone since
+    "gcs demo-proj-k3s-tfstate base",  # the lock-less text gpuctl wrote before MK-1
+    "",
+])
+def test_a_marker_for_another_bucket_stack_or_lock_file_triggers_a_reinit(tmp_path, marker):  # B-1, MK-1
     (tmp_path / "infra/base/.terraform").mkdir(parents=True)
     (tmp_path / "infra/base/.terraform" / TF_INIT_MARKER).write_text(marker + "\n")
     sh = FakeShell([ok()])
     Infra(sh, tmp_path, ENV).ensure_init("base")
     assert [c.args for c in sh.calls] == [init_args(tmp_path, "base")]
-    assert (tmp_path / "infra/base/.terraform" / TF_INIT_MARKER).read_text() == "gcs demo-proj-k3s-tfstate base\n"
+    assert ((tmp_path / "infra/base/.terraform" / TF_INIT_MARKER).read_text()
+            == "gcs demo-proj-k3s-tfstate base lock no-lock-file\n")
+
+
+# --- the init marker's lock-file checksum (MK-1) -------------------------------------------------
+# scripts/lib/common.sh tf_init records `cksum < .terraform.lock.hcl` (Task 10 X1-2: init again after a provider
+# bump). gpuctl computes the very same text in pure Python, or each would re-initialise the stack the other set up.
+
+@pytest.mark.parametrize("data, want", [
+    (b"", "4294967295 0"),
+    (b"123456789", "930766865 9"),  # the CRC-32/CKSUM check value
+    (b"\x00" * 256, None),  # the length bytes go in least-significant first: checked against the binary below
+], ids=["empty", "check-value", "two-length-bytes"])
+def test_posix_cksum_known_values(tmp_path, data, want):
+    if want is None:
+        (tmp_path / "data").write_bytes(data)
+        want = cksum_binary(tmp_path / "data")
+    assert posix_cksum(data) == want
+
+
+@pytest.mark.parametrize("path", [*sorted(REPO.glob("infra/*/.terraform.lock.hcl")), REPO / "Makefile", None],
+                         ids=lambda p: "empty-file" if p is None else str(p.relative_to(REPO)))
+def test_posix_cksum_matches_the_cksum_binary(tmp_path, path):
+    if path is None:
+        path = tmp_path / "empty"
+        path.write_bytes(b"")
+    assert path.is_file()
+    assert posix_cksum(path.read_bytes()) == cksum_binary(path)
+
+
+def test_the_cksum_comparison_covers_the_committed_lock_files():  # the glob above must not silently match nothing
+    assert {p.parent.name for p in REPO.glob("infra/*/.terraform.lock.hcl")} >= {"base", "gpu-access", "workers"}
+
+
+def test_ensure_init_records_the_lock_file_cksum_like_tf_init(tmp_path):
+    stack_dir = tmp_path / "infra/gpu-access"
+    stack_dir.mkdir(parents=True)
+    shutil.copy2(REPO / "infra/gpu-access/.terraform.lock.hcl", stack_dir / ".terraform.lock.hcl")
+    sh = FakeShell([ok()])
+    Infra(sh, tmp_path, ENV).ensure_init("gpu-access")
+    lock_sum = cksum_binary(stack_dir / ".terraform.lock.hcl")
+    marker = stack_dir / ".terraform" / TF_INIT_MARKER
+    assert marker.read_text() == f"gcs demo-proj-k3s-tfstate gpu-access lock {lock_sum}\n"
+
+
+def test_ensure_init_reinitialises_when_the_committed_lock_file_changed(tmp_path):  # X1-2, on the gpuctl side
+    stack_dir = tmp_path / "infra/base"
+    stack_dir.mkdir(parents=True)
+    lockfile = stack_dir / ".terraform.lock.hcl"
+    lockfile.write_text('provider "registry.terraform.io/hashicorp/google" {\n  version = "8.6.0"\n}\n')
+    sh = FakeShell([ok(), ok(), ok()])
+    infra = Infra(sh, tmp_path, ENV)
+    infra.ensure_init("base")
+    infra.ensure_init("base")
+    assert len(sh.calls) == 1, "an unchanged lock file is still trusted"
+    lockfile.write_text('provider "registry.terraform.io/hashicorp/google" {\n  version = "8.7.0"\n}\n')
+    infra.ensure_init("base")
+    infra.ensure_init("base")
+    assert [c.args for c in sh.calls] == [init_args(tmp_path, "base")] * 2, "a pulled provider bump is installed"
+    lockfile.unlink()
+    infra.ensure_init("base")
+    assert len(sh.calls) == 3, "a removed lock file counts as a change"
+    marker = stack_dir / ".terraform" / TF_INIT_MARKER
+    assert marker.read_text() == "gcs demo-proj-k3s-tfstate base lock no-lock-file\n"
 
 
 def test_a_failed_reinit_removes_the_stale_marker(tmp_path):  # B-1: never trusted again after GCP_PROJECT changed

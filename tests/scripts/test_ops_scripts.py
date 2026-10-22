@@ -17,6 +17,8 @@ from pathlib import Path
 
 import pytest
 
+from gpuctl.infra import Infra, SubprocessShell
+
 ROOT = Path(__file__).resolve().parents[2]
 FAKES = Path(__file__).with_name("fake_tools.py")
 PROJECT = "k3s-demo-123456"
@@ -278,6 +280,55 @@ def test_tf_init_reinitialises_when_the_project_changed(env):
     assert env.lib("load_env; tf_init base").returncode == 0
     inits = env.argvs("terraform")
     assert len(inits) == 2 and "-backend-config=bucket=other-project-42-k3s-tfstate" in inits[1]
+
+
+# tf_init and gpuctl's Infra.ensure_init share infra/<stack>/.terraform/k3s-tf-init.ok (MK-1). If they disagree on
+# its text, each runs `terraform init -reconfigure` on the stack the other set up (and gpuctl, should that init fail,
+# deletes a .terraform a concurrent `make up` is using). These run both real implementations against the fake
+# terraform, so the only terraform calls are the ones each side really makes.
+
+def gpuctl_infra(env):
+    """gpuctl's real adapter for env.repo, its terraform the same fake the scripts get (no network, no backend)."""
+    return Infra(SubprocessShell(), env.repo, {**env.environ({}), "GCP_PROJECT": PROJECT})
+
+
+def with_lock_file(env, lock):
+    if lock:
+        shutil.copy2(ROOT / "infra/base/.terraform.lock.hcl", env.repo / "infra/base/.terraform.lock.hcl")
+
+
+@pytest.mark.parametrize("lock", [True, False], ids=["lock-file", "no-lock-file"])
+def test_gpuctl_trusts_a_stack_tf_init_initialised(env, lock):
+    with_lock_file(env, lock)
+    assert env.lib("load_env; tf_init base").returncode == 0
+    assert tf_subcommands(env) == ["init"]
+    gpuctl_infra(env).ensure_init("base")
+    assert tf_subcommands(env) == ["init"], "gpuctl re-initialised a stack tf_init had just initialised"
+
+
+@pytest.mark.parametrize("lock", [True, False], ids=["lock-file", "no-lock-file"])
+def test_tf_init_trusts_a_stack_gpuctl_initialised(env, lock):
+    with_lock_file(env, lock)
+    gpuctl_infra(env).ensure_init("base")
+    assert tf_subcommands(env) == ["init"]
+    assert env.lib("load_env; tf_init base").returncode == 0
+    assert tf_subcommands(env) == ["init"], "tf_init re-initialised a stack gpuctl had just initialised"
+
+
+def test_both_sides_reinitialise_once_after_a_lock_file_change(env):  # X1-2 holds across the two implementations
+    with_lock_file(env, True)
+    assert env.lib("load_env; tf_init base").returncode == 0
+    lockfile = env.repo / "infra/base/.terraform.lock.hcl"
+    bumped = lockfile.read_text().replace('version     = "8.7.0"', 'version     = "8.7.1"')
+    assert bumped != lockfile.read_text()
+    lockfile.write_text(bumped)
+    gpuctl_infra(env).ensure_init("base")
+    assert tf_subcommands(env) == ["init", "init"], "gpuctl must install the pulled provider bump"
+    assert env.lib("load_env; tf_init base").returncode == 0
+    lockfile.write_text(lockfile.read_text() + "\n")
+    assert env.lib("load_env; tf_init base").returncode == 0
+    gpuctl_infra(env).ensure_init("base")
+    assert tf_subcommands(env) == ["init", "init", "init"]
 
 
 def test_tf_init_refuses_the_bootstrap_stack_and_unknown_stacks(env):
