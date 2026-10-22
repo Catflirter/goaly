@@ -63,11 +63,20 @@ lint: ## Run all pre-commit hooks, the repo secret scan, the Terraform tests, th
 verify: ## Run verification checks A-D (RESILIENCE=1 adds E) into verification/<timestamp>/
 	$(ROOT)/scripts/verify.sh
 
-.PHONY: gpu-plan gpu-status
+# AUTO_APPROVE=1 (or yes/true) skips the confirmation prompt of gpu-apply and gpu-down.
+GPU_AUTO_APPROVE := $(if $(filter 1 yes true,$(AUTO_APPROVE)), --auto-approve)
+
+.PHONY: gpu-plan gpu-apply gpu-down gpu-status
 gpu-plan: ## Show what gpu-apply would create/delete on Lambda and the hourly cost (read-only)
 	$(ROOT)/scripts/gpuctl plan
 
-gpu-status: ## Show Lambda GPU capacity and this cluster's GPU instances (read-only)
+gpu-apply: ## Create/delete Lambda GPU nodes to match lambda/gpu-nodes.yaml, then firewall and join (AUTO_APPROVE=1)
+	$(ROOT)/scripts/gpuctl apply$(GPU_AUTO_APPROVE)
+
+gpu-down: ## Delete every Lambda GPU node and the autoscaler overrides (AUTO_APPROVE=1 skips the prompt)
+	$(ROOT)/scripts/gpuctl down$(GPU_AUTO_APPROVE)
+
+gpu-status: ## Show GPU capacity, GPU instances and drift (changes no cloud state; may terraform init locally; exit 3 on drift)
 	$(ROOT)/scripts/gpuctl status
 
 .PHONY: sync-peers
