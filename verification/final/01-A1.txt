@@ -1,0 +1,11 @@
+# A1 — Nodes Ready (at least 2)
+# started: 2026-10-22T12:50:46-07:00
+$ kc get nodes -o wide --request-timeout=60s
+NAME        STATUS   ROLES           AGE    VERSION        INTERNAL-IP   EXTERNAL-IP     OS-IMAGE             KERNEL-VERSION           CONTAINER-RUNTIME
+k3s-cp      Ready    control-plane   150m   v1.36.5+k3s1   10.10.0.2     136.87.143.58   Ubuntu 24.04.5 LTS   7.0.0-1014-gcp (amd64)   containerd://2.3.4-k3s1.36
+k3s-cpu-1   Ready    <none>          147m   v1.36.5+k3s1   10.20.0.2     34.28.157.143   Ubuntu 24.04.5 LTS   7.0.0-1014-gcp (amd64)   containerd://2.3.4-k3s1.36
+$ kc get nodes --request-timeout=60s -o 'jsonpath={range .items[*]}{.metadata.name}{" "}{.status.conditions[?(@.type=="Ready")].status}{"\n"}{end}'
+k3s-cp True
+k3s-cpu-1 True
+A1: 2 of 2 nodes Ready (want all of them, and at least 2)
+# finished: 2026-10-22T12:50:47-07:00 — PASS (exit 0)

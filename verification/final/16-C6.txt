@@ -1,0 +1,8 @@
+# C6 — kubectl top pod
+# started: 2026-10-22T12:52:47-07:00
+$ kc -n hello top pod --request-timeout=60s
+NAME                     CPU(cores)   MEMORY(bytes)   
+hello-849b58876f-7mzbr   1m           3Mi             
+hello-849b58876f-wjgt5   1m           6Mi             
+C6: kubectl top pod returned data
+# finished: 2026-10-22T12:52:47-07:00 — PASS (exit 0)

@@ -1,0 +1,9 @@
+# C1 — hello rollout
+# started: 2026-10-22T12:52:36-07:00
+$ kc -n hello rollout status deploy/hello --timeout=120s
+deployment "hello" successfully rolled out
+$ kc -n hello get pods -o wide --request-timeout=60s
+NAME                     READY   STATUS    RESTARTS      AGE    IP           NODE        NOMINATED NODE   READINESS GATES
+hello-849b58876f-7mzbr   1/1     Running   3 (26m ago)   148m   10.42.1.25   k3s-cpu-1   <none>           <none>
+hello-849b58876f-wjgt5   1/1     Running   3 (26m ago)   148m   10.42.1.24   k3s-cpu-1   <none>           <none>
+# finished: 2026-10-22T12:52:37-07:00 — PASS (exit 0)

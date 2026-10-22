@@ -1,0 +1,29 @@
+# C8 — NetworkPolicy: allowed from nettest, denied elsewhere
+# started: 2026-10-22T12:54:17-07:00
+C8: first the allowed path from nettest (C2)
+$ kc -n hello get pods -l app=hello --field-selector=status.phase=Running --request-timeout=60s -o 'jsonpath={range .items[*]}{.spec.nodeName}{"\n"}{end}'
+k3s-cpu-1
+k3s-cpu-1
+$ kc -n nettest get pods -l app=probe --field-selector=status.phase=Running --request-timeout=60s -o 'jsonpath={range .items[*]}{.spec.nodeName}{" "}{.metadata.name}{" "}{.status.podIP}{"\n"}{end}'
+k3s-cp probe-kkl5q 10.42.0.6
+k3s-cpu-1 probe-v54jv 10.42.1.26
+C2: hello replicas on: k3s-cpu-1 k3s-cpu-1; asking from probe-kkl5q on k3s-cp
+$ kc_within 60 -n nettest exec probe-kkl5q -- curl -fsS -m 5 http://hello.hello.svc.cluster.local
+hello world
+C2: answered exactly 'hello world'
+$ kc delete namespace np-denied --ignore-not-found --timeout=120s
+$ kc apply -f /home/catflirter/goaly/k8s/verify/np-denied.yaml --request-timeout=60s
+namespace/np-denied created
+pod/client created
+$ kc -n np-denied wait pod/client --for=condition=Ready --timeout=120s
+pod/client condition met
+$ kc_within 60 -n np-denied exec client -- curl -sS -m 5 -o /dev/null -w '%{http_code}' http://echo.nettest.svc.cluster.local:8080/
+200
+C8: positive control: the np-denied client gets HTTP 200 from echo.nettest
+$ kc_within 60 -n np-denied exec client -- curl -sS -m 5 http://hello.hello.svc.cluster.local
+curl: (7) Failed to connect to hello.hello.svc.cluster.local:80 after 303 ms: Could not connect to server
+command terminated with exit code 7
+C8: from np-denied the connection to hello was refused (curl exit 7): the NetworkPolicy rejects it
+$ kc delete namespace np-denied --ignore-not-found --timeout=120s
+namespace "np-denied" deleted
+# finished: 2026-10-22T12:55:04-07:00 — PASS (exit 0)

@@ -1,0 +1,12 @@
+# A3 — metrics-server and CoreDNS Ready on k3s-cp
+# started: 2026-10-22T12:50:48-07:00
+$ kc -n kube-system get pods -o wide --request-timeout=60s
+NAME                                      READY   STATUS    RESTARTS   AGE    IP          NODE     NOMINATED NODE   READINESS GATES
+coredns-7cfb7bc9c7-q9n5d                  1/1     Running   0          150m   10.42.0.3   k3s-cp   <none>           <none>
+local-path-provisioner-77b9867795-dp89r   1/1     Running   0          150m   10.42.0.2   k3s-cp   <none>           <none>
+metrics-server-5bff977ff5-fgfrr           1/1     Running   0          147m   10.42.0.4   k3s-cp   <none>           <none>
+$ kc -n kube-system get pods -l 'k8s-app in (metrics-server,kube-dns)' --request-timeout=60s -o 'jsonpath={range .items[*]}{.metadata.labels.k8s-app}{" "}{.metadata.name}{" "}{.spec.nodeName}{" "}{.status.conditions[?(@.type=="Ready")].status}{"\n"}{end}'
+kube-dns coredns-7cfb7bc9c7-q9n5d k3s-cp True
+metrics-server metrics-server-5bff977ff5-fgfrr k3s-cp True
+A3: 1 metrics-server and 1 CoreDNS Pod(s), all Ready on k3s-cp
+# finished: 2026-10-22T12:50:49-07:00 — PASS (exit 0)

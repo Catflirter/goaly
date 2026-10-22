@@ -1,0 +1,5 @@
+# D4 — gpu-smoke: nvidia-smi
+# started: 2026-10-22T12:55:05-07:00
+$ kc get nodes -l node-restriction.kubernetes.io/accelerator=nvidia --request-timeout=60s -o 'jsonpath={range .items[*]}{.metadata.name}{"\n"}{end}'
+D: no node has the label node-restriction.kubernetes.io/accelerator=nvidia (no GPU node): skipped
+# finished: 2026-10-22T12:55:05-07:00 — SKIP (exit 77)

@@ -1,0 +1,28 @@
+# B4 — iperf3 across nodes
+# started: 2026-10-22T12:52:05-07:00
+$ kc get nodes --request-timeout=60s -o 'jsonpath={range .items[*]}{.metadata.name}{"\n"}{end}'
+k3s-cp
+k3s-cpu-1
+$ probe_on k3s-cpu-1
+probe-v54jv
+$ probe_on k3s-cp
+probe-kkl5q
+$ kc -n nettest get pod probe-kkl5q --request-timeout=60s -o 'jsonpath={.status.podIP}'
+10.42.0.6
+$ kc_within 60 -n nettest exec probe-kkl5q -- sh -c 'pkill -x iperf3; rc=$?; [ $rc -le 1 ] || exit $rc'
+$ kc_within 170 -n nettest exec probe-kkl5q -- timeout 150 iperf3 -s -1 --forceflush &
+$ kc_within 140 -n nettest exec probe-v54jv -- timeout 120 iperf3 -c 10.42.0.6 -n 50M -J
+--- iperf3 server on k3s-cp (probe-kkl5q) ---
+-----------------------------------------------------------
+Server listening on 5201 (test #1)
+-----------------------------------------------------------
+Accepted connection from 10.42.1.26, port 34956
+[  5] local 10.42.0.6 port 5201 connected to 10.42.1.26 port 34966
+[ ID] Interval           Transfer     Bitrate
+[  5]   0.00-1.00   sec  20.0 MBytes   168 Mbits/sec                  
+[  5]   1.00-2.00   sec  30.0 MBytes   252 Mbits/sec                  
+- - - - - - - - - - - - - - - - - - - - - - - - -
+[ ID] Interval           Transfer     Bitrate
+[  5]   0.00-2.04   sec  50.0 MBytes   206 Mbits/sec                  receiver
+B4: k3s-cpu-1 -> k3s-cp: sum_sent bits_per_second=209667919, sum_received bits_per_second=205890879 (about 205 Mbit/s)
+# finished: 2026-10-22T12:52:10-07:00 — PASS (exit 0)

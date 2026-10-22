@@ -1,0 +1,66 @@
+# C7 — limits-demo: OOMKilled and CPU throttling
+# started: 2026-10-22T12:52:47-07:00
+$ kc -n limits-demo delete pod oom cpu-burn --ignore-not-found --timeout=90s
+$ kc apply -f /home/catflirter/goaly/k8s/limits-demo/limits-demo.yaml --request-timeout=60s
+namespace/limits-demo unchanged
+pod/oom created
+pod/cpu-burn created
+$ kc -n limits-demo get pod oom --request-timeout=60s -o 'jsonpath={.status.containerStatuses[0].state.terminated.reason}{" "}{.status.containerStatuses[0].state.terminated.exitCode}'
+ 
+$ kc -n limits-demo get pod oom --request-timeout=60s -o 'jsonpath={.status.containerStatuses[0].state.terminated.reason}{" "}{.status.containerStatuses[0].state.terminated.exitCode}'
+OOMKilled 137
+C7 ①: oom was OOMKilled, exit code 137
+$ kc -n limits-demo wait pod/cpu-burn --for=condition=Ready --timeout=90s
+pod/cpu-burn condition met
+C7 ②: cpu-burn Ready; reading kubectl top after 30 s
+$ kc -n limits-demo top pod cpu-burn --request-timeout=60s
+NAME       CPU(cores)   MEMORY(bytes)   
+cpu-burn   101m         3Mi             
+C7 ②: kubectl top reads 101m (at most 110m)
+$ kc -n limits-demo get pod cpu-burn --request-timeout=60s -o 'jsonpath={.spec.nodeName}{" "}{.status.containerStatuses[0].containerID}'
+k3s-cpu-1 containerd://149fa5cfb4a47764973d488b22c43cb8367257ffa3e3a76477e268f1f88f4344
+$ _worker_zone k3s-cpu-1
+$ node_ssh k3s-cpu-1 'sudo find /sys/fs/cgroup -type d -name "*149fa5cfb4a47764973d488b22c43cb8367257ffa3e3a76477e268f1f88f4344*"'
+WARNING: 
+
+To increase the performance of the tunnel, consider installing NumPy. For instructions,
+please see https://cloud.google.com/iap/docs/using-tcp-forwarding#increasing_the_tcp_upload_bandwidth
+
+/sys/fs/cgroup/kubepods.slice/kubepods-pod15801c72_a47c_4d73_a32d_33aa19d9d6dd.slice/cri-containerd-149fa5cfb4a47764973d488b22c43cb8367257ffa3e3a76477e268f1f88f4344.scope
+$ node_ssh k3s-cpu-1 'cat /sys/fs/cgroup/kubepods.slice/kubepods-pod15801c72_a47c_4d73_a32d_33aa19d9d6dd.slice/cri-containerd-149fa5cfb4a47764973d488b22c43cb8367257ffa3e3a76477e268f1f88f4344.scope/cpu.stat'
+WARNING: 
+
+To increase the performance of the tunnel, consider installing NumPy. For instructions,
+please see https://cloud.google.com/iap/docs/using-tcp-forwarding#increasing_the_tcp_upload_bandwidth
+
+usage_usec 4263718
+user_usec 4240787
+system_usec 22931
+nice_usec 0
+core_sched.force_idle_usec 0
+nr_periods 425
+nr_throttled 160
+throttled_usec 7411814
+nr_bursts 0
+burst_usec 0
+$ node_ssh k3s-cpu-1 'cat /sys/fs/cgroup/kubepods.slice/kubepods-pod15801c72_a47c_4d73_a32d_33aa19d9d6dd.slice/cri-containerd-149fa5cfb4a47764973d488b22c43cb8367257ffa3e3a76477e268f1f88f4344.scope/cpu.stat'
+WARNING: 
+
+To increase the performance of the tunnel, consider installing NumPy. For instructions,
+please see https://cloud.google.com/iap/docs/using-tcp-forwarding#increasing_the_tcp_upload_bandwidth
+
+usage_usec 5533432
+user_usec 5510501
+system_usec 22931
+nice_usec 0
+core_sched.force_idle_usec 0
+nr_periods 552
+nr_throttled 275
+throttled_usec 12702110
+nr_bursts 0
+burst_usec 0
+C7 ②: nr_throttled 160 -> 275 in 10 s: throttled at its CPU limit
+$ kc -n limits-demo delete pod oom cpu-burn --ignore-not-found --timeout=90s
+pod "oom" deleted from limits-demo namespace
+pod "cpu-burn" deleted from limits-demo namespace
+# finished: 2026-10-22T12:54:17-07:00 — PASS (exit 0)
