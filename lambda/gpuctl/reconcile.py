@@ -407,7 +407,14 @@ class Reconciler:
             # 4. deletes before creates
             gone, attempted, failures = self._delete(plan)
             if plan.create and not failures:
-                failures = self._launches_refused()
+                try:
+                    failures = self._launches_refused()
+                except KeyboardInterrupt:  # Ctrl-C is not a refusal: it ends the run (review F2b-1)
+                    self._warn("interrupted (KeyboardInterrupt) while checking which cluster the kubeconfig "
+                               "reaches: launched nothing")
+                    if attempted:
+                        self._drop_terminated_ips(spec, gone, "the interrupted apply")
+                    raise
             if failures:
                 return self._delete_failed(spec, gone, attempted, failures)
         return self._create_and_join(spec, plan, types, keep_on_failure=keep_on_failure, gone=gone)
@@ -554,12 +561,13 @@ class Reconciler:
         """Before step 5 (review S0-1/X0-1): a new node joins through the kubeconfig, and join-node.sh deletes a
         stale NotReady Node of its name there (Ruling R55), so nothing is launched unless the cluster the kubeconfig
         reaches is this project's. Read-only, and before any launch: a refused apply starts nothing that bills.
-        The failure to report, or [] when the launches may go ahead."""
+        The failure to report, or [] when the launches may go ahead. A check that raises refuses the launches; a
+        Ctrl-C during it is raised again, an interrupt and not a refusal (review F2b-1)."""
         if not self._cluster_checked:
             try:
                 self._check_cluster()
-            except (Exception, KeyboardInterrupt):
-                pass  # _check_cluster refused the run, with the error in its message
+            except Exception:  # _check_cluster refused the run, with the error in its message; Ctrl-C goes on
+                pass
         problem = self._problem if self._refusal is not None else self._gone
         if problem is None:
             return []
@@ -635,13 +643,17 @@ class Reconciler:
         for failure in failures:
             self._warn(f"error: {failure}")
         if attempted:
-            try:
-                self._reconcile_firewall(spec, gone)
-            except (Exception, KeyboardInterrupt) as e:
-                self._warn(f"error: firewall reconcile after the failed delete failed: {str(e) or type(e).__name__}; "
-                           "re-run make gpu-apply or make sync-peers")
+            self._drop_terminated_ips(spec, gone, "the failed delete")
         self._warn("No new GPU nodes were launched; fix the error and re-run")
         return 1
+
+    def _drop_terminated_ips(self, spec: Spec, gone: set[str], after: str) -> None:
+        """Step 7 after AFTER, best effort: the IPs of the instances this run terminated leave every allow-list."""
+        try:
+            self._reconcile_firewall(spec, gone)
+        except (Exception, KeyboardInterrupt) as e:
+            self._warn(f"error: firewall reconcile after {after} failed: {str(e) or type(e).__name__}; "
+                       "re-run make gpu-apply or make sync-peers")
 
     def _launch(self, pool: Pool, name: str, types: Mapping[str, InstanceType], rules: list[FirewallRule],
                 failures: list[str], unknown: list[str]) -> _Launched | None:

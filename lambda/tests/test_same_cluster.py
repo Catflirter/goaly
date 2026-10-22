@@ -20,7 +20,8 @@ from fakes import DEFAULT_OUTPUTS, FakeInfra, FakeLambda
 from gpuctl.__main__ import main
 from gpuctl.infra import CommandError
 from test_cli import ENV
-from test_reconcile import SPEC, TYPES, inst, make_rec, mutations
+from test_reconcile import SPEC, TYPES, inst, make_rec, mutations, spec_with
+from test_spec import VALID
 
 CP_IP = DEFAULT_OUTPUTS["base"]["cp_ip"]  # 34.82.10.10
 OTHER_CP_IP = "35.199.7.7"  # k3s-cp of another project's cluster, reached through the same kubeconfig/tunnel
@@ -204,6 +205,63 @@ def test_a_cluster_check_that_fails_part_way_refuses_the_later_nodes(capsys):
     err = capsys.readouterr().err
     assert "KUBECONFIG lists several files" in err
     assert "delete k3s-gpu-a6000-1" in err and "delete k3s-gpu-a6000-2" in err
+
+
+@pytest.mark.parametrize("error", [ValueError("KUBECONFIG lists several files"),
+                                   FileNotFoundError(2, "No such file or directory", "kubectl")],
+                         ids=["kubeconfig", "no-kubectl"])
+def test_a_launch_check_that_raises_launches_nothing(error, capsys):
+    """PR #104 review F2b-1: an error out of the check before the first launch refuses the launches, with the error
+    and what to do in the message; nothing bills and nothing joins."""
+    fake, infra = FakeLambda(types=TYPES), FakeInfra()
+
+    def check_fails():
+        raise error
+    if isinstance(error, ValueError):
+        infra.kubeconfig_missing = check_fails
+    else:
+        infra.cp_external_ip = check_fails
+    assert make_rec(fake, infra).apply(SPEC, auto_approve=True, keep_on_failure=False) == 1
+    assert fake.launched == [] and mutations(fake) == [] and infra.joined == [] and infra.events == []
+    err = capsys.readouterr().err
+    assert "launched nothing: the check of which cluster the kubeconfig reaches failed" in err
+    assert str(error) in err and "fix that error and re-run make gpu-apply" in err
+
+
+def test_ctrl_c_during_the_launch_check_is_an_interrupt_not_a_refusal(capsys):
+    """PR #104 review F2b-1: Ctrl-C during the check before the first launch ends gpu-apply as an interrupt (the
+    KeyboardInterrupt goes on, as everywhere else gpuctl does not have to finish a cleanup), not as a refusal
+    telling the operator to fix an error. Nothing was launched."""
+    fake, infra = FakeLambda(types=TYPES), FakeInfra()
+
+    def ctrl_c():
+        raise KeyboardInterrupt
+    infra.cp_external_ip = ctrl_c
+    with pytest.raises(KeyboardInterrupt):
+        make_rec(fake, infra).apply(SPEC, auto_approve=True, keep_on_failure=False)
+    assert fake.launched == [] and mutations(fake) == [] and infra.joined == [] and infra.events == []
+    err = capsys.readouterr().err
+    assert "interrupted" in err and "launched nothing" in err
+    assert "fix that error" not in err and "check of which cluster the kubeconfig reaches failed" not in err
+
+
+def test_ctrl_c_during_the_launch_check_still_drops_a_terminated_ip_from_the_allow_lists(capsys):
+    """A duplicate is terminated by id, without a drain (Ruling R17), so the cluster is first checked before the
+    launch. Ctrl-C there still takes the terminated IP out of every allow-list before the interrupt goes on, as a
+    refused launch does (Lambda may hand that IP to another tenant)."""
+    keep = inst(id="a", ip="129.80.30.30")
+    dup = inst(id="b", ip="129.80.30.31")
+    fake, infra = FakeLambda(types=TYPES, instances=[dup, keep]), FakeInfra()
+
+    def ctrl_c():
+        raise KeyboardInterrupt
+    infra.cp_external_ip = ctrl_c
+    spec = spec_with(budget_usd_per_hour=5.0, pools={"a6000": {**VALID["pools"]["a6000"], "count": 2}})
+    with pytest.raises(KeyboardInterrupt):
+        make_rec(fake, infra).apply(spec, auto_approve=True, keep_on_failure=False)
+    assert fake.terminated == ["b"] and fake.launched == [] and infra.joined == []
+    assert infra.applied_gpu_ips[-1] == ["129.80.30.30"]
+    assert "fix that error" not in capsys.readouterr().err
 
 
 def test_each_run_checks_the_cluster_again():
