@@ -4,8 +4,10 @@ The scripts run from a copy of the repo layout with terraform, gcloud and kubect
 tests/scripts/fake_tools.py on PATH. The fakes record every call, so the tests assert the exact
 commands and flags the scripts would run. Nothing here reaches GCP, a cluster or the network.
 """
+import contextlib
 import json
 import os
+import select
 import shutil
 import signal
 import socket
@@ -555,6 +557,230 @@ def test_tf_apply_refuses_an_unknown_option(env):
     assert proc.returncode != 0 and env.calls("terraform") == []
 
 
+def test_tf_apply_plan_confirmed_applies_without_asking_again(env):
+    """S3-m1: a caller that asked the question itself (cpu-pool.sh --guarded) applies the saved plan with
+    --confirmed: no second question, and no AUTO_APPROVE line for the operator's own yes (S3-L3)."""
+    proc = env.lib("load_env; tf_init base; tf_plan base; tf_apply_plan base --confirmed")  # empty stdin
+    assert proc.returncode == 0, proc.stderr
+    assert tf_subcommands(env) == ["init", "plan", "show", "apply"]
+    assert "[y/N]" not in proc.stderr and "AUTO_APPROVE" not in proc.stderr
+    assert not (env.repo / ".run/base.tfplan").exists()
+
+
+def test_tf_apply_plan_refuses_an_unknown_option(env):
+    proc = env.lib("load_env; tf_init base; tf_plan base; tf_apply_plan base --yes", AUTO_APPROVE="1")
+    assert proc.returncode != 0 and "apply" not in tf_subcommands(env)
+
+
+# ---- one Terraform run per stack (C-1: stack_lock) ---------------------------------------------
+
+def lock_free(path):
+    """Nobody holds PATH with flock(1)."""
+    return subprocess.run(["flock", "-n", str(path), "true"]).returncode == 0
+
+
+@contextlib.contextmanager
+def lock_holder(path):
+    """Another run holds PATH: `flock -o PATH sleep 60` in its own process group. -o: sleep does not inherit the lock,
+    so once the flock process is gone (reaped) the lock is free, whatever happens to sleep (S3-m3)."""
+    path.parent.mkdir(exist_ok=True)
+    holder = subprocess.Popen(["flock", "-o", str(path), "sleep", "60"], start_new_session=True)
+    try:
+        deadline = time.monotonic() + 10
+        while lock_free(path):
+            assert time.monotonic() < deadline and holder.poll() is None, "the holder never took the lock"
+            time.sleep(0.02)
+        yield holder
+    finally:
+        if holder.poll() is None:
+            os.killpg(holder.pid, signal.SIGKILL)
+        holder.wait()
+
+
+def path_without_flock(env, tmp_path):
+    """env's PATH with the fakes first, then every other directory's commands linked into one, flock left out."""
+    dirs = [d for d in env.environ({})["PATH"].split(":") if d != str(env.bin)]
+    tools = tmp_path / "no-flock-bin"
+    tools.mkdir()
+    for d in dirs:
+        if not os.path.isdir(d):
+            continue
+        for name in os.listdir(d):
+            target = tools / name
+            if name != "flock" and not target.exists() and os.access(os.path.join(d, name), os.X_OK):
+                target.symlink_to(os.path.join(d, name))
+    path = f"{env.bin}:{tools}"
+    assert shutil.which("flock", path=path) is None
+    return path
+
+
+def gate_terraform(env, sub):
+    """terraform's SUB (plan, apply) waits while $FAKE_LOG.gate exists, after touching $FAKE_LOG.at_SUB: one run can be
+    held inside its plan while a test starts another."""
+    gate, at = Path(f"{env.log}.gate"), Path(f"{env.log}.at_{sub}")
+    (env.bin / "terraform").write_text(
+        f'#!/bin/sh\nif [ "$2" = {sub} ] && [ -e "{gate}" ]; then : > "{at}"; while [ -e "{gate}" ]; do sleep 0.05; done; fi\n'
+        f'exec "{sys.executable}" "{FAKES}" terraform "$@"\n')
+    gate.write_text("")
+    return gate, at
+
+
+def wait_for_file(path, proc, seconds=30):
+    deadline = time.monotonic() + seconds
+    while not path.exists():
+        assert proc.poll() is None, proc.communicate()
+        assert time.monotonic() < deadline, f"{path} never appeared"
+        time.sleep(0.02)
+
+
+def test_a_second_run_on_a_stack_is_refused_without_touching_terraform(env):
+    gate, at_plan = gate_terraform(env, "plan")
+    first = env.popen(["bash", "-c", "set -euo pipefail; source scripts/lib/common.sh; load_env; tf_init base;"
+                       " tf_apply base"], AUTO_APPROVE="1")
+    try:
+        wait_for_file(at_plan, first)  # the first run is inside its plan, so it holds the base stack's lock
+        before = len(env.calls("terraform"))
+        second = env.lib("load_env; tf_init base; tf_apply base", AUTO_APPROVE="1")
+        assert second.returncode == 2, second.stderr
+        assert "base" in second.stderr and str(env.repo.resolve() / ".run/base.lock") in second.stderr
+        assert len(env.calls("terraform")) == before, "the refused run ran no terraform at all (its init was done)"
+    finally:
+        gate.unlink()
+        out, err = first.communicate(timeout=60)
+    assert first.returncode == 0, err
+    assert tf_subcommands(env) == ["init", "plan", "show", "apply"]
+    assert lock_free(env.repo / ".run/base.lock"), "released when the first run exited"
+
+
+@pytest.mark.parametrize("call", ["tf_apply workers", "tf_plan workers", "stack_lock workers"])
+def test_a_held_stack_lock_refuses_naming_the_stack_and_the_file(env, call):
+    lock = env.repo / ".run/workers.lock"
+    with lock_holder(lock):
+        proc = env.lib(f"load_env; {call}", AUTO_APPROVE="1")
+    assert proc.returncode == 2
+    assert "workers stack" in proc.stderr and str(lock.resolve()) in proc.stderr
+    assert env.calls("terraform") == []
+
+
+def test_a_held_lock_of_another_stack_does_not_block(env):
+    with lock_holder(env.repo / ".run/workers.lock"):
+        proc = env.lib("load_env; tf_init base; tf_apply base", AUTO_APPROVE="1")
+    assert proc.returncode == 0, proc.stderr
+    assert tf_subcommands(env)[-1] == "apply"
+
+
+def test_stack_lock_is_reentrant_and_held_until_the_process_exits(env):
+    lock = env.repo / ".run/base.lock"
+    proc = env.lib(f'load_env; stack_lock base; stack_lock base; tf_init base; tf_apply base; stack_lock base;'
+                   f' if flock -n "{lock}" true; then echo free; else echo held; fi', AUTO_APPROVE="1")
+    assert proc.returncode == 0, proc.stderr
+    assert proc.stdout.split() == ["held"], "taken once, kept through tf_apply, released only on exit"
+    assert tf_subcommands(env)[-1] == "apply"
+    assert lock_free(lock)
+
+
+def test_stack_lock_refuses_a_bad_stack_name(env):
+    for name in ("../x", "", "Base", "base/x"):
+        proc = env.lib(f"stack_lock '{name}'")
+        assert proc.returncode != 0 and "stack" in proc.stderr
+    assert not (env.repo / "x.lock").exists() and not list(env.repo.rglob("*.lock"))
+
+
+def test_without_flock_terraform_runs_unlocked_after_one_warning(env, tmp_path):
+    proc = env.lib("load_env; stack_lock base; tf_init base; tf_apply base; tf_init workers; tf_apply workers",
+                   AUTO_APPROVE="1", PATH=path_without_flock(env, tmp_path))
+    assert proc.returncode == 0, proc.stderr
+    assert tf_subcommands(env).count("apply") == 2
+    assert proc.stderr.count("WARNING") == 1 and "flock" in proc.stderr
+
+
+def test_stack_lock_required_refuses_without_flock(env, tmp_path):
+    proc = env.lib("stack_lock --required workers", PATH=path_without_flock(env, tmp_path))
+    assert proc.returncode == 2 and "flock" in proc.stderr
+
+
+@pytest.mark.parametrize("version, ok", [(("3", "2"), False), (("4", "0"), False), (("4", "1"), True),
+                                         (("4", "4"), True), (("5", "0"), True), (("10", "0"), True)])
+def test_bash_version_check(env, version, ok):
+    """exec {fd}> needs bash >= 4.1 (macOS ships 3.2)."""
+    assert (env.lib(f"_bash_version_ok {' '.join(version)}").returncode == 0) == ok
+    assert env.lib("_bash_version_ok").returncode == 0, "the bash running these tests"
+
+
+OLD_BASH = "_bash_version_ok() { return 1; }"  # what bash 3.2 (macOS) answers
+
+
+@pytest.mark.parametrize("flock", [True, False], ids=["flock", "no-flock"])
+@pytest.mark.parametrize("call", ["stack_lock base", "stack_lock --required base", "tf_init base; tf_apply base"])
+def test_stack_lock_refuses_an_old_bash(env, tmp_path, flock, call):
+    """The brief: bash < 4.1 is refused (exit 2) wherever stack_lock is used, with flock(1) on PATH or not (S0-1)."""
+    extra = {} if flock else {"PATH": path_without_flock(env, tmp_path)}
+    proc = env.lib(f"{OLD_BASH}; load_env; {call}", AUTO_APPROVE="1", **extra)
+    assert proc.returncode == 2, proc.stderr
+    assert "bash >= 4.1" in proc.stderr and "brew install bash" in proc.stderr
+    assert "WARNING" not in proc.stderr, "refused, not run unlocked"
+    assert not (env.repo / ".run/base.lock").exists()
+    assert "plan" not in tf_subcommands(env)
+
+
+def test_a_held_stack_lock_says_how_to_find_its_holder(env):
+    """X0-3: children inherit the descriptor, so the holder may be an orphaned terraform or join-node.sh."""
+    lock = env.repo / ".run/base.lock"
+    with lock_holder(lock):
+        proc = env.lib("stack_lock base")
+    assert proc.returncode == 2
+    assert f"fuser -v {lock.resolve()}" in proc.stderr and f"lsof {lock.resolve()}" in proc.stderr
+
+
+FLOCK_HINT = "Debian/Ubuntu: apt install util-linux; macOS: brew install flock"
+
+
+def test_without_flock_the_messages_say_how_to_install_it(env, tmp_path):
+    """X0-4: the refusal (--required) and the warning both name the install command."""
+    path = path_without_flock(env, tmp_path)
+    assert FLOCK_HINT in env.lib("stack_lock --required workers", PATH=path).stderr
+    assert FLOCK_HINT in env.lib("stack_lock workers", PATH=path).stderr
+
+
+def lock_probe_terraform(env):
+    """terraform plan/apply first record whether their stack's lock (.run/<stack>.lock) is held: STACK SUB held|free."""
+    record = Path(f"{env.log}.locks")
+    (env.bin / "terraform").write_text(
+        '#!/bin/sh\nstack="${1##*/}"\n'
+        f'if [ "$2" = plan ] || [ "$2" = apply ]; then\n'
+        f'  if flock -n "{env.repo}/.run/$stack.lock" true; then s=free; else s=held; fi\n'
+        f'  echo "$stack $2 $s" >> "{record}"\nfi\n'
+        f'exec "{sys.executable}" "{FAKES}" terraform "$@"\n')
+    return record
+
+
+def test_up_base_and_workers_stages_hold_their_stacks_locks(env):
+    record = lock_probe_terraform(env)
+    proc = env.script("up.sh", "all", AUTO_APPROVE="1")
+    assert proc.returncode == 0, proc.stderr
+    assert record.read_text().splitlines() == ["base plan held", "base apply held",
+                                               "workers plan held", "workers apply held"]
+    # The workers stack's lock is cpu-pool.sh's: one lock for every run that plans or applies the workers stack.
+    assert (env.repo / ".run/workers.lock").exists()
+    # Released when up.sh exits, although the API tunnel it started runs on (it must not inherit the lock).
+    assert alive(int(env.pidfile.read_text()))
+    assert lock_free(env.repo / ".run/base.lock") and lock_free(env.repo / ".run/workers.lock")
+
+
+def test_up_init_holds_the_bootstrap_stacks_lock(env):
+    record = lock_probe_terraform(env)
+    proc = env.script("up.sh", "init", AUTO_APPROVE="1")
+    assert proc.returncode == 0, proc.stderr
+    assert record.read_text().splitlines() == ["bootstrap plan held", "bootstrap apply held"]
+
+
+def test_up_base_is_refused_while_another_run_holds_the_base_stack(env):
+    with lock_holder(env.repo / ".run/base.lock"):
+        proc = env.script("up.sh", "base", AUTO_APPROVE="1")
+    assert proc.returncode == 2 and "base stack" in proc.stderr
+    assert "plan" not in tf_subcommands(env) and env.calls("gcloud") == []
+
+
 # ---- kubeconfig.sh ---------------------------------------------------------------------------
 
 def test_kubeconfig_writes_a_private_file_from_the_cp(env):
@@ -617,6 +843,30 @@ def tunnels(env):
     return [a for a in env.argvs("gcloud") if "-N" in a]
 
 
+def gate_readyz(env):
+    """kubectl's /readyz probes wait while $FAKE_LOG.gate exists, after touching $FAKE_LOG.at_readyz: a tunnel.sh start
+    can be held inside its first probe, its lock taken and its tunnel launched."""
+    gate, at = Path(f"{env.log}.gate"), Path(f"{env.log}.at_readyz")
+    (env.bin / "kubectl").write_text(
+        f'#!/bin/sh\ncase "$*" in *--raw*/readyz*) if [ -e "{gate}" ]; then : > "{at}";'
+        f' while [ -e "{gate}" ]; do sleep 0.05; done; fi;; esac\n'
+        f'exec "{sys.executable}" "{FAKES}" kubectl "$@"\n')
+    gate.write_text("")
+    return gate, at
+
+
+def read_stderr_until(proc, text, seconds=60):
+    """What PROC wrote to stderr up to and including TEXT (which it must write while it runs)."""
+    err, deadline = b"", time.monotonic() + seconds
+    while text.encode() not in err:
+        ready, _, _ = select.select([proc.stderr], [], [], max(0.0, deadline - time.monotonic()))
+        assert ready, f"{text!r} never came; stderr so far: {err.decode()}"
+        chunk = os.read(proc.stderr.fileno(), 4096)
+        assert chunk, f"exited before {text!r}; stderr: {err.decode()}"
+        err += chunk
+    return err.decode()
+
+
 def make_kubeconfig(env):
     env.kubeconfig.parent.mkdir(exist_ok=True)
     env.kubeconfig.write_text(KUBECONFIG)
@@ -635,7 +885,7 @@ def test_tunnel_start_status_stop(env):
         in env.argvs("kubectl")
     assert "waiting up to 30s for the API's /readyz" in proc.stderr, "brief: default wait 30s"
     env.assert_no_lambda_key()  # also the long-lived tunnel's environment
-    assert not env.lockfile.exists(), "the start/stop lock is released"
+    assert lock_free(env.lockfile), "the start/stop lock is released, and the tunnel does not hold it"
 
     assert env.script("tunnel.sh", "status").returncode == 0
 
@@ -794,8 +1044,7 @@ def test_tunnel_running_but_api_down_is_restarted(env):
 
 def test_concurrent_starts_launch_one_tunnel(env):
     """`make tunnel` while `make up` is in its tunnel step: without a lock both launch, the loser's
-    cleanup drops the PID file and the winner's tunnel is orphaned (C0-3). The race is real here:
-    repeat this test to see a non-atomic lock (e.g. uutils' mkdir) fail it."""
+    cleanup drops the PID file and the winner's tunnel is orphaned (C0-3)."""
     make_kubeconfig(env)
     start = [str(env.repo / "scripts/tunnel.sh"), "start"]
     procs = [env.popen(start), env.popen(start)]
@@ -804,46 +1053,16 @@ def test_concurrent_starts_launch_one_tunnel(env):
     assert len(tunnels(env)) == 1, results
     pid = int(env.pidfile.read_text())
     assert alive(pid) and int(Path(f"{env.log}.tunnel").read_text()) == pid
-    assert not env.lockfile.exists()
+    assert lock_free(env.lockfile), "released by both runs, and never held by the tunnel they started"
 
 
-def test_tunnel_start_waits_for_a_held_lock(env):
+@pytest.mark.parametrize("left_behind", ["", "4242\n", "not a pid\n"])
+def test_concurrent_starts_with_a_lock_file_left_behind_launch_one_tunnel(env, left_behind):
+    """C-2: the lock is flock(1) on .run/tunnel.lock. Whatever an earlier (killed) run left in the file, nothing
+    has to break a stale lock, so four waiting runs still start exactly one tunnel."""
     make_kubeconfig(env)
-    holder = subprocess.Popen(["sleep", "30"])
-    try:
-        env.lockfile.parent.mkdir()
-        env.lockfile.write_text(f"{holder.pid}\n")
-        proc = env.popen([str(env.repo / "scripts/tunnel.sh"), "start"])
-        time.sleep(1.5)
-        assert proc.poll() is None and tunnels(env) == [], "waits while a live holder has the lock"
-        env.lockfile.unlink()
-        _, err = proc.communicate(timeout=60)
-        assert proc.returncode == 0, err
-        assert f"pid {holder.pid}" in err and len(tunnels(env)) == 1
-    finally:
-        holder.kill()
-        holder.wait()
-
-
-def test_tunnel_takes_over_a_stale_lock(env):
-    make_kubeconfig(env)
-    dead = subprocess.Popen(["true"])
-    dead.wait()
     env.lockfile.parent.mkdir()
-    env.lockfile.write_text(f"{dead.pid}\n")
-    proc = env.script("tunnel.sh", "start")
-    assert proc.returncode == 0, proc.stderr
-    assert "stale" in proc.stderr and len(tunnels(env)) == 1 and not env.lockfile.exists()
-
-
-def test_concurrent_starts_take_over_a_stale_lock_once(env):
-    """Several runs waiting on a stale lock: only one may break it. Unserialised, a later waiter's rm
-    deletes the lock an earlier one had just taken, both start a tunnel and one is orphaned (C1-1)."""
-    make_kubeconfig(env)
-    dead = subprocess.Popen(["true"])
-    dead.wait()
-    env.lockfile.parent.mkdir()
-    env.lockfile.write_text(f"{dead.pid}\n")
+    env.lockfile.write_text(left_behind)
     start = [str(env.repo / "scripts/tunnel.sh"), "start"]
     procs = [env.popen(start) for _ in range(4)]
     results = [p.communicate(timeout=60) for p in procs]
@@ -851,21 +1070,127 @@ def test_concurrent_starts_take_over_a_stale_lock_once(env):
     assert len(tunnels(env)) == 1, results
     pid = int(env.pidfile.read_text())
     assert alive(pid) and int(Path(f"{env.log}.tunnel").read_text()) == pid
-    assert not env.lockfile.exists() and not Path(f"{env.lockfile}.break").exists()
+    assert not any("stale" in err for _, err in results)
+    assert not Path(f"{env.lockfile}.break").exists()
 
 
-def test_tunnel_exit_never_removes_a_lock_held_by_another_run(env):
-    """A run whose lock was taken from it must not delete the new holder's lock on exit (C1-1)."""
-    holder = subprocess.Popen(["sleep", "30"])
+def test_tunnel_start_waits_for_a_live_holder(env):
+    make_kubeconfig(env)
+    with lock_holder(env.lockfile) as holder:
+        env.lockfile.write_text(f"{holder.pid}\n")  # what a holding tunnel.sh writes: its PID, for this message
+        proc = env.popen([str(env.repo / "scripts/tunnel.sh"), "start"])
+        err = read_stderr_until(proc, "waiting for another tunnel.sh")
+        assert proc.poll() is None and tunnels(env) == [], "waits while a live holder has the lock"
+    _, rest = proc.communicate(timeout=60)
+    assert proc.returncode == 0, err + rest
+    assert f"waiting for another tunnel.sh (pid {holder.pid}) to finish" in err and len(tunnels(env)) == 1
+    assert env.lockfile.read_text() == f"{proc.pid}\n", "the new holder wrote its own PID"
+
+
+def test_a_lock_file_naming_a_live_unrelated_pid_never_blocks(env):
+    """C-2: after a reboot the PID in .run/tunnel.lock can belong to another process. Only a held flock(1) counts."""
+    make_kubeconfig(env)
+    other = subprocess.Popen(["sleep", "60"])
     try:
         env.lockfile.parent.mkdir()
-        env.lockfile.write_text(f"{holder.pid}\n")
-        proc = env.script("tunnel.sh", "stop", TUNNEL_TIMEOUT_S="0")
-        assert proc.returncode != 0 and "still holds" in proc.stderr
-        assert env.lockfile.read_text() == f"{holder.pid}\n"
+        env.lockfile.write_text(f"{other.pid}\n")
+        for action in ("stop", "start"):
+            proc = env.script("tunnel.sh", action)
+            assert proc.returncode == 0, proc.stderr
+            assert "waiting for another tunnel.sh" not in proc.stderr
+        assert len(tunnels(env)) == 1
     finally:
-        holder.kill()
-        holder.wait()
+        other.kill()
+        other.wait()
+
+
+def test_a_killed_holder_never_blocks_the_next_run(env):
+    """tunnel.sh SIGKILLed while it holds the lock (inside start, its tunnel launched): the kernel released the lock,
+    and the tunnel it left running never held it, so the next start takes it at once and reuses that tunnel."""
+    make_kubeconfig(env)
+    gate, at = gate_readyz(env)
+    first = env.popen([str(env.repo / "scripts/tunnel.sh"), "start"])
+    wait_for_file(at, first)  # the first run holds the lock and probes its tunnel
+    assert not lock_free(env.lockfile)
+    first.kill()
+    gate.unlink()  # the killed run's probe (it inherited the descriptor and stderr too) ends now
+    first.communicate(timeout=60)
+    deadline = time.monotonic() + 30
+    while not lock_free(env.lockfile):
+        assert time.monotonic() < deadline, "the orphaned tunnel must not hold the lock"
+        time.sleep(0.05)
+    proc = env.script("tunnel.sh", "start")
+    assert proc.returncode == 0, proc.stderr
+    assert "waiting for another tunnel.sh" not in proc.stderr and "already running" in proc.stderr
+    assert len(tunnels(env)) == 1
+
+
+def test_tunnel_stop_during_a_start_waits_then_stops_the_new_tunnel(env):
+    make_kubeconfig(env)
+    gate, at = gate_readyz(env)
+    start = env.popen([str(env.repo / "scripts/tunnel.sh"), "start"])
+    wait_for_file(at, start)  # start holds the lock, its tunnel launched, its first probe held at the gate
+    stop = env.popen([str(env.repo / "scripts/tunnel.sh"), "stop"])
+    err = read_stderr_until(stop, "waiting for another tunnel.sh")
+    assert f"(pid {start.pid})" in err
+    gate.unlink()
+    _, start_err = start.communicate(timeout=60)
+    _, stop_err = stop.communicate(timeout=60)
+    assert start.returncode == 0, start_err
+    assert stop.returncode == 0, err + stop_err
+    tunnel = int(Path(f"{env.log}.tunnel").read_text())
+    assert f"tunnel stopped (pid {tunnel})" in stop_err
+    assert wait_gone(tunnel) and not env.pidfile.exists()
+    assert lock_free(env.lockfile)
+
+
+def test_tunnel_stop_holds_the_lock(env):
+    make_kubeconfig(env)
+    assert env.script("tunnel.sh", "start").returncode == 0
+    record = Path(f"{env.log}.ps_lock")
+    real_ps = shutil.which("ps")
+    (env.bin / "ps").write_text(f'#!/bin/sh\nif flock -n "{env.lockfile}" true; then echo free; else echo held; fi'
+                                f' >> "{record}"\nexec "{real_ps}" "$@"\n')
+    (env.bin / "ps").chmod(0o755)
+    proc = env.script("tunnel.sh", "stop")
+    assert proc.returncode == 0, proc.stderr
+    assert record.read_text().splitlines() == ["held"], "stop looks up and kills the tunnel under the lock"
+
+
+def test_a_run_that_gives_up_waiting_leaves_the_holders_lock_alone(env):
+    with lock_holder(env.lockfile) as holder:
+        env.lockfile.write_text(f"{holder.pid}\n")
+        proc = env.script("tunnel.sh", "stop", TUNNEL_TIMEOUT_S="0")  # waits TUNNEL_TIMEOUT_S + 30 s, then gives up
+        assert proc.returncode != 0 and "still holds" in proc.stderr and f"pid {holder.pid}" in proc.stderr
+        assert not lock_free(env.lockfile) and env.lockfile.read_text() == f"{holder.pid}\n"
+
+
+@pytest.mark.parametrize("action", ["start", "stop"])
+def test_tunnel_refuses_without_flock(env, tmp_path, action):
+    make_kubeconfig(env)
+    proc = env.run([str(env.repo / "scripts/tunnel.sh"), action], PATH=path_without_flock(env, tmp_path))
+    assert proc.returncode == 2 and "flock" in proc.stderr
+    assert FLOCK_HINT in proc.stderr  # X0-4
+    assert tunnels(env) == []
+
+
+@pytest.mark.parametrize("flock", [True, False], ids=["flock", "no-flock"])
+@pytest.mark.parametrize("action", ["start", "stop"])
+def test_tunnel_refuses_an_old_bash(env, tmp_path, action, flock):
+    """S0-2: tunnel.sh sources common.sh; the copy's _bash_version_ok answers as bash 3.2 does."""
+    make_kubeconfig(env)
+    with open(env.repo / "scripts/lib/common.sh", "a") as f:
+        f.write(f"\n{OLD_BASH}\n")
+    extra = {} if flock else {"PATH": path_without_flock(env, tmp_path)}
+    proc = env.run([str(env.repo / "scripts/tunnel.sh"), action], **extra)
+    assert proc.returncode == 2, proc.stderr
+    assert "bash >= 4.1" in proc.stderr and "brew install bash" in proc.stderr
+    assert not env.lockfile.exists() and tunnels(env) == []
+
+
+def test_tunnel_sh_has_no_stale_lock_breaking_left():
+    text = (ROOT / "scripts/tunnel.sh").read_text()
+    assert "break_stale_lock" not in text and ".break" not in text and "noclobber" not in text
 
 
 def test_tunnel_usage(env):
@@ -901,11 +1226,14 @@ def base_sequence(env, mtu="1460"):
 READYZ = ["--request-timeout=5s", "get", "--raw", "/readyz"]
 
 
-def non_tf(env):
+def non_tf(env, proc):
     """gcloud/kubectl calls in order, without the tunnel and the /readyz probes: the backgrounded
     fake tunnel logs its call concurrently with tunnel.sh's first probes. What is deterministic is
-    checked here: one tunnel, started after the kubeconfig fetch, and a successful probe after it
-    (the fake logs a probe once it has its answer) and before the first `kc wait`."""
+    checked here: one tunnel, started after the kubeconfig fetch; probes before the first `kc wait`;
+    and, in up.sh's own stderr (PROC, the up.sh run), tunnel.sh reporting the API ready before up.sh
+    starts that wait. That last check replaces `tunnel_at < probes[-1]` (M-3): fake_tools.py logs a
+    probe only once it has its answer and answers ok only while the tunnel runs, so a successful last
+    probe always came after the tunnel's line and that assertion could not fail."""
     calls = [(c["tool"], c["argv"]) for c in env.calls() if c["tool"] != "terraform"]
     assert tunnels(env) == [tunnel_argv(env)]
     tunnel_at = calls.index(("gcloud", tunnel_argv(env)))
@@ -913,7 +1241,10 @@ def non_tf(env):
     first_wait = next(i for i, (_, argv) in enumerate(calls) if "wait" in argv)
     before = [argv for _, argv in calls[:tunnel_at] if argv[2:] != READYZ]
     assert before[-1][-1] == "sudo cat /etc/rancher/k3s/k3s.yaml"
-    assert probes and tunnel_at < probes[-1] < first_wait
+    assert probes and probes[-1] < first_wait
+    ready = proc.stderr.find("tunnel up (pid ")
+    assert 0 <= ready < proc.stderr.index("waiting up to 300s for: kc wait --for=condition=Ready node/k3s-cp"), \
+        "up.sh waits for k3s-cp only once tunnel.sh has seen the API answer /readyz"
     return [c for c in calls if c[1][2:] != READYZ and "-N" not in c[1]]
 
 
@@ -923,7 +1254,7 @@ def test_up_base_runs_the_whole_sequence(env):
     tf = tf_subcommands(env)
     assert tf[:4] == ["init", "plan", "show", "apply"]
     assert env.argvs("terraform")[0][-2:] == [f"-backend-config=bucket={BUCKET}", "-backend-config=prefix=base"]
-    assert non_tf(env) == base_sequence(env)
+    assert non_tf(env, proc) == base_sequence(env)
     assert env.kubeconfig.read_text() == KUBECONFIG
     assert alive(int(env.pidfile.read_text()))
     # The brief's waits (C0-2): IAP SSH 300s, k3s-cp Ready 300s, CoreDNS Ready 300s, tunnel 30s.
@@ -1012,14 +1343,16 @@ def test_up_base_refuses_to_replace_the_cp_under_auto_approve(env):
 
 def test_up_base_passes_underlay_mtu_from_env(env):
     env.write_env(f"GCP_PROJECT={PROJECT}\nUNDERLAY_MTU=1380\n")
-    assert env.script("up.sh", "base", AUTO_APPROVE="1").returncode == 0
-    assert non_tf(env) == base_sequence(env, mtu="1380")
+    proc = env.script("up.sh", "base", AUTO_APPROVE="1")
+    assert proc.returncode == 0, proc.stderr
+    assert non_tf(env, proc) == base_sequence(env, mtu="1380")
 
 
 def test_up_base_defaults_an_empty_underlay_mtu(env):
     env.write_env(f"GCP_PROJECT={PROJECT}\nUNDERLAY_MTU=\n")
-    assert env.script("up.sh", "base", AUTO_APPROVE="1").returncode == 0
-    assert non_tf(env) == base_sequence(env, mtu="1460")
+    proc = env.script("up.sh", "base", AUTO_APPROVE="1")
+    assert proc.returncode == 0, proc.stderr
+    assert non_tf(env, proc) == base_sequence(env, mtu="1460")
 
 
 @pytest.mark.parametrize("mtu", ["1460; reboot", "abc", "0", "99999"])
@@ -1061,7 +1394,7 @@ def test_up_all_runs_every_stage_but_init(env):
     assert chdirs == {tf_base_dir(env), f"-chdir={env.repo.resolve()}/infra/workers"}, \
         "make up must not re-apply the bootstrap stack (make init does)"
     # Every stage's calls, in order: tests/scripts/test_workers_ops.py (Task 14, Ruling R38).
-    assert non_tf(env)[:len(base_sequence(env))] == base_sequence(env)
+    assert non_tf(env, proc)[:len(base_sequence(env))] == base_sequence(env)
 
 
 @pytest.mark.parametrize("args", [[], ["nosuch"], ["base", "extra"]])

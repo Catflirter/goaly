@@ -3,13 +3,15 @@
 #
 #   vr_init DIR                     start a run: DIR (mode 0700)/SUMMARY.md with an empty results table;
 #                                   returns 2 if DIR already holds files; finds the operator's IP
-#                                   (vr_operator_ip), which redact then masks as <operator_ip>
+#                                   (vr_operator_ip), which redact then masks as <operator_ip>, and reads
+#                                   GCP_PROJECT from .env, which redact masks as <GCP_PROJECT>
 #   run_check ID TITLE FUNC [ARG…]  run one check into DIR/<NN>-<ID>.txt; FUNC returns 0 PASS, 77 SKIP, else FAIL
 #   vr_cmd CMD…                     print "$ CMD" (redacted), then run CMD; returns CMD's status
 #   vr_cap [--no-echo] CMD…         vr_cmd for $(…): command and output to stderr, stdout to the caller
 #   vr_bg FILE CMD…                 print "$ CMD &", run CMD in the background into FILE (VR_BG_PID)
 #   vr_retry TIMEOUT_S INTERVAL_S CMD…  retry CMD until it succeeds, for at most TIMEOUT_S seconds
 #   redact                          stdin -> stdout filter that replaces secret values with <redacted>
+#                                   and masks .env's project id and the operator's IP (Ruling R39)
 #   vr_finish                       write the totals, scan the run with gitleaks; 1 on any FAIL or leak
 #
 # The check functions check_<id>_<name> (A–C: Task 18; D: Task 21; E: Task 22) are registered in
@@ -25,6 +27,8 @@
 #   - background jobs (kubectl port-forward &, tcpdump &) are killed when the check returns, because
 #     run_check waits for every process holding the check's output; so do not set an EXIT trap in a
 #     check (it replaces that cleanup), and do not leave grandchildren (setsid, nohup) running;
+#     _vr_reap sends them TERM every 0.1 s while any is left and KILL after about 5 s (longer under
+#     load), so a job that needs more than about 5 s after TERM to shut down is killed (Ruling R56);
 #   - a check that leaves something behind until its end (a pcap, Pods, a namespace, a listening
 #     server, GPU instances, a firewall rule) removes it on SIGINT/SIGTERM/SIGHUP too, with
 #     _vr_on_signal --left WHAT CMD; the operator sees the cleanup and, if it fails, what may remain and
@@ -80,10 +84,53 @@ fi
 # The operator's public IP, masked as <operator_ip> once vr_operator_ip has found it (empty until then).
 _VR_MASK_EXPRS=()
 
+# The GCP project id, masked as <GCP_PROJECT>: _VR_PROJECT is the one read from .env by vr_init or
+# by _vr_project_mask (empty until then, or when it is not a project id); _VR_PROJECT_LOOKED is set
+# once either has looked. Kept apart from _VR_MASK_EXPRS, which vr_operator_ip resets.
+# _VR_PROJECT_EXPRS masks the ids listed in _VR_PROJECT_IDS (see _vr_project_mask).
+_VR_PROJECT=""
+_VR_PROJECT_LOOKED=""
+_VR_PROJECT_IDS=""
+_VR_PROJECT_EXPRS=()
+
+# _vr_project_mask: point _VR_PROJECT_EXPRS at the project ids this shell knows: vr_init's, and
+# GCP_PROJECT once vr_env or load_env has read .env. When it knows none, it reads .env itself, once
+# (_vr_project_lookup, in a subshell): a redact may start before .env is loaded (the demo's screen
+# pipe), and a check's own vr_env runs in the check's subshell, out of reach of the redact it is
+# piped into. So a redact masks .env's id whatever the order; the ids are fixed when it starts.
+# Only an id _gcp_project_ok accepts is masked, so it holds no sed metacharacter. It is masked
+# anywhere in a line and in any case: in A2's FQDNs (k3s-cp.<zone>.c.<id>.internal), the state
+# bucket (<id>-k3s-tfstate) and service accounts (<name>@<id>.iam.gserviceaccount.com).
+_vr_project_mask() {
+  local id ids="" upper e i
+  if [[ -z "$_VR_PROJECT_LOOKED" ]] && ! GCP_PROJECT="$_VR_PROJECT" _gcp_project_ok && ! _gcp_project_ok; then
+    _VR_PROJECT_LOOKED=1
+    _VR_PROJECT="$(_vr_project_lookup 2>/dev/null)" || _VR_PROJECT=""
+    GCP_PROJECT="$_VR_PROJECT" _gcp_project_ok || _VR_PROJECT=""
+  fi
+  for id in "$_VR_PROJECT" "${GCP_PROJECT:-}"; do
+    if GCP_PROJECT="$id" _gcp_project_ok && [[ " $ids " != *" $id "* ]]; then ids+="${ids:+ }$id"; fi
+  done
+  [[ "$ids" != "$_VR_PROJECT_IDS" ]] || return 0
+  _VR_PROJECT_IDS="$ids"
+  _VR_PROJECT_EXPRS=()
+  for id in $ids; do
+    # Portable ERE has no case-insensitive flag (see above): each letter becomes an [xX] class.
+    upper="$(printf '%s' "$id" | tr '[:lower:]' '[:upper:]')"
+    e=""
+    for ((i = 0; i < ${#id}; i++)); do
+      if [[ "${id:i:1}" == [a-z] ]]; then e+="[${id:i:1}${upper:i:1}]"; else e+="${id:i:1}"; fi
+    done
+    _VR_PROJECT_EXPRS+=(-e "s/$e/<GCP_PROJECT>/g")
+  done
+}
+
 # LC_ALL=C: match bytes, not characters. All patterns are ASCII, and BSD sed under a UTF-8 locale
 # aborts ("illegal byte sequence") on binary or non-UTF-8 output such as tcpdump -A payloads.
 redact() {
-  LC_ALL=C "${_VR_SED[@]}" -E "${_VR_REDACT_EXPRS[@]}" ${_VR_MASK_EXPRS[@]+"${_VR_MASK_EXPRS[@]}"}
+  _vr_project_mask
+  LC_ALL=C "${_VR_SED[@]}" -E "${_VR_REDACT_EXPRS[@]}" ${_VR_PROJECT_EXPRS[@]+"${_VR_PROJECT_EXPRS[@]}"} \
+    ${_VR_MASK_EXPRS[@]+"${_VR_MASK_EXPRS[@]}"}
 }
 
 # _vr_trim TEXT: TEXT without leading and trailing whitespace (Python's str.strip, as gpuctl uses).
@@ -110,6 +157,13 @@ _vr_operator_ip_lookup() (
   ip="$(_vr_trim "$ip")"
   is_ipv4 "$ip" || exit 1
   printf '%s checkip.amazonaws.com\n' "$ip"
+)
+
+# _vr_project_lookup: print GCP_PROJECT from .env. Runs in a subshell, so .env's values stay out of
+# the caller; exits 2 without a readable .env (load_env).
+_vr_project_lookup() (
+  load_env
+  printf '%s\n' "${GCP_PROJECT:-}"
 )
 
 # vr_operator_ip: find the operator's public IP once (vr_init does, so every check of the run shares
@@ -151,7 +205,9 @@ _vr_now() {
 # the evidence of two runs is never mixed. DIR is 0700 and its files 0600: unreviewed evidence (cluster
 # topology, IPs, anything redact missed) stays readable by the operator only; promoting a run to
 # verification/final/ is a deliberate copy. It also finds the operator's public IP for the whole run
-# (vr_operator_ip) and says in SUMMARY.md whether it is masked; when it is unknown, it warns.
+# (vr_operator_ip) and reads GCP_PROJECT from .env, so that redact masks both in all evidence and on
+# the operator's screen (Ruling R39), and says in SUMMARY.md whether each is masked; when one is
+# unknown, it warns.
 vr_init() {
   local dir="$1"
   if [[ -d "$dir" && -n "$(ls -A -- "$dir")" ]]; then
@@ -164,7 +220,23 @@ vr_init() {
   VR_SEQ=0
   VR_FAILS=0
   VR_SKIPS=0
-  local opip
+  local opip project project_rc=0
+  _VR_PROJECT_LOOKED=1
+  _VR_PROJECT="$(_vr_project_lookup 2>/dev/null)" || project_rc=$?
+  if GCP_PROJECT="$_VR_PROJECT" _gcp_project_ok; then
+    project="masked as <GCP_PROJECT>"
+  else
+    _VR_PROJECT=""
+    if ((project_rc == 2)); then
+      # A2's describe needs no .env, so its evidence would show the raw id: say so, not only in SUMMARY.md.
+      project="not masked (.env is not readable)"
+      log "warning: .env is not readable, so the evidence cannot mask the GCP project id"
+    else
+      project="not masked (GCP_PROJECT in .env is empty or not a project id)"
+      log "warning: GCP_PROJECT in .env is empty or not a GCP project id, so the evidence cannot mask it"
+    fi
+  fi
+  _vr_project_mask
   if vr_operator_ip; then
     opip="masked as <operator_ip> ($VR_OPERATOR_IP_FROM)"
   else
@@ -182,6 +254,7 @@ vr_init() {
       printf '# Verification run\n\n'
       printf 'Started: %s (%s)\n\n' "$(_vr_now)" "$VR_TZ"
       printf 'Operator IP: %s\n\n' "$opip"
+      printf 'GCP project id: %s\n\n' "$project"
       printf '| # | ID | Check | Result |\n'
       printf '|---|---|---|---|\n'
     } >"$VR_DIR/SUMMARY.md"
@@ -506,6 +579,7 @@ vr_env() {
   load_env
   unset LAMBDA_API_KEY
   _VR_ENV_LOADED=1
+  _vr_project_mask # GCP_PROJECT is known now: mask it (also when it differs from what vr_init read)
 }
 
 # _vr_sleep SECONDS: sleep; VR_NO_WAIT=1 (the offline tests) skips it and says so in the evidence.
@@ -1124,19 +1198,16 @@ _vr_table() {
 # A line of `gpuctl rules` for Lambda's rule that admits the operator (lambda/gpuctl/peers.py).
 _VR_OPERATOR_RULE_RE='^(  [a-z]+ +[^ ]+ +)[0-9.]+(/32 +operator ssh)$'
 
-# _vr_mask_ids: stdin -> stdout with the GCP project id from .env replaced by <GCP_PROJECT> and the
-# operator's IP (vr_operator_ip) by <operator_ip>: B6's evidence holds both, and a run promoted to
+# _vr_mask_ids: stdin -> stdout with the GCP project id replaced by <GCP_PROJECT> and the operator's
+# IP (vr_operator_ip) by <operator_ip>: B6's evidence holds both, and a run promoted to
 # verification/final is committed (Ruling R39 keeps real project ids and IPs out of what is
-# delivered). redact masks the IP in all evidence too; this covers a check called without vr_init.
-# The project id is checked first, so it holds no sed metacharacter. The source of Lambda's
-# "operator ssh" rule is masked even when the operator's IP is unknown.
+# delivered). redact masks both in all evidence too, with the same expressions (_vr_project_mask
+# also finds the id vr_env read); this covers a check called without vr_init or run_check. The
+# source of Lambda's "operator ssh" rule is masked even when the operator's IP is unknown.
 _vr_mask_ids() {
-  local -a exprs=(-e '')
-  if _gcp_project_ok; then
-    exprs+=(-e "s/${GCP_PROJECT}/<GCP_PROJECT>/g")
-  fi
-  exprs+=(-e "s#${_VR_OPERATOR_RULE_RE}#\\1<operator_ip>\\2#")
-  LC_ALL=C sed -E "${exprs[@]}" ${_VR_MASK_EXPRS[@]+"${_VR_MASK_EXPRS[@]}"}
+  _vr_project_mask
+  LC_ALL=C sed -E -e '' ${_VR_PROJECT_EXPRS[@]+"${_VR_PROJECT_EXPRS[@]}"} \
+    -e "s#${_VR_OPERATOR_RULE_RE}#\\1<operator_ip>\\2#" ${_VR_MASK_EXPRS[@]+"${_VR_MASK_EXPRS[@]}"}
 }
 
 # B6: the GCP firewall rules named fw-* as a table, and gpuctl's Lambda rules. Every source must be
@@ -1248,7 +1319,8 @@ check_c2_cross_node_curl() {
 }
 
 # C3: kubectl port-forward svc/hello (in the background), curl it on localhost, stop the forward.
-# VR_PF_PORT (default 18080) is the local port; the offline tests pick a free one.
+# VR_PF_PORT (default 18080) is the local port; the offline tests pick a free one. --noproxy '*':
+# an operator's http_proxy, HTTPS_PROXY or ALL_PROXY would send the localhost request to the proxy.
 check_c3_port_forward() {
   local port="${VR_PF_PORT:-18080}" logf pid body rc=0
   [[ "$port" =~ ^[1-9][0-9]{0,4}$ ]] || { echo "C3: VR_PF_PORT is not a port: '$port'"; return 1; }
@@ -1256,7 +1328,7 @@ check_c3_port_forward() {
   vr_bg "$logf" kc -n hello port-forward svc/hello "$port:80"
   pid="$VR_BG_PID"
   if _vr_wait_text "$logf" "Forwarding from" "$pid" 30; then
-    body="$(vr_cap curl -fsS -m 5 "localhost:$port")" || rc=$?
+    body="$(vr_cap curl --noproxy '*' -fsS -m 5 "localhost:$port")" || rc=$?
   else
     echo "C3: the port-forward did not start"
     rc=1

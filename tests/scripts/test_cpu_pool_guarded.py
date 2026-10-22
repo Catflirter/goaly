@@ -18,7 +18,8 @@ from pathlib import Path
 
 import pytest
 
-from test_ops_scripts import OUTPUTS
+from test_ops_scripts import OUTPUTS, lock_holder, path_without_flock
+from test_ops_scripts import lock_free as path_lock_free
 from test_workers_ops import (
     DRAIN_ARGS, RT, calls, cpu_join, env, get_node, index_of, is_drain, is_tf, kc, leftovers, planned, pool,  # noqa: F401
     set_pool, tf, worker_resources,
@@ -244,24 +245,13 @@ LOCK = ".run/workers.lock"
 
 def lock_free(env):
     """Nobody holds .run/workers.lock (flock(1), as the guarded run takes it)."""
-    return subprocess.run(["flock", "-n", str(env.repo / LOCK), "true"]).returncode == 0
+    return path_lock_free(env.repo / LOCK)
 
 
-@contextlib.contextmanager
 def other_guarded_run(env):
-    """Another guarded run holds the lock: `flock .run/workers.lock sleep 60` in its own process group."""
-    (env.repo / ".run").mkdir(exist_ok=True)
-    holder = subprocess.Popen(["flock", str(env.repo / LOCK), "sleep", "60"], start_new_session=True)
-    try:
-        deadline = time.monotonic() + 10
-        while lock_free(env):
-            assert time.monotonic() < deadline and holder.poll() is None, "the holder never took the lock"
-            time.sleep(0.02)
-        yield holder
-    finally:
-        if holder.poll() is None:
-            os.killpg(holder.pid, signal.SIGKILL)
-        holder.wait()
+    """Another run holds the workers stack's lock: `flock -o .run/workers.lock sleep 60` in its own process group.
+    -o: sleep does not inherit the lock, so the lock is free as soon as the flock process is reaped (S3-m3)."""
+    return lock_holder(env.repo / LOCK)
 
 
 @pytest.mark.parametrize("args", [["scale", "2"], ["scale", "1"], ["remove", "k3s-cpu-2"]])
@@ -272,8 +262,8 @@ def test_a_guarded_run_refuses_while_another_holds_the_lock(env, args):
         proc = guarded(env, *args, AUTO_APPROVE="1")
         assert not lock_free(env), "the other run still holds it"
     assert proc.returncode == 2
-    assert "another guarded cpu-pool.sh run holds" in proc.stderr and "workers.lock" in proc.stderr
-    assert "nothing was changed" in proc.stderr
+    assert "another run holds" in proc.stderr and "workers.lock" in proc.stderr
+    assert "changed nothing in the workers stack" in proc.stderr
     assert env.calls() == [], "nothing planned, drained or applied"
     assert env.tfvars.read_text() == before
 
@@ -316,31 +306,32 @@ def test_a_failed_guarded_run_releases_the_lock(env):
     assert lock_free(env)
 
 
-def test_without_guarded_the_lock_is_not_used(env):
-    """Core behaviour is unchanged without --guarded (task scope): an unguarded run neither takes nor honours it.
-    A guarded run is protected from an unguarded one by the plan check below."""
+@pytest.mark.parametrize("args", [["scale", "2"], ["scale", "1"], ["remove", "k3s-cpu-2"]])
+def test_an_unguarded_run_is_refused_too_while_another_holds_the_lock(env, args):
+    """C-1: the workers stack's lock is core's (stack_lock), so an unguarded make cpu-scale / cpu-remove takes it too,
+    before it reads the inventory: it can neither race a guarded run nor make up's workers stage."""
+    set_pool(env, ["k3s-cpu-1", "k3s-cpu-2"])
     workers(env, ips(1, 2))
-    env.scenario["ready"] = ["k3s-cpu-1"]
+    before = env.tfvars.read_text()
     with other_guarded_run(env):
-        proc = env.script("cpu-pool.sh", "scale", "2", AUTO_APPROVE="1")
+        proc = env.script("cpu-pool.sh", *args, AUTO_APPROVE="1")
+    assert proc.returncode == 2, proc.stderr
+    assert "another run holds" in proc.stderr and "workers.lock" in proc.stderr
+    assert env.calls() == [] and env.tfvars.read_text() == before
+
+
+@pytest.mark.parametrize("args", [["scale", "1"], ["remove", "k3s-cpu-2"]])
+def test_an_unguarded_run_holds_the_lock_through_the_drain_to_the_apply(env, args):
+    set_pool(env, ["k3s-cpu-1", "k3s-cpu-2"])
+    workers(env, ips(1, 2), after=ips(1))
+    env.scenario["changes"] = {"workers": deletes("k3s-cpu-2")}
+    env.scenario["drain_plan"] = "keep"
+    env.scenario["ready"] = ["k3s-cpu-1", "k3s-cpu-2"]
+    proc = env.script("cpu-pool.sh", *args, AUTO_APPROVE="1")
     assert proc.returncode == 0, proc.stderr
-
-
-def path_without_flock(env, tmp_path):
-    """env's PATH with the fakes first, then every other directory's commands linked into one, flock left out."""
-    dirs = [d for d in env.environ({})["PATH"].split(":") if d != str(env.bin)]
-    tools = tmp_path / "no-flock-bin"
-    tools.mkdir()
-    for d in dirs:
-        if not os.path.isdir(d):
-            continue
-        for name in os.listdir(d):
-            target = tools / name
-            if name != "flock" and not target.exists() and os.access(os.path.join(d, name), os.X_OK):
-                target.symlink_to(os.path.join(d, name))
-    path = f"{env.bin}:{tools}"
-    assert shutil.which("flock", path=path) is None
-    return path
+    assert Path(str(env.log) + ".lock_at_drain").read_text() == "held", "the lock is held during the drain"
+    assert tf(env)[-1] == "apply"
+    assert lock_free(env)
 
 
 def test_guarded_refuses_without_flock_and_unguarded_runs_unchanged(env, tmp_path):
@@ -350,11 +341,16 @@ def test_guarded_refuses_without_flock_and_unguarded_runs_unchanged(env, tmp_pat
     proc = env.run([str(env.repo / "scripts/cpu-pool.sh"), "scale", "1", "--guarded"], AUTO_APPROVE="1", PATH=path)
     assert proc.returncode == 2
     assert "--guarded needs flock" in proc.stderr and "nothing was changed" in proc.stderr
+    assert "Debian/Ubuntu: apt install util-linux; macOS: brew install flock" in proc.stderr  # X0-4
     assert env.calls() == [] and env.tfvars.read_text() == before
     workers(env, ips(1, 2))
     env.scenario["ready"] = ["k3s-cpu-1", "k3s-cpu-2"]
     proc = env.run([str(env.repo / "scripts/cpu-pool.sh"), "scale", "2"], AUTO_APPROVE="1", PATH=path)
     assert proc.returncode == 0, proc.stderr
+    # An unguarded run without flock(1) runs unlocked, after exactly one warning (its take_lock, tf_plan and
+    # tf_apply_plan all ask for the workers stack's lock).
+    assert proc.stderr.count("WARNING") == 1 and "flock" in proc.stderr
+    assert tf(env)[-1] == "apply"
 
 
 @pytest.mark.parametrize("args, changes", [(["scale", "1"], deletes("k3s-cpu-2")),
@@ -391,6 +387,52 @@ def test_a_plan_replaced_while_the_guard_reads_it_is_never_applied(env):
     assert "apply" not in tf(env) and not any(is_drain(c) for c in env.calls())
     assert env.tfvars.read_text() == before
     assert (env.repo / ".run/workers.tfplan").read_text() == "another run's plan"
+
+
+@pytest.mark.parametrize("args", [["scale", "1"], ["remove", "k3s-cpu-2"]])
+def test_a_failed_run_leaves_a_plan_another_run_wrote_after_the_guard(env, args):
+    """S3-m2: the EXIT trap removes the saved plan only while it is still the bytes this run's guard read. Here
+    another run replaces it during the drain, and the drain then fails: the other run's plan stays."""
+    set_pool(env, ["k3s-cpu-1", "k3s-cpu-2"])
+    workers(env, ips(1, 2), after=ips(1))
+    env.scenario["changes"] = {"workers": deletes("k3s-cpu-2")}
+    env.scenario["drain_plan"] = "replace"
+    env.scenario["drain_fail"] = ["k3s-cpu-2"]
+    env.scenario["ready"] = ["k3s-cpu-1", "k3s-cpu-2"]
+    proc = guarded(env, *args, AUTO_APPROVE="1")
+    assert proc.returncode == 1 and "cannot drain k3s-cpu-2" in proc.stderr
+    assert "apply" not in tf(env)
+    assert (env.repo / ".run/workers.tfplan").read_text() == "another run's plan"
+
+
+@pytest.mark.parametrize("args", [["scale", "1"], ["remove", "k3s-cpu-2"]])
+def test_a_failed_run_removes_its_own_plan(env, args):
+    """The same failure with the plan untouched: it is this run's, and the EXIT trap removes it."""
+    set_pool(env, ["k3s-cpu-1", "k3s-cpu-2"])
+    workers(env, ips(1, 2), after=ips(1))
+    env.scenario["changes"] = {"workers": deletes("k3s-cpu-2")}
+    env.scenario["drain_fail"] = ["k3s-cpu-2"]
+    env.scenario["ready"] = ["k3s-cpu-1", "k3s-cpu-2"]
+    proc = guarded(env, *args, AUTO_APPROVE="1")
+    assert proc.returncode == 1 and "cannot drain k3s-cpu-2" in proc.stderr
+    assert "apply" not in tf(env) and not (env.repo / ".run/workers.tfplan").exists()
+    assert leftovers(env) == []
+
+
+@pytest.mark.parametrize("args", [["scale", "1"], ["remove", "k3s-cpu-2"]])
+def test_a_failed_run_says_its_plan_is_gone_when_another_run_removed_it(env, args):
+    """C0-2: the EXIT trap tells a removed plan from a replaced one, as the decline path does (S3-m4)."""
+    set_pool(env, ["k3s-cpu-1", "k3s-cpu-2"])
+    workers(env, ips(1, 2), after=ips(1))
+    env.scenario["changes"] = {"workers": deletes("k3s-cpu-2")}
+    env.scenario["drain_plan"] = "remove"
+    env.scenario["drain_fail"] = ["k3s-cpu-2"]
+    env.scenario["ready"] = ["k3s-cpu-1", "k3s-cpu-2"]
+    proc = guarded(env, *args, AUTO_APPROVE="1")
+    assert proc.returncode == 1 and "cannot drain k3s-cpu-2" in proc.stderr
+    assert "workers.tfplan is gone already" in proc.stderr and "nothing to remove" in proc.stderr
+    assert "another run wrote it" not in proc.stderr
+    assert not (env.repo / ".run/workers.tfplan").exists()
 
 
 def test_a_plan_removed_after_the_guard_is_a_clear_failure(env):
@@ -501,6 +543,26 @@ def test_an_interactive_guarded_run_declined_at_the_apply_applies_nothing(env):
     assert rc == 2 and "not applied: workers" in err
     assert "apply" not in tf(env)
     assert not (env.repo / ".run/workers.tfplan").exists()
+    assert "workers.tfplan was removed" in err  # S3-m4: the log says what happened to it
+
+
+def test_an_interactive_decline_says_so_when_the_plan_is_already_gone(env):
+    """S3-m4: another run removed the saved plan while this one asked: the decline says it was gone already, not that
+    it was removed or left where it is."""
+    args = scenario(env, "scale up")
+    plan = env.repo / ".run/workers.tfplan"
+
+    def answer(question):
+        if question == APPLY_Q:
+            plan.unlink()
+            return "n\n"
+        return "y\n"
+
+    rc, err = interactive(env, args, answer)
+    assert rc == 2 and "not applied: workers" in err
+    assert "workers.tfplan is gone already" in err
+    assert "was removed" not in err and "left where it is" not in err
+    assert "apply" not in tf(env) and not plan.exists()
 
 
 def test_an_interactive_decline_leaves_a_plan_another_run_wrote_while_it_asked(env):
@@ -600,3 +662,10 @@ def test_without_guarded_no_guard_runs(env):
 def test_guarded_usage(env, args):
     proc = env.script("cpu-pool.sh", *args)
     assert proc.returncode == 2 and env.calls() == []
+
+
+def test_cpu_pool_applies_only_through_core_tf_apply_plan():
+    """S3-m1: the guarded apply is core's tf_apply_plan (--confirmed once apply_plan asked), not a copy of it."""
+    text = (Path(__file__).resolve().parents[2] / "scripts/cpu-pool.sh").read_text()
+    assert "tf_apply_plan workers --confirmed" in text
+    assert " apply -input" not in text and "apply_checked_plan" not in text
