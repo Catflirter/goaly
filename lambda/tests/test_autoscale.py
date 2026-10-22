@@ -3,15 +3,17 @@
 The fixtures build kubectl-JSON-shaped dicts (`kubectl get pods -A -o json`, `kubectl get nodes -o json`); every
 decision is a pure function of them, the stored State and `now`.
 """
+import ast
 import json
 from datetime import datetime, timezone
+from pathlib import Path
 
 import pytest
 
 from gpuctl import autoscale
 from gpuctl.autoscale import (
-    COOLDOWN_S, CPU_IDLE_S, PENDING_GRACE_S, Action, NodeObs, PendingPod, State, decide, node_observations,
-    pending_pods,
+    CLOCK_SKEW_S, COOLDOWN_S, CPU_IDLE_S, GPU_JOIN_DEADLINE_S, PENDING_GRACE_S, STUCK_IDLE_S, Action, NodeObs,
+    PendingPod, State, decide, node_observations, pending_pods,
 )
 from gpuctl.spec import Autoscale, Pool
 
@@ -99,10 +101,38 @@ def test_constants_match_spec():
     assert (PENDING_GRACE_S, CPU_IDLE_S, COOLDOWN_S) == (30, 300, 120)
 
 
+# Everything autoscale.py may import: no os, pathlib, socket, subprocess, time, requests.
+ALLOWED_IMPORTS = {"__future__", "json", "math", "re", "collections.abc", "dataclasses", "datetime", "typing",
+                   "gpuctl.planner", "gpuctl.spec"}
+# Calls that read a clock, a file or the terminal, or run something.
+FORBIDDEN_CALLS = {"open", "now", "utcnow", "today", "time", "time_ns", "monotonic", "perf_counter", "print", "input",
+                   "exec", "eval", "__import__", "read_text", "system", "run", "Popen"}
+
+
+def _imports_and_calls(source):
+    imported, called = set(), set()
+    for n in ast.walk(ast.parse(source)):
+        if isinstance(n, ast.Import):
+            imported |= {alias.name for alias in n.names}
+        elif isinstance(n, ast.ImportFrom):
+            imported.add(n.module)
+        elif isinstance(n, ast.Call):
+            called.add(n.func.id if isinstance(n.func, ast.Name) else getattr(n.func, "attr", None))
+    return imported, called
+
+
 def test_module_does_no_io():
-    source = open(autoscale.__file__, encoding="utf-8").read()
-    for forbidden in ("import subprocess", "import requests", "import time", "time.time", "open("):
-        assert forbidden not in source
+    # Scope: pure functions, no I/O, no clock reads; `now` is always a parameter.
+    imported, called = _imports_and_calls(Path(autoscale.__file__).read_text(encoding="utf-8"))
+    assert imported <= ALLOWED_IMPORTS
+    assert not called & FORBIDDEN_CALLS
+
+
+@pytest.mark.parametrize("snippet", ["import os", "from time import monotonic", "import socket", "import pathlib",
+                                     "x = datetime.now(timezone.utc)", "x = datetime.utcnow()", "y = open('f')"])
+def test_io_check_catches_a_regression(snippet):
+    imported, called = _imports_and_calls(snippet)
+    assert not imported <= ALLOWED_IMPORTS or called & FORBIDDEN_CALLS
 
 
 # --- pending_pods -------------------------------------------------------------------------------------------------
@@ -233,13 +263,29 @@ def test_node_observations_only_own_nodes_and_read_ready_and_label():
     ]
 
 
+@pytest.mark.parametrize("bad", [None, {}, {"kind": "Status", "message": "Unauthorized"}, {"items": None},
+                                 {"items": {}}, {"items": ["not-a-pod"]}, []])
+def test_node_observations_rejects_a_malformed_listing(bad):
+    # Busyness guards every scale-down: a broken listing must never read as "nothing runs anywhere".
+    with pytest.raises(ValueError):
+        node_observations(items(node("k3s-cpu-2")), bad)
+    with pytest.raises(ValueError):
+        node_observations(bad, items())
+
+
+def test_node_observations_accepts_an_empty_listing():
+    assert node_observations(items(node("k3s-cpu-2")), items()) == [NodeObs("k3s-cpu-2", "cpu", True, True, False)]
+    assert node_observations(items(), items()) == []
+
+
 # --- State ----------------------------------------------------------------------------------------------------------
 
 def test_state_roundtrip_preserves_cooldown():
     # Review Focus #1: the cooldown survives a restart through .run/autoscaler-state.json.
     s = State(last_action_at=1000.0, idle_since={"k3s-cpu-2": 900.0})
     assert State.from_json(s.to_json()) == s
-    assert json.loads(s.to_json()) == {"last_action_at": 1000.0, "idle_since": {"k3s-cpu-2": 900.0}}
+    assert json.loads(s.to_json()) == {"last_action_at": 1000.0, "idle_since": {"k3s-cpu-2": 900.0}, "stuck": {},
+                                       "launches": {}}
 
 
 @pytest.mark.parametrize("text, expected", [
@@ -255,12 +301,37 @@ def test_state_from_json_tolerates_missing_or_empty_fields(text, expected):
 
 @pytest.mark.parametrize("text", [
     "[]", "not json", '{"last_action_at": "soon"}', '{"last_action_at": true}', '{"idle_since": []}',
-    '{"idle_since": {"k3s-cpu-2": "x"}}', '{"last_action_at": NaN}',
+    '{"idle_since": {"k3s-cpu-2": "x"}}', '{"last_action_at": NaN}', '{"last_action_at": 1' + "0" * 400 + '}',
+    '{"stuck": []}', '{"stuck": {"ns/p": 3}}', '{"launches": {"a6000": 2}}', '{"launches": {"a6000": {"at": 1.0}}}',
+    '{"launches": {"a6000": {"target": "2", "at": 1.0}}}', '{"launches": {"a6000": {"target": 2, "at": "x"}}}',
+    '{"launches": {"a6000": {"target": true, "at": 1.0}}}',
 ])
 def test_state_from_json_rejects_garbage(text):
     # A corrupt file must not silently reset the cooldown: the caller sees the error.
     with pytest.raises(ValueError):
         State.from_json(text)
+
+
+def test_state_roundtrip_preserves_stuck_pods_and_launches():
+    s = State(last_action_at=1000.0, idle_since={"k3s-gpu-a6000-2": 950.0},
+              stuck={"gpu-test/burn-2": "k3s-gpu-a6000-2 was idle"}, launches={"a6000": (2, 990.0)})
+    assert State.from_json(s.to_json()) == s
+
+
+def test_held_reason_is_not_saved():
+    s = State(last_action_at=1000.0, held="cooldown: 10s left")
+    assert "held" not in json.loads(s.to_json())
+    assert State.from_json(s.to_json()).held is None
+
+
+def test_state_timestamp_in_the_future_is_rejected():
+    # A last_action_at ahead of `now` would hold every action silently (clock moved back, or a bad file).
+    for state in (State(last_action_at=NOW + CLOCK_SKEW_S + 1), State(idle_since={"k3s-cpu-2": NOW + CLOCK_SKEW_S + 1}),
+                  State(launches={"a6000": (2, NOW + CLOCK_SKEW_S + 1)})):
+        with pytest.raises(ValueError, match="future"):
+            run(pending=[cpu_pending()], state=state)
+    action, _ = run(pending=[cpu_pending()], state=State(last_action_at=NOW + CLOCK_SKEW_S))
+    assert action is None  # within the allowed skew: just a cooldown
 
 
 def test_default_states_do_not_share_idle_since():
@@ -332,6 +403,7 @@ def test_no_second_gpu_launch_while_launching():
 
 @pytest.mark.parametrize("new_node", [
     gpu_node("k3s-gpu-a6000-2", ready=False, labeled=False),  # joined, not Ready yet
+    gpu_node("k3s-gpu-a6000-2", ready=False, labeled=True),   # labeled node gone NotReady (reboot, kubelet restart)
     gpu_node("k3s-gpu-a6000-2", ready=True, labeled=False),   # Ready, admin label not applied yet
     None,                                                     # instance active, node not registered yet
 ])
@@ -412,17 +484,24 @@ def test_pool_without_autoscale_is_never_scaled():
 
 
 def test_priority_scale_up_before_scale_down():
-    nodes = [cpu_node("k3s-cpu-1", busy=True), cpu_node("k3s-cpu-2"), gpu_node("k3s-gpu-a6000-1"),
-             gpu_node("k3s-gpu-a6000-2")]
-    idle = State(idle_since={n.name: NOW - 3600 for n in nodes})
+    # Each scale-up competes with a scale-down of the other kind: a Pending Pod next to an idle node of its own kind
+    # is stuck (see the stuck-Pod tests below), so it would not ask for a scale-up at all.
     pools = {"a6000": pool(lo=0, hi=3)}
-    common = dict(nodes=nodes, pools=pools, gpu_counts={"a6000": 2}, cpu_count=2, state=idle)
-    assert run(pending=[gpu_pending(), cpu_pending()], **common)[0].kind == "gpu_scale"
-    assert run(pending=[gpu_pending(), cpu_pending()], **common)[0].target == 3
-    assert run(pending=[cpu_pending()], **common)[0].kind == "cpu_scale"
-    assert run(**common)[0] == Action("cpu_remove", node="k3s-cpu-2", reason=run(**common)[0].reason)
-    nodes_no_idle_cpu = [n for n in nodes if n.name != "k3s-cpu-2"]
-    action, _ = run(**{**common, "nodes": nodes_no_idle_cpu, "cpu_count": 1})
+    long_idle = {n: NOW - 3600 for n in ("k3s-cpu-2", "k3s-gpu-a6000-2")}
+    common = dict(pools=pools, gpu_counts={"a6000": 2}, cpu_count=2, state=State(idle_since=long_idle))
+    cpu_idle = [cpu_node("k3s-cpu-1", busy=True), cpu_node("k3s-cpu-2"), gpu_node("k3s-gpu-a6000-1", busy=True),
+                gpu_node("k3s-gpu-a6000-2", busy=True)]
+    action, _ = run(pending=[gpu_pending()], nodes=cpu_idle, **common)
+    assert (action.kind, action.target) == ("gpu_scale", 3)  # rule 2 before rule 4
+    gpu_idle = [cpu_node("k3s-cpu-1", busy=True), cpu_node("k3s-cpu-2", busy=True),
+                gpu_node("k3s-gpu-a6000-1", busy=True), gpu_node("k3s-gpu-a6000-2")]
+    action, _ = run(pending=[cpu_pending()], nodes=gpu_idle, **common)
+    assert (action.kind, action.target) == ("cpu_scale", 3)  # rule 3 before rule 5
+    both_idle = [cpu_node("k3s-cpu-1", busy=True), cpu_node("k3s-cpu-2"), gpu_node("k3s-gpu-a6000-1", busy=True),
+                 gpu_node("k3s-gpu-a6000-2")]
+    action, _ = run(nodes=both_idle, **common)
+    assert action == Action("cpu_remove", node="k3s-cpu-2", reason=action.reason)  # rule 4 before rule 5
+    action, _ = run(nodes=gpu_idle, **common)
     assert (action.kind, action.target) == ("gpu_scale", 1)
 
 
@@ -434,3 +513,174 @@ def test_every_action_carries_a_reason():
         run(nodes=nodes, cpu_count=2, state=State(idle_since={"k3s-cpu-2": NOW - CPU_IDLE_S}))[0],
     ]
     assert all(a is not None and a.reason for a in actions)
+
+
+# --- rule 0 per the brief: Ready and not busy, labeled or not ------------------------------------------------------
+
+def test_unlabeled_idle_gpu_node_gets_an_idle_clock_and_is_scaled_down():
+    # Brief rule 0 has no label condition: a GPU node whose labeling step failed must not run (and bill) forever.
+    pools = {"a6000": pool(lo=1, hi=2, idle_minutes=5)}
+    nodes = [cpu_node("k3s-cpu-1", busy=True), gpu_node("k3s-gpu-a6000-1", busy=True),
+             gpu_node("k3s-gpu-a6000-2", labeled=False)]
+    _, state = run(nodes=nodes, pools=pools, gpu_counts={"a6000": 2},
+                   state=State(idle_since={"k3s-gpu-a6000-2": NOW - 100}))
+    assert state.idle_since["k3s-gpu-a6000-2"] == NOW - 100
+    action, _ = run(nodes=nodes, pools=pools, gpu_counts={"a6000": 2},
+                    state=State(idle_since={"k3s-gpu-a6000-2": NOW - 5 * 60}))
+    assert (action.kind, action.pool, action.target) == ("gpu_scale", "a6000", 1)
+
+
+def test_fixed_pool_with_fewer_nodes_does_not_block_an_autoscaled_pool():
+    # The "registered < count" launching check covers autoscaled pools only; a fixed pool is managed by hand.
+    pools = {"a": pool("a", count=1, hi=2), "b": pool("b", count=1, autoscaled=False)}
+    nodes = [cpu_node("k3s-cpu-1", busy=True), gpu_node("k3s-gpu-a-1", busy=True)]
+    action, _ = run(pending=[gpu_pending()], nodes=nodes, pools=pools, gpu_counts={"a": 1})
+    assert (action.kind, action.pool, action.target) == ("gpu_scale", "a", 2)
+
+
+# --- held: why a scale-up that Pending Pods asked for was withheld ---------------------------------------------------
+
+@pytest.mark.parametrize("kwargs, words", [
+    (dict(pending=[gpu_pending()], gpu_launching=True), "booting"),
+    (dict(pending=[gpu_pending()], nodes=[*CLUSTER, gpu_node("k3s-gpu-a6000-2", ready=False)],
+          gpu_counts={"a6000": 2}, pools={"a6000": pool(hi=3)}), "k3s-gpu-a6000-2 is NotReady"),
+    (dict(pending=[gpu_pending()], nodes=[*CLUSTER, gpu_node("k3s-gpu-a6000-2", labeled=False)],
+          gpu_counts={"a6000": 2}, pools={"a6000": pool(hi=3)}), "k3s-gpu-a6000-2 has no"),
+    (dict(pending=[gpu_pending()], gpu_counts={"a6000": 2}, pools={"a6000": pool(hi=3)}), "1 of 2"),
+    (dict(pending=[gpu_pending()], nodes=[*CLUSTER, gpu_node("k3s-gpu-a6000-2", busy=True)],
+          gpu_counts={"a6000": 2}), "max"),
+    (dict(pending=[cpu_pending()], cpu_count=3), "cpu_max 3"),
+    (dict(pending=[cpu_pending()], state=State(last_action_at=NOW - 35)), "cooldown: 85s left"),
+])
+def test_withheld_scale_up_reports_why(kwargs, words):
+    action, state = run(**kwargs)
+    assert action is None
+    assert words in state.held
+    assert "/" in state.held  # names the waiting Pod
+
+
+def test_nothing_pending_means_nothing_held():
+    assert run()[1].held is None
+    assert run(state=State(last_action_at=NOW - 1))[1].held is None
+
+
+# --- Pods a new node cannot help (review C0-1, X0-2) ----------------------------------------------------------------
+
+def big(resource="cpu", name="too-big"):
+    return PendingPod(namespace="scale-demo", name=name, resource=resource, since=NOW - 60)
+
+
+def test_pending_pod_next_to_an_idle_node_is_stuck_and_does_not_scale_up():
+    # The scheduler retries a capacity-Pending Pod on every node; one still Pending while a same-kind node has been
+    # idle for STUCK_IDLE_S does not fit that node, so another node of the same shape would not help either.
+    nodes = [cpu_node("k3s-cpu-1", busy=True), cpu_node("k3s-cpu-2")]
+    action, state = run(pending=[big()], nodes=nodes, cpu_count=2,
+                        state=State(idle_since={"k3s-cpu-2": NOW - STUCK_IDLE_S}))
+    assert action is None
+    assert state.stuck == {"scale-demo/too-big": "k3s-cpu-2 was idle"}
+    assert "scale-demo/too-big" in state.held and "k3s-cpu-2" in state.held
+    # Idle for less than STUCK_IDLE_S (the scheduler may not have caught up yet): scale up as usual.
+    action, state = run(pending=[big()], nodes=nodes, cpu_count=2,
+                        state=State(idle_since={"k3s-cpu-2": NOW - STUCK_IDLE_S + 1}))
+    assert (action.kind, action.target) == ("cpu_scale", 3) and state.stuck == {}
+
+
+def test_stuck_mark_outlives_the_idle_node_and_ends_when_the_pod_does():
+    stuck = State(stuck={"scale-demo/too-big": "k3s-cpu-2 was idle"})
+    action, state = run(pending=[big()], state=stuck)  # k3s-cpu-2 already removed
+    assert action is None and state.stuck == stuck.stuck
+    action, state = run(pending=[big("cpu", "other")], state=stuck)  # the stuck Pod is gone, so is its mark
+    assert action.kind == "cpu_scale" and state.stuck == {}
+
+
+def test_idle_gpu_node_marks_gpu_pods_only():
+    nodes = [cpu_node("k3s-cpu-1", busy=True), gpu_node("k3s-gpu-a6000-1")]
+    action, state = run(pending=[big("gpu", "burn"), big("cpu", "web")], nodes=nodes,
+                        state=State(idle_since={"k3s-gpu-a6000-1": NOW - 600}))
+    assert state.stuck == {"scale-demo/burn": "k3s-gpu-a6000-1 was idle"}
+    assert (action.kind, action.target) == ("cpu_scale", 2)
+    # An unlabeled GPU node cannot take GPU Pods yet, so its idleness proves nothing.
+    nodes = [cpu_node("k3s-cpu-1", busy=True), gpu_node("k3s-gpu-a6000-1", busy=True),
+             gpu_node("k3s-gpu-a6000-2", labeled=False)]
+    _, state = run(pending=[big("gpu", "burn")], nodes=nodes, gpu_counts={"a6000": 2}, pools={"a6000": pool(hi=3)},
+                   state=State(idle_since={"k3s-gpu-a6000-2": NOW - 600}))
+    assert state.stuck == {}
+
+
+def simulate(resource, *, seconds=3600, step=20, join_delay=120):
+    """Ticks decide() against a toy cluster in which one Pod fits no node; the state goes through JSON every tick."""
+    pools = {"a6000": pool(lo=1, hi=2, idle_minutes=5)}
+    busy = {"k3s-cpu-1": True, "k3s-gpu-a6000-1": True}
+    joining, cpu_count, gpus, state, actions = {}, 1, 1, State(), []
+    for t in range(0, seconds, step):
+        now = NOW + t
+        for name in [n for n, at in joining.items() if now >= at]:
+            busy[name] = False
+            del joining[name]
+        nodes = [cpu_node(n, busy=b) if n.startswith("k3s-cpu-") else gpu_node(n, busy=b) for n, b in busy.items()]
+        action, state = decide(now=now, pending=[big(resource)], nodes=nodes, state=State.from_json(state.to_json()),
+                               cpu_count=cpu_count, cpu_max=3, gpu_counts={"a6000": gpus}, pools=pools,
+                               gpu_launching=any(n.startswith("k3s-gpu-") for n in joining))
+        if action is None:
+            continue
+        actions.append((t, action.kind, action.target or action.node))
+        if action.kind == "cpu_scale":
+            cpu_count = action.target
+            joining[f"k3s-cpu-{cpu_count}"] = now + join_delay
+        elif action.kind == "cpu_remove":
+            del busy[action.node]
+            cpu_count -= 1
+        elif action.target > gpus:
+            gpus = action.target
+            joining[f"k3s-gpu-a6000-{gpus}"] = now + join_delay
+        else:
+            del busy[f"k3s-gpu-a6000-{gpus}"]
+            gpus = action.target
+    return actions, state
+
+
+def test_unfixable_cpu_pod_gives_one_bounded_burst_not_an_endless_loop():
+    actions, state = simulate("cpu")
+    assert [kind for _, kind, _ in actions] == ["cpu_scale", "cpu_scale", "cpu_remove", "cpu_remove"]
+    assert actions[-1][0] < 1200  # then quiet for the rest of the hour
+    assert "scale-demo/too-big" in state.stuck and "scale-demo/too-big" in state.held
+
+
+def test_unfixable_gpu_pod_launches_at_most_one_instance():
+    actions, state = simulate("gpu")
+    assert [(kind, target) for _, kind, target in actions] == [("gpu_scale", 2), ("gpu_scale", 1)]
+    assert "scale-demo/too-big" in state.stuck
+
+
+# --- a GPU launch whose node never joins (review X0-5) --------------------------------------------------------------
+
+def test_gpu_scale_up_is_remembered_until_its_node_joins():
+    _, state = run(pending=[gpu_pending()])
+    assert state.launches == {"a6000": (2, NOW)}
+    joined = [*CLUSTER, gpu_node("k3s-gpu-a6000-2", busy=True)]
+    _, after = run(nodes=joined, gpu_counts={"a6000": 2}, state=state, now=NOW + 300)
+    assert after.launches == {}
+    _, after = run(gpu_counts={"a6000": 1}, state=state, now=NOW + 300)  # count changed (gpu-down, a hand edit)
+    assert after.launches == {}
+
+
+def test_gpu_launch_that_never_joins_is_rolled_back_and_not_retried():
+    launched = State(last_action_at=NOW, launches={"a6000": (2, NOW)})
+    common = dict(pending=[gpu_pending()], gpu_counts={"a6000": 2})
+    action, state = run(state=launched, now=NOW + GPU_JOIN_DEADLINE_S - 1, **common)
+    assert action is None and "1 of 2" in state.held
+    action, state = run(state=launched, now=NOW + GPU_JOIN_DEADLINE_S, **common)
+    assert (action.kind, action.pool, action.target) == ("gpu_scale", "a6000", 1)
+    assert "k3s-gpu-a6000-2" in action.reason
+    assert state.launches == {}
+    assert state.stuck == {"gpu-test/gpu-burn-x": "k3s-gpu-a6000-2 was launched for it and never joined"}
+    # The same Pod launches no second instance once the pool is back at 1.
+    again, _ = run(pending=[gpu_pending()], state=state, now=NOW + GPU_JOIN_DEADLINE_S + COOLDOWN_S)
+    assert again is None
+
+
+def test_gpu_launch_rollback_never_goes_below_min():
+    state = State(launches={"a6000": (1, NOW - GPU_JOIN_DEADLINE_S)})
+    action, _ = run(nodes=[cpu_node("k3s-cpu-1", busy=True)], gpu_counts={"a6000": 1}, state=state,
+                    pools={"a6000": pool(lo=1)})
+    assert action is None
