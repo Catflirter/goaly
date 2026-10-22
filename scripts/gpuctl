@@ -12,4 +12,6 @@ export KUBECONFIG="${KUBECONFIG:-$HOME/.kube/hybrid-gpu.yaml}"
 [[ -x "$REPO_ROOT/.venv/bin/python" ]] || die "$REPO_ROOT/.venv/bin/python not found: run make venv"
 # -P (safe path, Python >= 3.11): `-m` would otherwise put the caller's cwd first on sys.path, so a stray
 # argparse.py or yaml.py there would run with the .env secrets in its environment.
-exec env PYTHONPATH="$REPO_ROOT/lambda" "$REPO_ROOT/.venv/bin/python" -P -m gpuctl "$@"
+# -u (unbuffered): a piped stdout (make gpu-apply | tee) shows gpuctl's progress as it happens, not minutes later
+# in one block (live finding L21-4).
+exec env PYTHONPATH="$REPO_ROOT/lambda" "$REPO_ROOT/.venv/bin/python" -u -P -m gpuctl "$@"

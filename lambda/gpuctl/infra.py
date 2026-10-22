@@ -13,7 +13,8 @@ import re
 import shlex
 import shutil
 import subprocess
-from collections.abc import Mapping, Sequence
+from collections import deque
+from collections.abc import Callable, Mapping, Sequence
 from pathlib import Path
 from typing import Protocol
 
@@ -47,6 +48,10 @@ _NODE_NAME_RE = re.compile(r"[a-z0-9]+(?:-[a-z0-9]+)*")
 _GPU_TYPE_RE = re.compile(r"[a-z0-9]+(?:[_-][a-z0-9]+)*")
 _LABEL_VALUE_MAX = 63
 _STDERR_TAIL = 2000
+# A streamed command (join-node.sh, L21-4): the last lines kept for the error message, and how long a child gets to
+# finish (join-node.sh deletes its join token on the way out) once the reader stops before it is killed.
+STREAM_TAIL_LINES = 40
+STREAM_STOP_TIMEOUT_S = 60.0
 
 
 class CommandError(Exception):
@@ -69,16 +74,25 @@ class MissingStackError(CommandError):
 
 class Shell(Protocol):
     def run(self, args: Sequence[str], *, input: str | None = None, check: bool = True,
-            timeout: float | None = None, env: Mapping[str, str] | None = None) -> subprocess.CompletedProcess[str]:
+            timeout: float | None = None, env: Mapping[str, str] | None = None,
+            on_line: Callable[[str], None] | None = None) -> subprocess.CompletedProcess[str]:
         ...
 
 
 class SubprocessShell:
-    """Shell backed by subprocess.run: text mode, stdout and stderr captured, no shell interpretation."""
+    """Shell backed by subprocess.run: text mode, stdout and stderr captured, no shell interpretation.
+
+    With `on_line`, the command's stdout and stderr (merged, in the order written) are passed to it line by line as
+    they come instead of being captured (L21-4: join-node.sh's progress). The result's stdout is then empty and its
+    stderr holds the last STREAM_TAIL_LINES lines, which a CommandError quotes. Streaming takes no input or timeout.
+    """
 
     def run(self, args: Sequence[str], *, input: str | None = None, check: bool = True,
-            timeout: float | None = None, env: Mapping[str, str] | None = None) -> subprocess.CompletedProcess[str]:
+            timeout: float | None = None, env: Mapping[str, str] | None = None,
+            on_line: Callable[[str], None] | None = None) -> subprocess.CompletedProcess[str]:
         args = [str(a) for a in args]
+        if on_line is not None:
+            return self._stream(args, check=check, env=env, on_line=on_line, input=input, timeout=timeout)
         try:
             result = subprocess.run(args, input=input, capture_output=True, text=True, timeout=timeout,
                                     env=None if env is None else dict(env), check=False)
@@ -90,6 +104,45 @@ class SubprocessShell:
             raise CommandError(args, 126, f"{args[0]}: cannot run: {e.strerror or e}") from None
         if check and result.returncode != 0:
             raise CommandError(args, result.returncode, result.stderr)
+        return result
+
+    @staticmethod
+    def _stream(args: list[str], *, check: bool, env: Mapping[str, str] | None, on_line: Callable[[str], None],
+                input: str | None, timeout: float | None) -> subprocess.CompletedProcess[str]:
+        if input is not None or timeout is not None:
+            raise ValueError("a streamed command takes no input and no timeout")
+        try:
+            proc = subprocess.Popen(args, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True,
+                                    errors="replace", env=None if env is None else dict(env))
+        except FileNotFoundError:
+            raise CommandError(args, 127, f"{args[0]}: command not found") from None
+        except OSError as e:
+            raise CommandError(args, 126, f"{args[0]}: cannot run: {e.strerror or e}") from None
+        tail: deque[str] = deque(maxlen=STREAM_TAIL_LINES)
+        try:
+            assert proc.stdout is not None
+            for raw in proc.stdout:
+                line = raw.rstrip("\n")
+                tail.append(line)
+                on_line(line)
+            returncode = proc.wait()
+        except BaseException as e:
+            # The reader stopped (a closed pipe, a bug, Ctrl-C): never leave the child running. Ctrl-C has already
+            # reached it (same process group); anything else gets SIGTERM. Either way it gets time to clean up.
+            if not isinstance(e, KeyboardInterrupt):
+                proc.terminate()
+            try:
+                proc.wait(timeout=STREAM_STOP_TIMEOUT_S)
+            except subprocess.TimeoutExpired:
+                proc.kill()
+                proc.wait()
+            raise
+        finally:
+            if proc.stdout is not None:
+                proc.stdout.close()
+        result = subprocess.CompletedProcess(args, returncode, "", "".join(f"{line}\n" for line in tail))
+        if check and returncode != 0:
+            raise CommandError(args, returncode, result.stderr)
         return result
 
 
@@ -347,14 +400,17 @@ class Infra:
 
     # --- nodes ---
 
-    def join_node(self, name: str, ip: str, gpu_type: str) -> None:
+    def join_node(self, name: str, ip: str, gpu_type: str,
+                  progress: Callable[[str], None] | None = None) -> None:
         """scripts/join-node.sh for a GPU node; the caller has already synced the peers (--skip-sync).
 
         The IP comes from the Lambda API and becomes an SSH target, so it must be one public IPv4 address.
+        `progress` gets the script's output line by line as it runs (L21-4); without it the output is captured.
+        Showing it is safe: join-node.sh pipes the join token from k3s-cp straight into the node and never prints it.
         """
         ip = check_join_args(name, ip, gpu_type)
         self.shell.run([str(self.repo_root / "scripts" / "join-node.sh"), "--node", name, "--external-ip", ip,
-                        "--gpu-type", gpu_type, "--skip-sync"], env=self._child_env())
+                        "--gpu-type", gpu_type, "--skip-sync"], env=self._child_env(), on_line=progress)
 
     def forget_host_key(self, name: str) -> None:
         """Delete .run/known_hosts_<name>: the next instance with this name has a new host key."""

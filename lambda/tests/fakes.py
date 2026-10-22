@@ -8,7 +8,7 @@ from __future__ import annotations
 
 import ipaddress
 import subprocess
-from collections.abc import Iterable, Mapping, Sequence
+from collections.abc import Callable, Iterable, Mapping, Sequence
 from dataclasses import dataclass
 
 from gpuctl.infra import (
@@ -198,6 +198,7 @@ class ShellCall:
     check: bool
     timeout: float | None
     env: dict[str, str] | None
+    streamed: bool = False  # run with on_line: the output went to the caller line by line
 
 
 class FakeShell:
@@ -217,13 +218,20 @@ class FakeShell:
         FakeShell.created.append(self)
 
     def run(self, args: Sequence[str], *, input: str | None = None, check: bool = True,
-            timeout: float | None = None, env: Mapping[str, str] | None = None) -> subprocess.CompletedProcess[str]:
+            timeout: float | None = None, env: Mapping[str, str] | None = None,
+            on_line: Callable[[str], None] | None = None) -> subprocess.CompletedProcess[str]:
         args = list(args)
-        self.calls.append(ShellCall(args, input, check, timeout, None if env is None else dict(env)))
+        self.calls.append(ShellCall(args, input, check, timeout, None if env is None else dict(env),
+                                    streamed=on_line is not None))
         assert self.results, f"unexpected command (no scripted result left): {args}"
         result = self.results.pop(0)
         if isinstance(result, Exception):
             raise result
+        if on_line is not None:  # like SubprocessShell: stdout then stderr to on_line, the text kept as stderr
+            text = (result.stdout or "") + (result.stderr or "")
+            for line in text.splitlines():
+                on_line(line)
+            result = subprocess.CompletedProcess(args, result.returncode, "", text)
         result = subprocess.CompletedProcess(args, result.returncode, result.stdout, result.stderr)
         if check and result.returncode != 0:
             raise CommandError(args, result.returncode, result.stderr)
@@ -308,12 +316,17 @@ class FakeInfra:
         self.deleted_nodes.append(name)
         self.cluster_nodes.pop(name, None)
 
-    def join_node(self, name: str, ip: str, gpu_type: str) -> None:
+    def join_node(self, name: str, ip: str, gpu_type: str,
+                  progress: Callable[[str], None] | None = None) -> None:
         ip = check_join_args(name, ip, gpu_type)
         self.joined.append((name, ip, gpu_type))
         self.events.append(f"join:{name}:{gpu_type}")
         if name in self.join_fail:
+            if progress is not None:
+                progress(f"error: node {name} not Ready")
             raise CommandError(["join-node.sh", "--node", name], 1, "join failed")
+        if progress is not None:
+            progress(f"{name} joined and Ready")
         self.cluster_nodes[name] = ip
 
     def forget_host_key(self, name: str) -> None:

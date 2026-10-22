@@ -63,6 +63,7 @@ def _clean(text: str) -> str:
 
 def _emit(out: TextIO, line: str = "") -> None:
     out.write(_clean(line) + "\n")
+    out.flush()  # L21-4: shown as it happens when stdout is a pipe (make gpu-status | tee)
 
 
 def _set_counts(items: Iterable[str]) -> dict[str, int]:

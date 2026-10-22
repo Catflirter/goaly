@@ -9,9 +9,10 @@ from __future__ import annotations
 import json
 import sys
 import time
-from datetime import datetime
-from collections.abc import Callable, Iterable, Mapping
+from collections.abc import Callable, Iterable, Iterator, Mapping
+from contextlib import contextmanager
 from dataclasses import dataclass
+from datetime import datetime
 from pathlib import Path
 from typing import TextIO
 
@@ -111,6 +112,22 @@ def _is_transient(error: LambdaAPIError) -> bool:
 CONFIRM_PROMPT = "Apply these changes? [y/N] "
 
 
+def duration(seconds: float) -> str:
+    """A step's duration for the progress lines: 42s, 5m21s."""
+    whole = int(seconds)
+    return f"{whole}s" if whole < 60 else f"{whole // 60}m{whole % 60:02d}s"
+
+
+class _Step:
+    """What a step reports when its block ends without an exception: done, unless the block marked it failed."""
+
+    def __init__(self) -> None:
+        self.ok = True
+
+    def failed(self) -> None:
+        self.ok = False
+
+
 @dataclass(frozen=True)
 class _Launched:
     id: str
@@ -129,10 +146,39 @@ class Reconciler:
         self.clock = clock
         self.sleep = sleep
         self.confirm = confirm
+        self._started = clock()  # reset by each apply/down: the progress stamps count from there
+        self._command = "apply"
 
     def _emit(self, line: str = "") -> None:
         out = sys.stdout if self.out is None else self.out
         out.write(_clean(line) + "\n")
+        out.flush()  # L21-4: a piped stdout (make gpu-apply | tee) shows each line as it happens
+
+    def _stamp(self, now: float) -> str:
+        """[+MM:SS] since this apply or down started."""
+        elapsed = int(now - self._started)
+        return f"[+{elapsed // 60:02d}:{elapsed % 60:02d}]"
+
+    @contextmanager
+    def _step(self, what: str) -> Iterator[_Step]:
+        """Progress lines around one step of apply or down (L21-4): "[+MM:SS] WHAT ..." when it starts, then
+        "WHAT: done in 12s", or "WHAT: failed after 12s" when it raises or the block calls step.failed()."""
+        step = _Step()
+        start = self.clock()
+        self._emit(f"{self._stamp(start)} {what} ...")
+        try:
+            yield step
+        except BaseException:
+            end = self.clock()
+            self._emit(f"{self._stamp(end)} {what}: failed after {duration(end - start)}")
+            raise
+        end = self.clock()
+        result = "done in" if step.ok else "failed after"
+        self._emit(f"{self._stamp(end)} {what}: {result} {duration(end - start)}")
+
+    def _join_line(self, line: str) -> None:
+        """One line of join-node.sh's output, under its step."""
+        self._emit(f"    | {line}")
 
     def ensure_ruleset(self, region: str, rules: Iterable[FirewallRule]) -> Ruleset:
         """Create k3s-gpu-<region> with `rules`, or replace the rules of every existing ruleset of that name."""
@@ -274,7 +320,7 @@ class Reconciler:
             self._warn(f"apply refused: {e}")
             return 2
         return self._reconcile(spec, overrides=overrides, set_counts=None, auto_approve=auto_approve,
-                               keep_on_failure=keep_on_failure, on_commit=self._clear_down_marker)
+                               keep_on_failure=keep_on_failure, on_commit=self._clear_down_marker, command="apply")
 
     def down(self, spec: Spec, *, auto_approve: bool) -> int:
         """Remove the autoscaler's override file, then reconcile every pool to 0 (spec section 10.4: gpu-down always
@@ -287,7 +333,8 @@ class Reconciler:
             path.unlink()
             self._emit(f"Removed the autoscaler overrides {path}")
         return self._reconcile(spec, overrides=None, set_counts={name: 0 for name in spec.pools},
-                               auto_approve=auto_approve, keep_on_failure=False, on_commit=self._write_down_marker)
+                               auto_approve=auto_approve, keep_on_failure=False, on_commit=self._write_down_marker,
+                               command="down")
 
     def down_since(self) -> str | None:
         """read_down_marker(settings.down_marker_path): when gpu-down set every pool to 0, or None."""
@@ -315,7 +362,10 @@ class Reconciler:
                        "0 instances per pool until it is removed")
 
     def _reconcile(self, spec: Spec, *, overrides: Mapping[str, int] | None, set_counts: Mapping[str, int] | None,
-                   auto_approve: bool, keep_on_failure: bool, on_commit: Callable[[], None] | None = None) -> int:
+                   auto_approve: bool, keep_on_failure: bool, on_commit: Callable[[], None] | None = None,
+                   command: str = "apply") -> int:
+        self._started = self.clock()
+        self._command = command
         # 1. plan and limits: nothing has changed yet
         instances = self.client.list_instances()
         types = self.client.instance_types()
@@ -363,16 +413,18 @@ class Reconciler:
                 try:
                     if instance.id in duplicate_ids:
                         # Ruling R17: the node name and host key belong to the instance that is kept, so by id only
+                        with self._step(f"terminate duplicate {instance.name} {instance.id}"):
+                            attempted.add(instance.id)
+                            self.client.terminate([instance.id])
+                            gone.add(instance.id)
+                        self._emit(f"Terminated duplicate {instance.name} {instance.id}")
+                        continue
+                    with self._step(f"delete {instance.name}"):
+                        self.infra.drain_and_delete_node(instance.name)
                         attempted.add(instance.id)
                         self.client.terminate([instance.id])
                         gone.add(instance.id)
-                        self._emit(f"Terminated duplicate {instance.name} {instance.id}")
-                        continue
-                    self.infra.drain_and_delete_node(instance.name)
-                    attempted.add(instance.id)
-                    self.client.terminate([instance.id])
-                    gone.add(instance.id)
-                    self.infra.forget_host_key(instance.name)
+                        self.infra.forget_host_key(instance.name)
                     self._emit(f"Deleted {instance.name} {instance.id}")
                 except Exception as e:
                     failures.append(f"delete {instance.name} ({instance.id}): {e}")
@@ -438,8 +490,11 @@ class Reconciler:
         `gone` holds the ids this run terminated: they are left out even if Lambda still lists them as active.
         """
         gone = set(gone)
-        self.infra.apply_gpu_access(self._live_gpu_ips(gone), max_nodes=spec.max_nodes)
-        self.sync_peers(spec, exclude_ids=gone)
+        ips = self._live_gpu_ips(gone)
+        with self._step(f"terraform apply gpu-access ({len(ips)} GPU IP{'' if len(ips) == 1 else 's'})"):
+            self.infra.apply_gpu_access(ips, max_nodes=spec.max_nodes)
+        with self._step("sync-peers"):
+            self.sync_peers(spec, exclude_ids=gone)
 
     def _create_and_join(self, spec: Spec, plan: Plan, types: Mapping[str, InstanceType], *,
                          keep_on_failure: bool, gone: set[str]) -> int:
@@ -452,7 +507,10 @@ class Reconciler:
             if plan.create:
                 rules = region_ruleset_rules(self._peer_set(gone))
                 for name, pool_name in plan.create:
-                    new = self._launch(spec.pools[pool_name], name, types, rules, failures, unknown)
+                    with self._step(f"launch {name}") as step:
+                        new = self._launch(spec.pools[pool_name], name, types, rules, failures, unknown)
+                        if new is None:
+                            step.failed()
                     if new is not None:
                         launched.append(new)
                         unknown.remove(name)
@@ -460,7 +518,8 @@ class Reconciler:
             ready: list[tuple[_Launched, Instance]] = []
             for new in launched:
                 try:
-                    ready.append((new, self.wait_active(new.id)))
+                    with self._step(f"wait for {new.name} to be active with an IP"):
+                        ready.append((new, self.wait_active(new.id)))
                 except (TimeoutError, LambdaAPIError) as e:
                     failures.append(f"{new.name}: {e}")
             # 7. firewalls for every live IP (also corrects them when nothing else changed)
@@ -468,15 +527,20 @@ class Reconciler:
             # 8. join
             for new, instance in ready:
                 try:
-                    self.infra.join_node(new.name, instance.ip, gpu_type_label(new.instance_type))
+                    with self._step(f"join {new.name}"):
+                        self.infra.join_node(new.name, instance.ip, gpu_type_label(new.instance_type),
+                                             progress=self._join_line)
                     joined.add(new.id)
                 except (CommandError, ValueError) as e:
                     failures.append(f"{new.name}: join failed: {e}")
         except (Exception, KeyboardInterrupt) as e:  # anything else (Ctrl-C included): clean up as for a failed node
             failures.append(f"apply failed: {str(e) or type(e).__name__}")
+        now = self.clock()
         if not failures:
-            self._emit("GPU nodes match the spec")
+            self._emit(f"{self._stamp(now)} GPU nodes match the spec ({self._command} took "
+                       f"{duration(now - self._started)})")
             return 0
+        self._emit(f"{self._stamp(now)} {self._command} failed after {duration(now - self._started)}")
         for failure in failures:
             self._warn(f"error: {failure}")
         failed = [new for new in launched if new.id not in joined]
