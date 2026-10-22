@@ -15,6 +15,7 @@ import pytest
 
 ROOT = Path(__file__).resolve().parents[2]
 TS = "2026-10-21T1430-0700"
+DEMO_TS = "demo-2026-10-21T1600-0700"
 K3S_TOKEN = "K10" + "c" * 64 + "::server:" + "0123456789abcdef"
 FAKE_LAMBDA_KEY = "secret" + "_demo_" + "0123456789abcdef" * 2 + "." + "Q7xZ" * 8
 SUMMARY = ("# Verification run\n\nStarted: 2026-10-21T14:30:05-07:00 (America/Los_Angeles)\n\n"
@@ -219,7 +220,7 @@ def assert_refused(repo, r, before, *words):
 
 
 @pytest.mark.parametrize("args", [[], ["verify"], ["verify", f"verification/{TS}", "extra"], ["bogus"],
-                                  ["demo", f"verification/{TS}"]])
+                                  ["demo"], ["demo", f"verification/{DEMO_TS}", "extra"]])
 def test_usage_errors(repo, args):
     before = previous_final(repo)
     make_run(repo)
@@ -564,7 +565,7 @@ def test_the_operator_ip_is_found_after_a_byte_that_is_not_utf8(repo):
     r = promote(repo, "verify", f"verification/{TS}", env=env)
     assert r.returncode == 1, r.stderr
     assert snapshot(repo / "verification/final") == before
-    assert "06-B6.txt" in r.stderr
+    assert "06-B6.txt" in r.stderr and "OPERATOR_IP" in r.stderr
 
 
 @pytest.mark.parametrize("ip, line", [
@@ -814,3 +815,262 @@ def test_a_stale_lock_is_reported_not_broken(repo):
     assert r.returncode == 1 and ".promote.lock" in r.stderr, r.stderr
     assert snapshot(repo / "verification/final") == before
     assert (repo / "verification/.promote.lock").read_text() == "999999999\n", "not ours to remove"
+
+
+# --- promote.sh demo (Task 25) and verify keeping final/demo/ (progress.md note at line 322) -------
+
+DEMO_FILES = {"ch1.txt": "--- [ch1.1] A1\n$ check_a1_nodes\nA1: 2 of 2 nodes Ready\n",
+              "ch3.txt": "--- [ch3.1] B1\nmatrix ok\n",
+              "timings.txt": "ch1 120s (commands 40s; 3 step(s), 0 failed, 0 skipped) Architecture\n"}
+
+
+def make_demo(repo, name=DEMO_TS, files=None):
+    """A verification/demo-<ts>/ run as scripts/demo.sh leaves it (0700 directory, 0600 files)."""
+    run = repo / "verification" / name
+    run.mkdir(mode=0o700)
+    for rel, text in (DEMO_FILES if files is None else files).items():
+        (run / rel).parent.mkdir(parents=True, exist_ok=True)
+        (run / rel).write_text(text)
+    for p in [run, *run.rglob("*")]:
+        p.chmod(0o700 if p.is_dir() else 0o600)
+    return run
+
+
+def promote_demo(repo, arg=f"verification/{DEMO_TS}", env=None):
+    return promote(repo, "demo", arg, env=env)
+
+
+def test_promote_demo_copies_the_run_to_final_demo_and_keeps_the_rest_of_final(repo):
+    before = previous_final(repo)
+    run = make_demo(repo)
+    recorded = snapshot(run)
+    r = promote_demo(repo)
+    assert r.returncode == 0, r.stderr
+    final = repo / "verification/final"
+    assert snapshot(final / "demo") == recorded
+    assert {k: v for k, v in snapshot(final).items() if not k.startswith("demo")} == before
+    assert snapshot(run) == recorded, "the run itself is left as it was"
+    assert verification_entries(repo) == [".gitkeep", DEMO_TS, "final"], "no staging directory is left behind"
+    assert "verification/final/demo" in r.stderr and "no leaks" in r.stderr
+
+
+@pytest.mark.parametrize("arg", ["abs", f"verification/{DEMO_TS}/", f"./verification/{DEMO_TS}"])
+def test_promote_demo_accepts_the_run_in_any_spelling(repo, arg):
+    run = make_demo(repo)
+    r = promote_demo(repo, str(run) if arg == "abs" else arg)
+    assert r.returncode == 0, r.stderr
+    assert snapshot(repo / "verification/final/demo") == snapshot(run)
+
+
+def test_promote_demo_creates_final_when_there_is_none(repo):
+    run = make_demo(repo)
+    r = promote_demo(repo)
+    assert r.returncode == 0, r.stderr
+    assert snapshot(repo / "verification/final/demo") == snapshot(run)
+    assert sorted(p.name for p in (repo / "verification/final").iterdir()) == ["demo"]
+
+
+def test_promote_demo_replaces_the_previous_demo_instead_of_merging(repo):
+    previous_final(repo)
+    old = repo / "verification/final/demo"
+    old.mkdir()
+    (old / "ch8.txt").write_text("old recording\n")
+    run = make_demo(repo)
+    r = promote_demo(repo)
+    assert r.returncode == 0, r.stderr
+    assert snapshot(old) == snapshot(run) and not (old / "ch8.txt").exists()
+
+
+@pytest.mark.parametrize("secret", [K3S_TOKEN, "Authorization: Bearer " + FAKE_LAMBDA_KEY])
+def test_promote_demo_fails_on_a_leak_and_changes_nothing(repo, secret):
+    before = previous_final(repo)
+    make_demo(repo, files={**DEMO_FILES, "ch4.txt": "oops " + secret + "\n"})
+    r = promote_demo(repo)
+    assert r.returncode == 1, r.stderr
+    assert snapshot(repo / "verification/final") == before
+    assert verification_entries(repo) == [".gitkeep", DEMO_TS, "final"]
+    assert "ch4.txt" in r.stderr
+    assert secret.split()[-1] not in r.stdout + r.stderr
+
+
+def test_promote_demo_fails_on_the_operator_ip(repo):
+    before = previous_final(repo)
+    make_demo(repo, files={**DEMO_FILES, "ch2.txt": f"fw-ssh-operator  {OPERATOR_IP}/32\n"})
+    r = promote_demo(repo, env={**os.environ, "OPERATOR_IP": OPERATOR_IP})
+    assert r.returncode == 1, r.stderr
+    assert snapshot(repo / "verification/final") == before
+    assert "ch2.txt" in r.stderr and "ch1.txt" not in r.stderr and "OPERATOR_IP" in r.stderr
+
+
+@pytest.mark.parametrize("name", ["scratch", TS, "demo-2026-10-21T1430", "demo-final", "final"])
+def test_promote_demo_refuses_a_directory_not_named_like_a_demo_run(repo, name):
+    before = previous_final(repo)
+    if name not in ("final", TS):
+        make_demo(repo, name=name)
+    if name == TS:
+        make_run(repo)
+    assert_refused(repo, promote_demo(repo, f"verification/{name}"), before)
+
+
+def test_promote_demo_refuses_a_demo_run_outside_verification(repo, tmp_path):
+    before = previous_final(repo)
+    outside = tmp_path / DEMO_TS
+    outside.mkdir()
+    (outside / "ch1.txt").write_text("x\n")
+    (outside / "timings.txt").write_text("x\n")
+    assert_refused(repo, promote_demo(repo, str(outside)), before)
+
+
+@pytest.mark.parametrize("name", ["ch9.txt", "ch0.txt", "notes.md", ".hidden", "ch1.txt.png", "SUMMARY.md",
+                                  "sub/ch1.txt"])
+def test_promote_demo_refuses_a_file_demo_sh_does_not_write(repo, name):
+    before = previous_final(repo)
+    make_demo(repo, files={**DEMO_FILES, name: "x\n"})
+    assert_refused(repo, promote_demo(repo), before, name.split("/")[0])
+
+
+def test_promote_demo_refuses_a_symlink_in_the_run(repo, tmp_path):
+    before = previous_final(repo)
+    run = make_demo(repo)
+    (tmp_path / "x.txt").write_text("x\n")
+    (run / "ch5.txt").symlink_to(tmp_path / "x.txt")
+    assert_refused(repo, promote_demo(repo), before, "ch5.txt")
+
+
+@pytest.mark.parametrize("files", [{}, {"timings.txt": "x\n"}, {"ch1.txt": "x\n"}],
+                         ids=["empty", "no-chapter", "no-timings"])
+def test_promote_demo_refuses_a_run_without_chapters_or_timings(repo, files):
+    before = previous_final(repo)
+    make_demo(repo, files=files)
+    assert_refused(repo, promote_demo(repo), before)
+
+
+def test_promote_demo_refuses_a_final_that_is_a_symlink(repo, tmp_path):
+    elsewhere = tmp_path / "elsewhere"
+    elsewhere.mkdir()
+    (repo / "verification/final").symlink_to(elsewhere)
+    make_demo(repo)
+    r = promote_demo(repo)
+    assert r.returncode == 2, r.stderr
+    assert list(elsewhere.iterdir()) == []
+
+
+def test_a_failed_rename_restores_the_previous_demo(repo, tmp_path):
+    previous_final(repo)
+    old = repo / "verification/final/demo"
+    old.mkdir()
+    (old / "ch8.txt").write_text("old recording\n")
+    before = snapshot(repo / "verification/final")
+    make_demo(repo)
+    bin_dir = tmp_path / "fakebin"
+    bin_dir.mkdir()
+    (bin_dir / "mv").write_text("#!/bin/sh\n"
+                                # mv -- SRC DST: $2 is the source; the scanned copy's rename fails
+                                'case "$2" in */.promote-*/demo) exit 1 ;; esac\n'
+                                f'exec {shutil.which("mv")} "$@"\n')
+    (bin_dir / "mv").chmod(0o755)
+    r = promote_demo(repo, env={**os.environ, "PATH": f"{bin_dir}:{os.environ['PATH']}"})
+    assert r.returncode == 1, r.stderr
+    assert snapshot(repo / "verification/final") == before
+    assert verification_entries(repo) == [".gitkeep", DEMO_TS, "final"]
+
+
+def test_make_promote_demo_promotes_the_run(repo):
+    run = make_demo(repo)
+    r = subprocess.run(["make", "--no-print-directory", "-f", str(repo / "Makefile"), "promote-demo",
+                        f"RUN=verification/{DEMO_TS}"], capture_output=True, text=True, cwd=repo)
+    assert r.returncode == 0, r.stderr
+    assert snapshot(repo / "verification/final/demo") == snapshot(run)
+
+
+def test_make_promote_demo_requires_run(repo):
+    r = subprocess.run(["make", "--no-print-directory", "-f", str(repo / "Makefile"), "promote-demo"],
+                       capture_output=True, text=True, cwd=repo)
+    assert r.returncode == 2 and "RUN=verification/demo-" in r.stderr
+
+
+def demo_in_final(repo):
+    """A final/ with a promoted demo/ in it; returns the demo's snapshot."""
+    previous_final(repo)
+    make_demo(repo)
+    assert promote_demo(repo).returncode == 0
+    shutil.rmtree(repo / "verification" / DEMO_TS)
+    return snapshot(repo / "verification/final/demo")
+
+
+def test_a_verify_promotion_keeps_the_promoted_demo(repo):
+    demo = demo_in_final(repo)
+    run = make_run(repo)
+    r = promote(repo, "verify", f"verification/{TS}")
+    assert r.returncode == 0, r.stderr
+    final = repo / "verification/final"
+    assert snapshot(final / "demo") == demo
+    assert {k: v for k, v in snapshot(final).items() if not k.startswith("demo")} == snapshot(run)
+    assert not (final / "99-old.txt").exists(), "the rest of the old final is still replaced, not merged"
+    assert verification_entries(repo) == [".gitkeep", TS, "final"]
+
+
+def test_a_verify_promotion_without_a_demo_adds_none(repo):
+    previous_final(repo)
+    run = make_run(repo)
+    assert promote(repo, "verify", f"verification/{TS}").returncode == 0
+    assert snapshot(repo / "verification/final") == snapshot(run)
+
+
+def test_a_demo_promoted_after_verify_stays_with_it(repo):
+    run = make_run(repo)
+    assert promote(repo, "verify", f"verification/{TS}").returncode == 0
+    demo = make_demo(repo)
+    assert promote_demo(repo).returncode == 0
+    final = repo / "verification/final"
+    assert snapshot(final / "demo") == snapshot(demo)
+    assert {k: v for k, v in snapshot(final).items() if not k.startswith("demo")} == snapshot(run)
+
+
+@pytest.mark.parametrize("change", ["leak", "bad-name", "symlink", "operator-ip", "no-chapter"])
+def test_a_verify_promotion_refuses_a_kept_demo_it_cannot_vouch_for(repo, tmp_path, change):
+    demo_in_final(repo)
+    demo = repo / "verification/final/demo"
+    if change == "leak":
+        (demo / "ch4.txt").write_text(K3S_TOKEN + "\n")
+    elif change == "bad-name":
+        (demo / "notes.md").write_text("x\n")
+    elif change == "symlink":
+        (tmp_path / "x.txt").write_text("x\n")
+        (demo / "ch4.txt").symlink_to(tmp_path / "x.txt")
+    elif change == "operator-ip":
+        (demo / "ch4.txt").write_text(f"rule {OPERATOR_IP}/32\n")
+    else:
+        for p in demo.glob("ch*.txt"):
+            p.unlink()
+    before = snapshot(repo / "verification/final")
+    make_run(repo)
+    r = promote(repo, "verify", f"verification/{TS}", env={**os.environ, "OPERATOR_IP": OPERATOR_IP})
+    assert r.returncode == 1, r.stderr
+    assert snapshot(repo / "verification/final") == before
+    assert verification_entries(repo) == [".gitkeep", TS, "final"]
+    assert "final/demo" in r.stderr
+
+
+def test_a_verify_promotion_refuses_a_kept_demo_that_is_a_symlink(repo, tmp_path):
+    previous_final(repo)
+    elsewhere = tmp_path / "elsewhere"
+    elsewhere.mkdir()
+    (elsewhere / "ch1.txt").write_text("x\n")
+    (repo / "verification/final/demo").symlink_to(elsewhere)
+    before = snapshot(repo / "verification/final")
+    make_run(repo)
+    r = promote(repo, "verify", f"verification/{TS}")
+    assert r.returncode == 1, r.stderr
+    assert snapshot(repo / "verification/final") == before
+    assert "final/demo" in r.stderr
+
+
+def test_a_failed_rename_in_a_verify_promotion_keeps_the_demo(repo, tmp_path):
+    demo = demo_in_final(repo)
+    make_run(repo)
+    env, _, _ = fake_mv(tmp_path, "fail")
+    r = promote(repo, "verify", f"verification/{TS}", env=env)
+    assert r.returncode == 1, r.stderr
+    assert snapshot(repo / "verification/final/demo") == demo
+    assert (repo / "verification/final/99-old.txt").exists()

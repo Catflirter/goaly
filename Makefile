@@ -117,6 +117,27 @@ promote-verify: ## Copy a verify run to verification/final/ if gitleaks finds no
 	@[ -n "$(RUN)" ] || { echo "usage: make promote-verify RUN=verification/<YYYY-MM-DDTHHMM-0700>" >&2; exit 2; }
 	$(ROOT)/scripts/promote.sh verify "$(RUN)"
 
+.PHONY: promote-demo
+promote-demo: ## Copy a demo run to verification/final/demo/ if gitleaks finds no secrets (make promote-demo RUN=verification/demo-<ts>)
+	@[ -n "$(RUN)" ] || { echo "usage: make promote-demo RUN=verification/demo-<YYYY-MM-DDTHHMM-0700>" >&2; exit 2; }
+	$(ROOT)/scripts/promote.sh demo "$(RUN)"
+
+# The live demo (spec section 9.1). CHAPTERS (make demo CHAPTERS=1,2,4,5) and DEMO_NO_PAUSE=1 reach demo.sh
+# through the environment. make demo-replay CHAPTER=n plays verification/final/demo/chN.txt (the fallback).
+.PHONY: preflight demo demo-replay demo-reset
+preflight: ## Pre-demo checks: tools, gcloud and ADC login, gpuctl status, sync-peers, tunnel, nodes Ready
+	$(ROOT)/scripts/preflight.sh
+
+demo: ## Run the live demo, chapter by chapter, pausing after each step (CHAPTERS=1,2,4,5 picks chapters)
+	$(ROOT)/scripts/demo.sh run
+
+demo-replay: ## Play the recorded output of a demo chapter (make demo-replay CHAPTER=3)
+	@[ -n "$(CHAPTER)" ] || { echo "usage: make demo-replay CHAPTER=<1-8>" >&2; exit 2; }
+	@$(ROOT)/scripts/demo.sh replay "$(CHAPTER)"
+
+demo-reset: ## Delete the demo's objects (limits-demo, np-denied, GPU test Pods) and scale the CPU pool to 1
+	$(ROOT)/scripts/demo.sh reset
+
 # AUTO_APPROVE=1 (or yes/true) skips the confirmation prompt of gpu-apply and gpu-down.
 GPU_AUTO_APPROVE := $(if $(filter 1 yes true,$(AUTO_APPROVE)), --auto-approve)
 
