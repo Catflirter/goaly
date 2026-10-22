@@ -20,6 +20,7 @@ from typing import TextIO
 
 from gpuctl.infra import CommandError, Infra, SubprocessShell
 from gpuctl.lambda_api import FirewallRule, Instance, LambdaAPIError, LambdaClient
+from gpuctl.output import write
 from gpuctl.peers import ruleset_name
 from gpuctl.planner import (
     LIVE_STATUSES, PlanError, check_limits, keeper_order, make_plan, owned_instances, plan_lines, target_counts,
@@ -62,8 +63,9 @@ def _clean(text: str) -> str:
 
 
 def _emit(out: TextIO, line: str = "") -> None:
-    out.write(_clean(line) + "\n")
-    out.flush()  # L21-4: shown as it happens when stdout is a pipe (make gpu-status | tee)
+    # Flushed (L21-4: shown as it happens when stdout is a pipe, make gpu-status | tee) and best effort: a reader
+    # that is gone never stops a command half way (gpuctl.output)
+    write(out, _clean(line) + "\n")
 
 
 def _set_counts(items: Iterable[str]) -> dict[str, int]:
@@ -219,8 +221,8 @@ def _ip(args: argparse.Namespace, client, out: TextIO) -> int:
 def _confirm(out: TextIO) -> Callable[[str], bool]:
     """Ask on `out` and read one line from stdin: only y/yes confirms; end of input declines."""
     def confirm(prompt: str) -> bool:
-        out.write(prompt)
-        out.flush()
+        if not write(out, prompt):  # a prompt nobody can see is never answered: decline, nothing changes
+            return False
         return sys.stdin.readline().strip().lower() in ("y", "yes")
     return confirm
 
@@ -322,13 +324,13 @@ def main(argv: list[str] | None = None, *, env: Mapping[str, str] = os.environ, 
         handler = {"rules": _rules, "list-nodes": _list_nodes, "ip": _ip}[args.command]
         return handler(args, _client(env, client), out)
     except _Refused as e:
-        print(_clean(f"gpuctl: {e}"), file=sys.stderr)
+        write(sys.stderr, _clean(f"gpuctl: {e}") + "\n")
         return EXIT_REFUSED
     except _Failed as e:
-        print(_clean(f"gpuctl: {e}"), file=sys.stderr)
+        write(sys.stderr, _clean(f"gpuctl: {e}") + "\n")
         return EXIT_FAILED
     except LambdaAPIError as e:
-        print(_clean(f"gpuctl: Lambda API error: {e}"), file=sys.stderr)
+        write(sys.stderr, _clean(f"gpuctl: Lambda API error: {e}") + "\n")
         return EXIT_FAILED
 
 

@@ -18,6 +18,7 @@ from typing import TextIO
 
 from gpuctl.infra import CommandError, MissingStackError
 from gpuctl.lambda_api import FirewallRule, Instance, InstanceType, InsufficientCapacity, LambdaAPIError, Ruleset
+from gpuctl.output import write
 from gpuctl.peers import (
     PeerSet, cp_guard_elements, global_rules, nft_replace_script, region_ruleset_rules, ruleset_name,
 )
@@ -150,9 +151,9 @@ class Reconciler:
         self._command = "apply"
 
     def _emit(self, line: str = "") -> None:
-        out = sys.stdout if self.out is None else self.out
-        out.write(_clean(line) + "\n")
-        out.flush()  # L21-4: a piped stdout (make gpu-apply | tee) shows each line as it happens
+        # Flushed (L21-4: a piped stdout, make gpu-apply | tee, shows each line as it happens) and best effort: a
+        # reader that is gone never stops the step being reported (review C0-1/C0-2/X0-1, gpuctl.output).
+        write(sys.stdout if self.out is None else self.out, _clean(line) + "\n")
 
     def _stamp(self, now: float) -> str:
         """[+MM:SS] since this apply or down started."""
@@ -206,8 +207,7 @@ class Reconciler:
             self.infra.ensure_init("workers")
             outputs = self.infra.tf_output("workers")
         except MissingStackError as e:
-            sys.stderr.write(_clean(f"warning: infra/workers is not in this checkout, treating the CPU worker list "
-                                    f"as empty ({e})") + "\n")
+            self._warn(f"warning: infra/workers is not in this checkout, treating the CPU worker list as empty ({e})")
             return ()
         except CommandError as e:
             raise ReconcileError(
@@ -275,7 +275,7 @@ class Reconciler:
     # --- apply / down ---------------------------------------------------------------------------
 
     def _warn(self, line: str) -> None:
-        sys.stderr.write(_clean(line) + "\n")
+        write(sys.stderr, _clean(line) + "\n")  # best effort, like _emit
 
     def wait_active(self, instance_id: str) -> Instance:
         """Poll get_instance every poll_s until the instance is active with an IP (Review Focus #2: never return a
@@ -540,17 +540,18 @@ class Reconciler:
             self._emit(f"{self._stamp(now)} GPU nodes match the spec ({self._command} took "
                        f"{duration(now - self._started)})")
             return 0
-        self._emit(f"{self._stamp(now)} {self._command} failed after {duration(now - self._started)}")
-        for failure in failures:
-            self._warn(f"error: {failure}")
         failed = [new for new in launched if new.id not in joined]
-        if keep_on_failure:
-            if failed or unknown:
+        try:  # the report never decides whether the billed instances are cleaned up (review C0-2)
+            self._emit(f"{self._stamp(now)} {self._command} failed after {duration(now - self._started)}")
+            for failure in failures:
+                self._warn(f"error: {failure}")
+            if keep_on_failure and (failed or unknown):
                 names = ", ".join([new.name for new in failed] + unknown)
                 self._warn(f"--keep-on-failure: kept {names} for troubleshooting; they bill until "
                            "make gpu-down (or a gpu-apply that no longer wants them)")
-            return 1
-        self._clean_up(spec, failed, unknown, gone)
+        finally:
+            if not keep_on_failure:
+                self._clean_up(spec, failed, unknown, gone)
         return 1
 
     def _find_unknown(self, unknown: list[str], known: set[str]) -> list[tuple[str, str]]:
