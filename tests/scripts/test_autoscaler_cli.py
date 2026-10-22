@@ -5,6 +5,7 @@ Most tests run autoscaler.main() in-process with an injected clock and a fake co
 cpu-pool.sh ever runs); a few run the script itself against stub tools (fake_autoscaler_tools.py) under a temporary
 AUTOSCALER_ROOT: the brief's --once --dry-run fixture tests, the real subprocess wiring and Ctrl-C.
 """
+import fcntl
 import importlib.util
 import io
 import json
@@ -103,6 +104,28 @@ def make_root(tmp_path, workers=("k3s-cpu-1",), overrides=None):
     return root
 
 
+def lock_is_free(path):
+    """Whether another process could take gpuctl's write lock now (a separate open file description)."""
+    if not path.is_file():
+        return True
+    fd = os.open(path, os.O_RDWR)
+    try:
+        fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        return True
+    except BlockingIOError:
+        return False
+    finally:
+        os.close(fd)
+
+
+def hold_lock(path):
+    """make gpu-down (or a make gpu-apply) running in another terminal: it holds gpuctl's write lock."""
+    path.parent.mkdir(parents=True, exist_ok=True)
+    fd = os.open(path, os.O_RDWR | os.O_CREAT, 0o600)
+    fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+    return fd
+
+
 class Harness:
     """autoscaler.main() with a fixed clock, a fake runner and a fake wait; records every command."""
 
@@ -124,10 +147,15 @@ class Harness:
         self.log_dir = tmp_path / "log"
         self.hooks = {}  # tool -> fn(harness), run when that tool is called (it may raise KeyboardInterrupt)
         self.on_wait = None  # fn(harness, tick) between the ticks of a --loop run
+        self.stopper = None  # a real Stopper whose handler a test calls (a Ctrl-C without a signal)
 
     @property
     def overrides_path(self):
         return self.root / "lambda" / ".autoscale-state.json"
+
+    @property
+    def lock_path(self):
+        return self.root / ".run" / "gpuctl.lock"
 
     # the fake runner -------------------------------------------------------------------------
     def tool(self, argv):
@@ -142,10 +170,11 @@ class Harness:
             return value.pop(0) if len(value) > 1 else value[0]
         return value
 
-    def run(self, argv, *, env=None, stream=False):
+    def run(self, argv, *, env=None, stream=False, pass_fds=()):
         tool = self.tool(list(argv))
         overrides = self.root / "lambda" / ".autoscale-state.json"
         self.calls.append({"tool": tool, "argv": list(argv), "env": dict(env or {}), "stream": stream,
+                           "pass_fds": tuple(pass_fds), "lock_free": lock_is_free(self.lock_path),
                            "state": self.state_path.read_text() if self.state_path.exists() else None,
                            "overrides": overrides.read_text() if overrides.exists() else None})
         result = self.module.Result
@@ -185,7 +214,7 @@ class Harness:
                 self.on_wait(self, next(done))
             return next(waits)
 
-        deps = self.module.Deps(clock=lambda: self.now, run=self.run, wait=wait, out=self.out)
+        deps = self.module.Deps(clock=lambda: self.now, run=self.run, wait=wait, out=self.out, stopper=self.stopper)
         full_env = {"AUTOSCALER_ROOT": str(self.root), **(env or {})}
         argv = list(args) + ["--log", str(self.log_dir)]
         if ticks == 1 and "--loop" not in args:
@@ -292,6 +321,15 @@ def test_once_runs_guarded_cpu_pool_with_auto_approve(tmp_path):
     assert "fake cpu-pool scale 2 --guarded" in r.stdout  # the action's output reaches the operator
 
 
+def test_gpu_apply_subprocess_inherits_the_lock(tmp_path):  # review r2-1: the real Popen pass_fds wiring
+    scenario = {"pods": klist(GPU_PENDING, GPU1_BUSY), "nodes": klist(CP, CPU1, node("k3s-gpu-a6000-1")),
+                "instances": [INSTANCE_1]}
+    r = run_autoscaler(tmp_path, "--once", "--log", str(tmp_path / "log"), scenario=scenario)
+    assert r.returncode == 0, r.stdout + r.stderr
+    (apply,) = [c for c in fake_calls(tmp_path) if c["tool"] == "gpuctl-apply"]
+    assert apply["lock_inherited"] is True
+
+
 def test_dry_run_with_kubectl_reads_the_cluster_and_changes_nothing(tmp_path):
     scenario = {"pods": klist(GPU_PENDING, GPU1_BUSY), "nodes": klist(CP, CPU1, node("k3s-gpu-a6000-1")),
                 "instances": [INSTANCE_1]}
@@ -392,7 +430,8 @@ def test_gpu_scale_checks_budget_then_writes_override_then_applies(harness):
     h = harness(**GPU_CLUSTER, overrides={"other": 0})
     assert h.main() == 0
     tools = [c["tool"] for c in h.calls]
-    assert tools == ["kubectl", "kubectl", "gpuctl-list-nodes", "gpuctl-plan", "gpuctl-apply"]
+    # the second list-nodes re-checks the instances under gpuctl's lock, right before the write (review r2-1)
+    assert tools == ["kubectl", "kubectl", "gpuctl-list-nodes", "gpuctl-plan", "gpuctl-list-nodes", "gpuctl-apply"]
     plan, apply = h.of("gpuctl-plan")[0], h.of("gpuctl-apply")[0]
     assert plan["argv"][1:] == ["plan", "--set-count", "a6000=2"]
     assert json.loads(plan["overrides"]) == {"pools": {"other": 0}}  # nothing written before the check passed
@@ -524,6 +563,202 @@ def test_failed_gpu_scale_down_keeps_the_lower_target(harness):
     assert h.overrides() == {"pools": {"a6000": 1}}  # never a target above what may still run: no relaunch
 
 
+# --- gpu-down vs a running tick: gpuctl's write lock (review r2-1, spec section 10.4) ------------------
+
+def test_gpu_apply_runs_under_the_lock_and_inherits_it(harness):
+    h = harness(**GPU_CLUSTER)
+    assert h.main() == 0
+    recheck, apply = h.of("gpuctl-list-nodes")[1], h.of("gpuctl-apply")[0]
+    assert not recheck["lock_free"] and not apply["lock_free"]  # held from the re-check through the apply
+    (fd,) = apply["pass_fds"]
+    assert apply["env"] == {"GPUCTL_LOCK_FD": str(fd)}  # its own apply does not wait for the autoscaler's lock
+    assert all(c["pass_fds"] == () for c in h.calls if c is not apply)
+    assert lock_is_free(h.lock_path)  # released after the action
+
+
+def test_gpu_down_between_the_read_and_the_write_without_an_override_launches_nothing(harness):
+    """The finding's case: no override file yet (the first scale-up), and gpu-down terminates the instances while
+    gpuctl plan runs. Nothing the autoscaler owns changed, but the re-check under the lock sees the instances go."""
+    h = harness(**GPU_CLUSTER, state={"last_action_at": NOW - 500, "idle_since": {}})
+    h.hooks["gpuctl-plan"] = gpu_down
+    assert h.main("--loop", ticks=2, interval=200) == 0
+    assert h.of("gpuctl-apply") == [] and h.overrides() is None  # no {a6000: 2} written, nothing launched
+    (line,) = [x for x in h.log() if x["action"] == "gpu_scale"]
+    assert line["result"].startswith("not started") and "k3s-gpu-a6000-1" in line["result"]
+    assert "make gpu-down" in line["result"]
+    assert h.state()["last_action_at"] == NOW - 500  # nothing ran: no cooldown
+    assert len(h.of("gpuctl-plan")) == 1  # GPU scaling is off until a restart
+    notices = [x["reason"] for x in h.log() if x["action"] == "notice"]
+    assert any("GPU scaling is off" in n for n in notices)
+
+
+def test_a_running_gpuctl_write_holds_the_lock_and_the_gpu_scale_waits_a_tick(harness):
+    h = harness(**GPU_CLUSTER, state={"last_action_at": NOW - 500, "idle_since": {}})
+    held, plans = [], []
+
+    def other_terminal(h):  # a make gpu-apply in another terminal holds the lock during the first plan
+        plans.append(1)
+        if len(plans) == 1:
+            held.append(hold_lock(h.lock_path))
+
+    h.hooks["gpuctl-plan"] = other_terminal
+    h.on_wait = lambda h, tick: os.close(held.pop()) if held else None  # ... and ends; nothing changed here
+    try:
+        assert h.main("--loop", ticks=2, interval=10) == 0
+    finally:
+        for fd in held:
+            os.close(fd)
+    first, second = [x for x in h.log() if x["action"] == "gpu_scale"]
+    assert first["result"].startswith("not started") and "gpuctl.lock" in first["result"]
+    assert second["result"] == "ok"  # not turned off, and no cooldown: the next tick scales up
+    assert len(h.of("gpuctl-apply")) == 1 and h.overrides() == {"pools": {"a6000": 2}}
+
+
+def test_the_lock_is_released_when_the_apply_fails_or_is_interrupted(harness, tmp_path):
+    h = harness(**GPU_CLUSTER, rc={"gpuctl-apply": 1})
+    h.main()
+    assert h.of("gpuctl-apply") and lock_is_free(h.lock_path)
+
+    def interrupt(h):
+        raise KeyboardInterrupt
+
+    h.hooks["gpuctl-apply"] = interrupt
+    h.rc = {}
+    h.now += 500
+    assert h.main() == 130
+    assert len(h.of("gpuctl-apply")) == 2 and lock_is_free(h.lock_path)
+
+
+def test_second_ctrl_c_right_after_the_override_write_restores_it(harness, autoscaler, monkeypatch):  # r2-3
+    h = harness(**GPU_CLUSTER, overrides={"a6000": 1})
+    real = autoscaler.atomic_write
+
+    def write_then_interrupt(path, text, **kw):
+        real(path, text, **kw)
+        if path == h.overrides_path:
+            raise KeyboardInterrupt  # lands after the rename, before gpuctl apply starts
+
+    monkeypatch.setattr(autoscaler, "atomic_write", write_then_interrupt)
+    assert h.main() == 130
+    assert h.of("gpuctl-apply") == []
+    assert h.overrides() == {"pools": {"a6000": 1}}  # no raised GPU target left behind
+    assert lock_is_free(h.lock_path)
+
+
+def test_a_third_ctrl_c_cannot_stop_the_override_restore(harness, autoscaler, monkeypatch):  # r2-3
+    h = harness(**GPU_CLUSTER, overrides={"a6000": 1})
+    h.stopper = autoscaler.Stopper()
+
+    def second_ctrl_c(h):  # the second Ctrl-C interrupts gpuctl apply
+        h.stopper.request()
+        raise KeyboardInterrupt
+
+    h.hooks["gpuctl-apply"] = second_ctrl_c
+    real = autoscaler.atomic_write
+
+    def third_ctrl_c(path, text, **kw):
+        if path == h.overrides_path and json.loads(text) == {"pools": {"a6000": 1}}:
+            h.stopper._handle(signal.SIGINT, None)  # lands as the file is put back
+        real(path, text, **kw)
+
+    monkeypatch.setattr(autoscaler, "atomic_write", third_ctrl_c)
+    assert h.main() == 130
+    assert h.overrides() == {"pools": {"a6000": 1}}  # put back all the same
+    assert lock_is_free(h.lock_path)
+
+
+def test_run_command_returns_minus_one_for_a_sighup_killed_child(autoscaler):  # r2-5: the real Popen value
+    r = autoscaler.run_command(["bash", "-c", "kill -HUP $$"], stream=True)
+    assert r.rc == -signal.SIGHUP == -1
+    assert autoscaler._exit_text(r.rc) == "killed by SIGHUP"
+    assert autoscaler._exit_text(2) == "exit 2" and autoscaler._exit_text(-200) == "killed by signal 200"
+
+
+def test_a_child_killed_by_a_signal_is_a_failure_not_a_refusal(harness):  # r2-5: SIGHUP -> returncode -1
+    h = harness(**GPU_CLUSTER, overrides={"a6000": 1}, rc={"gpuctl-apply": -1})
+    assert h.main() == 1
+    (line,) = [x for x in h.log() if x["action"] == "gpu_scale"]
+    assert line["result"].startswith("failed (killed by SIGHUP)") and "1/2 failures" in line["result"]
+    assert h.state()["last_action_at"] == NOW + 5  # the cooldown counts, from the end of the run
+    assert h.overrides() == {"pools": {"a6000": 1}}
+
+
+def test_a_cpu_pool_killed_by_a_signal_is_a_failure(harness):
+    h = harness(pods=[CPU_PENDING], rc={"cpu-pool": -1})
+    assert h.main() == 1
+    (line,) = [x for x in h.log() if x["action"] == "cpu_scale"]
+    assert line["result"].startswith("failed (killed by SIGHUP)")
+
+
+# --- a failed GPU scale-down is finished (review r2-2) ---------------------------------------------
+
+def scaled_down_cluster(harness, rc):
+    """Two GPU nodes, target 2, k3s-gpu-a6000-2 idle past idle_minutes: the first tick scales a6000 down to 1."""
+    nodes = [CP, CPU1, node("k3s-gpu-a6000-1"), node("k3s-gpu-a6000-2")]
+    return harness(nodes=nodes, instances=[INSTANCE_1, INSTANCE_1.replace("-1 ", "-2 ")], overrides={"a6000": 2},
+                   pods=[GPU1_BUSY], state={"last_action_at": None, "idle_since": {"k3s-gpu-a6000-2": NOW - 301}},
+                   rc={"gpuctl-apply": rc})
+
+
+def terminated_2(h):
+    h.instances = [INSTANCE_1]
+    h.nodes = klist(CP, CPU1, node("k3s-gpu-a6000-1"))
+
+
+def test_failed_gpu_scale_down_is_retried_after_the_cooldown(harness):
+    h = scaled_down_cluster(harness, [1, 0])
+    applies = []
+
+    def apply_hook(h):
+        applies.append(1)
+        if len(applies) == 2:  # the retry terminates the idle node
+            terminated_2(h)
+
+    h.hooks["gpuctl-apply"] = apply_hook
+    h.main("--loop", ticks=4, interval=70)  # tick 2 is inside the cooldown, tick 3 past it
+    assert len(h.of("gpuctl-apply")) == 2 and h.overrides() == {"pools": {"a6000": 1}}
+    first, retry = [x for x in h.log() if x["action"] == "gpu_scale"]
+    assert first["target"] == 1 and "retried after the cooldown" in first["result"]
+    assert retry["target"] == 1 and retry["result"] == "ok" and "2 GPU instances live, target 1" in retry["reason"]
+    notices = [x["reason"] for x in h.log() if x["action"] == "notice"]
+    assert sum("pool a6000: 2 GPU instances live, target 1" in n for n in notices) == 2  # ticks 2 and 3, not 4
+    assert h.log()[-1]["action"] == "none"
+
+
+def test_scale_down_that_terminated_before_failing_needs_no_retry(harness):
+    h = scaled_down_cluster(harness, 1)
+    h.hooks["gpuctl-apply"] = terminated_2  # the terminate went through, a later step failed
+    h.main("--loop", ticks=3, interval=200)
+    assert len(h.of("gpuctl-apply")) == 1
+    assert not any("GPU instances live" in x["reason"] for x in h.log() if x["action"] == "notice")
+
+
+def test_live_above_target_is_reported_every_tick_until_it_converges(harness):
+    h = scaled_down_cluster(harness, 1)
+    h.main("--loop", ticks=5, interval=200)
+    assert len(h.of("gpuctl-apply")) == 2  # the scale-down and one retry: then GPU scale-down is off
+    notices = [x["reason"] for x in h.log() if x["action"] == "notice"]
+    live = [n for n in notices if "pool a6000: 2 GPU instances live, target 1" in n]
+    assert len(live) == 4 and "make gpu-apply" in live[-1] and "make gpu-down" in live[-1]
+
+
+# --- a failure limit turns off only its own kind (review r2-4) ---------------------------------------
+
+def test_gpu_scale_down_off_still_scales_up(harness):
+    h = scaled_down_cluster(harness, [1, 1, 0])
+
+    def gpu_pod_arrives(h, tick):
+        if tick == 2:  # GPU scale-down is off now; a GPU Pod goes Pending
+            h.pods = klist(GPU1_BUSY, GPU_PENDING)
+
+    h.on_wait = gpu_pod_arrives
+    h.main("--loop", ticks=3, interval=200)
+    results = [(x["target"], x["result"]) for x in h.log() if x["action"] == "gpu_scale"]
+    assert "GPU scale-down disabled after 2 failures" in results[1][1]
+    assert results[2] == (2, "ok")  # GPU scale-up still works
+    assert not any("waiting: GPU scale-down disabled" in x["reason"] for x in h.log())
+
+
 def test_repeated_gpu_apply_failures_disable_gpu_scale_up(harness):
     h = harness(**GPU_CLUSTER, rc={"gpuctl-apply": 1})
     h.main("--loop", ticks=6, interval=200)  # every tick is past the cooldown
@@ -567,6 +802,8 @@ def test_unwritable_override_file_is_a_logged_failure(harness, autoscaler, monke
     assert h.of("gpuctl-apply") == []
     (line,) = [x for x in h.log() if x["action"] == "gpu_scale"]
     assert line["result"].startswith("failed") and "No space left on device" in line["result"]
+    assert "left as it is" not in line["result"]  # the file nobody changed is not taken for a gpu-down
+    assert not any("GPU scaling is off" in x["reason"] for x in h.log())
 
 
 def test_unwritable_state_file_starts_no_action(harness, autoscaler, monkeypatch):
@@ -838,3 +1075,13 @@ def test_ctrl_c_between_ticks_exits_at_once(tmp_path):
     assert proc.returncode == 0, out + stderr_of(tmp_path)
     assert "Traceback" not in stderr_of(tmp_path)
     assert [c["tool"] for c in fake_calls(tmp_path)] == ["kubectl", "kubectl", "gpuctl"]  # no second tick
+
+
+def test_a_lock_file_that_cannot_be_opened_is_a_failed_gpu_scale(harness):
+    h = harness(**GPU_CLUSTER)
+    h.lock_path.parent.mkdir(parents=True, exist_ok=True)
+    h.lock_path.mkdir()  # not a file: it cannot be opened
+    assert h.main() == 1
+    assert h.of("gpuctl-apply") == [] and h.overrides() is None
+    (line,) = [x for x in h.log() if x["action"] == "gpu_scale"]
+    assert line["result"].startswith("failed") and "gpuctl.lock" in line["result"]

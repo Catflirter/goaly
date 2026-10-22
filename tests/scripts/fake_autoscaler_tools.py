@@ -34,6 +34,10 @@ def main():
     entry = {"tool": tool, "argv": argv, "auto_approve": os.environ.get("AUTO_APPROVE"),
              "state": read(os.environ.get("AUTOSCALER_STATE")),
              "overrides": read(root / "lambda" / ".autoscale-state.json")}
+    if tool == "gpuctl-apply":  # the autoscaler's lock reaches gpuctl through the bash wrapper's exec (review r2-1)
+        sys.path.insert(0, str(Path(__file__).resolve().parents[2] / "lambda"))
+        from gpuctl.lock import inherited, lock_path
+        entry["lock_inherited"] = inherited(lock_path(root), os.environ)
     with open(os.environ["FAKE_LOG"], "a", encoding="utf-8") as f:
         f.write(json.dumps(entry) + "\n")
     if tool == "kubectl":
