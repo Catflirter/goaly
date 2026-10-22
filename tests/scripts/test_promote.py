@@ -6,7 +6,9 @@ tests/test_gitleaks_rules.py); the files the script sees at run time hold the fu
 """
 import os
 import shutil
+import signal
 import subprocess
+import time
 from pathlib import Path
 
 import pytest
@@ -20,16 +22,19 @@ SUMMARY = ("# Verification run\n\nStarted: 2026-10-21T14:30:05-07:00 (America/Lo
            "**Result:** 1 passed, 0 failed, 0 skipped\n\n**Secret scan:** gitleaks found no leaks\n")
 
 
-@pytest.fixture
-def repo(tmp_path):
+def make_repo(root):
     """A throwaway repo root holding copies of promote.sh, common.sh, the gitleaks config and the Makefile."""
-    root = tmp_path / "repo"
     (root / "scripts/lib").mkdir(parents=True)
     for rel in ("scripts/promote.sh", "scripts/lib/common.sh", ".gitleaks.toml", "Makefile"):
         shutil.copy2(ROOT / rel, root / rel)
     (root / "verification").mkdir()
     (root / "verification/.gitkeep").write_text("")
     return root.resolve()
+
+
+@pytest.fixture
+def repo(tmp_path):
+    return make_repo(tmp_path / "repo")
 
 
 def make_run(repo, name=TS, files=None, summary=SUMMARY):
@@ -77,7 +82,7 @@ def previous_final(repo):
 # --- happy path ---------------------------------------------------------------------------------
 
 def test_promote_copies_the_run_exactly(repo):
-    run = make_run(repo, files={"01-A1.txt": "a\n", "02-B1.txt": "b\n", "nested/03-C1.txt": "c\n"})
+    run = make_run(repo, files={"01-A1.txt": "a\n", "02-B1.txt": "b\n", "03-C1.txt": "c\n", "autoscaler.log": "d\n"})
     before = snapshot(run)
     r = promote(repo, "verify", f"verification/{TS}")
     assert r.returncode == 0, r.stderr
@@ -144,14 +149,14 @@ def test_promote_accepts_a_run_that_scripts_verify_sh_wrote(repo):
 # proves the scan used the repo config.
 @pytest.mark.parametrize("secret", [K3S_TOKEN, "Authorization: Bearer " + FAKE_LAMBDA_KEY])
 def test_a_leak_fails_and_leaves_no_final(repo, secret):
-    make_run(repo, files={"01-A1.txt": "fine\n", "nested/02-B1.txt": "oops " + secret + "\n"})
+    make_run(repo, files={"01-A1.txt": "fine\n", "02-B1.txt": "oops " + secret + "\n"})
     r = promote(repo, "verify", f"verification/{TS}")
     assert r.returncode == 1, r.stderr
     assert not (repo / "verification/final").exists()
     assert verification_entries(repo) == [".gitkeep", TS], "the scanned copy is removed"
     out = r.stdout + r.stderr
     assert secret.split()[-1] not in out, "gitleaks output is redacted"
-    assert "leak" in out and "nested/02-B1.txt" in out
+    assert "leak" in out and "02-B1.txt" in out and "01-A1.txt" not in out
 
 
 def test_a_leak_keeps_the_previous_final_unchanged(repo):
@@ -353,3 +358,192 @@ def test_make_help_lists_promote_verify():
     r = subprocess.run(["make", "--no-print-directory", "-f", str(ROOT / "Makefile"), "help"],
                        capture_output=True, text=True, cwd=ROOT)
     assert "promote-verify" in r.stdout
+
+
+# --- review round 0 (PR #92) --------------------------------------------------------------------
+
+# C0-1/X0-1: gitleaks' default path allowlist (.gitleaks.toml has useDefault = true) skips images,
+# .git, vendor/, node_modules/ and more, so the run may hold only the flat files verify.sh writes.
+@pytest.mark.parametrize("name", ["02-B1.png", "notes.md", ".hidden.txt", "01-gitleaks.toml.txt", "README",
+                                  ".git/03-x.txt", "vendor/03-x.txt", "node_modules/03-x.txt",
+                                  "nested/03-C1.txt", "03-x.txt/"])
+def test_refuses_a_run_holding_a_file_verify_sh_does_not_write(repo, name):
+    before = previous_final(repo)
+    run = make_run(repo)
+    if name.endswith("/"):
+        (run / name).mkdir()
+    else:
+        (run / name).parent.mkdir(parents=True, exist_ok=True)
+        (run / name).write_text("oops " + K3S_TOKEN + "\n")
+    assert_refused(repo, promote(repo, "verify", f"verification/{TS}"), before, name.split("/")[0])
+
+
+def test_an_autoscaler_log_is_promoted_and_scanned(repo):
+    # spec section 10.5: the autoscaler writes verification/<ts>/autoscaler.log.
+    run = make_run(repo, files={"01-A1.txt": "a\n", "autoscaler.log": "scale up: pending GPU pod\n"})
+    r = promote(repo, "verify", f"verification/{TS}")
+    assert r.returncode == 0, r.stderr
+    assert snapshot(repo / "verification/final") == snapshot(run)
+    shutil.rmtree(repo / "verification/final")
+    (run / "autoscaler.log").write_text("join " + K3S_TOKEN + "\n")
+    r = promote(repo, "verify", f"verification/{TS}")
+    assert r.returncode == 1 and "autoscaler.log" in r.stderr, r.stderr
+    assert not (repo / "verification/final").exists()
+
+
+def test_a_gitleaks_allow_marker_does_not_hide_a_leak(repo):
+    before = previous_final(repo)
+    make_run(repo, files={"01-A1.txt": "token " + K3S_TOKEN + "  # gitleaks" + ":allow\n"})
+    r = promote(repo, "verify", f"verification/{TS}")
+    assert r.returncode == 1, r.stderr
+    assert snapshot(repo / "verification/final") == before
+
+
+def test_a_repo_under_an_allowlisted_directory_is_still_scanned(tmp_path):
+    # The default allowlist matches (^|/)node_modules(/.*)?$ against the scanned path: the repo's own
+    # location must not exempt the run.
+    repo = make_repo(tmp_path / "node_modules" / "repo")
+    make_run(repo, files={"01-A1.txt": K3S_TOKEN + "\n"})
+    r = promote(repo, "verify", f"verification/{TS}")
+    assert r.returncode == 1, r.stderr
+    assert not (repo / "verification/final").exists()
+
+
+# C0-3/X0-3: final is the run where every check passed (spec section 9, Task 24 Step 3).
+FAILED_SUMMARY = SUMMARY.replace("1 passed, 0 failed, 0 skipped", "3 passed, 2 failed, 0 skipped")
+
+
+def test_refuses_a_run_with_failed_checks(repo):
+    before = previous_final(repo)
+    make_run(repo, summary=FAILED_SUMMARY)
+    assert_refused(repo, promote(repo, "verify", f"verification/{TS}"), before, "2 failed", "PROMOTE_ALLOW_FAIL=1")
+
+
+@pytest.mark.parametrize("via_make", [False, True])
+def test_promote_allow_fail_promotes_a_failed_run_with_a_warning(repo, via_make):
+    run = make_run(repo, summary=FAILED_SUMMARY)
+    if via_make:
+        r = make_target(repo, f"RUN=verification/{TS}", "PROMOTE_ALLOW_FAIL=1")
+    else:
+        r = promote(repo, "verify", f"verification/{TS}", env={**os.environ, "PROMOTE_ALLOW_FAIL": "1"})
+    assert r.returncode == 0, r.stderr
+    assert snapshot(repo / "verification/final") == snapshot(run)
+    assert "warning" in r.stderr and "2 failed" in r.stderr
+
+
+@pytest.mark.parametrize("result", ["**Result:** all good\n", "**Result:** 1 passed, x failed, 0 skipped\n"])
+def test_refuses_a_result_line_it_cannot_read(repo, result):
+    before = previous_final(repo)
+    make_run(repo, summary=SUMMARY.split("**Result:**")[0] + result)
+    assert_refused(repo, promote(repo, "verify", f"verification/{TS}"), before, "Result")
+
+
+def test_a_skipped_check_is_promoted_with_a_warning(repo):
+    run = make_run(repo, summary=SUMMARY.replace("1 passed, 0 failed, 0 skipped", "1 passed, 0 failed, 2 skipped"))
+    r = promote(repo, "verify", f"verification/{TS}")
+    assert r.returncode == 0, r.stderr
+    assert snapshot(repo / "verification/final") == snapshot(run)
+    assert "warning" in r.stderr and "2 skipped" in r.stderr
+
+
+# X0-2: the operator IP (Task 24 Step 4) must not reach final.
+OPERATOR_IP = "73.15.40.40"
+
+
+@pytest.mark.parametrize("via_make", [False, True])
+def test_the_operator_ip_fails_and_keeps_the_previous_final(repo, via_make):
+    before = previous_final(repo)
+    make_run(repo, files={"01-A1.txt": "fine\n", "06-B6.txt": f"fw-ssh-operator  {OPERATOR_IP}/32\n"})
+    if via_make:
+        r = make_target(repo, f"RUN=verification/{TS}", f"OPERATOR_IP={OPERATOR_IP}")
+    else:
+        r = promote(repo, "verify", f"verification/{TS}", env={**os.environ, "OPERATOR_IP": OPERATOR_IP})
+    assert r.returncode == (2 if via_make else 1), r.stderr     # make reports a failed recipe as 2
+    assert snapshot(repo / "verification/final") == before
+    assert verification_entries(repo) == [".gitkeep", TS, "final"]
+    assert "06-B6.txt" in r.stderr and "01-A1.txt" not in r.stderr and "OPERATOR_IP" in r.stderr
+
+
+def test_success_reminds_the_operator_ip_check(repo):
+    make_run(repo)
+    r = promote(repo, "verify", f"verification/{TS}", env={**os.environ, "OPERATOR_IP": OPERATOR_IP})
+    assert r.returncode == 0, r.stderr
+    assert "checkip.amazonaws.com" in r.stderr
+
+
+# S0-2/C0-2/X0-4: replacing final survives a failed rename, Ctrl-C, and a second promotion.
+
+def fake_mv(tmp_path, mode):
+    """A PATH dir whose mv fails ("fail") or sleeps ("sleep") when renaming the scanned copy (step 2),
+    or sleeps when moving the old final aside ("sleep-old"); a marker file says it reached that point."""
+    bin_dir = tmp_path / "fakebin"
+    bin_dir.mkdir()
+    marker = tmp_path / "mv-reached"
+    src = "*/.promote-*/final" if mode in ("fail", "sleep") else "*/verification/final"
+    action = "exit 1" if mode == "fail" else "sleep 2"
+    (bin_dir / "mv").write_text(
+        "#!/bin/sh\n"
+        f'case "$2" in {src}) : >"{marker}"; {action} ;; esac\n'
+        f'exec {shutil.which("mv")} "$@"\n')
+    (bin_dir / "mv").chmod(0o755)
+    return {**os.environ, "PATH": f"{bin_dir}:{os.environ['PATH']}"}, marker
+
+
+def wait_for(path, proc, seconds=20):
+    deadline = time.monotonic() + seconds
+    while not path.exists():
+        assert proc.poll() is None, proc.communicate()
+        assert time.monotonic() < deadline, "timed out"
+        time.sleep(0.05)
+
+
+def test_a_failed_rename_restores_the_previous_final(repo, tmp_path):
+    before = previous_final(repo)
+    make_run(repo)
+    env, _ = fake_mv(tmp_path, "fail")
+    r = promote(repo, "verify", f"verification/{TS}", env=env)
+    assert r.returncode == 1, r.stderr
+    assert snapshot(repo / "verification/final") == before
+    assert verification_entries(repo) == [".gitkeep", TS, "final"]
+
+
+@pytest.mark.parametrize("mode", ["sleep-old", "sleep"])
+def test_ctrl_c_while_replacing_final_leaves_a_whole_final(repo, tmp_path, mode):
+    previous_final(repo)
+    run = make_run(repo)
+    env, marker = fake_mv(tmp_path, mode)
+    proc = subprocess.Popen(["bash", str(repo / "scripts/promote.sh"), "verify", f"verification/{TS}"],
+                            cwd=repo, env=env, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True,
+                            start_new_session=True)
+    wait_for(marker, proc)
+    os.killpg(proc.pid, signal.SIGINT)                     # Ctrl-C reaches the whole foreground group
+    proc.communicate(timeout=30)
+    assert snapshot(repo / "verification/final") == snapshot(run), "the swap ran to completion"
+    assert verification_entries(repo) == [".gitkeep", TS, "final"]
+
+
+def test_a_second_promotion_waits_its_turn(repo, tmp_path):
+    previous_final(repo)
+    run = make_run(repo)
+    other = make_run(repo, name="2026-10-21T1500-0700")
+    env, marker = fake_mv(tmp_path, "sleep")
+    first = subprocess.Popen(["bash", str(repo / "scripts/promote.sh"), "verify", f"verification/{TS}"],
+                             cwd=repo, env=env, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
+    wait_for(marker, first)
+    second = promote(repo, "verify", f"verification/{other.name}")
+    _, err = first.communicate(timeout=30)
+    assert first.returncode == 0, err
+    assert second.returncode == 1 and "another promotion" in second.stderr, second.stderr
+    assert snapshot(repo / "verification/final") == snapshot(run)
+    assert not (repo / "verification/final/final").exists()
+    assert verification_entries(repo) == [".gitkeep", TS, other.name, "final"]
+
+
+def test_a_stale_lock_is_reported_not_broken(repo):
+    before = previous_final(repo)
+    make_run(repo)
+    (repo / "verification/.promote.lock").write_text("999999999\n")
+    r = promote(repo, "verify", f"verification/{TS}")
+    assert r.returncode == 1 and ".promote.lock" in r.stderr, r.stderr
+    assert snapshot(repo / "verification/final") == before
+    assert (repo / "verification/.promote.lock").read_text() == "999999999\n", "not ours to remove"

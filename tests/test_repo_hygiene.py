@@ -16,7 +16,7 @@ def ignored(path):
     "infra/base/terraform.tfstate", "verification/run1.txt",
     # Task 24a: every verify run but final/, and promote.sh's staging copy, stay out of git.
     "verification/2026-10-21T1430-0700/SUMMARY.md", "verification/2026-10-21T1430-0700/01-A1.txt",
-    "verification/.promote-a1B2c3/final/SUMMARY.md",
+    "verification/.promote-a1B2c3/final/SUMMARY.md", "verification/.promote.lock",
     # The workflow makes .venv a symlink to a shared venv; ".venv/" would match only a directory.
     ".venv"])
 def test_secret_and_state_files_are_ignored(path):
