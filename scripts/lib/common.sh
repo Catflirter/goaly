@@ -1,7 +1,8 @@
 # shellcheck shell=bash
 # Shared helpers for the operator scripts. Source it; do not run it.
 # Task 7: REPO_ROOT, log, die, load_env. Task 10: the Terraform, IAP SSH, kubectl and prompt helpers
-# below. Kept to bash 3.2 (macOS operators): no bash-4-only features.
+# below. Kept to bash 3.2 (macOS operators): no bash-4-only features, except where stack_lock takes a
+# lock (exec {fd}>, bash >= 4.1; checked at run time, so an older bash is refused with a clear message).
 
 REPO_ROOT="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")/../.." && pwd -P)"
 
@@ -68,6 +69,56 @@ _export_tf_vars() {
 tf_env() {
   _gcp_project_ok || die "GCP_PROJECT='${GCP_PROJECT:-}' in .env is not a GCP project id" 2
   _export_tf_vars
+}
+
+# _bash_version_ok [MAJOR MINOR]: the bash version (default: this bash) is at least 4.1, which
+# `exec {fd}>` (a descriptor bash picks and names) needs. macOS ships bash 3.2.
+_bash_version_ok() {
+  local major="${1:-${BASH_VERSINFO[0]}}" minor="${2:-${BASH_VERSINFO[1]}}"
+  (( major > 4 || (major == 4 && minor >= 1) ))
+}
+
+# stack_lock [--required] STACK: hold flock(1) on $RUN_DIR/STACK.lock until this process exits, so two
+# runs never plan or apply one stack at once (C-1): they would race on its saved plan
+# ($RUN_DIR/STACK.tfplan) and, for workers, on the inventory file. tf_plan and tf_apply_plan take it;
+# cpu-pool.sh takes the workers lock before it reads the inventory (its --guarded runs since Ruling
+# SR8: workers.lock is the one lock of the workers stack); down.sh takes every stack it destroys.
+# Another holder: fail fast (exit 2), naming the stack and the file. The kernel drops the lock when the
+# holder exits, however it ends, so there is no stale lock and nothing to clean up; the file stays
+# (removing it would let a waiting run lock an unlinked file). Re-entrant: a stack this process holds
+# already is a no-op (a second open of the file would conflict with this process's own lock); a
+# subshell shares the descriptor, so it may call it too. Children inherit the descriptor: a script
+# that starts a process outliving it must close it there (tunnel.sh does for the API tunnel).
+# Without flock(1) on PATH: one WARNING per process and the run goes on unlocked, or with --required
+# exit 2. Locking needs bash >= 4.1; an older bash is refused (exit 2).
+stack_lock() {
+  local required=0 stack file fd
+  if [[ "${1:-}" == --required ]]; then
+    required=1
+    shift
+  fi
+  stack="${1:-}"
+  [[ "$stack" =~ ^[a-z][a-z0-9-]*$ ]] || die "stack_lock: not a stack name: '$stack'"
+  [[ " ${_STACK_LOCKS:-} " != *" $stack "* ]] || return 0
+  file="$RUN_DIR/$stack.lock"
+  if ! command -v flock > /dev/null 2>&1; then
+    (( required == 0 )) \
+      || die "flock(1) (util-linux) is not on PATH, and this run must hold the $stack stack's lock $file: nothing was changed" 2
+    if [[ -z "${_STACK_LOCK_WARNED:-}" ]]; then
+      log "WARNING: flock(1) (util-linux) is not on PATH: this run plans and applies Terraform stacks without their locks; do not run make up, make down or cpu-pool.sh at the same time"
+      _STACK_LOCK_WARNED=1
+    fi
+    return 0
+  fi
+  _bash_version_ok \
+    || die "taking the $stack stack's lock needs bash >= 4.1 (this is bash ${BASH_VERSION}); run it with a newer bash (macOS: brew install bash)" 2
+  run_dir || die "cannot create $RUN_DIR"
+  exec {fd}>> "$file" || die "cannot open $file"
+  if ! flock -n "$fd"; then
+    exec {fd}>&-
+    die "another run holds $file, the lock of the $stack stack (make up, make down, cpu-pool.sh or the autoscaler): this run changed nothing in the $stack stack; the lock is released when that run exits" 2
+  fi
+  _STACK_LOCKS="${_STACK_LOCKS:-} $stack"
 }
 
 # tf_dir STACK: the stack's directory, $REPO_ROOT/infra/STACK; dies for anything else.
@@ -150,6 +201,8 @@ _tf_output() {
 #                          stack's *.auto.tfvars files, and the saved plan keeps them. cpu-pool.sh plans
 #                          the new inventory this way before it drains anything or writes the file.
 # Declining exits 2. STACK must be initialised already (tf_init; `terraform init` for bootstrap).
+# tf_plan takes the stack's lock (stack_lock STACK) before it plans, and this process keeps it until it
+# exits: another run that plans or applies STACK meanwhile is refused (exit 2).
 tf_apply() {
   tf_plan "$@"
   tf_apply_plan "$1"
@@ -181,6 +234,7 @@ tf_plan() {
   esac
   dir="$(tf_dir "$stack")" || exit
   tf_env
+  stack_lock "$stack"
   run_dir || die "cannot create $RUN_DIR"
   plan="$RUN_DIR/$stack.tfplan"
   rm -f -- "$plan"
@@ -219,15 +273,24 @@ tf_plan() {
   TF_PLAN="$plan"
 }
 
-# tf_apply_plan STACK: the second half of tf_apply: ask, then apply exactly the plan tf_plan saved
-# ($TF_PLAN) and remove it. Nothing to do when TF_PLAN is "" (no changes).
+# tf_apply_plan STACK [--confirmed]: the second half of tf_apply: ask, then apply exactly the plan
+# tf_plan saved ($TF_PLAN) and remove it. Nothing to do when TF_PLAN is "" (no changes). --confirmed:
+# the caller asked this question itself (confirm) and got a yes, so it is not asked again and no
+# AUTO_APPROVE line is logged for an operator's yes (cpu-pool.sh --guarded checks the plan in between).
 tf_apply_plan() {
-  local stack="$1" dir plan="${TF_PLAN:-}" rc=0
+  local stack="$1" dir plan="${TF_PLAN:-}" rc=0 confirmed=0
+  case "${2:-}" in
+    "") ;;
+    --confirmed) confirmed=1 ;;
+    *) die "tf_apply_plan: unknown option ${2}" ;;
+  esac
+  (( $# <= 2 )) || die "tf_apply_plan: unexpected arguments after $2"
   [[ -n "$plan" ]] || return 0
   [[ "$plan" == "$RUN_DIR/$stack.tfplan" && -f "$plan" ]] || die "tf_apply_plan: no saved plan for $stack"
   dir="$(tf_dir "$stack")" || exit
   tf_env
-  if ! confirm "Apply this plan to the $stack stack?"; then
+  stack_lock "$stack"
+  if (( confirmed == 0 )) && ! confirm "Apply this plan to the $stack stack?"; then
     rm -f -- "$plan"
     TF_PLAN=""
     die "not applied: $stack" 2

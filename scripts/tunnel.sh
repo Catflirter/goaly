@@ -104,6 +104,18 @@ tunnel_pid() {
   printf '%s\n' "$pid"
 }
 
+# close_fds_above_2: close every descriptor of this shell above 2 (the ones /dev/fd lists). Run in the
+# background job right before it execs the tunnel.
+close_fds_above_2() {
+  local f n
+  for f in /dev/fd/*; do
+    n="${f##*/}"
+    if [[ "$n" =~ ^[0-9]+$ ]] && (( n > 2 )); then
+      eval "exec $n>&-"
+    fi
+  done
+}
+
 api_ready() {
   [[ "$(kc --request-timeout=5s get --raw /readyz 2> /dev/null)" == ok ]]
 }
@@ -174,11 +186,16 @@ start() {
   run_dir || die "cannot create $RUN_DIR"
   umask 077
   # Job control puts the background job in its own process group, so stop can end gcloud, the ssh
-  # it runs and ssh's IAP ProxyCommand together; nohup keeps it alive when the terminal closes.
+  # it runs and ssh's IAP ProxyCommand together; nohup keeps it alive when the terminal closes. The
+  # job execs gcloud (its PID stays $!) with every descriptor above 2 closed: the tunnel runs for days
+  # and must not keep a lock its starter holds (a stack's lock when make up starts it, stack_lock).
   set -m
-  nohup gcloud compute ssh "$CP_NAME" --project "$GCP_PROJECT" --zone "$CP_ZONE" --tunnel-through-iap --quiet \
-    -- -N -L "$FORWARD" -o ExitOnForwardFailure=yes -o ServerAliveInterval=30 -o GatewayPorts=no \
-    < /dev/null > "$LOGFILE" 2>&1 &
+  {
+    close_fds_above_2
+    exec nohup gcloud compute ssh "$CP_NAME" --project "$GCP_PROJECT" --zone "$CP_ZONE" --tunnel-through-iap \
+      --quiet -- -N -L "$FORWARD" -o ExitOnForwardFailure=yes -o ServerAliveInterval=30 -o GatewayPorts=no \
+      < /dev/null > "$LOGFILE" 2>&1
+  } &
   pid=$!
   set +m
   printf '%s\n' "$pid" > "$PIDFILE"

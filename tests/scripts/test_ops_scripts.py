@@ -4,6 +4,7 @@ The scripts run from a copy of the repo layout with terraform, gcloud and kubect
 tests/scripts/fake_tools.py on PATH. The fakes record every call, so the tests assert the exact
 commands and flags the scripts would run. Nothing here reaches GCP, a cluster or the network.
 """
+import contextlib
 import json
 import os
 import shutil
@@ -553,6 +554,203 @@ def test_tf_apply_no_destroy_lets_a_plan_without_deletes_through(env):
 def test_tf_apply_refuses_an_unknown_option(env):
     proc = env.lib("load_env; tf_apply base --allow-delete", AUTO_APPROVE="1")
     assert proc.returncode != 0 and env.calls("terraform") == []
+
+
+def test_tf_apply_plan_confirmed_applies_without_asking_again(env):
+    """S3-m1: a caller that asked the question itself (cpu-pool.sh --guarded) applies the saved plan with
+    --confirmed: no second question, and no AUTO_APPROVE line for the operator's own yes (S3-L3)."""
+    proc = env.lib("load_env; tf_init base; tf_plan base; tf_apply_plan base --confirmed")  # empty stdin
+    assert proc.returncode == 0, proc.stderr
+    assert tf_subcommands(env) == ["init", "plan", "show", "apply"]
+    assert "[y/N]" not in proc.stderr and "AUTO_APPROVE" not in proc.stderr
+    assert not (env.repo / ".run/base.tfplan").exists()
+
+
+def test_tf_apply_plan_refuses_an_unknown_option(env):
+    proc = env.lib("load_env; tf_init base; tf_plan base; tf_apply_plan base --yes", AUTO_APPROVE="1")
+    assert proc.returncode != 0 and "apply" not in tf_subcommands(env)
+
+
+# ---- one Terraform run per stack (C-1: stack_lock) ---------------------------------------------
+
+def lock_free(path):
+    """Nobody holds PATH with flock(1)."""
+    return subprocess.run(["flock", "-n", str(path), "true"]).returncode == 0
+
+
+@contextlib.contextmanager
+def lock_holder(path):
+    """Another run holds PATH: `flock -o PATH sleep 60` in its own process group. -o: sleep does not inherit the lock,
+    so once the flock process is gone (reaped) the lock is free, whatever happens to sleep (S3-m3)."""
+    path.parent.mkdir(exist_ok=True)
+    holder = subprocess.Popen(["flock", "-o", str(path), "sleep", "60"], start_new_session=True)
+    try:
+        deadline = time.monotonic() + 10
+        while lock_free(path):
+            assert time.monotonic() < deadline and holder.poll() is None, "the holder never took the lock"
+            time.sleep(0.02)
+        yield holder
+    finally:
+        if holder.poll() is None:
+            os.killpg(holder.pid, signal.SIGKILL)
+        holder.wait()
+
+
+def path_without_flock(env, tmp_path):
+    """env's PATH with the fakes first, then every other directory's commands linked into one, flock left out."""
+    dirs = [d for d in env.environ({})["PATH"].split(":") if d != str(env.bin)]
+    tools = tmp_path / "no-flock-bin"
+    tools.mkdir()
+    for d in dirs:
+        if not os.path.isdir(d):
+            continue
+        for name in os.listdir(d):
+            target = tools / name
+            if name != "flock" and not target.exists() and os.access(os.path.join(d, name), os.X_OK):
+                target.symlink_to(os.path.join(d, name))
+    path = f"{env.bin}:{tools}"
+    assert shutil.which("flock", path=path) is None
+    return path
+
+
+def gate_terraform(env, sub):
+    """terraform's SUB (plan, apply) waits while $FAKE_LOG.gate exists, after touching $FAKE_LOG.at_SUB: one run can be
+    held inside its plan while a test starts another."""
+    gate, at = Path(f"{env.log}.gate"), Path(f"{env.log}.at_{sub}")
+    (env.bin / "terraform").write_text(
+        f'#!/bin/sh\nif [ "$2" = {sub} ] && [ -e "{gate}" ]; then : > "{at}"; while [ -e "{gate}" ]; do sleep 0.05; done; fi\n'
+        f'exec "{sys.executable}" "{FAKES}" terraform "$@"\n')
+    gate.write_text("")
+    return gate, at
+
+
+def wait_for_file(path, proc, seconds=30):
+    deadline = time.monotonic() + seconds
+    while not path.exists():
+        assert proc.poll() is None, proc.communicate()
+        assert time.monotonic() < deadline, f"{path} never appeared"
+        time.sleep(0.02)
+
+
+def test_a_second_run_on_a_stack_is_refused_without_touching_terraform(env):
+    gate, at_plan = gate_terraform(env, "plan")
+    first = env.popen(["bash", "-c", "set -euo pipefail; source scripts/lib/common.sh; load_env; tf_init base;"
+                       " tf_apply base"], AUTO_APPROVE="1")
+    try:
+        wait_for_file(at_plan, first)  # the first run is inside its plan, so it holds the base stack's lock
+        before = len(env.calls("terraform"))
+        second = env.lib("load_env; tf_init base; tf_apply base", AUTO_APPROVE="1")
+        assert second.returncode == 2, second.stderr
+        assert "base" in second.stderr and str(env.repo.resolve() / ".run/base.lock") in second.stderr
+        assert len(env.calls("terraform")) == before, "the refused run ran no terraform at all (its init was done)"
+    finally:
+        gate.unlink()
+        out, err = first.communicate(timeout=60)
+    assert first.returncode == 0, err
+    assert tf_subcommands(env) == ["init", "plan", "show", "apply"]
+    assert lock_free(env.repo / ".run/base.lock"), "released when the first run exited"
+
+
+@pytest.mark.parametrize("call", ["tf_apply workers", "tf_plan workers", "stack_lock workers"])
+def test_a_held_stack_lock_refuses_naming_the_stack_and_the_file(env, call):
+    lock = env.repo / ".run/workers.lock"
+    with lock_holder(lock):
+        proc = env.lib(f"load_env; {call}", AUTO_APPROVE="1")
+    assert proc.returncode == 2
+    assert "workers stack" in proc.stderr and str(lock.resolve()) in proc.stderr
+    assert env.calls("terraform") == []
+
+
+def test_a_held_lock_of_another_stack_does_not_block(env):
+    with lock_holder(env.repo / ".run/workers.lock"):
+        proc = env.lib("load_env; tf_init base; tf_apply base", AUTO_APPROVE="1")
+    assert proc.returncode == 0, proc.stderr
+    assert tf_subcommands(env)[-1] == "apply"
+
+
+def test_stack_lock_is_reentrant_and_held_until_the_process_exits(env):
+    lock = env.repo / ".run/base.lock"
+    proc = env.lib(f'load_env; stack_lock base; stack_lock base; tf_init base; tf_apply base; stack_lock base;'
+                   f' if flock -n "{lock}" true; then echo free; else echo held; fi', AUTO_APPROVE="1")
+    assert proc.returncode == 0, proc.stderr
+    assert proc.stdout.split() == ["held"], "taken once, kept through tf_apply, released only on exit"
+    assert tf_subcommands(env)[-1] == "apply"
+    assert lock_free(lock)
+
+
+def test_stack_lock_refuses_a_bad_stack_name(env):
+    for name in ("../x", "", "Base", "base/x"):
+        proc = env.lib(f"stack_lock '{name}'")
+        assert proc.returncode != 0 and "stack" in proc.stderr
+    assert not (env.repo / "x.lock").exists() and not list(env.repo.rglob("*.lock"))
+
+
+def test_without_flock_terraform_runs_unlocked_after_one_warning(env, tmp_path):
+    proc = env.lib("load_env; stack_lock base; tf_init base; tf_apply base; tf_init workers; tf_apply workers",
+                   AUTO_APPROVE="1", PATH=path_without_flock(env, tmp_path))
+    assert proc.returncode == 0, proc.stderr
+    assert tf_subcommands(env).count("apply") == 2
+    assert proc.stderr.count("WARNING") == 1 and "flock" in proc.stderr
+
+
+def test_stack_lock_required_refuses_without_flock(env, tmp_path):
+    proc = env.lib("stack_lock --required workers", PATH=path_without_flock(env, tmp_path))
+    assert proc.returncode == 2 and "flock" in proc.stderr
+
+
+@pytest.mark.parametrize("version, ok", [(("3", "2"), False), (("4", "0"), False), (("4", "1"), True),
+                                         (("4", "4"), True), (("5", "0"), True), (("10", "0"), True)])
+def test_bash_version_check(env, version, ok):
+    """exec {fd}> needs bash >= 4.1 (macOS ships 3.2)."""
+    assert (env.lib(f"_bash_version_ok {' '.join(version)}").returncode == 0) == ok
+    assert env.lib("_bash_version_ok").returncode == 0, "the bash running these tests"
+
+
+def test_stack_lock_checks_the_bash_version_before_it_opens_a_descriptor():
+    text = (ROOT / "scripts/lib/common.sh").read_text()
+    body = text[text.index("\nstack_lock() {"):]
+    body = body[:body.index("\n}\n")]
+    assert "_bash_version_ok \\\n    || die" in body
+    assert body.index("_bash_version_ok") < body.index("exec {")
+
+
+def lock_probe_terraform(env):
+    """terraform plan/apply first record whether their stack's lock (.run/<stack>.lock) is held: STACK SUB held|free."""
+    record = Path(f"{env.log}.locks")
+    (env.bin / "terraform").write_text(
+        '#!/bin/sh\nstack="${1##*/}"\n'
+        f'if [ "$2" = plan ] || [ "$2" = apply ]; then\n'
+        f'  if flock -n "{env.repo}/.run/$stack.lock" true; then s=free; else s=held; fi\n'
+        f'  echo "$stack $2 $s" >> "{record}"\nfi\n'
+        f'exec "{sys.executable}" "{FAKES}" terraform "$@"\n')
+    return record
+
+
+def test_up_base_and_workers_stages_hold_their_stacks_locks(env):
+    record = lock_probe_terraform(env)
+    proc = env.script("up.sh", "all", AUTO_APPROVE="1")
+    assert proc.returncode == 0, proc.stderr
+    assert record.read_text().splitlines() == ["base plan held", "base apply held",
+                                               "workers plan held", "workers apply held"]
+    # The workers stack's lock is cpu-pool.sh's: one lock for every run that plans or applies the workers stack.
+    assert (env.repo / ".run/workers.lock").exists()
+    # Released when up.sh exits, although the API tunnel it started runs on (it must not inherit the lock).
+    assert alive(int(env.pidfile.read_text()))
+    assert lock_free(env.repo / ".run/base.lock") and lock_free(env.repo / ".run/workers.lock")
+
+
+def test_up_init_holds_the_bootstrap_stacks_lock(env):
+    record = lock_probe_terraform(env)
+    proc = env.script("up.sh", "init", AUTO_APPROVE="1")
+    assert proc.returncode == 0, proc.stderr
+    assert record.read_text().splitlines() == ["bootstrap plan held", "bootstrap apply held"]
+
+
+def test_up_base_is_refused_while_another_run_holds_the_base_stack(env):
+    with lock_holder(env.repo / ".run/base.lock"):
+        proc = env.script("up.sh", "base", AUTO_APPROVE="1")
+    assert proc.returncode == 2 and "base stack" in proc.stderr
+    assert "plan" not in tf_subcommands(env) and env.calls("gcloud") == []
 
 
 # ---- kubeconfig.sh ---------------------------------------------------------------------------

@@ -9,6 +9,9 @@
 #      for any other reason, refuses the run (exit 2, nothing changed). Terraform's own overrides
 #      TF_WORKSPACE, TF_DATA_DIR and TF_CLI_ARGS[_*] would point the destroys at another workspace, data
 #      directory or -target: set in .env or in the caller's environment, they refuse the run too.
+#      Before the question the run takes the lock of every stack it destroys (common.sh stack_lock,
+#      .run/<stack>.lock, held until it exits): while make up, cpu-pool.sh or another make down holds
+#      one, it refuses (exit 2) with nothing changed.
 #   2. scripts/gpuctl down --auto-approve: every Lambda GPU node of this cluster (drained, deleted from
 #      the cluster, terminated) and the autoscaler overrides.
 #   3. drain every CPU worker (k3s-cpu-<n>) the cluster lists and delete its Node. An unreachable
@@ -279,6 +282,11 @@ LAMBDA_WAIT_S="${DOWN_LAMBDA_WAIT_S:-60}"
 # kubectl and the tunnel.
 unset LAMBDA_API_KEY
 tf_env
+# C-1: no make up, cpu-pool.sh (the autoscaler's guarded runs included) or second make down may plan or
+# apply a stack this run destroys. Held until the run exits; one that is held refuses here (exit 2).
+for stack in $DESTROY_STACKS; do
+  stack_lock "$stack"
+done
 confirm_project
 trap 'interrupted 130' INT
 trap 'interrupted 143' TERM

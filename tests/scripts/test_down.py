@@ -8,11 +8,14 @@ import shutil
 import signal
 import stat
 import subprocess
+import sys
 import time
 
 import pytest
 
-from test_ops_scripts import BUCKET, KUBECONFIG, PROJECT, ROOT, Env, make_kubeconfig, wait_gone
+from test_ops_scripts import (
+    BUCKET, FAKES, KUBECONFIG, PROJECT, ROOT, Env, lock_free, lock_holder, make_kubeconfig, wait_gone,
+)
 
 STACKS = ("gpu-access", "workers", "base")  # brief step 4: destroyed in this order
 RT = "--request-timeout=60s"
@@ -692,6 +695,32 @@ def test_a_failed_tunnel_stop_fails_the_run_after_the_destroys(env):
     assert proc.returncode == 1
     assert calls(env) == sequence(env, final=False)
     assert "tunnel.sh stop failed" in proc.stderr and "make down" in proc.stderr
+
+
+# ---- one Terraform run per stack (C-1) ---------------------------------------------------------
+
+@pytest.mark.parametrize("stack", STACKS)
+def test_a_held_stack_lock_refuses_before_anything_changes(env, stack):
+    """make up, cpu-pool.sh (the autoscaler's guarded runs too) or a second make down holds one of the stacks this run
+    destroys: refused (exit 2) before the question, with nothing changed."""
+    with lock_holder(env.repo / f".run/{stack}.lock"):
+        proc = down(env, AUTO_APPROVE="1")
+    assert proc.returncode == 2, proc.stderr
+    assert f"{stack} stack" in proc.stderr and f".run/{stack}.lock" in proc.stderr
+    assert env.calls() == [], "no gpuctl down, drain or destroy"
+    assert (env.repo / ".run/known_hosts_k3s-gpu-a6000-1").exists() and env.kubeconfig.exists()
+
+
+def test_the_teardown_holds_every_stack_lock_until_it_ends(env):
+    record = env.repo.parent / "locks.txt"
+    (env.bin / "terraform").write_text(
+        '#!/bin/sh\nif [ "$2" = destroy ]; then for s in gpu-access workers base; do\n'
+        f'  if flock -n "{env.repo}/.run/$s.lock" true; then echo "$s free"; else echo "$s held"; fi >> "{record}"\n'
+        f'done; fi\nexec "{sys.executable}" "{FAKES}" terraform "$@"\n')
+    proc = down(env, AUTO_APPROVE="1")
+    assert proc.returncode == 0, proc.stderr
+    assert set(record.read_text().splitlines()) == {"gpu-access held", "workers held", "base held"}
+    assert all(lock_free(env.repo / f".run/{s}.lock") for s in STACKS)
 
 
 # ---- the script and the Makefile ---------------------------------------------------------------
