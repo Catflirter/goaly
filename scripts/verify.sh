@@ -57,6 +57,9 @@ register_check D D3 'Device plugin registered' check_d3_device_plugin
 register_check D D4 'gpu-smoke: nvidia-smi' check_d4_gpu_smoke
 register_check D D5 'vectoradd: Test PASSED' check_d5_vectoradd
 register_check D D6 'gpu-overflow stays Pending' check_d6_overflow
+register_check E E1 'CPU worker reboot: NotReady, Ready again, then B1' check_e1_worker_reboot
+register_check E E2 'GPU node replaced (gpuctl down, apply), then D2, D4, B1' check_e2_gpu_replace
+register_check E E3 'Firewall drift: found by gpuctl status, repaired by gpuctl apply' check_e3_firewall_drift
 # --- end of registered checks ---
 
 main() {
