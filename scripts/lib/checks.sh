@@ -2,7 +2,8 @@
 # Verification harness shared by scripts/verify.sh and the demo (spec section 9). Source it; do not run it.
 #
 #   vr_init DIR                     start a run: DIR (mode 0700)/SUMMARY.md with an empty results table;
-#                                   returns 2 if DIR already holds files
+#                                   returns 2 if DIR already holds files; finds the operator's IP
+#                                   (vr_operator_ip), which redact then masks as <operator_ip>
 #   run_check ID TITLE FUNC [ARG…]  run one check into DIR/<NN>-<ID>.txt; FUNC returns 0 PASS, 77 SKIP, else FAIL
 #   vr_cmd CMD…                     print "$ CMD" (redacted), then run CMD; returns CMD's status
 #   vr_cap [--no-echo] CMD…         vr_cmd for $(…): command and output to stderr, stdout to the caller
@@ -11,20 +12,26 @@
 #   redact                          stdin -> stdout filter that replaces secret values with <redacted>
 #   vr_finish                       write the totals, scan the run with gitleaks; 1 on any FAIL or leak
 #
-# The check functions check_<id>_<name> (A–C: Task 18; D: Task 21; E: Task 22) are registered in scripts/verify.sh; the demo (Task 25) calls them directly. Each returns 0
+# The check functions check_<id>_<name> (A–C: Task 18; D: Task 21; E: Task 22) are registered in
+# scripts/verify.sh; the demo (Task 25) calls them directly. Each returns 0
 # (PASS), 1 (FAIL) or 77 (SKIP); one that cannot read .env exits 2 (a FAIL), so call it in a subshell.
 # Every command a check runs goes through vr_cmd, vr_cap or vr_bg, so its evidence shows what ran
-# (node_external_ip, probe_on and echo_on appear by name; their kubectl queries are in common.sh).
+# (node_external_ip, probe_on and echo_on appear by name; their kubectl queries are in common.sh;
+# so do cp_resolve and _worker_zone, the SSH zone lookups from Terraform outputs).
 # The offline tests set VR_NO_WAIT=1 (no fixed sleeps) and VR_PF_PORT (C3's local port).
 # Rules for check functions:
 #   - bound every wait (kubectl wait --timeout=…, curl --max-time …): run_check has no timeout of its own;
+#     kubectl exec runs under kc_within SECONDS and other network calls under bounded SECONDS;
 #   - background jobs (kubectl port-forward &, tcpdump &) are killed when the check returns, because
 #     run_check waits for every process holding the check's output; so do not set an EXIT trap in a
 #     check (it replaces that cleanup), and do not leave grandchildren (setsid, nohup) running;
-#   - cleanup that must run however the check ends (the GPU Pods of D4-D6, E2's leftover GPU
-#     instances, E3's extra firewall rule) goes through _vr_guarded, whose EXIT trap lives in a
-#     subshell of its own; a cleanup that a second Ctrl-C must not stop ignores SIGINT/SIGTERM and
-#     runs its commands through _vr_shielded (a process group of their own, waited for).
+#   - a check that leaves something behind until its end (a pcap, Pods, a namespace, a listening
+#     server, GPU instances, a firewall rule) removes it on SIGINT/SIGTERM/SIGHUP too, with
+#     _vr_on_signal --left WHAT CMD; the operator sees the cleanup and, if it fails, what may remain and
+#     the command that removes it (the GPU checks D4-D6 do this through _vr_gpu_guarded, which also
+#     reports a failed cleanup that was not interrupted; E2 and E3 through _vr_e_guarded, whose cleanup
+#     also runs when the check dies);
+#   - run_check gives a check fd 3 (the operator's stderr) for that; do not use fd 3 otherwise.
 
 # common.sh is linted on its own; pre-commit runs shellcheck without -x, so don't follow it.
 # shellcheck disable=SC1091
@@ -70,10 +77,65 @@ elif sed -l -e '' </dev/null >/dev/null 2>&1; then
   _VR_SED=(sed -l)
 fi
 
+# The operator's public IP, masked as <operator_ip> once vr_operator_ip has found it (empty until then).
+_VR_MASK_EXPRS=()
+
 # LC_ALL=C: match bytes, not characters. All patterns are ASCII, and BSD sed under a UTF-8 locale
 # aborts ("illegal byte sequence") on binary or non-UTF-8 output such as tcpdump -A payloads.
 redact() {
-  LC_ALL=C "${_VR_SED[@]}" -E "${_VR_REDACT_EXPRS[@]}"
+  LC_ALL=C "${_VR_SED[@]}" -E "${_VR_REDACT_EXPRS[@]}" ${_VR_MASK_EXPRS[@]+"${_VR_MASK_EXPRS[@]}"}
+}
+
+# _vr_trim TEXT: TEXT without leading and trailing whitespace (Python's str.strip, as gpuctl uses).
+_vr_trim() {
+  local s="$1"
+  s="${s#"${s%%[![:space:]]*}"}"
+  printf '%s\n' "${s%"${s##*[![:space:]]}"}"
+}
+
+# _vr_operator_ip_lookup: print "IP SOURCE" for the operator's public IP, found as gpuctl finds it
+# (lambda/gpuctl/infra.py detect_operator_ip): OPERATOR_IP from .env, trimmed; when that is empty,
+# the address checkip.amazonaws.com reports (one curl, at most 10 s). Runs in a subshell, so .env's
+# values stay out of the caller. Exits 2 without a readable .env (load_env), 1 when OPERATOR_IP is not
+# an IPv4 address (gpuctl refuses it) or the lookup gives none.
+_vr_operator_ip_lookup() (
+  load_env
+  ip="$(_vr_trim "${OPERATOR_IP:-}")"
+  if [[ -n "$ip" ]]; then
+    is_ipv4 "$ip" || exit 1
+    printf '%s OPERATOR_IP in .env\n' "$ip"
+    exit 0
+  fi
+  ip="$(bounded 10 curl -fsS --max-time 5 https://checkip.amazonaws.com)" || exit 1
+  ip="$(_vr_trim "$ip")"
+  is_ipv4 "$ip" || exit 1
+  printf '%s checkip.amazonaws.com\n' "$ip"
+)
+
+# vr_operator_ip: find the operator's public IP once (vr_init does, so every check of the run shares
+# it) and from then on mask it as <operator_ip> in everything redact filters: all evidence, not only
+# B6. Lambda's "operator ssh" rule holds it, and a run promoted to verification/final is committed
+# (Ruling R39 keeps real IPs out of what is delivered). Sets VR_OPERATOR_IP and VR_OPERATOR_IP_FROM
+# (where it came from); returns 1 when it is unknown, and then nothing can be masked: B6 fails if a
+# Lambda rule shows it. The IP must stand alone to be masked (198.51.100.2 stays in 198.51.100.20 and
+# in 10.198.51.100.2). Each match includes the characters around the IP, so one pass misses an IP
+# right after another ("IP,IP"); after it, no two unmasked ones are adjacent, so a second pass gets them.
+vr_operator_ip() {
+  local out e
+  if [[ -z "${_VR_OPIP_DONE:-}" ]]; then
+    _VR_OPIP_DONE=1
+    VR_OPERATOR_IP=""
+    VR_OPERATOR_IP_FROM=""
+    _VR_OPIP_RC=0
+    _VR_MASK_EXPRS=()
+    out="$(_vr_operator_ip_lookup 2>/dev/null)" || _VR_OPIP_RC=$?
+    if ((_VR_OPIP_RC == 0)); then
+      read -r VR_OPERATOR_IP VR_OPERATOR_IP_FROM <<< "$out"
+      e="s/(^|[^0-9.])${VR_OPERATOR_IP//./\\.}(\$|[^0-9])/\\1<operator_ip>\\2/g"
+      _VR_MASK_EXPRS=(-e "$e" -e "$e")
+    fi
+  fi
+  [[ -n "${VR_OPERATOR_IP:-}" ]]
 }
 
 # --- run bookkeeping ----------------------------------------------------------------------------
@@ -88,7 +150,8 @@ _vr_now() {
 # vr_init DIR: create DIR and its SUMMARY.md. Refuses a DIR that already holds files (returns 2), so
 # the evidence of two runs is never mixed. DIR is 0700 and its files 0600: unreviewed evidence (cluster
 # topology, IPs, anything redact missed) stays readable by the operator only; promoting a run to
-# verification/final/ is a deliberate copy.
+# verification/final/ is a deliberate copy. It also finds the operator's public IP for the whole run
+# (vr_operator_ip) and says in SUMMARY.md whether it is masked; when it is unknown, it warns.
 vr_init() {
   local dir="$1"
   if [[ -d "$dir" && -n "$(ls -A -- "$dir")" ]]; then
@@ -101,43 +164,59 @@ vr_init() {
   VR_SEQ=0
   VR_FAILS=0
   VR_SKIPS=0
+  local opip
+  if vr_operator_ip; then
+    opip="masked as <operator_ip> ($VR_OPERATOR_IP_FROM)"
+  else
+    if ((_VR_OPIP_RC == 2)); then
+      opip="not determined (.env is not readable)" # the checks that need .env say so themselves
+    else
+      opip="not determined (OPERATOR_IP in .env is empty or not an address, and checkip.amazonaws.com gave none)"
+      log "warning: cannot determine the operator's public IP, so the evidence cannot mask it; B6 fails if a"
+      log "Lambda rule shows it. Set OPERATOR_IP in .env to the address gpuctl used, or check the network."
+    fi
+  fi
   (
     umask 077
     {
       printf '# Verification run\n\n'
       printf 'Started: %s (%s)\n\n' "$(_vr_now)" "$VR_TZ"
+      printf 'Operator IP: %s\n\n' "$opip"
       printf '| # | ID | Check | Result |\n'
       printf '|---|---|---|---|\n'
     } >"$VR_DIR/SUMMARY.md"
   )
 }
 
-# EXIT trap of a check's subshell: kill the background jobs it left running (see the header).
+# EXIT trap of a check's subshell: kill the background jobs it left running (see the header). TERM
+# again until they are gone, KILL what is left after 5s: one TERM is not enough. This trap makes bash
+# catch TERM, and a job runs that handler until it has exec'd its program, so a TERM that arrives
+# before then can be dropped and the program runs on, holding the check's output open.
 _vr_reap() {
-  local pids
-  pids="$(jobs -p)"
-  if [[ -n "$pids" ]]; then
+  local pids i
+  for ((i = 0; i < 50; i++)); do
+    pids="$(jobs -pr)"
+    [[ -n "$pids" ]] || return 0
     # shellcheck disable=SC2086 # one PID per word
     kill $pids 2>/dev/null || true
-  fi
+    sleep 0.1
+  done
+  pids="$(jobs -pr)"
+  # shellcheck disable=SC2086 # one PID per word
+  [[ -z "$pids" ]] || kill -KILL $pids 2>/dev/null || true
 }
 
 # run_check ID TITLE FUNC [ARGS…]: run FUNC ARGS in a subshell (so exit and set -e failures end only
 # the check) with stdin from /dev/null, stdout+stderr redacted into $VR_DIR/<NN>-<ID>.txt.
 # FUNC's status: 0 PASS, 77 SKIP, anything else FAIL; a failed redact filter (lost evidence) is a FAIL
-# too. Returns 0; vr_finish reports the outcome.
-# Interrupted: a Ctrl-C reaches the whole process group. The filter ignores SIGINT and SIGTERM (sed
-# inherits that) and ends when the check's output does, so a check cleaning up after the signal
-# (_vr_guarded) can still record, and so run, its cleanup commands (Task 21a review C0-3/X0-2). This
-# shell notes the signal instead of dying of it at once; once the check has ended and its result is
-# recorded, it ends itself by that signal (the caller's own trap, if any, runs), so the run stops.
+# too. Always returns 0; vr_finish reports the outcome.
 # A hangup (SIGHUP: the operator's SSH session dropped) ends this shell at once, but the filter ignores
 # it, and the check's subshell exits (129) only after its foreground command, so a check's cleanup
-# (_vr_guarded) runs to its end and is recorded in the evidence file (Task 22b review X0-1).
+# (_vr_on_signal) runs to its end and is recorded in the evidence file (Task 22b review X0-1, Ruling R62).
 run_check() {
   local id="$1" title="$2" func="$3"
   shift 3
-  local seq file rc redact_rc result errexit=0 traps signal=""
+  local seq file rc redact_rc result errexit=0
   VR_SEQ=$((VR_SEQ + 1))
   printf -v seq '%02d' "$VR_SEQ"
   file="$VR_DIR/$seq-$id.txt"
@@ -152,25 +231,23 @@ run_check() {
   # The check keeps the caller's errexit; run_check itself must survive the check failing.
   [[ $- == *e* ]] && errexit=1
   set +e
-  traps="$(trap -p INT TERM)"
-  trap 'signal=${signal:-INT}' INT
-  trap 'signal=${signal:-TERM}' TERM
+  # fd 3 is run_check's own stderr (the operator's terminal under make verify), for _vr_tell.
   (
     if ((errexit)); then set -e; fi
+    # shellcheck disable=SC2030 # meant for this check's subshell only (_vr_tell)
+    _VR_CHECK_ID="$id" _VR_CHECK_FILE="$file" _VR_TELL_FD=3
     trap _vr_reap EXIT
-    # A hangup ends this subshell only once its foreground command is over: dying at once would run
-    # _vr_reap while the check still runs, and its SIGTERM would hit a check's cleanup (_vr_guarded) or a
-    # command that ignores SIGHUP to finish (E's applies). Keep it when merging H-1's _vr_reap (test:
-    # test_run_check_ends_a_hung_up_check_only_after_its_foreground_command, review C1-2).
+    # A hangup ends this subshell only once its foreground command is over (Ruling R62): dying at once would
+    # run _vr_reap while the check still runs, and its SIGTERM (then, after 5 s, its SIGKILL) would hit a
+    # check's cleanup or a command that ignores SIGHUP to finish (E's applies). Test:
+    # test_run_check_ends_a_hung_up_check_only_after_its_foreground_command (review C1-2).
     trap 'exit 129' HUP
     "$func" "$@"
-  ) </dev/null 2>&1 | (
-    trap '' INT TERM HUP
+  ) 3>&2 </dev/null 2>&1 | (
+    trap '' HUP
     redact
   ) >>"$file"
   local -a status=("${PIPESTATUS[@]}")
-  trap - INT TERM
-  eval "$traps"
   if ((errexit)); then set -e; fi
   rc=${status[0]}
   redact_rc=${status[1]}
@@ -194,10 +271,6 @@ run_check() {
   printf '# finished: %s — %s (exit %d)\n' "$(_vr_now)" "$result" "$rc" >>"$file"
   printf '| %d | %s | %s | %s |\n' "$VR_SEQ" "$id" "${title//|/\\|}" "$result" >>"$VR_DIR/SUMMARY.md"
   printf '[%s] %-4s %-4s %s\n' "$seq" "$id" "$result" "$title"
-  if [[ -n "$signal" ]]; then
-    printf 'interrupted (SIG%s) during %s: stopping\n' "$signal" "$id" >&2
-    kill -s "$signal" "${BASHPID:-$$}"
-  fi
   return 0
 }
 
@@ -210,10 +283,22 @@ _vr_quote() {
     if [[ "$arg" =~ ^[A-Za-z0-9_./:=@%+,-]+$ ]]; then
       line+=" $arg"
     else
-      line+=" '${arg//\'/\'\\\'\'}'"
+      line+=" $(_vr_sq "$arg")"
     fi
   done
   printf '%s\n' "$line"
+}
+
+# _vr_sq STRING: STRING in single quotes, each ' in it written as '\''. Not ${s//\'/…} inside double
+# quotes: bash <= 4.2 (macOS's /bin/bash 3.2) does no quote removal on that replacement, which would
+# keep its backslashes and print a command that cannot be pasted.
+_vr_sq() {
+  local s="$1" q="'" out=""
+  while [[ "$s" == *"$q"* ]]; do
+    out+=${s%%"$q"*}$q\\$q$q
+    s=${s#*"$q"}
+  done
+  printf '%s\n' "$q$out$s$q"
 }
 
 # vr_cmd CMD…: record the command (redacted) in the check's output, then run it.
@@ -256,9 +341,131 @@ vr_bg() {
 
 # --- check helpers (Task 18) --------------------------------------------------------------------
 
-# The bound of one kubectl request (get, describe, apply, top); waits carry their own --timeout,
-# and exec'd commands bound themselves (curl -m, ping -W, timeout N iperf3).
+# The bound of one kubectl request (get, describe, apply, top); waits carry their own --timeout.
+# kubectl exec streams are not bounded by it: exec runs under kc_within (below), and the exec'd
+# commands bound themselves too (curl -m, ping -W, timeout N iperf3).
 _VR_RT="--request-timeout=$KC_REQUEST_TIMEOUT"
+
+# bounded SECONDS CMD…: run the program CMD for at most SECONDS; exit 124 when it had to be stopped.
+# --foreground keeps CMD in the terminal's process group, so Ctrl-C still reaches it. `command` skips
+# a shell function named timeout (the offline tests replace it for check B5). In an interrupt cleanup
+# (_VR_CLEANING=1, set by _vr_signalled) CMD must ignore a further Ctrl-C as the cleanup's other
+# commands do, but timeout sets its own SIGINT handler, so CMD would not inherit the ignore, and
+# passes SIGINT on to CMD or ends it (GNU and uutils differ): there the shell bounds CMD instead
+# (_vr_within), and CMD inherits the ignore. A SIGTERM and the bound still stop CMD.
+bounded() {
+  if [[ "${_VR_CLEANING:-}" == 1 ]]; then
+    _vr_within "$@"
+  else
+    command timeout --foreground "$@"
+  fi
+}
+
+# kc_within SECONDS ARGS…: kc with an outer time bound, for kubectl exec, so a stalled API tunnel
+# fails the call instead of hanging the check. A call stopped by the bound exits 124, which no check
+# takes for a verdict (B5 and C8 want curl's own 7 or 28).
+kc_within() {
+  local seconds="$1"
+  shift
+  bounded "$seconds" kubectl --kubeconfig "$KUBECONFIG_FILE" "$@"
+}
+
+# _vr_within SECONDS CMD…: run CMD (a shell function too, such as cp_ssh) in the background and stop
+# it after SECONDS. Returns CMD's status, or 124.
+_vr_within() {
+  local seconds="$1" pid i
+  shift
+  "$@" &
+  pid=$!
+  for ((i = 0; i < seconds * 5; i++)); do
+    if ! kill -0 "$pid" 2>/dev/null; then
+      wait "$pid"
+      return
+    fi
+    sleep 0.2
+  done
+  _vr_stop "$pid"
+  return 124
+}
+
+# _vr_on_signal [--left WHAT] CMD…: when the check is interrupted (SIGINT: Ctrl-C during make verify
+# or the demo; SIGTERM), kill its background jobs, run CMD (for at most 120 s; a shell function is
+# fine) and end the check by the same signal, so verify.sh and the demo stop as they would without
+# the trap. WHAT names what CMD removes; if CMD fails, the operator is told it may remain and how to
+# remove it. _vr_on_signal without CMD removes the trap. The EXIT trap stays the harness's (_vr_reap).
+_vr_on_signal() {
+  if (($# == 0)); then
+    trap - INT TERM
+    return 0
+  fi
+  _VR_ON_SIGNAL_LEFT="what that command removes"
+  if [[ "$1" == --left ]]; then
+    _VR_ON_SIGNAL_LEFT="$2"
+    shift 2
+  fi
+  _VR_ON_SIGNAL=("$@")
+  trap '_vr_signalled INT' INT
+  trap '_vr_signalled TERM' TERM
+}
+
+# _vr_tell [LINE…]: LINEs (else stdin's lines), redacted, to the operator and into the check's
+# evidence file. The operator sees them on run_check's own stderr (fd 3; outside run_check, stderr),
+# prefixed with the check's id. For the interrupt cleanup: Ctrl-C has also ended the evidence filter
+# the check's output normally goes through, so that output would be lost. Outside run_check (a check
+# called directly, as the demo does) that is fd 4: the caller's stderr, saved before the loop's own
+# stderr goes to /dev/null, where fd 2 would reach no one.
+# shellcheck disable=SC2031 # run_check sets the _VR_CHECK_* and _VR_TELL_FD in the check's subshell
+_vr_tell() {
+  local line fd="${_VR_TELL_FD:-4}"
+  if (($#)); then printf '%s\n' "$@"; else cat; fi | redact | while IFS= read -r line || [[ -n "$line" ]]; do
+    if [[ -n "${_VR_CHECK_FILE:-}" ]]; then printf '%s\n' "$line" >>"$_VR_CHECK_FILE"; fi
+    printf '%s: %s\n' "${_VR_CHECK_ID:-check}" "$line" >&"$fd"
+  done 4>&2 2>/dev/null
+}
+
+# _vr_signalled SIGNAL: the trap set by _vr_on_signal. SIGPIPE is ignored and errexit is off while it
+# cleans up (a closed pipe must not end kubectl or gcloud before they have done their work). The
+# cleanup's progress, its output and its outcome go to the operator and the evidence (_vr_tell).
+# A further Ctrl-C is ignored until then, by this shell and (inherited) by the cleanup's commands, the
+# ones under bounded or kc_within too (_VR_CLEANING: see bounded), so it can neither cut the cleanup
+# short nor hide its outcome. A further SIGTERM stops the cleanup's commands (they keep its default
+# action: TERM is also how the 120 s bound stops them) but not this shell, which still reports the
+# outcome; the first signal then ends the check.
+_vr_signalled() {
+  local line rc how
+  trap '' INT
+  trap ':' TERM
+  set +e
+  trap '' PIPE
+  _VR_CLEANING=1
+  _vr_reap
+  line="$(_vr_quote "${_VR_ON_SIGNAL[@]}")"
+  line="${line#\$ }"
+  _vr_tell "interrupted (SIG$1); cleaning up (at most 120 s): $line"
+  _vr_within 120 "${_VR_ON_SIGNAL[@]}" </dev/null 2>&1 | _vr_tell
+  rc=${PIPESTATUS[0]}
+  if ((rc == 0)); then
+    _vr_tell "cleanup done"
+  else
+    how="exit $rc"
+    ((rc != 124)) || how="stopped after 120 s"
+    _vr_tell "cleanup FAILED ($how); may remain: $_VR_ON_SIGNAL_LEFT" \
+      "to remove it, run from the repository root: $(_vr_removal "${_VR_ON_SIGNAL[@]}")"
+  fi
+  trap - INT TERM PIPE
+  kill -s "$1" "${BASHPID:-$$}"
+  exit 1
+}
+
+# _vr_removal CMD…: the command line that runs a check's cleanup CMD by hand from the repository root.
+# In a child shell: pasted into the operator's own bash, a die (exit) ends only that child, and .env's
+# values and the harness's functions do not stay behind in the operator's shell.
+_vr_removal() {
+  local line
+  line="$(_vr_quote "$@")"
+  line="source scripts/lib/checks.sh && vr_env && ${line#\$ }"
+  printf 'bash -c %s\n' "$(_vr_sq "$line")"
+}
 
 # vr_env: load .env once per shell (GCP_PROJECT for IAP SSH and gcloud, UNDERLAY_MTU, the Lambda SSH
 # key path); a missing or non-private .env ends the check (exit 2, a FAIL). The Lambda API key is
@@ -270,11 +477,10 @@ vr_env() {
   _VR_ENV_LOADED=1
 }
 
-# _vr_sleep SECONDS: sleep; VR_NO_WAIT=1 (the offline tests) skips it and says so in the evidence, so
-# the tests can see the wait (D6's 30 s).
+# _vr_sleep SECONDS: sleep; VR_NO_WAIT=1 (the offline tests) skips it and says so in the evidence.
 _vr_sleep() {
   if [[ "${VR_NO_WAIT:-}" == 1 ]]; then
-    echo "(wait ${1}s skipped)" >&2
+    echo "(VR_NO_WAIT: skipped sleep $1)" >&2
   else
     sleep "$1"
   fi
@@ -358,7 +564,7 @@ _vr_load_pods() {
 
 # _vr_pick NODE LINE…: "POD IP" of the first "NODE POD IP" line on NODE; fails if there is none.
 _vr_pick() {
-  local want="$1" node name ip
+  local want="$1" line node name ip
   shift
   for line in "$@"; do
     read -r node name ip <<< "$line"
@@ -382,13 +588,15 @@ _vr_in() {
 
 # _vr_ssh_prepare NODE…: look up the SSH zones once, in the check's own shell: cp_resolve and
 # _worker_zone cache there only, so node_ssh in $(…) would otherwise read Terraform outputs each time.
+# Both exit the shell (die) when an output cannot be read, so a check that must clean up runs the
+# work that calls this in a subshell.
 _vr_ssh_prepare() {
   local n
   for n in "$@"; do
     if [[ "$n" == "$CP_NAME" ]]; then
-      cp_resolve
+      vr_cmd cp_resolve
     elif [[ "$n" =~ $CPU_NODE_RE ]]; then
-      _worker_zone "$n"
+      vr_cmd _worker_zone "$n"
     fi
   done
 }
@@ -487,14 +695,23 @@ check_a4_flannel_annotations() {
 # --- B: connectivity (spec §9 B) ----------------------------------------------------------------
 
 # _vr_b1_cell PROBE ECHO_IP SMALL BIG: one matrix cell (spec §2.3 #3: a Pod-to-Pod ICMP payload of
-# UNDERLAY_MTU-108 fits, UNDERLAY_MTU-107 does not). Sets VR_CELL to ok or the failed parts.
+# UNDERLAY_MTU-108 fits, UNDERLAY_MTU-107 does not). Sets VR_CELL to ok or the failed parts. The
+# oversized ping counts as blocked only when it fails as an MTU rejection (EMSGSIZE "message too
+# long", "frag needed", or every packet lost); a failed exec (kubectl, the bound) is ping-<size>-error.
 _vr_b1_cell() {
+  local outf rc=0
   VR_CELL=""
-  vr_cmd kc -n nettest exec "$1" -- curl -fsS -m 5 "http://$2:8080/" || VR_CELL+="curl,"
-  vr_cmd kc -n nettest exec "$1" -- ping -M 'do' -c 2 -W 2 -s "$3" "$2" || VR_CELL+="ping-$3,"
-  if vr_cmd kc -n nettest exec "$1" -- ping -M 'do' -c 2 -W 2 -s "$4" "$2"; then
+  vr_cmd kc_within 60 -n nettest exec "$1" -- curl -fsS -m 5 "http://$2:8080/" || VR_CELL+="curl,"
+  vr_cmd kc_within 60 -n nettest exec "$1" -- ping -M 'do' -c 2 -W 2 -s "$3" "$2" || VR_CELL+="ping-$3,"
+  outf="$(mktemp)" || return 1
+  vr_cmd kc_within 60 -n nettest exec "$1" -- ping -M 'do' -c 2 -W 2 -s "$4" "$2" >"$outf" 2>&1 || rc=$?
+  cat -- "$outf"
+  if ((rc == 0)); then
     VR_CELL+="ping-$4-passed,"
+  elif ! grep -qiE 'message too long|frag(mentation)? needed| 100% packet loss' "$outf"; then
+    VR_CELL+="ping-$4-error,"
   fi
+  rm -f -- "$outf"
   VR_CELL="${VR_CELL%,}"
   VR_CELL="${VR_CELL:-ok}"
 }
@@ -539,7 +756,7 @@ check_b1_matrix() {
       [[ "$VR_CELL" == ok ]] || fail=1
       row+=$'\t'"$VR_CELL"
     done
-    if vr_cmd kc -n nettest exec "$name" -- curl -fsS -m 5 http://echo.nettest.svc.cluster.local:8080/; then
+    if vr_cmd kc_within 60 -n nettest exec "$name" -- curl -fsS -m 5 http://echo.nettest.svc.cluster.local:8080/; then
       row+=$'\tok'
     else
       row+=$'\tFAIL'
@@ -549,18 +766,24 @@ check_b1_matrix() {
   done
   echo
   echo "B1: N x N matrix, UNDERLAY_MTU=$mtu: each cell is curl to the echo Pod IP, ping -M do -s $small"
-  echo "(must pass) and -s $big (must fail); svc-dns is curl http://echo.nettest.svc.cluster.local:8080/"
+  echo "(must pass) and -s $big (must fail as too big for the MTU); svc-dns is curl"
+  echo "http://echo.nettest.svc.cluster.local:8080/"
   printf '%s\n' "${rows[@]}" | _vr_table
   return "$fail"
 }
 
-# _vr_b2_flows PEER_IP…: read `tcpdump -nn -q -t` lines on stdin and summarise them: the udp/51820
-# packets (any host), and the traffic with the other nodes' public IPs by service port. Only
-# 51820/udp (WireGuard), 6443/tcp (the API, mTLS) and 10250/tcp (kubelet, TLS) may appear there
-# (spec §2.2: the two TLS ports cross the internet by design); ICMP carries no port and is listed.
-# Fails on any other port or protocol, or when no udp/51820 packet was seen.
+# _vr_b2_flows MIN PEER_IP…: read `tcpdump -nn -q -t` lines on stdin and summarise them: the
+# udp/51820 packets (any host, and with each peer), and the traffic with the other nodes' public IPs
+# by service port. Only 51820/udp (WireGuard), 6443/tcp (the API, mTLS) and 10250/tcp (kubelet, TLS)
+# may appear there (spec §2.2: the two TLS ports cross the internet by design); ICMP carries no port
+# and is listed. Fails on any other port or protocol, when no udp/51820 packet was seen, or when a
+# peer has fewer than MIN udp/51820 packets: each peer sends the marked requests, so its WireGuard
+# traffic proves they crossed the wire encrypted while the capture ran (keepalives alone give 1-2
+# packets in 25 s), and that the peer's wire address is the one ③ examines.
 _vr_b2_flows() {
-  awk -v peers="$*" '
+  local min="$1"
+  shift
+  awk -v min="$min" -v peers="$*" '
     BEGIN { n = split(peers, p, " "); for (i = 1; i <= n; i++) peer[p[i]] = 1 }
     function host(a,  f) { split(a, f, "."); return f[1] "." f[2] "." f[3] "." f[4] }
     function port(a,  f) { return split(a, f, ".") == 5 ? f[5] : "" }
@@ -568,7 +791,11 @@ _vr_b2_flows() {
       dst = $4; sub(/:$/, "", dst)
       proto = ($5 == "tcp") ? "tcp" : ($5 ~ /^UDP/) ? "udp" : ($5 == "ICMP") ? "icmp" : "other"
       sh = host($2); dh = host(dst); sp = port($2); dp = port(dst)
-      if (proto == "udp" && (sp == 51820 || dp == 51820)) wg++
+      if (proto == "udp" && (sp == 51820 || dp == 51820)) {
+        wg++
+        if (sh in peer) pwg[sh]++
+        if (dh in peer && dh != sh) pwg[dh]++
+      }
       if (!(sh in peer) && !(dh in peer)) next
       if (proto == "udp" && (sp == 51820 || dp == 51820)) key = "51820/udp"
       else if (proto == "tcp" && (dp == 6443 || dp == 10250)) key = dp "/tcp"
@@ -580,24 +807,39 @@ _vr_b2_flows() {
     END {
       printf "B2 ②: %d udp/51820 packets in the capture\n", wg
       if (wg < 1) print "B2 ②: no udp/51820 packet: no WireGuard traffic was captured"
+      for (i = 1; i <= n; i++) {
+        c = pwg[p[i]] + 0
+        printf "B2 ②: %d udp/51820 packets with %s (want at least %d: the 20 marked requests and their answers)\n", c, p[i], min
+        if (c < min) short = 1
+      }
       printf "B2 ③: packets to or from the other nodes'\'' public IPs (%s):\n", peers
       split("51820/udp 6443/tcp 10250/tcp icmp", k, " ")
       for (i = 1; i <= 4; i++) if (seen[k[i]]) printf "  %-10s %d\n", k[i], seen[k[i]]
       for (b in bad) printf "  UNEXPECTED %s: %d packets\n", b, bad[b]
       if (nbad == 0) print "B2 ③: only 51820/udp, 6443/tcp and 10250/tcp"
-      exit (wg >= 1 && nbad == 0) ? 0 : 1
+      exit (wg >= 1 && !short && nbad == 0) ? 0 : 1
     }'
 }
 
+# B2's cleanup on interrupt, on k3s-cp: stop the capture, wait until it is gone, then remove its file.
+# A Ctrl-C while the check still waits for tcpdump to start could otherwise remove the file before
+# tcpdump creates it. The pattern matches the capture's command line ([^ ]+: the interface) but not
+# this command's own, nor pkill's or pgrep's ("[.]" in their text is not the "." it matches).
+# shellcheck disable=SC2016 # expanded on k3s-cp
+_VR_B2_CLEANUP='p='\''tcpdump -ni [^ ]+ -U -w /tmp/b2[.]pcap'\''; sudo pkill -f "$p"; i=0; while sudo pgrep -f "$p" >/dev/null && [ $i -lt 30 ]; do sleep 1; i=$((i + 1)); done; sudo rm -f /tmp/b2.pcap'
+
 # B2: capture on k3s-cp's default interface while the probes on the other nodes send 20 requests
 # each, carrying a random marker header, to the echo Pod on k3s-cp. PASS: ① the marker is not in
-# the capture's payloads; ② there is udp/51820; ③ only the expected ports cross to the other nodes'
-# public IPs. The capture file is removed afterwards, pass or fail.
+# the capture's payloads; ② there is udp/51820, and each sending node has at least 40 such packets
+# (its marked requests crossed while the capture ran, which must still be running after them);
+# ③ only the expected ports cross to the other nodes' public IPs. The capture file is created
+# under umask 077 (sudo keeps the stricter umask: never world-readable) and removed afterwards,
+# pass, fail or interrupt.
 check_b2_wire() {
   local marker route iface n ip probe cp_echo capf pid started=0 rc=0 out matches fail=0
   local -a peers=() probes=()
   vr_env
-  cp_resolve
+  vr_cmd cp_resolve
   marker="b2-marker-$(od -An -N8 -tx1 /dev/urandom | tr -d ' \n')"
   [[ "$marker" =~ ^b2-marker-[0-9a-f]{16}$ ]] || { echo "B2: cannot make a random marker"; return 1; }
   echo "B2: marker $marker"
@@ -616,19 +858,27 @@ check_b2_wire() {
   cp_echo="$(vr_cap echo_on "$CP_NAME")" || return 1
 
   capf="$(mktemp)" || return 1
-  vr_bg "$capf" cp_ssh "sudo timeout 25 tcpdump -ni $iface -U -w /tmp/b2.pcap 'not port 22'"
+  _vr_on_signal --left "/tmp/b2.pcap (the packet capture) on $CP_NAME" cp_ssh "$_VR_B2_CLEANUP"
+  vr_bg "$capf" cp_ssh "umask 077 && sudo timeout 25 tcpdump -ni $iface -U -w /tmp/b2.pcap 'not port 22'"
   pid="$VR_BG_PID"
   if _vr_wait_text "$capf" "listening on" "$pid" 60; then
     started=1
     for probe in "${probes[@]}"; do
-      vr_cmd kc -n nettest exec "$probe" -- sh -c "n=0; for i in \$(seq 20); do curl -fsS -m 2 -o /dev/null -H \"X-Marker: $marker\" http://$cp_echo:8080/ && n=\$((n + 1)); done; echo \"\$n/20 requests answered\"; [ \"\$n\" -eq 20 ]" \
+      vr_cmd kc_within 90 -n nettest exec "$probe" -- sh -c "n=0; for i in \$(seq 20); do curl -fsS -m 2 -o /dev/null -H \"X-Marker: $marker\" http://$cp_echo:8080/ && n=\$((n + 1)); done; echo \"\$n/20 requests answered\"; [ \"\$n\" -eq 20 ]" \
         || { echo "B2: not all 20 requests from $probe were answered"; fail=1; }
     done
+    if ! kill -0 "$pid" 2>/dev/null; then
+      echo "B2: the capture on $CP_NAME ended before the marked requests finished, so it may not hold them"
+      fail=1
+    fi
     wait "$pid" || rc=$?
   else
     _vr_stop "$pid"
     echo "B2: the capture on $CP_NAME did not start"
     fail=1
+    # Its start may only have been unseen (a slow IAP relay): such a capture writes for up to 25 s.
+    echo "B2: waiting 30 s for a capture that may have started late, then removing its file"
+    _vr_sleep 30
   fi
   _vr_show "$capf" "capture on $CP_NAME"
   if ((started)); then
@@ -637,11 +887,12 @@ check_b2_wire() {
       fail=1
     fi
     rc=0
-    out="$(vr_cap cp_ssh "sudo tcpdump -A -nn -r /tmp/b2.pcap | grep -c -F -- '$marker'" </dev/null)" || rc=$?
+    # pipefail with grep's "no match" (exit 1) masked: a non-zero status is tcpdump failing to read.
+    out="$(vr_cap cp_ssh "bash -o pipefail -c 'sudo tcpdump -A -nn -r /tmp/b2.pcap | { grep -c -F -- $marker || true; }'" </dev/null)" || rc=$?
     matches="${out##*$'\n'}"
-    if ((rc <= 1)) && [[ "$matches" == 0 ]]; then
+    if ((rc == 0)) && [[ "$matches" == 0 ]]; then
       echo "B2 ①: the marker is not in the capture (the cross-node traffic is encrypted)"
-    elif ((rc <= 1)) && [[ "$matches" =~ ^[0-9]+$ ]]; then
+    elif ((rc == 0)) && [[ "$matches" =~ ^[1-9][0-9]*$ ]]; then
       echo "B2 ①: MARKER found in the capture $matches times: Pod traffic crossed the wire in plaintext"
       fail=1
     else
@@ -649,13 +900,14 @@ check_b2_wire() {
       fail=1
     fi
     if out="$(vr_cap --no-echo cp_ssh 'sudo tcpdump -nn -q -t -r /tmp/b2.pcap' </dev/null)"; then
-      _vr_b2_flows "${peers[@]}" <<< "$out" || fail=1
+      _vr_b2_flows 40 "${peers[@]}" <<< "$out" || fail=1
     else
       echo "B2: cannot read the capture"
       fail=1
     fi
   fi
   vr_cmd cp_ssh 'sudo rm -f /tmp/b2.pcap' </dev/null || { echo "B2: cannot remove /tmp/b2.pcap on $CP_NAME"; fail=1; }
+  _vr_on_signal
   return "$fail"
 }
 
@@ -713,23 +965,46 @@ check_b3_wg() {
   return "$fail"
 }
 
+# Stops the iperf3 servers in a probe (run with sh -c). pkill exits 1 when no process matched: no server
+# is left, the outcome wanted (an interrupt before the server started or after it ended is no failed
+# cleanup); pkill's own errors (2: syntax, 3: fatal) still fail with their own code, so they do not
+# read as that harmless 1, and so does a failed kubectl exec.
+# shellcheck disable=SC2016 # expanded by the probe's sh, not here
+_VR_B4_STOP='pkill -x iperf3; rc=$?; [ $rc -le 1 ] || exit $rc'
+
 # _vr_b4_pair CLIENT_PROBE CLIENT_NODE SERVER_NODE: iperf3 from CLIENT_PROBE to the probe on
-# SERVER_NODE (-n 50M: a bounded transfer, spec §9 B4), and record bits_per_second.
+# SERVER_NODE (-n 50M: a bounded transfer, spec §9 B4), and record bits_per_second. The server runs
+# with --forceflush: through kubectl exec without a tty its stdout is a pipe, which iperf3 otherwise
+# buffers, so "Server listening" would only arrive when it exits. When the measurement fails, the
+# server is stopped in its probe too (stopping kubectl leaves it listening on 5201 for up to 150 s);
+# so it is on interrupt, and a server left by an earlier run is stopped before this one starts.
 _vr_b4_pair() {
   local sprobe sip logf pid json rc=0 sent recv mbit
   sprobe="$(vr_cap probe_on "$3")" || return 1
   sip="$(vr_cap kc -n nettest get pod "$sprobe" "$_VR_RT" -o 'jsonpath={.status.podIP}')" || return 1
   is_ipv4 "$sip" || { echo "B4: $sprobe has no Pod IP: '$sip'"; return 1; }
   logf="$(mktemp)" || return 1
-  vr_bg "$logf" kc -n nettest exec "$sprobe" -- timeout 150 iperf3 -s -1
+  # A server left by an interrupted run would hold port 5201: stop it.
+  vr_cmd kc_within 60 -n nettest exec "$sprobe" -- sh -c "$_VR_B4_STOP" \
+    || echo "B4: could not stop an iperf3 server left in $sprobe (going on)"
+  _vr_on_signal --left "an iperf3 server on port 5201 in $sprobe (it ends by itself within 150 s)" \
+    kc_within 60 -n nettest exec "$sprobe" -- sh -c "$_VR_B4_STOP"
+  vr_bg "$logf" kc_within 170 -n nettest exec "$sprobe" -- timeout 150 iperf3 -s -1 --forceflush
   pid="$VR_BG_PID"
   if _vr_wait_text "$logf" "Server listening" "$pid" 60; then
-    json="$(vr_cap --no-echo kc -n nettest exec "$1" -- timeout 120 iperf3 -c "$sip" -n 50M -J)" || rc=$?
+    json="$(vr_cap --no-echo kc_within 140 -n nettest exec "$1" -- timeout 120 iperf3 -c "$sip" -n 50M -J)" \
+      || rc=$?
   else
     echo "B4: the iperf3 server on $3 did not start"
     rc=1
   fi
-  if ((rc == 0)); then wait "$pid" || true; else _vr_stop "$pid"; fi
+  if ((rc == 0)); then
+    wait "$pid" || true
+  else
+    _vr_stop "$pid"
+    vr_cmd kc_within 60 -n nettest exec "$sprobe" -- sh -c "$_VR_B4_STOP" || true
+  fi
+  _vr_on_signal
   _vr_show "$logf" "iperf3 server on $3 ($sprobe)"
   if ((rc != 0)); then
     echo "B4: iperf3 $2 -> $3 failed (exit $rc)"
@@ -760,7 +1035,8 @@ check_b4_iperf() {
 
 # B5: what must fail does. ① this machine cannot open tcp 6443 or 10250 on k3s-cp's public IP;
 # ② a Pod on a GCP node cannot reach the metadata server (curl itself must fail: exit 28 timeout or
-# 7 refused; any other code means kubectl or the probe failed, so nothing was proven); ③ DNS works
+# 7 refused; any other code means kubectl or the probe failed, or the exec's bound ran out (124), so
+# nothing was proven); ③ DNS works
 # from every probe; ④ the k3s_guard table (with its counters) on every node.
 check_b5_negative() {
   local cp_ip port n p name ip rc fail=0
@@ -785,7 +1061,7 @@ check_b5_negative() {
     read -r name ip <<< "$p"
     if [[ "$n" == "$CP_NAME" || "$n" =~ $CPU_NODE_RE ]]; then
       rc=0
-      vr_cmd kc -n nettest exec "$name" -- curl -m 3 -H 'Metadata-Flavor: Google' \
+      vr_cmd kc_within 60 -n nettest exec "$name" -- curl -m 3 -H 'Metadata-Flavor: Google' \
         http://169.254.169.254/computeMetadata/v1/ || rc=$?
       case "$rc" in
         7 | 28) echo "B5 ②: $n: a Pod cannot reach the metadata server (curl exit $rc, expected)" ;;
@@ -793,7 +1069,7 @@ check_b5_negative() {
         *) echo "B5 ②: $n: exit $rc: kubectl or curl failed before a verdict (want curl's 28 or 7)"; fail=1 ;;
       esac
     fi
-    vr_cmd kc -n nettest exec "$name" -- nslookup kubernetes.default.svc.cluster.local \
+    vr_cmd kc_within 60 -n nettest exec "$name" -- nslookup kubernetes.default.svc.cluster.local \
       || { echo "B5 ③: $n: the DNS lookup failed"; fail=1; }
   done
   _vr_ssh_prepare "${VR_NODES[@]}"
@@ -814,14 +1090,54 @@ _vr_table() {
             sub(/ +$/, "", line); print line } }'
 }
 
+# A line of `gpuctl rules` for Lambda's rule that admits the operator (lambda/gpuctl/peers.py).
+_VR_OPERATOR_RULE_RE='^(  [a-z]+ +[^ ]+ +)[0-9.]+(/32 +operator ssh)$'
+
+# _vr_mask_ids: stdin -> stdout with the GCP project id from .env replaced by <GCP_PROJECT> and the
+# operator's IP (vr_operator_ip) by <operator_ip>: B6's evidence holds both, and a run promoted to
+# verification/final is committed (Ruling R39 keeps real project ids and IPs out of what is
+# delivered). redact masks the IP in all evidence too; this covers a check called without vr_init.
+# The project id is checked first, so it holds no sed metacharacter. The source of Lambda's
+# "operator ssh" rule is masked even when the operator's IP is unknown.
+_vr_mask_ids() {
+  local -a exprs=(-e '')
+  if _gcp_project_ok; then
+    exprs+=(-e "s/${GCP_PROJECT}/<GCP_PROJECT>/g")
+  fi
+  exprs+=(-e "s#${_VR_OPERATOR_RULE_RE}#\\1<operator_ip>\\2#")
+  LC_ALL=C sed -E "${exprs[@]}" ${_VR_MASK_EXPRS[@]+"${_VR_MASK_EXPRS[@]}"}
+}
+
 # B6: the GCP firewall rules named fw-* as a table, and gpuctl's Lambda rules. Every source must be
 # one address (/32), except Google's IAP range 35.235.240.0/20. An ingress rule without source
 # ranges admits every address on GCP, so it fails too, as does a tag or service-account source.
+# The evidence shows the project id and the operator's IP masked (_vr_mask_ids). When the operator's
+# IP is unknown, the rest of the run's evidence cannot mask it, so B6 fails if Lambda's
+# "operator ssh" rule shows it.
 check_b6_firewall_inventory() {
-  local json table violations rules count fail=0
+  local outf rc=0 known=1
   vr_env
-  json="$(vr_cap --no-echo gcloud compute firewall-rules list --project "$GCP_PROJECT" --filter='name~^fw-' \
-    --format=json)" || return 1
+  vr_operator_ip || known=0
+  outf="$(mktemp)" || return 1
+  _vr_b6 >"$outf" 2>&1 || rc=$?
+  if ! _vr_mask_ids <"$outf"; then
+    echo "B6: cannot mask the project id and the operator IP; the evidence is left out"
+    rc=1
+  fi
+  if ((!known)) && grep -Eq -- "$_VR_OPERATOR_RULE_RE" "$outf"; then
+    echo "B6: cannot determine the operator's public IP (OPERATOR_IP in .env is empty or not an address,"
+    echo "and checkip.amazonaws.com gave none), so this run's evidence cannot mask it; the source of the"
+    echo "'operator ssh' rule is masked above. Set OPERATOR_IP in .env to the address gpuctl used, run again."
+    rc=1
+  fi
+  rm -f -- "$outf"
+  return "$rc"
+}
+
+_vr_b6() {
+  local json table violations rules count fail=0
+  json="$(vr_cap --no-echo bounded 120 gcloud compute firewall-rules list --project "$GCP_PROJECT" \
+    --filter='name~^fw-' --format=json)" || return 1
   table="$(jq -r '
     (["NAME", "NETWORK", "DIRECTION", "SOURCES", "ALLOWED", "TARGET_SA"] | @tsv),
     (.[] | [.name, ((.network // "-") | split("/") | last), (.direction // "INGRESS"),
@@ -842,7 +1158,7 @@ check_b6_firewall_inventory() {
        | "VIOLATION \($r.name): source \(.) is not a single address (/32)")' <<< "$json")" \
     || { echo "B6: cannot read gcloud's answer"; return 1; }
 
-  rules="$(vr_cap "$REPO_ROOT/scripts/gpuctl" rules </dev/null)" \
+  rules="$(vr_cap bounded 120 "$REPO_ROOT/scripts/gpuctl" rules </dev/null)" \
     || { echo "B6: scripts/gpuctl rules failed"; fail=1; }
   violations+=$'\n'"$(awk '
     /^[^ ]/ { section = $0; next }
@@ -891,7 +1207,7 @@ check_c2_cross_node_curl() {
   fi
   [[ -n "$probe" ]] || { echo "C2: no probe runs on a node other than a hello replica's"; return 1; }
   echo "C2: hello replicas on: ${hello[*]}; asking from $probe on $pnode"
-  body="$(vr_cap kc -n nettest exec "$probe" -- curl -fsS -m 5 http://hello.hello.svc.cluster.local)" || rc=$?
+  body="$(vr_cap kc_within 60 -n nettest exec "$probe" -- curl -fsS -m 5 http://hello.hello.svc.cluster.local)" || rc=$?
   if ((rc == 0)) && [[ "$body" == "hello world" ]]; then
     echo "C2: answered exactly 'hello world'"
     return 0
@@ -1063,45 +1379,71 @@ _vr_c7() {
 
 # C7: k8s/limits-demo: ① oom is OOMKilled with exit code 137 within 90 s; ② 30 s after cpu-burn is
 # Ready, kubectl top reads at most 110m and its cgroup's nr_throttled grows over 10 s. Both Pods are
-# deleted before (left over from an earlier run) and after, pass or fail.
+# deleted before (left over from an earlier run) and after, pass, fail or interrupt. The work runs in
+# a subshell, so a die in it (the SSH zone lookup) cannot skip the delete.
 check_c7_limits_demo() {
   local rc=0
   vr_env
   vr_cmd kc -n limits-demo delete pod oom cpu-burn --ignore-not-found --timeout=90s \
     || echo "C7: could not delete Pods left from an earlier run (going on)"
-  _vr_c7 || rc=1
+  _vr_on_signal --left "the Pods oom and cpu-burn in namespace limits-demo" \
+    kc -n limits-demo delete pod oom cpu-burn --ignore-not-found --wait=false "$_VR_RT"
+  (_vr_c7) || rc=1
   vr_cmd kc -n limits-demo delete pod oom cpu-burn --ignore-not-found --timeout=90s \
     || { echo "C7: cannot delete the demo Pods"; rc=1; }
+  _vr_on_signal
   return "$rc"
 }
 
 _vr_c8() {
-  local rc=0
+  local rc=0 code
   vr_cmd kc apply -f "$REPO_ROOT/k8s/verify/np-denied.yaml" "$_VR_RT" || return 1
   vr_cmd kc -n np-denied wait pod/client --for=condition=Ready --timeout=120s || return 1
-  vr_cmd kc -n np-denied exec client -- curl -sS -m 5 http://hello.hello.svc.cluster.local || rc=$?
-  if ((rc == 28)); then
-    echo "C8: from np-denied the request timed out (curl exit 28): the NetworkPolicy drops it"
-    return 0
+  # Positive control (Ruling R45): echo.nettest has no NetworkPolicy, so the same client must get
+  # HTTP 200 there; a client without a working network or DNS must not count as "denied".
+  code="$(vr_cap kc_within 60 -n np-denied exec client -- curl -sS -m 5 -o /dev/null -w '%{http_code}' \
+    http://echo.nettest.svc.cluster.local:8080/)" || rc=$?
+  if ((rc != 0)) || [[ "$code" != 200 ]]; then
+    echo "C8: positive control failed: the np-denied client got curl exit $rc, HTTP '${code:-}' from echo.nettest;"
+    echo "C8: want 200, else being unable to reach hello proves nothing about the NetworkPolicy"
+    return 1
   fi
-  echo "C8: curl exit $rc from np-denied; want 28 (a timeout: the NetworkPolicy drops the connection)"
+  echo "C8: positive control: the np-denied client gets HTTP 200 from echo.nettest"
+  rc=0
+  vr_cmd kc_within 60 -n np-denied exec client -- curl -sS -m 5 http://hello.hello.svc.cluster.local || rc=$?
+  case "$rc" in
+    7)
+      echo "C8: from np-denied the connection to hello was refused (curl exit 7): the NetworkPolicy rejects it"
+      return 0
+      ;;
+    28)
+      echo "C8: from np-denied the request to hello timed out (curl exit 28): the NetworkPolicy drops it"
+      return 0
+      ;;
+  esac
+  echo "C8: curl exit $rc from np-denied; want 7 (refused) or 28 (timed out), the NetworkPolicy's verdict (R45)"
   return 1
 }
 
-# C8: the allowed path works (C2, from nettest), then a client in the np-denied namespace times out
-# (curl exit 28). The namespace is deleted before (left over from an earlier run) and after.
+# C8: the allowed path works (C2, from nettest); then a client in the np-denied namespace reaches
+# echo.nettest (HTTP 200: the positive control) but not hello: curl exits 7 (kube-router rejects, as
+# measured live) or 28 (a policy that drops), per Ruling R45. The namespace is deleted before (left
+# over from an earlier run) and after, pass, fail or interrupt; the work runs in a subshell, as C7's.
 check_c8_netpol() {
   local rc=0
   echo "C8: first the allowed path from nettest (C2)"
   if ! check_c2_cross_node_curl; then
-    echo "C8: C2 failed, so a timeout from np-denied would prove nothing"
+    echo "C8: C2 failed, so a failure from np-denied would prove nothing"
     return 1
   fi
   vr_cmd kc delete namespace np-denied --ignore-not-found --timeout=120s \
     || { echo "C8: cannot delete np-denied left from an earlier run"; return 1; }
-  _vr_c8 || rc=1
+  _vr_on_signal --left "the namespace np-denied (its client Pod)" \
+    kc delete namespace np-denied --ignore-not-found --wait=false "$_VR_RT"
+  (_vr_c8) || rc=1
   vr_cmd kc delete namespace np-denied --ignore-not-found --timeout=120s \
     || { echo "C8: cannot delete the np-denied namespace"; rc=1; }
+  _vr_on_signal
   return "$rc"
 }
 
@@ -1110,7 +1452,7 @@ check_c8_netpol() {
 # Every D check SKIPs (77) when no node carries the admin-only accelerator label join-node.sh sets on a
 # GPU node, so make verify passes without a GPU node (Review Focus #5). D1 and D2 check every GPU
 # node; D6 holds every allocatable GPU. The Pods D4-D6 create are deleted before (left over from an
-# earlier run) and after, pass or fail, and also when the check is cut short (_vr_guarded): a
+# earlier run) and after, pass or fail, and also when the check is interrupted (_vr_gpu_guarded): a
 # leftover gpu-hold keeps a billed GPU allocated.
 
 _VR_GPU_LABEL='node-restriction.kubernetes.io/accelerator=nvidia'
@@ -1157,6 +1499,91 @@ _vr_guard_signal() {
   trap - INT TERM HUP PIPE
   kill -s "$1" "$BASHPID"
   exit 1
+}
+
+# _vr_gpu_guarded WHAT FUNC CLEANUP DROP…: run FUNC in a subshell (a die in it ends only FUNC), then
+# CLEANUP (the Pods' delete, waited for), however FUNC ended. FUNC runs on the left of ||, as C7's and
+# C8's work does, so errexit is off in it: it returns its failures.
+# Returns FUNC's status; 1 when FUNC passed but CLEANUP failed. An interrupt (Ctrl-C during make verify
+# or the demo; SIGTERM) is handled as Task 18's checks handle it (_vr_on_signal): DROP (the same Pods'
+# delete without the wait) runs, a further Ctrl-C cannot cut it short, and the check ends by the signal.
+# WHAT names the Pods: if CLEANUP or DROP fails, the operator is told at once (_vr_tell: redacted, on
+# run_check's fd 3 and in the evidence) that they may remain, holding billed GPUs, and how to run DROP
+# by hand in a child shell (_vr_removal).
+_vr_gpu_guarded() {
+  local what="$1" func="$2" cleanup="$3" rc=0 crc=0
+  shift 3
+  _vr_on_signal --left "$what" "$@"
+  ("$func") || rc=$?
+  "$cleanup" || crc=$?
+  if ((crc != 0)); then
+    _vr_tell "cleanup FAILED (exit $crc); may remain: $what" \
+      "to remove it, run from the repository root: $(_vr_removal "$@")"
+    ((rc != 0)) || rc=1
+  fi
+  _vr_on_signal
+  return "$rc"
+}
+
+# The bounds of the D checks' waits, in seconds: D4/D5's Pod (brief: 300 s), D2's resource (L21-2: 90 s), D6's
+# look at gpu-overflow (brief: 30 s). Fixed; only the offline tests shrink them, to run a stalled tunnel on
+# the real clock.
+_VR_POD_WAIT_S=300
+_VR_D2_WAIT_S=90
+_VR_D6_WAIT_S=30
+
+# The D waits count the time their kubectl requests take, not only their own sleeps: through a half-stalled
+# API tunnel every request waits for its whole --request-timeout, which would stretch D4's 300 s to about an
+# hour of a billed GPU session (review F2-1). So they keep a deadline on _vr_clock and cut each request's
+# --request-timeout to the time left. Under VR_NO_WAIT=1 (the offline tests skip the sleeps) the clock is
+# the sum of the skipped sleeps, so the tests see every poll; otherwise it is bash's SECONDS.
+_VR_SLEPT=0
+
+# _vr_clock: the clock's reading, into VR_CLOCK (set here, not printed: no subshell).
+_vr_clock() {
+  if [[ "${VR_NO_WAIT:-}" == 1 ]]; then
+    VR_CLOCK=$_VR_SLEPT
+  else
+    VR_CLOCK=$SECONDS
+  fi
+}
+
+# _vr_wait SECONDS: _vr_sleep, counted on the clock.
+_vr_wait() {
+  _vr_sleep "$1"
+  _VR_SLEPT=$((_VR_SLEPT + $1))
+}
+
+# _vr_rt_until DEADLINE: VR_RT = the --request-timeout of the next kubectl request: KC_REQUEST_TIMEOUT cut
+# to the whole seconds left before DEADLINE. Returns 1 when less than a second is left (kubectl reads
+# --request-timeout=0 as no bound at all).
+_vr_rt_until() {
+  local left max="${KC_REQUEST_TIMEOUT%s}"
+  _vr_clock
+  left=$(($1 - VR_CLOCK))
+  ((left >= 1)) || return 1
+  ((left <= max)) || left=$max
+  VR_RT="--request-timeout=${left}s"
+}
+
+# _vr_poll SECONDS INTERVAL CMD…: run CMD every INTERVAL s until it returns 0 (0), for at most SECONDS on
+# _vr_clock, CMD's own time included: CMD passes "$VR_RT" to its kubectl requests, which _vr_poll cuts to
+# the time left. CMD returns 2 when waiting longer cannot help (a Pod that Failed): 2. Time up: 1.
+_vr_poll() {
+  local timeout="$1" interval="$2" deadline rc VR_RT
+  shift 2
+  _vr_clock
+  deadline=$((VR_CLOCK + timeout))
+  while _vr_rt_until "$deadline"; do
+    rc=0
+    "$@" || rc=$?
+    ((rc != 0)) || return 0
+    ((rc != 2)) || return 2
+    _vr_clock
+    ((VR_CLOCK + interval < deadline)) || return 1
+    _vr_wait "$interval"
+  done
+  return 1
 }
 
 # _vr_cleanup_say LINE: print LINE. When that fails (the reader of this shell's output died, such as a
@@ -1221,11 +1648,12 @@ check_d1_gpu_stack() {
 }
 
 # _vr_d2_node NODE: kubectl describe node NODE shows nvidia.com/gpu >= 1 under both Capacity and
-# Allocatable. VR_D2_OUT keeps the last answer, VR_D2_CAP/VR_D2_ALLOC the two values.
+# Allocatable. VR_D2_OUT keeps the last answer, VR_D2_CAP/VR_D2_ALLOC the two values. Under _vr_poll, the
+# request is bounded by the time left ($VR_RT).
 _vr_d2_node() {
   local vals
   VR_D2_OUT="" VR_D2_CAP="" VR_D2_ALLOC=""
-  VR_D2_OUT="$(vr_cap --no-echo kc describe node "$1" "$_VR_RT")" || return 1
+  VR_D2_OUT="$(vr_cap --no-echo kc describe node "$1" "${VR_RT:-$_VR_RT}")" || return 1
   vals="$(awk '/^Capacity:/ { s = "cap"; next } /^Allocatable:/ { s = "alloc"; next } /^[^ ]/ { s = "" }
                s && $1 == "nvidia.com/gpu:" { v[s] = $2 } END { print (v["cap"] == "" ? "-" : v["cap"]), (v["alloc"] == "" ? "-" : v["alloc"]) }' \
     <<< "$VR_D2_OUT")"
@@ -1235,15 +1663,15 @@ _vr_d2_node() {
 
 # D2: every GPU node reports nvidia.com/gpu >= 1 in Capacity and Allocatable (kubectl describe node).
 # The resource appears about 20 s after the device plugin registers (live finding L21-2), so each
-# node gets up to 90 s.
+# node gets up to 90 s (every 10 s; the requests' own time included).
 check_d2_gpu_capacity() {
   local n fail=0
   _vr_gpu_nodes || return
   for n in "${VR_GPU_NODES[@]}"; do
-    if vr_retry 90 10 _vr_d2_node "$n"; then
+    if _vr_poll "$_VR_D2_WAIT_S" 10 _vr_d2_node "$n"; then
       echo "D2: $n: nvidia.com/gpu capacity $VR_D2_CAP, allocatable $VR_D2_ALLOC"
     else
-      echo "D2: $n: nvidia.com/gpu capacity '$VR_D2_CAP', allocatable '$VR_D2_ALLOC' after 90 s; want both >= 1"
+      echo "D2: $n: nvidia.com/gpu capacity '$VR_D2_CAP', allocatable '$VR_D2_ALLOC' after $_VR_D2_WAIT_S s; want both >= 1"
       fail=1
     fi
     [[ -z "$VR_D2_OUT" ]] || printf -- '--- kubectl describe node %s ---\n%s\n' "$n" "$VR_D2_OUT"
@@ -1272,26 +1700,30 @@ _vr_gpu_pod_delete() {
   vr_cmd kc -n gpu-test delete pod "$1" --ignore-not-found --timeout=120s "$_VR_RT"
 }
 
-# _vr_gpu_pod_wait POD: poll POD's phase every 5 s until it is Succeeded (0), for at most 300 s (1). A
-# Pod that Failed never succeeds, so that ends the wait at once (1) instead of after 300 billed seconds.
+# _vr_gpu_pod_phase POD: one look at POD's phase (VR_POD_PHASE) under _vr_poll: 0 Succeeded, 2 Failed (it
+# never succeeds), else 1.
+_vr_gpu_pod_phase() {
+  VR_POD_PHASE="$(vr_cap kc -n gpu-test get pod "$1" "$VR_RT" -o 'jsonpath={.status.phase}')" || VR_POD_PHASE=""
+  case "$VR_POD_PHASE" in
+    Succeeded) return 0 ;;
+    Failed) return 2 ;;
+  esac
+  return 1
+}
+
+# _vr_gpu_pod_wait POD: poll POD's phase every 5 s until it is Succeeded (0), for at most 300 s on the
+# clock, the requests' own time included (1). A Pod that Failed never succeeds, so that ends the wait at
+# once (1) instead of after 300 billed seconds.
 _vr_gpu_pod_wait() {
-  local phase="" waited=0
-  while :; do
-    phase="$(vr_cap kc -n gpu-test get pod "$1" "$_VR_RT" -o 'jsonpath={.status.phase}')" || phase=""
-    case "$phase" in
-      Succeeded) return 0 ;;
-      Failed)
-        echo "$1 Failed"
-        return 1
-        ;;
-    esac
-    if ((waited + 5 > 300)); then
-      echo "$1 did not succeed within 300 s (phase '$phase')"
-      return 1
-    fi
-    _vr_sleep 5
-    waited=$((waited + 5))
-  done
+  local rc=0
+  VR_POD_PHASE=""
+  _vr_poll "$_VR_POD_WAIT_S" 5 _vr_gpu_pod_phase "$1" || rc=$?
+  case "$rc" in
+    0) return 0 ;;
+    2) echo "$1 Failed" ;;
+    *) echo "$1 did not succeed within $_VR_POD_WAIT_S s (phase '$VR_POD_PHASE')" ;;
+  esac
+  return 1
 }
 
 # _vr_gpu_pod_run POD: apply k8s/gpu-test/POD.yaml, wait (at most 300 s) until it Succeeded, and set
@@ -1334,7 +1766,8 @@ _vr_d4() {
 # table and names the GPU of the node it ran on: that node's gpu-type label, uppercased (A10, A6000).
 check_d4_gpu_smoke() {
   _vr_gpu_nodes || return
-  _vr_guarded _vr_d4_cleanup _vr_d4
+  _vr_gpu_guarded "the Pod gpu-smoke in namespace gpu-test (it holds a billed GPU)" _vr_d4 _vr_d4_cleanup \
+    kc -n gpu-test delete pod gpu-smoke --ignore-not-found --wait=false "$_VR_RT"
 }
 
 _vr_d5_cleanup() { _vr_gpu_pod_delete vectoradd; }
@@ -1353,7 +1786,8 @@ _vr_d5() {
 # D5: the CUDA vectorAdd sample Succeeded within 300 s and logged "Test PASSED".
 check_d5_vectoradd() {
   _vr_gpu_nodes || return
-  _vr_guarded _vr_d5_cleanup _vr_d5
+  _vr_gpu_guarded "the Pod vectoradd in namespace gpu-test (it holds a billed GPU)" _vr_d5 _vr_d5_cleanup \
+    kc -n gpu-test delete pod vectoradd --ignore-not-found --wait=false "$_VR_RT"
 }
 
 # Holders are deleted by their label: they have generated names (gpu-hold-xxxxx).
@@ -1364,8 +1798,19 @@ _vr_d6_cleanup() {
   return "$rc"
 }
 
+# _vr_d6_drop: D6's interrupt cleanup, and the command printed to run it by hand: the same Pods as
+# _vr_d6_cleanup (the holders by their label, gpu-overflow by name), without the wait. Never every Pod in
+# gpu-test: the stretch gpu-burn workload runs there too (review F8-1). Both deletes run (each bounded by
+# $_VR_RT); it fails if either fails.
+_vr_d6_drop() {
+  local rc=0
+  vr_cmd kc -n gpu-test delete pod -l app=gpu-hold --ignore-not-found --wait=false "$_VR_RT" || rc=1
+  vr_cmd kc -n gpu-test delete pod gpu-overflow --ignore-not-found --wait=false "$_VR_RT" || rc=1
+  return "$rc"
+}
+
 _vr_d6() {
-  local out n alloc total=0 i running phase uid events
+  local out n alloc total=0 i running phase uid events window VR_RT
   out="$(vr_cap kc get nodes -l "$_VR_GPU_LABEL" "$_VR_RT" \
     -o 'jsonpath={range .items[*]}{.metadata.name}{" "}{.status.allocatable.nvidia\.com/gpu}{"\n"}{end}')" || return 1
   while read -r n alloc; do
@@ -1386,14 +1831,24 @@ _vr_d6() {
   running="$(grep -c . <<< "$out" || true)"
   ((running == total)) || { echo "D6: $running gpu-hold Pod(s) Running; want $total"; return 1; }
   vr_cmd kc apply -f "$REPO_ROOT/k8s/gpu-test/gpu-overflow.yaml" "$_VR_RT" || return 1
+  # The 30 s run from the apply, on the clock: a slow uid read is part of them, not added to them. The two
+  # reads after them share one more such window (review F2-1), while every GPU is held.
+  _vr_clock
+  window=$((VR_CLOCK + _VR_D6_WAIT_S))
   # Events outlive their Pod (about an hour): only this gpu-overflow's, by its uid, count.
-  uid="$(vr_cap kc -n gpu-test get pod gpu-overflow "$_VR_RT" -o 'jsonpath={.metadata.uid}')" || return 1
+  _vr_rt_until "$window" || { echo "D6: no time left to read gpu-overflow's uid"; return 1; }
+  uid="$(vr_cap kc -n gpu-test get pod gpu-overflow "$VR_RT" -o 'jsonpath={.metadata.uid}')" || return 1
   [[ "$uid" =~ ^[0-9a-f-]+$ ]] || { echo "D6: gpu-overflow has no valid uid: '$uid'"; return 1; }
-  echo "D6: every GPU is held; looking at gpu-overflow after 30 s"
-  _vr_sleep 30
-  phase="$(vr_cap kc -n gpu-test get pod gpu-overflow "$_VR_RT" -o 'jsonpath={.status.phase}')" || return 1
+  echo "D6: every GPU is held; looking at gpu-overflow $_VR_D6_WAIT_S s after it was applied"
+  _vr_clock
+  if ((window > VR_CLOCK)); then _vr_wait $((window - VR_CLOCK)); fi
+  _vr_clock
+  window=$((VR_CLOCK + _VR_D6_WAIT_S))
+  _vr_rt_until "$window" || { echo "D6: no time left to read gpu-overflow's phase"; return 1; }
+  phase="$(vr_cap kc -n gpu-test get pod gpu-overflow "$VR_RT" -o 'jsonpath={.status.phase}')" || return 1
+  _vr_rt_until "$window" || { echo "D6: no time left to read gpu-overflow's events"; return 1; }
   events="$(vr_cap kc -n gpu-test get events \
-    "--field-selector=involvedObject.kind=Pod,involvedObject.name=gpu-overflow,involvedObject.uid=$uid" "$_VR_RT")" \
+    "--field-selector=involvedObject.kind=Pod,involvedObject.name=gpu-overflow,involvedObject.uid=$uid" "$VR_RT")" \
     || return 1
   if [[ "$phase" == Pending && "$events" == *"Insufficient nvidia.com/gpu"* ]]; then
     echo "D6: gpu-overflow is Pending with 'Insufficient nvidia.com/gpu'"
@@ -1405,11 +1860,12 @@ _vr_d6() {
 
 # D6: one gpu-hold Pod per allocatable GPU (on every GPU node), all Running within 300 s; then
 # gpu-overflow is still Pending 30 s after it was applied, with an "Insufficient nvidia.com/gpu"
-# event of that Pod (its uid, not an earlier run's). The holders (by label) and gpu-overflow are
-# deleted before and after.
+# event of that Pod (its uid, not an earlier run's), both read within 30 s more. The holders (by
+# label) and gpu-overflow are deleted before and after.
 check_d6_overflow() {
   _vr_gpu_nodes || return
-  _vr_guarded _vr_d6_cleanup _vr_d6
+  _vr_gpu_guarded "the gpu-hold Pods (each holds a billed GPU) and gpu-overflow in namespace gpu-test" \
+    _vr_d6 _vr_d6_cleanup _vr_d6_drop
 }
 
 # --- E: resilience (spec §9 E; make verify RESILIENCE=1) -----------------------------------------

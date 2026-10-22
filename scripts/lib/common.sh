@@ -284,20 +284,30 @@ confirm() {
   [[ "$answer" =~ ^([yY]|[yY][eE][sS])$ ]]
 }
 
-# wait_for CMD TIMEOUT_S: eval CMD (a string, so shell functions such as kc and cp_ssh work) every
-# WAIT_INTERVAL_S seconds (default 5) until it succeeds. Returns 1 after TIMEOUT_S seconds, with
-# the last attempt's output on stderr. Each attempt runs in a subshell: a CMD that dies (cp_ssh ->
-# tf_out -> die) is a failed attempt whose message is shown, not a silent exit of the whole script;
-# variables CMD sets do not outlive the attempt. CMD must bound its own runtime (kubectl --timeout,
-# ConnectTimeout), or one hung attempt outlasts TIMEOUT_S.
+# wait_for CMD TIMEOUT_S [STOP_RC]: eval CMD (a string, so shell functions such as kc and cp_ssh
+# work) every WAIT_INTERVAL_S seconds (default 5) until it succeeds. Returns 1 after TIMEOUT_S
+# seconds, with the last attempt's output on stderr (TIMEOUT_S counts bash SECONDS, which step on
+# whole wall-clock seconds: a TIMEOUT_S of 1 can expire after a few ms; N gives at least N-1 s).
+# With STOP_RC, an attempt that exits STOP_RC (a failure that no retry can clear) ends the wait
+# at once: wait_for returns STOP_RC, with that attempt's output on stderr. Each attempt runs in a
+# subshell: a CMD that dies (cp_ssh -> tf_out -> die) is a failed attempt whose message is shown,
+# not a silent exit of the whole script; variables CMD sets do not outlive the attempt. CMD must
+# bound its own runtime (kubectl --timeout, ConnectTimeout), or one hung attempt outlasts TIMEOUT_S.
 wait_for() {
-  local cmd="$1" timeout="$2" interval="${WAIT_INTERVAL_S:-5}" deadline last
+  local cmd="$1" timeout="$2" stop="${3:-}" interval="${WAIT_INTERVAL_S:-5}" deadline last rc
   [[ "$timeout" =~ ^[0-9]+$ ]] || die "wait_for: bad timeout '$timeout'"
+  [[ -z "$stop" || "$stop" =~ ^[1-9][0-9]{0,2}$ ]] || die "wait_for: bad stop code '$stop'"
   [[ "$interval" =~ ^[0-9]+$ ]] || die "wait_for: bad WAIT_INTERVAL_S '$interval'"
   last="$(mktemp)" || die "wait_for: mktemp failed"
   deadline=$((SECONDS + timeout))
   log "waiting up to ${timeout}s for: $cmd"
-  until (eval "$cmd") > "$last" 2>&1; do
+  while rc=0; (eval "$cmd") > "$last" 2>&1 || rc=$?; (( rc != 0 )); do
+    if [[ -n "$stop" ]] && (( rc == stop )); then
+      log "stopped waiting for: $cmd (exit $rc, which no retry clears); the attempt said:"
+      tail -n 20 -- "$last" >&2
+      rm -f -- "$last"
+      return "$rc"
+    fi
     if (( SECONDS >= deadline )); then
       log "timed out after ${timeout}s waiting for: $cmd; the last attempt said:"
       tail -n 20 -- "$last" >&2
@@ -350,6 +360,17 @@ _worker_zone() {
     <<< "$_WORKER_ZONES")" || die "unexpected worker_zones output from the workers stack"
   [[ -n "$_ZONE" ]] || die "$1 is not in the workers stack (worker_zones)"
   [[ "$_ZONE" =~ ^[a-z]+-[a-z]+[0-9]+-[a-z]$ ]] || die "unexpected zone for $1: '$_ZONE'"
+}
+
+# vm_status NAME: the GCE status of CPU worker NAME's VM (RUNNING, TERMINATED, SUSPENDED, ...) in
+# VM_STATUS, and its zone in _ZONE. Call it outside $(...): _worker_zone caches worker_zones for the
+# shell. Used by cpu-pool.sh (scale step 4) and join-node.sh (a stopped VM fails at once).
+vm_status() {
+  tf_env
+  _worker_zone "$1"
+  VM_STATUS="$(gcloud compute instances describe "$1" --project "$GCP_PROJECT" --zone "$_ZONE" \
+    --format='value(status)')" || die "cannot read the status of the VM $1"
+  [[ "$VM_STATUS" =~ ^[A-Z_]+$ ]] || die "unexpected status for the VM $1: '$VM_STATUS'"
 }
 
 # worker_ssh NAME CMD: run CMD on CPU worker NAME over IAP SSH (OS Login), as cp_ssh does on k3s-cp;

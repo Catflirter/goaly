@@ -134,8 +134,13 @@ def test_agent_dropin_orders_k3s_agent_after_the_guard(tmp_path):
 
 def test_sysctl_values(tmp_path):
     assert run_agent(tmp_path, "--no-gpu").returncode == 0
-    lines = {l.strip() for l in rendered(tmp_path, "etc/sysctl.d/90-kubelet.conf").splitlines() if l.strip()}
-    assert lines == {"vm.panic_on_oom=0", "vm.overcommit_memory=1", "kernel.panic=10", "kernel.panic_on_oops=1"}
+    lines = {l.strip() for l in rendered(tmp_path, "etc/sysctl.d/90-kubelet.conf").splitlines()
+             if l.strip() and not l.lstrip().startswith("#")}
+    assert lines == {"vm.panic_on_oom=0", "vm.overcommit_memory=1", "kernel.panic=10", "kernel.panic_on_oops=1",
+                     "net.ipv4.ip_forward=1", "net.ipv4.conf.all.forwarding=1",
+                     "net.ipv4.conf.all.accept_redirects=0", "net.ipv4.conf.default.accept_redirects=0",
+                     "net.ipv4.conf.all.send_redirects=0", "net.ipv4.conf.default.send_redirects=0",
+                     "net.ipv4.conf.all.accept_source_route=0", "net.ipv4.conf.default.accept_source_route=0"}
 
 
 def test_renders_exactly_the_expected_files(tmp_path):
@@ -391,11 +396,19 @@ def test_gpu_audit_abandons_a_probe_that_cannot_be_reaped(tmp_path):
     assert "$ systemctl is-enabled lambda-jupyter docker" in text
 
 
-def test_gpu_audit_stops_on_ctrl_c(tmp_path):
+@pytest.mark.parametrize("poll_sleep_ignores_int", [False, True])
+def test_gpu_audit_stops_on_ctrl_c(tmp_path, poll_sleep_ignores_int):
     # Ctrl-C reaches the whole foreground process group: the probe and the bootstrap stop, nothing
     # after the audit runs (a probe in its own process group would let the root bootstrap carry on).
+    # poll_sleep_ignores_int: the audit's 0.1 s poll sleep does not die of the SIGINT, as when it has
+    # just ended when Ctrl-C comes (seen under load). Bash ignores a SIGINT that a foreground command
+    # it waits for survives, so the audit must not wait for that sleep in the foreground.
     probe_pid = tmp_path / "probe.pid"
-    bindir, _ = make_stubs(tmp_path, {"nvidia-smi": f'echo $$ > "{probe_pid}"; exec sleep 30'},
+    real_sleep = shutil.which("sleep")
+    bodies = {"nvidia-smi": f'echo $$ > "{probe_pid}"; exec {real_sleep} 30'}
+    if poll_sleep_ignores_int:
+        bodies["sleep"] = f"trap '' INT; exec {real_sleep} \"$@\""
+    bindir, _ = make_stubs(tmp_path, bodies,
                            names=["nvidia-smi", "lsb_release", "uname", "dpkg", "iptables", "ip", "systemctl"])
     sysroot = tmp_path / "sys"
     env = {**os.environ, "K3S_BOOTSTRAP_TEST_ROOT": str(sysroot), "SYSFS_NET": str(fake_sysfs(tmp_path, "eno1", 1500)),
@@ -468,6 +481,13 @@ def run_host(tmp, bindir, *flags, node="k3s-cpu-1", ext="34.29.20.20", extra_env
     return subprocess.run(["bash", str(SCRIPT), "--server-ip", "34.82.10.10", "--node-name", node,
                            "--external-ip", ext, "--iface", "ens4", *flags],
                           capture_output=True, text=True, env=env)
+
+
+def snapshot_sysctl(bindir, tmp):
+    """Make the sysctl stub copy the 90-kubelet.conf that `sysctl --system` would apply."""
+    stub = bindir / "sysctl"
+    stub.write_text(stub.read_text() + f'cp "{tmp}/sys/etc/sysctl.d/90-kubelet.conf" "{tmp}/sysctl-saw.conf" '
+                    f'2>/dev/null || echo MISSING > "{tmp}/sysctl-saw.conf"\n')
 
 
 def host_calls(log):
@@ -623,3 +643,18 @@ def test_host_mode_requires_root_without_test_root(tmp_path):
                        capture_output=True, text=True, env=env)
     assert r.returncode == 1 and "run as root" in r.stderr
     assert calls(log) == []
+
+
+def test_host_rerun_applies_the_new_sysctl_file_without_restarting_k3s_agent(tmp_path):
+    # As on the server: a re-run installs the new 90-kubelet.conf before `sysctl --system` and does not
+    # restart k3s-agent for a sysctl-only change.
+    bindir, log = host_stubs(tmp_path)
+    assert run_host(tmp_path, bindir, "--no-gpu").returncode == 0
+    (tmp_path / "agent-active").touch()
+    (tmp_path / "sys/etc/sysctl.d/90-kubelet.conf").write_text("vm.panic_on_oom=0\nvm.overcommit_memory=1\nkernel.panic=10\nkernel.panic_on_oops=1\n")
+    snapshot_sysctl(bindir, tmp_path)
+    log.write_text("")
+    r = run_host(tmp_path, bindir, "--no-gpu")
+    assert r.returncode == 0, r.stderr
+    assert "net.ipv4.ip_forward=1" in (tmp_path / "sysctl-saw.conf").read_text().splitlines()
+    assert not any(c.startswith("systemctl restart") for c in calls(log)), calls(log)

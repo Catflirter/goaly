@@ -23,7 +23,7 @@ run "cp_instance_is_hardened" {
   }
   assert {
     condition     = google_compute_instance.cp.can_ip_forward == false
-    error_message = "no ip forwarding"
+    error_message = "GCE can_ip_forward off (anti-spoofing at the NIC; the guest still forwards Pod traffic)"
   }
   assert {
     condition = (google_compute_instance.cp.boot_disk[0].initialize_params[0].image == "ubuntu-os-cloud/ubuntu-2404-lts-amd64"

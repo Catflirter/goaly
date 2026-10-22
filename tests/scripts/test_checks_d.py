@@ -15,7 +15,8 @@ import time
 
 import pytest
 
-from test_checks_abc import CP, CPU1, EXPECTED, GPU1, NODES, NOT_REACHABLE, Cluster, kc, on, rule
+from test_checks_abc import (CP, CPU1, EXPECTED, GPU1, NODES, NOT_REACHABLE, OPERATOR, PCAP_OK, ROOT, Cluster, kc, on, rule,
+                             wg_packets)
 from test_ops_scripts import free_port
 
 GPU2 = "k3s-gpu-a6000-2"
@@ -99,6 +100,8 @@ class GpuCluster(Cluster):
     def __init__(self, tmp, gpus=(GPU1,), **kw):
         super().__init__(tmp, nodes=(CP, CPU1, GPU1))
         self.first(*gpu_answers(gpus, **kw))
+        # B2 (Ruling R52): the GPU node's probe sends marked requests too, so k3s-cp sees its WireGuard packets
+        self.first(on(CP, "sudo tcpdump -nn -q -t -r /tmp/b2.pcap", stdout=PCAP_OK + wg_packets(NODES[GPU1]["ext"], 50)))
 
 
 @pytest.fixture
@@ -221,7 +224,10 @@ def test_d2_gives_up_after_90_seconds(gpu, cap, alloc):
     gpu.first(kc(f"describe node {GPU1} ", stdout=describe(GPU1, cap, alloc)))
     result, text = gpu.check("check_d2_gpu_capacity")
     assert result == "FAIL", text
-    assert len([a for a in gpu.kubectl() if a[:2] == ["describe", "node"]]) == 10  # every 10 s for 90 s
+    describes = [a for a in gpu.kubectl() if a[:2] == ["describe", "node"]]
+    # every 10 s within 90 s (at 0, 10, ..., 80 s); each request bounded by the time left (review F2-1)
+    assert [a[3] for a in describes] == ["--request-timeout=60s"] * 4 + [f"--request-timeout={s}s"
+                                                                          for s in (50, 40, 30, 20, 10)]
 
 
 def test_d2_checks_every_gpu_node(tmp_path):
@@ -283,7 +289,7 @@ def test_d4_d5_wait_up_to_300_seconds_for_succeeded(gpu, func, pod):
                                                               {"stdout": "Succeeded"}]))
     result, text = gpu.check(func)
     assert result == "PASS", text
-    assert len(phase_polls(gpu, pod)) == 3 and text.count("(wait 5s skipped)") == 2
+    assert len(phase_polls(gpu, pod)) == 3 and text.count("(VR_NO_WAIT: skipped sleep 5)") == 2
 
 
 @pytest.mark.parametrize("func, pod", [("check_d4_gpu_smoke", "gpu-smoke"), ("check_d5_vectoradd", "vectoradd")])
@@ -291,7 +297,9 @@ def test_d4_d5_give_up_after_300_seconds(gpu, func, pod):
     gpu.first(kc(f"-n gpu-test get pod {pod}", "phase", stdout="Pending"))
     result, text = gpu.check(func)
     assert result == "FAIL", text
-    assert len(phase_polls(gpu, pod)) == 61  # every 5 s for 300 s
+    # every 5 s within 300 s (at 0, 5, ..., 295 s); a request never outlasts the 300 s (review F2-1)
+    assert [a[5] for a in phase_polls(gpu, pod)] == (["--request-timeout=60s"] * 49 +
+                                                     [f"--request-timeout={s}s" for s in range(55, 0, -5)])
     assert f"{pod} did not succeed within 300 s (phase 'Pending')" in text
     assert pod_calls(gpu, pod)[-1] == delete(pod)
 
@@ -380,11 +388,11 @@ def test_d6_holds_every_gpu_then_overflow_stays_pending(gpu):
     assert "Insufficient nvidia.com/gpu" in text
     # the events of this gpu-overflow only, not those an earlier run's left behind (review S0-2)
     assert ["-n", "gpu-test", "get", "events", "--field-selector=involvedObject.kind=Pod,"
-            f"involvedObject.name=gpu-overflow,involvedObject.uid={OVERFLOW_UID}", "--request-timeout=60s"] in calls
+            f"involvedObject.name=gpu-overflow,involvedObject.uid={OVERFLOW_UID}", "--request-timeout=30s"] in calls
     # brief: gpu-overflow is looked at 30 s after it was applied (review S0-3)
     lines = text.splitlines()
     applied = next(i for i, line in enumerate(lines) if line.startswith("$ kc apply -f") and "gpu-overflow" in line)
-    waited = lines.index("(wait 30s skipped)")
+    waited = lines.index("(VR_NO_WAIT: skipped sleep 30)")
     phase = next(i for i, line in enumerate(lines) if "get pod gpu-overflow" in line and "status.phase" in line)
     events = next(i for i, line in enumerate(lines) if "get events" in line)
     assert applied < waited < phase < events, lines
@@ -435,97 +443,263 @@ def test_d6_passing_body_with_a_failed_final_cleanup_is_a_fail(gpu):  # review C
     result, text = gpu.check("check_d6_overflow")
     assert result == "FAIL", text
     assert "D6: gpu-overflow is Pending with 'Insufficient nvidia.com/gpu'" in text  # the body passed
-    assert "cleanup failed" in text
+    assert "cleanup FAILED (exit 1); may remain: the gpu-hold Pods" in text
+    assert D6_REMOVAL in text  # how to remove what may be left (F2-2)
     assert gpu_test_calls(gpu)[-2:] == [HOLD_DELETE, OVERFLOW_DELETE]
 
 
-# ---- _vr_guarded: the cleanup also runs when a check is cut short --------------------------------
+# ---- a half-stalled API tunnel: the waits are bounded by the wall clock (review F2-1) -------------
 
-def guarded(env, body):
-    code = ("source scripts/lib/checks.sh; cleanup() { echo CLEANUP; }; "
-            f"body() {{ {body}; }}; _vr_guarded cleanup body; echo rc=$?")
+# A kubectl through a half-stalled tunnel: the requests whose arguments hold MATCH answer nothing until their
+# --request-timeout (default 60 s) has passed, then fail as kubectl does. Each stall is logged with its bound.
+STALLING_KC = (
+    "kc() { local a t=60s; if [[ \"$*\" == *@MATCH@* ]]; then "
+    "for a; do [[ $a == --request-timeout=* ]] && t=${a#--request-timeout=}; done; "
+    "echo \"$t\" >> @LOG@; sleep \"${t%s}\"; "
+    "echo 'Unable to connect to the server: net/http: request canceled (Client.Timeout exceeded)' >&2; return 1; fi; "
+    "kubectl --kubeconfig \"$KUBECONFIG_FILE\" \"$@\"; }; ")
+
+
+def stalled_check(env, func, match, budget):
+    """Run FUNC through run_check on the real clock (no VR_NO_WAIT) with its wait bound BUDGET (NAME=SECONDS, a small
+    stand-in for 300/90/30 s) and the requests matching MATCH stalled: (result, evidence, seconds taken, bounds)."""
+    run, log = env.repo / "verification" / "t", env.repo / "stalls"
+    kc_fn = STALLING_KC.replace("@MATCH@", shlex.quote(match)).replace("@LOG@", str(log))
+    code = (f"set -euo pipefail; source scripts/lib/checks.sh; vr_init {run}; {budget}; {kc_fn}"
+            f"run_check T title {func}")
+    start = time.monotonic()
+    proc = subprocess.Popen(["bash", "-c", code], cwd=env.repo, env=env.environ({}), stdin=subprocess.DEVNULL,
+                            stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True, start_new_session=True)
+    try:
+        out, err = proc.communicate(timeout=45)
+    finally:
+        if proc.poll() is None:
+            os.killpg(proc.pid, signal.SIGKILL)
+            proc.communicate()
+    took = time.monotonic() - start
+    assert proc.returncode == 0, err
+    result = re.search(r"^\| 1 \| T \| title \| (\w+) \|$", (run / "SUMMARY.md").read_text(), re.M).group(1)
+    bounds = log.read_text().split() if log.exists() else []
+    return result, (run / "01-T.txt").read_text(), took, bounds
+
+
+@pytest.mark.parametrize("func, pod", [("check_d4_gpu_smoke", "gpu-smoke"), ("check_d5_vectoradd", "vectoradd")])
+def test_d4_d5_wait_ends_on_time_through_a_stalled_tunnel(gpu, func, pod):
+    """Each phase request waiting for its --request-timeout counts toward the 300 s, not only the 5 s sleeps: else
+    61 polls x 65 s (66 billed minutes). Here the bound is 4 s and every phase request stalls."""
+    result, text, took, bounds = stalled_check(gpu, func, f"get pod {pod} --request-timeout=", "_VR_POD_WAIT_S=4")
+    assert result == "FAIL", text
+    assert took < 4 + 8, (took, bounds)
+    assert bounds and all(int(b.rstrip("s")) <= 4 for b in bounds), bounds
+    assert f"{pod} did not succeed within 4 s" in text
+    assert pod_calls(gpu, pod)[-1] == delete(pod)  # still deleted
+
+
+def test_d2_wait_ends_on_time_through_a_stalled_tunnel(gpu):
+    result, text, took, bounds = stalled_check(gpu, "check_d2_gpu_capacity", f"describe node {GPU1}",
+                                               "_VR_D2_WAIT_S=3")
+    assert result == "FAIL", text
+    assert took < 3 + 8, (took, bounds)
+    assert bounds and all(int(b.rstrip("s")) <= 3 for b in bounds), bounds
+    assert "after 3 s" in text
+
+
+def test_d6_window_and_its_reads_end_on_time_through_a_stalled_tunnel(gpu):
+    """D6 looks at gpu-overflow 30 s after it was applied (here 3 s); the two reads after that share one more such
+    window, so a stalled tunnel cannot stretch them to 2 x 60 s while every GPU is held."""
+    result, text, took, bounds = stalled_check(gpu, "check_d6_overflow", "jsonpath={.status.phase}", "_VR_D6_WAIT_S=3")
+    assert result == "FAIL", text
+    assert took < 3 + 3 + 8, (took, bounds)
+    assert bounds and all(int(b.rstrip("s")) <= 3 for b in bounds), bounds
+    assert gpu_test_calls(gpu)[-2:] == [HOLD_DELETE, OVERFLOW_DELETE]
+
+
+# ---- the cleanup runs however a D check ends: returns, dies, is interrupted (SYNC-2) ----------------
+# D4-D6 use Task 18's interrupt cleanup (_vr_on_signal, _vr_signalled) and its one operator channel (_vr_tell on
+# run_check's fd 3, redacted), as C7 and C8 do: no channel or signal handling of their own.
+
+SMOKE_DROP = ["-n", "gpu-test", "delete", "pod", "gpu-smoke", "--ignore-not-found", "--wait=false",
+              "--request-timeout=60s"]
+VECTORADD_DROP = ["-n", "gpu-test", "delete", "pod", "vectoradd", "--ignore-not-found", "--wait=false",
+                  "--request-timeout=60s"]
+# D6's interrupt cleanup deletes the holders by their label and gpu-overflow by name, not every Pod in gpu-test (the
+# stretch gpu-burn workload runs there too: review F8-1). Two requests, so it is the function _vr_d6_drop.
+HOLD_DROP = ["-n", "gpu-test", "delete", "pod", "-l", "app=gpu-hold", "--ignore-not-found", "--wait=false",
+             "--request-timeout=60s"]
+OVERFLOW_DROP = ["-n", "gpu-test", "delete", "pod", "gpu-overflow", "--ignore-not-found", "--wait=false",
+                 "--request-timeout=60s"]
+D6_DROP = [HOLD_DROP, OVERFLOW_DROP]
+D6_REMOVAL = "bash -c 'source scripts/lib/checks.sh && vr_env && _vr_d6_drop'"
+INTERRUPTED = [  # (check, a call the check waits on, the answer that makes it wait, its interrupt cleanup's calls,
+    #               the cleanup as the operator is told it runs)
+    ("check_d4_gpu_smoke", "{.status.phase}", kc("-n gpu-test get pod gpu-smoke", "phase", sleep=30), [SMOKE_DROP],
+     f"kc {' '.join(SMOKE_DROP)}"),
+    ("check_d5_vectoradd", "{.status.phase}", kc("-n gpu-test get pod vectoradd", "phase", sleep=30),
+     [VECTORADD_DROP], f"kc {' '.join(VECTORADD_DROP)}"),
+    ("check_d6_overflow", "--for=condition=Ready", kc("-n gpu-test wait pod -l app=gpu-hold", sleep=30), D6_DROP,
+     "_vr_d6_drop"),
+]
+LEFT_D6 = "may remain: the gpu-hold Pods (each holds a billed GPU) and gpu-overflow in namespace gpu-test"
+
+
+def guarded(env, body, cleanup="echo CLEANUP"):
+    code = (f"source scripts/lib/checks.sh; cleanup() {{ {cleanup}; }}; body() {{ {body}; }}; rc=0; "
+            "_vr_gpu_guarded 'the test Pods' body cleanup kc -n gpu-test delete pod x || rc=$?; echo rc=$rc")
     return env.run(["bash", "-c", code])
 
 
-@pytest.mark.parametrize("body, rc", [("echo ok", 0), ("return 1", 1), ("exit 2", 2), ("set -e; false; echo x", 1),
+@pytest.mark.parametrize("body, rc", [("echo ok", 0), ("return 1", 1), ("exit 2", 2), ("die 'no .env'", 1),
                                       ("kill -TERM $BASHPID", 143)])
 def test_guarded_runs_the_cleanup_however_the_body_ends(no_gpu, body, rc):
     proc = guarded(no_gpu, body)
     assert proc.stdout.splitlines()[-2:] == ["CLEANUP", f"rc={rc}"], proc.stdout + proc.stderr
 
 
-def test_guarded_cleanup_failure_fails_a_passing_body(no_gpu):
-    code = ("source scripts/lib/checks.sh; cleanup() { return 3; }; body() { echo ok; }; rc=0; "
-            "_vr_guarded cleanup body || rc=$?; echo rc=$rc")
-    assert no_gpu.run(["bash", "-c", code]).stdout.splitlines()[-1] == "rc=1"
+def test_guarded_cleanup_failure_fails_a_passing_body_and_says_how_to_finish_it(no_gpu):
+    proc = guarded(no_gpu, "echo ok", cleanup="return 3")
+    assert proc.stdout.splitlines()[-1] == "rc=1"
+    # outside run_check the operator channel is stderr
+    assert "check: cleanup FAILED (exit 3); may remain: the test Pods" in proc.stderr
+    assert ("check: to remove it, run from the repository root: "
+            "bash -c 'source scripts/lib/checks.sh && vr_env && kc -n gpu-test delete pod x'") in proc.stderr
 
 
-def test_guarded_keeps_the_callers_exit_trap(no_gpu):
-    code = ("source scripts/lib/checks.sh; trap 'echo OUTER' EXIT; cleanup() { echo CLEANUP; }; "
-            "body() { exit 2; }; _vr_guarded cleanup body || true; echo after")
-    assert no_gpu.run(["bash", "-c", code]).stdout.splitlines() == ["CLEANUP", "after", "OUTER"]
+def test_guarded_leaves_no_signal_trap_behind(no_gpu):
+    proc = no_gpu.run(["bash", "-c", "source scripts/lib/checks.sh; cleanup() { :; }; body() { :; }; "
+                                     "_vr_gpu_guarded 'the test Pods' body cleanup true; trap -p INT TERM; echo end"])
+    assert proc.stdout.splitlines() == ["end"], proc.stdout
 
 
-def test_d6_check_killed_while_waiting_still_deletes_the_holders(gpu):
-    """A check stopped by a signal (make verify interrupted) while D6 waits for its holders still deletes them: a
-    leftover gpu-hold keeps a billed GPU allocated (Task 16 ledger note). Here kc signals its own shell at the wait."""
-    run = gpu.repo / "verification" / "t"
-    code = (f"set -euo pipefail; source scripts/lib/checks.sh; vr_init {run}; "
-            "kc() { if [[ \"$*\" == *'wait pod -l app=gpu-hold'* ]]; then kill -TERM $BASHPID; fi; "
-            "kubectl --kubeconfig \"$KUBECONFIG_FILE\" \"$@\"; }; run_check T title check_d6_overflow")
-    proc = gpu.run(["bash", "-c", code], VR_NO_WAIT="1")
+def test_the_d_checks_use_the_one_redacted_operator_channel():
+    text = (ROOT / "scripts/lib/checks.sh").read_text()
+    for gone in ("VR_OPERATOR_FD", "_vr_operator ", "_vr_guard_signal", "_vr_guarded ", "_vr_gpu_leftover", "9>&2"):
+        assert gone not in text, gone
+
+
+@pytest.mark.parametrize("sig", [signal.SIGINT, signal.SIGTERM])
+@pytest.mark.parametrize("func, when, waits, drops, said", INTERRUPTED)
+def test_an_interrupted_d_check_deletes_its_gpu_pods_and_stops(gpu, func, when, waits, drops, said, sig):
+    """Ctrl-C (or a TERM) while D4-D6 wait: their Pods are deleted (a leftover gpu-hold, restartPolicy Always, keeps
+    a billed GPU allocated), the operator sees it, the evidence records it, and the run stops by the signal."""
+    gpu.first(waits)
+    assert gpu.interrupt(func, when, sig) == -sig
+    assert gpu_test_calls(gpu)[-len(drops):] == drops, gpu.interrupted
+    err, text = gpu.interrupted
+    for out in (err, text):
+        assert f"interrupted ({sig.name}); cleaning up (at most 120 s): {said}" in out
+        assert "cleanup done" in out and "may remain" not in out
+    assert "T: cleanup done" in err
+
+
+def test_a_second_ctrl_c_does_not_stop_the_gpu_cleanup(gpu):  # review F2-2
+    gpu.first(kc("-n gpu-test wait pod -l app=gpu-hold", sleep=30), kc(" ".join(HOLD_DROP[:6]), "--wait=false", sleep=2))
+    assert gpu.interrupt("check_d6_overflow", "--for=condition=Ready", signal.SIGINT,
+                         again="--wait=false") == -signal.SIGINT
+    assert gpu_test_calls(gpu)[-2:] == D6_DROP
+    err, text = gpu.interrupted
+    for out in (err, text):
+        assert "cleanup done" in out and "FAILED" not in out
+
+
+def test_a_failed_gpu_cleanup_after_ctrl_c_says_what_may_remain_and_how_to_remove_it(gpu):  # review F2-2
+    gpu.first(kc("-n gpu-test wait pod -l app=gpu-hold", sleep=30),
+              kc(" ".join(HOLD_DROP[:6]), "--wait=false", rc=1,
+                 stderr="Unable to connect to the server: dial tcp 127.0.0.1:6443\n"))
+    assert gpu.interrupt("check_d6_overflow", "--for=condition=Ready", signal.SIGINT) == -signal.SIGINT
+    # the holders' delete failed: gpu-overflow is still deleted
+    assert gpu_test_calls(gpu)[-2:] == D6_DROP
+    err, text = gpu.interrupted
+    for out in (err, text):
+        assert f"cleanup FAILED (exit 1); {LEFT_D6}" in out
+        assert f"to remove it, run from the repository root: {D6_REMOVAL}" in out
+    # the command it names, run in a child shell, does the cleanup once the API answers again
+    cmd = next(line for line in err.splitlines() if "to remove it" in line).split("repository root: ", 1)[1]
+    gpu.scenario["answers"] = gpu_answers()
+    r = gpu.run(["bash", "-c", cmd])
+    assert r.returncode == 0, r.stderr
+    assert gpu.kubectl()[-2:] == D6_DROP
+    assert_d6_deletes_only_its_own_pods(gpu)
+
+
+def assert_d6_deletes_only_its_own_pods(env):
+    """Every delete D6 makes in gpu-test names its holders (label app=gpu-hold) or gpu-overflow: another Pod there
+    (the stretch gpu-burn workload) survives D6, its interrupt and the removal command (review F8-1)."""
+    deletes = [a for a in gpu_test_calls(env) if "delete" in a]
+    assert deletes
+    for a in deletes:
+        assert "--all" not in a and "pods" not in a, a
+        assert a[3:6] == ["pod", "-l", "app=gpu-hold"] or a[3:5] == ["pod", "gpu-overflow"], a
+
+
+@pytest.mark.parametrize("sig", [signal.SIGINT, signal.SIGTERM])
+def test_an_interrupted_d6_leaves_other_pods_in_gpu_test_alone(gpu, sig):  # review F8-1
+    gpu.first(kc("-n gpu-test wait pod -l app=gpu-hold", sleep=30))
+    assert gpu.interrupt("check_d6_overflow", "--for=condition=Ready", sig) == -sig
+    assert_d6_deletes_only_its_own_pods(gpu)
+    err, _ = gpu.interrupted
+    # the operator sees which Pods the cleanup deletes
+    assert f"$ kc {' '.join(HOLD_DROP)}" in err and f"$ kc {' '.join(OVERFLOW_DROP)}" in err
+
+
+def test_a_passing_d6_leaves_other_pods_in_gpu_test_alone(gpu):  # review F8-1
+    result, text = gpu.check("check_d6_overflow")
+    assert result == "PASS", text
+    assert_d6_deletes_only_its_own_pods(gpu)
+    assert "delete pods --all" not in (ROOT / "scripts/lib/checks.sh").read_text()
+
+
+def run_d6(env):
+    """D6 through run_check as make verify runs it: (process, evidence)."""
+    run = env.repo / "verification" / "t"
+    code = f"set -euo pipefail; source scripts/lib/checks.sh; vr_init {run}; run_check T title check_d6_overflow"
+    proc = env.run(["bash", "-c", code], VR_NO_WAIT="1")
     assert proc.returncode == 0, proc.stderr
     assert "| 1 | T | title | FAIL |" in (run / "SUMMARY.md").read_text()
-    calls = gpu_test_calls(gpu)
-    assert not any("wait" in a for a in calls)  # killed before kubectl wait ran
-    assert calls[-2:] == [HOLD_DELETE, OVERFLOW_DELETE], calls
+    return proc, (run / "01-T.txt").read_text()
 
 
-def test_guarded_cleanup_runs_after_a_signal_even_when_its_output_pipe_is_gone(no_gpu):  # review C0-3 / X0-2
-    """vr_cmd runs nothing it cannot record; after a signal a dead output pipe must not stop the cleanup."""
-    mark = no_gpu.repo / "cleaned"
-    code = ("source scripts/lib/checks.sh; "
-            f"cleanup() {{ vr_cmd touch {mark}; }}; body() {{ sleep 0.5; kill -INT $BASHPID; }}; "
-            "_vr_guarded cleanup body")
-    proc = no_gpu.run(["bash", "-c", f"bash -c {shlex.quote(code)} | true"])
-    assert mark.exists(), proc.stderr
+def test_a_failed_final_gpu_cleanup_is_told_to_the_operator_with_the_removal_command(gpu):  # review F2-2
+    """Not interrupted: the holders' final delete fails. The check FAILs and the operator is told at once (run_check's
+    fd 3), not only in the evidence: the Pods may hold every billed GPU."""
+    gpu.first(kc("-n gpu-test delete pod -l app=gpu-hold", seq=[{"rc": 0}, {"rc": 1, "stderr": "error: timed out\n"}]))
+    proc, text = run_d6(gpu)
+    for out in (proc.stderr, text):
+        assert f"cleanup FAILED (exit 1); {LEFT_D6}" in out
+        assert D6_REMOVAL in out
+    assert "T: cleanup FAILED" in proc.stderr
 
 
-def test_ctrl_c_of_the_whole_run_still_deletes_the_holders_and_stops_the_run(gpu):  # review C0-3 / X0-2
-    """A terminal Ctrl-C sends SIGINT to the whole foreground process group: the check, kubectl, and run_check's
-    evidence filter (redact). The filter must outlive the check's cleanup, or the cleanup's logging fails and the
-    gpu-hold Pods (restartPolicy Always) keep every GPU allocated. The run then stops: no later check starts."""
-    run = gpu.repo / "verification" / "t"
-    waiting = gpu.repo / "waiting"
-    code = (f"set -euo pipefail; source scripts/lib/checks.sh; vr_init {run}; "
-            "kc() { if [[ \"$*\" == *'wait pod -l app=gpu-hold'* ]]; then "
-            f"touch {waiting}; sleep 30; fi; "
-            "kubectl --kubeconfig \"$KUBECONFIG_FILE\" \"$@\"; }; "
-            "run_check T title check_d6_overflow; run_check U later check_d1_gpu_stack")
-    proc = subprocess.Popen(["bash", "-c", code], cwd=gpu.repo, env=gpu.environ({"VR_NO_WAIT": "1"}),
-                            stdin=subprocess.DEVNULL, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True,
-                            start_new_session=True)
-    try:
-        for _ in range(200):
-            if waiting.exists():
-                break
-            time.sleep(0.05)
-        assert waiting.exists(), "D6 never reached the holder wait"
-        time.sleep(0.2)
-        os.killpg(proc.pid, signal.SIGINT)
-        proc.communicate(timeout=60)
-    finally:
-        if proc.poll() is None:
-            os.killpg(proc.pid, signal.SIGKILL)
-    calls = gpu_test_calls(gpu)
-    assert calls[-2:] == [HOLD_DELETE, OVERFLOW_DELETE], calls
-    evidence = (run / "01-T.txt").read_text()
-    # the evidence filter survived: the cleanup is on record
-    assert "interrupted (SIGINT); cleaning up" in evidence and "redact failed" not in evidence, evidence
-    assert "delete pod -l app=gpu-hold" in evidence.split("interrupted (SIGINT); cleaning up")[1], evidence
-    assert not (run / "02-U.txt").exists()  # the run stopped
-    assert "| 1 | T | title | FAIL |" in (run / "SUMMARY.md").read_text()  # after recording the check
-    assert proc.returncode == -signal.SIGINT  # by the signal, as without the traps: make stops too
+TOKEN = "K10" + "ab" * 32 + "::server:s3cr3tpassw0rd"
+
+
+def test_d_evidence_is_redacted(gpu):
+    gpu.first(kc(f"describe node {GPU1} ", stdout=describe(GPU1) + f"Annotations: k3s.io/external-ip: {OPERATOR}\n"
+                                                               f"  bootstrap: {TOKEN}\n"))
+    result, text = gpu.check("check_d2_gpu_capacity")
+    assert result == "PASS", text
+    assert OPERATOR not in text and "<operator_ip>" in text
+    assert "s3cr3t" not in text and "bootstrap: <redacted>" in text
+
+
+def test_what_an_interrupted_d_check_tells_the_operator_is_redacted(gpu):
+    gpu.first(kc("-n gpu-test wait pod -l app=gpu-hold", sleep=30),
+              kc(" ".join(HOLD_DROP[:6]), "--wait=false", rc=1,
+                 stderr=f"error: dial tcp {OPERATOR}:6443: bootstrap {TOKEN}\n"))
+    assert gpu.interrupt("check_d6_overflow", "--for=condition=Ready", signal.SIGINT) == -signal.SIGINT
+    err, text = gpu.interrupted
+    for out in (err, text):
+        assert "cleanup FAILED" in out and "<operator_ip>:6443" in out and "bootstrap <redacted>" in out
+        assert OPERATOR not in out and "s3cr3t" not in out
+
+
+def test_a_failed_final_gpu_cleanup_is_redacted_in_the_evidence_and_on_the_terminal(gpu):
+    gpu.first(kc("-n gpu-test delete pod -l app=gpu-hold",
+                 seq=[{"rc": 0}, {"rc": 1, "stderr": f"error: dial tcp {OPERATOR}:6443: bootstrap {TOKEN}\n"}]))
+    proc, text = run_d6(gpu)
+    assert "<operator_ip>:6443" in text and "bootstrap <redacted>" in text  # the delete's own error, recorded
+    for out in (proc.stderr, text):
+        assert "cleanup FAILED" in out
+        assert OPERATOR not in out and "s3cr3t" not in out
 
 
 # ---- make verify with a GPU node --------------------------------------------------------------

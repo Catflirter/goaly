@@ -58,6 +58,16 @@ init: ## Create the Terraform state bucket and enable the GCP APIs (infra/bootst
 up: ## Bring the cluster up: base, k3s-cp, kubeconfig, tunnel, CPU workers, system components, workloads (safe to re-run)
 	$(ROOT)/scripts/up.sh all
 
+# Ordered teardown (spec §11): asks once for the GCP project id; the bootstrap stack (state bucket)
+# is kept. Only AUTO_APPROVE=1 skips the question (unlike gpu-apply/gpu-down, yes and true do not),
+# and only on the command line or in the environment: a .env that sets it refuses the run. Declining
+# changes nothing and exits 2, so make reports "Error 2". Ends by asking Lambda that no GPU node is
+# left (DOWN_LAMBDA_WAIT_S, default 60 s, for a node just terminated). Safe to re-run after a partial
+# teardown.
+.PHONY: down
+down: ## Tear everything down: GPU nodes, CPU workers, gpu-access/workers/base stacks, tunnel (keeps bootstrap)
+	$(ROOT)/scripts/down.sh
+
 # The CPU worker pool (spec §5.3). Removing a worker drains it and deletes it from the cluster
 # before the apply destroys its VM; k3s-cpu-1 is never removed.
 .PHONY: cpu-scale cpu-remove cpu-stop cpu-start
@@ -100,6 +110,13 @@ lint: ## Run all pre-commit hooks, the repo secret scan, the Terraform tests, th
 verify: ## Run verification checks A-D (RESILIENCE=1 adds E) into verification/<timestamp>/
 	$(ROOT)/scripts/verify.sh
 
+# RUN is a path to the run, as the shell sees it from where make runs (make -C <repo> for a repo-relative one).
+# PROMOTE_ALLOW_SKIP=1 (a run with skipped, never failed, checks) and OPERATOR_IP=<ip> reach promote.sh through the environment.
+.PHONY: promote-verify
+promote-verify: ## Copy a verify run to verification/final/ if gitleaks finds no secrets (make promote-verify RUN=verification/<ts>)
+	@[ -n "$(RUN)" ] || { echo "usage: make promote-verify RUN=verification/<YYYY-MM-DDTHHMM-0700>" >&2; exit 2; }
+	$(ROOT)/scripts/promote.sh verify "$(RUN)"
+
 # AUTO_APPROVE=1 (or yes/true) skips the confirmation prompt of gpu-apply and gpu-down.
 GPU_AUTO_APPROVE := $(if $(filter 1 yes true,$(AUTO_APPROVE)), --auto-approve)
 
@@ -119,3 +136,24 @@ gpu-status: ## Show GPU capacity, GPU instances and drift (changes no cloud stat
 .PHONY: sync-peers
 sync-peers: ## Rewrite the peer allow-lists (cp k3s_peers set, Lambda firewall) from the current node IPs
 	$(ROOT)/scripts/gpuctl sync-peers
+
+# Stretch S0 (spec §10.0): the monitoring stack in k8s/monitoring/. Grafana and Prometheus have no
+# exposed Service: they are reached only through kubectl port-forward on 127.0.0.1 (via make tunnel).
+.PHONY: monitoring monitoring-down grafana grafana-stop prometheus prometheus-stop
+monitoring: ## Install or upgrade the monitoring stack (expects k3s-cpu-1 as e2-standard-2; warns otherwise); a new Grafana password is shown once
+	$(ROOT)/scripts/monitoring.sh install
+
+monitoring-down: ## Delete the monitoring stack and its data (asks first; AUTO_APPROVE=1 skips)
+	$(ROOT)/scripts/monitoring.sh uninstall
+
+grafana: ## Port-forward Grafana to http://127.0.0.1:3000 in the background (GRAFANA_PORT=... to change)
+	$(ROOT)/scripts/monitoring.sh forward grafana
+
+grafana-stop: ## Stop the Grafana port-forward
+	$(ROOT)/scripts/monitoring.sh stop grafana
+
+prometheus: ## Port-forward Prometheus to http://127.0.0.1:9090 in the background (PROMETHEUS_PORT=...)
+	$(ROOT)/scripts/monitoring.sh forward prometheus
+
+prometheus-stop: ## Stop the Prometheus port-forward
+	$(ROOT)/scripts/monitoring.sh stop prometheus

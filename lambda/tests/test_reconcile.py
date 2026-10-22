@@ -708,3 +708,64 @@ def test_a_second_ctrl_c_during_the_cleanup_wait_still_terminates_names_found_fi
     err = capsys.readouterr().err
     assert "launch outcome of k3s-gpu-a6000-2 unknown" in err and "gpu-down" in err
     assert "k3s-gpu-a6000-1 unknown" not in err
+
+
+# --- a second Ctrl-C during apply's failure cleanup (review F2-4) ----------------------------------
+
+TWO_FAILING = {"k3s-gpu-a6000-1", "k3s-gpu-a6000-2"}
+
+
+def interrupt_terminates(fake, *numbers):
+    """Ctrl-C (KeyboardInterrupt) on the given calls of terminate (1-based), before the terminate is done."""
+    terminate, sent = fake.terminate, []
+
+    def terminate_or_interrupt(ids):
+        sent.append(list(ids))
+        if len(sent) in numbers:
+            raise KeyboardInterrupt
+        terminate(ids)
+
+    fake.terminate = terminate_or_interrupt
+    return sent
+
+
+def test_ctrl_c_during_the_cleanup_still_terminates_every_failed_instance(capsys):
+    fake, infra = FakeLambda(types=TYPES), FakeInfra(join_fail=TWO_FAILING)
+    sent = interrupt_terminates(fake, 1)
+    with pytest.raises(KeyboardInterrupt):  # gpuctl still stops, once the instances are terminated
+        make_rec(fake, infra).apply(two_node_spec(), auto_approve=True, keep_on_failure=False)
+    first, second = fake.launched_ids
+    assert sent == [[first], [first], [second]]  # the interrupted terminate is sent again, the other one still
+    assert sorted(fake.terminated) == sorted([first, second])
+    assert infra.applied_gpu_ips[-1] == []  # and their IPs leave every allow-list
+    err = capsys.readouterr().err
+    assert f"terminated k3s-gpu-a6000-1 {first}, k3s-gpu-a6000-2 {second}" in err
+    assert "NOT terminated" not in err
+
+
+def test_ctrl_c_twice_on_one_terminate_moves_on_and_names_what_still_bills(capsys):
+    fake, infra = FakeLambda(types=TYPES), FakeInfra(join_fail=TWO_FAILING)
+    sent = interrupt_terminates(fake, 1, 2)
+    with pytest.raises(KeyboardInterrupt):
+        make_rec(fake, infra).apply(two_node_spec(), auto_approve=True, keep_on_failure=False)
+    first, second = fake.launched_ids
+    assert sent == [[first], [first], [second]]
+    assert fake.terminated == [second]
+    err = capsys.readouterr().err
+    assert f"NOT terminated, still billing: k3s-gpu-a6000-1 {first}" in err and "make gpu-down" in err
+
+
+def test_ctrl_c_during_a_node_delete_in_the_cleanup_still_terminates_the_rest():
+    fake, infra = FakeLambda(types=TYPES), FakeInfra(join_fail=TWO_FAILING)
+    drains = []
+
+    def interrupted_drain(name):
+        drains.append(name)
+        raise KeyboardInterrupt
+
+    infra.drain_and_delete_node = interrupted_drain
+    with pytest.raises(KeyboardInterrupt):
+        make_rec(fake, infra).apply(two_node_spec(), auto_approve=True, keep_on_failure=False)
+    assert sorted(fake.terminated) == sorted(fake.launched_ids)
+    assert drains == ["k3s-gpu-a6000-1"]  # after a Ctrl-C the slow node deletes are skipped
+    assert infra.forgotten == ["k3s-gpu-a6000-1", "k3s-gpu-a6000-2"]
