@@ -1,0 +1,8 @@
+ch1 3s (commands 3s; 3 step(s), 0 failed, 0 skipped) Architecture: nodes, describe node (summary), system Pods on k3s-cp (A1, A2, A3)
+ch2 73s (commands 73s; 3 step(s), 0 failed, 0 skipped) Security: firewall inventory, negative tests, only WireGuard on the wire (B6, B5, B2)
+ch3 49s (commands 49s; 1 step(s), 0 failed, 0 skipped) Cross-node connectivity matrix (B1)
+ch4 148s (commands 148s; 6 step(s), 0 failed, 0 skipped) hello-world: cross-node, port-forward, QoS, cgroup, OOMKilled and throttling, NetworkPolicy (C2-C5, C7, C8)
+ch5 111s (commands 111s; 4 step(s), 0 failed, 0 skipped) GPU: capacity, nvidia-smi, vectoradd, the over-request stays Pending (D2, D4, D5, D6)
+ch6 343s (commands 343s; 4 step(s), 1 failed, 0 skipped) Scaling by inventory: workers plan, CPU pool 1 -> 2 -> 1, GPU plan with the pool at 2
+ch8 5s (commands 5s; 2 step(s), 0 failed, 0 skipped) Wrap-up: the teardown plan; make down only if you say so
+total 732s; chapters 1-6: 12m07s (target 25 min)

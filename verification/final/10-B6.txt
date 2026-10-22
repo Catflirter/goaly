@@ -1,13 +1,15 @@
 # B6 — Firewall inventory: every source a /32 (or IAP)
-# started: 2026-10-22T12:52:34-07:00
+# started: 2026-10-22T13:22:47-07:00
 $ bounded 120 gcloud compute firewall-rules list --project <GCP_PROJECT> '--filter=name~^fw-' --format=json
-NAME                      NETWORK   DIRECTION  SOURCES           ALLOWED                   TARGET_SA
-fw-cp-allow-iap-ssh       k3s-core  INGRESS    35.235.240.0/20   tcp:22                    k3s-cp@<GCP_PROJECT>.iam.gserviceaccount.com
-fw-cp-allow-self          k3s-core  INGRESS    136.87.143.58/32  tcp:6443;10250            k3s-cp@<GCP_PROJECT>.iam.gserviceaccount.com
-fw-cp-to-workers          k3s-edge  INGRESS    136.87.143.58/32  icmp,udp:51820,tcp:10250  k3s-worker@<GCP_PROJECT>.iam.gserviceaccount.com
-fw-k3s-cpu-1-mesh         k3s-edge  INGRESS    34.28.157.143/32  icmp,udp:51820            k3s-worker@<GCP_PROJECT>.iam.gserviceaccount.com
-fw-k3s-cpu-1-to-cp        k3s-core  INGRESS    34.28.157.143/32  icmp,tcp:6443,udp:51820   k3s-cp@<GCP_PROJECT>.iam.gserviceaccount.com
-fw-workers-allow-iap-ssh  k3s-edge  INGRESS    35.235.240.0/20   tcp:22                    k3s-worker@<GCP_PROJECT>.iam.gserviceaccount.com
+NAME                               NETWORK   DIRECTION  SOURCES             ALLOWED                   TARGET_SA
+fw-cp-allow-iap-ssh                k3s-core  INGRESS    35.235.240.0/20     tcp:22                    k3s-cp@<GCP_PROJECT>.iam.gserviceaccount.com
+fw-cp-allow-self                   k3s-core  INGRESS    136.87.143.58/32    tcp:6443;10250            k3s-cp@<GCP_PROJECT>.iam.gserviceaccount.com
+fw-cp-to-workers                   k3s-edge  INGRESS    136.87.143.58/32    icmp,udp:51820,tcp:10250  k3s-worker@<GCP_PROJECT>.iam.gserviceaccount.com
+fw-gpu-155-248-202-136-to-cp       k3s-core  INGRESS    155.248.202.136/32  icmp,tcp:6443,udp:51820   k3s-cp@<GCP_PROJECT>.iam.gserviceaccount.com
+fw-gpu-155-248-202-136-to-workers  k3s-edge  INGRESS    155.248.202.136/32  icmp,udp:51820            k3s-worker@<GCP_PROJECT>.iam.gserviceaccount.com
+fw-k3s-cpu-1-mesh                  k3s-edge  INGRESS    34.28.157.143/32    icmp,udp:51820            k3s-worker@<GCP_PROJECT>.iam.gserviceaccount.com
+fw-k3s-cpu-1-to-cp                 k3s-core  INGRESS    34.28.157.143/32    icmp,tcp:6443,udp:51820   k3s-cp@<GCP_PROJECT>.iam.gserviceaccount.com
+fw-workers-allow-iap-ssh           k3s-edge  INGRESS    35.235.240.0/20     tcp:22                    k3s-worker@<GCP_PROJECT>.iam.gserviceaccount.com
 $ bounded 120 /home/catflirter/goaly/scripts/gpuctl rules
 global
   tcp   22          <operator_ip>/32  operator ssh
@@ -16,10 +18,10 @@ ruleset k3s-gpu-us-east-1 bd113ffc17b540cd85de31295d7b214b us-east-1
   tcp   10250       136.87.143.58/32   metrics-server from cp
   udp   51820       34.28.157.143/32   wireguard 34.28.157.143
   icmp  -           34.28.157.143/32   icmp 34.28.157.143
-  udp   51820       64.181.247.15/32   wireguard 64.181.247.15
-  icmp  -           64.181.247.15/32   icmp 64.181.247.15
   udp   51820       136.87.143.58/32   wireguard 136.87.143.58
   icmp  -           136.87.143.58/32   icmp 136.87.143.58
+  udp   51820       155.248.202.136/32 wireguard 155.248.202.136
+  icmp  -           155.248.202.136/32 icmp 155.248.202.136
 ruleset k3s-gpu-us-west-1 278ead73cf6e4f86afd37b89831b803f us-west-1
   tcp   22          <operator_ip>/32  operator ssh
   tcp   10250       136.87.143.58/32   metrics-server from cp
@@ -27,14 +29,16 @@ ruleset k3s-gpu-us-west-1 278ead73cf6e4f86afd37b89831b803f us-west-1
   icmp  -           34.28.157.143/32   icmp 34.28.157.143
   udp   51820       136.87.143.58/32   wireguard 136.87.143.58
   icmp  -           136.87.143.58/32   icmp 136.87.143.58
+  udp   51820       155.248.202.136/32 wireguard 155.248.202.136
+  icmp  -           155.248.202.136/32 icmp 155.248.202.136
 ruleset k3s-gpu-us-west-2 0dc855927b344ec8ad71341fd6ec6033 us-west-2
   tcp   22          <operator_ip>/32  operator ssh
   tcp   10250       136.87.143.58/32   metrics-server from cp
   udp   51820       34.28.157.143/32   wireguard 34.28.157.143
   icmp  -           34.28.157.143/32   icmp 34.28.157.143
-  udp   51820       64.181.247.15/32   wireguard 64.181.247.15
-  icmp  -           64.181.247.15/32   icmp 64.181.247.15
   udp   51820       136.87.143.58/32   wireguard 136.87.143.58
   icmp  -           136.87.143.58/32   icmp 136.87.143.58
+  udp   51820       155.248.202.136/32 wireguard 155.248.202.136
+  icmp  -           155.248.202.136/32 icmp 155.248.202.136
 B6: every source is a single address (/32) or the IAP range 35.235.240.0/20
-# finished: 2026-10-22T12:52:36-07:00 — PASS (exit 0)
+# finished: 2026-10-22T13:22:49-07:00 — PASS (exit 0)

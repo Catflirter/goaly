@@ -1,8 +1,9 @@
 # B3 — WireGuard peers and recent handshakes
-# started: 2026-10-22T12:51:55-07:00
+# started: 2026-10-22T13:21:59-07:00
 $ kc get nodes --request-timeout=60s -o 'jsonpath={range .items[*]}{.metadata.name}{"\n"}{end}'
 k3s-cp
 k3s-cpu-1
+k3s-gpu-a6000-1
 $ cp_resolve
 $ _worker_zone k3s-cpu-1
 $ node_ssh k3s-cp 'sudo wg show flannel-wg'
@@ -19,11 +20,19 @@ interface: flannel-wg
 peer: gq9TOcwRhmqKecw/teRkRFKJ0Et8QUqJHvqdMUCN/kE=
   endpoint: 34.28.157.143:51820
   allowed ips: 10.42.1.0/24
-  latest handshake: 2 minutes, 2 seconds ago
-  transfer: 33.63 KiB received, 38.27 KiB sent
+  latest handshake: 1 minute, 37 seconds ago
+  transfer: 53.24 MiB received, 142.37 KiB sent
   persistent keepalive: every 25 seconds
-B3: k3s-cp: 1 peers (want 1)
-  peer 34.28.157.143:51820: latest handshake 122 s ago
+
+peer: zi3BMizqUvwM7/N432PbNl159StuozWBR3uHNB6hSG8=
+  endpoint: 155.248.202.136:51820
+  allowed ips: 10.42.6.0/24
+  latest handshake: 2 minutes, 7 seconds ago
+  transfer: 22.25 KiB received, 24.14 KiB sent
+  persistent keepalive: every 25 seconds
+B3: k3s-cp: 2 peers (want 2)
+  peer 34.28.157.143:51820: latest handshake 97 s ago
+  peer 155.248.202.136:51820: latest handshake 127 s ago
 $ node_ssh k3s-cpu-1 'sudo wg show flannel-wg'
 WARNING: 
 
@@ -38,9 +47,39 @@ interface: flannel-wg
 peer: 6IClWSJ0isyRBCUTuppozJmJnj+BY83JISQCt7Z7PTU=
   endpoint: 136.87.143.58:51820
   allowed ips: 10.42.0.0/24
-  latest handshake: 2 minutes, 6 seconds ago
-  transfer: 38.12 KiB received, 33.63 KiB sent
+  latest handshake: 1 minute, 41 seconds ago
+  transfer: 142.22 KiB received, 54.05 MiB sent
   persistent keepalive: every 25 seconds
-B3: k3s-cpu-1: 1 peers (want 1)
-  peer 136.87.143.58:51820: latest handshake 126 s ago
-# finished: 2026-10-22T12:52:05-07:00 — PASS (exit 0)
+
+peer: zi3BMizqUvwM7/N432PbNl159StuozWBR3uHNB6hSG8=
+  endpoint: 155.248.202.136:51820
+  allowed ips: 10.42.6.0/24
+  latest handshake: 2 minutes, 5 seconds ago
+  transfer: 7.95 KiB received, 7.89 KiB sent
+  persistent keepalive: every 25 seconds
+B3: k3s-cpu-1: 2 peers (want 2)
+  peer 136.87.143.58:51820: latest handshake 101 s ago
+  peer 155.248.202.136:51820: latest handshake 125 s ago
+$ node_ssh k3s-gpu-a6000-1 'sudo wg show flannel-wg'
+interface: flannel-wg
+  public key: zi3BMizqUvwM7/N432PbNl159StuozWBR3uHNB6hSG8=
+  private key: <redacted>
+  listening port: 51820
+
+peer: gq9TOcwRhmqKecw/teRkRFKJ0Et8QUqJHvqdMUCN/kE=
+  endpoint: 34.28.157.143:51820
+  allowed ips: 10.42.1.0/24
+  latest handshake: 2 minutes, 6 seconds ago
+  transfer: 7.80 KiB received, 8.04 KiB sent
+  persistent keepalive: every 25 seconds
+
+peer: 6IClWSJ0isyRBCUTuppozJmJnj+BY83JISQCt7Z7PTU=
+  endpoint: 136.87.143.58:51820
+  allowed ips: 10.42.0.0/24
+  latest handshake: 2 minutes, 12 seconds ago
+  transfer: 24.00 KiB received, 22.25 KiB sent
+  persistent keepalive: every 25 seconds
+B3: k3s-gpu-a6000-1: 2 peers (want 2)
+  peer 34.28.157.143:51820: latest handshake 126 s ago
+  peer 136.87.143.58:51820: latest handshake 132 s ago
+# finished: 2026-10-22T13:22:09-07:00 — PASS (exit 0)

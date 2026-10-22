@@ -1,5 +1,33 @@
 # D6 — gpu-overflow stays Pending
-# started: 2026-10-22T12:55:06-07:00
+# started: 2026-10-22T13:25:38-07:00
 $ kc get nodes -l node-restriction.kubernetes.io/accelerator=nvidia --request-timeout=60s -o 'jsonpath={range .items[*]}{.metadata.name}{"\n"}{end}'
-D: no node has the label node-restriction.kubernetes.io/accelerator=nvidia (no GPU node): skipped
-# finished: 2026-10-22T12:55:06-07:00 — SKIP (exit 77)
+k3s-gpu-a6000-1
+D: GPU nodes: k3s-gpu-a6000-1
+$ kc get nodes -l node-restriction.kubernetes.io/accelerator=nvidia --request-timeout=60s -o 'jsonpath={range .items[*]}{.metadata.name}{" "}{.status.allocatable.nvidia\.com/gpu}{"\n"}{end}'
+k3s-gpu-a6000-1 1
+D6: 1 allocatable GPU(s): one gpu-hold Pod each
+$ kc -n gpu-test delete pod -l app=gpu-hold --ignore-not-found --timeout=120s --request-timeout=60s
+No resources found
+$ kc -n gpu-test delete pod gpu-overflow --ignore-not-found --timeout=120s --request-timeout=60s
+$ kc -n gpu-test create -f /home/catflirter/goaly/k8s/gpu-test/gpu-hold.yaml --request-timeout=60s
+pod/gpu-hold-sl7gt created
+$ kc -n gpu-test wait pod -l app=gpu-hold --for=condition=Ready --timeout=300s
+pod/gpu-hold-sl7gt condition met
+$ kc -n gpu-test get pods -l app=gpu-hold --field-selector=status.phase=Running --request-timeout=60s -o 'jsonpath={range .items[*]}{.metadata.name}{"\n"}{end}'
+gpu-hold-sl7gt
+$ kc apply -f /home/catflirter/goaly/k8s/gpu-test/gpu-overflow.yaml --request-timeout=60s
+pod/gpu-overflow created
+$ kc -n gpu-test get pod gpu-overflow --request-timeout=30s -o 'jsonpath={.metadata.uid}'
+8222ea6e-d81e-4bad-983d-e32c4b28c0ba
+D6: every GPU is held; looking at gpu-overflow 30 s after it was applied
+$ kc -n gpu-test get pod gpu-overflow --request-timeout=30s -o 'jsonpath={.status.phase}'
+Pending
+$ kc -n gpu-test get events --field-selector=involvedObject.kind=Pod,involvedObject.name=gpu-overflow,involvedObject.uid=8222ea6e-d81e-4bad-983d-e32c4b28c0ba --request-timeout=30s
+LAST SEEN   TYPE      REASON             OBJECT             MESSAGE
+30s         Warning   FailedScheduling   pod/gpu-overflow   0/3 nodes are available: 1 Insufficient nvidia.com/gpu, 1 node(s) didn't match Pod's node affinity/selector, 1 node(s) had untolerated taint(s). no new claims to deallocate, preemption: 0/3 nodes are available: 1 No preemption victims found for incoming pod, 2 Preemption is not helpful for scheduling.
+D6: gpu-overflow is Pending with 'Insufficient nvidia.com/gpu'
+$ kc -n gpu-test delete pod -l app=gpu-hold --ignore-not-found --timeout=120s --request-timeout=60s
+pod "gpu-hold-sl7gt" deleted from gpu-test namespace
+$ kc -n gpu-test delete pod gpu-overflow --ignore-not-found --timeout=120s --request-timeout=60s
+pod "gpu-overflow" deleted from gpu-test namespace
+# finished: 2026-10-22T13:27:14-07:00 — PASS (exit 0)

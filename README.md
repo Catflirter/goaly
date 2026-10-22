@@ -294,11 +294,11 @@ check's cleanup, and gitleaks scans the run.
 
 The final run is committed as [verification/final/SUMMARY.md](verification/final/SUMMARY.md):
 2026-10-22, on a freshly rebuilt cluster (`make down` 6m10s, then `make up` 6m19s from scratch),
-`make verify` gave 18 PASS (A1-A4, B1-B6, C1-C8), 0 failed, 6 skipped. Group D was skipped because no
-GPU node could be launched: Lambda's write API (instance launch and firewall updates) returned
-timeouts and HTTP 504 for about 30 minutes around 12:30-13:00 PDT, while reads worked. The run was
-promoted with `PROMOTE_ALLOW_SKIP=1`, and `SUMMARY.md` notes the skips (see the
-[Lambda write API](#limitations-and-next-steps) limitation).
+the run started 13:20 PDT, after Lambda's write API had recovered (about 13:10 PDT; see the
+[Lambda write API](#limitations-and-next-steps) limitation). `make verify` gave 24/24 PASS (A1-A4,
+B1-B6, C1-C8, D1-D6), 0 failed, 0 skipped, in 6m52s. The GPU node had been relaunched just before by
+`make gpu-apply` in 6m03s (launch 8 s, active with an IP 4m25s, `gpu-access` 15 s, `sync-peers` 19 s,
+join 49 s).
 
 GPU and resilience results from earlier runs on 2026-10-22 (evidence not committed; the same code
 except PRs #106, #105 and #107 where noted):
@@ -309,6 +309,7 @@ except PRs #106, #105 and #107 where noted):
 | Task 24 run 1, 10:43 | main `f9b24a7` (#105 and #107 merged, #106 not) | D1-D6 PASS, E1 PASS; C7 FAIL (containerd reported reason `Error`, exit 137; the kernel log confirmed a memcg OOM kill); interrupted during E2 | |
 | Task 24 run 2, 11:06 | main `f9b24a7` | 26/27 PASS, C7, D1-D6, E1, E2 and E3 included; B3 FAIL (stale WireGuard peer on `k3s-cp`) | |
 | Task 24 run 3, 12:17 | main `f9b24a7` | 25 PASS, B3, D1-D6 and E1 included; E2 FAIL (Lambda API read timeout during `gpuctl down`; cleanup confirmed no instance left), E3 SKIP | |
+| A-C run, 12:50 | the final from-scratch build | 18 PASS (A1-A4, B1-B6, C1-C8), 0 failed, D skipped: no GPU node could be launched during the Lambda write API outage | 4m20s |
 
 Earlier, Task 21 (2026-10-21): A-D 24/24 PASS on one A10 in 412 s, and A-C without a GPU node 18 PASS
 with D skipped in 258-263 s.
@@ -353,6 +354,16 @@ and the project id typed without echo.
 | `make demo-replay CHAPTER=n` | prints the promoted recording `verification/final/demo/chN.txt`, the fallback when a live step fails |
 | `make demo-reset` | deletes what the demo creates (the limits-demo Pods, the `np-denied` namespace, the GPU test Pods) and scales the CPU pool back to 1 |
 | `make promote-demo RUN=verification/demo-<ts>` | copies a reviewed demo run to `verification/final/demo/` after a gitleaks scan, for `demo-replay` |
+
+The rehearsal recording, promoted after the final run (`verification/demo-2026-10-22T1328-0700`), is
+in [verification/final/demo/](verification/final/demo/), with per-chapter times in
+[timings.txt](verification/final/demo/timings.txt): chapter 1 3 s, 2 73 s, 3 49 s, 4 148 s, 5 111 s,
+6 343 s, 8 5 s; chapters 1-6 took 12m07s against a 25-minute target. `make demo-replay CHAPTER=n`
+plays them. Chapter 6's last step (`gpuctl plan --set-count a6000=2`) is refused by the budget guard
+as designed: $3.28/h is over the $3.00/h cap, because a new node is priced at the pool's most
+expensive candidate (a100, $1.99/h). `demo.sh` records that refusal as a failed step, so the
+recording was promoted with `PROMOTE_ALLOW_FAIL=1`; planned fix: chapter 6 treats the refusal as the
+expected outcome.
 
 Chapter 6 waits for a CPU worker to join, and the measured building blocks are `make cpu-scale N=2`
 156 s, back to 1 in 179-182 s, and `make gpu-apply` 5m43s-9m41s, which is why the GPU node is
@@ -417,7 +428,9 @@ of this cluster.
 - **Lambda write API timeouts/504.** `gpuctl`'s Lambda API timeout is a fixed 30 s (`TIMEOUT_S` in
   [lambda/gpuctl/lambda_api.py](lambda/gpuctl/lambda_api.py)). On 2026-10-22 instance launches and
   firewall updates timed out even at 120 s, with HTTP 504, for about 30 minutes, while reads took
-  about 0.4 s; every failure left no instance (`make gpu-status`: 0 instances, no drift). Planned
+  about 0.4 s; every failure left no instance (`make gpu-status`: 0 instances, no drift), and a launch
+  from the Lambda console hung as well. It resolved at about 13:10 PDT, and the final run then passed
+  24/24. Planned
   fix: a configurable timeout ([runbook](docs/runbook.md#troubleshooting)).
 - **Not merged before the deadline:** a monitoring check and an autoscaler, implemented and reviewed
   in separate PRs (#101, #102), on top of the port-forward-only monitoring stack (`make monitoring`)

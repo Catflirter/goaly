@@ -1,0 +1,244 @@
+
+=== Chapter 2: Security: firewall inventory, negative tests, only WireGuard on the wire (B6, B5, B2) (about 5 min) ===
+
+--- [ch2.1] B6 firewall inventory: every source a /32 (or IAP)
+$ check_b6_firewall_inventory
+$ bounded 120 gcloud compute firewall-rules list --project <GCP_PROJECT> '--filter=name~^fw-' --format=json
+NAME                               NETWORK   DIRECTION  SOURCES             ALLOWED                   TARGET_SA
+fw-cp-allow-iap-ssh                k3s-core  INGRESS    35.235.240.0/20     tcp:22                    k3s-cp@<GCP_PROJECT>.iam.gserviceaccount.com
+fw-cp-allow-self                   k3s-core  INGRESS    136.87.143.58/32    tcp:6443;10250            k3s-cp@<GCP_PROJECT>.iam.gserviceaccount.com
+fw-cp-to-workers                   k3s-edge  INGRESS    136.87.143.58/32    icmp,udp:51820,tcp:10250  k3s-worker@<GCP_PROJECT>.iam.gserviceaccount.com
+fw-gpu-155-248-202-136-to-cp       k3s-core  INGRESS    155.248.202.136/32  icmp,tcp:6443,udp:51820   k3s-cp@<GCP_PROJECT>.iam.gserviceaccount.com
+fw-gpu-155-248-202-136-to-workers  k3s-edge  INGRESS    155.248.202.136/32  icmp,udp:51820            k3s-worker@<GCP_PROJECT>.iam.gserviceaccount.com
+fw-k3s-cpu-1-mesh                  k3s-edge  INGRESS    34.28.157.143/32    icmp,udp:51820            k3s-worker@<GCP_PROJECT>.iam.gserviceaccount.com
+fw-k3s-cpu-1-to-cp                 k3s-core  INGRESS    34.28.157.143/32    icmp,tcp:6443,udp:51820   k3s-cp@<GCP_PROJECT>.iam.gserviceaccount.com
+fw-workers-allow-iap-ssh           k3s-edge  INGRESS    35.235.240.0/20     tcp:22                    k3s-worker@<GCP_PROJECT>.iam.gserviceaccount.com
+$ bounded 120 /home/catflirter/goaly/scripts/gpuctl rules
+global
+  tcp   22          <operator_ip>/32  operator ssh
+ruleset k3s-gpu-us-east-1 bd113ffc17b540cd85de31295d7b214b us-east-1
+  tcp   22          <operator_ip>/32  operator ssh
+  tcp   10250       136.87.143.58/32   metrics-server from cp
+  udp   51820       34.28.157.143/32   wireguard 34.28.157.143
+  icmp  -           34.28.157.143/32   icmp 34.28.157.143
+  udp   51820       136.87.143.58/32   wireguard 136.87.143.58
+  icmp  -           136.87.143.58/32   icmp 136.87.143.58
+  udp   51820       155.248.202.136/32 wireguard 155.248.202.136
+  icmp  -           155.248.202.136/32 icmp 155.248.202.136
+ruleset k3s-gpu-us-west-1 278ead73cf6e4f86afd37b89831b803f us-west-1
+  tcp   22          <operator_ip>/32  operator ssh
+  tcp   10250       136.87.143.58/32   metrics-server from cp
+  udp   51820       34.28.157.143/32   wireguard 34.28.157.143
+  icmp  -           34.28.157.143/32   icmp 34.28.157.143
+  udp   51820       136.87.143.58/32   wireguard 136.87.143.58
+  icmp  -           136.87.143.58/32   icmp 136.87.143.58
+  udp   51820       155.248.202.136/32 wireguard 155.248.202.136
+  icmp  -           155.248.202.136/32 icmp 155.248.202.136
+ruleset k3s-gpu-us-west-2 0dc855927b344ec8ad71341fd6ec6033 us-west-2
+  tcp   22          <operator_ip>/32  operator ssh
+  tcp   10250       136.87.143.58/32   metrics-server from cp
+  udp   51820       34.28.157.143/32   wireguard 34.28.157.143
+  icmp  -           34.28.157.143/32   icmp 34.28.157.143
+  udp   51820       136.87.143.58/32   wireguard 136.87.143.58
+  icmp  -           136.87.143.58/32   icmp 136.87.143.58
+  udp   51820       155.248.202.136/32 wireguard 155.248.202.136
+  icmp  -           155.248.202.136/32 icmp 155.248.202.136
+B6: every source is a single address (/32) or the IAP range 35.235.240.0/20
+=> OK
+
+--- [ch2.2] B5 negative tests: API ports from here, the metadata server, DNS, guard counters
+$ check_b5_negative
+$ node_external_ip k3s-cp
+136.87.143.58
+$ timeout 3 bash -c '</dev/tcp/136.87.143.58/6443'
+B5 ①: tcp/6443 on k3s-cp is not reachable from this machine (expected)
+$ timeout 3 bash -c '</dev/tcp/136.87.143.58/10250'
+B5 ①: tcp/10250 on k3s-cp is not reachable from this machine (expected)
+$ kc get nodes --request-timeout=60s -o 'jsonpath={range .items[*]}{.metadata.name}{"\n"}{end}'
+k3s-cp
+k3s-cpu-1
+k3s-gpu-a6000-1
+$ kc -n nettest get pods -l app=probe --field-selector=status.phase=Running --request-timeout=60s -o 'jsonpath={range .items[*]}{.spec.nodeName}{" "}{.metadata.name}{" "}{.status.podIP}{"\n"}{end}'
+k3s-gpu-a6000-1 probe-9tqsr 10.42.6.3
+k3s-cp probe-kkl5q 10.42.0.6
+k3s-cpu-1 probe-v54jv 10.42.1.26
+$ kc_within 60 -n nettest exec probe-kkl5q -- curl -m 3 -H 'Metadata-Flavor: Google' http://169.254.169.254/computeMetadata/v1/
+curl: (28) Connection timed out after 3001 milliseconds
+command terminated with exit code 28
+B5 ②: k3s-cp: a Pod cannot reach the metadata server (curl exit 28, expected)
+$ kc_within 60 -n nettest exec probe-kkl5q -- nslookup kubernetes.default.svc.cluster.local
+;; Got recursion not available from 10.43.0.10
+;; Got recursion not available from 10.43.0.10
+;; Got recursion not available from 10.43.0.10
+;; Got recursion not available from 10.43.0.10
+Server:		10.43.0.10
+Address:	10.43.0.10#53
+
+Name:	kubernetes.default.svc.cluster.local
+Address: 10.43.0.1
+;; Got recursion not available from 10.43.0.10
+
+$ kc_within 60 -n nettest exec probe-v54jv -- curl -m 3 -H 'Metadata-Flavor: Google' http://169.254.169.254/computeMetadata/v1/
+curl: (28) Connection timed out after 3001 milliseconds
+command terminated with exit code 28
+B5 ②: k3s-cpu-1: a Pod cannot reach the metadata server (curl exit 28, expected)
+$ kc_within 60 -n nettest exec probe-v54jv -- nslookup kubernetes.default.svc.cluster.local
+;; Got recursion not available from 10.43.0.10
+;; Got recursion not available from 10.43.0.10
+;; Got recursion not available from 10.43.0.10
+;; Got recursion not available from 10.43.0.10
+Server:		10.43.0.10
+Address:	10.43.0.10#53
+
+Name:	kubernetes.default.svc.cluster.local
+Address: 10.43.0.1
+;; Got recursion not available from 10.43.0.10
+
+$ kc_within 60 -n nettest exec probe-9tqsr -- nslookup kubernetes.default.svc.cluster.local
+;; Got recursion not available from 10.43.0.10
+;; Got recursion not available from 10.43.0.10
+;; Got recursion not available from 10.43.0.10
+;; Got recursion not available from 10.43.0.10
+Server:		10.43.0.10
+Address:	10.43.0.10#53
+
+Name:	kubernetes.default.svc.cluster.local
+Address: 10.43.0.1
+;; Got recursion not available from 10.43.0.10
+
+$ cp_resolve
+$ _worker_zone k3s-cpu-1
+$ node_ssh k3s-cp 'sudo nft list table inet k3s_guard'
+WARNING: 
+
+To increase the performance of the tunnel, consider installing NumPy. For instructions,
+please see https://cloud.google.com/iap/docs/using-tcp-forwarding#increasing_the_tcp_upload_bandwidth
+
+table inet k3s_guard {
+	set k3s_peers {
+		type ipv4_addr
+		elements = { 10.10.0.2, 34.28.157.143,
+			     136.87.143.58, 155.248.202.136 }
+	}
+
+	chain input {
+		type filter hook input priority filter - 5; policy accept;
+		tcp dport { 6443, 10250 } iifname { "lo", "cni0" } accept
+		tcp dport { 6443, 10250 } ip saddr @k3s_peers counter packets 51954 bytes 7681348 accept
+		tcp dport { 6443, 10250 } counter packets 0 bytes 0 drop
+	}
+
+	chain forward {
+		type filter hook forward priority filter - 5; policy accept;
+		ip saddr 10.42.0.0/16 ip daddr 169.254.169.254 meta l4proto { tcp, udp } th dport 53 accept
+		ip saddr 10.42.0.0/16 ip daddr 169.254.169.254 counter packets 18 bytes 1080 drop
+	}
+}
+$ node_ssh k3s-cpu-1 'sudo nft list table inet k3s_guard'
+WARNING: 
+
+To increase the performance of the tunnel, consider installing NumPy. For instructions,
+please see https://cloud.google.com/iap/docs/using-tcp-forwarding#increasing_the_tcp_upload_bandwidth
+
+table inet k3s_guard {
+	chain input {
+		type filter hook input priority filter - 5; policy accept;
+		tcp dport 10250 iifname { "lo", "cni0" } accept
+		tcp dport 10250 ip saddr 136.87.143.58 counter packets 504 bytes 378761 accept
+		tcp dport 10250 counter packets 0 bytes 0 drop
+	}
+
+	chain forward {
+		type filter hook forward priority filter - 5; policy accept;
+		ip saddr 10.42.0.0/16 ip daddr 169.254.169.254 meta l4proto { tcp, udp } th dport 53 accept
+		ip saddr 10.42.0.0/16 ip daddr 169.254.169.254 counter packets 9 bytes 540 drop
+	}
+}
+$ node_ssh k3s-gpu-a6000-1 'sudo nft list table inet k3s_guard'
+table inet k3s_guard {
+	chain input {
+		type filter hook input priority filter - 5; policy accept;
+		tcp dport 10250 iifname { "lo", "cni0" } accept
+		tcp dport 10250 ip saddr 136.87.143.58 counter packets 76 bytes 53755 accept
+		tcp dport 10250 counter packets 0 bytes 0 drop
+	}
+
+	chain forward {
+		type filter hook forward priority filter - 5; policy accept;
+		ip saddr 10.42.0.0/16 ip daddr 169.254.169.254 meta l4proto { tcp, udp } th dport 53 accept
+		ip saddr 10.42.0.0/16 ip daddr 169.254.169.254 counter packets 0 bytes 0 drop
+	}
+}
+=> OK
+
+--- [ch2.3] B2 on the wire at k3s-cp: only WireGuard (udp/51820) between the nodes
+$ check_b2_wire
+$ cp_resolve
+B2: marker b2-marker-af64a4cc2cf80c3e
+$ cp_ssh 'ip -o route show default'
+WARNING: 
+
+To increase the performance of the tunnel, consider installing NumPy. For instructions,
+please see https://cloud.google.com/iap/docs/using-tcp-forwarding#increasing_the_tcp_upload_bandwidth
+
+default via 10.10.0.1 dev ens4 proto dhcp src 10.10.0.2 metric 100 
+$ kc get nodes --request-timeout=60s -o 'jsonpath={range .items[*]}{.metadata.name}{"\n"}{end}'
+k3s-cp
+k3s-cpu-1
+k3s-gpu-a6000-1
+$ node_external_ip k3s-cpu-1
+34.28.157.143
+$ probe_on k3s-cpu-1
+probe-v54jv
+$ node_external_ip k3s-gpu-a6000-1
+155.248.202.136
+$ probe_on k3s-gpu-a6000-1
+probe-9tqsr
+$ echo_on k3s-cp
+10.42.0.5
+$ cp_ssh 'umask 077 && sudo timeout 25 tcpdump -ni ens4 -U -w /tmp/b2.pcap '\''not port 22'\''' &
+$ kc_within 90 -n nettest exec probe-v54jv -- sh -c 'n=0; for i in $(seq 20); do curl -fsS -m 2 -o /dev/null -H "X-Marker: b2-marker-af64a4cc2cf80c3e" http://10.42.0.5:8080/ && n=$((n + 1)); done; echo "$n/20 requests answered"; [ "$n" -eq 20 ]'
+20/20 requests answered
+$ kc_within 90 -n nettest exec probe-9tqsr -- sh -c 'n=0; for i in $(seq 20); do curl -fsS -m 2 -o /dev/null -H "X-Marker: b2-marker-af64a4cc2cf80c3e" http://10.42.0.5:8080/ && n=$((n + 1)); done; echo "$n/20 requests answered"; [ "$n" -eq 20 ]'
+20/20 requests answered
+--- capture on k3s-cp ---
+WARNING: 
+
+To increase the performance of the tunnel, consider installing NumPy. For instructions,
+please see https://cloud.google.com/iap/docs/using-tcp-forwarding#increasing_the_tcp_upload_bandwidth
+
+tcpdump: listening on ens4, link-type EN10MB (Ethernet), snapshot length 262144 bytes
+679 packets captured
+683 packets received by filter
+0 packets dropped by kernel
+$ cp_ssh 'bash -o pipefail -c '\''sudo tcpdump -A -nn -r /tmp/b2.pcap | { grep -c -F -- b2-marker-af64a4cc2cf80c3e || true; }'\'''
+WARNING: 
+
+To increase the performance of the tunnel, consider installing NumPy. For instructions,
+please see https://cloud.google.com/iap/docs/using-tcp-forwarding#increasing_the_tcp_upload_bandwidth
+
+reading from file /tmp/b2.pcap, link-type EN10MB (Ethernet), snapshot length 262144
+0
+B2 ①: the marker is not in the capture (the cross-node traffic is encrypted)
+$ cp_ssh 'sudo tcpdump -nn -q -t -r /tmp/b2.pcap'
+WARNING: 
+
+To increase the performance of the tunnel, consider installing NumPy. For instructions,
+please see https://cloud.google.com/iap/docs/using-tcp-forwarding#increasing_the_tcp_upload_bandwidth
+
+reading from file /tmp/b2.pcap, link-type EN10MB (Ethernet), snapshot length 262144
+B2 ②: 408 udp/51820 packets in the capture
+B2 ②: 204 udp/51820 packets with 34.28.157.143 (want at least 40: the 20 marked requests and their answers)
+B2 ②: 204 udp/51820 packets with 155.248.202.136 (want at least 40: the 20 marked requests and their answers)
+B2 ③: packets to or from the other nodes' public IPs (34.28.157.143 155.248.202.136):
+  51820/udp  408
+  6443/tcp   173
+  10250/tcp  16
+B2 ③: only 51820/udp, 6443/tcp and 10250/tcp
+$ cp_ssh 'sudo rm -f /tmp/b2.pcap'
+WARNING: 
+
+To increase the performance of the tunnel, consider installing NumPy. For instructions,
+please see https://cloud.google.com/iap/docs/using-tcp-forwarding#increasing_the_tcp_upload_bandwidth
+
+=> OK

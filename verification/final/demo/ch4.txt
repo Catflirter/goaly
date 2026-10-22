@@ -1,0 +1,161 @@
+
+=== Chapter 4: hello-world: cross-node, port-forward, QoS, cgroup, OOMKilled and throttling, NetworkPolicy (C2-C5, C7, C8) (about 5 min) ===
+
+--- [ch4.1] C2 hello world from another node
+$ check_c2_cross_node_curl
+$ kc -n hello get pods -l app=hello --field-selector=status.phase=Running --request-timeout=60s -o 'jsonpath={range .items[*]}{.spec.nodeName}{"\n"}{end}'
+k3s-cpu-1
+k3s-cpu-1
+$ kc -n nettest get pods -l app=probe --field-selector=status.phase=Running --request-timeout=60s -o 'jsonpath={range .items[*]}{.spec.nodeName}{" "}{.metadata.name}{" "}{.status.podIP}{"\n"}{end}'
+k3s-gpu-a6000-1 probe-9tqsr 10.42.6.3
+k3s-cp probe-kkl5q 10.42.0.6
+k3s-cpu-1 probe-v54jv 10.42.1.26
+C2: hello replicas on: k3s-cpu-1 k3s-cpu-1; asking from probe-9tqsr on k3s-gpu-a6000-1
+$ kc_within 60 -n nettest exec probe-9tqsr -- curl -fsS -m 5 http://hello.hello.svc.cluster.local
+hello world
+C2: answered exactly 'hello world'
+=> OK
+
+--- [ch4.2] C3 hello world through kubectl port-forward
+$ check_c3_port_forward
+$ kc -n hello port-forward svc/hello 18080:80 &
+$ curl --noproxy '*' -fsS -m 5 localhost:18080
+hello world
+C3: port-forward stopped
+--- port-forward ---
+Forwarding from 127.0.0.1:18080 -> 8080
+Forwarding from [::1]:18080 -> 8080
+Handling connection for 18080
+C3: localhost:18080 answered exactly 'hello world'
+=> OK
+
+--- [ch4.3] C4 QoS class Guaranteed
+$ check_c4_qos
+$ kc -n hello get pods -l app=hello --request-timeout=60s -o 'jsonpath={range .items[*]}{.metadata.name}{" "}{.status.qosClass}{"\n"}{end}'
+hello-849b58876f-7mzbr Guaranteed
+hello-849b58876f-wjgt5 Guaranteed
+C4: all 2 hello Pods are Guaranteed
+=> OK
+
+--- [ch4.4] C5 cgroup memory.max and cpu.max
+$ check_c5_cgroup
+$ kc -n hello get pods -l app=hello --field-selector=status.phase=Running --request-timeout=60s -o 'jsonpath={range .items[*]}{.metadata.name}{" "}{.spec.nodeName}{" "}{.status.containerStatuses[0].containerID}{"\n"}{end}'
+hello-849b58876f-7mzbr k3s-cpu-1 containerd://d78464720e0c294590fa23da1278853af86e1c8d9f5656cb9e29b1e13dba1d41
+hello-849b58876f-wjgt5 k3s-cpu-1 containerd://db0f704fb09e3e84639152b62be205815ed1be8c6bc89458273ae7667e01bedb
+C5: hello-849b58876f-7mzbr on k3s-cpu-1, container d78464720e0c294590fa23da1278853af86e1c8d9f5656cb9e29b1e13dba1d41
+$ _worker_zone k3s-cpu-1
+$ node_ssh k3s-cpu-1 'sudo find /sys/fs/cgroup -type d -name "*d78464720e0c294590fa23da1278853af86e1c8d9f5656cb9e29b1e13dba1d41*"'
+WARNING: 
+
+To increase the performance of the tunnel, consider installing NumPy. For instructions,
+please see https://cloud.google.com/iap/docs/using-tcp-forwarding#increasing_the_tcp_upload_bandwidth
+
+/sys/fs/cgroup/kubepods.slice/kubepods-podbe7080a8_bf05_49ac_805e_147ad7661eaa.slice/cri-containerd-d78464720e0c294590fa23da1278853af86e1c8d9f5656cb9e29b1e13dba1d41.scope
+$ node_ssh k3s-cpu-1 'cat /sys/fs/cgroup/kubepods.slice/kubepods-podbe7080a8_bf05_49ac_805e_147ad7661eaa.slice/cri-containerd-d78464720e0c294590fa23da1278853af86e1c8d9f5656cb9e29b1e13dba1d41.scope/memory.max /sys/fs/cgroup/kubepods.slice/kubepods-podbe7080a8_bf05_49ac_805e_147ad7661eaa.slice/cri-containerd-d78464720e0c294590fa23da1278853af86e1c8d9f5656cb9e29b1e13dba1d41.scope/cpu.max'
+WARNING: 
+
+To increase the performance of the tunnel, consider installing NumPy. For instructions,
+please see https://cloud.google.com/iap/docs/using-tcp-forwarding#increasing_the_tcp_upload_bandwidth
+
+67108864
+10000 100000
+C5: memory.max 67108864, cpu.max 10000 100000
+=> OK
+
+--- [ch4.5] C7 limits-demo: OOMKilled and CPU throttling
+$ check_c7_limits_demo
+$ kc -n limits-demo delete pod oom cpu-burn --ignore-not-found --timeout=90s
+$ kc apply -f /home/catflirter/goaly/k8s/limits-demo/limits-demo.yaml --request-timeout=60s
+namespace/limits-demo unchanged
+pod/oom created
+pod/cpu-burn created
+$ kc -n limits-demo get pod oom --request-timeout=60s -o 'jsonpath={.status.containerStatuses[0].state.terminated.reason}{" "}{.status.containerStatuses[0].state.terminated.exitCode}'
+ 
+$ kc -n limits-demo get pod oom --request-timeout=60s -o 'jsonpath={.status.containerStatuses[0].state.terminated.reason}{" "}{.status.containerStatuses[0].state.terminated.exitCode}'
+OOMKilled 137
+C7 ①: oom was OOMKilled, exit code 137
+$ kc -n limits-demo wait pod/cpu-burn --for=condition=Ready --timeout=90s
+pod/cpu-burn condition met
+C7 ②: cpu-burn Ready; reading kubectl top after 30 s
+$ kc -n limits-demo top pod cpu-burn --request-timeout=60s
+NAME       CPU(cores)   MEMORY(bytes)   
+cpu-burn   101m         0Mi             
+C7 ②: kubectl top reads 101m (at most 110m)
+$ kc -n limits-demo get pod cpu-burn --request-timeout=60s -o 'jsonpath={.spec.nodeName}{" "}{.status.containerStatuses[0].containerID}'
+k3s-cpu-1 containerd://14669e482b32abd3c2daa8ba19300a366ed4b6276055f6b1624f4819bd3e492a
+$ _worker_zone k3s-cpu-1
+$ node_ssh k3s-cpu-1 'sudo find /sys/fs/cgroup -type d -name "*14669e482b32abd3c2daa8ba19300a366ed4b6276055f6b1624f4819bd3e492a*"'
+WARNING: 
+
+To increase the performance of the tunnel, consider installing NumPy. For instructions,
+please see https://cloud.google.com/iap/docs/using-tcp-forwarding#increasing_the_tcp_upload_bandwidth
+
+/sys/fs/cgroup/kubepods.slice/kubepods-pod71184588_15d2_4c18_af00_e9ae6cf625a1.slice/cri-containerd-14669e482b32abd3c2daa8ba19300a366ed4b6276055f6b1624f4819bd3e492a.scope
+$ node_ssh k3s-cpu-1 'cat /sys/fs/cgroup/kubepods.slice/kubepods-pod71184588_15d2_4c18_af00_e9ae6cf625a1.slice/cri-containerd-14669e482b32abd3c2daa8ba19300a366ed4b6276055f6b1624f4819bd3e492a.scope/cpu.stat'
+WARNING: 
+
+To increase the performance of the tunnel, consider installing NumPy. For instructions,
+please see https://cloud.google.com/iap/docs/using-tcp-forwarding#increasing_the_tcp_upload_bandwidth
+
+usage_usec 4298945
+user_usec 4284846
+system_usec 14098
+nice_usec 0
+core_sched.force_idle_usec 0
+nr_periods 428
+nr_throttled 163
+throttled_usec 12423631
+nr_bursts 0
+burst_usec 0
+$ node_ssh k3s-cpu-1 'cat /sys/fs/cgroup/kubepods.slice/kubepods-pod71184588_15d2_4c18_af00_e9ae6cf625a1.slice/cri-containerd-14669e482b32abd3c2daa8ba19300a366ed4b6276055f6b1624f4819bd3e492a.scope/cpu.stat'
+WARNING: 
+
+To increase the performance of the tunnel, consider installing NumPy. For instructions,
+please see https://cloud.google.com/iap/docs/using-tcp-forwarding#increasing_the_tcp_upload_bandwidth
+
+usage_usec 5627166
+user_usec 5613067
+system_usec 14098
+nice_usec 0
+core_sched.force_idle_usec 0
+nr_periods 561
+nr_throttled 245
+throttled_usec 18721078
+nr_bursts 0
+burst_usec 0
+C7 ②: nr_throttled 163 -> 245 in 10 s: throttled at its CPU limit
+$ kc -n limits-demo delete pod oom cpu-burn --ignore-not-found --timeout=90s
+pod "oom" deleted from limits-demo namespace
+pod "cpu-burn" deleted from limits-demo namespace
+=> OK
+
+--- [ch4.6] C8 NetworkPolicy: allowed from nettest, denied elsewhere
+$ check_c8_netpol
+C8: first the allowed path from nettest (C2)
+$ kc -n hello get pods -l app=hello --field-selector=status.phase=Running --request-timeout=60s -o 'jsonpath={range .items[*]}{.spec.nodeName}{"\n"}{end}'
+k3s-cpu-1
+k3s-cpu-1
+$ kc -n nettest get pods -l app=probe --field-selector=status.phase=Running --request-timeout=60s -o 'jsonpath={range .items[*]}{.spec.nodeName}{" "}{.metadata.name}{" "}{.status.podIP}{"\n"}{end}'
+k3s-gpu-a6000-1 probe-9tqsr 10.42.6.3
+k3s-cp probe-kkl5q 10.42.0.6
+k3s-cpu-1 probe-v54jv 10.42.1.26
+C2: hello replicas on: k3s-cpu-1 k3s-cpu-1; asking from probe-9tqsr on k3s-gpu-a6000-1
+$ kc_within 60 -n nettest exec probe-9tqsr -- curl -fsS -m 5 http://hello.hello.svc.cluster.local
+hello world
+C2: answered exactly 'hello world'
+$ kc delete namespace np-denied --ignore-not-found --timeout=120s
+$ kc apply -f /home/catflirter/goaly/k8s/verify/np-denied.yaml --request-timeout=60s
+namespace/np-denied created
+pod/client created
+$ kc -n np-denied wait pod/client --for=condition=Ready --timeout=120s
+pod/client condition met
+$ kc_within 60 -n np-denied exec client -- curl -sS -m 5 -o /dev/null -w '%{http_code}' http://echo.nettest.svc.cluster.local:8080/
+200
+C8: positive control: the np-denied client gets HTTP 200 from echo.nettest
+$ kc_within 60 -n np-denied exec client -- curl -sS -m 5 http://hello.hello.svc.cluster.local
+curl: (7) Failed to connect to hello.hello.svc.cluster.local:80 after 312 ms: Could not connect to server
+command terminated with exit code 7
+C8: from np-denied the connection to hello was refused (curl exit 7): the NetworkPolicy rejects it
+$ kc delete namespace np-denied --ignore-not-found --timeout=120s
+namespace "np-denied" deleted
+=> OK
