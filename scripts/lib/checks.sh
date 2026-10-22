@@ -11,7 +11,7 @@
 #   vr_bg FILE CMD…                 print "$ CMD &", run CMD in the background into FILE (VR_BG_PID)
 #   vr_retry TIMEOUT_S INTERVAL_S CMD…  retry CMD until it succeeds, for at most TIMEOUT_S seconds
 #   redact                          stdin -> stdout filter that replaces secret values with <redacted>
-#                                   and masks the project id and the operator's IP (Ruling R39)
+#                                   and masks .env's project id and the operator's IP (Ruling R39)
 #   vr_finish                       write the totals, scan the run with gitleaks; 1 on any FAIL or leak
 #
 # The check functions check_<id>_<name> (A–C: Task 18; D: Task 21; E: Task 22) are registered in
@@ -82,20 +82,30 @@ fi
 # The operator's public IP, masked as <operator_ip> once vr_operator_ip has found it (empty until then).
 _VR_MASK_EXPRS=()
 
-# The GCP project id, masked as <GCP_PROJECT>: _VR_PROJECT is the one vr_init read from .env (empty
-# until then, or when it is not a project id). Kept apart from _VR_MASK_EXPRS, which vr_operator_ip
-# resets. _VR_PROJECT_EXPRS masks the ids listed in _VR_PROJECT_IDS (see _vr_project_mask).
+# The GCP project id, masked as <GCP_PROJECT>: _VR_PROJECT is the one read from .env by vr_init or
+# by _vr_project_mask (empty until then, or when it is not a project id); _VR_PROJECT_LOOKED is set
+# once either has looked. Kept apart from _VR_MASK_EXPRS, which vr_operator_ip resets.
+# _VR_PROJECT_EXPRS masks the ids listed in _VR_PROJECT_IDS (see _vr_project_mask).
 _VR_PROJECT=""
+_VR_PROJECT_LOOKED=""
 _VR_PROJECT_IDS=""
 _VR_PROJECT_EXPRS=()
 
 # _vr_project_mask: point _VR_PROJECT_EXPRS at the project ids this shell knows: vr_init's, and
-# GCP_PROJECT once vr_env or load_env has read .env (a check called without vr_init, as the demo
-# does). Only an id _gcp_project_ok accepts is masked, so it holds no sed metacharacter. It is masked
+# GCP_PROJECT once vr_env or load_env has read .env. When it knows none, it reads .env itself, once
+# (_vr_project_lookup, in a subshell): a redact may start before .env is loaded (the demo's screen
+# pipe), and a check's own vr_env runs in the check's subshell, out of reach of the redact it is
+# piped into. So a redact masks .env's id whatever the order; the ids are fixed when it starts.
+# Only an id _gcp_project_ok accepts is masked, so it holds no sed metacharacter. It is masked
 # anywhere in a line and in any case: in A2's FQDNs (k3s-cp.<zone>.c.<id>.internal), the state
 # bucket (<id>-k3s-tfstate) and service accounts (<name>@<id>.iam.gserviceaccount.com).
 _vr_project_mask() {
   local id ids="" upper e i
+  if [[ -z "$_VR_PROJECT_LOOKED" ]] && ! GCP_PROJECT="$_VR_PROJECT" _gcp_project_ok && ! _gcp_project_ok; then
+    _VR_PROJECT_LOOKED=1
+    _VR_PROJECT="$(_vr_project_lookup 2>/dev/null)" || _VR_PROJECT=""
+    GCP_PROJECT="$_VR_PROJECT" _gcp_project_ok || _VR_PROJECT=""
+  fi
   for id in "$_VR_PROJECT" "${GCP_PROJECT:-}"; do
     if GCP_PROJECT="$id" _gcp_project_ok && [[ " $ids " != *" $id "* ]]; then ids+="${ids:+ }$id"; fi
   done
@@ -209,13 +219,16 @@ vr_init() {
   VR_FAILS=0
   VR_SKIPS=0
   local opip project project_rc=0
+  _VR_PROJECT_LOOKED=1
   _VR_PROJECT="$(_vr_project_lookup 2>/dev/null)" || project_rc=$?
   if GCP_PROJECT="$_VR_PROJECT" _gcp_project_ok; then
     project="masked as <GCP_PROJECT>"
   else
     _VR_PROJECT=""
     if ((project_rc == 2)); then
-      project="not masked (.env is not readable)" # the checks that need .env say so themselves
+      # A2's describe needs no .env, so its evidence would show the raw id: say so, not only in SUMMARY.md.
+      project="not masked (.env is not readable)"
+      log "warning: .env is not readable, so the evidence cannot mask the GCP project id"
     else
       project="not masked (GCP_PROJECT in .env is empty or not a project id)"
       log "warning: GCP_PROJECT in .env is empty or not a GCP project id, so the evidence cannot mask it"
@@ -522,7 +535,7 @@ vr_env() {
   load_env
   unset LAMBDA_API_KEY
   _VR_ENV_LOADED=1
-  _vr_project_mask # redact masks GCP_PROJECT from now on, also without vr_init
+  _vr_project_mask # GCP_PROJECT is known now: mask it (also when it differs from what vr_init read)
 }
 
 # _vr_sleep SECONDS: sleep; VR_NO_WAIT=1 (the offline tests) skips it and says so in the evidence.

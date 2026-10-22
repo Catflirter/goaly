@@ -92,7 +92,8 @@ READYZ_WAIT=180
 if [[ -n $HOST ]]; then
   log "WARNING: K3S_BOOTSTRAP_TEST_ROOT=$HOST: test mode, host paths are prefixed with it"
   READYZ_WAIT=${READYZ_TIMEOUT:-180}
-  [[ $READYZ_WAIT =~ ^[0-9]+$ ]] || die "READYZ_TIMEOUT must be a number of seconds: $READYZ_WAIT"
+  # No leading zero: $(( )) reads 010 as octal 8 and fails on 08.
+  [[ $READYZ_WAIT =~ ^(0|[1-9][0-9]*)$ ]] || die "READYZ_TIMEOUT must be a number of seconds: $READYZ_WAIT"
 else
   (( EUID == 0 )) || die "run as root, or use --render-only DIR"
 fi

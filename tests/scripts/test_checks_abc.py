@@ -939,17 +939,16 @@ def test_vr_init_makes_redact_mask_the_project_id_in_every_form(env, line, want)
 def test_the_project_mask_survives_the_operator_ip_lookup_resetting_its_mask(env):
     env.write_env(env.repo.joinpath(".env").read_text() + f"OPERATOR_IP={OPERATOR}\n")
     run = env.repo / "verification" / "p"
-    code = (f"source scripts/lib/checks.sh; vr_init {run}; redact; "
-            "unset _VR_OPIP_DONE; vr_operator_ip; redact")                # vr_operator_ip sets _VR_MASK_EXPRS=() again
-    proc = env.run(["bash", "-c", code], stdin=f"{FQDN} ssh from {OPERATOR}\n")
-    assert proc.stdout == f"{MASKED_FQDN} ssh from <operator_ip>\n", proc.stderr
+    # Each redact gets its own copy of the line: the second runs after vr_operator_ip set _VR_MASK_EXPRS=() again.
+    code = (f'source scripts/lib/checks.sh; vr_init {run}; redact <<<"$1"; '
+            'unset _VR_OPIP_DONE; vr_operator_ip; redact <<<"$1"')
+    proc = env.run(["bash", "-c", code, "_", f"{FQDN} ssh from {OPERATOR}"])
+    assert proc.stdout == f"{MASKED_FQDN} ssh from <operator_ip>\n" * 2, proc.stderr
 
 
 @pytest.mark.parametrize("setup", ["vr_env", "load_env"])
 def test_a_check_called_without_vr_init_masks_the_project_id_once_env_is_loaded(env, setup):
     # the demo calls checks directly (Task 25): .env read by vr_env (or load_env) is enough for redact
-    proc = env.run(["bash", "-c", "source scripts/lib/checks.sh; redact"], stdin=f"{FQDN}\n")
-    assert proc.stdout == f"{FQDN}\n", proc.stderr                  # before .env: no id to mask
     code = f"source scripts/lib/checks.sh; {setup}; redact; _vr_tell 'gs://{PROJECT}-k3s-tfstate' 2>&1"
     proc = env.run(["bash", "-c", code], stdin=f"{FQDN}\n")
     assert proc.stdout == f"{MASKED_FQDN}\ncheck: gs://<GCP_PROJECT>-k3s-tfstate\n", proc.stderr
@@ -967,13 +966,37 @@ def test_an_empty_or_invalid_project_id_masks_nothing_and_warns_once(env, value)
     assert len(warnings) == 1 and warnings[0].startswith("warning: "), proc.stderr
 
 
-def test_an_unreadable_env_is_reported_in_the_summary_without_a_project_warning(env):
+def test_an_unreadable_env_is_reported_in_the_summary_with_one_warning(env):
+    # A2's describe needs no .env, so its evidence keeps the raw FQDN: the operator is told, once (S0-1).
     (env.repo / ".env").chmod(0o644)                                # load_env refuses it (exit 2)
     run = env.repo / "verification" / "p"
-    proc = env.run(["bash", "-c", f"source scripts/lib/checks.sh; vr_init {run}"])
+    proc = env.run(["bash", "-c", f"source scripts/lib/checks.sh; vr_init {run}; redact; redact </dev/null"],
+                   stdin=f"{FQDN}\n")
     assert proc.returncode == 0, proc.stderr
+    assert proc.stdout == f"{FQDN}\n"
     assert project_summary(run) == "GCP project id: not masked (.env is not readable)"
-    assert "GCP_PROJECT" not in proc.stderr                         # the checks that need .env say so themselves
+    warnings = [w for w in proc.stderr.splitlines() if "project id" in w]
+    assert warnings == ["warning: .env is not readable, so the evidence cannot mask the GCP project id"], proc.stderr
+
+
+@pytest.mark.parametrize("code", [
+    "source scripts/lib/checks.sh; redact",                                          # nothing read .env
+    'source scripts/lib/checks.sh; { vr_env; echo "$GCP_PROJECT"; cat; } | redact',  # redact started first
+    "source scripts/lib/checks.sh; check(){ vr_env; cat; }; check | redact",          # vr_env only in the check
+])
+def test_redact_reads_the_project_id_from_env_when_its_shell_does_not_know_it(env, code):
+    # A pipe to redact may start before vr_init, vr_env or load_env, and a check's vr_env runs in its own
+    # subshell (review X0-1, S0-2): redact then reads .env itself, in a subshell, and still masks the id.
+    proc = env.run(["bash", "-c", code + '; echo "[${GCP_PROJECT-unset}]"'], stdin=f"{FQDN}\n")
+    assert proc.returncode == 0, proc.stderr
+    assert PROJECT not in proc.stdout and f"{MASKED_FQDN}\n" in proc.stdout, proc.stdout
+    assert proc.stdout.endswith("[unset]\n")                        # .env's values stay out of the caller
+
+
+def test_redact_without_a_readable_env_masks_nothing_and_says_nothing(env):
+    (env.repo / ".env").unlink()
+    proc = env.run(["bash", "-c", "source scripts/lib/checks.sh; redact"], stdin=f"{FQDN}\n")
+    assert (proc.returncode, proc.stdout, proc.stderr) == (0, f"{FQDN}\n", "")
 
 
 def test_b6_decides_on_the_raw_project_id_while_its_evidence_masks_it(env):

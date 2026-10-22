@@ -783,14 +783,14 @@ def host_stubs(tmp):
     })
 
 
-def run_host(tmp, bindir, **extra):
+def run_host(tmp, bindir, timeout=None, **extra):
     sysroot = tmp / "sys"
     networkd(tmp, "10-netplan-ens4.network", "[Match]\nName=ens4\n")
     env = {**os.environ, "SYSFS_NET": str(fake_sysfs(tmp, "ens4", 1460)),
            "K3S_BOOTSTRAP_TEST_ROOT": str(sysroot), "PATH": f"{bindir}:{os.environ['PATH']}", **extra}
     return subprocess.run(["bash", str(ROOT / "node/server-bootstrap.sh"), "--cp-ip", "34.82.10.10",
                            "--cp-internal-ip", "10.10.0.2", "--iface", "ens4"],
-                          capture_output=True, text=True, env=env, timeout=60)
+                          capture_output=True, text=True, env=env, timeout=timeout)
 
 
 def snapshot_sysctl(bindir, tmp):
@@ -953,13 +953,14 @@ def test_host_readyz_wait_retries_until_the_apiserver_is_ready(tmp_path):
 def test_host_readyz_wait_gives_up_at_the_deadline(tmp_path):
     # READYZ_TIMEOUT (seconds, test mode only) brings the 180 s deadline within reach of a test.
     bindir, log = readyz_stubs(tmp_path, fail_first=10**6)
-    r = run_host(tmp_path, bindir, READYZ_TIMEOUT="0")
+    # timeout: without the READYZ_TIMEOUT seam, the stubbed sleep would let the 180 s loop spin, not fail.
+    r = run_host(tmp_path, bindir, timeout=60, READYZ_TIMEOUT="0")
     assert r.returncode == 1
     assert r.stderr.rstrip().endswith("ERROR: apiserver not ready after 0s; see journalctl -u k3s")
     assert host_calls(log)[-1] == READYZ and "sleep 5" not in calls(log)
 
 
-@pytest.mark.parametrize("value", ["-1", "1.5", "soon"])
+@pytest.mark.parametrize("value", ["-1", "1.5", "soon", "08", "010"])  # 08: no octal arithmetic error
 def test_host_readyz_timeout_must_be_a_number_of_seconds(tmp_path, value):
     bindir, log = readyz_stubs(tmp_path, fail_first=0)
     r = run_host(tmp_path, bindir, READYZ_TIMEOUT=value)
