@@ -391,6 +391,11 @@ def test_a_failed_gpu_down_with_gpu_nodes_left_stops_before_any_destroy(env):
     assert GPU_LINE in proc.stderr
     assert "make tunnel" in proc.stderr and "Lambda console" in proc.stderr and "make down" in proc.stderr
     assert "nothing was destroyed" in proc.stderr
+    # PR #104 review X0-4: gpuctl down may have refused another cluster (D-2): make kubeconfig points the kubeconfig
+    # back here; --no-drain abandons the cluster through gpuctl (firewall and peers kept right); the console last.
+    err = " ".join(proc.stderr.split())
+    assert "another cluster" in err and "make kubeconfig" in err
+    assert err.index("make kubeconfig") < err.index("scripts/gpuctl down --no-drain") < err.index("Lambda console")
     assert known_hosts(env) == ["known_hosts_k3s-gpu-a6000-1", "known_hosts_k3s-gpu-a6000-2"]
     assert env.kubeconfig.exists()
 
@@ -823,6 +828,23 @@ def test_rerun_after_the_workers_destroy_completes_end_to_end(real_gpuctl):
     assert destroyed(env) == [destroy(env, "base")]
     assert "workers: nothing in its state" in proc.stderr and "make down: done" in proc.stderr
     assert "scripts/gpuctl down failed" not in proc.stderr
+    assert "Traceback" not in proc.stdout + proc.stderr
+
+
+def test_rerun_after_the_workers_destroy_warns_about_the_stale_worker_node_end_to_end(real_gpuctl):
+    """PR #104 review S0-3/C0-4: in the real D-3 state k3s-cp still lists the destroyed worker's Node, NotReady. Its
+    drain fails (on a real cluster after its 120 s timeout): only a warning, the Node is deleted, base goes, exit 0."""
+    env = real_gpuctl
+    env.scenario["answers"] = [tf_outputs("base", OUTPUTS["base"]), tf_outputs("workers", {}),
+                               listed("gpu-access"), listed("workers"), listed("base", BASE_RESOURCES)]
+    env.scenario["nodes"] = ["k3s-cp", "k3s-cpu-1"]
+    env.scenario["drain_fail"] = ["k3s-cpu-1"]
+    proc = down(env, AUTO_APPROVE="1")
+    assert proc.returncode == 0, proc.stderr
+    assert "warning: cannot drain k3s-cpu-1; deleting its Node anyway" in proc.stderr
+    assert kc(env, "delete", "node", "k3s-cpu-1", RT) in calls(env)
+    assert destroyed(env) == [destroy(env, "base")]
+    assert "make down: done" in proc.stderr
     assert "Traceback" not in proc.stdout + proc.stderr
 
 

@@ -44,7 +44,9 @@
 #   - gpuctl down failed: the run asks Lambda (scripts/gpuctl list-nodes) whether any GPU node of this
 #     cluster is still live (see "Asking Lambda"). If one is, or Lambda cannot be asked, it stops
 #     before any destroy: a GPU node left running after gpu-access and base are gone keeps billing,
-#     outside the firewall model, with no cluster to join. If none is, the failure was in gpuctl down's
+#     outside the firewall model, with no cluster to join; it says how to go on (make tunnel; make
+#     kubeconfig when gpuctl found another cluster, D-2; scripts/gpuctl down --no-drain; the Lambda
+#     console last). If none is, the failure was in gpuctl down's
 #     firewall and peer step (a terraform or IAP error reading or writing them, Ruling R29), which the
 #     destroys below make moot: the run goes on.
 #   - a terraform init or destroy failed: the stacks after it are not touched (each one reads the base
@@ -175,7 +177,7 @@ gpu_down() {
   if (( clear == 1 )); then
     log "GPU nodes still live on Lambda (they keep billing):"
     log "$(printf '%s\n' "$LIVE_NODES" | sed 's/^/  /')"
-    die "scripts/gpuctl down did not remove them, so nothing was destroyed: the gpu-access and base stacks stay until they are gone. If the cluster is unreachable, bring the API tunnel up (make tunnel) and re-run make down; if it cannot be reached at all, terminate them in the Lambda console and re-run make down"
+    die "scripts/gpuctl down did not remove them, so nothing was destroyed: the gpu-access and base stacks stay until they are gone. If the cluster is unreachable, bring the API tunnel up (make tunnel) and re-run make down; if the kubeconfig or the tunnel reaches another cluster (gpuctl says so above), run make kubeconfig and make tunnel for this project and re-run make down. To abandon this cluster's GPU nodes undrained, run scripts/gpuctl down --no-drain (it keeps the firewalls and peer lists right), then re-run make down; terminate them in the Lambda console only as a last resort, then re-run make down"
   fi
   log "warning: Lambda lists no GPU node of this cluster, so no GPU node is left outside the firewall model; going on (the destroys below remove the gpu-access stack and k3s-cp)"
   # gpuctl down removes the autoscaler overrides only when it succeeds.
