@@ -905,7 +905,7 @@ def non_tf(env):
     """gcloud/kubectl calls in order, without the tunnel and the /readyz probes: the backgrounded
     fake tunnel logs its call concurrently with tunnel.sh's first probes. What is deterministic is
     checked here: one tunnel, started after the kubeconfig fetch, and a successful probe after it
-    and before the first `kc wait`."""
+    (the fake logs a probe once it has its answer) and before the first `kc wait`."""
     calls = [(c["tool"], c["argv"]) for c in env.calls() if c["tool"] != "terraform"]
     assert tunnels(env) == [tunnel_argv(env)]
     tunnel_at = calls.index(("gcloud", tunnel_argv(env)))

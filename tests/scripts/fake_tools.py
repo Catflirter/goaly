@@ -3,7 +3,9 @@ scripts/ (never the real CLIs).
 
 The stub bin/ directory holds one wrapper per tool, `exec python fake_tools.py <tool> "$@"` (the repo
 copy's scripts/gpuctl is such a wrapper too). Every call appends one JSON line {"tool", "argv", "env"}
-to $FAKE_LOG. $FAKE_SCENARIO (a JSON file) steers the answers:
+to $FAKE_LOG; a /readyz probe does so only once it has its answer, so a probe that found the tunnel up
+is always logged after the tunnel's own call (that tunnel runs concurrently, in the background).
+$FAKE_SCENARIO (a JSON file) steers the answers:
 
   outputs        {stack: {name: value}}   terraform output -raw/-json
   init_rc        {stack: rc}              terraform init exit code (default 0). Like the real one, the fake
@@ -66,6 +68,24 @@ The plan guardrail (stretch S3, cpu-pool.sh --guarded):
                                           overwrites it with other bytes, or deletes it, and writes "held" or
                                           "free" (whether .run/workers.lock is flock(1)ed then) to $FAKE_LOG.lock_at_drain
 
+Verification checks (Task 18) script their answers instead, with rules tried before every handler above:
+
+  answers        [rule, ...]              the first rule whose "tool" is this tool, whose "has" substrings
+                                          all occur in the call's arguments joined by spaces (for a remote
+                                          command that includes the command) and none of whose "not"
+                                          substrings occur, answers the call: it prints "stdout" and
+                                          "stderr" and exits "rc" (default 0). With "seq": [answer, ...]
+                                          successive calls get successive answers (the last one repeats).
+                                          An answer with "serve": TEXT (kubectl port-forward L:R) listens on
+                                          127.0.0.1:L, prints kubectl's "Forwarding from" line and answers
+                                          every HTTP GET with TEXT until it is killed. "sleep": SECONDS
+                                          waits that long after printing, before exiting (a capture or a
+                                          stalled call that is still running). "run_with": {TOOL: rc}
+                                          runs the command after `--` (kubectl exec) for real, here, with
+                                          only stubs of the named tools (each exits its rc) in front of
+                                          /usr/bin:/bin, and exits with its status: the exec'd script's
+                                          own logic is tested, not a canned exit code.
+
 Teardown (Task 22a, scripts/down.sh):
 
   destroy_rc     {stack: rc}              terraform destroy exit code (default 0)
@@ -86,8 +106,10 @@ Teardown (Task 22a, scripts/down.sh):
 
 `scripts/gpuctl down` and `list-nodes` log what they read on stdin as "stdin" (down.sh gives them /dev/null).
 """
+import http.server
 import json
 import os
+import re
 import subprocess
 import sys
 import time
@@ -96,6 +118,7 @@ from pathlib import Path
 TOOL = sys.argv[1]
 ARGS = sys.argv[2:]
 SCENARIO = json.loads(Path(os.environ["FAKE_SCENARIO"]).read_text())
+READYZ_PROBE = TOOL == "kubectl" and "--raw" in ARGS and "/readyz" in ARGS
 LOGGED_ENV = ("TF_VAR_project_id", "TF_VAR_state_bucket", "AUTO_APPROVE", "LAMBDA_API_KEY", "GPU_SSH_IP")
 
 TOKEN = "K10fakejointoken0123456789abcdef::server:s3cr3t-join"
@@ -247,10 +270,14 @@ def not_found(node):
 
 
 def kubectl():
-    if "--raw" in ARGS and "/readyz" in ARGS:
+    if READYZ_PROBE:
         n = counter("readyz")
         answer = SCENARIO.get("readyz", "ok")
-        if answer != "ok" or n < SCENARIO.get("readyz_fail_first", 0) or not tunnel_running():
+        up = answer == "ok" and n >= SCENARIO.get("readyz_fail_first", 0) and tunnel_running()
+        # Logged after the answer: the tunnel logs its call before it writes $FAKE_LOG.tunnel, so a probe
+        # that saw the tunnel up comes after the tunnel in $FAKE_LOG however the two were scheduled.
+        log()
+        if not up:
             return 1
         sys.stdout.write("ok")
         return 0
@@ -354,9 +381,72 @@ def gpuctl(entry):
     return 1
 
 
+def serve(text):
+    """kubectl port-forward LOCAL:REMOTE: answer HTTP GETs on 127.0.0.1:LOCAL until killed."""
+    local, remote = next(a for a in ARGS if re.fullmatch(r"\d+:\d+", a)).split(":")
+    body = text.encode()
+
+    class Handler(http.server.BaseHTTPRequestHandler):
+        def do_GET(self):  # noqa: N802 (http.server's name)
+            self.send_response(200)
+            self.send_header("Content-Length", str(len(body)))
+            self.end_headers()
+            self.wfile.write(body)
+
+        def log_message(self, *args):
+            pass
+
+    server = http.server.HTTPServer(("127.0.0.1", int(local)), Handler)
+    print(f"Forwarding from 127.0.0.1:{local} -> {remote}", flush=True)
+    server.serve_forever()
+
+
+def scripted():
+    """The exit code of the first matching "answers" rule (see the module docstring), or None."""
+    joined = " ".join(ARGS)
+    for i, rule in enumerate(SCENARIO.get("answers", [])):
+        if rule.get("tool") != TOOL or not all(s in joined for s in rule.get("has", [])):
+            continue
+        if any(s in joined for s in rule.get("not", [])):
+            continue
+        answer = rule
+        if "seq" in rule:
+            answer = rule["seq"][min(counter(f"answer-{i}"), len(rule["seq"]) - 1)]
+        sys.stdout.write(answer.get("stdout", ""))
+        sys.stdout.flush()
+        sys.stderr.write(answer.get("stderr", ""))
+        sys.stderr.flush()
+        if "serve" in answer:
+            serve(answer["serve"])
+        time.sleep(answer.get("sleep", 0))
+        if "run_with" in answer:
+            return run_with(answer["run_with"])
+        return answer.get("rc", 0)
+    return None
+
+
+def run_with(stubs):
+    """Run the command after `--` with stub tools STUBS {name: rc} first on PATH; its exit status."""
+    stub_dir = Path(os.environ["FAKE_LOG"] + ".run_with")
+    stub_dir.mkdir(exist_ok=True)
+    for name, rc in stubs.items():
+        stub = stub_dir / name
+        stub.write_text(f"#!/bin/sh\nexit {int(rc)}\n")
+        stub.chmod(0o755)
+    command = ARGS[ARGS.index("--") + 1:]
+    return subprocess.run(command, env={"PATH": f"{stub_dir}:/usr/bin:/bin"}).returncode
+
+
 if __name__ == "__main__":
-    ENTRY = log()
-    if TOOL == "gpuctl":
+    ENTRY = None
+    if not READYZ_PROBE:  # a /readyz probe logs itself once it has its answer (kubectl)
+        ENTRY = log()
+    rc = scripted()
+    if rc is not None:
+        if READYZ_PROBE:  # a scripted answer to a /readyz probe: log it now that it is answered
+            log()
+        sys.exit(rc)
+    if TOOL == "gpuctl":  # never a /readyz probe, so ENTRY is set (gpuctl tfguard reads its logged stdin)
         sys.exit(gpuctl(ENTRY))
     sys.exit({"terraform": terraform, "gcloud": gcloud, "kubectl": kubectl, "helm": helm, "ssh": ssh,
               "scp": scp}[TOOL]())

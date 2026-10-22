@@ -18,17 +18,87 @@ HEX20 = "01234567" + "89abcdef" + "0123"
 
 
 UTC_ENV = {**os.environ, "TZ": "UTC"}
+# What the throwaway repo's .env says (TEST-NET-1), and what its stubbed checkip.amazonaws.com answers.
+ENV_OPERATOR_IP = "192.0.2.77"
+CHECKIP_IP = "198.51.100.9"
+CHECKIP_CALL = "-fsS --max-time 5 https://checkip.amazonaws.com"
 
 
-def bash(script, env=LA_ENV):
-    return subprocess.run(["bash", "-c", f"set -euo pipefail; source {ROOT}/scripts/lib/checks.sh; {script}"],
-                          capture_output=True, text=True, cwd=ROOT, env=env)
+class Hermetic:
+    """A throwaway repo root for these tests (review F3-1): copies of checks.sh, common.sh and the gitleaks
+    config, a private .env with OPERATOR_IP set (and a sentinel), and a curl stub first on PATH that logs
+    every call; checkip.amazonaws.com answers CHECKIP_IP, anything else fails. Sourcing the copy makes it
+    REPO_ROOT, so vr_init never reads the operator's real .env and never reaches the network."""
+
+    def __init__(self, root):
+        self.root = root
+        (root / "scripts/lib").mkdir(parents=True)
+        for rel in ("scripts/lib/checks.sh", "scripts/lib/common.sh", ".gitleaks.toml"):
+            shutil.copy2(ROOT / rel, root / rel)
+        self.write_env(f"VR_SENTINEL=hermetic-env\nOPERATOR_IP={ENV_OPERATOR_IP}\n")
+        self.bin = root / "bin"
+        self.bin.mkdir()
+        self.curl_log = root / "curl.log"
+        (self.bin / "curl").write_text(
+            f'#!/bin/sh\nprintf "%s\\n" "$*" >> "{self.curl_log}"\n'
+            f'case "$*" in *checkip.amazonaws.com*) echo {CHECKIP_IP}; exit 0 ;; esac\n'
+            'echo "curl stub: no network in these tests" >&2\nexit 7\n')
+        (self.bin / "curl").chmod(0o755)
+        self.checks = root / "scripts/lib/checks.sh"
+
+    def write_env(self, text):
+        env = self.root / ".env"
+        env.write_text(text)
+        env.chmod(0o600)
+
+    def environ(self, env):
+        return {**env, "PATH": f"{self.bin}:{env['PATH']}"}
+
+    def curl_calls(self):
+        """The curl calls so far; the log is emptied, so the teardown check sees only later ones."""
+        calls = self.curl_log.read_text().splitlines() if self.curl_log.exists() else []
+        self.curl_log.unlink(missing_ok=True)
+        return calls
+
+
+H = None
+
+
+@pytest.fixture(autouse=True)
+def hermetic(tmp_path_factory):
+    global H
+    H = Hermetic(tmp_path_factory.mktemp("repo"))
+    yield H
+    # OPERATOR_IP is set, so nothing may call curl (a test that empties it reads curl_calls() itself)
+    assert H.curl_calls() == []
+
+
+def bash(script, env=LA_ENV, **kw):
+    return subprocess.run(["bash", "-c", f"set -euo pipefail; source {H.checks}; {script}"],
+                          capture_output=True, text=True, cwd=H.root, env=H.environ(env), **kw)
 
 
 def redact(text):
-    proc = subprocess.run(["bash", "-c", f"source {ROOT}/scripts/lib/checks.sh; redact"], input=text,
-                          capture_output=True, text=True, check=True)
+    proc = subprocess.run(["bash", "-c", f"source {H.checks}; redact"], input=text,
+                          capture_output=True, text=True, check=True, cwd=H.root, env=H.environ(LA_ENV))
     return proc.stdout
+
+
+# --- hermetic setup (F3-1) ----------------------------------------------------------------------
+
+def test_the_harness_tests_read_their_own_env_and_never_the_operators(tmp_path):
+    r = bash('load_env; printf "%s\\n" "$REPO_ROOT" "$VR_SENTINEL"')
+    assert r.stdout.splitlines() == [str(H.root.resolve()), "hermetic-env"] and H.root != ROOT
+    assert bash(f"vr_init {tmp_path}/run").returncode == 0
+    assert "Operator IP: masked as <operator_ip> (OPERATOR_IP in .env)" in (tmp_path / "run/SUMMARY.md").read_text()
+    assert H.curl_calls() == []                               # no checkip lookup with OPERATOR_IP set
+
+
+def test_vr_init_without_operator_ip_asks_checkip_through_the_stub(tmp_path):
+    H.write_env("VR_SENTINEL=hermetic-env\nOPERATOR_IP=\n")
+    r = bash(f'vr_init {tmp_path}/run; echo "$VR_OPERATOR_IP"; echo "from {CHECKIP_IP}" | redact')
+    assert r.stdout.splitlines() == [CHECKIP_IP, "from <operator_ip>"], r.stderr
+    assert H.curl_calls() == [CHECKIP_CALL]
 
 
 # --- run_check / vr_finish ----------------------------------------------------------------------
@@ -91,9 +161,7 @@ def test_run_check_survives_exit_and_errexit_in_the_check(tmp_path):
 
 
 def test_run_check_does_not_let_the_check_read_stdin(tmp_path):
-    r = subprocess.run(["bash", "-c", f"set -euo pipefail; source {ROOT}/scripts/lib/checks.sh; vr_init {tmp_path}; "
-                        "rd(){ cat; }; run_check A1 rd rd; vr_finish"],
-                       input="stdin-data\n", capture_output=True, text=True, env=LA_ENV)
+    r = bash(f"vr_init {tmp_path}; rd(){{ cat; }}; run_check A1 rd rd; vr_finish", input="stdin-data\n")
     assert r.returncode == 0
     assert "stdin-data" not in (tmp_path / "01-A1.txt").read_text()
 
@@ -155,11 +223,22 @@ def test_vr_cmd_does_not_run_the_command_when_redact_fails(tmp_path):
 
 def test_background_jobs_of_a_check_do_not_block_the_run(tmp_path):
     # A check that leaves e.g. `kubectl port-forward &` running must not hang make verify.
-    r = subprocess.run(["bash", "-c", f"set -euo pipefail; source {ROOT}/scripts/lib/checks.sh; vr_init {tmp_path}; "
-                        "bg(){ sleep 30 & echo started; }; run_check A1 bg bg; vr_finish"],
-                       capture_output=True, text=True, env=LA_ENV, timeout=15)
+    r = bash(f"vr_init {tmp_path}; bg(){{ sleep 30 & echo started; }}; run_check A1 bg bg; vr_finish", timeout=15)
     assert r.returncode == 0, r.stderr
     assert "started" in (tmp_path / "01-A1.txt").read_text()
+
+
+def test_a_job_that_misses_the_first_term_does_not_block_the_run(tmp_path):
+    # Until a job forked from the check's subshell has exec'd its program, it runs the TERM handler bash
+    # installed there for the EXIT trap, which drops a TERM that arrives in that window (seen under load:
+    # `sleep 30 &` outlived the reap). This job drops the first TERM on purpose; it ends by itself in ~15s.
+    job = f"(trap 'trap - TERM' TERM; : >{tmp_path}/armed; for _ in $(seq 300); do sleep 0.05; done) &"
+    r = subprocess.run(["bash", "-c", f"set -euo pipefail; source {ROOT}/scripts/lib/checks.sh; vr_init {tmp_path}/run; "
+                        f"bg(){{ {job} until [[ -e {tmp_path}/armed ]]; do sleep 0.01; done; echo started; }}; "
+                        "run_check A1 bg bg; vr_finish"],
+                       capture_output=True, text=True, env=LA_ENV, timeout=10)
+    assert r.returncode == 0, r.stderr
+    assert "| 1 | A1 | bg | PASS |" in (tmp_path / "run/SUMMARY.md").read_text()
 
 
 def wg_key(seed):
@@ -263,8 +342,8 @@ def test_redaction_replaces_pem_private_key_bodies():
 
 def test_redaction_survives_non_utf8_bytes():
     raw = b"\xff\xfe payload\ntoken: " + b"bm9uVXRm" + b"OA\n"
-    proc = subprocess.run(["bash", "-c", f"source {ROOT}/scripts/lib/checks.sh; redact"], input=raw,
-                          capture_output=True, check=True, env={**os.environ, "LC_ALL": "C.UTF-8"})
+    proc = subprocess.run(["bash", "-c", f"source {H.checks}; redact"], input=raw, capture_output=True, check=True,
+                          cwd=H.root, env=H.environ({**os.environ, "LC_ALL": "C.UTF-8"}))
     assert proc.stdout == b"\xff\xfe payload\ntoken: <redacted>\n"
 
 
@@ -310,14 +389,22 @@ def test_vr_cmd_redacts_arguments_that_contain_spaces():
 # --- verify.sh ----------------------------------------------------------------------------------
 
 REGISTRATIONS_MARKER = "# --- registered checks ---"
+REGISTRATIONS_END = "# --- end of registered checks ---"
 
 
 @pytest.fixture
 def repo(tmp_path):
-    """A throwaway repo root holding copies of verify.sh, its libraries and the gitleaks config."""
+    """A throwaway repo root holding copies of verify.sh, its libraries and the gitleaks config. The copy's
+    real registrations (Task 18 on) are removed: they would run kubectl, gcloud and ssh against the
+    operator's cluster. The tests register their own stand-in checks."""
     (tmp_path / "scripts/lib").mkdir(parents=True)
     for rel in ("scripts/verify.sh", "scripts/lib/checks.sh", "scripts/lib/common.sh", ".gitleaks.toml"):
         shutil.copy2(ROOT / rel, tmp_path / rel)
+    verify = tmp_path / "scripts/verify.sh"
+    text = verify.read_text()
+    assert text.count(REGISTRATIONS_MARKER) == 1 and text.count(REGISTRATIONS_END) == 1
+    head, rest = text.split(REGISTRATIONS_MARKER)
+    verify.write_text(head + REGISTRATIONS_MARKER + "\n" + REGISTRATIONS_END + rest.split(REGISTRATIONS_END)[1])
     return tmp_path
 
 
@@ -331,8 +418,9 @@ def register(repo, lines):
 
 def verify(repo, *groups, **env):
     clean = {k: v for k, v in LA_ENV.items() if k != "RESILIENCE"}
+    # The copy has no .env, so vr_init does not look the operator IP up; the curl stub would catch it if it did.
     return subprocess.run(["bash", str(repo / "scripts/verify.sh"), *groups], capture_output=True, text=True,
-                          cwd=repo, env={**clean, **env})
+                          cwd=repo, env=H.environ({**clean, **env}))
 
 
 def run_dir(repo):

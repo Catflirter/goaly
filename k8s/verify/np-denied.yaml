@@ -1,5 +1,7 @@
-# Negative NetworkPolicy test (check C8): a client in a namespace other than nettest must time out
-# (curl exit 28) against hello. The check applies this file and deletes the namespace afterwards.
+# Negative NetworkPolicy test (check C8): a client in a namespace other than nettest must not reach
+# hello (curl exit 7: kube-router rejects; or 28: a policy that drops), while it does get HTTP 200
+# from echo.nettest (the positive control, Ruling R45). The check applies this file and deletes the
+# namespace afterwards.
 apiVersion: v1
 kind: Namespace
 metadata:

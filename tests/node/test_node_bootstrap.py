@@ -396,11 +396,19 @@ def test_gpu_audit_abandons_a_probe_that_cannot_be_reaped(tmp_path):
     assert "$ systemctl is-enabled lambda-jupyter docker" in text
 
 
-def test_gpu_audit_stops_on_ctrl_c(tmp_path):
+@pytest.mark.parametrize("poll_sleep_ignores_int", [False, True])
+def test_gpu_audit_stops_on_ctrl_c(tmp_path, poll_sleep_ignores_int):
     # Ctrl-C reaches the whole foreground process group: the probe and the bootstrap stop, nothing
     # after the audit runs (a probe in its own process group would let the root bootstrap carry on).
+    # poll_sleep_ignores_int: the audit's 0.1 s poll sleep does not die of the SIGINT, as when it has
+    # just ended when Ctrl-C comes (seen under load). Bash ignores a SIGINT that a foreground command
+    # it waits for survives, so the audit must not wait for that sleep in the foreground.
     probe_pid = tmp_path / "probe.pid"
-    bindir, _ = make_stubs(tmp_path, {"nvidia-smi": f'echo $$ > "{probe_pid}"; exec sleep 30'},
+    real_sleep = shutil.which("sleep")
+    bodies = {"nvidia-smi": f'echo $$ > "{probe_pid}"; exec {real_sleep} 30'}
+    if poll_sleep_ignores_int:
+        bodies["sleep"] = f"trap '' INT; exec {real_sleep} \"$@\""
+    bindir, _ = make_stubs(tmp_path, bodies,
                            names=["nvidia-smi", "lsb_release", "uname", "dpkg", "iptables", "ip", "systemctl"])
     sysroot = tmp_path / "sys"
     env = {**os.environ, "K3S_BOOTSTRAP_TEST_ROOT": str(sysroot), "SYSFS_NET": str(fake_sysfs(tmp_path, "eno1", 1500)),
