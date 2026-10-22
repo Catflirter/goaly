@@ -375,22 +375,73 @@ def test_restart_during_cooldown_does_not_scale_again():
     assert again is None
 
 
-# --- the clock (Ruling SR6: now < last_action_at is a cooldown, never an exception) ----------------------------------
+# --- the clock (Ruling SR7(b): a saved time in the future is clamped to now, and held says so) -----------------------
 
-def test_clock_behind_last_action_is_a_cooldown_not_an_error():
-    state = State(last_action_at=NOW + 3600, idle_since={"k3s-cpu-2": NOW + 3600})
-    nodes = [*CLUSTER, cpu_node("k3s-cpu-2")]
-    action, new_state = run(pending=[cpu_pending()], nodes=nodes, cpu_count=2, state=state)
+GPU_IDLE_CLUSTER = [cpu_node("k3s-cpu-1", busy=True), gpu_node("k3s-gpu-a6000-1", busy=True),
+                    gpu_node("k3s-gpu-a6000-2")]
+
+
+@pytest.mark.parametrize("last", [NOW + 3600, 1e12])
+def test_future_last_action_is_clamped_and_reported_even_with_nothing_pending(last):
+    # Clock stepped back, a state file from another machine, or a corrupt finite value: the cooldown restarts once.
+    old = State(last_action_at=last, idle_since={"k3s-gpu-a6000-2": NOW - 3600})
+    action, state = run(nodes=GPU_IDLE_CLUSTER, gpu_counts={"a6000": 2}, state=old)
     assert action is None
-    assert new_state.last_action_at == NOW + 3600
-    assert "clock" in new_state.held and "scale-demo/php-apache-x" in new_state.held
+    assert state.last_action_at == NOW
+    assert state.held is not None and "last_action_at" in state.held and "clamped" in state.held
+    assert State.from_json(state.to_json()).last_action_at == NOW
 
 
-def test_idle_clock_in_the_future_never_counts_as_idle():
-    # Clock moved back, no cooldown pending: a node whose idle clock lies ahead of `now` is not idle yet.
+@pytest.mark.parametrize("last", [NOW + 3600, 1e12])
+def test_after_a_clamped_last_action_a_later_tick_scales_down_normally(last):
+    # The idle paid GPU node is removed one cooldown after the clamp, not when the clock reaches `last`.
+    old = State(last_action_at=last, idle_since={"k3s-gpu-a6000-2": NOW - 3600})
+    _, state = run(nodes=GPU_IDLE_CLUSTER, gpu_counts={"a6000": 2}, state=old)
+    state = State.from_json(state.to_json())
+    action, later = run(nodes=GPU_IDLE_CLUSTER, gpu_counts={"a6000": 2}, state=state, now=NOW + COOLDOWN_S - 20)
+    assert action is None and later.held is None
+    action, later = run(nodes=GPU_IDLE_CLUSTER, gpu_counts={"a6000": 2}, state=later, now=NOW + COOLDOWN_S)
+    assert (action.kind, action.pool, action.target) == ("gpu_scale", "a6000", 1)
+    assert later.last_action_at == NOW + COOLDOWN_S and later.held is None
+
+
+def test_future_last_action_with_pending_pods_reports_clamp_and_cooldown():
+    action, state = run(pending=[cpu_pending()], state=State(last_action_at=NOW + 3600))
+    assert action is None and state.last_action_at == NOW
+    assert "clamped" in state.held and "scale-demo/php-apache-x" in state.held and "cooldown" in state.held
+    action, _ = run(pending=[cpu_pending()], state=State.from_json(state.to_json()), now=NOW + COOLDOWN_S)
+    assert (action.kind, action.target) == ("cpu_scale", 2)
+
+
+def test_future_idle_clock_is_clamped_restarts_and_is_reported():
     nodes = [*CLUSTER, cpu_node("k3s-cpu-2")]
-    action, state = run(nodes=nodes, cpu_count=2, state=State(idle_since={"k3s-cpu-2": NOW + 600}))
-    assert action is None and state.idle_since == {"k3s-cpu-2": NOW + 600}
+    action, state = run(nodes=nodes, cpu_count=2, state=State(idle_since={"k3s-cpu-2": 1e12}))
+    assert action is None and state.idle_since == {"k3s-cpu-2": NOW}
+    assert "k3s-cpu-2" in state.held and "clamped" in state.held
+    state = State.from_json(state.to_json())
+    action, later = run(nodes=nodes, cpu_count=2, state=state, now=NOW + CPU_IDLE_S - 20)
+    assert action is None and later.held is None and later.idle_since == {"k3s-cpu-2": NOW}
+    action, _ = run(nodes=nodes, cpu_count=2, state=later, now=NOW + CPU_IDLE_S)
+    assert (action.kind, action.node) == ("cpu_remove", "k3s-cpu-2")
+
+
+def test_future_idle_clock_of_a_node_that_is_gone_or_busy_is_dropped_silently():
+    # Rule 0 drops it anyway; nothing was clamped, so there is nothing to report.
+    _, state = run(state=State(idle_since={"k3s-cpu-9": NOW + 600, "k3s-cpu-1": NOW + 600}))
+    assert state.idle_since == {} and state.held is None
+
+
+def test_present_and_past_times_are_not_clamped():
+    state = State(last_action_at=NOW, idle_since={"k3s-cpu-2": NOW})
+    _, new_state = run(nodes=[*CLUSTER, cpu_node("k3s-cpu-2")], cpu_count=2, state=state)
+    assert new_state.last_action_at == NOW and new_state.idle_since == {"k3s-cpu-2": NOW}
+    assert new_state.held is None
+
+
+def test_clamp_does_not_modify_the_input_state():
+    old = State(last_action_at=NOW + 3600, idle_since={"k3s-cpu-2": NOW + 600})
+    run(nodes=[*CLUSTER, cpu_node("k3s-cpu-2")], cpu_count=2, state=old)
+    assert old == State(last_action_at=NOW + 3600, idle_since={"k3s-cpu-2": NOW + 600})
 
 
 # --- decide: the brief's rules 0-6 ----------------------------------------------------------------------------------
@@ -579,7 +630,7 @@ def test_unlabeled_idle_gpu_node_gets_an_idle_clock_and_is_scaled_down():
 
 def test_unfittable_pod_scales_to_the_cap_spaced_by_the_cooldown():
     # Known limitation (Ruling SR6): a Pod no new node can satisfy drives scale-up to cpu_max, one step per cooldown.
-    # (Rule 4 removes the new idle workers CPU_IDLE_S later; the window below ends before that.)
+    # (Rule 4 removes the new idle workers CPU_IDLE_S later: see the cycle tests below.)
     cpu_count, state, actions = 1, State(), []
     for t in range(0, CPU_IDLE_S, 20):
         nodes = [cpu_node(f"k3s-cpu-{i}", busy=i == 1) for i in range(1, cpu_count + 1)]
@@ -590,6 +641,49 @@ def test_unfittable_pod_scales_to_the_cap_spaced_by_the_cooldown():
             cpu_count = action.target
     assert actions == [(0, "cpu_scale", 2), (COOLDOWN_S, "cpu_scale", 3)]
     assert "cpu_max 3" in state.held
+
+
+def _unfittable_cycle(kind, boot_s, horizon_s):
+    """Ruling SR7(c): 20 s ticks with one Pod Pending that no new node can satisfy; the cluster is 1 busy node plus
+    at most one extra (cpu_max 2 / autoscale max 2), and an added node is Ready `boot_s` after its action."""
+    count, state, arriving, actions = 1, State(), None, []
+    pools = {"a6000": pool(lo=1, hi=2, idle_minutes=5)}
+    for t in range(0, horizon_s, 20):
+        booting = arriving is not None and t < arriving
+        extra = [] if count == 1 or booting else [
+            cpu_node("k3s-cpu-2") if kind == "cpu" else gpu_node("k3s-gpu-a6000-2", ready_since=NOW + arriving)]
+        busy = cpu_node("k3s-cpu-1", busy=True) if kind == "cpu" else gpu_node("k3s-gpu-a6000-1", busy=True)
+        others = [gpu_node("k3s-gpu-a6000-1", busy=True)] if kind == "cpu" else [cpu_node("k3s-cpu-1", busy=True)]
+        action, state = run(pending=[cpu_pending() if kind == "cpu" else gpu_pending()],
+                            nodes=[busy, *others, *extra], cpu_count=count if kind == "cpu" else 1, cpu_max=2,
+                            gpu_counts={"a6000": count if kind == "gpu" else 1}, pools=pools,
+                            gpu_launching=kind == "gpu" and booting, state=State.from_json(state.to_json()),
+                            now=NOW + t)
+        if action is None:
+            continue
+        actions.append((t, action.kind, action.node or action.target))
+        if action.kind == "cpu_remove":
+            count = 1
+        else:
+            count = action.target
+            arriving = t + boot_s if count == 2 else None
+    return actions
+
+
+def test_unfittable_cpu_pod_cycles_remove_and_add_every_idle_window_plus_cooldown():
+    # The cap does not settle: rule 4 removes the idle worker, rule 3 adds it back one cooldown later.
+    # Period = boot (20 s, one tick here) + CPU_IDLE_S + COOLDOWN_S = 440 s.
+    assert _unfittable_cycle("cpu", boot_s=20, horizon_s=1400) == [
+        (0, "cpu_scale", 2), (320, "cpu_remove", "k3s-cpu-2"), (440, "cpu_scale", 2),
+        (760, "cpu_remove", "k3s-cpu-2"), (880, "cpu_scale", 2), (1200, "cpu_remove", "k3s-cpu-2"),
+        (1320, "cpu_scale", 2)]
+
+
+def test_unfittable_gpu_pod_is_a_paid_launch_and_terminate_cycle():
+    # Each gpu_scale 2 is a paid Lambda launch: period = boot 180 s + idle_minutes 5 + COOLDOWN_S = 600 s.
+    assert _unfittable_cycle("gpu", boot_s=180, horizon_s=1900) == [
+        (0, "gpu_scale", 2), (480, "gpu_scale", 1), (600, "gpu_scale", 2), (1080, "gpu_scale", 1),
+        (1200, "gpu_scale", 2), (1680, "gpu_scale", 1), (1800, "gpu_scale", 2)]
 
 
 # --- held: why a scale-up that Pending Pods asked for was withheld ---------------------------------------------------

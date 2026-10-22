@@ -1,11 +1,11 @@
-"""Autoscaler decision engine (stretch S2; design spec sections 10.2, 10.4, 10.5; Ruling SR6).
+"""Autoscaler decision engine (stretch S2; design spec sections 10.2, 10.4, 10.5; Rulings SR6, SR7).
 
 Pure functions only: the caller (scripts/autoscaler.py, every 20 s) passes in kubectl JSON, the stored State and
 `now`, and executes the one Action that comes back. Nothing here reads a clock, a file or the network.
 
 decide() checks the brief's rules in priority order and returns only the first that fires:
   0. refresh idle_since: a Ready node that is not busy keeps its clock (or starts one at now); others are dropped;
-  1. cooldown (now - last_action_at < COOLDOWN_S, which includes a clock that is behind last_action_at) -> nothing;
+  1. cooldown (now - last_action_at < COOLDOWN_S) -> nothing;
   2. a GPU Pod Pending for capacity and no GPU node launching -> +1 on the first autoscaled pool (by name) below max;
   3. a CPU/memory Pod Pending for capacity and cpu_count < cpu_max -> +1 CPU worker;
   4. a CPU worker other than k3s-cpu-1 idle for CPU_IDLE_S -> remove it (highest index first);
@@ -20,12 +20,21 @@ gives it no clock), so rule 5 cannot scale it away while its plugin starts. Past
 time, the window is over: the node is broken (plugin or GPU failed), does not hold rule 2, gets an idle clock like any
 other node, and the State's `held` names it whenever GPU Pods are Pending.
 
-Known limitation (Ruling SR6): rules 2 and 3 do not ask whether a new node would fit the Pending Pod. A Pod that no
-new node can satisfy (it asks for more than one node has) drives scale-up to autoscale.max / cpu_max, one step per
-COOLDOWN_S, and rules 4/5 later remove the idle nodes again. Every decision is logged with its reason (S4), so the
-operator sees it in autoscaler.log and stops it with Ctrl-C, make gpu-down or make cpu-scale N=1.
+Clock (Ruling SR7(b)): a saved last_action_at or idle_since later than `now` (the clock stepped back, a state file
+from another machine, a corrupt but finite value) is clamped to now in the returned State, so the cooldown or that
+node's idle clock restarts once instead of blocking every action, scale-down included, until the clock catches up.
 
-When rules 2 or 3 are withheld, the returned State's `held` says why (for autoscaler.log; it is not saved).
+Known limitation (Rulings SR6, SR7(c)): rules 2 and 3 do not ask whether a new node would fit the Pending Pod. A Pod
+that no new node can satisfy (it asks for more than one node has) drives scale-up to autoscale.max / cpu_max, one step
+per COOLDOWN_S, and it does not settle there: the new nodes stay idle, rules 4/5 remove them after CPU_IDLE_S /
+idle_minutes, and one COOLDOWN_S later rules 3/2 add them again. While the Pod stays Pending this repeats every
+boot time + idle window + COOLDOWN_S (about 10 minutes for a GPU pool with idle_minutes 5 and a 3-minute boot), and
+every GPU cycle is a paid Lambda launch and terminate. Every decision is logged with its reason (S4), so the operator
+sees the cycle in autoscaler.log and stops it by deleting the Pod, or with Ctrl-C, make gpu-down or
+make cpu-scale N=1.
+
+The returned State's `held` (for autoscaler.log; it is not saved) names every clamped time and says why rules 2 or 3
+were withheld.
 """
 
 from __future__ import annotations
@@ -95,7 +104,8 @@ class NodeObs:
 class State:
     last_action_at: float | None = None
     idle_since: dict[str, float] = field(default_factory=dict)
-    # Not saved: why this tick withheld a scale-up that Pending Pods asked for, for autoscaler.log; None if nothing was.
+    # Not saved; for autoscaler.log: which saved times in the future this tick clamped to now (Ruling SR7(b)) and why
+    # it withheld a scale-up that Pending Pods asked for. None if neither happened.
     held: str | None = field(default=None, compare=False)
 
     def to_json(self) -> str:
@@ -319,13 +329,27 @@ def decide(*, now: float, pending: list[PendingPod], nodes: list[NodeObs], state
            cpu_max: int, gpu_counts: dict[str, int], pools: dict[str, Pool],
            gpu_launching: bool) -> tuple[Action | None, State]:
     """At most one scaling action for this tick, and the state to save. The input state is not modified."""
+    # Ruling SR7(b): a saved time later than now (the clock stepped back, a state file from another machine, a corrupt
+    # value) is clamped to now and reported, so it costs one cooldown or one idle window, never a silent stall.
+    clamped = []
+    last = state.last_action_at
+    if last is not None and last > now:
+        clamped.append(f"last_action_at was {last - now:.0f}s ahead of now; clamped to now (cooldown restarts)")
+        last = now
     # Rule 0. A joining node is not idle (Ruling SR6): its clock starts once it has GPUs or its window is over.
-    idle_since = {obs.name: state.idle_since.get(obs.name, now) for obs in nodes
-                  if obs.ready and not obs.busy and not _joining(obs, now)}
-    new_state = State(last_action_at=state.last_action_at, idle_since=idle_since)
+    idle_since = {}
+    for obs in nodes:
+        if obs.ready and not obs.busy and not _joining(obs, now):
+            since = state.idle_since.get(obs.name, now)
+            if since > now:
+                clamped.append(f"idle_since[{obs.name}] was {since - now:.0f}s ahead of now; clamped to now "
+                               "(idle clock restarts)")
+                since = now
+            idle_since[obs.name] = since
+    new_state = State(last_action_at=last, idle_since=idle_since)
     action, held = _choose(now=now, pending=pending, nodes=nodes, state=new_state, cpu_count=cpu_count,
                            cpu_max=cpu_max, gpu_counts=gpu_counts, pools=pools, gpu_launching=gpu_launching)
-    new_state.held = "; ".join(held) or None
+    new_state.held = "; ".join(clamped + held) or None
     if action is None:
         return None, new_state
     return action, replace(new_state, last_action_at=now)  # rule 6
@@ -342,12 +366,10 @@ def _choose(*, now: float, pending: list[PendingPod], nodes: list[NodeObs], stat
         held.extend(_broken(now, nodes))
 
     last = state.last_action_at
-    if last is not None and now - last < COOLDOWN_S:  # rule 1; also a clock that is behind last_action_at
+    if last is not None and now - last < COOLDOWN_S:  # rule 1 (decide() has clamped last_action_at to <= now)
         if pending:
-            wait = (f"cooldown: {COOLDOWN_S - (now - last):.0f}s left" if now >= last else
-                    f"cooldown: the clock is {last - now:.0f}s behind the last action; "
-                    f"{COOLDOWN_S + last - now:.0f}s left")
-            held.append(f"{_describe(gpu_pending + cpu_pending)} waiting: {wait}")
+            held.append(f"{_describe(gpu_pending + cpu_pending)} waiting: "
+                        f"cooldown: {COOLDOWN_S - (now - last):.0f}s left")
         return None, held
 
     def count(name: str) -> int:
