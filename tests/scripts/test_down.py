@@ -270,6 +270,19 @@ def test_a_failing_env_line_is_not_blamed_on_a_forbidden_variable(env, line):
     assert_nothing_changed(env)
 
 
+@pytest.mark.parametrize("comment", ["# AUTO_APPROVE belongs on the command line, never here",
+                                     "  # DESTROY_STACKS is decided by make down"])
+def test_a_comment_naming_a_forbidden_variable_is_not_blamed(env, comment):
+    """Only a line that is not a comment can set a variable: a comment that mentions a readonly name plus an
+    unrelated failing line gets the generic message, not 'remove that line'."""
+    env.write_env(f"GCP_PROJECT={PROJECT}\n{comment}\nFOO=$(cat /no/such/file)\n")
+    proc = down(env, AUTO_APPROVE="1")
+    assert proc.returncode == 2, proc.stderr
+    assert "a line of" in proc.stderr and ".env failed" in proc.stderr and "nothing was changed" in proc.stderr
+    assert "names AUTO_APPROVE" not in proc.stderr and "names DESTROY_STACKS" not in proc.stderr
+    assert "remove that line" not in proc.stderr
+    assert_nothing_changed(env)
+
 def test_a_non_private_env_keeps_load_envs_own_message(env):
     """load_env's own refusal (exit 2, .env not 600) is not rewritten as a failed .env line."""
     env.write_env(f"GCP_PROJECT={PROJECT}\n", mode=0o644)

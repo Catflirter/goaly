@@ -97,7 +97,8 @@ env_refused() {
   (( $1 != 0 )) || return 0
   [[ -f "$REPO_ROOT/.env" && "$(_file_mode "$REPO_ROOT/.env" 2>/dev/null)" == 600 ]] || return 0
   for name in $PINNED_NAMES; do
-    if grep -Eq "(^|[^A-Za-z0-9_])$name([^A-Za-z0-9_]|\$)" "$REPO_ROOT/.env"; then
+    # Only a line that is not a comment can set the name.
+    if grep -Ev '^[[:space:]]*#' "$REPO_ROOT/.env" | grep -Eq "(^|[^A-Za-z0-9_])$name([^A-Za-z0-9_]|\$)"; then
       named="$named${named:+, }$name"
     fi
   done
