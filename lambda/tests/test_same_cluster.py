@@ -6,8 +6,13 @@ of an apply or a down, gpuctl checks what scripts/down.sh's same_cluster checks:
 infra/base's cp_ip. A mismatch is handled like an API server that does not answer (Ruling R54): the undrained
 terminate is refused, with both IPs in the message (callers' evidence redaction masks them), and nothing in the
 other cluster is drained or deleted. --no-drain still terminates without draining. A base stack without its
-cluster outputs (no cp_ip) is R54's "cluster gone": gpu-down terminates without draining, through whatever
-cluster the kubeconfig still reaches.
+cluster outputs (neither cp_ip nor cp_internal_ip) is R54's "cluster gone": gpu-down terminates without draining,
+and drains nothing through whatever cluster the kubeconfig still reaches. One with cp_internal_ip but no cp_ip is a
+broken stack, refused (review S0-2).
+
+A gpu-apply that launches checks before its first launch too (review S0-1/X0-1): a new node joins through the same
+kubeconfig, and join-node.sh deletes a stale NotReady Node of its name there (Ruling R55). Each refusal says what
+to fix for its cause (review X0-3), and a check that fails part-way refuses the rest of the run (review C0-2).
 """
 import pytest
 
@@ -15,7 +20,7 @@ from fakes import DEFAULT_OUTPUTS, FakeInfra, FakeLambda
 from gpuctl.__main__ import main
 from gpuctl.infra import CommandError
 from test_cli import ENV
-from test_reconcile import SPEC, TYPES, inst, make_rec
+from test_reconcile import SPEC, TYPES, inst, make_rec, mutations
 
 CP_IP = DEFAULT_OUTPUTS["base"]["cp_ip"]  # 34.82.10.10
 OTHER_CP_IP = "35.199.7.7"  # k3s-cp of another project's cluster, reached through the same kubeconfig/tunnel
@@ -36,10 +41,16 @@ def test_down_drains_when_node_k3s_cp_is_this_projects():
     assert infra.identity_reads == 1  # checked once per run, before the first drain
 
 
-def test_apply_with_nothing_to_delete_never_reads_the_cluster_identity():
-    fake, infra = FakeLambda(types=TYPES, instances=[inst()]), FakeInfra()
+def test_apply_with_nothing_to_change_never_reads_the_cluster_identity():
+    fake, infra = FakeLambda(types=TYPES, instances=[inst()]), FakeInfra()  # SPEC wants exactly this node
     assert make_rec(fake, infra).apply(SPEC, auto_approve=True, keep_on_failure=False) == 0
-    assert infra.identity_reads == 0 and infra.deleted_nodes == []
+    assert infra.identity_reads == 0 and infra.deleted_nodes == [] and fake.launched == []
+
+
+def test_apply_reads_the_cluster_identity_once_before_its_first_launch():
+    fake, infra = FakeLambda(types=TYPES), FakeInfra()
+    assert make_rec(fake, infra).apply(SPEC, auto_approve=True, keep_on_failure=False) == 0
+    assert [n.name for n in fake.launched] == ["k3s-gpu-a6000-1"] and infra.identity_reads == 1
 
 
 # --- another cluster -----------------------------------------------------------------------------
@@ -53,7 +64,7 @@ def test_down_refuses_and_never_drains_in_another_cluster(capsys):
     assert infra.identity_reads == 1  # the second node is refused without a second read
     err = capsys.readouterr().err
     assert OTHER_CP_IP in err and CP_IP in err  # both IPs named
-    assert "not this project's" in err and "--no-drain" in err
+    assert "not this project's" in err and "--no-drain" in err and "make kubeconfig" in err  # review X0-3
     assert "delete k3s-gpu-a6000-1" in err and "delete k3s-gpu-a6000-2" in err  # both reported, both kept
 
 
@@ -76,15 +87,52 @@ def test_apply_never_drains_in_another_cluster(capsys):
     assert "--no-drain" not in err  # gpu-apply has no such flag
 
 
-def test_apply_cleanup_never_deletes_a_node_in_another_cluster(capsys):
-    """A new node that failed to join is still terminated (it bills), but its Node is not deleted elsewhere."""
-    fake, infra = FakeLambda(types=TYPES), FakeInfra(join_fail={"k3s-gpu-a6000-1"})
+def test_apply_launches_nothing_to_join_another_cluster(capsys):
+    """Review S0-1/X0-1: the join goes through the kubeconfig, and join-node.sh deletes a stale NotReady Node of the
+    new node's name there (and so its node-password secret, Ruling R55). Checked before the first launch, so a
+    refused apply starts nothing that bills."""
+    fake, infra = FakeLambda(types=TYPES), FakeInfra()
     infra.cp_node_ip = OTHER_CP_IP
     assert make_rec(fake, infra).apply(SPEC, auto_approve=True, keep_on_failure=False) == 1
-    assert fake.terminated == [fake.launched_ids[0]] and infra.forgotten == ["k3s-gpu-a6000-1"]
-    assert infra.deleted_nodes == []
+    assert fake.launched == [] and mutations(fake) == [] and infra.joined == [] and infra.deleted_nodes == []
+    assert infra.events == [] and infra.identity_reads == 1  # no launch, so no firewall change either
     err = capsys.readouterr().err
-    assert "cleanup: delete node k3s-gpu-a6000-1" in err and OTHER_CP_IP in err
+    assert OTHER_CP_IP in err and CP_IP in err and "not this project's" in err
+    assert "make kubeconfig" in err and "make tunnel" in err and "re-run make gpu-apply" in err
+    assert "does not terminate" not in err and "--no-drain" not in err
+
+
+def test_apply_without_a_kubeconfig_says_to_fetch_it(capsys):
+    """Review S0-4: no kubeconfig is not a missing base stack; make kubeconfig (make up writes it) fixes it."""
+    fake, infra = FakeLambda(types=TYPES), FakeInfra()
+    infra.no_kubeconfig = "no kubeconfig at /home/op/.kube/hybrid-gpu.yaml"
+    assert make_rec(fake, infra).apply(SPEC, auto_approve=True, keep_on_failure=False) == 1
+    assert fake.launched == [] and mutations(fake) == [] and infra.identity_reads == 0
+    err = capsys.readouterr().err
+    assert "no kubeconfig at" in err and "make kubeconfig" in err and "apply the base stack" not in err
+
+
+def test_apply_with_infra_base_destroyed_says_to_apply_it(capsys):
+    fake, infra = FakeLambda(types=TYPES), FakeInfra(outputs={"base": {}, "workers": {}})
+    assert make_rec(fake, infra).apply(SPEC, auto_approve=True, keep_on_failure=False) == 1
+    assert fake.launched == [] and mutations(fake) == [] and infra.identity_reads == 0
+    err = capsys.readouterr().err
+    assert "infra/base has no cluster outputs" in err and "apply the base stack" in err and "make up" in err
+
+
+def test_a_refused_cleanup_node_delete_says_the_node_is_left_and_how_to_remove_it():
+    """Review C0-3: step 9 terminates the instance whether or not its Node can be deleted, so the refusal does not
+    say "does not terminate"; it says the Node stays and how to remove it once this project's cluster answers.
+    (A launching apply is refused before its launches, so only a refusal that comes later reaches step 9.)"""
+    infra = FakeInfra()
+    infra.cp_node_ip = OTHER_CP_IP
+    rec = make_rec(FakeLambda(types=TYPES), infra)
+    with pytest.raises(CommandError) as refused:
+        rec._delete_node("k3s-gpu-a6000-1")
+    message = str(refused.value)
+    assert infra.deleted_nodes == [] and OTHER_CP_IP in message and CP_IP in message
+    assert "does not terminate" not in message and "make tunnel" in message
+    assert "kubectl --kubeconfig ~/.kube/hybrid-gpu.yaml delete node k3s-gpu-a6000-1" in message
 
 
 def test_down_refuses_when_the_cluster_has_no_node_k3s_cp(capsys):
@@ -104,6 +152,69 @@ def test_down_refuses_when_node_k3s_cp_has_no_external_ip():
     infra.cp_node_ip = None
     assert make_rec(fake, infra).down(SPEC, auto_approve=True) == 1
     assert infra.deleted_nodes == [] and fake.terminated == []
+
+
+def test_down_never_drains_when_infra_base_cannot_be_read(capsys):
+    """Review C0-1 (a): not knowing infra/base's cp_ip is neither "gone" nor "same": nothing is drained through a
+    kubeconfig that may reach another cluster, and nothing is terminated undrained."""
+    fake, infra = FakeLambda(types=TYPES, instances=two_nodes()), FakeInfra(outputs={"workers": {}})  # no base
+    infra.cp_node_ip = OTHER_CP_IP
+    assert make_rec(fake, infra).down(SPEC, auto_approve=True) == 1
+    assert infra.deleted_nodes == [] and fake.terminated == [] and infra.identity_reads == 0
+    err = capsys.readouterr().err
+    assert "cannot read infra/base outputs" in err
+    assert "terraform -chdir=infra/base init" in err and "--no-drain" in err  # review X0-3: the fix for this cause
+
+
+def test_down_refuses_when_infra_base_has_no_cp_ip(capsys):
+    """Review C0-1 (c), S0-2: cp_internal_ip without cp_ip is a broken base stack, not R54's "no base stack outputs"
+    (test_partial_base_outputs_are_not_a_gone_cluster): refused, never terminated undrained."""
+    base = {"cp_internal_ip": "10.10.0.2", "cp_zone": "us-west1-b"}
+    fake, infra = FakeLambda(types=TYPES, instances=two_nodes()), FakeInfra(outputs={"base": base, "workers": {}})
+    assert make_rec(fake, infra).down(SPEC, auto_approve=True) == 1
+    assert infra.deleted_nodes == [] and fake.terminated == [] and infra.identity_reads == 0
+    err = capsys.readouterr().err
+    assert "no cp_ip output" in err and "make up" in err and "--no-drain" in err  # review X0-3
+
+
+def test_down_refuses_when_neither_the_identity_read_nor_the_probe_works(capsys):
+    """Review C0-1 (b)."""
+    fake, infra = FakeLambda(types=TYPES, instances=two_nodes()), FakeInfra()
+    infra.cp_node_ip = CommandError(["kubectl", "get", "node", "k3s-cp"], 1, "Unauthorized")
+
+    def probe_fails():
+        raise CommandError(["kubectl", "get", "--raw", "/readyz"], 1, "x509: certificate signed by unknown authority")
+    infra.api_unreachable = probe_fails
+    assert make_rec(fake, infra).down(SPEC, auto_approve=True) == 1
+    assert infra.deleted_nodes == [] and fake.terminated == [] and infra.identity_reads == 1
+    err = capsys.readouterr().err
+    assert "could not be probed either" in err and "make kubeconfig" in err
+
+
+def test_a_cluster_check_that_fails_part_way_refuses_the_later_nodes(capsys):
+    """Review C0-2/X0-2: an error out of the check fails that node, and the next node is refused too, never drained
+    unchecked."""
+    fake, infra = FakeLambda(types=TYPES, instances=two_nodes()), FakeInfra()
+
+    def kubeconfig_list():
+        raise ValueError("KUBECONFIG lists several files")
+    infra.kubeconfig_missing = kubeconfig_list
+    assert make_rec(fake, infra).down(SPEC, auto_approve=True) == 1
+    assert infra.deleted_nodes == [] and fake.terminated == []
+    err = capsys.readouterr().err
+    assert "KUBECONFIG lists several files" in err
+    assert "delete k3s-gpu-a6000-1" in err and "delete k3s-gpu-a6000-2" in err
+
+
+def test_each_run_checks_the_cluster_again():
+    """Review C0-1 (d): one Reconciler for several runs (the stretch autoscaler loop) reads the identity each run."""
+    fake, infra = FakeLambda(types=TYPES), FakeInfra()
+    rec = make_rec(fake, infra)
+    assert rec.apply(SPEC, auto_approve=True, keep_on_failure=False) == 0
+    assert infra.identity_reads == 1
+    infra.cp_node_ip = OTHER_CP_IP  # the tunnel now reaches another cluster
+    assert rec.down(SPEC, auto_approve=True) == 1
+    assert infra.identity_reads == 2 and infra.deleted_nodes == [] and fake.terminated == []
 
 
 def test_down_refuses_like_r54_when_the_identity_read_finds_no_api_server(capsys):
