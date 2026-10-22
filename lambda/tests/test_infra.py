@@ -319,10 +319,13 @@ def test_child_processes_never_get_the_lambda_api_key(tmp_path):  # X0-3
     assert env["LAMBDA_API_KEY"] == "secret_abc"  # the caller's mapping is untouched
 
 
-def test_cp_ssh_failure_raises():
+def test_cp_ssh_failure_raises(tmp_path):
     sh = FakeShell([BASE_OUTPUTS, fail(255, "ssh: connect to host failed")])
-    with pytest.raises(CommandError):
-        Infra(sh, ROOT, ENV).cp_ssh("sudo true")
+    with pytest.raises(CommandError, match="connect to host failed"):
+        Infra(sh, initialised(tmp_path, "base"), ENV).cp_ssh("sudo true")
+    # the failure came from the IAP SSH itself, not from an earlier step (e.g. a missing infra/base)
+    assert [c.args[:3] for c in sh.calls] == [["terraform", f"-chdir={tmp_path}/infra/base", "output"],
+                                              ["gcloud", "compute", "ssh"]]
 
 
 def test_kubectl_uses_the_cluster_kubeconfig():
