@@ -204,12 +204,17 @@ class FakeShell:
     """Replays `results` in order, one per run(), and records every call in `calls`.
 
     Like SubprocessShell, a non-zero exit code raises CommandError when check=True. A result that is an exception
-    is raised instead. Running out of results fails the test: every command a test causes must be scripted.
+    is raised instead. Running out of results fails the test: every command a test causes must be scripted. So does
+    leaving results unused (conftest.py checks every FakeShell a test made): a test whose commands never ran is
+    vacuous.
     """
+
+    created: list[FakeShell] = []  # every instance, for conftest.py's unused-results check
 
     def __init__(self, results: Iterable[subprocess.CompletedProcess[str] | Exception]) -> None:
         self.results = list(results)
         self.calls: list[ShellCall] = []
+        FakeShell.created.append(self)
 
     def run(self, args: Sequence[str], *, input: str | None = None, check: bool = True,
             timeout: float | None = None, env: Mapping[str, str] | None = None) -> subprocess.CompletedProcess[str]:
