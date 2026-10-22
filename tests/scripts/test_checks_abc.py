@@ -1296,7 +1296,7 @@ EXPECTED = [("A", "A1", "check_a1_nodes"), ("A", "A2", "check_a2_describe_nodes"
 def test_verify_registers_a_b_c_and_d_in_order():
     text = (ROOT / "scripts/verify.sh").read_text()
     regs = re.findall(r"^register_check (\w) (\w+) (?:'[^']*'|\"[^\"]*\") (\w+)$", text, re.M)
-    assert regs == EXPECTED
+    assert [r for r in regs if r[0] != "E"] == EXPECTED  # E (RESILIENCE=1): tests/scripts/test_checks_e.py
 
 
 def test_every_registered_function_is_defined_in_checks_sh():
