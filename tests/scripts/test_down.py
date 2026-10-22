@@ -18,6 +18,8 @@ STACKS = ("gpu-access", "workers", "base")  # brief step 4: destroyed in this or
 RT = "--request-timeout=60s"
 DRAIN = ["--ignore-daemonsets", "--delete-emptydir-data", "--force", "--timeout=120s", RT]
 GPU_LINE = "k3s-gpu-a6000-1 129.80.1.2 active gpu_1x_a6000 us-west-1"
+GPU_LINE_GOING = "k3s-gpu-a6000-1 129.80.1.2 terminating gpu_1x_a6000 us-west-1"
+GPU_LINE_BOOTING = "k3s-gpu-a6000-2 - booting gpu_1x_a6000 us-west-1"
 KEY = "lambda-secret-key-do-not-print-0123456789"
 CP_EXTERNAL_IP = 'jsonpath={.status.addresses[?(@.type=="ExternalIP")].address}'
 
@@ -40,6 +42,8 @@ def env(tmp_path):
 
 
 def down(env, stdin="", **extra):
+    """down.sh; Lambda is asked once per check unless the test sets DOWN_LAMBDA_WAIT_S (F2-3)."""
+    extra.setdefault("DOWN_LAMBDA_WAIT_S", "0")
     return env.script("down.sh", stdin=stdin, **extra)
 
 
@@ -220,23 +224,53 @@ def test_only_auto_approve_1_skips_the_question(env):
     assert_nothing_changed(env)
 
 
-def test_auto_approve_in_env_does_not_skip_the_question(env):
-    """Only the caller's AUTO_APPROVE=1 skips the question, never a line in .env (X0-3)."""
-    env.write_env(f"GCP_PROJECT={PROJECT}\nAUTO_APPROVE=1\n")
-    proc = down(env, stdin="")
-    assert proc.returncode == 2 and "Type the GCP project id" in proc.stderr
+def assert_env_refused(env, proc, name):
+    assert proc.returncode == 2, proc.stderr
+    assert "Type the GCP project id" not in proc.stderr and "AUTO_APPROVE=1: going on" not in proc.stderr
+    assert name in proc.stderr and ".env" in proc.stderr and "nothing was changed" in proc.stderr
     assert_nothing_changed(env)
 
 
-def test_env_cannot_redirect_the_teardown(env, tmp_path):
-    """.env is sourced with set -a: it cannot change which stacks are destroyed, which Nodes are drained or
-    which files are removed."""
+@pytest.mark.parametrize("line", ["AUTO_APPROVE=1", "export AUTO_APPROVE=1", "declare -g AUTO_APPROVE=1",
+                                  "AUTO_APPROVE=", "unset AUTO_APPROVE"])
+@pytest.mark.parametrize("caller", [None, "1"])
+def test_env_cannot_set_auto_approve(env, line, caller):
+    """Only the caller's AUTO_APPROVE=1 skips the question, never a line in .env (X0-3, F2-1): make down
+    refuses to run (exit 2, nothing changed) while .env touches AUTO_APPROVE, whatever the caller set."""
+    env.write_env(f"GCP_PROJECT={PROJECT}\n{line}\n")
+    proc = down(env, stdin="", **({"AUTO_APPROVE": caller} if caller else {}))
+    assert_env_refused(env, proc, "AUTO_APPROVE")
+
+
+@pytest.mark.parametrize("line", ["REPO_ROOT={other}", "RUN_DIR={other}", "KUBECONFIG_FILE={other}/kubeconfig",
+                                  "CPU_NODE_RE='.*'", "CP_NAME=k3s-cpu-1", "KC_REQUEST_TIMEOUT=1s",
+                                  "DESTROY_STACKS=bootstrap", "export RUN_DIR={other}"])
+def test_env_cannot_redirect_the_teardown(env, tmp_path, line):
+    """.env is sourced with set -a: a line that sets what down.sh destroys, drains or removes refuses the run
+    before the question (F2-1): nothing is drained, destroyed or removed, here or in the other directory."""
     other = tmp_path / "other"
     other.mkdir()
     (other / "known_hosts_x").write_text("keep\n")
     (other / "kubeconfig").write_text("keep\n")
-    env.write_env(f"GCP_PROJECT={PROJECT}\nDESTROY_STACKS=bootstrap\nRUN_DIR={other}\n"
-                  f"KUBECONFIG_FILE={other}/kubeconfig\nCPU_NODE_RE='.*'\nREPO_ROOT={other}\n")
+    env.write_env(f"GCP_PROJECT={PROJECT}\n{line.format(other=other)}\n")
+    proc = down(env, AUTO_APPROVE="1")
+    assert_env_refused(env, proc, line.split("=")[0].split()[-1])
+    assert (other / "known_hosts_x").exists() and (other / "kubeconfig").exists()
+
+
+@pytest.mark.parametrize("line", ["APPROVE=1", "PINNED_REPO_ROOT={other}", "PINNED_RUN_DIR={other}",
+                                  "PINNED_KUBECONFIG_FILE={other}/kubeconfig"])
+def test_env_cannot_reach_the_old_pinned_names(env, tmp_path, line):
+    """The names round 1 pinned with (APPROVE, PINNED_*) mean nothing to down.sh any more: the question is still
+    asked, and with AUTO_APPROVE=1 from the caller the teardown removes exactly this project's files (F2-1)."""
+    other = tmp_path / "other"
+    other.mkdir()
+    (other / "known_hosts_x").write_text("keep\n")
+    (other / "kubeconfig").write_text("keep\n")
+    env.write_env(f"GCP_PROJECT={PROJECT}\n{line.format(other=other)}\n")
+    proc = down(env, stdin="")
+    assert proc.returncode == 2 and "Type the GCP project id" in proc.stderr
+    assert_nothing_changed(env)
     proc = down(env, AUTO_APPROVE="1")
     assert proc.returncode == 0, proc.stderr
     assert calls(env) == sequence(env)
@@ -331,6 +365,8 @@ def test_a_gpu_node_still_on_lambda_after_the_teardown_fails_the_run(env):
     assert proc.returncode == 1
     assert calls(env) == sequence(env)
     assert GPU_LINE in proc.stderr and "still billing" in proc.stderr and "Lambda console" in proc.stderr
+    # make gpu-down drains each node through the cluster first, and the cluster is gone (F2-2).
+    assert "make gpu-down, or" not in proc.stderr and "make gpu-down cannot" in proc.stderr
     assert "make down: done" not in proc.stderr
     # Everything else was finished: the local cleanup ran.
     assert known_hosts(env) == [] and not env.kubeconfig.exists()
@@ -350,7 +386,70 @@ def test_a_failed_last_lambda_check_fails_the_run(env):
     assert proc.returncode == 1
     assert calls(env) == sequence(env)
     assert "could not" in proc.stderr and "scripts/gpuctl list-nodes" in proc.stderr
+    assert "Lambda console" in proc.stderr
+    assert "make gpu-down, or" not in proc.stderr and "make gpu-down cannot" in proc.stderr
     assert "make down: done" not in proc.stderr
+
+
+# ---- a node Lambda still lists right after its terminate (F2-3) ---------------------------------
+
+@pytest.mark.parametrize("then", [[GPU_LINE_GOING], []])
+def test_a_just_terminated_node_still_listed_as_active_is_not_a_false_alarm(env, then):
+    """gpuctl down terminated the node, then failed in sync-peers; Lambda may list the node as active for a
+    moment after the terminate call (reconcile.py _live_gpu_ips). down.sh asks again within its window and goes
+    on once the node is terminating or gone."""
+    env.scenario.update(gpu_down_rc=1, gpu_nodes=[GPU_LINE], gpu_nodes_then=then)
+    proc = down(env, AUTO_APPROVE="1", DOWN_LAMBDA_WAIT_S="2")
+    assert proc.returncode == 0, proc.stderr
+    assert calls(env) == [GPU_DOWN, LIST_GPU, LIST_GPU, *sequence(env)[1:]]
+    assert "asking again" in proc.stderr
+
+
+def test_a_terminating_node_is_not_live(env):
+    """terminating and terminated instances no longer bill: they never stop the teardown."""
+    env.scenario.update(gpu_down_rc=1, gpu_nodes=[GPU_LINE_GOING.replace("terminating", "terminated"),
+                                                  GPU_LINE_GOING])
+    proc = down(env, AUTO_APPROVE="1", DOWN_LAMBDA_WAIT_S="30")
+    assert proc.returncode == 0, proc.stderr
+    assert calls(env) == [GPU_DOWN, LIST_GPU, *sequence(env)[1:]]
+
+
+@pytest.mark.parametrize("line", [GPU_LINE, GPU_LINE_BOOTING])
+def test_a_node_still_live_after_the_window_stops_before_any_destroy(env, line):
+    env.scenario.update(gpu_down_rc=1, gpu_nodes=[line])
+    start = time.monotonic()
+    proc = down(env, AUTO_APPROVE="1", DOWN_LAMBDA_WAIT_S="1")
+    assert proc.returncode == 1
+    assert time.monotonic() - start < 10
+    got = calls(env)
+    assert got[:3] == [GPU_DOWN, LIST_GPU, LIST_GPU] and all(call == LIST_GPU for call in got[1:])
+    assert line in proc.stderr and "nothing was destroyed" in proc.stderr
+    assert env.kubeconfig.exists()
+
+
+def test_the_window_defaults_to_60_seconds(env):
+    env.scenario.update(gpu_down_rc=1, gpu_nodes=[GPU_LINE], gpu_nodes_then=[])
+    proc = env.script("down.sh", AUTO_APPROVE="1")
+    assert proc.returncode == 0, proc.stderr
+    assert "asking again in 5 s, for up to 60 s" in proc.stderr
+    assert calls(env) == [GPU_DOWN, LIST_GPU, LIST_GPU, *sequence(env)[1:]]
+
+
+def test_the_last_check_asks_again_too(env):
+    """The last check uses the same window: a node gpuctl down terminated may still be listed as active."""
+    env.scenario.update(gpu_nodes=[GPU_LINE], gpu_nodes_then=[])
+    proc = down(env, AUTO_APPROVE="1", DOWN_LAMBDA_WAIT_S="2")
+    assert proc.returncode == 0, proc.stderr
+    assert calls(env) == [*sequence(env), LIST_GPU]
+    assert "make down: done" in proc.stderr
+
+
+@pytest.mark.parametrize("value", ["abc", "-1", "1.5", "5s", "60 x"])
+def test_a_bad_lambda_window_refuses_before_asking(env, value):
+    proc = down(env, stdin=f"{PROJECT}\n", DOWN_LAMBDA_WAIT_S=value)
+    assert proc.returncode == 2 and "DOWN_LAMBDA_WAIT_S" in proc.stderr
+    assert "Type the GCP project id" not in proc.stderr
+    assert_nothing_changed(env)
 
 
 # ---- Ctrl-C ------------------------------------------------------------------------------------

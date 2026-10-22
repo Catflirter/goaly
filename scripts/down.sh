@@ -2,8 +2,11 @@
 # make down (spec §11): tear the whole environment down, in order. Takes no arguments.
 #
 #   1. ask once: type the GCP project id (GCP_PROJECT in .env) to go on; anything else, or end of input,
-#      exits 2 with nothing changed. AUTO_APPROVE=1 (exactly 1, from the caller's environment, never
-#      from .env) skips the question. Nothing after it asks again.
+#      exits 2 with nothing changed. AUTO_APPROVE=1 (exactly 1, from the caller's environment) skips the
+#      question. Nothing after it asks again. .env is sourced (load_env), but it may not set AUTO_APPROVE
+#      or anything that decides what is destroyed, drained or removed (REPO_ROOT, RUN_DIR,
+#      KUBECONFIG_FILE, CPU_NODE_RE, CP_NAME, KC_REQUEST_TIMEOUT, DESTROY_STACKS): they are readonly
+#      while it loads, and a .env that sets or unsets one refuses the run (exit 2, nothing changed).
 #   2. scripts/gpuctl down --auto-approve: every Lambda GPU node of this cluster (drained, deleted from
 #      the cluster, terminated) and the autoscaler overrides.
 #   3. drain every CPU worker (k3s-cpu-<n>) the cluster lists and delete its Node. An unreachable
@@ -23,16 +26,22 @@
 #   7. ask Lambda once more (scripts/gpuctl list-nodes): a GPU node of this cluster that is still live
 #      (started after step 2 by a stretch autoscaler still running, or by a concurrent gpu-apply) keeps
 #      billing with nothing left to join, the largest cost risk of spec §13. A listed node, or a list
-#      that fails, fails the run (exit 1) and says what to do.
+#      that fails, fails the run (exit 1) and says what to do: terminate it in the Lambda console, since
+#      make gpu-down drains each node through the cluster, which is gone by then.
+#
+# Asking Lambda (steps 2 and 7). Lambda may still list an instance as active for a moment after its
+# terminate call returned, so a listed node is asked about again every 5 s for up to DOWN_LAMBDA_WAIT_S
+# seconds (default 60; 0 asks once). A terminating or terminated instance is gone (it no longer bills);
+# an active, booting or unhealthy one still listed when the window ends is live.
 #
 # Failures, Ctrl-C and re-runs. Every step is safe to repeat, so a teardown that stopped part-way is
 # finished by running make down again. The first failing step stops the run (exit 1) and says what is
 # left. Ctrl-C stops the run where it is (exit 130): kubectl runs under timeout --foreground, so the
 # interrupt reaches it, and the INT trap keeps every later step from running.
 #   - gpuctl down failed: the run asks Lambda (scripts/gpuctl list-nodes) whether any GPU node of this
-#     cluster is still live. If one is, or Lambda cannot be asked, it stops before any destroy: a GPU
-#     node left running after gpu-access and base are gone keeps billing, outside the firewall model,
-#     with no cluster to join. If none is, the failure was in gpuctl down's firewall and peer step
+#     cluster is still live (see "Asking Lambda"). If one is, or Lambda cannot be asked, it stops
+#     before any destroy: a GPU node left running after gpu-access and base are gone keeps billing,
+#     outside the firewall model, with no cluster to join. If none is, the failure was in gpuctl down's firewall and peer step
 #     (on a re-run after the workers or base stack is destroyed, sync-peers cannot read their outputs,
 #     Ruling R29), which the destroys below make moot: the run goes on.
 #   - a terraform init or destroy failed: the stacks after it are not touched (each one reads the base
@@ -58,7 +67,7 @@ confirm_project() {
   log "    the static IPs and the firewall rules"
   log "It keeps the bootstrap stack: the Terraform state bucket gs://$GCP_PROJECT-k3s-tfstate and the enabled APIs."
   log "Stop the stretch autoscaler first if it is running (Ctrl-C it): it could start a GPU node again."
-  if [[ "$APPROVE" == 1 ]]; then
+  if [[ "${AUTO_APPROVE:-}" == 1 ]]; then
     log "[AUTO_APPROVE=1: going on without asking]"
     return 0
   fi
@@ -76,19 +85,53 @@ interrupted() {
   exit "$1"
 }
 
+# env_refused STATUS: the EXIT trap while .env loads. load_env exits 2 itself, with its reason, for a
+# missing or non-private .env; status 1 is a line of .env that failed, such as an assignment to one of the
+# readonly variables above (bash names it).
+env_refused() {
+  (( $1 == 1 )) || return 0
+  log "error: $REPO_ROOT/.env could not be loaded (see above): it must not set or unset AUTO_APPROVE (only the caller's environment may), $PINNED_NAMES; remove that line from .env. make down refused; nothing was changed"
+  exit 2
+}
+
+# live_gpu_nodes: Lambda's GPU nodes of this cluster that still bill, one line each (list-nodes' third
+# field is the status: terminating and terminated ones do not count). Fails when Lambda cannot be asked.
+live_gpu_nodes() {
+  local listed
+  listed="$("$REPO_ROOT/scripts/gpuctl" list-nodes < /dev/null)" || return 1
+  printf '%s\n' "$listed" | awk 'NF && $3 != "terminating" && $3 != "terminated"'
+}
+
+# lambda_clear: ask Lambda until it lists no live GPU node of this cluster, for up to LAMBDA_WAIT_S
+# seconds (see "Asking Lambda" in the header). Returns 0 when none is live, 1 when LIVE_NODES (set
+# here) are still live at the end of the window, 2 when Lambda cannot be asked.
+lambda_clear() {
+  local deadline=$(( SECONDS + LAMBDA_WAIT_S )) pause
+  while true; do
+    LIVE_NODES="$(live_gpu_nodes)" || return 2
+    [[ -z "$LIVE_NODES" ]] && return 0
+    (( SECONDS < deadline )) || return 1
+    pause=$(( deadline - SECONDS ))
+    (( pause <= 5 )) || pause=5
+    log "Lambda still lists a GPU node of this cluster as live (a node just terminated can be listed as active for a moment): asking again in $pause s, for up to $LAMBDA_WAIT_S s in all"
+    sleep "$pause"
+  done
+}
+
 # Step 2. On failure, Lambda decides whether the teardown may go on (see the header).
 gpu_down() {
-  local rc=0 nodes
+  local rc=0 clear=0
   log "==> GPU nodes: scripts/gpuctl down"
   "$REPO_ROOT/scripts/gpuctl" down --auto-approve < /dev/null || rc=$?
   (( rc == 0 )) && return 0
   log "scripts/gpuctl down failed (exit $rc); asking Lambda which GPU nodes of this cluster are still live"
-  if ! nodes="$("$REPO_ROOT/scripts/gpuctl" list-nodes < /dev/null)"; then
+  lambda_clear || clear=$?
+  if (( clear == 2 )); then
     die "cannot list the GPU nodes on Lambda either: nothing was destroyed. Fix the error above (scripts/gpuctl status shows the GPU nodes) and re-run make down"
   fi
-  if [[ -n "$nodes" ]]; then
+  if (( clear == 1 )); then
     log "GPU nodes still live on Lambda (they keep billing):"
-    log "$(printf '%s\n' "$nodes" | sed 's/^/  /')"
+    log "$(printf '%s\n' "$LIVE_NODES" | sed 's/^/  /')"
     die "scripts/gpuctl down did not remove them, so nothing was destroyed: the gpu-access and base stacks stay until they are gone. If the cluster is unreachable, bring the API tunnel up (make tunnel) and re-run make down; if it cannot be reached at all, terminate them in the Lambda console and re-run make down"
   fi
   log "warning: Lambda lists no GPU node of this cluster, so no GPU node is left outside the firewall model; going on (the destroys below remove the gpu-access stack and k3s-cp)"
@@ -165,33 +208,40 @@ stacks_after() {
 }
 
 # Step 7 (spec §13): no GPU node of this cluster may be left billing on Lambda.
+# make gpu-down cannot help here: gpuctl down drains each node through the cluster before it terminates
+# it, and k3s-cp, the base stack and the kubeconfig are gone.
 check_lambda() {
-  local nodes
+  local clear=0 why="make gpu-down cannot do it now: it drains each node through the cluster first, and the cluster is destroyed"
   log "==> Lambda: is any GPU node of this cluster still live?"
-  if ! nodes="$("$REPO_ROOT/scripts/gpuctl" list-nodes < /dev/null)"; then
-    die "everything else is torn down, but Lambda could not be asked whether a GPU node of this cluster is still live (error above): run scripts/gpuctl list-nodes, and terminate any node it lists (make gpu-down, or the Lambda console)"
+  lambda_clear || clear=$?
+  if (( clear == 2 )); then
+    die "everything else is torn down, but Lambda could not be asked whether a GPU node of this cluster is still live (error above): run scripts/gpuctl list-nodes, and terminate any node it lists in the Lambda console ($why)"
   fi
-  if [[ -n "$nodes" ]]; then
+  if (( clear == 1 )); then
     log "GPU nodes still billing on Lambda:"
-    log "$(printf '%s\n' "$nodes" | sed 's/^/  /')"
-    die "GPU nodes still billing on Lambda: terminate them (make gpu-down, or the Lambda console), then check that scripts/gpuctl list-nodes prints nothing. Everything else is torn down; the bootstrap stack is kept"
+    log "$(printf '%s\n' "$LIVE_NODES" | sed 's/^/  /')"
+    die "GPU nodes still billing on Lambda: terminate them in the Lambda console ($why), then check that scripts/gpuctl list-nodes prints nothing. Everything else is torn down; the bootstrap stack is kept"
   fi
 }
 
 (( $# == 0 )) || usage
-# Read before .env is sourced (load_env exports every line of it): only the caller's AUTO_APPROVE skips
-# the question, and .env cannot change what is destroyed, drained or removed.
-APPROVE="${AUTO_APPROVE:-}"
-PINNED_REPO_ROOT="$REPO_ROOT" PINNED_RUN_DIR="$RUN_DIR" PINNED_KUBECONFIG_FILE="$KUBECONFIG_FILE"
-PINNED_CPU_NODE_RE="$CPU_NODE_RE" PINNED_KC_REQUEST_TIMEOUT="$KC_REQUEST_TIMEOUT" PINNED_CP_NAME="$CP_NAME"
-load_env
-REPO_ROOT="$PINNED_REPO_ROOT" RUN_DIR="$PINNED_RUN_DIR" KUBECONFIG_FILE="$PINNED_KUBECONFIG_FILE"
-CPU_NODE_RE="$PINNED_CPU_NODE_RE" KC_REQUEST_TIMEOUT="$PINNED_KC_REQUEST_TIMEOUT" CP_NAME="$PINNED_CP_NAME"
 # Brief step 4: destroyed in this order. gpu-access and workers read the base stack's state.
 DESTROY_STACKS="gpu-access workers base"
+# Frozen before .env is sourced (load_env exports every line of it, F2-1): the caller's AUTO_APPROVE (set
+# or unset) is the only one that skips the question, and .env cannot change what is destroyed, drained or
+# removed. A line of .env that sets or unsets one of them fails, and env_refused stops the run.
+PINNED_NAMES="REPO_ROOT, RUN_DIR, KUBECONFIG_FILE, CPU_NODE_RE, CP_NAME, KC_REQUEST_TIMEOUT or DESTROY_STACKS"
+readonly AUTO_APPROVE REPO_ROOT RUN_DIR KUBECONFIG_FILE CPU_NODE_RE CP_NAME KC_REQUEST_TIMEOUT DESTROY_STACKS
+readonly PINNED_NAMES
+trap 'env_refused $?' EXIT
+load_env
+trap - EXIT
 KC_KILL_S="${DOWN_KC_KILL_S:-180}"
 [[ "$KC_KILL_S" =~ ^[1-9][0-9]*$ ]] \
   || die "DOWN_KC_KILL_S='$KC_KILL_S' is not a whole number of seconds (default 180): nothing was changed" 2
+LAMBDA_WAIT_S="${DOWN_LAMBDA_WAIT_S:-60}"
+[[ "$LAMBDA_WAIT_S" =~ ^(0|[1-9][0-9]{0,3})$ ]] \
+  || die "DOWN_LAMBDA_WAIT_S='$LAMBDA_WAIT_S' is not a whole number of seconds from 0 to 9999 (default 60): nothing was changed" 2
 # Only scripts/gpuctl needs the Lambda API key, and it loads .env itself: keep the key out of terraform,
 # kubectl and the tunnel.
 unset LAMBDA_API_KEY

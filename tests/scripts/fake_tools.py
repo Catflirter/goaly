@@ -60,6 +60,8 @@ Teardown (Task 22a, scripts/down.sh):
                                           gpuctl does (it catches KeyboardInterrupt)
   gpu_nodes      [line]                   what `scripts/gpuctl list-nodes` prints, one line each (default none)
   late_gpu_nodes [line]                   ... and these too, from its second call on (a node started meanwhile)
+  gpu_nodes_then [line]                   from its second call on, printed instead of gpu_nodes (a node Lambda
+                                          still listed as active right after its terminate call)
   list_nodes_rc  rc                       exit code of `scripts/gpuctl list-nodes` (default 0)
 
 `scripts/gpuctl down` and `list-nodes` log what they read on stdin as "stdin" (down.sh gives them /dev/null).
@@ -282,8 +284,10 @@ def gpuctl():
                 return 1
         return SCENARIO.get("gpu_down_rc", 0)
     if ARGS[:1] == ["list-nodes"]:
-        late = SCENARIO.get("late_gpu_nodes", []) if counter("list-nodes") else []
-        for line in SCENARIO.get("gpu_nodes", []) + late:
+        later = counter("list-nodes") > 0
+        late = SCENARIO.get("late_gpu_nodes", []) if later else []
+        nodes = SCENARIO["gpu_nodes_then"] if later and "gpu_nodes_then" in SCENARIO else SCENARIO.get("gpu_nodes", [])
+        for line in nodes + late:
             print(line)
         return SCENARIO.get("list_nodes_rc", 0)
     return 1
