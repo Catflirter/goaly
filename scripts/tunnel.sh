@@ -11,9 +11,11 @@
 # start and stop hold a lock (.run/tunnel.lock), so `make tunnel` during `make up`'s tunnel step
 # waits for it instead of launching a second tunnel that would orphan the first.
 #
-# The tunnel binds 127.0.0.1 explicitly, so a GatewayPorts setting in the operator's ssh config
-# cannot expose the API on the LAN. Test seam: K3S_TUNNEL_TEST_PORT replaces the local port 6443;
-# only the offline tests set it (the kubeconfig always points at 6443).
+# The forward is spec §8's -L 6443:127.0.0.1:6443. It names no bind address, so ssh listens on the
+# loopback addresses only unless GatewayPorts is on. start passes -o GatewayPorts=no, and ssh takes
+# a command-line option over any ssh config file, so a `GatewayPorts yes` in the operator's ssh
+# config cannot expose the cluster-admin API on the LAN. Test seam: K3S_TUNNEL_TEST_PORT replaces
+# the local port 6443; only the offline tests set it (the kubeconfig always points at 6443).
 set -euo pipefail
 
 # shellcheck disable=SC1091  # common.sh is linted on its own
@@ -22,8 +24,8 @@ source "$(dirname -- "${BASH_SOURCE[0]}")/lib/common.sh"
 PIDFILE="$RUN_DIR/tunnel.pid"
 LOGFILE="$RUN_DIR/tunnel.log"
 LOCAL_PORT="${K3S_TUNNEL_TEST_PORT:-6443}"
-# Also the marker that identifies our tunnel among running processes.
-FORWARD="127.0.0.1:$LOCAL_PORT:127.0.0.1:6443"
+# "-L $FORWARD" also identifies our tunnel among running processes (tunnel_pid).
+FORWARD="$LOCAL_PORT:127.0.0.1:6443"
 TIMEOUT="${TUNNEL_TIMEOUT_S:-30}"
 LOCKFILE="$RUN_DIR/tunnel.lock"
 BREAKFILE="$LOCKFILE.break"
@@ -90,14 +92,15 @@ unlock() {
 }
 
 # tunnel_pid: print the PID in $PIDFILE if that process is alive and is this tunnel (its command
-# line holds $FORWARD); 1 otherwise. A recycled PID that now belongs to something else is not ours.
+# line holds the arguments -L $FORWARD); 1 otherwise. A recycled PID that now belongs to something
+# else is not ours, nor is another forward that ends in ours, such as -L 16443:127.0.0.1:6443.
 tunnel_pid() {
   local pid
   [[ -f "$PIDFILE" ]] || return 1
   pid="$(cat -- "$PIDFILE")" || return 1
   [[ "$pid" =~ ^[1-9][0-9]*$ ]] || return 1
   kill -0 "$pid" 2> /dev/null || return 1
-  [[ "$(ps -ww -p "$pid" -o command= 2> /dev/null)" == *"$FORWARD"* ]] || return 1
+  [[ " $(ps -ww -p "$pid" -o command= 2> /dev/null) " == *" -L $FORWARD "* ]] || return 1
   printf '%s\n' "$pid"
 }
 
@@ -174,7 +177,7 @@ start() {
   # it runs and ssh's IAP ProxyCommand together; nohup keeps it alive when the terminal closes.
   set -m
   nohup gcloud compute ssh "$CP_NAME" --project "$GCP_PROJECT" --zone "$CP_ZONE" --tunnel-through-iap --quiet \
-    -- -N -L "$FORWARD" -o ExitOnForwardFailure=yes -o ServerAliveInterval=30 \
+    -- -N -L "$FORWARD" -o ExitOnForwardFailure=yes -o ServerAliveInterval=30 -o GatewayPorts=no \
     < /dev/null > "$LOGFILE" 2>&1 &
   pid=$!
   set +m

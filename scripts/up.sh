@@ -3,13 +3,16 @@
 #
 #   up.sh init   make init: the Terraform state bucket and the GCP APIs (infra/bootstrap, local state)
 #   up.sh base   the base stack, k3s on k3s-cp, kubeconfig, API tunnel; waits for k3s-cp and CoreDNS
-#   up.sh all    make up: every stage below in order, init excepted (it is one-time, spec §3.1)
+#   up.sh all    make up: the stages in ALL_STAGES below, in order. init is not one of them: spec
+#                §11's make up starts at base, and spec §3.1 applies the bootstrap stack once, by hand
 #
 # Each terraform apply shows its plan and asks first (AUTO_APPROVE=1 skips the question). The base
-# stage applies with --no-destroy: under AUTO_APPROVE=1 a plan that would destroy or replace
-# anything there (k3s-cp) is refused. A deliberate replacement of k3s-cp (a ForceNew change such as
-# its image, machine type or startup metadata) runs `make up` interactively, where the plan's
-# destroys are listed and confirmed. A plan without changes applies nothing.
+# stage applies with --no-destroy, since spec §3.1 applies the base stack only after a manual review
+# of its plan: under AUTO_APPROVE=1 a plan that would destroy or replace anything there (k3s-cp) is
+# refused, so an unattended make up never recreates the control plane. A deliberate replacement of
+# k3s-cp (a change Terraform can only make by recreating it, such as a new zone) runs `make up`
+# interactively, where the plan's destroys are listed and confirmed. A plan without changes applies
+# nothing.
 set -euo pipefail
 
 # shellcheck disable=SC1091  # common.sh is linted on its own

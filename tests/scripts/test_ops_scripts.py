@@ -121,7 +121,8 @@ class Env:
         return self.home / ".kube/hybrid-gpu.yaml"
 
     def forward(self):
-        return f"127.0.0.1:{self.port}:127.0.0.1:6443"
+        """Spec §8's -L 6443:127.0.0.1:6443, with the test port in place of the local 6443."""
+        return f"{self.port}:127.0.0.1:6443"
 
     @property
     def lockfile(self):
@@ -519,9 +520,10 @@ def test_kubeconfig_failed_ssh_leaves_nothing(env):
 # ---- tunnel.sh -------------------------------------------------------------------------------
 
 def tunnel_argv(env):
+    """The brief's ssh arguments verbatim, then -o GatewayPorts=no (S0-2)."""
     return ["compute", "ssh", "k3s-cp", "--project", PROJECT, "--zone", "us-west1-b", "--tunnel-through-iap",
             "--quiet", "--", "-N", "-L", env.forward(), "-o", "ExitOnForwardFailure=yes",
-            "-o", "ServerAliveInterval=30"]
+            "-o", "ServerAliveInterval=30", "-o", "GatewayPorts=no"]
 
 
 def tunnels(env):
@@ -559,6 +561,35 @@ def test_tunnel_start_status_stop(env):
     assert wait_gone(pid) and not env.pidfile.exists()
     assert env.script("tunnel.sh", "status").returncode == 1
     assert env.script("tunnel.sh", "stop").returncode == 0, "stop is idempotent"
+
+
+def test_tunnel_forward_stays_on_loopback_whatever_the_ssh_config_says(env, tmp_path):
+    """Spec §8's -L 6443:127.0.0.1:6443 names no bind address, so with `GatewayPorts yes` in the
+    operator's ssh config ssh would listen on every interface and open the cluster-admin API to the
+    LAN. tunnel.sh adds -o GatewayPorts=no, and ssh takes a command-line option over any config file
+    (S0-2). Checked with the real ssh client: -G prints the configuration it would use and connects
+    to nothing. The arguments go after the host, where gcloud puts them."""
+    ssh = shutil.which("ssh")
+    if ssh is None:
+        pytest.skip("no ssh client on PATH")
+    make_kubeconfig(env)
+    assert env.script("tunnel.sh", "start").returncode == 0
+    [argv] = tunnels(env)
+    config = tmp_path / "ssh_config"
+    config.write_text("Host *\n  GatewayPorts yes\n")
+    config.chmod(0o600)
+
+    def effective(ssh_args):
+        proc = subprocess.run([ssh, "-G", "-F", str(config), "k3s-cp", *ssh_args],
+                              capture_output=True, text=True, timeout=30)
+        assert proc.returncode == 0, proc.stderr
+        return proc.stdout.splitlines()
+
+    brief_only = ["-N", "-L", env.forward(), "-o", "ExitOnForwardFailure=yes", "-o", "ServerAliveInterval=30"]
+    assert "gatewayports yes" in effective(brief_only), "the config does turn it on for the brief's arguments"
+    used = effective(argv[argv.index("--") + 1:])
+    assert "gatewayports no" in used
+    assert f"localforward {env.port} [127.0.0.1]:6443" in used
 
 
 def test_tunnel_stop_kills_the_whole_process_group(env):
@@ -615,6 +646,26 @@ def test_tunnel_never_kills_an_unrelated_process_named_in_the_pidfile(env):
         assert env.script("tunnel.sh", "status").returncode == 1
     finally:
         other.kill()
+        other.wait()
+
+
+def test_tunnel_never_kills_another_forward_named_in_the_pidfile(env):
+    """Our forward PORT:127.0.0.1:6443 is the tail of others, such as 1PORT:127.0.0.1:6443 (an
+    operator's own tunnel to another cluster): a recycled PID that runs one is not ours either."""
+    other = subprocess.Popen(["bash", "-c", "sleep 30; :", "other-tunnel", "-N", "-L",
+                              f"1{env.port}:127.0.0.1:6443", "-o", "ExitOnForwardFailure=yes"],
+                             start_new_session=True)
+    try:
+        env.pidfile.parent.mkdir()
+        env.pidfile.write_text(f"{other.pid}\n")
+        assert env.script("tunnel.sh", "stop").returncode == 0
+        assert other.poll() is None, "another forward's process must not be killed"
+        assert env.script("tunnel.sh", "status").returncode == 1
+    finally:
+        try:
+            os.killpg(other.pid, signal.SIGKILL)  # bash and its sleep
+        except ProcessLookupError:
+            pass
         other.wait()
 
 
