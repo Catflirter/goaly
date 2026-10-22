@@ -133,6 +133,13 @@ gpu-down: ## Delete every Lambda GPU node and the autoscaler overrides (AUTO_APP
 gpu-status: ## Show GPU capacity, GPU instances and drift (changes no cloud state; may terraform init locally; exit 3 on drift)
 	$(ROOT)/scripts/gpuctl status
 
+# Stretch S4 (spec §10.2, §10.4, §10.5): the autoscaler loop runs here, on the operator machine. Ctrl-C stops it
+# after the current action; make gpu-down / make cpu-scale N=1 finish by hand. AUTOSCALE_ARGS adds options
+# (--dry-run, --once, --cpu-max N, --interval S, --log DIR). Every decision goes to verification/autoscale-<ts>/.
+.PHONY: autoscale
+autoscale: ## Run the autoscaler every 20 s: CPU workers via cpu-pool.sh --guarded, GPU pools via gpuctl (Ctrl-C stops)
+	$(ROOT)/$(PY) $(ROOT)/scripts/autoscaler.py $(AUTOSCALE_ARGS)
+
 .PHONY: sync-peers
 sync-peers: ## Rewrite the peer allow-lists (cp k3s_peers set, Lambda firewall) from the current node IPs
 	$(ROOT)/scripts/gpuctl sync-peers

@@ -1,0 +1,41 @@
+# Stretch S4 (spec §10.2): CPU node-layer demo. Each replica reserves 600m CPU and sleeps, so a few replicas
+# leave Pods Pending with "Insufficient cpu" on the e2-small workers and scripts/autoscaler.py adds a worker.
+# It burns no CPU itself. Scale it with: kc -n scale-demo scale deploy/cpu-hog --replicas=4 (0 to release).
+# The scale-demo Namespace comes from scale-demo.yaml (stretch S1).
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: cpu-hog
+  namespace: scale-demo
+spec:
+  replicas: 0
+  selector:
+    matchLabels:
+      app: cpu-hog
+  template:
+    metadata:
+      labels:
+        app: cpu-hog
+    spec:
+      automountServiceAccountToken: false
+      securityContext:
+        runAsNonRoot: true
+        runAsUser: 65534
+        runAsGroup: 65534
+        seccompProfile:
+          type: RuntimeDefault
+      containers:
+        - name: cpu-hog
+          image: docker.io/library/busybox:1.37@sha256:bdf57e528e45e4433820e045b29b4597825a1c9e38353532d90a01445013f82e
+          command: ["sleep", "infinity"]
+          resources:
+            requests:
+              cpu: 600m
+              memory: 32Mi
+            limits:
+              cpu: 600m
+              memory: 32Mi
+          securityContext:
+            allowPrivilegeEscalation: false
+            capabilities:
+              drop: [ALL]
