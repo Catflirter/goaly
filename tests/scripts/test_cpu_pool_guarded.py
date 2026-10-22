@@ -70,6 +70,7 @@ def ips(*numbers):
 # ---- scale up --------------------------------------------------------------------------------------
 
 def test_guarded_scale_up_checks_the_saved_plan_then_applies_it(env):
+    set_pool(env, ["k3s-cpu-1"])  # not the committed inventory, whose machine types may change
     workers(env, ips(1), after=ips(1, 2))
     env.scenario["changes"] = {"workers": [*creates("k3s-cpu-2"), *SHARED]}
     env.scenario["ready"] = ["k3s-cpu-1"]
