@@ -204,6 +204,18 @@ def test_status_unreadable_sources_are_skipped_with_exit_0(capsys):
     captured = capsys.readouterr()
     assert captured.out.count("skipped: ") == 3
     assert "kubectl get nodes" in captured.err  # the reason goes to stderr
+    # B-3: a skipped source is not an all-clear, so the summary never reads as a bare "No drift"
+    assert "  No drift in the 2 sources read; 3 source(s) skipped (see above)\n" in captured.out
+    assert "  No drift\n" not in captured.out
+
+
+def test_status_with_the_gpu_access_state_skipped_says_so_in_the_summary(capsys):  # B-3
+    fake = FakeLambda(types=TYPES, instances=[NODE])
+    infra = consistent_infra(init_fail={"gpu-access"})  # e.g. GCS unreachable: the stale-firewall check is lost
+    assert main(["status"], env=ENV, client=fake, infra=infra) == 0  # skipped sources stay exit 0 (brief)
+    out = capsys.readouterr().out
+    assert "skipped: gpu-access state unavailable" in out
+    assert out.rstrip().endswith("No drift in the 4 sources read; 1 source(s) skipped (see above)")
 
 
 def test_status_drift_uses_the_override_target(tmp_path, monkeypatch, capsys):

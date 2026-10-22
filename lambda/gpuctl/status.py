@@ -50,6 +50,8 @@ def render_capacity(rows: list[CapacityRow]) -> str:
 
 SKIPPED_PREFIX = "skipped: "
 SECURITY_PREFIX = "SECURITY: "
+# The sources find_drift compares, in the order of its "skipped: <source> unavailable" lines.
+DRIFT_SOURCES = ("target counts", "Lambda instances", "cluster nodes", "gpu-access state", "cp k3s_peers set")
 
 
 def _stale_and_missing(listed: Iterable[str], live_ips: set[str], what: str) -> tuple[list[str], list[str]]:
@@ -69,8 +71,7 @@ def find_drift(*, counts: Mapping[str, int] | None, instances: Iterable[Instance
     a problem, and every comparison needing it is left out. `nft_elements` holds only the GPU entries of k3s_peers
     (the caller removes the cp and worker addresses). Instances that are not ours or not live are ignored.
     """
-    sources = {"target counts": counts, "Lambda instances": instances, "cluster nodes": cluster_nodes,
-               "gpu-access state": tf_ips, "cp k3s_peers set": nft_elements}
+    sources = dict(zip(DRIFT_SOURCES, (counts, instances, cluster_nodes, tf_ips, nft_elements), strict=True))
     skipped = [f"{SKIPPED_PREFIX}{name} unavailable" for name, value in sources.items() if value is None]
     if instances is None:
         return skipped
