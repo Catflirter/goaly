@@ -1,0 +1,260 @@
+# Prometheus, one instance (spec §10.0): 24h retention on a size-limited emptyDir, on k3s-cpu-1.
+#
+# What it scrapes, and how (no new firewall rule, no public port, spec §10.0):
+#   - every target is a Pod IP found by Pod service discovery in two namespaces (Roles below, no
+#     ClusterRole): node-exporter and dcgm-exporter in monitoring-host, kube-state-metrics in monitoring.
+#     Pod IPs sit on the flannel WireGuard network, so scrapes from k3s-cpu-1 to k3s-cp or a Lambda node
+#     ride the existing udp/51820 tunnels; no exporter listens on a node IP (no hostNetwork, no hostPort).
+#   - service discovery itself is an in-cluster API client: the kubernetes Service, i.e. k3s-cp:6443,
+#     which every worker may already reach (spec §3.1).
+#   - no kubelet/cAdvisor job. Scraping kubelets directly needs worker -> node:10250, which the firewall
+#     model only allows from k3s-cp (spec §4.2); the API server proxy path needs RBAC on nodes/proxy, which
+#     also lets its holder run commands in any Pod through the kubelet. Node figures come from
+#     node-exporter, Pod CPU from metrics-server (kubectl top, the HPA), replica counts from
+#     kube-state-metrics.
+# Config changes: --config.auto-reload re-reads the mounted ConfigMap when its content changes (the
+# kubelet refreshes the volume within about a minute), so no reloader sidecar and no lifecycle API.
+# Retention lives in the config file: the command-line retention flags are deprecated in Prometheus 3.
+# The data is an emptyDir: it survives container restarts, not a new Pod (redeploy, node drain). A
+# local-path PVC would tie the Pod to one node's disk for the stack's lifetime; for a demo stack the
+# last 24h of the current Pod is enough (spec §10.0: "实时看、能回看").
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: prometheus-config
+  namespace: monitoring
+  labels:
+    app.kubernetes.io/name: prometheus
+    app.kubernetes.io/part-of: monitoring
+data:
+  prometheus.yml: |
+    global:
+      scrape_interval: 15s
+      scrape_timeout: 10s
+      external_labels:
+        cluster: hybrid-gpu
+    storage:
+      tsdb:
+        retention:
+          time: 24h
+          size: 1GB
+    scrape_configs:
+      - job_name: prometheus
+        static_configs:
+          - targets: ["localhost:9090"]
+
+      # One target per node (DaemonSet). instance and node are the node name.
+      - job_name: node-exporter
+        kubernetes_sd_configs:
+          - role: pod
+            namespaces:
+              names: [monitoring-host]
+        relabel_configs:
+          - source_labels: [__meta_kubernetes_pod_label_app_kubernetes_io_name, __meta_kubernetes_pod_container_port_name]
+            regex: node-exporter;metrics
+            action: keep
+          - source_labels: [__meta_kubernetes_pod_phase]
+            regex: Running
+            action: keep
+          - source_labels: [__meta_kubernetes_pod_node_name]
+            target_label: node
+          - source_labels: [__meta_kubernetes_pod_node_name]
+            target_label: instance
+
+      # One target per admin-labelled GPU node; none while no GPU node runs.
+      - job_name: dcgm-exporter
+        kubernetes_sd_configs:
+          - role: pod
+            namespaces:
+              names: [monitoring-host]
+        relabel_configs:
+          - source_labels: [__meta_kubernetes_pod_label_app_kubernetes_io_name, __meta_kubernetes_pod_container_port_name]
+            regex: dcgm-exporter;metrics
+            action: keep
+          - source_labels: [__meta_kubernetes_pod_phase]
+            regex: Running
+            action: keep
+          - source_labels: [__meta_kubernetes_pod_node_name]
+            target_label: node
+          - source_labels: [__meta_kubernetes_pod_node_name]
+            target_label: instance
+
+      # kube-state-metrics' own namespace/pod/deployment labels describe the objects: keep them.
+      - job_name: kube-state-metrics
+        honor_labels: true
+        kubernetes_sd_configs:
+          - role: pod
+            namespaces:
+              names: [monitoring]
+        relabel_configs:
+          - source_labels: [__meta_kubernetes_pod_label_app_kubernetes_io_name, __meta_kubernetes_pod_container_port_name]
+            regex: kube-state-metrics;http-metrics
+            action: keep
+          - source_labels: [__meta_kubernetes_pod_phase]
+            regex: Running
+            action: keep
+---
+apiVersion: v1
+kind: ServiceAccount
+metadata:
+  name: prometheus
+  namespace: monitoring
+  labels:
+    app.kubernetes.io/name: prometheus
+    app.kubernetes.io/part-of: monitoring
+---
+# Pod discovery only, and only in the two monitoring namespaces: no ClusterRole, no nodes, no secrets.
+apiVersion: rbac.authorization.k8s.io/v1
+kind: Role
+metadata:
+  name: prometheus-discovery
+  namespace: monitoring
+rules:
+  - apiGroups: [""]
+    resources: ["pods"]
+    verbs: ["get", "list", "watch"]
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: RoleBinding
+metadata:
+  name: prometheus-discovery
+  namespace: monitoring
+roleRef:
+  apiGroup: rbac.authorization.k8s.io
+  kind: Role
+  name: prometheus-discovery
+subjects:
+  - kind: ServiceAccount
+    name: prometheus
+    namespace: monitoring
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: Role
+metadata:
+  name: prometheus-discovery
+  namespace: monitoring-host
+rules:
+  - apiGroups: [""]
+    resources: ["pods"]
+    verbs: ["get", "list", "watch"]
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: RoleBinding
+metadata:
+  name: prometheus-discovery
+  namespace: monitoring-host
+roleRef:
+  apiGroup: rbac.authorization.k8s.io
+  kind: Role
+  name: prometheus-discovery
+subjects:
+  - kind: ServiceAccount
+    name: prometheus
+    namespace: monitoring
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: prometheus
+  namespace: monitoring
+  labels:
+    app.kubernetes.io/name: prometheus
+    app.kubernetes.io/part-of: monitoring
+spec:
+  replicas: 1
+  # Recreate: never two Prometheus Pods (and their memory) on k3s-cpu-1 at once; the data is per Pod anyway.
+  strategy:
+    type: Recreate
+  revisionHistoryLimit: 2
+  selector:
+    matchLabels:
+      app.kubernetes.io/name: prometheus
+  template:
+    metadata:
+      labels:
+        app.kubernetes.io/name: prometheus
+        app.kubernetes.io/part-of: monitoring
+    spec:
+      serviceAccountName: prometheus
+      automountServiceAccountToken: true  # Pod discovery reads the API with this token
+      # k3s-cpu-1 is never removed (global constraints). Pinned there, the monitoring Pods never keep a
+      # scaled-up worker busy, so the CPU pool can always shrink back (stretch S2/S4). No tolerations:
+      # never k3s-cp (CriticalAddonsOnly NoExecute) or a GPU node (nvidia.com/gpu NoSchedule).
+      nodeSelector:
+        kubernetes.io/hostname: k3s-cpu-1
+      securityContext:
+        runAsNonRoot: true
+        runAsUser: 65534
+        runAsGroup: 65534
+        fsGroup: 65534
+        seccompProfile:
+          type: RuntimeDefault
+      containers:
+        - name: prometheus
+          image: quay.io/prometheus/prometheus:v3.15.1@sha256:fa3302279710be2f21a8301ec17a8b4f2301fd829bd113839b3b6b02b6f191a2
+          args:
+            - --config.file=/etc/prometheus/prometheus.yml
+            - --config.auto-reload
+            - --config.auto-reload-interval=30s
+            - --storage.tsdb.path=/prometheus
+            - --web.listen-address=:9090
+          ports:
+            - name: web
+              containerPort: 9090
+              protocol: TCP
+          readinessProbe:
+            httpGet:
+              path: /-/ready
+              port: web
+            periodSeconds: 10
+          livenessProbe:
+            httpGet:
+              path: /-/healthy
+              port: web
+            initialDelaySeconds: 30
+            periodSeconds: 15
+            failureThreshold: 6
+          resources:
+            requests:
+              cpu: 100m
+              memory: 512Mi
+            limits:
+              cpu: "1"
+              memory: 1Gi
+          securityContext:
+            allowPrivilegeEscalation: false
+            readOnlyRootFilesystem: true
+            capabilities:
+              drop: [ALL]
+          volumeMounts:
+            - name: config
+              mountPath: /etc/prometheus
+              readOnly: true
+            - name: data
+              mountPath: /prometheus
+      volumes:
+        - name: config
+          configMap:
+            name: prometheus-config
+        - name: data
+          emptyDir:
+            sizeLimit: 2Gi
+---
+# ClusterIP only: Grafana's datasource, and the operator's `make prometheus` (kubectl port-forward).
+apiVersion: v1
+kind: Service
+metadata:
+  name: prometheus
+  namespace: monitoring
+  labels:
+    app.kubernetes.io/name: prometheus
+    app.kubernetes.io/part-of: monitoring
+spec:
+  type: ClusterIP
+  selector:
+    app.kubernetes.io/name: prometheus
+  ports:
+    - name: web
+      port: 9090
+      targetPort: web
+      protocol: TCP

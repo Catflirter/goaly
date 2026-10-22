@@ -1,0 +1,28 @@
+# Namespaces of the monitoring stack (spec §10.0, stretch S0).
+#
+# monitoring: Prometheus, kube-state-metrics, Grafana. They need nothing from the host, so the namespace
+# enforces the cluster default, restricted (spec §4.3), written out here.
+apiVersion: v1
+kind: Namespace
+metadata:
+  name: monitoring
+  labels:
+    pod-security.kubernetes.io/enforce: restricted
+    pod-security.kubernetes.io/warn: restricted
+    pod-security.kubernetes.io/audit: restricted
+---
+# monitoring-host: node-exporter and the DCGM exporter, and nothing else. node-exporter reads the host's
+# /proc, /sys and root filesystem through read-only hostPath mounts; the DCGM exporter reads the kubelet's
+# pod-resources socket (hostPath) to tell which Pod holds which GPU and runs as root, as upstream ships it.
+# PSA baseline and restricted both forbid hostPath volumes, so only this namespace enforces privileged,
+# as nvidia-device-plugin does (spec §4.3). Neither Pod uses hostNetwork, hostPID, hostIPC, hostPort,
+# privileged mode or an added capability; tests/k8s/test_monitoring_manifests.py holds them to that.
+# warn and audit are privileged too, or every apply would print warnings for Pods admission accepts.
+apiVersion: v1
+kind: Namespace
+metadata:
+  name: monitoring-host
+  labels:
+    pod-security.kubernetes.io/enforce: privileged
+    pod-security.kubernetes.io/warn: privileged
+    pod-security.kubernetes.io/audit: privileged

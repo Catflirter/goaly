@@ -1,0 +1,121 @@
+# node-exporter v1.12.1 (spec §10.0): node CPU, memory, disk and load on every node, k3s-cp and the GPU
+# nodes included. In the privileged namespace monitoring-host only for its read-only hostPath mounts
+# of /proc, /sys and / (namespaces.yaml); otherwise it runs as nobody with a read-only root filesystem
+# and no capabilities.
+#
+# No hostNetwork (upstream's DaemonSets use it): its :9100 would then be on the node IP, which the
+# firewall model does not open to the workers (spec §4.1, §4.2). On the Pod network Prometheus reaches
+# it through WireGuard instead. The cost: the network collectors would report the Pod's own network
+# namespace rather than the host's, so they are switched off. No hostPID either: the host's /proc is
+# read through the mount, and the per-process collectors are off by default.
+apiVersion: v1
+kind: ServiceAccount
+metadata:
+  name: node-exporter
+  namespace: monitoring-host
+  labels:
+    app.kubernetes.io/name: node-exporter
+    app.kubernetes.io/part-of: monitoring
+automountServiceAccountToken: false
+---
+apiVersion: apps/v1
+kind: DaemonSet
+metadata:
+  name: node-exporter
+  namespace: monitoring-host
+  labels:
+    app.kubernetes.io/name: node-exporter
+    app.kubernetes.io/part-of: monitoring
+spec:
+  revisionHistoryLimit: 2
+  selector:
+    matchLabels:
+      app.kubernetes.io/name: node-exporter
+  updateStrategy:
+    type: RollingUpdate
+    rollingUpdate:
+      maxUnavailable: 1
+  template:
+    metadata:
+      labels:
+        app.kubernetes.io/name: node-exporter
+        app.kubernetes.io/part-of: monitoring
+    spec:
+      serviceAccountName: node-exporter
+      automountServiceAccountToken: false
+      # Every node: k3s-cp (CriticalAddonsOnly=true:NoExecute), GPU nodes (nvidia.com/gpu=present:NoSchedule).
+      tolerations:
+        - operator: Exists
+      securityContext:
+        runAsNonRoot: true
+        runAsUser: 65534
+        runAsGroup: 65534
+        seccompProfile:
+          type: RuntimeDefault
+      containers:
+        - name: node-exporter
+          image: quay.io/prometheus/node-exporter:v1.12.1@sha256:1b4e4438faca4dd7e001dd445d161a4a2091b0fededa84093b3a8dfeae1f1be0
+          args:
+            - --web.listen-address=:9100
+            - --path.procfs=/host/proc
+            - --path.sysfs=/host/sys
+            - --path.rootfs=/host/root
+            - --path.udev.data=/host/root/run/udev/data
+            - --collector.filesystem.mount-points-exclude=^/(dev|proc|sys|run|var/lib/kubelet/.+|var/lib/rancher/.+)($|/)
+            - --no-collector.arp
+            - --no-collector.conntrack
+            - --no-collector.ipvs
+            - --no-collector.netclass
+            - --no-collector.netdev
+            - --no-collector.netstat
+            - --no-collector.sockstat
+          ports:
+            - name: metrics
+              containerPort: 9100
+              protocol: TCP
+          readinessProbe:
+            httpGet:
+              path: /
+              port: metrics
+          livenessProbe:
+            httpGet:
+              path: /
+              port: metrics
+            initialDelaySeconds: 10
+            periodSeconds: 20
+          resources:
+            requests:
+              cpu: 20m
+              memory: 32Mi
+            limits:
+              cpu: 200m
+              memory: 64Mi
+          securityContext:
+            allowPrivilegeEscalation: false
+            readOnlyRootFilesystem: true
+            capabilities:
+              drop: [ALL]
+          volumeMounts:
+            - name: proc
+              mountPath: /host/proc
+              readOnly: true
+            - name: sys
+              mountPath: /host/sys
+              readOnly: true
+            - name: root
+              mountPath: /host/root
+              mountPropagation: HostToContainer
+              readOnly: true
+      volumes:
+        - name: proc
+          hostPath:
+            path: /proc
+            type: Directory
+        - name: sys
+          hostPath:
+            path: /sys
+            type: Directory
+        - name: root
+          hostPath:
+            path: /
+            type: Directory

@@ -1,0 +1,148 @@
+# NVIDIA DCGM exporter 4.8.1 (DCGM 4.5.2) (spec §10.0): GPU utilisation, memory, temperature and power on
+# every admin-labelled GPU node. Written from upstream's Helm chart at tag 4.5.2-4.8.1
+# (deployment/templates/daemonset.yaml, values.yaml); changes from it:
+#   - scheduling as the RuntimeClass nvidia-gpu demands (spec §6.2): nodeSelector on the admin label
+#     node-restriction.kubernetes.io/accelerator=nvidia (a node cannot set it on itself) and the GPU
+#     taint's toleration, both in the Pod template because the DaemonSet controller only reads those;
+#   - runtimeClassName nvidia-gpu, so the nvidia runtime mounts the driver into the container;
+#   - it requests NO nvidia.com/gpu (upstream does not either): the device plugin never assigns it a GPU,
+#     so it never takes one from a workload. It sees every GPU through NVIDIA_VISIBLE_DEVICES=all, the
+#     mechanism spec §6.4 lists as a residual risk, here used on purpose and confined to this
+#     DaemonSet in the privileged monitoring-host namespace;
+#   - no SYS_ADMIN (upstream adds it for the profiling DCGM_FI_PROF_* metrics, which the dashboard
+#     does not use): all capabilities dropped; a short counters file without profiling fields;
+#   - the ubuntu22.04 image rather than distroless, so `kubectl exec` can debug it on the GPU node.
+# It runs as root, as upstream does (DCGM's embedded host engine), with a writable container root
+# filesystem; the only host path is the kubelet's pod-resources socket directory, read-only, which maps
+# GPUs to the Pods using them (the pod/namespace/container labels).
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: dcgm-counters
+  namespace: monitoring-host
+  labels:
+    app.kubernetes.io/name: dcgm-exporter
+    app.kubernetes.io/part-of: monitoring
+data:
+  # Format: DCGM field, Prometheus type, help text (upstream's etc/default-counters.csv, trimmed).
+  counters.csv: |
+    # Utilisation
+    DCGM_FI_DEV_GPU_UTIL,      gauge, GPU utilization (in %).
+    DCGM_FI_DEV_MEM_COPY_UTIL, gauge, Memory utilization (in %).
+    # Memory
+    DCGM_FI_DEV_FB_FREE, gauge, Framebuffer memory free (in MiB).
+    DCGM_FI_DEV_FB_USED, gauge, Framebuffer memory used (in MiB).
+    # Temperature, power, clocks
+    DCGM_FI_DEV_GPU_TEMP,    gauge, GPU temperature (in C).
+    DCGM_FI_DEV_POWER_USAGE, gauge, Power draw (in W).
+    DCGM_FI_DEV_SM_CLOCK,    gauge, SM clock frequency (in MHz).
+    # Errors
+    DCGM_FI_DEV_XID_ERRORS, gauge, Value of the last XID error encountered.
+---
+apiVersion: v1
+kind: ServiceAccount
+metadata:
+  name: dcgm-exporter
+  namespace: monitoring-host
+  labels:
+    app.kubernetes.io/name: dcgm-exporter
+    app.kubernetes.io/part-of: monitoring
+automountServiceAccountToken: false
+---
+apiVersion: apps/v1
+kind: DaemonSet
+metadata:
+  name: dcgm-exporter
+  namespace: monitoring-host
+  labels:
+    app.kubernetes.io/name: dcgm-exporter
+    app.kubernetes.io/part-of: monitoring
+spec:
+  revisionHistoryLimit: 2
+  selector:
+    matchLabels:
+      app.kubernetes.io/name: dcgm-exporter
+  updateStrategy:
+    type: RollingUpdate
+    rollingUpdate:
+      maxUnavailable: 1
+  template:
+    metadata:
+      labels:
+        app.kubernetes.io/name: dcgm-exporter
+        app.kubernetes.io/part-of: monitoring
+    spec:
+      serviceAccountName: dcgm-exporter
+      automountServiceAccountToken: false
+      runtimeClassName: nvidia-gpu
+      nodeSelector:
+        node-restriction.kubernetes.io/accelerator: nvidia
+      tolerations:
+        - key: nvidia.com/gpu
+          operator: Exists
+          effect: NoSchedule
+      securityContext:
+        seccompProfile:
+          type: RuntimeDefault
+      containers:
+        - name: dcgm-exporter
+          image: nvcr.io/nvidia/k8s/dcgm-exporter:4.5.2-4.8.1-ubuntu22.04@sha256:17e9d49093f2d86d90260eec3c07b18b3f78fc5eadef3c8ab26a24fa5a9c1b2c
+          args: ["-f", "/etc/dcgm-exporter/counters.csv"]
+          env:
+            # Every GPU on the node, without a device-plugin allocation (see the header).
+            - name: NVIDIA_VISIBLE_DEVICES
+              value: all
+            - name: DCGM_EXPORTER_KUBERNETES
+              value: "true"
+            - name: DCGM_EXPORTER_LISTEN
+              value: ":9400"
+            - name: NODE_NAME
+              valueFrom:
+                fieldRef:
+                  fieldPath: spec.nodeName
+          ports:
+            - name: metrics
+              containerPort: 9400
+              protocol: TCP
+          # DCGM needs a while to start its host engine and read the GPUs (upstream waits 45s).
+          readinessProbe:
+            httpGet:
+              path: /health
+              port: metrics
+            initialDelaySeconds: 45
+          livenessProbe:
+            httpGet:
+              path: /health
+              port: metrics
+            initialDelaySeconds: 45
+            periodSeconds: 10
+            failureThreshold: 6
+          resources:
+            requests:
+              cpu: 100m
+              memory: 128Mi
+            limits:
+              cpu: 500m
+              memory: 512Mi
+          securityContext:
+            runAsUser: 0
+            allowPrivilegeEscalation: false
+            readOnlyRootFilesystem: false
+            capabilities:
+              drop: [ALL]
+          volumeMounts:
+            - name: pod-resources
+              mountPath: /var/lib/kubelet/pod-resources
+              readOnly: true
+            - name: counters
+              mountPath: /etc/dcgm-exporter/counters.csv
+              subPath: counters.csv
+              readOnly: true
+      volumes:
+        - name: pod-resources
+          hostPath:
+            path: /var/lib/kubelet/pod-resources
+            type: Directory
+        - name: counters
+          configMap:
+            name: dcgm-counters
