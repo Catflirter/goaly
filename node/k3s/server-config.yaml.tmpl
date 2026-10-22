@@ -1,5 +1,8 @@
 # /etc/rancher/k3s/config.yaml on k3s-cp (spec §2.1). Rendered by node/server-bootstrap.sh.
 # All flannel settings live here only: setting them on agents makes nodes NotReady (k3s#12942).
+# node-name is pinned: on GCE's Ubuntu 24.04 the hostname is the FQDN
+# (k3s-cp.<zone>.c.<project>.internal), which k3s would otherwise use as the node name.
+node-name: k3s-cp
 node-external-ip: @CP_IP@
 flannel-backend: wireguard-native
 flannel-external-ip: true

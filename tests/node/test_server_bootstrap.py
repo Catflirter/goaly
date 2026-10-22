@@ -69,7 +69,8 @@ def test_server_config_matches_spec(tmp_path):
     r = run_server(tmp_path)
     assert r.returncode == 0, r.stderr
     cfg = yaml.safe_load(rendered(tmp_path, "etc/rancher/k3s/config.yaml"))
-    assert cfg == {"node-external-ip": "34.82.10.10", "flannel-backend": "wireguard-native",
+    assert cfg == {"node-name": "k3s-cp", "node-external-ip": "34.82.10.10",
+        "flannel-backend": "wireguard-native",
         "flannel-external-ip": True, "secrets-encryption": True, "write-kubeconfig-mode": "0600",
         "protect-kernel-defaults": True, "node-taint": ["CriticalAddonsOnly=true:NoExecute"],
         "disable": ["traefik", "servicelb", "metrics-server"],
