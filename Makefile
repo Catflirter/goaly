@@ -36,10 +36,13 @@ secrets: ## Scan committed history and uncommitted tracked changes for secrets
 # Offline only: -backend=false and the tests' mock provider need no cloud credentials.
 # -lockfile=readonly: init verifies providers against the committed .terraform.lock.hcl and
 # never rewrites it. To change providers, run tf-lock deliberately and commit the result.
+# TF_DATA_DIR keeps this offline init in .run/tf-test/<stack>, never in infra/<stack>/.terraform: a
+# -backend=false init there leaves a .terraform with providers but no backend, which the real
+# (GCS) init used by gpuctl and scripts/up.sh would otherwise have to undo.
 .PHONY: tf-test tf-lock
 tf-test: ## terraform init + validate every infra/ stack, then terraform test where it has tests/
 	@for d in $(ROOT)/infra/*/; do \
-	  d=$${d%/}; echo "==> $$d"; \
+	  d=$${d%/}; echo "==> $$d"; export TF_DATA_DIR="$(ROOT)/.run/tf-test/$${d##*/}"; \
 	  terraform -chdir="$$d" init -backend=false -input=false -lockfile=readonly; \
 	  terraform -chdir="$$d" validate; \
 	  if [ -d "$$d/tests" ]; then terraform -chdir="$$d" test; fi; \
@@ -77,9 +80,27 @@ lint: ## Run all pre-commit hooks, the repo secret scan, the Terraform tests, th
 	$(MAKE) tf-test
 	$(MAKE) test
 
-.PHONY: gpu-plan gpu-status
+# RESILIENCE=1 (make verify RESILIENCE=1) reaches verify.sh through the environment and adds group E.
+.PHONY: verify
+verify: ## Run verification checks A-D (RESILIENCE=1 adds E) into verification/<timestamp>/
+	$(ROOT)/scripts/verify.sh
+
+# AUTO_APPROVE=1 (or yes/true) skips the confirmation prompt of gpu-apply and gpu-down.
+GPU_AUTO_APPROVE := $(if $(filter 1 yes true,$(AUTO_APPROVE)), --auto-approve)
+
+.PHONY: gpu-plan gpu-apply gpu-down gpu-status
 gpu-plan: ## Show what gpu-apply would create/delete on Lambda and the hourly cost (read-only)
 	$(ROOT)/scripts/gpuctl plan
 
-gpu-status: ## Show Lambda GPU capacity and this cluster's GPU instances (read-only)
+gpu-apply: ## Create/delete Lambda GPU nodes to match lambda/gpu-nodes.yaml, then firewall and join (AUTO_APPROVE=1)
+	$(ROOT)/scripts/gpuctl apply$(GPU_AUTO_APPROVE)
+
+gpu-down: ## Delete every Lambda GPU node and the autoscaler overrides (AUTO_APPROVE=1 skips the prompt)
+	$(ROOT)/scripts/gpuctl down$(GPU_AUTO_APPROVE)
+
+gpu-status: ## Show GPU capacity, GPU instances and drift (changes no cloud state; may terraform init locally; exit 3 on drift)
 	$(ROOT)/scripts/gpuctl status
+
+.PHONY: sync-peers
+sync-peers: ## Rewrite the peer allow-lists (cp k3s_peers set, Lambda firewall) from the current node IPs
+	$(ROOT)/scripts/gpuctl sync-peers

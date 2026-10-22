@@ -1,5 +1,6 @@
-"""Repo-level guards: what .gitignore keeps out, and that `make secrets` scans tracked content."""
-import shutil, subprocess
+"""Repo-level guards: what .gitignore keeps out, that `make secrets` scans tracked content, and where tf-test
+keeps its offline Terraform data."""
+import os, shutil, subprocess
 from pathlib import Path
 import pytest
 
@@ -76,3 +77,26 @@ def test_make_secrets_flags_staged_change(repo):
     (repo / "new.txt").write_text(K3S_TOKEN + "\n")
     git(repo, "add", "new.txt")
     assert_leak_found(make_secrets(repo))
+
+# --- make tf-test: the offline init never touches infra/<stack>/.terraform (B-1) ---------------
+
+def test_tf_test_keeps_its_offline_init_out_of_the_stack_directories(tmp_path):
+    # A -backend=false init in infra/<stack> left .terraform/providers without a backend, which gpuctl took for an
+    # initialised stack. Every terraform call of tf-test must use a TF_DATA_DIR under .run/tf-test/<stack>.
+    shutil.copy(ROOT / "Makefile", tmp_path / "Makefile")
+    for stack in ("base", "workers"):
+        (tmp_path / "infra" / stack).mkdir(parents=True)
+    (tmp_path / "infra/workers/tests").mkdir()
+    bin_dir, log = tmp_path / "bin", tmp_path / "terraform.log"
+    bin_dir.mkdir()
+    (bin_dir / "terraform").write_text(f'#!/bin/bash\nprintf "%s %s\\n" "${{TF_DATA_DIR-unset}}" "$*" >> {log}\n')
+    (bin_dir / "terraform").chmod(0o755)
+    proc = subprocess.run(["make", "--no-print-directory", "-f", str(tmp_path / "Makefile"), "tf-test"],
+                          cwd=tmp_path, capture_output=True, text=True,
+                          env={**os.environ, "PATH": f"{bin_dir}:{os.environ['PATH']}"})
+    assert proc.returncode == 0, proc.stdout + proc.stderr
+    calls = [line.split(" ", 2) for line in log.read_text().splitlines()]
+    assert [c[2].split()[0] for c in calls] == ["init", "validate", "init", "validate", "test"]
+    for data_dir, chdir, _ in calls:
+        stack = chdir.removeprefix(f"-chdir={tmp_path}/infra/")
+        assert data_dir == f"{tmp_path}/.run/tf-test/{stack}", calls

@@ -16,6 +16,9 @@ from gpuctl.spec import POOL_NAME_RE, Pool, Spec
 PREFIX = "k3s-gpu-"
 # booting (ip still null) and unhealthy instances exist and bill; terminating/terminated do not count.
 LIVE_STATUSES = frozenset({"booting", "active", "unhealthy"})
+# Ruling R22: among live instances sharing a name, the best status is the node (the active copy is the one that
+# joined the cluster), then the smallest id.
+_STATUS_RANK = {"active": 0, "booting": 1, "unhealthy": 2}
 
 # Canonical names only (index >= 1, no leading zeros), so a name and its (pool, index) map one to one.
 _NODE_NAME_RE = re.compile(rf"{re.escape(PREFIX)}({POOL_NAME_RE.pattern})-([1-9][0-9]*)")
@@ -38,8 +41,8 @@ class BudgetExceeded(PlanError):
 class Plan:
     """What to change on Lambda.
 
-    `duplicates` is the subset of `delete` that shares its name with another owned instance (the one with the
-    smallest id, which is in `keep` or earlier in `delete`). The name is also the K8s node name and the host-key
+    `duplicates` is the subset of `delete` that shares its name with another owned instance (the one keeper_order()
+    puts first, which is in `keep` or earlier in `delete`). The name is also the K8s node name and the host-key
     entry, so an executor must terminate a duplicate by id only: never drain/delete the node or forget the host
     key for it. That is done once, for the name's own instance, if and only if that instance is deleted.
     """
@@ -65,6 +68,11 @@ def parse_node_name(name: str) -> tuple[str, int] | None:
 
 def owned_instances(instances: Iterable[Instance]) -> list[Instance]:
     return [i for i in instances if i.name.startswith(PREFIX) and i.status in LIVE_STATUSES]
+
+
+def keeper_order(instance: Instance) -> tuple[int, str]:
+    """Sort key among owned instances sharing a name: the first one is the node, the rest are duplicates (R22)."""
+    return _STATUS_RANK.get(instance.status, len(_STATUS_RANK)), instance.id
 
 
 def _count(value: object, where: str) -> int:
@@ -129,10 +137,10 @@ def make_plan(spec: Spec, instances: Iterable[Instance], types: Mapping[str, Ins
     if total > max(spec.max_nodes, PLAN_NODE_CEILING):  # keep + create == total, so fail before building it
         raise PlanError(f"max_nodes: counts ask for {total} GPU nodes, limit is {spec.max_nodes}")
 
-    # One instance per name: the smallest id wins, the rest are deleted.
+    # One instance per name: the best status, then the smallest id, wins (Ruling R22); the rest are deleted.
     by_name: dict[str, Instance] = {}
     duplicates: list[Instance] = []
-    for instance in sorted(owned_instances(instances), key=lambda i: (i.name, i.id)):
+    for instance in sorted(owned_instances(instances), key=lambda i: (i.name, keeper_order(i))):
         if instance.name in by_name:
             duplicates.append(instance)
         else:
@@ -179,6 +187,22 @@ def make_plan(spec: Spec, instances: Iterable[Instance], types: Mapping[str, Ins
 
     return Plan(create=tuple(create), delete=tuple(delete), keep=tuple(keep), hourly_usd=cents / 100,
                 duplicates=tuple(duplicates))
+
+
+def plan_lines(plan: Plan, spec: Spec) -> list[str]:
+    """How plan and apply show a plan: one line per create, delete and keep, then the node count and cost."""
+    duplicate_ids = {i.id for i in plan.duplicates}
+    lines = [f"create {name} (pool {pool})" for name, pool in plan.create]
+    for instance in plan.delete:
+        why = "duplicate name" if instance.id in duplicate_ids else instance.status
+        lines.append(f"delete {instance.name} {instance.id} ({why})")
+    lines += [f"keep {i.name} {i.ip or '-'} ({i.status})" for i in plan.keep]
+    if not plan.create and not plan.delete:
+        lines.append("No instance changes")
+    lines.append(f"GPU nodes after apply: {len(plan.keep) + len(plan.create)} (max_nodes {spec.max_nodes})")
+    lines.append(f"Hourly cost: ${plan.hourly_usd:.2f}/h (budget ${spec.budget_usd_per_hour:.2f}/h; "
+                 "new nodes priced at their pool's most expensive candidate type)")
+    return lines
 
 
 def check_limits(plan: Plan, spec: Spec) -> None:

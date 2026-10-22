@@ -1,0 +1,16 @@
+# RuntimeClass for GPU pods (spec §6.2 step 3). The "nvidia" handler is the containerd runtime k3s
+# registers when it finds nvidia-container-runtime on PATH at startup. scheduling confines pods using
+# this class to admin-labelled GPU nodes (a node cannot set node-restriction.kubernetes.io/ labels on
+# itself) and lets them tolerate the GPU taint. k3s's own RuntimeClass "nvidia" is left untouched.
+apiVersion: node.k8s.io/v1
+kind: RuntimeClass
+metadata:
+  name: nvidia-gpu
+handler: nvidia
+scheduling:
+  nodeSelector:
+    node-restriction.kubernetes.io/accelerator: nvidia
+  tolerations:
+    - key: nvidia.com/gpu
+      operator: Exists
+      effect: NoSchedule

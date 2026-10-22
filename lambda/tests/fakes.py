@@ -1,13 +1,23 @@
-"""In-memory test doubles. FakeLambda mirrors LambdaClient's methods and signatures (test_fakes.py checks this)."""
+"""In-memory test doubles.
+
+FakeLambda mirrors LambdaClient's methods and signatures (test_fakes.py checks this); FakeInfra mirrors Infra's
+(test_infra.py checks this). FakeShell replays scripted results for the real Infra.
+"""
 
 from __future__ import annotations
 
 import ipaddress
-from collections.abc import Iterable, Mapping
+import subprocess
+from collections.abc import Iterable, Mapping, Sequence
+from dataclasses import dataclass
 
+from gpuctl.infra import (
+    CommandError, MissingStackError, check_join_args, check_max_nodes, normalise_gpu_ips, operator_ip,
+)
 from gpuctl.lambda_api import (
     FirewallRule, Instance, InstanceType, LambdaAPIError, Ruleset, _serialise_rules,
 )
+from gpuctl.reconcile import GUARD_PEERS_COMMAND
 
 # The everyone-CIDR is built, never written out: global constraints forbid the literal in any file.
 ANY_IPV4 = str(ipaddress.IPv4Network((0, 0)))
@@ -18,35 +28,65 @@ def _not_found(what: str) -> LambdaAPIError:
     return LambdaAPIError("global/object-does-not-exist", 404, f"{what} not found")
 
 
+DEFAULT_LAUNCH_IPS = tuple(f"129.80.30.{n}" for n in range(30, 40))
+
+
+@dataclass(frozen=True)
+class Launch:
+    """One successful FakeLambda.launch: its arguments and the id it returned."""
+    id: str
+    name: str
+    region: str
+    instance_type: str
+    ssh_key_name: str
+    image_family: str
+    ruleset_id: str
+
+
 class FakeLambda:
     """Lambda account state in memory.
 
     Every call is appended to `calls` as (method name, *positional args); launch, whose arguments are keyword-only,
-    is recorded as ("launch", {kwargs}). `launch_errors[(type, region)]` is raised by launch for that combination;
-    `instance_progress[id]` is the sequence get_instance returns for that id (the last entry repeats), and each
-    result also replaces the instance in `instances`. Rules go through the real client's serialiser, so the fake
-    refuses exactly what LambdaClient would never send.
+    is recorded as ("launch", {kwargs}), and each successful one also in `launched`. Instance ids are i-1, i-2, ...
+    and ruleset ids rs-1, rs-2, ..., counted separately. `launch_errors[(type, region)]` is raised by launch for
+    that combination. `instance_progress[id]` is the sequence get_instance returns for that id (the last entry
+    repeats), and each result also replaces the instance in `instances`; without one, a launched instance is booting
+    (ip null) until the first get_instance, which makes it active with the next of `launch_ips`. Rules go through
+    the real client's serialiser, so the fake refuses exactly what LambdaClient would never send.
     """
+
+    TEST_HELPERS = frozenset({"ruleset_by_name"})  # public, but not LambdaClient methods
 
     def __init__(self, *, types: Mapping[str, InstanceType] | None = None,
                  instances: Iterable[Instance] = (), rulesets: Iterable[Ruleset] = (),
                  global_rules: Iterable[FirewallRule] = (),
                  launch_errors: Mapping[tuple[str, str], Exception] | None = None,
-                 instance_progress: Mapping[str, list[Instance]] | None = None) -> None:
+                 instance_progress: Mapping[str, list[Instance]] | None = None,
+                 launch_ips: Iterable[str] = DEFAULT_LAUNCH_IPS) -> None:
         self.types = dict(types or {})
         self.instances = list(instances)
         self.rulesets = list(rulesets)
         self.global_rules = list(global_rules)
         self.launch_errors = dict(launch_errors or {})
         self.instance_progress = {k: list(v) for k, v in (instance_progress or {}).items()}
+        self.launch_ips = list(launch_ips)
         self.calls: list[tuple] = []
+        self.launched: list[Launch] = []
         self.launched_ids: list[str] = []
         self.terminated: list[str] = []
-        self._next_id = 0
+        self._next_id: dict[str, int] = {}
+        self._pending_ips: dict[str, str] = {}
 
     def _new_id(self, prefix: str) -> str:
-        self._next_id += 1
-        return f"{prefix}-{self._next_id}"
+        self._next_id[prefix] = self._next_id.get(prefix, 0) + 1
+        return f"{prefix}-{self._next_id[prefix]}"
+
+    def ruleset_by_name(self, name: str) -> Ruleset:
+        """The one stored ruleset called `name` (KeyError if there is none, or more than one)."""
+        matches = [r for r in self.rulesets if r.name == name]
+        if len(matches) != 1:
+            raise KeyError(f"{len(matches)} rulesets named {name!r}")
+        return matches[0]
 
     def _replace_instance(self, instance: Instance) -> None:
         self.instances = [instance if i.id == instance.id else i for i in self.instances]
@@ -70,6 +110,10 @@ class FakeLambda:
             return instance
         for instance in self.instances:
             if instance.id == instance_id:
+                if instance.status == "booting" and instance_id in self._pending_ips:
+                    instance = Instance(instance.id, instance.name, "active", self._pending_ips.pop(instance_id),
+                                        instance.region, instance.instance_type)
+                    self._replace_instance(instance)
                 return instance
         raise _not_found(f"instance {instance_id}")
 
@@ -83,6 +127,9 @@ class FakeLambda:
             raise error
         instance_id = self._new_id("i")
         self.instances.append(Instance(instance_id, name, "booting", None, region, instance_type))
+        if self.launch_ips:
+            self._pending_ips[instance_id] = self.launch_ips.pop(0)
+        self.launched.append(Launch(instance_id, name, region, instance_type, ssh_key_name, image_family, ruleset_id))
         self.launched_ids.append(instance_id)
         return instance_id
 
@@ -130,3 +177,150 @@ class FakeLambda:
         self.calls.append(("update_global_rules", rules))
         _serialise_rules(rules)
         self.global_rules = rules
+
+
+# --- shell and infra ----------------------------------------------------------------------------
+
+def ok(stdout: str = "", stderr: str = "") -> subprocess.CompletedProcess[str]:
+    """A scripted FakeShell result: exit code 0."""
+    return subprocess.CompletedProcess([], 0, stdout, stderr)
+
+
+def fail(returncode: int, stderr: str = "", stdout: str = "") -> subprocess.CompletedProcess[str]:
+    """A scripted FakeShell result: a non-zero exit code."""
+    return subprocess.CompletedProcess([], returncode, stdout, stderr)
+
+
+@dataclass(frozen=True)
+class ShellCall:
+    args: list[str]
+    input: str | None
+    check: bool
+    timeout: float | None
+    env: dict[str, str] | None
+
+
+class FakeShell:
+    """Replays `results` in order, one per run(), and records every call in `calls`.
+
+    Like SubprocessShell, a non-zero exit code raises CommandError when check=True. A result that is an exception
+    is raised instead. Running out of results fails the test: every command a test causes must be scripted. So does
+    leaving results unused (conftest.py checks every FakeShell a test made): a test whose commands never ran is
+    vacuous.
+    """
+
+    created: list[FakeShell] = []  # every instance, for conftest.py's unused-results check
+
+    def __init__(self, results: Iterable[subprocess.CompletedProcess[str] | Exception]) -> None:
+        self.results = list(results)
+        self.calls: list[ShellCall] = []
+        FakeShell.created.append(self)
+
+    def run(self, args: Sequence[str], *, input: str | None = None, check: bool = True,
+            timeout: float | None = None, env: Mapping[str, str] | None = None) -> subprocess.CompletedProcess[str]:
+        args = list(args)
+        self.calls.append(ShellCall(args, input, check, timeout, None if env is None else dict(env)))
+        assert self.results, f"unexpected command (no scripted result left): {args}"
+        result = self.results.pop(0)
+        if isinstance(result, Exception):
+            raise result
+        result = subprocess.CompletedProcess(args, result.returncode, result.stdout, result.stderr)
+        if check and result.returncode != 0:
+            raise CommandError(args, result.returncode, result.stderr)
+        return result
+
+
+DEFAULT_OUTPUTS = {
+    "base": {"cp_ip": "34.82.10.10", "cp_internal_ip": "10.10.0.2", "cp_zone": "us-west1-b", "cp_name": "k3s-cp"},
+    "workers": {"worker_ips": {"k3s-cpu-1": "34.29.20.20"}},
+}
+
+
+class FakeInfra:
+    """Terraform outputs, cp SSH, kubectl and join-node in memory.
+
+    `outputs[stack]` is what tf_output returns; a stack missing from it, or not passed to ensure_init first (like
+    terraform on a stack never initialised against its backend), raises CommandError (it cannot be read).
+    ensure_init raises MissingStackError for a stack in `missing` (not in the checkout, like Infra) and
+    CommandError for a stack in `init_fail`. `events` records the side effects in order:
+    "tf:<gpu ips>" for apply_gpu_access (its max_nodes go to `applied_max_nodes`), "nft" for the cp peer-set push,
+    "ssh:<command>" for any other cp_ssh, "join:<name>:<type>". Arguments are validated and normalised exactly
+    like Infra (shared helpers in gpuctl.infra): apply_gpu_access records normalise_gpu_ips() and check_max_nodes(),
+    join_node runs check_join_args(), detect_operator_ip validates env["OPERATOR_IP"] (there is no network fallback).
+    """
+
+    def __init__(self, *, outputs: Mapping[str, Mapping] | None = None, env: Mapping[str, str] | None = None,
+                 cluster_nodes: Mapping[str, str | None] | None = None, nft_elements: Iterable[str] = (),
+                 join_fail: Iterable[str] = (), missing: Iterable[str] = (), init_fail: Iterable[str] = ()) -> None:
+        source = DEFAULT_OUTPUTS if outputs is None else outputs
+        self.outputs = {stack: dict(values) for stack, values in source.items()}
+        self.env = dict({"OPERATOR_IP": "73.15.40.40"} if env is None else env)
+        self.cluster_nodes = dict(cluster_nodes or {})
+        self.nft_elements = list(nft_elements)
+        self.join_fail = set(join_fail)
+        self.missing = set(missing)
+        self.init_fail = set(init_fail)
+        self.events: list[str] = []
+        self.initialised: list[str] = []
+        self.ssh_calls: list[tuple[str, str | None]] = []
+        self.kubectl_calls: list[tuple[str, ...]] = []
+        self.applied_gpu_ips: list[list[str]] = []
+        self.applied_max_nodes: list[int] = []
+        self.deleted_nodes: list[str] = []
+        self.joined: list[tuple[str, str, str]] = []
+        self.forgotten: list[str] = []
+
+    def ensure_init(self, stack: str) -> None:
+        if stack in self.missing:
+            raise MissingStackError(["terraform", f"-chdir=infra/{stack}", "init"], 1,
+                                    f"infra/{stack} does not exist in this checkout")
+        if stack in self.init_fail:
+            raise CommandError(["terraform", f"-chdir=infra/{stack}", "init"], -1, "timed out after 900.0s")
+        self.initialised.append(stack)
+
+    def tf_output(self, stack: str) -> dict:
+        # Like terraform output on a stack never initialised against its backend (B-1): every caller must run
+        # ensure_init(stack) first, or a fresh clone fails here.
+        if stack not in self.initialised or stack not in self.outputs:
+            raise CommandError(["terraform", f"-chdir=infra/{stack}", "output", "-json"], 1,
+                               "Backend initialization required")
+        return dict(self.outputs[stack])
+
+    def apply_gpu_access(self, gpu_ips: Sequence[str], *, max_nodes: int) -> None:
+        ips = normalise_gpu_ips(gpu_ips)  # ValueError on a null or non-public IP, like Infra (Review Focus #2)
+        self.applied_max_nodes.append(check_max_nodes(max_nodes))
+        self.applied_gpu_ips.append(ips)
+        self.events.append(f"tf:{ips}")
+
+    def cp_ssh(self, command: str, input: str | None = None) -> str:
+        self.ssh_calls.append((command, input))
+        self.events.append("nft" if command == GUARD_PEERS_COMMAND else f"ssh:{command}")
+        return ""
+
+    def kubectl(self, *args: str, check: bool = True) -> subprocess.CompletedProcess[str]:
+        self.kubectl_calls.append(args)
+        return subprocess.CompletedProcess(["kubectl", *args], 0, "", "")
+
+    def cluster_gpu_nodes(self) -> dict[str, str | None]:
+        return dict(self.cluster_nodes)
+
+    def drain_and_delete_node(self, name: str) -> None:
+        self.deleted_nodes.append(name)
+        self.cluster_nodes.pop(name, None)
+
+    def join_node(self, name: str, ip: str, gpu_type: str) -> None:
+        ip = check_join_args(name, ip, gpu_type)
+        self.joined.append((name, ip, gpu_type))
+        self.events.append(f"join:{name}:{gpu_type}")
+        if name in self.join_fail:
+            raise CommandError(["join-node.sh", "--node", name], 1, "join failed")
+        self.cluster_nodes[name] = ip
+
+    def forget_host_key(self, name: str) -> None:
+        self.forgotten.append(name)
+
+    def detect_operator_ip(self) -> str:
+        return operator_ip(self.env.get("OPERATOR_IP", ""))
+
+    def cp_guard_elements(self) -> list[str]:
+        return list(self.nft_elements)

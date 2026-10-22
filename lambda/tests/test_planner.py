@@ -104,7 +104,7 @@ def test_duplicate_names_keep_smallest_id():
 def test_duplicates_are_marked_so_the_executor_spares_the_shared_name():
     # Duplicates share a name (= K8s node name, host key) with another instance: Plan.duplicates tells the
     # executor to terminate them by id only. Ordinary deletes and keeps are never marked.
-    b = inst("k3s-gpu-a6000-1", id="b", status="active")
+    b = inst("k3s-gpu-a6000-1", id="b", status="booting", ip=None)
     a = inst("k3s-gpu-a6000-1", id="a", status="booting", ip=None)
     extra = inst("k3s-gpu-a6000-2")
     plan = make_plan(SPEC, [b, a, extra], TYPES, {"a6000": 1})
@@ -112,8 +112,25 @@ def test_duplicates_are_marked_so_the_executor_spares_the_shared_name():
     assert {i.name for i in plan.duplicates} <= {i.name for i in plan.keep}
 
 
+@pytest.mark.parametrize("winner, loser", [
+    (("z", "active"), ("a", "booting")),
+    (("z", "active"), ("a", "unhealthy")),
+    (("z", "booting"), ("a", "unhealthy")),
+    (("a", "booting"), ("z", "booting")),
+])
+def test_duplicate_names_keep_the_best_status_then_the_smallest_id(winner, loser):  # Ruling R22
+    # The active copy is the one that joined the cluster; keeping a booting copy would terminate the joined node
+    # and keep one that is never joined.
+    win = inst("k3s-gpu-a6000-1", id=winner[0], status=winner[1])
+    lose = inst("k3s-gpu-a6000-1", id=loser[0], status=loser[1])
+    for order in ([win, lose], [lose, win]):
+        plan = make_plan(SPEC, order, TYPES, {"a6000": 1})
+        assert plan.keep == (win,) and plan.delete == (lose,) and plan.duplicates == (lose,)
+
+
 def test_duplicates_of_a_deleted_name_are_marked_too():
-    # The smallest id carries the name (drain + forget once); the other copy is terminated by id only.
+    # The kept copy (best status, then smallest id) carries the name (drain + forget once); the other copy is
+    # terminated by id only.
     first = inst("k3s-gpu-old-1", id="a")
     second = inst("k3s-gpu-old-1", id="b")
     plan = make_plan(SPEC, [second, first], TYPES, {"a6000": 0})

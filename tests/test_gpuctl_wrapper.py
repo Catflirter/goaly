@@ -107,6 +107,29 @@ def test_wrapper_runs_the_package_from_the_venv_with_env_loaded(repo, tmp_path_f
     ]
 
 
+KUBECONFIG_PYTHON = """#!/usr/bin/env bash
+printf 'KUBECONFIG=%s\\n' "${KUBECONFIG-unset}"
+"""
+
+
+@pytest.mark.parametrize("env_text, ambient, expected", [
+    ("LAMBDA_API_KEY=k-123\n", None, "{home}/.kube/hybrid-gpu.yaml"),
+    ("LAMBDA_API_KEY=k-123\n", "/home/op/.kube/work-cluster", "{home}/.kube/hybrid-gpu.yaml"),
+    ("LAMBDA_API_KEY=k-123\nKUBECONFIG=/srv/kc.yaml\n", "/home/op/.kube/work-cluster", "/srv/kc.yaml"),
+])
+def test_wrapper_pins_the_cluster_kubeconfig(repo, env_text, ambient, expected):
+    """Spec section 11: gpuctl's kubectl reaches ~/.kube/hybrid-gpu.yaml, not an ambient KUBECONFIG; .env overrides."""
+    write_env(repo, env_text)
+    (repo / ".venv/bin/python").write_text(KUBECONFIG_PYTHON)
+    env = {k: v for k, v in os.environ.items() if k not in ("LAMBDA_API_KEY", "REPO_ROOT", "KUBECONFIG")}
+    env["HOME"] = "/home/op"
+    if ambient is not None:
+        env["KUBECONFIG"] = ambient
+    proc = subprocess.run([str(repo / "scripts/gpuctl"), "status"], cwd=repo, env=env, capture_output=True, text=True)
+    assert proc.returncode == 0, proc.stderr
+    assert proc.stdout == f"KUBECONFIG={expected.format(home='/home/op')}\n"
+
+
 def test_wrapper_refuses_without_a_private_env(repo):
     write_env(repo, mode=0o644)
     proc = run([str(repo / "scripts/gpuctl"), "status"], repo)
@@ -132,3 +155,23 @@ def test_wrapper_never_imports_modules_from_the_callers_cwd(repo, tmp_path_facto
     proc = run([str(repo / "scripts/gpuctl"), "--help"], repo, cwd=hostile)
     assert proc.returncode == 0, proc.stderr
     assert "list-nodes" in proc.stdout and not marker.exists()
+
+
+@pytest.mark.parametrize("target, variables, expected", [
+    ("gpu-apply", [], "apply"),
+    ("gpu-apply", ["AUTO_APPROVE=1"], "apply --auto-approve"),
+    ("gpu-apply", ["AUTO_APPROVE=0"], "apply"),
+    ("gpu-down", [], "down"),
+    ("gpu-down", ["AUTO_APPROVE=yes"], "down --auto-approve"),
+])
+def test_make_gpu_apply_and_down_pass_auto_approve_through(target, variables, expected):
+    proc = subprocess.run(["make", "-s", "-n", "-f", str(ROOT / "Makefile"), target, *variables],
+                          cwd="/", capture_output=True, text=True)
+    assert proc.returncode == 0, proc.stderr
+    assert proc.stdout.strip() == f"{ROOT}/scripts/gpuctl {expected}"
+
+
+def test_gpu_apply_and_down_follow_gpu_plan_in_the_makefile():
+    targets = [line.split(":")[0] for line in (ROOT / "Makefile").read_text().splitlines()
+               if line.startswith("gpu-")]
+    assert targets[targets.index("gpu-plan"):][:3] == ["gpu-plan", "gpu-apply", "gpu-down"]

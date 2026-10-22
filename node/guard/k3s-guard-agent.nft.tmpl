@@ -1,0 +1,15 @@
+table inet k3s_guard
+delete table inet k3s_guard
+table inet k3s_guard {
+  chain input {
+    type filter hook input priority -5; policy accept;
+    tcp dport 10250 iifname { "lo", "cni0" } accept
+    tcp dport 10250 ip saddr @CP_IP@ counter accept
+    tcp dport 10250 counter drop
+  }
+  chain forward {
+    type filter hook forward priority -5; policy accept;
+    ip saddr 10.42.0.0/16 ip daddr 169.254.169.254 meta l4proto { tcp, udp } th dport 53 accept
+    ip saddr 10.42.0.0/16 ip daddr 169.254.169.254 counter drop
+  }
+}
