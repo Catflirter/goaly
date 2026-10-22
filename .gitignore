@@ -18,7 +18,6 @@ __pycache__/
 # Runtime state
 .run/
 lambda/.autoscale-state.json
-lambda/.gpu-down
 *.pcap
 
 # Terraform

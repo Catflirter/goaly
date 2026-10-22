@@ -12,7 +12,6 @@ import time
 from collections.abc import Callable, Iterable, Iterator, Mapping
 from contextlib import contextmanager
 from dataclasses import dataclass
-from datetime import datetime
 from pathlib import Path
 from typing import TextIO
 
@@ -63,25 +62,6 @@ def load_overrides(path: Path) -> dict[str, int]:
     return dict(pools)
 
 
-def read_down_marker(path: Path | None) -> str | None:
-    """When `make gpu-down` set every pool to 0 (live finding L21-1): the time it recorded in `path`
-    (lambda/.gpu-down), "(time not recorded)" for an empty file, or None when gpu-down is not in force.
-
-    The record is written by down() once the operator has confirmed it and removed by apply() once confirmed; while
-    it exists the drift check wants 0 instances per pool. Its text only reaches the screen, cleaned of control
-    characters; only its existence matters.
-    """
-    if path is None:
-        return None
-    try:
-        text = Path(path).read_text(encoding="utf-8", errors="replace").strip()
-    except FileNotFoundError:
-        return None
-    except OSError:  # it exists but cannot be read: still down
-        return "(time not readable)"
-    return _clean(text.splitlines()[0]) if text else "(time not recorded)"
-
-
 @dataclass(frozen=True)
 class Settings:
     spec_path: Path
@@ -89,8 +69,6 @@ class Settings:
     ssh_key_name: str
     launch_timeout_s: float = 900.0
     poll_s: float = 10.0
-    # gpu-down's record (L21-1); None (tests that do not care) records nothing
-    down_marker_path: Path | None = None
 
 
 def mask_ip(ip: str) -> str:
@@ -320,50 +298,22 @@ class Reconciler:
             self._warn(f"apply refused: {e}")
             return 2
         return self._reconcile(spec, overrides=overrides, set_counts=None, auto_approve=auto_approve,
-                               keep_on_failure=keep_on_failure, on_commit=self._clear_down_marker, command="apply")
+                               keep_on_failure=keep_on_failure, command="apply")
 
     def down(self, spec: Spec, *, auto_approve: bool) -> int:
         """Remove the autoscaler's override file, then reconcile every pool to 0 (spec section 10.4: gpu-down always
         wins over the autoscaler). A second run finds nothing to delete and only re-applies the empty firewall.
-
-        Once confirmed (before the first delete), gpu-down is recorded in settings.down_marker_path, so the drift
-        check of `gpuctl status` wants 0 instances per pool until the next apply (L21-1)."""
+        Nothing is recorded (spec section 5.4: no local state); `gpuctl status` treats the pools below their count
+        as a note, not drift (L21-1)."""
         path = Path(self.settings.overrides_path)
         if path.exists():
             path.unlink()
             self._emit(f"Removed the autoscaler overrides {path}")
         return self._reconcile(spec, overrides=None, set_counts={name: 0 for name in spec.pools},
-                               auto_approve=auto_approve, keep_on_failure=False, on_commit=self._write_down_marker,
-                               command="down")
-
-    def down_since(self) -> str | None:
-        """read_down_marker(settings.down_marker_path): when gpu-down set every pool to 0, or None."""
-        return read_down_marker(self.settings.down_marker_path)
-
-    def _write_down_marker(self) -> None:
-        """Best effort: a record that cannot be written never stops gpu-down from terminating (billing first)."""
-        path = self.settings.down_marker_path
-        if path is None:
-            return
-        try:
-            Path(path).write_text(datetime.now().astimezone().isoformat(timespec="seconds") + "\n", encoding="utf-8")
-        except OSError as e:
-            self._warn(f"warning: cannot record gpu-down in {path} ({e.strerror or e}); gpu-status will want the "
-                       "spec's counts until the next gpu-apply")
-
-    def _clear_down_marker(self) -> None:
-        path = self.settings.down_marker_path
-        if path is None:
-            return
-        try:
-            Path(path).unlink(missing_ok=True)
-        except OSError as e:
-            self._warn(f"warning: cannot remove the gpu-down record {path} ({e.strerror or e}); gpu-status will want "
-                       "0 instances per pool until it is removed")
+                               auto_approve=auto_approve, keep_on_failure=False, command="down")
 
     def _reconcile(self, spec: Spec, *, overrides: Mapping[str, int] | None, set_counts: Mapping[str, int] | None,
-                   auto_approve: bool, keep_on_failure: bool, on_commit: Callable[[], None] | None = None,
-                   command: str = "apply") -> int:
+                   auto_approve: bool, keep_on_failure: bool, command: str = "apply") -> int:
         self._started = self.clock()
         self._command = command
         # 1. plan and limits: nothing has changed yet
@@ -389,9 +339,6 @@ class Reconciler:
                 if not self.confirm(CONFIRM_PROMPT):
                     self._warn("Cancelled: nothing was changed")
                     return 2
-        if on_commit is not None:  # confirmed (or nothing to confirm): gpu-down's record changes here
-            on_commit()
-        if plan.create or plan.delete:
             # 4. deletes before creates
             gone, attempted, failures = self._delete(plan)
             if failures:
@@ -640,13 +587,9 @@ class Reconciler:
                 self._warn(f"warning: cannot read {what}: {e}")
                 return None
 
-        def counts() -> dict[str, int]:
-            if self.down_since() is not None:  # gpu-down is in force: every pool wants 0 (L21-1)
-                return {name: 0 for name in spec.pools}
-            return target_counts(spec, overrides=load_overrides(self.settings.overrides_path))
-
         return find_drift(
-            counts=read("the target counts", counts),
+            counts=read("the target counts", lambda: target_counts(
+                spec, overrides=load_overrides(self.settings.overrides_path))),
             instances=list(instances),
             cluster_nodes=read("the cluster's GPU nodes", self.infra.cluster_gpu_nodes),
             tf_ips=read("the gpu-access state", self._gpu_access_ips),
