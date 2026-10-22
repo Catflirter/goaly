@@ -10,7 +10,9 @@ file) steers the answers:
   plan_rc        {stack: rc}              terraform plan -detailed-exitcode (default 2: changes)
   deletes        {stack: [address]}       resource addresses the plan deletes or replaces
   ssh_failures   N                        first N `gcloud compute ssh --command true` calls fail
-  ssh_fail       [command]                `gcloud compute ssh --command C` exits 1 for each listed C
+  ssh_fail       [command]                `gcloud compute ssh --command C` exits ssh_fail_rc for each listed C
+  ssh_fail_rc    rc                       ... exit code of those calls (default 1: the remote command
+                                          failed; 255 is ssh's own error, e.g. IAP dropped the connection)
   kubeconfig     text                     answer to `sudo cat /etc/rancher/k3s/k3s.yaml`
   readyz         "ok" | anything else     kubectl get --raw /readyz (anything else: exit 1). Like the
                                           real API behind the tunnel, it answers ok only while a fake
@@ -90,7 +92,7 @@ def gcloud():
         time.sleep(300)
         return 0
     if command in SCENARIO.get("ssh_fail", []):
-        return 1
+        return SCENARIO.get("ssh_fail_rc", 1)
     if command == "true":
         counter = Path(os.environ["FAKE_LOG"] + ".ssh-true")
         n = int(counter.read_text()) if counter.exists() else 0

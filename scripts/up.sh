@@ -32,7 +32,7 @@ stage_init() {
 }
 
 stage_base() {
-  local mtu="${UNDERLAY_MTU:-1460}" cp_ip cp_internal_ip ip
+  local mtu="${UNDERLAY_MTU:-1460}" cp_ip cp_internal_ip ip rc
   # The MTU and both IPs end up in a command line run as root on k3s-cp: each is checked first.
   [[ "$mtu" =~ ^[1-9][0-9]{2,3}$ ]] || die "UNDERLAY_MTU in .env must be an MTU in bytes (100-9999): '$mtu'" 2
   log "==> base: VPCs, k3s-cp, k3s server, kubeconfig, API tunnel"
@@ -50,9 +50,13 @@ stage_base() {
   # A fresh staging directory every run, created by the operator's account with mode 0700. mkdir
   # (no -p) fails if anything recreated the path after rm, and the owner check catches a mkdir
   # that is not atomic, so nobody else on k3s-cp can place files there for root to run. node/'s
-  # entries go into it, so the script stays at /tmp/k3s-node/server-bootstrap.sh.
-  cp_ssh 'rm -rf /tmp/k3s-node && mkdir -m 0700 /tmp/k3s-node && [ ! -L /tmp/k3s-node ] && [ -O /tmp/k3s-node ]' \
-    || die "cannot create a private /tmp/k3s-node on $CP_NAME (it exists, is a symlink, or is owned by another user): remove it on the CP and re-run make up"
+  # entries go into it, so the script stays at /tmp/k3s-node/server-bootstrap.sh. Exit 255 is ssh's
+  # own failure (e.g. IAP dropped the connection), not the remote check: it gets its own message.
+  cp_ssh 'rm -rf /tmp/k3s-node && mkdir -m 0700 /tmp/k3s-node && [ ! -L /tmp/k3s-node ] && [ -O /tmp/k3s-node ]' || {
+    rc=$?
+    [[ $rc == 255 ]] && die "SSH to $CP_NAME failed while preparing /tmp/k3s-node (exit 255); re-run make up"
+    die "cannot create a private /tmp/k3s-node on $CP_NAME (it exists, is a symlink, or is owned by another user): remove it on the CP and re-run make up"
+  }
   cp_scp "$REPO_ROOT"/node/* /tmp/k3s-node
   cp_ssh "sudo bash /tmp/k3s-node/server-bootstrap.sh --cp-ip $cp_ip --cp-internal-ip $cp_internal_ip --underlay-mtu $mtu"
 

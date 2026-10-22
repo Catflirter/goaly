@@ -808,6 +808,21 @@ def test_up_base_stops_when_the_staging_directory_cannot_be_made_private(env):
     # The operator learns what to do, not just a bare exit status (X1-1).
     assert "cannot create a private /tmp/k3s-node on k3s-cp" in proc.stderr
     assert "remove it on the CP and re-run make up" in proc.stderr
+    assert "SSH to k3s-cp failed" not in proc.stderr
+    assert not [a for a in env.argvs("gcloud") if a[:2] == ["compute", "scp"]]
+    assert not [a for a in env.argvs("gcloud") if "server-bootstrap.sh" in a[-1]]
+
+
+def test_up_base_reports_an_ssh_failure_while_staging_as_such(env):
+    """ssh's own exit 255 (e.g. IAP dropped the connection) is not blamed on /tmp/k3s-node (X2-1)."""
+    staging = base_sequence(env)[1][1][-1]
+    env.scenario["ssh_fail"] = [staging]
+    env.scenario["ssh_fail_rc"] = 255
+    proc = env.script("up.sh", "base", AUTO_APPROVE="1")
+    assert proc.returncode != 0
+    assert "SSH to k3s-cp failed while preparing /tmp/k3s-node (exit 255); re-run make up" in proc.stderr
+    assert "cannot create a private /tmp/k3s-node" not in proc.stderr
+    assert "remove it on the CP" not in proc.stderr
     assert not [a for a in env.argvs("gcloud") if a[:2] == ["compute", "scp"]]
     assert not [a for a in env.argvs("gcloud") if "server-bootstrap.sh" in a[-1]]
 
