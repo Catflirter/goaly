@@ -101,7 +101,7 @@ verify: ## Run verification checks A-D (RESILIENCE=1 adds E) into verification/<
 	$(ROOT)/scripts/verify.sh
 
 # RUN is a path to the run, as the shell sees it from where make runs (make -C <repo> for a repo-relative one).
-# PROMOTE_ALLOW_FAIL=1 (a run with failed checks) and OPERATOR_IP=<ip> reach promote.sh through the environment.
+# PROMOTE_ALLOW_SKIP=1 (a run with skipped, never failed, checks) and OPERATOR_IP=<ip> reach promote.sh through the environment.
 .PHONY: promote-verify
 promote-verify: ## Copy a verify run to verification/final/ if gitleaks finds no secrets (make promote-verify RUN=verification/<ts>)
 	@[ -n "$(RUN)" ] || { echo "usage: make promote-verify RUN=verification/<YYYY-MM-DDTHHMM-0700>" >&2; exit 2; }

@@ -59,7 +59,7 @@ def snapshot(path):
 
 def promote(repo, *args, env=None, cwd=None):
     return subprocess.run(["bash", str(repo / "scripts/promote.sh"), *args], capture_output=True, text=True,
-                          cwd=cwd or repo, env=env or os.environ.copy())
+                          cwd=cwd or repo, env=env or os.environ.copy(), timeout=120)
 
 
 def make_target(repo, *args):
@@ -133,6 +133,11 @@ def test_promote_accepts_a_run_that_scripts_verify_sh_wrote(repo):
     # The tests above use a hand-made run; this one is the real harness's output (no checks registered).
     for rel in ("scripts/verify.sh", "scripts/lib/checks.sh"):
         shutil.copy2(ROOT / rel, repo / rel)
+    verify_sh = repo / "scripts/verify.sh"
+    marker = "# --- registered checks ---\n"
+    assert marker in verify_sh.read_text()
+    verify_sh.write_text(verify_sh.read_text().replace(
+        marker, marker + "check_ok() { echo ok; }\nregister_check A A1 'always passes' check_ok\n", 1))
     v = subprocess.run(["bash", str(repo / "scripts/verify.sh")], capture_output=True, text=True, cwd=repo,
                        env={k: val for k, val in os.environ.items() if k != "RESILIENCE"})
     assert v.returncode == 0, v.stderr
@@ -140,7 +145,7 @@ def test_promote_accepts_a_run_that_scripts_verify_sh_wrote(repo):
     r = promote(repo, "verify", f"verification/{run.name}")
     assert r.returncode == 0, r.stderr
     assert snapshot(repo / "verification/final") == snapshot(run)
-    assert "0 passed, 0 failed, 0 skipped" in r.stderr
+    assert "1 passed, 0 failed, 0 skipped" in r.stderr
 
 
 # --- secret scan --------------------------------------------------------------------------------
@@ -409,26 +414,95 @@ def test_a_repo_under_an_allowlisted_directory_is_still_scanned(tmp_path):
     assert not (repo / "verification/final").exists()
 
 
-# C0-3/X0-3: final is the run where every check passed (spec section 9, Task 24 Step 3).
-FAILED_SUMMARY = SUMMARY.replace("1 passed, 0 failed, 0 skipped", "3 passed, 2 failed, 0 skipped")
+# C0-3/X0-3, F2-2: final is the run where every check passed (spec section 9, Task 24 Step 3: A-E all
+# PASS). A failed check is always refused; a skipped one only with PROMOTE_ALLOW_SKIP=1, recorded in final.
+def summary_of(*results):
+    """A finished SUMMARY.md whose table rows and Result line hold these check results, in order."""
+    rows = "".join(f"| {i} | A{i} | check {i} | {res} |\n" for i, res in enumerate(results, 1))
+    return ("# Verification run\n\nStarted: 2026-10-21T14:30:05-07:00 (America/Los_Angeles)\n\n"
+            "| # | ID | Check | Result |\n|---|---|---|---|\n" + rows +
+            f"\n**Result:** {results.count('PASS')} passed, {results.count('FAIL')} failed, "
+            f"{results.count('SKIP')} skipped\n\n**Secret scan:** gitleaks found no leaks\n")
+
+
+FAILED_SUMMARY = summary_of("PASS", "FAIL", "PASS", "FAIL", "PASS")
+SKIPPED_SUMMARY = summary_of("PASS", "SKIP", "SKIP")
 
 
 def test_refuses_a_run_with_failed_checks(repo):
     before = previous_final(repo)
     make_run(repo, summary=FAILED_SUMMARY)
-    assert_refused(repo, promote(repo, "verify", f"verification/{TS}"), before, "2 failed", "PROMOTE_ALLOW_FAIL=1")
+    r = promote(repo, "verify", f"verification/{TS}")
+    assert_refused(repo, r, before, "2 failed check(s)")
+    assert "PROMOTE_ALLOW" not in r.stderr, "no override is offered for a failed check"
 
 
 @pytest.mark.parametrize("via_make", [False, True])
-def test_promote_allow_fail_promotes_a_failed_run_with_a_warning(repo, via_make):
-    run = make_run(repo, summary=FAILED_SUMMARY)
+@pytest.mark.parametrize("summary", [FAILED_SUMMARY, summary_of("PASS", "FAIL", "SKIP")], ids=["fail", "fail+skip"])
+def test_no_opt_in_promotes_a_failed_check(repo, via_make, summary):
+    before = previous_final(repo)
+    make_run(repo, summary=summary)
+    opt_in = {"PROMOTE_ALLOW_SKIP": "1", "PROMOTE_ALLOW_FAIL": "1"}
     if via_make:
-        r = make_target(repo, f"RUN=verification/{TS}", "PROMOTE_ALLOW_FAIL=1")
+        r = make_target(repo, f"RUN=verification/{TS}", *(f"{k}={v}" for k, v in opt_in.items()))
     else:
-        r = promote(repo, "verify", f"verification/{TS}", env={**os.environ, "PROMOTE_ALLOW_FAIL": "1"})
+        r = promote(repo, "verify", f"verification/{TS}", env={**os.environ, **opt_in})
+    assert_refused(repo, r, before, "failed check(s)")
+
+
+@pytest.mark.parametrize("allow", [None, "0", "yes", ""])
+def test_refuses_a_run_with_skipped_checks(repo, allow):
+    before = previous_final(repo)
+    make_run(repo, summary=SKIPPED_SUMMARY)
+    env = {k: v for k, v in os.environ.items() if k != "PROMOTE_ALLOW_SKIP"}
+    if allow is not None:
+        env["PROMOTE_ALLOW_SKIP"] = allow
+    assert_refused(repo, promote(repo, "verify", f"verification/{TS}", env=env), before,
+                   "2 skipped", "PROMOTE_ALLOW_SKIP=1")
+
+
+@pytest.mark.parametrize("via_make", [False, True])
+def test_promote_allow_skip_promotes_a_skipped_run_and_records_it(repo, via_make):
+    run = make_run(repo, summary=SKIPPED_SUMMARY)
+    if via_make:
+        r = make_target(repo, f"RUN=verification/{TS}", "PROMOTE_ALLOW_SKIP=1")
+    else:
+        r = promote(repo, "verify", f"verification/{TS}", env={**os.environ, "PROMOTE_ALLOW_SKIP": "1"})
+    assert r.returncode == 0, r.stderr
+    final = repo / "verification/final"
+    got, want = snapshot(final), snapshot(run)
+    assert got.pop("SUMMARY.md") != want.pop("SUMMARY.md") and got == want, "only SUMMARY.md gains the note"
+    text = (final / "SUMMARY.md").read_text()
+    assert text.startswith(SKIPPED_SUMMARY), "the run's summary is kept as it was"
+    note = text[len(SKIPPED_SUMMARY):]
+    assert "2 skipped" in note and "PROMOTE_ALLOW_SKIP=1" in note, note
+    assert (run / "SUMMARY.md").read_text() == SKIPPED_SUMMARY, "the run itself is not changed"
+    assert "WARNING" in r.stderr and "2 skipped" in r.stderr
+
+
+def test_a_passing_run_gets_no_note(repo):
+    run = make_run(repo)
+    r = promote(repo, "verify", f"verification/{TS}", env={**os.environ, "PROMOTE_ALLOW_SKIP": "1"})
     assert r.returncode == 0, r.stderr
     assert snapshot(repo / "verification/final") == snapshot(run)
-    assert "warning" in r.stderr and "2 failed" in r.stderr
+
+
+def test_refuses_a_run_where_no_check_ran(repo):
+    before = previous_final(repo)
+    make_run(repo, summary=summary_of())
+    assert_refused(repo, promote(repo, "verify", f"verification/{TS}"), before, "no check")
+
+
+@pytest.mark.parametrize("summary", [
+    SUMMARY.replace("| PASS |", "| FAIL |"),                              # a FAIL row under a passing total
+    SUMMARY.replace("| PASS |", "| SKIP |"),
+    SUMMARY.replace("1 passed", "2 passed"),                              # more checks counted than listed
+    summary_of("PASS", "PASS").replace("2 passed", "1 passed"),          # a row the total leaves out
+], ids=["fail-row", "skip-row", "missing-row", "extra-row"])
+def test_refuses_a_summary_whose_table_disagrees_with_its_result(repo, summary):
+    before = previous_final(repo)
+    make_run(repo, summary=summary)
+    assert_refused(repo, promote(repo, "verify", f"verification/{TS}"), before, "Result")
 
 
 @pytest.mark.parametrize("result", ["**Result:** all good\n", "**Result:** 1 passed, x failed, 0 skipped\n"])
@@ -436,14 +510,6 @@ def test_refuses_a_result_line_it_cannot_read(repo, result):
     before = previous_final(repo)
     make_run(repo, summary=SUMMARY.split("**Result:**")[0] + result)
     assert_refused(repo, promote(repo, "verify", f"verification/{TS}"), before, "Result")
-
-
-def test_a_skipped_check_is_promoted_with_a_warning(repo):
-    run = make_run(repo, summary=SUMMARY.replace("1 passed, 0 failed, 0 skipped", "1 passed, 0 failed, 2 skipped"))
-    r = promote(repo, "verify", f"verification/{TS}")
-    assert r.returncode == 0, r.stderr
-    assert snapshot(repo / "verification/final") == snapshot(run)
-    assert "warning" in r.stderr and "2 skipped" in r.stderr
 
 
 # X0-2: the operator IP (Task 24 Step 4) must not reach final.
@@ -471,25 +537,135 @@ def test_success_reminds_the_operator_ip_check(repo):
     assert "checkip.amazonaws.com" in r.stderr
 
 
-# S0-2/C0-2/X0-4: replacing final survives a failed rename, Ctrl-C, and a second promotion.
+# F2-4: OPERATOR_IP is read as gpuctl reads it (surrounding whitespace dropped) and must be one IPv4
+# address; anything else would make the check match nothing.
+@pytest.mark.parametrize("value", [f" {OPERATOR_IP}", f"{OPERATOR_IP}\n", f"\t{OPERATOR_IP}  "])
+def test_the_operator_ip_is_checked_despite_surrounding_whitespace(repo, value):
+    before = previous_final(repo)
+    make_run(repo, files={"01-A1.txt": "fine\n", "06-B6.txt": f"fw-ssh-operator  {OPERATOR_IP}/32\n"})
+    r = promote(repo, "verify", f"verification/{TS}", env={**os.environ, "OPERATOR_IP": value})
+    assert r.returncode == 1, r.stderr
+    assert snapshot(repo / "verification/final") == before
+    assert "06-B6.txt" in r.stderr
+
+
+@pytest.mark.parametrize("value", ["73.15.40", "73.15.40.40.1", "73.15.40.400", "073.15.40.40", "not-an-ip",
+                                   f"{OPERATOR_IP}/32", f"{OPERATOR_IP} 10.0.0.1", "::1", "73.15.40.4x"])
+def test_refuses_an_operator_ip_that_is_not_one_ipv4_address(repo, value):
+    before = previous_final(repo)
+    make_run(repo, files={"01-A1.txt": "fine\n", "06-B6.txt": f"fw-ssh-operator  {OPERATOR_IP}/32\n"})
+    r = promote(repo, "verify", f"verification/{TS}", env={**os.environ, "OPERATOR_IP": value})
+    assert_refused(repo, r, before, "OPERATOR_IP")
+
+
+@pytest.mark.parametrize("value", ["", "  ", "\n"])
+def test_a_blank_operator_ip_is_unset(repo, value):
+    # As in gpuctl (detect_operator_ip): blank means "not given"; the success message then prints the
+    # Task 24 Step 4 grep for the operator to run.
+    run = make_run(repo)
+    r = promote(repo, "verify", f"verification/{TS}", env={**os.environ, "OPERATOR_IP": value})
+    assert r.returncode == 0, r.stderr
+    assert snapshot(repo / "verification/final") == snapshot(run)
+    assert "checkip.amazonaws.com" in r.stderr
+
+
+# F2-1: what is scanned and promoted is the staged copy, so the copy itself must be a flat, finished,
+# passing run of regular files. An entry that reaches the run after it was checked (here: added by a cp
+# wrapper just before the copy) fails the promotion instead of reaching final unscanned.
+def fake_cp(tmp_path, kind):
+    bin_dir = tmp_path / "fakecp"
+    bin_dir.mkdir()
+    secret = tmp_path / "secret.env"
+    secret.write_text("token " + K3S_TOKEN + "\n")
+    add = {
+        "dir": f'mkdir "$run/03-C1.txt" && cp {secret} "$run/03-C1.txt/04-x.txt"',
+        "symlink": f'ln -s {secret} "$run/03-C1.txt"',
+        "fifo": 'mkfifo "$run/03-C1.txt"',
+        "badname": f'cp {secret} "$run/03-C1.png"',
+        "no-summary": 'rm "$run/SUMMARY.md"',
+        "failed": f'cp {tmp_path / "failed.md"} "$run/SUMMARY.md"',
+    }[kind]
+    (tmp_path / "failed.md").write_text(FAILED_SUMMARY)
+    real_cp = shutil.which("cp")
+    # promote.sh runs `cp -R -- RUN COPY`; the wrapper changes RUN first. Other cp calls pass through.
+    (bin_dir / "cp").write_text(
+        "#!/bin/sh\n"
+        f'if [ "$1" = -R ] && [ "$2" = -- ]; then run="$3"; cp() {{ {real_cp} "$@"; }}; {add}; fi\n'
+        f'exec {real_cp} "$@"\n')
+    (bin_dir / "cp").chmod(0o755)
+    return {**os.environ, "PATH": f"{bin_dir}:{os.environ['PATH']}"}
+
+
+@pytest.mark.parametrize("kind", ["dir", "symlink", "fifo", "badname", "no-summary", "failed"])
+def test_an_entry_that_reaches_the_run_after_its_check_fails_the_promotion(repo, tmp_path, kind):
+    before = previous_final(repo)
+    make_run(repo)
+    r = promote(repo, "verify", f"verification/{TS}", env=fake_cp(tmp_path, kind))
+    assert r.returncode == 1, (r.returncode, r.stderr)
+    assert snapshot(repo / "verification/final") == before
+    assert verification_entries(repo) == [".gitkeep", TS, "final"], "the copy is removed"
+    assert "copy" in r.stderr, r.stderr
+    assert K3S_TOKEN not in r.stdout + r.stderr
+
+
+def fake_gitleaks(tmp_path, output):
+    """A PATH dir whose gitleaks reads stdin, logs OUTPUT and exits 0."""
+    bin_dir = tmp_path / "bin"
+    bin_dir.mkdir()
+    (tmp_path / "gitleaks.out").write_text(output)
+    (bin_dir / "gitleaks").write_text(f"#!/bin/sh\ncat >/dev/null\ncat {tmp_path / 'gitleaks.out'} >&2\nexit 0\n")
+    (bin_dir / "gitleaks").chmod(0o755)
+    return {**os.environ, "PATH": f"{bin_dir}:{os.environ['PATH']}"}
+
+
+@pytest.mark.parametrize("output", [
+    # What gitleaks stdin logs for a directory on stdin; it still exits 0 (measured, gitleaks 8.x).
+    '6:00AM ERR error="could not read file: read /dev/stdin: is a directory"\n'
+    "6:00AM INF scanned ~0 bytes (0) in 35ms\n6:00AM INF no leaks found\n",
+    "6:00AM WRN something unexpected\n6:00AM INF no leaks found\n",
+    "",                                                                   # no "no leaks found" at all
+    "6:00AM INF scanned ~0 bytes (0) in 35ms\n",
+], ids=["read-error", "warning", "silent", "no-verdict"])
+def test_the_scan_fails_closed_on_anything_but_a_clean_report(repo, tmp_path, output):
+    before = previous_final(repo)
+    make_run(repo)
+    r = promote(repo, "verify", f"verification/{TS}", env=fake_gitleaks(tmp_path, output))
+    assert r.returncode == 1, r.stderr
+    assert snapshot(repo / "verification/final") == before
+    assert verification_entries(repo) == [".gitkeep", TS, "final"]
+
+
+def test_a_clean_report_from_the_fake_scanner_promotes(repo, tmp_path):
+    # The positive control of the test above: the same fake with gitleaks' clean output promotes.
+    run = make_run(repo)
+    env = fake_gitleaks(tmp_path, "6:00AM INF scanned ~6 bytes (6 bytes) in 37ms\n6:00AM INF no leaks found\n")
+    r = promote(repo, "verify", f"verification/{TS}", env=env)
+    assert r.returncode == 0, r.stderr
+    assert snapshot(repo / "verification/final") == snapshot(run)
+
+
+# S0-2/C0-2/X0-4, F2-3: replacing final survives a failed rename, Ctrl-C, and a second promotion. The fake
+# mv blocks until the test releases it, so no timing window decides the outcome.
 
 def fake_mv(tmp_path, mode):
-    """A PATH dir whose mv fails ("fail") or sleeps ("sleep") when renaming the scanned copy (step 2),
-    or sleeps when moving the old final aside ("sleep-old"); a marker file says it reached that point."""
+    """A PATH dir whose mv fails ("fail") or blocks ("block") when renaming the scanned copy (step 2), or
+    blocks when moving the old final aside ("block-old"). On reaching that point it creates the marker
+    file; a blocked mv goes on once the release file exists (and fails after about 60 s, so nothing hangs)."""
     bin_dir = tmp_path / "fakebin"
     bin_dir.mkdir()
-    marker = tmp_path / "mv-reached"
-    src = "*/.promote-*/final" if mode in ("fail", "sleep") else "*/verification/final"
-    action = "exit 1" if mode == "fail" else "sleep 2"
+    marker, release = tmp_path / "mv-reached", tmp_path / "mv-release"
+    src = "*/.promote-*/final" if mode in ("fail", "block") else "*/verification/final"
+    action = "exit 1" if mode == "fail" else (
+        f'i=0; while [ ! -e "{release}" ]; do i=$((i + 1)); [ "$i" -le 1200 ] || exit 1; sleep 0.05; done')
     (bin_dir / "mv").write_text(
         "#!/bin/sh\n"
         f'case "$2" in {src}) : >"{marker}"; {action} ;; esac\n'
         f'exec {shutil.which("mv")} "$@"\n')
     (bin_dir / "mv").chmod(0o755)
-    return {**os.environ, "PATH": f"{bin_dir}:{os.environ['PATH']}"}, marker
+    return {**os.environ, "PATH": f"{bin_dir}:{os.environ['PATH']}"}, marker, release
 
 
-def wait_for(path, proc, seconds=20):
+def wait_for(path, proc, seconds=60):
     deadline = time.monotonic() + seconds
     while not path.exists():
         assert proc.poll() is None, proc.communicate()
@@ -500,38 +676,44 @@ def wait_for(path, proc, seconds=20):
 def test_a_failed_rename_restores_the_previous_final(repo, tmp_path):
     before = previous_final(repo)
     make_run(repo)
-    env, _ = fake_mv(tmp_path, "fail")
+    env, _, _ = fake_mv(tmp_path, "fail")
     r = promote(repo, "verify", f"verification/{TS}", env=env)
     assert r.returncode == 1, r.stderr
     assert snapshot(repo / "verification/final") == before
     assert verification_entries(repo) == [".gitkeep", TS, "final"]
 
 
-@pytest.mark.parametrize("mode", ["sleep-old", "sleep"])
+@pytest.mark.parametrize("mode", ["block-old", "block"])
 def test_ctrl_c_while_replacing_final_leaves_a_whole_final(repo, tmp_path, mode):
     previous_final(repo)
     run = make_run(repo)
-    env, marker = fake_mv(tmp_path, mode)
+    env, marker, release = fake_mv(tmp_path, mode)
     proc = subprocess.Popen(["bash", str(repo / "scripts/promote.sh"), "verify", f"verification/{TS}"],
                             cwd=repo, env=env, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True,
                             start_new_session=True)
-    wait_for(marker, proc)
-    os.killpg(proc.pid, signal.SIGINT)                     # Ctrl-C reaches the whole foreground group
-    proc.communicate(timeout=30)
-    assert snapshot(repo / "verification/final") == snapshot(run), "the swap ran to completion"
+    try:
+        wait_for(marker, proc)                             # blocked inside the swap
+        os.killpg(proc.pid, signal.SIGINT)                 # Ctrl-C reaches the whole foreground group
+    finally:
+        release.touch()                                    # only now may the swap go on
+    _, err = proc.communicate(timeout=60)
+    assert snapshot(repo / "verification/final") == snapshot(run), ("the swap ran to completion", err)
     assert verification_entries(repo) == [".gitkeep", TS, "final"]
 
 
-def test_a_second_promotion_waits_its_turn(repo, tmp_path):
+def test_a_second_promotion_is_refused_while_the_first_holds_the_lock(repo, tmp_path):
     previous_final(repo)
     run = make_run(repo)
     other = make_run(repo, name="2026-10-21T1500-0700")
-    env, marker = fake_mv(tmp_path, "sleep")
+    env, marker, release = fake_mv(tmp_path, "block")
     first = subprocess.Popen(["bash", str(repo / "scripts/promote.sh"), "verify", f"verification/{TS}"],
                              cwd=repo, env=env, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
-    wait_for(marker, first)
-    second = promote(repo, "verify", f"verification/{other.name}")
-    _, err = first.communicate(timeout=30)
+    try:
+        wait_for(marker, first)                            # the first holds the lock, blocked inside the swap
+        second = promote(repo, "verify", f"verification/{other.name}")
+    finally:
+        release.touch()
+    _, err = first.communicate(timeout=60)
     assert first.returncode == 0, err
     assert second.returncode == 1 and "another promotion" in second.stderr, second.stderr
     assert snapshot(repo / "verification/final") == snapshot(run)
