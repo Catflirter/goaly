@@ -119,7 +119,12 @@ def healthy(nodes=(CP, CPU1), mtu=1460):
     def lines(app):  # _vr_pods: "NODE POD IP" for the Running Pods of app=APP
         return "".join(f"{n} {NODES[n][app]} {NODES[n][app + '_ip']}\n" for n in nodes)
 
+    gpus = [n for n in nodes if n.startswith("k3s-gpu-")]
     r = [
+        # the D checks' GPU node list (labelled by join-node.sh); first, so the plain node list below cannot answer it
+        kc("get nodes", "-l node-restriction.kubernetes.io/accelerator=nvidia", "allocatable",
+           stdout="".join(f"{n} 1\n" for n in gpus)),
+        kc("get nodes", "-l node-restriction.kubernetes.io/accelerator=nvidia", stdout="".join(f"{n}\n" for n in gpus)),
         kc("get nodes -o wide", stdout="".join(f"{n} Ready <none> 1h v1.36.5+k3s1\n" for n in nodes)),
         kc("get nodes", 'Ready")].status', stdout="".join(f"{n} True\n" for n in nodes)),
         kc("get nodes", '{.metadata.name}{"\\n"}', stdout="".join(f"{n}\n" for n in nodes)),
@@ -1275,7 +1280,7 @@ def test_c8_fails_without_touching_np_denied_when_c2_fails(env):
     assert np_calls(env) == []
 
 
-# ---- D placeholders and verify.sh registration --------------------------------------------------
+# ---- verify.sh registration (D1-D6: Task 21, tests/scripts/test_checks_d.py) ---------------------
 
 EXPECTED = [("A", "A1", "check_a1_nodes"), ("A", "A2", "check_a2_describe_nodes"), ("A", "A3", "check_a3_system_pods"),
             ("A", "A4", "check_a4_flannel_annotations"), ("B", "B1", "check_b1_matrix"), ("B", "B2", "check_b2_wire"),
@@ -1283,10 +1288,12 @@ EXPECTED = [("A", "A1", "check_a1_nodes"), ("A", "A2", "check_a2_describe_nodes"
             ("B", "B6", "check_b6_firewall_inventory"), ("C", "C1", "check_c1_rollout"),
             ("C", "C2", "check_c2_cross_node_curl"), ("C", "C3", "check_c3_port_forward"), ("C", "C4", "check_c4_qos"),
             ("C", "C5", "check_c5_cgroup"), ("C", "C6", "check_c6_top"), ("C", "C7", "check_c7_limits_demo"),
-            ("C", "C8", "check_c8_netpol")] + [("D", f"D{i}", "check_d_pending") for i in range(1, 7)]
+            ("C", "C8", "check_c8_netpol"), ("D", "D1", "check_d1_gpu_stack"),
+            ("D", "D2", "check_d2_gpu_capacity"), ("D", "D3", "check_d3_device_plugin"), ("D", "D4", "check_d4_gpu_smoke"),
+            ("D", "D5", "check_d5_vectoradd"), ("D", "D6", "check_d6_overflow")]
 
 
-def test_verify_registers_a_b_c_and_d_placeholders_in_order():
+def test_verify_registers_a_b_c_and_d_in_order():
     text = (ROOT / "scripts/verify.sh").read_text()
     regs = re.findall(r"^register_check (\w) (\w+) (?:'[^']*'|\"[^\"]*\") (\w+)$", text, re.M)
     assert regs == EXPECTED
@@ -1297,12 +1304,6 @@ def test_every_registered_function_is_defined_in_checks_sh():
     proc = subprocess.run(["bash", "-c", f"source {ROOT}/scripts/lib/checks.sh; for f in {names}; do "
                            'declare -F "$f" >/dev/null || echo "missing $f"; done'], capture_output=True, text=True)
     assert proc.stdout == "" and proc.returncode == 0
-
-
-def test_d_placeholder_skips(env):
-    result, text = env.check("check_d_pending")
-    assert result == "SKIP"
-    assert "Task 21" in text
 
 
 def test_make_verify_passes_a_b_c_and_skips_d_on_a_healthy_cluster(env):

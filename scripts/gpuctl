@@ -4,6 +4,12 @@ set -euo pipefail
 
 # shellcheck disable=SC1091  # common.sh is linted on its own
 source "$(dirname -- "${BASH_SOURCE[0]}")/lib/common.sh"
+# tfguard (stretch S3) only reads a Terraform plan on stdin: it runs without .env, and never with the Lambda API key.
+if [[ "${1:-}" == tfguard ]]; then
+  unset LAMBDA_API_KEY
+  [[ -x "$REPO_ROOT/.venv/bin/python" ]] || die "$REPO_ROOT/.venv/bin/python not found: run make venv"
+  exec env PYTHONPATH="$REPO_ROOT/lambda" "$REPO_ROOT/.venv/bin/python" -P -m gpuctl "$@"
+fi
 # kubectl must reach this cluster (spec section 11: KUBECONFIG=~/.kube/hybrid-gpu.yaml), never the cluster an
 # ambient KUBECONFIG in the operator's shell points at. .env may still set KUBECONFIG explicitly.
 unset KUBECONFIG
@@ -12,4 +18,6 @@ export KUBECONFIG="${KUBECONFIG:-$HOME/.kube/hybrid-gpu.yaml}"
 [[ -x "$REPO_ROOT/.venv/bin/python" ]] || die "$REPO_ROOT/.venv/bin/python not found: run make venv"
 # -P (safe path, Python >= 3.11): `-m` would otherwise put the caller's cwd first on sys.path, so a stray
 # argparse.py or yaml.py there would run with the .env secrets in its environment.
-exec env PYTHONPATH="$REPO_ROOT/lambda" "$REPO_ROOT/.venv/bin/python" -P -m gpuctl "$@"
+# -u (unbuffered): a piped stdout (make gpu-apply | tee) shows gpuctl's progress as it happens, not minutes later
+# in one block (live finding L21-4).
+exec env PYTHONPATH="$REPO_ROOT/lambda" "$REPO_ROOT/.venv/bin/python" -u -P -m gpuctl "$@"

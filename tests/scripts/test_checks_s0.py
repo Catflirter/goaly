@@ -365,6 +365,12 @@ def test_make_verify_stretch_runs_group_s_after_d(env):
     proc, results = verify(env, STRETCH="1")
     assert proc.returncode == 0, proc.stdout + proc.stderr
     assert results == [*[(i, "SKIP" if i.startswith("D") else "PASS") for _, i, _ in EXPECTED], ("S0", "PASS")]
+    # Group S runs beside Task 21's real D checks (no GPU node: they skip for that reason, not as placeholders).
+    run = next((env.repo / "verification").iterdir())
+    d_files = sorted(run.glob("*-D?.txt"))
+    assert len(d_files) == 6
+    for f in d_files:
+        assert f"no node has the label {GPU_LABEL}" in f.read_text(), f.name
 
 
 def test_verify_stretch_group_s_alone(env):

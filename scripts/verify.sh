@@ -56,13 +56,12 @@ register_check C C5 'cgroup memory.max and cpu.max' check_c5_cgroup
 register_check C C6 'kubectl top pod' check_c6_top
 register_check C C7 'limits-demo: OOMKilled and CPU throttling' check_c7_limits_demo
 register_check C C8 'NetworkPolicy: allowed from nettest, denied elsewhere' check_c8_netpol
-# D1-D6: placeholders (SKIP) until Task 21 replaces check_d_pending with check_d1_gpu_stack … check_d6_overflow.
-register_check D D1 'GPU stack: audit, containerd, RuntimeClass' check_d_pending
-register_check D D2 'GPU capacity and allocatable' check_d_pending
-register_check D D3 'Device plugin registered' check_d_pending
-register_check D D4 'gpu-smoke: nvidia-smi' check_d_pending
-register_check D D5 'vectoradd: Test PASSED' check_d_pending
-register_check D D6 'gpu-overflow stays Pending' check_d_pending
+register_check D D1 'GPU stack: audit, containerd, RuntimeClass' check_d1_gpu_stack
+register_check D D2 'GPU capacity and allocatable' check_d2_gpu_capacity
+register_check D D3 'Device plugin registered' check_d3_device_plugin
+register_check D D4 'gpu-smoke: nvidia-smi' check_d4_gpu_smoke
+register_check D D5 'vectoradd: Test PASSED' check_d5_vectoradd
+register_check D D6 'gpu-overflow stays Pending' check_d6_overflow
 # Stretch checks (group S), registered only with STRETCH=1 (make verify STRETCH=1). S0: stretch S0b;
 # S1 (check_s1_hpa) is added by stretch S1.
 if [[ "${STRETCH:-0}" == 1 ]]; then

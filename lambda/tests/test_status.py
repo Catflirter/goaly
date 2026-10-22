@@ -6,7 +6,7 @@ from fakes import DEFAULT_OUTPUTS, FakeInfra, FakeLambda
 from gpuctl.__main__ import main
 from gpuctl.lambda_api import Instance, InstanceType
 from gpuctl.spec import parse_spec
-from gpuctl.status import CapacityRow, capacity_rows, find_drift, render_capacity
+from gpuctl.status import CapacityRow, capacity_rows, find_drift, is_problem, render_capacity
 from test_spec import VALID
 
 SPEC = parse_spec(VALID)
@@ -110,8 +110,21 @@ def test_drift_flags_missing_node_and_stale_node():
     assert len(lines) == 2
 
 
-def test_drift_flags_pool_count():
-    assert find_drift(**{**CLEAN, "counts": {"a6000": 2}}) == ["pool a6000 has 1, wants 2"]
+def test_a_pool_below_its_count_is_a_note_not_drift():
+    """Spec section 5.4: gpu-status compares four sources (instances, nodes, gpu-access state, k3s_peers) and keeps
+    no local state, so it cannot know gpu-down ran. A pool below its count is what gpu-down leaves (Task 21 Step 7:
+    0 instances, no drift; live finding L21-1): a note pointing at gpu-apply, not a problem (Task 21a review S0-1)."""
+    lines = find_drift(**{**CLEAN, "counts": {"a6000": 2}})
+    assert lines == ["note: pool a6000: 1 of 2 running (make gpu-apply starts the rest)"]
+    assert not any(map(is_problem, lines))
+
+
+def test_a_pool_above_its_count_is_drift():
+    second = active_inst("129.80.30.31", name="k3s-gpu-a6000-2")
+    lines = find_drift(counts={"a6000": 1}, instances=[active_inst(IP), second],
+                       cluster_nodes={"k3s-gpu-a6000-1": IP, "k3s-gpu-a6000-2": "129.80.30.31"},
+                       tf_ips=[IP, "129.80.30.31"], nft_elements=[IP, "129.80.30.31"])
+    assert lines == ["pool a6000 has 2, wants 1"] and is_problem(lines[0])
 
 
 def test_drift_counts_pools_removed_from_the_spec():
@@ -189,7 +202,7 @@ def test_status_reports_an_instance_terminated_behind_gpuctls_back(capsys):  # s
     assert main(["status"], env=ENV, client=fake, infra=consistent_infra()) == 3
     out = capsys.readouterr().out
     assert f"firewall rule for {IP} has no live instance" in out and "stale node k3s-gpu-a6000-1" in out
-    assert "pool a6000 has 0, wants 1" in out
+    assert "note: pool a6000: 0 of 1 running" in out
 
 
 def test_status_unreadable_sources_are_skipped_with_exit_0(capsys):
@@ -219,12 +232,18 @@ def test_status_with_the_gpu_access_state_skipped_says_so_in_the_summary(capsys)
 
 
 def test_status_drift_uses_the_override_target(tmp_path, monkeypatch, capsys):
+    second = active_inst("129.80.30.31", name="k3s-gpu-a6000-2")
+    infra = FakeInfra(outputs={**DEFAULT_OUTPUTS, "gpu-access": {"gpu_ips": [IP, "129.80.30.31"]}},
+                      cluster_nodes={"k3s-gpu-a6000-1": IP, "k3s-gpu-a6000-2": "129.80.30.31"},
+                      nft_elements=[*PEERS, "129.80.30.31"])
+    fake = FakeLambda(types=TYPES, instances=[NODE, second])
+    assert main(["status"], env=ENV, client=fake, infra=infra) == 3  # the spec's count is 1
+    assert "pool a6000 has 2, wants 1" in capsys.readouterr().out
     path = tmp_path / "overrides.json"
     path.write_text('{"pools": {"a6000": 2}}')
     monkeypatch.setattr("gpuctl.__main__.OVERRIDES_PATH", path)
-    fake = FakeLambda(types=TYPES, instances=[NODE])
-    assert main(["status"], env=ENV, client=fake, infra=consistent_infra()) == 3
-    assert "pool a6000 has 1, wants 2" in capsys.readouterr().out
+    assert main(["status"], env=ENV, client=fake, infra=infra) == 0  # the autoscaler wants 2
+    assert "wants" not in capsys.readouterr().out
 
 
 def test_status_is_read_only():
