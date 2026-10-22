@@ -9,13 +9,16 @@
 #      worker, the gpu-access stack's gpu_ips for a GPU node. Then scripts/gpuctl sync-peers puts it
 #      into k3s-cp's k3s_peers set (and the Lambda rules), unless --skip-sync: the caller already
 #      did (scripts/gpuctl apply, or `make up`/cpu-pool.sh, which sync once for all their nodes).
-#   2. NAME already Ready: done (exit 0), unless --force. NAME registered but NotReady: that Node is
-#      deleted first (k3s then drops its node-password secret, which would reject a new machine of
-#      the same name); never a Ready node or another name.
+#   2. NAME already Ready: done (exit 0), unless --force. A registered but NotReady NAME is joined
+#      again (its Node is deleted only for a GPU node, in step 4).
 #   3. Wait (at most 300s) for SSH to the node: a VM or Lambda instance made seconds earlier has no
 #      sshd yet. Then node/ into a fresh private /tmp/k3s-node on it, and node-bootstrap.sh as root.
 #   4. k3s-agent is stopped (a no-op on a first join), so that it starts from the new token: an agent
-#      left running by an earlier join holds that join's token, which is deleted. A join token (TTL
+#      left running by an earlier join holds that join's token, which is deleted. GPU node only: a
+#      NotReady Node of exactly NAME (seen in step 2) is deleted now, after SSH worked and just before
+#      the token install, since k3s then drops its node-password secret, which would reject the new
+#      Lambda machine under that name (Ruling R55); never a Ready node, another name or a CPU worker,
+#      whose VM re-registers with the password it has. A join token (TTL
 #      15m) is created on k3s-cp and piped straight into the node's token-file; then k3s-agent
 #      starts. The token is never in a variable, an argument, a log or a local file.
 #   5. Wait (at most 300s) for the node to be Ready.
@@ -99,21 +102,11 @@ if (( ! SKIP_SYNC )); then
   "$REPO_ROOT/scripts/gpuctl" sync-peers || die "sync-peers failed: $NODE was not joined"
 fi
 
-# ---- 2. already Ready? A stale NotReady node of this name? -------------------------------------------
+# ---- 2. already Ready? -----------------------------------------------------------------------------
 state="$(node_state "$NODE")" || exit
 if [[ "$state" == Ready ]] && (( ! FORCE )); then
   log "$NODE is already Ready: nothing to do (--force bootstraps and joins it again)"
   exit 0
-fi
-# A NotReady Node of exactly this name (left by an instance terminated without a drain, or lost)
-# holds k3s's $NODE.node-password.k3s secret: a new machine under the name would be rejected
-# ("Node password rejected") after billed minutes. Deleting the Node makes k3s remove that secret
-# (review F3-2, Ruling R54). Never a Ready node, never another name. A rejoin of the same machine
-# (a Ready timeout re-run) just registers again with the password it already has.
-if [[ "$state" == NotReady ]]; then
-  log "WARNING: node $NODE is registered but NotReady: deleting it (and so k3s's $NODE.node-password.k3s secret) before the join"
-  _kc_node_gone_ok "$NODE" delete node "$NODE" --request-timeout="$KC_REQUEST_TIMEOUT" \
-    || die "cannot delete the stale NotReady node $NODE: $NODE was not joined (delete it with kubectl delete node $NODE and re-run)"
 fi
 
 # ---- 3. node-bootstrap.sh --------------------------------------------------------------------------
@@ -180,6 +173,20 @@ trap 'exit 143' TERM
 # stopped first, and starts from the new token (a no-op on a first join: the unit is inactive).
 node_ssh "$NODE" 'sudo systemctl stop k3s-agent' < /dev/null \
   || die "cannot stop k3s-agent on $NODE before handing it a new join token"
+
+# A NotReady GPU Node of exactly this name (left by an instance terminated without a drain, or lost)
+# holds k3s's $NODE.node-password.k3s secret: the new Lambda machine under the name would be rejected
+# ("Node password rejected") after billed minutes. Deleting the Node makes k3s remove that secret
+# (review F3-2, Ruling R54). Only now (review F4-3, Ruling R55): SSH to the machine works and it is
+# bootstrapped, so a join that cannot happen deletes nothing. Never a Ready node, never another name,
+# never a CPU worker (F4-4): its VM keeps its identity and re-registers with the password it has, so
+# its Node and the Pods bound to it stay. A rejoin of the same GPU machine (a Ready-timeout re-run)
+# just registers again with its password.
+if [[ "$KIND" == gpu && "$NODE" =~ ^k3s-gpu- && "$state" == NotReady ]]; then
+  log "WARNING: node $NODE is registered but NotReady: deleting it (and so k3s's $NODE.node-password.k3s secret) before the join"
+  _kc_node_gone_ok "$NODE" delete node "$NODE" --request-timeout="$KC_REQUEST_TIMEOUT" \
+    || die "cannot delete the stale NotReady node $NODE: $NODE was not joined (delete it with kubectl delete node $NODE and re-run)"
+fi
 
 # Set before the pipeline: k3s-cp may have made a token even if the node never received it.
 TOKEN_PENDING=1
