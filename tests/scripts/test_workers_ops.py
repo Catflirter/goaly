@@ -117,9 +117,10 @@ def cpu_join(env, name="k3s-cpu-1", ip="34.10.0.11", zone="us-central1-a", mtu="
     ]
 
 
-def gpu_join(env, stale=False):
-    """`stale`: GPU is registered but NotReady, so its Node is deleted once SSH works and the agent is stopped,
-    just before the token install (review F3-2/F4-3, Ruling R55)."""
+def gpu_join(env, stale=False, delete=True):
+    """`stale`: GPU is registered but NotReady, so once SSH works and the agent is stopped, just before the token
+    install, its state is read again and the Node deleted if it is still NotReady (review F3-2/F4-3/F5-1, Ruling
+    R55). `delete=False`: that second read found it Ready or gone, so nothing is deleted."""
     return [
         get_node(env, GPU),
         gpu(env, "true"),
@@ -128,7 +129,8 @@ def gpu_join(env, stale=False):
         gpu(env, f"sudo bash /tmp/k3s-node/node-bootstrap.sh --server-ip 34.82.10.10 --node-name {GPU}"
                  f" --external-ip {GPU_IP} --underlay-mtu 1460 --gpu --gpu-type a6000"),
         gpu(env, STOP_AGENT),
-        *([delete_stale(env, GPU)] if stale else []),
+        *([get_node(env, GPU)] if stale else []),
+        *([delete_stale(env, GPU)] if stale and delete else []),
         cp(f"sudo k3s token create --ttl 15m --description {GPU}"),
         gpu(env, INSTALL),
         kc(env, "wait", "--for=condition=Ready", f"node/{GPU}", "--timeout=10s"),
@@ -552,7 +554,8 @@ def test_join_force_never_deletes_a_ready_node(env):
 
 
 def test_join_stops_when_the_stale_node_cannot_be_deleted(env):
-    """No bootstrap and no token for an agent the cluster would reject anyway."""
+    """No token for an agent the cluster would reject anyway: the join stops after the bootstrap, the agent stop
+    and the failed delete (review F4-3: the delete comes last before the token install)."""
     env.scenario["registered"] = [GPU]
     env.scenario["answers"] = [{"tool": "kubectl", "has": [f"delete node {GPU}"], "rc": 1,
                                 "stderr": 'Error from server (Forbidden): nodes "x" is forbidden'}]
@@ -590,6 +593,56 @@ def test_join_deletes_no_stale_node_when_the_agent_cannot_be_stopped(env):
     proc = gpuctl_join(env)
     assert proc.returncode == 1 and "cannot stop k3s-agent" in proc.stderr
     assert calls(env) == gpu_join(env)[:6] and no_node_deleted(env) and piped(env) == []
+
+
+def second_read(state):
+    """A scripted answer for join-node's two `kubectl get node GPU` calls: NotReady in step 2, then STATE
+    (True, False or gone) in the read just before the stale-Node delete."""
+    later = ({"rc": 1, "stderr": f'Error from server (NotFound): nodes "{GPU}" not found'} if state == "gone"
+             else {"stdout": state})
+    return {"tool": "kubectl", "has": [f"get node {GPU}"], "seq": [{"stdout": "False"}, later]}
+
+
+def test_join_never_deletes_a_node_that_became_ready_during_the_join(env):
+    """Review F5-1, Ruling R55: step 2's NotReady can be minutes old by the delete (the SSH wait, the bootstrap).
+    On a re-run after a Ready timeout the earlier join's agent may have made the Node Ready meanwhile: it is the
+    same machine with its own node password, so its Node and Pods stay; join-node reads the state again and says
+    why it deletes nothing."""
+    env.scenario["answers"] = [second_read("True")]
+    proc = gpuctl_join(env)
+    assert proc.returncode == 0, proc.stderr
+    assert calls(env) == gpu_join(env, stale=True, delete=False)
+    assert no_node_deleted(env) and "WARNING" not in proc.stderr
+    assert f"node {GPU} is Ready now" in proc.stderr and "not deleting it" in proc.stderr
+
+
+def test_join_deletes_nothing_when_the_stale_node_left_during_the_join(env):
+    env.scenario["answers"] = [second_read("gone")]
+    proc = gpuctl_join(env)
+    assert proc.returncode == 0, proc.stderr
+    assert calls(env) == gpu_join(env, stale=True, delete=False)
+    assert no_node_deleted(env) and "WARNING" not in proc.stderr
+    assert f"node {GPU} is no longer registered: nothing to delete" in proc.stderr
+
+
+def test_join_deletes_a_node_still_not_ready_at_the_second_read(env):
+    env.scenario["answers"] = [second_read("False")]
+    proc = gpuctl_join(env)
+    assert proc.returncode == 0, proc.stderr
+    assert calls(env) == gpu_join(env, stale=True)
+    assert f"WARNING: node {GPU} is registered but NotReady" in proc.stderr
+
+
+def test_join_deletes_nothing_when_the_second_read_fails(env):
+    """An API that stops answering before the delete fails the join: no delete, no token."""
+    env.scenario["answers"] = [{"tool": "kubectl", "has": [f"get node {GPU}"], "seq": [
+        {"stdout": "False"},
+        {"rc": 1, "stderr": "Unable to connect to the server: dial tcp 127.0.0.1:6443: connect: connection refused"}]}]
+    proc = gpuctl_join(env)
+    assert proc.returncode == 1 and f"cannot read node {GPU}" in proc.stderr
+    expected = gpu_join(env, stale=True, delete=False)
+    assert calls(env) == expected[:expected.index(gpu(env, STOP_AGENT)) + 2]
+    assert no_node_deleted(env) and piped(env) == []
 
 
 def test_join_tolerates_a_stale_node_that_is_already_gone(env):
