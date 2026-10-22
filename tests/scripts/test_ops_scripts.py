@@ -244,6 +244,24 @@ def test_tf_init_reruns_after_a_failed_init(env):
     assert tf_subcommands(env) == ["init", "init"], "re-initialised once after the failure, then skipped"
 
 
+def test_tf_init_reruns_when_the_committed_lock_file_changed(env):
+    """A pulled provider bump changes infra/STACK/.terraform.lock.hcl: the next tf_init must install
+    it, or every plan fails with 'Inconsistent dependency lock file' until a manual init (X1-2)."""
+    lockfile = env.repo / "infra/base/.terraform.lock.hcl"
+    lockfile.write_text('provider "registry.terraform.io/hashicorp/google" {\n  version = "6.0.0"\n}\n')
+    assert env.lib("load_env; tf_init base").returncode == 0
+    assert env.lib("load_env; tf_init base").returncode == 0
+    assert tf_subcommands(env) == ["init"], "an unchanged lock file is still skipped"
+    lockfile.write_text('provider "registry.terraform.io/hashicorp/google" {\n  version = "6.1.0"\n}\n')
+    assert env.lib("load_env; tf_init base").returncode == 0
+    assert env.lib("load_env; tf_init base").returncode == 0
+    assert tf_subcommands(env) == ["init", "init"]
+    assert env.argvs("terraform")[-1][2:4] == ["-input=false", "-lockfile=readonly"]
+    lockfile.unlink()
+    assert env.lib("load_env; tf_init base").returncode == 0
+    assert tf_subcommands(env) == ["init", "init", "init"], "a removed lock file counts as a change"
+
+
 def test_tf_out_reinitialises_a_stack_whose_init_failed(env):
     env.scenario["init_rc"] = {"base": 1}
     assert env.lib("load_env; tf_init base").returncode != 0
@@ -680,6 +698,38 @@ def test_tunnel_takes_over_a_stale_lock(env):
     assert "stale" in proc.stderr and len(tunnels(env)) == 1 and not env.lockfile.exists()
 
 
+def test_concurrent_starts_take_over_a_stale_lock_once(env):
+    """Several runs waiting on a stale lock: only one may break it. Unserialised, a later waiter's rm
+    deletes the lock an earlier one had just taken, both start a tunnel and one is orphaned (C1-1)."""
+    make_kubeconfig(env)
+    dead = subprocess.Popen(["true"])
+    dead.wait()
+    env.lockfile.parent.mkdir()
+    env.lockfile.write_text(f"{dead.pid}\n")
+    start = [str(env.repo / "scripts/tunnel.sh"), "start"]
+    procs = [env.popen(start) for _ in range(4)]
+    results = [p.communicate(timeout=60) for p in procs]
+    assert [p.returncode for p in procs] == [0, 0, 0, 0], results
+    assert len(tunnels(env)) == 1, results
+    pid = int(env.pidfile.read_text())
+    assert alive(pid) and int(Path(f"{env.log}.tunnel").read_text()) == pid
+    assert not env.lockfile.exists() and not Path(f"{env.lockfile}.break").exists()
+
+
+def test_tunnel_exit_never_removes_a_lock_held_by_another_run(env):
+    """A run whose lock was taken from it must not delete the new holder's lock on exit (C1-1)."""
+    holder = subprocess.Popen(["sleep", "30"])
+    try:
+        env.lockfile.parent.mkdir()
+        env.lockfile.write_text(f"{holder.pid}\n")
+        proc = env.script("tunnel.sh", "stop", TUNNEL_TIMEOUT_S="0")
+        assert proc.returncode != 0 and "still holds" in proc.stderr
+        assert env.lockfile.read_text() == f"{holder.pid}\n"
+    finally:
+        holder.kill()
+        holder.wait()
+
+
 def test_tunnel_usage(env):
     proc = env.script("tunnel.sh", "bogus")
     assert proc.returncode == 2 and "usage" in proc.stderr
@@ -755,6 +805,9 @@ def test_up_base_stops_when_the_staging_directory_cannot_be_made_private(env):
     env.scenario["ssh_fail"] = [staging]
     proc = env.script("up.sh", "base", AUTO_APPROVE="1")
     assert proc.returncode != 0
+    # The operator learns what to do, not just a bare exit status (X1-1).
+    assert "cannot create a private /tmp/k3s-node on k3s-cp" in proc.stderr
+    assert "remove it on the CP and re-run make up" in proc.stderr
     assert not [a for a in env.argvs("gcloud") if a[:2] == ["compute", "scp"]]
     assert not [a for a in env.argvs("gcloud") if "server-bootstrap.sh" in a[-1]]
 

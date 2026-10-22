@@ -26,6 +26,7 @@ LOCAL_PORT="${K3S_TUNNEL_TEST_PORT:-6443}"
 FORWARD="127.0.0.1:$LOCAL_PORT:127.0.0.1:6443"
 TIMEOUT="${TUNNEL_TIMEOUT_S:-30}"
 LOCKFILE="$RUN_DIR/tunnel.lock"
+BREAKFILE="$LOCKFILE.break"
 
 usage() {
   log "usage: ${0##*/} start|stop|status"
@@ -35,18 +36,18 @@ usage() {
 # lock: take $LOCKFILE (it holds this run's PID), released on exit. Created with bash's noclobber,
 # which opens with O_EXCL inside the shell: atomic everywhere, unlike flock (absent on macOS) or
 # mkdir (uutils coreutils' mkdir, Ubuntu's default from 25.10, is not atomic under contention). A
-# lock whose PID is gone (a killed run) is taken over; a live holder is waited for, at most as long
-# as a start can take, then this run gives up.
+# lock whose PID is gone (a killed run) is taken over (break_stale_lock); a live holder is waited
+# for, at most as long as a start can take, then this run gives up.
 lock() {
   local deadline holder said=""
   [[ "$TIMEOUT" =~ ^[0-9]+$ ]] || die "bad TUNNEL_TIMEOUT_S '$TIMEOUT'"
   deadline=$((SECONDS + TIMEOUT + 30))
   run_dir || die "cannot create $RUN_DIR"
+  trap unlock EXIT
   until (set -o noclobber; printf '%s\n' "$$" > "$LOCKFILE") 2> /dev/null; do
     holder="$(cat -- "$LOCKFILE" 2> /dev/null || true)"
-    if [[ "$holder" =~ ^[1-9][0-9]*$ ]] && ! kill -0 "$holder" 2> /dev/null; then
-      log "removing a stale tunnel lock (pid $holder is gone)"
-      rm -f -- "$LOCKFILE"
+    if [[ "$holder" =~ ^[1-9][0-9]*$ ]] && ! kill -0 "$holder" 2> /dev/null \
+      && break_stale_lock "$holder"; then
       continue
     fi
     if [[ -z "$said" ]]; then
@@ -54,10 +55,38 @@ lock() {
       said=1
     fi
     (( SECONDS < deadline )) \
-      || die "another tunnel.sh still holds $LOCKFILE (pid ${holder:-unknown}); if none is running, remove it"
+      || die "another tunnel.sh still holds $LOCKFILE (pid ${holder:-unknown}); if none is running, remove it and $BREAKFILE"
     sleep 0.2
   done
-  trap 'rm -f -- "$LOCKFILE"' EXIT
+}
+
+# break_stale_lock DEAD_PID: remove $LOCKFILE if it still holds DEAD_PID; 0 if this run removed it.
+# Serialised by a second noclobber lock, $BREAKFILE. Without it, two waiters that read the same dead
+# holder could both remove "the stale lock": the later rm deletes the lock the other has just
+# taken, and both run start or stop at once (C1-1). Under $BREAKFILE the lock is read again; a dead
+# PID never takes a new lock, so a file that still holds it is the stale one. A run that cannot
+# take $BREAKFILE (another run is breaking the lock) waits and retries like any other waiter.
+break_stale_lock() {
+  local dead="$1" removed=1
+  (set -o noclobber; printf '%s\n' "$$" > "$BREAKFILE") 2> /dev/null || return 1
+  if [[ "$(cat -- "$LOCKFILE" 2> /dev/null || true)" == "$dead" ]]; then
+    log "removing a stale tunnel lock (pid $dead is gone)"
+    rm -f -- "$LOCKFILE"
+    removed=0
+  fi
+  rm -f -- "$BREAKFILE"
+  return "$removed"
+}
+
+# unlock (EXIT trap): remove $LOCKFILE and $BREAKFILE, each only while it holds this run's PID, so a
+# run never deletes a lock that another run holds.
+unlock() {
+  local f
+  for f in "$LOCKFILE" "$BREAKFILE"; do
+    if [[ "$(cat -- "$f" 2> /dev/null || true)" == "$$" ]]; then
+      rm -f -- "$f"
+    fi
+  done
 }
 
 # tunnel_pid: print the PID in $PIDFILE if that process is alive and is this tunnel (its command

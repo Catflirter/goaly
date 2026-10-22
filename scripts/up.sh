@@ -7,7 +7,9 @@
 #
 # Each terraform apply shows its plan and asks first (AUTO_APPROVE=1 skips the question). The base
 # stage applies with --no-destroy: under AUTO_APPROVE=1 a plan that would destroy or replace
-# anything there (k3s-cp) is refused. A plan without changes applies nothing.
+# anything there (k3s-cp) is refused. A deliberate replacement of k3s-cp (a ForceNew change such as
+# its image, machine type or startup metadata) runs `make up` interactively, where the plan's
+# destroys are listed and confirmed. A plan without changes applies nothing.
 set -euo pipefail
 
 # shellcheck disable=SC1091  # common.sh is linted on its own
@@ -49,7 +51,8 @@ stage_base() {
   # (no -p) fails if anything recreated the path after rm, and the owner check catches a mkdir
   # that is not atomic, so nobody else on k3s-cp can place files there for root to run. node/'s
   # entries go into it, so the script stays at /tmp/k3s-node/server-bootstrap.sh.
-  cp_ssh 'rm -rf /tmp/k3s-node && mkdir -m 0700 /tmp/k3s-node && [ ! -L /tmp/k3s-node ] && [ -O /tmp/k3s-node ]'
+  cp_ssh 'rm -rf /tmp/k3s-node && mkdir -m 0700 /tmp/k3s-node && [ ! -L /tmp/k3s-node ] && [ -O /tmp/k3s-node ]' \
+    || die "cannot create a private /tmp/k3s-node on $CP_NAME (it exists, is a symlink, or is owned by another user): remove it on the CP and re-run make up"
   cp_scp "$REPO_ROOT"/node/* /tmp/k3s-node
   cp_ssh "sudo bash /tmp/k3s-node/server-bootstrap.sh --cp-ip $cp_ip --cp-internal-ip $cp_internal_ip --underlay-mtu $mtu"
 

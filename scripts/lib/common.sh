@@ -77,8 +77,11 @@ tf_dir() {
 }
 
 # tf_init STACK: init STACK on the gcs backend, bucket $GCP_PROJECT-k3s-tfstate, prefix STACK.
-# Skipped when the last init of this stack succeeded for exactly that bucket and prefix. A marker,
-# .terraform/k3s-tf-init.ok, is removed before every init and written only after it succeeds.
+# Skipped when the last init of this stack succeeded for exactly that bucket and prefix and the
+# committed lock file (.terraform.lock.hcl) is unchanged since: a pulled provider bump is installed
+# by the next run instead of failing every plan with "Inconsistent dependency lock file". A marker,
+# .terraform/k3s-tf-init.ok, records both (the lock file's cksum, which only has to notice a
+# change); it is removed before every init and written only after it succeeds.
 # .terraform/terraform.tfstate cannot tell: terraform writes it before it installs the providers,
 # so a failed or interrupted init would otherwise be skipped on every later run. A stack
 # initialised for another bucket (GCP_PROJECT changed) is re-initialised with -reconfigure, which
@@ -87,13 +90,16 @@ tf_dir() {
 # Terraform's output goes to stderr, so $(tf_out ...) stays clean when it initialises on the way.
 # The bootstrap stack keeps local state; `scripts/up.sh init` initialises it, not this.
 tf_init() {
-  local stack="$1" dir marker want
+  local stack="$1" dir marker want lock_sum="no-lock-file"
   [[ "$stack" != bootstrap ]] \
     || die "tf_init: the bootstrap stack keeps local state; scripts/up.sh init initialises it"
   dir="$(tf_dir "$stack")" || exit
   tf_env
   marker="$dir/.terraform/k3s-tf-init.ok"
-  want="gcs $TF_VAR_state_bucket $stack"
+  if [[ -f "$dir/.terraform.lock.hcl" ]]; then
+    lock_sum="$(cksum < "$dir/.terraform.lock.hcl")" || die "cannot read $dir/.terraform.lock.hcl"
+  fi
+  want="gcs $TF_VAR_state_bucket $stack lock $lock_sum"
   if [[ -f "$marker" && "$(cat -- "$marker")" == "$want" ]]; then
     return 0
   fi
