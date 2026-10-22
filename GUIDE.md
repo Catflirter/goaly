@@ -121,13 +121,88 @@ builds a WireGuard mesh between those public endpoints.
 - **Two layers of rules.** Global rules carry only the operator's SSH. Per-region rulesets carry
   the cluster rules and are attached at launch.
 
-## 3. Verification with plain `kubectl`
+## 3. Operations guide
+
+Every operation is a `make` target run from the repository root. Run `make help` for the full list.
+The times below were measured live on 2026-10-22.
+
+### 3.1 Prerequisites (once)
+
+- Tools: `gcloud` (logged in, plus `gcloud auth application-default login`), `terraform`,
+  `kubectl`, `helm`, `jq`, Python ≥ 3.11, bash ≥ 4.1, `flock` (util-linux), `gitleaks`.
+  On macOS: `brew install bash util-linux`.
+- `make venv` creates `.venv` with the Python dependencies.
+- Copy `.env.example` to `.env`, run `chmod 600 .env`, and fill in:
+
+  | Key | Meaning |
+  |---|---|
+  | `GCP_PROJECT` | GCP project id |
+  | `LAMBDA_API_KEY` | Lambda Cloud API key (stays in `.env`; never printed or passed on argv) |
+  | `LAMBDA_SSH_KEY_NAME` | name of the SSH key registered in Lambda |
+  | `SSH_PRIVATE_KEY_PATH` | path to that key's private half |
+  | `OPERATOR_IP` | optional: your public IP (otherwise looked up via checkip.amazonaws.com) |
+  | `UNDERLAY_MTU` | optional: defaults to 1460 |
+
+### 3.2 Bring the cluster up
+
+| Step | Command | Time | What it does |
+|---|---|---|---|
+| 1 | `make init` | ~1 min (first time) | Terraform state bucket and GCP APIs; one-time |
+| 2 | `make up` | ~7 min | VPCs, k3s-cp, kubeconfig, API tunnel, CPU worker(s), metrics-server, device plugin, workloads; safe to re-run |
+| 3 | `make gpu-plan` | ~10 s | read-only: which GPU node would be created, and the hourly cost against the budget |
+| 4 | `make gpu-apply` | ~6 min | launch the Lambda GPU node(s), update the firewalls on both clouds, join the cluster |
+
+Every command that changes infrastructure shows its plan and asks before applying.
+`AUTO_APPROVE=1` skips the question.
+
+### 3.3 Day-to-day operations
+
+| Task | Command |
+|---|---|
+| Re-open the API tunnel (it can drop when idle) | `make tunnel` |
+| Scale CPU workers | `make cpu-scale N=2` (~2.5 min up, ~3 min down) |
+| Scale GPU nodes | edit `count` in `lambda/gpu-nodes.yaml`, then `make gpu-plan` and `make gpu-apply` |
+| GPU state and drift | `make gpu-status` |
+| Refresh the allow-lists (e.g. your IP changed) | `make sync-peers` |
+| Remove all GPU nodes (stops Lambda billing) | `make gpu-down` (~40 s) |
+
+GPU spend is capped by `budget_usd_per_hour` and `max_nodes` in `lambda/gpu-nodes.yaml`. A plan
+over the budget is refused. New nodes are priced at the most expensive fallback type.
+
+### 3.4 Verify and record evidence
+
+| Command | Time | What it does |
+|---|---|---|
+| `make verify` | ~7 min with a GPU | checks A–D into `verification/<timestamp>/` |
+| `make verify RESILIENCE=1` | ~22 min | adds E: worker reboot, GPU node replacement, firewall drift |
+| `make promote-verify RUN=verification/<timestamp>` | seconds | copies a passing run to `verification/final/` after a secret scan |
+
+### 3.5 Live demo
+
+- `make preflight`: checks tools, logins, the Lambda API, the tunnel and node readiness.
+- `make demo`: runs the chapters one step at a time. `CHAPTERS=1,4,5` picks chapters.
+- `make demo-replay CHAPTER=n`: plays a recorded chapter offline.
+- `make demo-reset`: cleans up after a demo.
+
+### 3.6 Tear down
+
+| Command | Time | What it does |
+|---|---|---|
+| `make gpu-down` | ~40 s | removes the GPU nodes only |
+| `make down` | ~6 min | removes everything except the state bucket |
+
+`make down` asks you to type the project id. It ends by checking that Lambda lists no GPU node of
+this cluster. Run `make tunnel` first so the worker nodes are drained cleanly.
+
+If something fails, see the Troubleshooting section of [docs/runbook.md](docs/runbook.md).
+
+## 4. Verification with plain `kubectl`
 
 Each command below sets `KUBECONFIG`, so it runs on its own. The only dependency is the IAP API
 tunnel (`make tunnel`), which is the cluster's single access path: kubeconfig →
 `127.0.0.1:6443`.
 
-### 3.1 Control plane on GCP, CPU workers in a separate VPC, GPU nodes on Lambda
+### 4.1 Control plane on GCP, CPU workers in a separate VPC, GPU nodes on Lambda
 
 ```bash
 export KUBECONFIG=$HOME/.kube/hybrid-gpu.yaml && kubectl get nodes -o wide
@@ -153,7 +228,7 @@ Check:
   - the label `node-restriction.kubernetes.io/accelerator=nvidia`;
   - the taint `nvidia.com/gpu=present:NoSchedule`.
 
-### 3.2 Nodes connected over WireGuard
+### 4.2 Nodes connected over WireGuard
 
 ```bash
 export KUBECONFIG=$HOME/.kube/hybrid-gpu.yaml && kubectl get nodes -o custom-columns='NAME:.metadata.name,BACKEND:.metadata.annotations.flannel\.alpha\.coreos\.com/backend-type,PUBLIC-IP:.metadata.annotations.flannel\.alpha\.coreos\.com/public-ip'
@@ -161,7 +236,7 @@ export KUBECONFIG=$HOME/.kube/hybrid-gpu.yaml && kubectl get nodes -o custom-col
 
 Expect `BACKEND=wireguard` on every node. PUBLIC-IP is each node's tunnel endpoint.
 
-### 3.3 NVIDIA device plugin and an `nvidia-smi` Pod
+### 4.3 NVIDIA device plugin and an `nvidia-smi` Pod
 
 ```bash
 export KUBECONFIG=$HOME/.kube/hybrid-gpu.yaml && kubectl -n nvidia-device-plugin get ds,pods -o wide
@@ -180,7 +255,7 @@ export KUBECONFIG=$HOME/.kube/hybrid-gpu.yaml && kubectl -n gpu-test delete pod 
 
 Expect the `nvidia-smi` table for the GPU, with the Pod placed on a GPU node.
 
-### 3.4 The two CPU nodes communicate
+### 4.4 The two CPU nodes communicate
 
 From a Pod on k3s-cpu-1 to a Pod IP on k3s-cpu-2:
 
@@ -191,7 +266,7 @@ export KUBECONFIG=$HOME/.kube/hybrid-gpu.yaml && P=$(kubectl -n nettest get pod 
 Expect an echo response. Replace `k3s-cpu-2` with `k3s-gpu-a6000-1` to show that GCP ↔ Lambda
 traffic works as well.
 
-### 3.5 hello-world Deployment with requests and limits
+### 4.5 hello-world Deployment with requests and limits
 
 ```bash
 export KUBECONFIG=$HOME/.kube/hybrid-gpu.yaml && kubectl -n hello get deploy,pods,svc -o wide
@@ -210,7 +285,7 @@ export KUBECONFIG=$HOME/.kube/hybrid-gpu.yaml && P=$(kubectl -n nettest get pod 
 Expect `hello world`. The request must come from the `nettest` namespace, because a NetworkPolicy
 allows ingress to hello only from there.
 
-### 3.6 Architecture brief and verification logs
+### 4.6 Architecture brief and verification logs
 
 - Architecture brief: [README.md](README.md) and [docs/](docs/).
 - Verification logs: [verification/final/SUMMARY.md](verification/final/SUMMARY.md), with one
