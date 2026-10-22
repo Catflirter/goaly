@@ -11,11 +11,14 @@ import re
 import pytest
 import yaml
 
-from k8s_helpers import K8S, all_containers, load_docs, one, pod_spec
+from k8s_helpers import K8S, ROOT, all_containers, load_docs, one, pod_spec
 
 MON = K8S / "monitoring"
-MANIFESTS = ["namespaces.yaml", "prometheus.yaml", "kube-state-metrics.yaml", "node-exporter.yaml",
-             "dcgm-exporter.yaml", "grafana.yaml", "network-policies.yaml"]
+# In the order scripts/monitoring.sh applies them: the namespaces and their default-deny policies before
+# anything else, so no workload is ever reachable without a policy (review r1, X0-2).
+MANIFESTS = ["namespaces.yaml", "network-policies.yaml", "prometheus.yaml", "kube-state-metrics.yaml",
+             "node-exporter.yaml", "dcgm-exporter.yaml", "grafana.yaml"]
+SCRIPT = ROOT / "scripts" / "monitoring.sh"
 DASHBOARD = MON / "grafana-dashboard.json"
 NS, HOST_NS = "monitoring", "monitoring-host"
 CLUSTER_SCOPED = {"Namespace", "ClusterRole", "ClusterRoleBinding"}
@@ -69,9 +72,17 @@ def env_of(container) -> dict:
 
 # ---- files, images, namespaces ------------------------------------------------------------------
 
+def _script_array(name) -> list[str]:
+    match = re.search(rf"^{name}=\(([^)]*)\)", SCRIPT.read_text(), re.MULTILINE)
+    assert match, f"{name}=( ... ) not found in {SCRIPT}"
+    return match.group(1).split()
+
+
 def test_directory_holds_exactly_the_listed_files():
-    # scripts/monitoring.sh applies MANIFESTS by name; a new file must be added there and here.
     assert sorted(p.name for p in MON.iterdir()) == sorted([*MANIFESTS, DASHBOARD.name])
+    # scripts/monitoring.sh applies FIRST, then MANIFESTS, by name: a file missing there would never be
+    # applied, so together they must be this list, in this order (review r1, C0-1).
+    assert [*_script_array("FIRST"), *_script_array("MANIFESTS")] == MANIFESTS
 
 
 def test_every_image_is_the_pinned_digest():
@@ -226,12 +237,18 @@ def test_node_exporter_runs_on_every_node():
     c = spec["containers"][0]
     assert c["securityContext"]["readOnlyRootFilesystem"] is True
     args = c["args"]
-    for flag in ("--path.procfs=/host/proc", "--path.sysfs=/host/sys", "--path.rootfs=/host/root"):
+    for flag in ("--path.procfs=/host/proc", "--path.sysfs=/host/sys"):
         assert flag in args
     # Without hostNetwork these collectors would report the Pod's own network namespace: switched off.
     for collector in ("netdev", "netstat", "sockstat", "netclass", "arp", "conntrack"):
         assert f"--no-collector.{collector}" in args
-    assert {v["hostPath"]["path"] for v in spec["volumes"] if "hostPath" in v} == {"/proc", "/sys", "/"}
+    # Only /proc and /sys from the host (review r1, X0-3): the host's root filesystem is not mounted, the
+    # collectors that would read it are off, and no flag points at a rootfs or udev path.
+    for collector in ("filesystem", "mountstats"):
+        assert f"--no-collector.{collector}" in args
+    assert not [a for a in args if a.startswith(("--path.rootfs", "--path.udev", "--collector.filesystem"))]
+    assert {v["hostPath"]["path"] for v in spec["volumes"] if "hostPath" in v} == {"/proc", "/sys"}
+    assert not [m for m in c["volumeMounts"] if "mountPropagation" in m]
 
 
 def test_dcgm_exporter_only_on_admin_labelled_gpu_nodes():
@@ -252,6 +269,33 @@ def test_dcgm_exporter_never_takes_a_gpu():
             assert set(c["resources"][part]) == {"cpu", "memory"}, (c["name"], part)
     c = spec["containers"][0]
     assert env_of(c)["NVIDIA_VISIBLE_DEVICES"]["value"] == "all"
+
+
+# The one container allowed to see GPUs without a device-plugin allocation (review r1, X0-1).
+GPU_ENV_EXCEPTION = ("DaemonSet", HOST_NS, "dcgm-exporter", "dcgm-exporter")
+
+
+def _all_k8s_docs() -> list[dict]:
+    """Every document under k8s/ except Helm values files (as test_workload_manifests.all_k8s_docs)."""
+    return [d for p in sorted(K8S.rglob("*.y*ml")) if not p.name.endswith("values.yaml") for d in load_docs(p)]
+
+
+def test_only_the_dcgm_exporter_sees_gpus_without_an_allocation():
+    # Spec §7: a GPU Pod sets runtimeClassName nvidia-gpu plus an nvidia.com/gpu limit and never
+    # NVIDIA_VISIBLE_DEVICES. The DCGM exporter has to watch every GPU without taking one from a workload,
+    # so it alone uses the spec §6.4 env-var path; this walk keeps any other manifest from copying it.
+    found = []
+    for d in _all_k8s_docs():
+        spec = pod_spec(d)
+        if spec is None:
+            continue
+        for c in all_containers(spec):
+            sets_env = any(e["name"] == "NVIDIA_VISIBLE_DEVICES" for e in c.get("env", []))
+            unallocated = (spec.get("runtimeClassName") == "nvidia-gpu"
+                           and "nvidia.com/gpu" not in c.get("resources", {}).get("limits", {}))
+            if sets_env or unallocated:
+                found.append((d["kind"], d["metadata"].get("namespace"), d["metadata"]["name"], c["name"]))
+    assert found == [GPU_ENV_EXCEPTION]
 
 
 def test_dcgm_exporter_has_no_extra_privileges():
@@ -305,6 +349,32 @@ def test_prometheus_scrapes_pods_over_the_pod_network_only():
     # proxy path would need nodes/proxy, which lets its holder run commands through the kubelet.
     text = configmap_data("prometheus-config", "prometheus.yml")
     assert "10250" not in text and "role: node" not in text and "proxy" not in text
+
+
+# Each Pod-discovery job keeps its targets by (Pod label app.kubernetes.io/name, container port name);
+# the port so selected must be the one the job's NetworkPolicy lets Prometheus reach.
+KEEP_LABELS = ["__meta_kubernetes_pod_label_app_kubernetes_io_name", "__meta_kubernetes_pod_container_port_name"]
+SCRAPED = {"node-exporter": ("DaemonSet", "allow-prometheus-node-exporter"),
+           "dcgm-exporter": ("DaemonSet", "allow-prometheus-dcgm-exporter"),
+           "kube-state-metrics": ("Deployment", "allow-prometheus-kube-state-metrics")}
+
+
+@pytest.mark.parametrize("job", sorted(SCRAPED))
+def test_each_scrape_job_keeps_the_workloads_real_port(job):
+    # A renamed port or label would drop every target while the job still exists (review r1, C0-2).
+    kind, policy = SCRAPED[job]
+    cfg = {j["job_name"]: j for j in prometheus_config()["scrape_configs"]}[job]
+    keeps = [r for r in cfg["relabel_configs"] if r.get("action") == "keep" and r["source_labels"] == KEEP_LABELS]
+    assert len(keeps) == 1, job
+    regex = keeps[0]["regex"]
+    template = workload(kind, job)["spec"]["template"]
+    name = template["metadata"]["labels"]["app.kubernetes.io/name"]
+    ports = [p for c in template["spec"]["containers"] for p in c.get("ports", [])
+             if re.fullmatch(regex, f"{name};{p['name']}")]
+    assert len(ports) == 1, (job, regex)
+    np = one(docs("network-policies.yaml"), "NetworkPolicy", policy)
+    assert np["spec"]["podSelector"] == {"matchLabels": {"app.kubernetes.io/name": name}}
+    assert [p["port"] for rule in np["spec"]["ingress"] for p in rule["ports"]] == [ports[0]["containerPort"]]
 
 
 def test_prometheus_rbac_is_read_only_pods_in_the_two_namespaces():

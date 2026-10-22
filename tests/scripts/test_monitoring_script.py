@@ -21,8 +21,11 @@ import yaml
 
 ROOT = Path(__file__).resolve().parents[2]
 SCRIPT = ROOT / "scripts" / "monitoring.sh"
+# tests/k8s/test_monitoring_manifests.py ties these lists to the script's FIRST and MANIFESTS arrays.
+FIRST = ["namespaces.yaml", "network-policies.yaml"]
 MANIFESTS = ["prometheus.yaml", "kube-state-metrics.yaml", "node-exporter.yaml", "dcgm-exporter.yaml",
-             "grafana.yaml", "network-policies.yaml"]
+             "grafana.yaml"]
+GIB = 1024 * 1024  # in Ki
 
 FAKE_KUBECTL = r'''
 import json, os, sys, time
@@ -49,13 +52,27 @@ if "get" in words and "deployment" in words:
     if (state / "grafana").exists():
         print("deployment.apps/grafana"); sys.exit(0)
     print('Error from server (NotFound): deployments.apps "grafana" not found', file=sys.stderr); sys.exit(1)
+if "get" in words and "node" in words:
+    if (state / "node-missing").exists():
+        print('Error from server (NotFound): nodes "k3s-cpu-1" not found', file=sys.stderr); sys.exit(1)
+    mem = state / "node-memory"
+    print(mem.read_text() if mem.exists() else "8131776Ki", end=""); sys.exit(0)
+if "get" in words and "configmap" in words:
+    name = words[words.index("configmap") + 1]
+    data = state / f"cm-{name}"
+    print(data.read_text() if data.exists() else json.dumps({"file": name}), end=""); sys.exit(0)
 if "create" in words and "configmap" in words:
     print("apiVersion: v1\nkind: ConfigMap\nmetadata:\n  name: grafana-dashboards\n"); sys.exit(0)
 if "create" in words:
     if (state / "secret").exists():
         print('Error from server (AlreadyExists): secrets "grafana-admin" already exists', file=sys.stderr)
         sys.exit(1)
-    (state / "secret").write_text(stdin); sys.exit(0)
+    (state / "secret").write_text(stdin)
+    if (state / "create-times-out").exists():  # created on the server, the reply lost on the way back
+        print("error: context deadline exceeded (Client.Timeout exceeded while awaiting headers)",
+              file=sys.stderr)
+        sys.exit(1)
+    sys.exit(0)
 if "apply" in words and any(a.endswith("grafana.yaml") for a in args):
     (state / "grafana").write_text("")
 if "rollout" in words and "status" in words and (state / "rollout-fails").exists():
@@ -214,7 +231,10 @@ def test_install_applies_everything_in_order_and_waits_for_the_rollout(env):
         assert a[:2] == ["--kubeconfig", str(env.kubeconfig)]
     mon = str(env.repo / "k8s/monitoring")
     applies = [a for a in argvs if "apply" in a]
-    assert applies[0][applies[0].index("-f") + 1] == f"{mon}/namespaces.yaml"
+    # The namespaces and their default-deny NetworkPolicies first, in one apply: no workload, and not
+    # Prometheus' unauthenticated API, is ever up without its policy (review r1, X0-2).
+    first = [applies[0][i + 1] for i, w in enumerate(applies[0]) if w == "-f"]
+    assert first == [f"{mon}/{m}" for m in FIRST]
     files = [a[i + 1] for a in applies[1:] for i, w in enumerate(a) if w == "-f"]
     assert files == ["-", *(f"{mon}/{m}" for m in MANIFESTS)]  # the dashboard ConfigMap, then the manifests
     # The namespace exists before the Secret is created; the Secret and dashboard before Grafana.
@@ -240,7 +260,11 @@ def test_install_restarts_a_running_grafana_when_the_password_is_new(env):
     proc = env.run("install")
     assert proc.returncode == 0, proc.stderr
     restarts = [a for a in env.argvs() if "restart" in a]
-    assert len(restarts) == 1 and restarts[0][-3:] == ["rollout", "restart", "deployment/grafana"]
+    assert len(restarts) == 1
+    i = restarts[0].index("rollout")
+    assert restarts[0][i:i + 3] == ["rollout", "restart", "deployment/grafana"]
+    # Bounded like every other one-shot request: a stalled tunnel must not hang make (review r1, C0-4).
+    assert "--request-timeout=60s" in restarts[0]
 
 
 def test_install_does_not_restart_grafana_on_an_ordinary_upgrade(env):
@@ -248,6 +272,98 @@ def test_install_does_not_restart_grafana_on_an_ordinary_upgrade(env):
     (env.state / "secret").write_text("existing")
     assert env.run("install").returncode == 0
     assert not [a for a in env.argvs() if "restart" in a]
+
+
+def test_a_secret_create_whose_reply_is_lost_still_restarts_grafana_and_says_how_to_read_it(env):
+    # The create reached the server but timed out on the way back (review r1, X0-5): the Secret holds the
+    # new password, so the running Grafana must restart onto it and the operator must learn how to read it.
+    (env.state / "grafana").write_text("")
+    (env.state / "create-times-out").write_text("")
+    proc = env.run("install")
+    assert proc.returncode == 0, proc.stderr
+    assert "jsonpath='{.data.admin-password}'" in proc.stderr
+    assert decoded(env, "admin-password") not in all_output(env, proc)
+    restarts = [a for a in env.argvs() if "restart" in a]
+    assert len(restarts) == 1 and "deployment/grafana" in restarts[0]
+
+
+def _patches(env):
+    """{object: (namespace, config hash)} from the install's `kubectl patch` calls."""
+    out = {}
+    for a in env.argvs():
+        if "patch" not in a:
+            continue
+        assert "--request-timeout=60s" in a and a[a.index("--type") + 1] == "merge"
+        body = json.loads(a[a.index("-p") + 1])
+        assert set(body) == {"spec"} and set(body["spec"]) == {"template"}
+        annotations = body["spec"]["template"]["metadata"]["annotations"]
+        assert set(annotations) == {"checksum/config"}
+        out[a[a.index("patch") + 1]] = (a[a.index("-n") + 1], annotations["checksum/config"])
+    return out
+
+
+def test_install_stamps_the_config_hash_on_the_pods_that_read_config_only_at_start(env):
+    # dcgm-exporter (counters.csv, a subPath mount) and Grafana (provisioning) read their ConfigMaps only
+    # at start: install puts a hash of them in the Pod template, so a changed ConfigMap rolls them (C0-3).
+    assert env.run("install").returncode == 0
+    first = _patches(env)
+    assert set(first) == {"daemonset/dcgm-exporter", "deployment/grafana"}
+    assert first["daemonset/dcgm-exporter"][0] == "monitoring-host"
+    assert first["deployment/grafana"][0] == "monitoring"
+    for _, digest in first.values():
+        assert re.fullmatch(r"[0-9a-f]{64}", digest)
+    # Hashed from the ConfigMaps the API server holds, read after the apply, before the rollout waits.
+    argvs = env.argvs()
+    gets = [i for i, a in enumerate(argvs) if "get" in a and "configmap" in a]
+    assert {argvs[i][argvs[i].index("configmap") + 1] for i in gets} == {
+        "dcgm-counters", "grafana-datasources", "grafana-dashboard-provider"}
+    last_apply = max(i for i, a in enumerate(argvs) if "apply" in a)
+    patches = [i for i, a in enumerate(argvs) if "patch" in a]
+    status = min(i for i, a in enumerate(argvs) if "status" in a)
+    assert last_apply < min(gets) and max(patches) < status
+
+    env.log.unlink()
+    assert env.run("install").returncode == 0
+    assert _patches(env) == first  # same config, same hash: the patch is a no-op, nothing restarts
+
+    env.log.unlink()
+    (env.state / "cm-dcgm-counters").write_text('{"counters.csv":"DCGM_FI_DEV_GPU_UTIL, gauge, x"}')
+    assert env.run("install").returncode == 0
+    again = _patches(env)
+    assert again["daemonset/dcgm-exporter"] != first["daemonset/dcgm-exporter"]
+    assert again["deployment/grafana"] == first["deployment/grafana"]
+
+    env.log.unlink()
+    (env.state / "cm-grafana-datasources").write_text('{"datasources.yaml":"changed"}')
+    assert env.run("install").returncode == 0
+    assert _patches(env)["deployment/grafana"] != first["deployment/grafana"]
+
+
+@pytest.mark.parametrize("memory", [f"{2 * GIB - 200000}Ki", "1920Mi", "2Gi"])
+def test_install_warns_when_the_permanent_worker_is_smaller_than_an_e2_standard_2(env, memory):
+    # Spec §10.0 sizes the stack for k3s-cpu-1 as an e2-standard-2 (8 GiB); an e2-small has 2 GiB (S0-2).
+    (env.state / "node-memory").write_text(memory)
+    proc = env.run("install")
+    assert proc.returncode == 0, proc.stderr  # a warning, not a refusal
+    assert "warning" in proc.stderr and "e2-standard-2" in proc.stderr
+    node = [a for a in env.argvs() if "node" in a and "get" in a]
+    assert len(node) == 1 and "k3s-cpu-1" in node[0] and "--request-timeout=60s" in node[0]
+    assert "jsonpath={.status.allocatable.memory}" in node[0]
+
+
+def test_install_warns_when_the_permanent_worker_cannot_be_read(env):
+    (env.state / "node-missing").write_text("")
+    proc = env.run("install")
+    assert proc.returncode == 0, proc.stderr
+    assert "warning" in proc.stderr and "k3s-cpu-1" in proc.stderr
+
+
+@pytest.mark.parametrize("memory", [f"{8 * GIB - 300000}Ki", "7900Mi", "8Gi"])
+def test_install_does_not_warn_on_an_e2_standard_2(env, memory):
+    (env.state / "node-memory").write_text(memory)
+    proc = env.run("install")
+    assert proc.returncode == 0, proc.stderr
+    assert "warning" not in proc.stderr
 
 
 def test_install_fails_when_a_rollout_does_not_finish(env):
@@ -278,7 +394,8 @@ def test_uninstall_deletes_the_manifests_then_the_namespaces(env):
     assert len(deletes) == 1
     mon = str(env.repo / "k8s/monitoring")
     files = [deletes[0][i + 1] for i, w in enumerate(deletes[0]) if w == "-f"]
-    assert files == [*(f"{mon}/{m}" for m in MANIFESTS), f"{mon}/namespaces.yaml"]
+    # The workloads first, then their NetworkPolicies, then the namespaces.
+    assert files == [*(f"{mon}/{m}" for m in [*MANIFESTS, *reversed(FIRST)])]
     assert "--ignore-not-found" in deletes[0]
 
 

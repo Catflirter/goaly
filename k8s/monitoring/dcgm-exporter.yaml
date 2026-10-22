@@ -8,7 +8,11 @@
 #   - it requests NO nvidia.com/gpu (upstream does not either): the device plugin never assigns it a GPU,
 #     so it never takes one from a workload. It sees every GPU through NVIDIA_VISIBLE_DEVICES=all, the
 #     mechanism spec §6.4 lists as a residual risk, here used on purpose and confined to this
-#     DaemonSet in the privileged monitoring-host namespace;
+#     DaemonSet in the privileged monitoring-host namespace. This is the one exception to spec §7's
+#     "GPU Pods never set NVIDIA_VISIBLE_DEVICES": tests/k8s/test_monitoring_manifests.py
+#     (test_only_the_dcgm_exporter_sees_gpus_without_an_allocation) fails on any other container under
+#     k8s/ that sets it or runs as nvidia-gpu without an nvidia.com/gpu limit. The exception goes into
+#     docs/threat-model.md next to §6.4 in S0 Step 4;
 #   - no SYS_ADMIN (upstream adds it for the profiling DCGM_FI_PROF_* metrics, which the dashboard
 #     does not use): all capabilities dropped; a short counters file without profiling fields;
 #   - the ubuntu22.04 image rather than distroless, so `kubectl exec` can debug it on the GPU node.
@@ -134,6 +138,9 @@ spec:
             - name: pod-resources
               mountPath: /var/lib/kubelet/pod-resources
               readOnly: true
+            # A subPath mount is never refreshed, and dcgm-exporter reads the file only at start anyway:
+            # scripts/monitoring.sh stamps a hash of dcgm-counters into this template, so a changed
+            # ConfigMap rolls the Pods.
             - name: counters
               mountPath: /etc/dcgm-exporter/counters.csv
               subPath: counters.csv

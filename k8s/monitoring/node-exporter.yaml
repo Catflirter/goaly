@@ -1,7 +1,12 @@
-# node-exporter v1.12.1 (spec §10.0): node CPU, memory, disk and load on every node, k3s-cp and the GPU
-# nodes included. In the privileged namespace monitoring-host only for its read-only hostPath mounts
-# of /proc, /sys and / (namespaces.yaml); otherwise it runs as nobody with a read-only root filesystem
-# and no capabilities.
+# node-exporter v1.12.1 (spec §10.0): node CPU, memory, disk I/O and load on every node, k3s-cp and the
+# GPU nodes included. In the privileged namespace monitoring-host only for its read-only hostPath mounts
+# of /proc and /sys (namespaces.yaml); otherwise it runs as nobody with a read-only root filesystem and
+# no capabilities.
+#
+# Not the host's root filesystem (upstream mounts / with HostToContainer propagation): only the
+# filesystem collector reads it, and neither the dashboard nor S0b's check uses filesystem metrics, so
+# that collector (and mountstats) is off and every node's files, the Lambda hosts' included, stay out of
+# the container. Mount / again on purpose if disk-space metrics are wanted later.
 #
 # No hostNetwork (upstream's DaemonSets use it): its :9100 would then be on the node IP, which the
 # firewall model does not open to the workers (spec §4.1, §4.2). On the Pod network Prometheus reaches
@@ -59,9 +64,8 @@ spec:
             - --web.listen-address=:9100
             - --path.procfs=/host/proc
             - --path.sysfs=/host/sys
-            - --path.rootfs=/host/root
-            - --path.udev.data=/host/root/run/udev/data
-            - --collector.filesystem.mount-points-exclude=^/(dev|proc|sys|run|var/lib/kubelet/.+|var/lib/rancher/.+)($|/)
+            - --no-collector.filesystem
+            - --no-collector.mountstats
             - --no-collector.arp
             - --no-collector.conntrack
             - --no-collector.ipvs
@@ -102,10 +106,6 @@ spec:
             - name: sys
               mountPath: /host/sys
               readOnly: true
-            - name: root
-              mountPath: /host/root
-              mountPropagation: HostToContainer
-              readOnly: true
       volumes:
         - name: proc
           hostPath:
@@ -114,8 +114,4 @@ spec:
         - name: sys
           hostPath:
             path: /sys
-            type: Directory
-        - name: root
-          hostPath:
-            path: /
             type: Directory

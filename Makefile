@@ -123,7 +123,7 @@ sync-peers: ## Rewrite the peer allow-lists (cp k3s_peers set, Lambda firewall) 
 # Stretch S0 (spec §10.0): the monitoring stack in k8s/monitoring/. Grafana and Prometheus have no
 # exposed Service: they are reached only through kubectl port-forward on 127.0.0.1 (via make tunnel).
 .PHONY: monitoring monitoring-down grafana grafana-stop prometheus prometheus-stop
-monitoring: ## Install or upgrade the monitoring stack (Prometheus, exporters, Grafana); a new Grafana password is shown once
+monitoring: ## Install or upgrade the monitoring stack (expects k3s-cpu-1 as e2-standard-2; warns otherwise); a new Grafana password is shown once
 	$(ROOT)/scripts/monitoring.sh install
 
 monitoring-down: ## Delete the monitoring stack and its data (asks first; AUTO_APPROVE=1 skips)

@@ -4,6 +4,11 @@
 # network namespace through the kubelet and is not subject to NetworkPolicy. The same holds for
 # `make prometheus`. The kubelet's probes come from the node itself and are allowed by k3s's policy
 # controller, as for hello (k8s/hello/hello.yaml).
+# The API server's Service proxy (kubectl get --raw .../services/prometheus:9090/proxy/...) is blocked by
+# design: it comes from k3s-cp, not from the Pod's own node, and no rule admits it. Port-forward is the
+# only way in (spec §10.0), so S0b's check_s0_metrics uses `scripts/monitoring.sh forward prometheus`
+# and `forward grafana`. Do not add an allow rule for the cp.
+# scripts/monitoring.sh applies this file together with namespaces.yaml, before any workload.
 apiVersion: networking.k8s.io/v1
 kind: NetworkPolicy
 metadata:

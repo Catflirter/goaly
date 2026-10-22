@@ -2,9 +2,17 @@
 # make monitoring / monitoring-down / grafana / prometheus (spec §10.0, stretch S0): the lightweight
 # monitoring stack in k8s/monitoring/ and the operator's only way in, kubectl port-forward on 127.0.0.1.
 #
-#   monitoring.sh install              install or upgrade: the namespaces, the Grafana admin Secret (made
-#                                      once, see below), the dashboard ConfigMap, the manifests; then
-#                                      wait for every rollout. Safe to re-run.
+#   monitoring.sh install              install or upgrade: the namespaces and their NetworkPolicies, the
+#                                      Grafana admin Secret (made once, see below), the dashboard
+#                                      ConfigMap, the manifests; then wait for every rollout. Safe to
+#                                      re-run. Warns when k3s-cpu-1 is smaller than the e2-standard-2
+#                                      (8 GiB) spec §10.0 sizes the stack for.
+#   (upgrades) dcgm-exporter and Grafana read their ConfigMaps (counters.csv; datasource and dashboard
+#              provider) only at start, so install stamps a hash of them into their Pod templates
+#              (annotation checksum/config, by kubectl patch, which apply leaves alone): a changed
+#              ConfigMap rolls those Pods, an unchanged one changes nothing. On the first install this
+#              rolls Grafana once more right after it is created. Prometheus reloads its config itself and
+#              Grafana re-reads the dashboard JSON every 30s.
 #   monitoring.sh uninstall            ask, then delete the stack: both namespaces (with Prometheus' data
 #                                      and the Secret) and kube-state-metrics' ClusterRole and binding
 #   monitoring.sh forward grafana|prometheus
@@ -19,7 +27,9 @@
 # password once, on the terminal (/dev/tty), not on stdout or stderr, which make, tee or a CI job may
 # keep. Without a terminal it is not shown at all; the command to read it from the Secret is.
 # A later install keeps the Secret. Grafana keeps its database in an emptyDir, so a new password
-# (the Secret was deleted) takes effect with the Grafana restart install then does.
+# (the Secret was deleted) takes effect with the Grafana restart install then does. A create that fails
+# although the Secret then exists (its reply was lost, or another run made it) counts as new too: the
+# password is not shown, the command to read it is, and a running Grafana restarts onto it.
 # Everything goes through the cluster kubeconfig (IAP tunnel, `make tunnel`); nothing here needs .env.
 # Test seam: MONITORING_TTY replaces /dev/tty; only the offline tests set it.
 set -euo pipefail
@@ -31,13 +41,18 @@ source "$(dirname -- "${BASH_SOURCE[0]}")/lib/common.sh"
 unset LAMBDA_API_KEY
 
 MON_DIR="$REPO_ROOT/k8s/monitoring"
-# Applied in this order after namespaces.yaml; tests/k8s/test_monitoring_manifests.py checks that this
-# list and the directory agree.
-MANIFESTS=(prometheus.yaml kube-state-metrics.yaml node-exporter.yaml dcgm-exporter.yaml grafana.yaml
-  network-policies.yaml)
+# FIRST is applied before anything else, so every workload starts behind its default-deny policy;
+# MANIFESTS follow in this order. tests/k8s/test_monitoring_manifests.py reads both arrays from this file
+# and checks that together they are exactly the manifests in k8s/monitoring/, in this order.
+FIRST=(namespaces.yaml network-policies.yaml)
+MANIFESTS=(prometheus.yaml kube-state-metrics.yaml node-exporter.yaml dcgm-exporter.yaml grafana.yaml)
 NS=monitoring
 HOST_NS=monitoring-host
 SECRET=grafana-admin
+# The permanent CPU worker the monitoring Deployments are pinned to, and the allocatable memory below
+# which it is not the e2-standard-2 (8 GiB) spec §10.0 asks for (an e2-small has 2 GiB).
+ANCHOR_NODE=k3s-cpu-1
+ANCHOR_MIN_MIB=6144
 ROLLOUT_TIMEOUT=5m
 TTY="${MONITORING_TTY:-/dev/tty}"
 FORWARD_TIMEOUT="${FORWARD_TIMEOUT_S:-30}"
@@ -56,6 +71,11 @@ b64() {
   printf '%s' "$1" | base64 | tr -d '\n'
 }
 
+# password_hint: log the command that reads the admin password from the Secret.
+password_hint() {
+  log "  kubectl --kubeconfig $KUBECONFIG_FILE -n $NS get secret $SECRET -o jsonpath='{.data.admin-password}' | base64 -d"
+}
+
 # show_password PASSWORD: write it to the terminal only (see the header).
 show_password() {
   if (exec 3>> "$TTY") 2> /dev/null; then
@@ -64,7 +84,7 @@ show_password() {
     log "the new Grafana admin password was shown on the terminal (user: admin)"
   else
     log "no terminal: the new Grafana admin password is not printed. Read it later with:"
-    log "  kubectl --kubeconfig $KUBECONFIG_FILE -n $NS get secret $SECRET -o jsonpath='{.data.admin-password}' | base64 -d"
+    password_hint
   fi
 }
 
@@ -88,9 +108,15 @@ ensure_admin_secret() {
     "$SECRET" "$NS" "$(b64 admin)" "$(b64 "$password")" "$(b64 "$secret_key")" \
     | kc create -f - --request-timeout="$KC_REQUEST_TIMEOUT" >&2 || rc=$?
   if (( rc != 0 )); then
-    # Another install created it in the meantime: that one shows its password; this one keeps quiet.
+    # The Secret exists although create failed: this create reached the server and only its reply was
+    # lost (a client timeout over the tunnel), or another run made it meanwhile. Either way its password
+    # may be new and is not known here: say how to read it, and have install restart a running Grafana
+    # onto it (NEW_SECRET), which is harmless if the other run restarts it too.
     if kc -n "$NS" get secret "$SECRET" -o name --request-timeout="$KC_REQUEST_TIMEOUT" > /dev/null 2>&1; then
-      log "Grafana admin password: the Secret $NS/$SECRET was created by another run meanwhile; kept"
+      log "Grafana admin password: creating the Secret $NS/$SECRET failed, but it exists now, so its"
+      log "password may be new and is not shown here. Read it with:"
+      password_hint
+      NEW_SECRET=1
       return 0
     fi
     die "cannot create the Secret $NS/$SECRET"
@@ -99,12 +125,67 @@ ensure_admin_secret() {
   show_password "$password"
 }
 
+# check_anchor_size: warn (never refuse) when k3s-cpu-1's allocatable memory is below ANCHOR_MIN_MIB.
+# The stack pins about 190m CPU and 864Mi of requests (about 2Gi of limits) to it, next to hello, nettest
+# and the HPA demo; spec §10.0 and the S0 live step make it an e2-standard-2 first.
+check_anchor_size() {
+  local mem mib=-1
+  mem="$(kc get node "$ANCHOR_NODE" -o 'jsonpath={.status.allocatable.memory}' \
+    --request-timeout="$KC_REQUEST_TIMEOUT" 2> /dev/null)" || mem=""
+  if [[ "$mem" =~ ^([0-9]+)(Ki|Mi|Gi)?$ ]]; then
+    case "${BASH_REMATCH[2]}" in
+      Ki) mib=$((10#${BASH_REMATCH[1]} / 1024)) ;;
+      Mi) mib=$((10#${BASH_REMATCH[1]})) ;;
+      Gi) mib=$((10#${BASH_REMATCH[1]} * 1024)) ;;
+      *) mib=$((10#${BASH_REMATCH[1]} / 1048576)) ;;
+    esac
+  fi
+  if (( mib < 0 )); then
+    log "warning: cannot read $ANCHOR_NODE's allocatable memory ('$mem'); the monitoring Deployments run"
+    log "  only there and are sized for an e2-standard-2 (spec §10.0). Installing anyway."
+  elif (( mib < ANCHOR_MIN_MIB )); then
+    log "warning: $ANCHOR_NODE has ${mib}Mi allocatable memory; the monitoring stack is sized for an"
+    log "  e2-standard-2 (8 GiB, spec §10.0). Change its machine type first (infra/workers/"
+    log "  workers.auto.tfvars.json, the stretch S0 live step). Installing anyway."
+  fi
+}
+
+# config_hash NS CONFIGMAP...: sha256 over the ConfigMaps' data as the API server now holds it.
+config_hash() {
+  local ns="$1" cm out data=""
+  shift
+  for cm in "$@"; do
+    out="$(kc -n "$ns" get configmap "$cm" -o 'jsonpath={.data}' --request-timeout="$KC_REQUEST_TIMEOUT")" \
+      || die "cannot read the ConfigMap $ns/$cm"
+    data+="$cm=$out"$'\n'
+  done
+  out="$(printf '%s' "$data" | openssl dgst -sha256)" || die "openssl dgst failed"
+  out="${out##*= }"
+  [[ "$out" =~ ^[0-9a-f]{64}$ ]] || die "unexpected openssl dgst output"
+  printf '%s\n' "$out"
+}
+
+# stamp_config NS KIND/NAME CONFIGMAP...: put the ConfigMaps' hash in the Pod template's checksum/config
+# annotation (see the header): a new value rolls the Pods, the same value is a no-op.
+stamp_config() {
+  local ns="$1" obj="$2" hash
+  shift 2
+  hash="$(config_hash "$ns" "$@")" || exit
+  kc -n "$ns" patch "$obj" --type merge \
+    -p "{\"spec\":{\"template\":{\"metadata\":{\"annotations\":{\"checksum/config\":\"$hash\"}}}}}" \
+    --request-timeout="$KC_REQUEST_TIMEOUT" >&2
+}
+
 install() {
   local grafana_existed=0 f
-  local -a files=()
+  local -a files=() first=()
   need_kubeconfig
-  log "==> monitoring: namespaces $NS (restricted) and $HOST_NS (privileged, for hostPath)"
-  kc apply -f "$MON_DIR/namespaces.yaml" --request-timeout="$KC_REQUEST_TIMEOUT" >&2
+  check_anchor_size
+  log "==> monitoring: namespaces $NS (restricted) and $HOST_NS (privileged, for hostPath), default-deny"
+  for f in "${FIRST[@]}"; do
+    first+=(-f "$MON_DIR/$f")
+  done
+  kc apply "${first[@]}" --request-timeout="$KC_REQUEST_TIMEOUT" >&2
   if kc -n "$NS" get deployment grafana -o name --request-timeout="$KC_REQUEST_TIMEOUT" > /dev/null 2>&1; then
     grafana_existed=1
   fi
@@ -118,9 +199,11 @@ install() {
     files+=(-f "$MON_DIR/$f")
   done
   kc apply "${files[@]}" --request-timeout="$KC_REQUEST_TIMEOUT" >&2
+  stamp_config "$HOST_NS" daemonset/dcgm-exporter dcgm-counters
+  stamp_config "$NS" deployment/grafana grafana-datasources grafana-dashboard-provider
   if (( NEW_SECRET && grafana_existed )); then
     log "the admin password is new: restarting Grafana so it starts from it"
-    kc -n "$NS" rollout restart deployment/grafana >&2
+    kc -n "$NS" rollout restart deployment/grafana --request-timeout="$KC_REQUEST_TIMEOUT" >&2
   fi
   kc -n "$NS" rollout status deployment/prometheus --timeout="$ROLLOUT_TIMEOUT" >&2
   kc -n "$NS" rollout status deployment/kube-state-metrics --timeout="$ROLLOUT_TIMEOUT" >&2
@@ -139,7 +222,8 @@ uninstall() {
   for name in grafana prometheus; do
     stop_forward "$name"
   done
-  for f in "${MANIFESTS[@]}" namespaces.yaml; do
+  # The workloads, then their NetworkPolicies, then the namespaces (FIRST in reverse).
+  for f in "${MANIFESTS[@]}" network-policies.yaml namespaces.yaml; do
     files+=(-f "$MON_DIR/$f")
   done
   kc delete "${files[@]}" --ignore-not-found --request-timeout="$KC_REQUEST_TIMEOUT" --timeout=5m >&2
