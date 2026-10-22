@@ -11,6 +11,8 @@ priority order and returns only the first that fires:
   4. a CPU worker other than k3s-cpu-1 idle for CPU_IDLE_S -> remove it (highest index first);
   5. an autoscaled pool above min whose highest-index node is idle for idle_minutes -> -1 on that pool;
   6. an autoscaled pool whose last scale-up node is not usable within GPU_JOIN_DEADLINE_S -> -1 on that pool.
+A node a GPU scale-up is still waiting for is left to rule 6, not rule 5, and its idle clock starts when it can first
+take GPU Pods, so a slow device plugin does not get its node scaled away (review C2-1).
 Rules 2 and 3 ignore a "stuck" Pod for STUCK_TTL_S: one still Pending while a node that could take it, of the kind
 a scale-up would add, sat idle beside it for STUCK_IDLE_S (it does not fit such a node, so another one would not help),
 or one whose GPU launch never joined. Without that, such a Pod would add and remove a node, a paid GPU instance
@@ -351,13 +353,15 @@ def _cpu_index(name: str) -> int | None:
 
 
 def _gpu_launching(now: float, nodes: Iterable[NodeObs], counts: Mapping[str, int], pools: Mapping[str, Pool],
-                   usable_idle_since: Mapping[str, float]) -> str | None:
+                   usable_idle_since: Mapping[str, float], joining: frozenset[str]) -> str | None:
     """Why a GPU node is still coming up (review focus #4), or None.
 
-    Joined but NotReady, Ready without the admin label, labeled but no GPUs advertised yet (the device plugin starts
-    only after labeling), usable and idle for less than STUCK_IDLE_S (the scheduler places its Pods first), or an
-    autoscaled pool with fewer registered nodes than its count (the instance runs but has not joined yet). Pools
-    without autoscale are managed by hand and never block. The caller reports booting instances via `gpu_launching`.
+    Joined but NotReady, Ready without the admin label, the node a recorded launch waits for (`joining`) labeled but
+    without GPUs advertised yet (the device plugin starts only after labeling; rule 6 bounds that wait), usable and
+    idle for less than STUCK_IDLE_S (the scheduler places its Pods first), or an autoscaled pool with fewer registered
+    nodes than its count (the instance runs but has not joined yet). Any other node without GPUs has a fault and does
+    not block (_gpu_faults reports it). Pools without autoscale are managed by hand and never block. The caller
+    reports booting instances via `gpu_launching`.
     """
     registered: dict[str, int] = {}
     for obs in nodes:
@@ -367,7 +371,7 @@ def _gpu_launching(now: float, nodes: Iterable[NodeObs], counts: Mapping[str, in
             return f"{obs.name} is NotReady"
         if not obs.labeled:
             return f"{obs.name} has no {GPU_ADMIN_LABEL[0]} label yet"
-        if not obs.gpu_allocatable:
+        if not obs.gpu_allocatable and obs.name in joining:
             return f"{obs.name} has no allocatable {GPU_RESOURCE} yet"
         if obs.name in usable_idle_since and now - usable_idle_since[obs.name] < STUCK_IDLE_S:
             return (f"{obs.name} can take GPU Pods since {now - usable_idle_since[obs.name]:.0f}s; "
@@ -382,6 +386,17 @@ def _gpu_launching(now: float, nodes: Iterable[NodeObs], counts: Mapping[str, in
         if registered.get(name, 0) < count:
             return f"pool {name} has {registered.get(name, 0)} of {count} nodes registered"
     return None
+
+
+def _gpu_faults(nodes: Iterable[NodeObs], joining: frozenset[str]) -> list[str]:
+    """Ready, labeled GPU nodes without GPUs that no launch waits for: the device plugin or the GPU has failed."""
+    return [f"{obs.name} has no allocatable {GPU_RESOURCE} (device plugin down?)" for obs in nodes
+            if obs.kind == "gpu" and obs.ready and obs.labeled and not obs.gpu_allocatable and obs.name not in joining]
+
+
+def _joining(launches: Mapping[str, Launch]) -> frozenset[str]:
+    """The nodes recorded GPU scale-ups still wait for."""
+    return frozenset(node_name(pool, launch.target) for pool, launch in launches.items())
 
 
 def _describe(pods: list[PendingPod]) -> str:
@@ -447,9 +462,17 @@ def decide(*, now: float, pending: list[PendingPod], nodes: list[NodeObs], state
     usable_idle_since = {obs.name: state.usable_idle_since.get(obs.name, now) for obs in nodes
                          if obs.usable and not obs.busy}
     joined = {obs.name for obs in nodes if obs.kind == "gpu" and obs.usable}
-    launches = {pool: launch for pool, launch in state.launches.items()
-                if pool in pools and gpu_counts.get(pool, pools[pool].count) == launch.target
-                and node_name(pool, launch.target) not in joined}
+    launches = {}
+    for pool, launch in state.launches.items():
+        if pool not in pools or gpu_counts.get(pool, pools[pool].count) != launch.target:
+            continue  # the count moved on (gpu-down, a hand edit): nothing to wait for
+        name = node_name(pool, launch.target)
+        if name not in joined:
+            launches[pool] = launch
+        elif name in idle_since:
+            # Its idle clock starts now, when it can first take GPU Pods (review C2-1): it may have been Ready and
+            # idle for longer than idle_minutes while its device plugin started.
+            idle_since[name] = now
     stuck = _stuck(now, pending, nodes, usable_idle_since, state.stuck, _gpu_evidence_pools(gpu_counts, pools))
     new_state = State(last_action_at=state.last_action_at, idle_since=idle_since, stuck=stuck, launches=launches,
                       usable_idle_since=usable_idle_since)
@@ -499,8 +522,10 @@ def _choose(*, now: float, pending: list[PendingPod], nodes: list[NodeObs], stat
     autoscaled = _autoscaled(pools)
 
     if gpu_pending:
+        joining = _joining(state.launches)
+        held.extend(_gpu_faults(nodes, joining))
         why = ("a GPU instance is still booting" if gpu_launching
-               else _gpu_launching(now, nodes, gpu_counts, pools, state.usable_idle_since))
+               else _gpu_launching(now, nodes, gpu_counts, pools, state.usable_idle_since, joining))
         if why is None:
             for name in autoscaled:
                 if count(name) < pools[name].autoscale.max:
@@ -524,8 +549,8 @@ def _choose(*, now: float, pending: list[PendingPod], nodes: list[NodeObs], stat
 
     for name in autoscaled:
         bounds, current = pools[name].autoscale, count(name)
-        if current <= bounds.min:
-            continue
+        if current <= bounds.min or name in state.launches:
+            continue  # a node still joining is left to rule 6 (GPU_JOIN_DEADLINE_S), however long it sat idle
         highest = node_name(name, current)
         if idle_for(highest) >= bounds.idle_minutes * 60:
             return Action("gpu_scale", target=current - 1, pool=name,

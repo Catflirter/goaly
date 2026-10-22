@@ -872,3 +872,108 @@ def test_gpu_launch_rollback_never_goes_below_min():
     action, _ = run(nodes=[cpu_node("k3s-cpu-1", busy=True)], gpu_counts={"a6000": 1}, state=state,
                     pools={"a6000": pool(lo=1)})
     assert action is None
+
+
+# --- a launched GPU node is not scaled down before it can take GPU Pods (review C2-1) ---------------------------------
+
+def simulate_slow_device_plugin(plugin_delay, idle_minutes, *, seconds=7200, step=20):
+    """Review C2-1's probe: pool a6000 min 1 max 2, k3s-gpu-a6000-1 busy, one 1-GPU Pod Pending. The new instance
+    boots for 300 s (registered, Ready and labeled then), its device plugin advertises the GPU `plugin_delay` s
+    later, and the scheduler binds the Pod on the tick after that (the kubectl snapshot lags by one tick)."""
+    pools = {"a6000": pool(lo=1, hi=2, idle_minutes=idle_minutes)}
+    waiting = [PendingPod("gpu-test", "train", "gpu", NOW - 60)]
+    launched_at, gpus = None, 1
+    state, actions, scheduled_at = State(), [], None
+    for t in range(0, seconds, step):
+        now = NOW + t
+        nodes = [cpu_node("k3s-cpu-1", busy=True), gpu_node("k3s-gpu-a6000-1", busy=True)]
+        booting = False
+        if gpus == 2:
+            labeled_at, gpus_at = launched_at + 300, launched_at + 300 + plugin_delay
+            booting = now < labeled_at
+            if not booting:
+                if waiting and scheduled_at is None and now > gpus_at:
+                    scheduled_at, waiting = now, []
+                nodes.append(gpu_node("k3s-gpu-a6000-2", busy=scheduled_at is not None,
+                                      allocatable=now >= gpus_at))
+        action, state = decide(now=now, pending=list(waiting), nodes=nodes, state=State.from_json(state.to_json()),
+                               cpu_count=1, cpu_max=3, gpu_counts={"a6000": gpus}, pools=pools,
+                               gpu_launching=booting)
+        if action is None:
+            continue
+        actions.append((t, action.kind, action.target))
+        if action.target > gpus:
+            launched_at = now
+        gpus = action.target
+    return actions, state, scheduled_at
+
+
+@pytest.mark.parametrize("idle_minutes", [1, 5])
+@pytest.mark.parametrize("extra", [-180, -10, 20, 300])
+def test_slow_device_plugin_does_not_get_its_node_scaled_away(idle_minutes, extra):
+    # Plugin delays around idle_minutes after Ready: before round 3, a delay just past idle_minutes removed the node
+    # at idle_minutes (rule 5, "idle"), marked the Pod stuck as a failed join, and relaunched an hour later.
+    actions, state, scheduled_at = simulate_slow_device_plugin(max(idle_minutes * 60 + extra, 20), idle_minutes)
+    assert [(kind, target) for _, kind, target in actions] == [("gpu_scale", 2)]
+    assert scheduled_at is not None and state.stuck == {}
+
+
+def test_launched_gpu_node_is_left_to_the_join_deadline_not_to_its_idle_clock():
+    # Ready and labeled but no GPUs advertised, idle well past idle_minutes: rule 5 waits, rule 6 decides at the
+    # deadline (with its own reason), so a node that registered gets the same GPU_JOIN_DEADLINE_S as one that did not.
+    pools = {"a6000": pool(lo=1, hi=2, idle_minutes=5)}
+    nodes = [*CLUSTER, gpu_node("k3s-gpu-a6000-2", allocatable=False)]
+    launched = State(last_action_at=NOW - 1000, idle_since={"k3s-gpu-a6000-2": NOW - 700},
+                     launches={"a6000": Launch(2, NOW - 1000, ("gpu-test/gpu-burn-x",))})
+    action, state = run(nodes=nodes, pools=pools, gpu_counts={"a6000": 2}, state=launched)
+    assert action is None and state.launches == launched.launches
+    deadline = NOW - 1000 + GPU_JOIN_DEADLINE_S
+    action, state = run(pending=[gpu_pending()], nodes=nodes, pools=pools, gpu_counts={"a6000": 2}, state=launched,
+                        now=deadline)
+    assert (action.kind, action.target) == ("gpu_scale", 1) and "did not join" in action.reason
+    assert set(state.stuck) == {"gpu-test/gpu-burn-x"}
+
+
+def test_launched_gpu_node_idle_clock_starts_when_it_can_take_gpu_pods():
+    pools = {"a6000": pool(lo=1, hi=2, idle_minutes=5)}
+    launched = State(last_action_at=NOW - 900, idle_since={"k3s-gpu-a6000-2": NOW - 600},
+                     launches={"a6000": Launch(2, NOW - 900)})
+    nodes = [*CLUSTER, gpu_node("k3s-gpu-a6000-2")]
+    action, state = run(nodes=nodes, pools=pools, gpu_counts={"a6000": 2}, state=launched)
+    assert action is None and state.launches == {}
+    assert state.idle_since["k3s-gpu-a6000-2"] == NOW
+    # From then on rule 5 as usual: idle_minutes after it could first take a GPU Pod.
+    action, _ = run(nodes=nodes, pools=pools, gpu_counts={"a6000": 2}, state=state, now=NOW + 5 * 60)
+    assert (action.kind, action.target) == ("gpu_scale", 1)
+
+
+# --- a GPU node without GPUs that is not joining does not block other launches (review X2-1) -------------------------
+
+def test_min_pool_node_without_allocatable_gpus_does_not_block_a_scale_up():
+    # No launch record: the plugin or the GPU failed for good. A second node would serve the Pod.
+    nodes = [cpu_node("k3s-cpu-1", busy=True), gpu_node("k3s-gpu-a6000-1", allocatable=False)]
+    action, state = run(pending=[gpu_pending()], nodes=nodes,
+                        state=State(idle_since={"k3s-gpu-a6000-1": NOW - 120}))
+    assert (action.kind, action.pool, action.target) == ("gpu_scale", "a6000", 2)
+    assert "k3s-gpu-a6000-1 has no allocatable nvidia.com/gpu (device plugin down?)" in state.held
+    assert "yet" not in state.held
+
+
+def test_fixed_pool_node_without_allocatable_gpus_does_not_block_an_autoscaled_pool():
+    pools = {"a6000": pool(count=1, hi=2), "h100": pool("h100", count=1, autoscaled=False)}
+    nodes = [cpu_node("k3s-cpu-1", busy=True), gpu_node("k3s-gpu-a6000-1", busy=True),
+             gpu_node("k3s-gpu-h100-1", allocatable=False)]
+    action, state = run(pending=[gpu_pending()], nodes=nodes, pools=pools, gpu_counts={"a6000": 1})
+    assert (action.kind, action.pool, action.target) == ("gpu_scale", "a6000", 2)
+    assert "k3s-gpu-h100-1 has no allocatable nvidia.com/gpu (device plugin down?)" in state.held
+
+
+def test_only_the_joining_node_without_gpus_counts_as_launching():
+    # The node a recorded launch is waiting for still blocks (bounded by rule 6); the same node without a launch
+    # record does not.
+    nodes = [*CLUSTER, gpu_node("k3s-gpu-a6000-2", allocatable=False)]
+    common = dict(pending=[gpu_pending()], nodes=nodes, gpu_counts={"a6000": 2}, pools={"a6000": pool(hi=3)})
+    action, state = run(state=State(launches={"a6000": Launch(2, NOW - 400)}), **common)
+    assert action is None and "k3s-gpu-a6000-2 has no allocatable nvidia.com/gpu yet" in state.held
+    action, state = run(**common)
+    assert (action.kind, action.target) == ("gpu_scale", 3)
