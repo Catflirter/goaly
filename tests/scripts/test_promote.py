@@ -625,8 +625,9 @@ def test_a_blank_operator_ip_is_unset(repo, value):
 
 
 # B1-1: the GCP project id must not reach final either. verify evidence carries it in the GCE FQDN hostname
-# (k3s-cp.<zone>.c.<project-id>.internal, A2's kubectl describe node) and in the state bucket's name. The id is
-# GCP_PROJECT from the environment, else from the repo's .env (load_env); it is never printed.
+# (k3s-cp.<zone>.c.<project-id>.internal, A2's kubectl describe node) and in the state bucket's name. Both
+# GCP_PROJECT from the environment and the one the repo's .env gives (load_env) are looked for (X0-1); neither is
+# ever printed.
 PROJECT_ID = "acme-gpu-lab-7731"
 SKIPPED = "WARNING: no GCP project id (GCP_PROJECT in the environment or .env): the project-id check was skipped"
 
@@ -700,20 +701,67 @@ def test_the_project_id_is_read_from_the_dotenv(repo):
     assert_failed_on(repo, r, before, "02-A2.txt")
 
 
-def test_the_environment_takes_precedence_over_the_dotenv(repo):
-    other = "other-project-42"
-    write_dotenv(repo, f"GCP_PROJECT={other}\n")
+OTHER_ID = "other-project-42"
+
+
+@pytest.mark.parametrize("leaked", [PROJECT_ID, OTHER_ID], ids=["environment-id", "dotenv-id"])
+def test_both_the_environment_and_the_dotenv_ids_are_looked_for(repo, leaked):
+    """X0-1: verify.sh's load_env sources .env over the caller's environment, so the evidence holds .env's id even
+    when the operator's shell exports another GCP_PROJECT. Neither id may reach final, whichever the copy holds."""
+    write_dotenv(repo, f"GCP_PROJECT={OTHER_ID}\n")
     before = previous_final(repo)
-    run = make_run(repo, files={"01-A1.txt": "fine\n", "02-A2.txt": f"k3s-cp.us-west1-b.c.{PROJECT_ID}.internal\n"})
+    make_run(repo, files={"01-A1.txt": "fine\n", "02-A2.txt": f"k3s-cp.us-west1-b.c.{leaked}.internal\n"})
     r = promote(repo, "verify", f"verification/{TS}", env={**BASE_ENV, "GCP_PROJECT": PROJECT_ID})
     assert_failed_on(repo, r, before, "02-A2.txt")
-    assert_no_id(r, PROJECT_ID, other)
-    # The .env's id alone is not looked for when the environment names another one.
-    (run / "02-A2.txt").write_text(f"k3s-cp.us-west1-b.c.{other}.internal\n")
+    assert "01-A1.txt" not in r.stderr
+    assert_no_id(r, PROJECT_ID, OTHER_ID)
+
+
+def test_with_both_ids_a_clean_copy_promotes(repo):
+    write_dotenv(repo, f"GCP_PROJECT={OTHER_ID}\n")
+    run = make_run(repo, files={"01-A1.txt": "k3s-cp.us-west1-b.c.another-project-1.internal\n"})
     r = promote(repo, "verify", f"verification/{TS}", env={**BASE_ENV, "GCP_PROJECT": PROJECT_ID})
     assert r.returncode == 0, r.stderr
     assert snapshot(repo / "verification/final") == snapshot(run)
-    assert_no_id(r, PROJECT_ID, other)
+    assert "WARNING" not in r.stderr
+    assert_no_id(r, PROJECT_ID, OTHER_ID)
+
+
+@pytest.mark.parametrize("bad", ["env", "dotenv"])
+def test_refuses_when_either_id_is_not_a_project_id(repo, bad):
+    """Both ids are looked for, so both must be project ids: one the check cannot match must not pass silently."""
+    value = "Not_A_Project-1"
+    write_dotenv(repo, f"GCP_PROJECT={value if bad == 'dotenv' else OTHER_ID}\n")
+    before = previous_final(repo)
+    make_run(repo)
+    r = promote(repo, "verify", f"verification/{TS}",
+                env={**BASE_ENV, "GCP_PROJECT": value if bad == "env" else PROJECT_ID})
+    assert_refused(repo, r, before, "GCP_PROJECT", "not a GCP project id")
+    assert_no_id(r, value, PROJECT_ID, OTHER_ID)
+
+
+@pytest.mark.parametrize("source", ["env", "dotenv", "both"])
+def test_the_project_id_never_reaches_a_command_line(repo, tmp_path, source):
+    """X0-2: argv is visible to every local user (ps, /proc/PID/cmdline) and to execve audit logs, so grep gets the
+    id(s) as a pattern file, never as an argument. A grep wrapper records every argument list it is given."""
+    bin_dir = tmp_path / "grepbin"
+    bin_dir.mkdir()
+    record = tmp_path / "grep.argv"
+    (bin_dir / "grep").write_text(f'#!/bin/sh\nprintf \'%s\\n\' "$*" >> "{record}"\nexec "{shutil.which("grep")}" "$@"\n')
+    (bin_dir / "grep").chmod(0o755)
+    env = {**BASE_ENV, "PATH": f"{bin_dir}:{os.environ['PATH']}"}
+    if source in ("env", "both"):
+        env["GCP_PROJECT"] = PROJECT_ID
+    if source in ("dotenv", "both"):
+        write_dotenv(repo, f"GCP_PROJECT={OTHER_ID if source == 'both' else PROJECT_ID}\n")
+    before = previous_final(repo)
+    make_run(repo, files={"01-A1.txt": "fine\n", "02-A2.txt": f"k3s-cp.us-west1-b.c.{PROJECT_ID}.internal\n"})
+    r = promote(repo, "verify", f"verification/{TS}", env=env)
+    assert_failed_on(repo, r, before, "02-A2.txt")
+    text = record.read_text().lower()
+    assert PROJECT_ID not in text and OTHER_ID not in text
+    argvs = record.read_text().splitlines()
+    assert any(" -f " in f" {a} " for a in argvs if "-liF" in a), "the project-id grep ran, with a pattern file"
 
 
 @pytest.mark.parametrize("value", ["Acme-Gpu-Lab-7731", "short", "1starts-with-digit", "ends-with-hyphen-",

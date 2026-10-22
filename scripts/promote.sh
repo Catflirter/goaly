@@ -22,13 +22,16 @@
 # and logs no error or warning (gitleaks stdin exits 0 when it cannot read its input). When OPERATOR_IP
 # is set (surrounding whitespace dropped, as gpuctl reads it; it must be one IPv4 address), the copy
 # must not contain it (as a whole address, between non-digits) either (Task 24 Step 4). Nor may it
-# contain the GCP project id (spec section 6: no project id in committed evidence): GCP_PROJECT from the
-# environment, else from this repo's .env (read with load_env in a subshell, so nothing else in .env
-# reaches this script; a .env that load_env refuses is refused here too). It must be a GCP project id
-# (_gcp_project_ok). It is looked for as a fixed string, in any case, anywhere in a file: it also sits
-# inside <id>-k3s-tfstate and in GCE hostnames such as k3s-cp.<zone>.c.<id>.internal. The id is never
-# printed; the files that hold it are named. Without an id (neither sets GCP_PROJECT) that check is
-# skipped with a warning, as the operator-IP check is without OPERATOR_IP. Only a clean copy replaces
+# contain the GCP project id (spec section 6: no project id in committed evidence): neither GCP_PROJECT
+# from the environment nor the one this repo's .env gives (read with load_env in a subshell, so nothing
+# else in .env reaches this script; a .env that load_env refuses is refused here too). Both are looked
+# for: verify.sh's load_env sources .env over the environment, so the evidence holds .env's id even when
+# the shell exports another one (X0-1). Each must be a GCP project id (_gcp_project_ok). An id is looked
+# for as a fixed string, in any case, anywhere in a file: it also sits inside <id>-k3s-tfstate and in GCE
+# hostnames such as k3s-cp.<zone>.c.<id>.internal. The ids are never printed, nor put on a command line
+# (grep reads them from a pipe; argv shows in ps and in audit logs); the files that hold one are named.
+# Without an id (neither sets GCP_PROJECT) that check is skipped with a warning, as the operator-IP check
+# is without OPERATOR_IP. Only a clean copy replaces
 # verification/final/: the old final is moved aside, the copy renamed into its place, and the old one
 # removed (not merged into). Interrupts are ignored during that swap, and on any failure the old final is
 # moved back, so verification/final is always either the previous final or the whole scanned copy.
@@ -37,8 +40,8 @@
 # Exit status: 0 promoted, 1 failed (gitleaks found a secret or failed, the operator IP or the GCP
 # project id was found, the copy was not a passing verify run, the copy or swap failed, another
 # promotion holds the lock), 2 refused (usage, an OPERATOR_IP that is not one IPv4 address, a
-# GCP_PROJECT that is not a GCP project id, a .env that load_env refuses, a RUN_DIR that is not a
-# finished verify run in which every check passed).
+# GCP_PROJECT in the environment or in .env that is not a GCP project id, a .env that load_env refuses,
+# a RUN_DIR that is not a finished verify run in which every check passed).
 set -euo pipefail
 
 # common.sh is linted on its own; pre-commit runs shellcheck without -x, so don't follow it.
@@ -75,8 +78,8 @@ usage: scripts/promote.sh verify RUN_DIR
 
   PROMOTE_ALLOW_SKIP=1  promote a run with skipped (never failed) checks, noted in final's SUMMARY.md
   OPERATOR_IP=<ip>      also fail when the copy contains this IPv4 address (Task 24 Step 4)
-  GCP_PROJECT=<id>      also fail when the copy contains this project id, in any case (default: GCP_PROJECT
-                        in .env; with neither, that check is skipped with a warning)
+  GCP_PROJECT=<id>      also fail when the copy contains this project id, in any case; GCP_PROJECT in .env
+                        is looked for too (with neither, that check is skipped with a warning)
 EOF
 }
 
@@ -180,20 +183,26 @@ operator_ip() {
   printf '%s' "$ip"
 }
 
-# project_id: print the GCP project id the copy must not contain: GCP_PROJECT from the environment, else
-# from $REPO_ROOT/.env (load_env; callers run it in $(...), so .env's other values never reach promote.sh's
-# commands); nothing when neither sets one. load_env's refusals (a .env that is not 600) exit 2. An id
-# that is not a GCP project id dies (2) without printing it: an id the check cannot match must not pass.
-project_id() {
-  local id="${GCP_PROJECT:-}"
-  if [[ -z "$id" && -f "$REPO_ROOT/.env" ]]; then
+# project_ids: print, one per line, the GCP project ids the copy must not contain: GCP_PROJECT from the
+# environment, and the one load_env gives when $REPO_ROOT/.env exists (what verify.sh sees: .env's
+# GCP_PROJECT, sourced over the environment's); each once, nothing when neither sets one. Callers run it
+# in $(...), so .env's other values never reach promote.sh's commands. load_env's refusals (a .env that
+# is not 600) exit 2. An id that is not a GCP project id dies (2) without printing it: an id the check
+# cannot match must not pass.
+project_ids() {
+  local env_id="${GCP_PROJECT:-}" dotenv_id=""
+  if [[ -n "$env_id" ]] && ! _gcp_project_ok; then
+    die "GCP_PROJECT in the environment is not a GCP project id (the value is not printed); fix it, or unset it" 2
+  fi
+  if [[ -f "$REPO_ROOT/.env" ]]; then
     load_env
-    id="${GCP_PROJECT:-}"
+    dotenv_id="${GCP_PROJECT:-}"
+    if [[ -n "$dotenv_id" ]] && ! _gcp_project_ok; then
+      die "GCP_PROJECT in $REPO_ROOT/.env is not a GCP project id (the value is not printed); fix it there, or leave it unset" 2
+    fi
   fi
-  if [[ -n "$id" ]] && ! GCP_PROJECT="$id" _gcp_project_ok; then
-    die "GCP_PROJECT is not a GCP project id (the value is not printed); fix it in the environment or in $REPO_ROOT/.env, or leave it unset" 2
-  fi
-  printf '%s' "$id"
+  [[ -z "$env_id" ]] || printf '%s\n' "$env_id"
+  [[ -z "$dotenv_id" || "$dotenv_id" == "$env_id" ]] || printf '%s\n' "$dotenv_id"
 }
 
 # take_lock: create verification/.promote.lock (noclobber: O_EXCL, atomic) holding this PID, or fail.
@@ -258,16 +267,16 @@ swap_in() {
 
 promote_verify() {
   (($# == 1)) || { usage >&2; die "usage: verify takes exactly one RUN_DIR" 2; }
-  local run copy result leaks ip ip_files project project_files rc skipped
+  local run copy result leaks ip ip_files projects project_files rc skipped
   run="$(resolve_run "$1")" || exit
   check_run "$run" "$1" 2
   skipped="$RUN_SKIPPED"
   ip="$(operator_ip)" || exit
-  project="$(project_id)" || exit
+  projects="$(project_ids)" || exit
   if ((skipped > 0)); then
     log "WARNING: promoting $1 with $skipped skipped check(s) (PROMOTE_ALLOW_SKIP=1); final's SUMMARY.md notes it"
   fi
-  if [[ -z "$project" ]]; then
+  if [[ -z "$projects" ]]; then
     log "WARNING: no GCP project id (GCP_PROJECT in the environment or .env): the project-id check was skipped"
   fi
   command -v gitleaks >/dev/null 2>&1 \
@@ -312,14 +321,16 @@ promote_verify() {
       exit 1
     fi
   fi
-  if [[ -n "$project" ]]; then
-    # A fixed string (-F), in any case (-i), anywhere in a line: the id is 6-30 characters and also sits
+  if [[ -n "$projects" ]]; then
+    # Fixed strings (-F), in any case (-i), anywhere in a line: an id is 6-30 characters and also sits
     # inside <id>-k3s-tfstate and FQDNs. LC_ALL=C: bytes that are not UTF-8 cannot hide it, and -i folds
-    # ASCII only, which is all a project id holds. grep prints file names only, never the id.
-    project_files="$(cd -- "$copy" && LC_ALL=C grep -liF -e "$project" ./*)" && rc=0 || rc=$?
+    # ASCII only, which is all a project id holds. The ids reach grep as a pattern file on a pipe (-f;
+    # printf is a builtin), never as arguments, and none is empty (an empty pattern matches every file).
+    # grep prints file names only, never an id.
+    project_files="$(cd -- "$copy" && LC_ALL=C grep -liF -f <(printf '%s\n' "$projects") ./*)" && rc=0 || rc=$?
     project_files="${project_files//.\//}"
     if ((rc != 1)); then
-      log "error: the GCP project id (GCP_PROJECT) appears in (or grep failed on): ${project_files//$'\n'/ }"
+      log "error: the GCP project id (GCP_PROJECT, environment or .env) appears in (or grep failed on): ${project_files//$'\n'/ }"
       log "  redact it in $run/ and promote again; verification/final was not changed"
       exit 1
     fi
