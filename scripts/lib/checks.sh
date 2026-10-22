@@ -11,8 +11,7 @@
 #   redact                          stdin -> stdout filter that replaces secret values with <redacted>
 #   vr_finish                       write the totals, scan the run with gitleaks; 1 on any FAIL or leak
 #
-# The check functions check_<id>_<name> (A–C: Task 18; D: Task 21, a SKIP placeholder until then; E:
-# Task 22) are registered in scripts/verify.sh; the demo (Task 25) calls them directly. Each returns 0
+# The check functions check_<id>_<name> (A–C: Task 18; D: Task 21; E: Task 22) are registered in scripts/verify.sh; the demo (Task 25) calls them directly. Each returns 0
 # (PASS), 1 (FAIL) or 77 (SKIP); one that cannot read .env exits 2 (a FAIL), so call it in a subshell.
 # Every command a check runs goes through vr_cmd, vr_cap or vr_bg, so its evidence shows what ran
 # (node_external_ip, probe_on and echo_on appear by name; their kubectl queries are in common.sh).
@@ -21,7 +20,9 @@
 #   - bound every wait (kubectl wait --timeout=…, curl --max-time …): run_check has no timeout of its own;
 #   - background jobs (kubectl port-forward &, tcpdump &) are killed when the check returns, because
 #     run_check waits for every process holding the check's output; so do not set an EXIT trap in a
-#     check (it replaces that cleanup), and do not leave grandchildren (setsid, nohup) running.
+#     check (it replaces that cleanup), and do not leave grandchildren (setsid, nohup) running;
+#   - cleanup that must run however the check ends (the GPU Pods of D4-D6) goes through _vr_guarded,
+#     whose EXIT trap lives in a subshell of its own.
 
 # common.sh is linted on its own; pre-commit runs shellcheck without -x, so don't follow it.
 # shellcheck disable=SC1091
@@ -1074,10 +1075,238 @@ check_c8_netpol() {
 
 # --- D: GPU (spec §9 D) -------------------------------------------------------------------------
 
-# D1-D6 are implemented by Task 21; until then they are registered with this placeholder (SKIP).
-check_d_pending() {
-  echo "D: the GPU checks D1-D6 are added by Task 21; skipped until then"
-  return 77
+# Every D check SKIPs (77) when no node carries the admin-only accelerator label join-node.sh sets on a
+# GPU node, so make verify passes without a GPU node (Review Focus #5). D1 and D2 check every GPU
+# node; D6 holds every allocatable GPU. The Pods D4-D6 create are deleted before (left over from an
+# earlier run) and after, pass or fail, and also when the check is cut short (_vr_guarded): a
+# leftover gpu-hold keeps a billed GPU allocated.
+
+_VR_GPU_LABEL='node-restriction.kubernetes.io/accelerator=nvidia'
+# join-node.sh's check that k3s's containerd has the nvidia runtime (spec §6.2 step 2).
+_VR_CONTAINERD_NVIDIA='sudo grep -A3 nvidia /var/lib/rancher/k3s/agent/etc/containerd/config.toml'
+# A gpu-type label value as gpuctl's gpu_type_label() makes it (a6000, a10, a100_80gb_sxm4).
+_VR_GPU_TYPE_RE='^[a-z0-9]+([_-][a-z0-9]+)*$'
+
+# _vr_guarded CLEANUP FUNC: run FUNC in a subshell whose EXIT trap runs CLEANUP however FUNC ends: it
+# returns, exits (die, set -e) or is stopped by SIGINT/SIGTERM (an interrupted make verify). The trap
+# lives in the subshell, so the caller's own EXIT trap (run_check's _vr_reap, the demo's) is kept.
+# Returns FUNC's status; 1 when FUNC passed but CLEANUP failed.
+_vr_guarded() {
+  (
+    # shellcheck disable=SC2064,SC2154 # CLEANUP ($1) is expanded now, on purpose; _vr_g and $? when it runs
+    trap "_vr_g=\$?; trap - EXIT; if ! $1; then echo 'cleanup failed'; ((_vr_g)) || _vr_g=1; fi; exit \$_vr_g" EXIT
+    trap 'exit 130' INT
+    trap 'exit 143' TERM
+    "$2"
+  )
+}
+
+# _vr_gpu_nodes: VR_GPU_NODES = the nodes labelled $_VR_GPU_LABEL. Returns 77 (SKIP) when there are
+# none, 1 when the list cannot be read or holds a name that is not a GPU node's (k3s-gpu-<pool>-<n>).
+_vr_gpu_nodes() {
+  local out n
+  VR_GPU_NODES=()
+  out="$(vr_cap kc get nodes -l "$_VR_GPU_LABEL" "$_VR_RT" -o 'jsonpath={range .items[*]}{.metadata.name}{"\n"}{end}')" \
+    || { echo "D: cannot list the GPU nodes"; return 1; }
+  while read -r n; do
+    [[ -n "$n" ]] || continue
+    [[ "$n" =~ $GPU_NODE_RE ]] || { echo "D: unexpected GPU node name from the cluster: '$n'"; return 1; }
+    VR_GPU_NODES+=("$n")
+  done <<< "$out"
+  if ((${#VR_GPU_NODES[@]} == 0)); then
+    echo "D: no node has the label $_VR_GPU_LABEL (no GPU node): skipped"
+    return 77
+  fi
+  echo "D: GPU nodes: ${VR_GPU_NODES[*]}"
+}
+
+# D1: on every GPU node the bootstrap's audit (/var/log/gpu-audit.txt, spec §6.2 step 1) has content
+# and k3s's containerd config has the nvidia runtime; the RuntimeClass nvidia-gpu exists.
+check_d1_gpu_stack() {
+  local n out fail=0
+  _vr_gpu_nodes || return
+  vr_env
+  for n in "${VR_GPU_NODES[@]}"; do
+    if out="$(vr_cap node_ssh "$n" 'sudo cat /var/log/gpu-audit.txt' </dev/null)" && [[ -n "${out//[[:space:]]/}" ]]; then
+      echo "D1: $n: /var/log/gpu-audit.txt has content"
+    else
+      echo "D1: $n: /var/log/gpu-audit.txt is missing, unreadable or empty"
+      fail=1
+    fi
+    if out="$(vr_cap node_ssh "$n" "$_VR_CONTAINERD_NVIDIA" </dev/null)" && [[ "$out" == *nvidia* ]]; then
+      echo "D1: $n: containerd has the nvidia runtime"
+    else
+      echo "D1: $n: no nvidia runtime in k3s's containerd config"
+      fail=1
+    fi
+  done
+  vr_cmd kc get runtimeclass nvidia-gpu "$_VR_RT" || { echo "D1: no RuntimeClass nvidia-gpu"; fail=1; }
+  return "$fail"
+}
+
+# _vr_d2_node NODE: kubectl describe node NODE shows nvidia.com/gpu >= 1 under both Capacity and
+# Allocatable. VR_D2_OUT keeps the last answer, VR_D2_CAP/VR_D2_ALLOC the two values.
+_vr_d2_node() {
+  local vals
+  VR_D2_OUT="" VR_D2_CAP="" VR_D2_ALLOC=""
+  VR_D2_OUT="$(vr_cap --no-echo kc describe node "$1" "$_VR_RT")" || return 1
+  vals="$(awk '/^Capacity:/ { s = "cap"; next } /^Allocatable:/ { s = "alloc"; next } /^[^ ]/ { s = "" }
+               s && $1 == "nvidia.com/gpu:" { v[s] = $2 } END { print (v["cap"] == "" ? "-" : v["cap"]), (v["alloc"] == "" ? "-" : v["alloc"]) }' \
+    <<< "$VR_D2_OUT")"
+  read -r VR_D2_CAP VR_D2_ALLOC <<< "$vals"
+  [[ "$VR_D2_CAP" =~ ^[0-9]+$ && "$VR_D2_ALLOC" =~ ^[0-9]+$ ]] && ((VR_D2_CAP >= 1 && VR_D2_ALLOC >= 1))
+}
+
+# D2: every GPU node reports nvidia.com/gpu >= 1 in Capacity and Allocatable (kubectl describe node).
+# The resource appears about 20 s after the device plugin registers (live finding L21-2), so each
+# node gets up to 90 s.
+check_d2_gpu_capacity() {
+  local n fail=0
+  _vr_gpu_nodes || return
+  for n in "${VR_GPU_NODES[@]}"; do
+    if vr_retry 90 10 _vr_d2_node "$n"; then
+      echo "D2: $n: nvidia.com/gpu capacity $VR_D2_CAP, allocatable $VR_D2_ALLOC"
+    else
+      echo "D2: $n: nvidia.com/gpu capacity '$VR_D2_CAP', allocatable '$VR_D2_ALLOC' after 90 s; want both >= 1"
+      fail=1
+    fi
+    [[ -z "$VR_D2_OUT" ]] || printf -- '--- kubectl describe node %s ---\n%s\n' "$n" "$VR_D2_OUT"
+  done
+  return "$fail"
+}
+
+# D3: the device plugin Pods and their logs; the logs say "Registered device plugin".
+check_d3_device_plugin() {
+  local out
+  _vr_gpu_nodes || return
+  vr_cmd kc -n nvidia-device-plugin get pods -o wide "$_VR_RT" || true
+  out="$(vr_cap kc -n nvidia-device-plugin logs -l app.kubernetes.io/name=nvidia-device-plugin --tail=100 "$_VR_RT")" \
+    || { echo "D3: cannot read the device plugin logs"; return 1; }
+  if [[ "$out" == *"Registered device plugin"* ]]; then
+    echo "D3: the device plugin registered with the kubelet"
+    return 0
+  fi
+  echo "D3: no 'Registered device plugin' in the last 100 log lines"
+  return 1
+}
+
+# _vr_gpu_pod_delete POD: delete Pod POD in gpu-test (if it exists), bounded.
+_vr_gpu_pod_delete() {
+  vr_cmd kc -n gpu-test delete pod "$1" --ignore-not-found --timeout=120s
+}
+
+# _vr_gpu_pod_run POD: apply k8s/gpu-test/POD.yaml, wait (at most 300 s) until it Succeeded, and set
+# VR_POD_LOG to its log. When it does not succeed, its description goes into the evidence.
+_vr_gpu_pod_run() {
+  local pod="$1"
+  VR_POD_LOG=""
+  vr_cmd kc apply -f "$REPO_ROOT/k8s/gpu-test/$pod.yaml" "$_VR_RT" || return 1
+  if ! vr_cmd kc -n gpu-test wait "pod/$pod" '--for=jsonpath={.status.phase}=Succeeded' --timeout=300s; then
+    echo "$pod did not succeed within 300 s"
+    vr_cmd kc -n gpu-test describe pod "$pod" "$_VR_RT" || true
+    return 1
+  fi
+  VR_POD_LOG="$(vr_cap kc -n gpu-test logs "$pod" "$_VR_RT")" || { echo "cannot read the log of $pod"; return 1; }
+}
+
+_vr_d4_cleanup() { _vr_gpu_pod_delete gpu-smoke; }
+
+_vr_d4() {
+  local node type want
+  _vr_d4_cleanup || { echo "D4: cannot delete gpu-smoke left from an earlier run"; return 1; }
+  _vr_gpu_pod_run gpu-smoke || return 1
+  [[ "$VR_POD_LOG" == *NVIDIA-SMI* ]] || { echo "D4: no NVIDIA-SMI table in the log of gpu-smoke"; return 1; }
+  node="$(vr_cap kc -n gpu-test get pod gpu-smoke "$_VR_RT" -o 'jsonpath={.spec.nodeName}')" || return 1
+  [[ "$node" =~ $GPU_NODE_RE ]] || { echo "D4: gpu-smoke ran on '$node', not on a GPU node"; return 1; }
+  type="$(vr_cap kc get node "$node" "$_VR_RT" -o 'jsonpath={.metadata.labels.gpu-type}')" || return 1
+  [[ "$type" =~ $_VR_GPU_TYPE_RE ]] || { echo "D4: $node has no valid gpu-type label: '$type'"; return 1; }
+  # The label is the instance type's model, gpu_1x_a10 -> a10; nvidia-smi prints "NVIDIA A10". A longer
+  # label (a100_sxm4) is matched by its model part (A100), as nvidia-smi spells the rest differently
+  # (A100-SXM4-40GB). A whole word: an A100 must not pass for an A10.
+  want="$(printf '%s' "${type%%_*}" | tr '[:lower:]' '[:upper:]')"
+  if grep -Eq "(^|[^A-Za-z0-9])${want}([^A-Za-z0-9]|\$)" <<< "$VR_POD_LOG"; then
+    echo "D4: gpu-smoke ran nvidia-smi on $node (gpu-type $type): its output names '$want'"
+    return 0
+  fi
+  echo "D4: $node is labelled gpu-type $type, but nvidia-smi's output does not name '$want'"
+  return 1
+}
+
+# D4: gpu-smoke (nvidia-smi as a non-root user) Succeeded within 300 s; its log has the NVIDIA-SMI
+# table and names the GPU of the node it ran on: that node's gpu-type label, uppercased (A10, A6000).
+check_d4_gpu_smoke() {
+  _vr_gpu_nodes || return
+  _vr_guarded _vr_d4_cleanup _vr_d4
+}
+
+_vr_d5_cleanup() { _vr_gpu_pod_delete vectoradd; }
+
+_vr_d5() {
+  _vr_d5_cleanup || { echo "D5: cannot delete vectoradd left from an earlier run"; return 1; }
+  _vr_gpu_pod_run vectoradd || return 1
+  if [[ "$VR_POD_LOG" == *"Test PASSED"* ]]; then
+    echo "D5: vectoradd: Test PASSED"
+    return 0
+  fi
+  echo "D5: no 'Test PASSED' in the log of vectoradd"
+  return 1
+}
+
+# D5: the CUDA vectorAdd sample Succeeded within 300 s and logged "Test PASSED".
+check_d5_vectoradd() {
+  _vr_gpu_nodes || return
+  _vr_guarded _vr_d5_cleanup _vr_d5
+}
+
+# Holders are deleted by their label: they have generated names (gpu-hold-xxxxx).
+_vr_d6_cleanup() {
+  local rc=0
+  vr_cmd kc -n gpu-test delete pod -l app=gpu-hold --ignore-not-found --timeout=120s || rc=1
+  _vr_gpu_pod_delete gpu-overflow || rc=1
+  return "$rc"
+}
+
+_vr_d6() {
+  local out n alloc total=0 i running phase events
+  out="$(vr_cap kc get nodes -l "$_VR_GPU_LABEL" "$_VR_RT" \
+    -o 'jsonpath={range .items[*]}{.metadata.name}{" "}{.status.allocatable.nvidia\.com/gpu}{"\n"}{end}')" || return 1
+  while read -r n alloc; do
+    [[ -n "$n" ]] || continue
+    [[ "${alloc:-0}" =~ ^[0-9]+$ ]] || { echo "D6: $n: allocatable nvidia.com/gpu is not a number: '$alloc'"; return 1; }
+    total=$((total + ${alloc:-0}))
+  done <<< "$out"
+  ((total >= 1)) || { echo "D6: no allocatable GPU to hold"; return 1; }
+  echo "D6: $total allocatable GPU(s): one gpu-hold Pod each"
+  _vr_d6_cleanup || { echo "D6: cannot delete the gpu-hold and gpu-overflow Pods left from an earlier run"; return 1; }
+  for ((i = 0; i < total; i++)); do
+    vr_cmd kc -n gpu-test create -f "$REPO_ROOT/k8s/gpu-test/gpu-hold.yaml" "$_VR_RT" || return 1
+  done
+  vr_cmd kc -n gpu-test wait pod -l app=gpu-hold --for=condition=Ready --timeout=300s \
+    || { echo "D6: the gpu-hold Pods are not all Running within 300 s"; return 1; }
+  out="$(vr_cap kc -n gpu-test get pods -l app=gpu-hold --field-selector=status.phase=Running "$_VR_RT" \
+    -o 'jsonpath={range .items[*]}{.metadata.name}{"\n"}{end}')" || return 1
+  running="$(grep -c . <<< "$out" || true)"
+  ((running == total)) || { echo "D6: $running gpu-hold Pod(s) Running; want $total"; return 1; }
+  vr_cmd kc apply -f "$REPO_ROOT/k8s/gpu-test/gpu-overflow.yaml" "$_VR_RT" || return 1
+  echo "D6: every GPU is held; looking at gpu-overflow after 30 s"
+  _vr_sleep 30
+  phase="$(vr_cap kc -n gpu-test get pod gpu-overflow "$_VR_RT" -o 'jsonpath={.status.phase}')" || return 1
+  events="$(vr_cap kc -n gpu-test get events --field-selector=involvedObject.kind=Pod,involvedObject.name=gpu-overflow \
+    "$_VR_RT")" || return 1
+  if [[ "$phase" == Pending && "$events" == *"Insufficient nvidia.com/gpu"* ]]; then
+    echo "D6: gpu-overflow is Pending with 'Insufficient nvidia.com/gpu'"
+    return 0
+  fi
+  echo "D6: gpu-overflow is '$phase'; want Pending with an 'Insufficient nvidia.com/gpu' event"
+  return 1
+}
+
+# D6: one gpu-hold Pod per allocatable GPU (on every GPU node), all Running within 300 s; then
+# gpu-overflow is still Pending 30 s after it was applied, with an "Insufficient nvidia.com/gpu"
+# event. The holders (by label) and gpu-overflow are deleted before and after.
+check_d6_overflow() {
+  _vr_gpu_nodes || return
+  _vr_guarded _vr_d6_cleanup _vr_d6
 }
 
 # --- run summary --------------------------------------------------------------------------------
