@@ -50,13 +50,28 @@ tf-test: ## terraform init + validate every infra/ stack, then terraform test wh
 
 # Cloud entry points (spec §8, §11). Every terraform apply shows its plan and asks first;
 # AUTO_APPROVE=1 skips the question, but `make up` never lets it destroy or replace anything in
-# the base stack (k3s-cp).
+# the base stack (k3s-cp) or the workers stack.
 .PHONY: init up kubeconfig tunnel tunnel-stop
 init: ## Create the Terraform state bucket and enable the GCP APIs (infra/bootstrap; one-time, billable)
 	$(ROOT)/scripts/up.sh init
 
-up: ## Bring the cluster up: base stack, k3s on k3s-cp, kubeconfig, API tunnel (safe to re-run)
+up: ## Bring the cluster up: base, k3s-cp, kubeconfig, tunnel, CPU workers, system components, workloads (safe to re-run)
 	$(ROOT)/scripts/up.sh all
+
+# The CPU worker pool (spec §5.3). Removing a worker drains it and deletes it from the cluster
+# before the apply destroys its VM; k3s-cpu-1 is never removed.
+.PHONY: cpu-scale cpu-remove cpu-stop cpu-start
+cpu-scale: ## Scale the CPU pool to N workers (make cpu-scale N=3): drain removed ones, plan, confirm, apply, join new ones
+	$(ROOT)/scripts/cpu-pool.sh scale "$(N)"
+
+cpu-remove: ## Drain and delete CPU worker NAME, then destroy its VM (make cpu-remove NAME=k3s-cpu-2)
+	$(ROOT)/scripts/cpu-pool.sh remove "$(NAME)"
+
+cpu-stop: ## Stop every CPU worker VM (nodes go NotReady, static IPs are kept)
+	$(ROOT)/scripts/cpu-pool.sh stop
+
+cpu-start: ## Start every CPU worker VM again
+	$(ROOT)/scripts/cpu-pool.sh start
 
 kubeconfig: ## Fetch the kubeconfig over IAP SSH into ~/.kube/hybrid-gpu.yaml (0600)
 	$(ROOT)/scripts/kubeconfig.sh

@@ -1,10 +1,14 @@
 #!/usr/bin/env bash
 # Bring the cluster up, one stage at a time; every stage is safe to re-run.
 #
-#   up.sh init   make init: the Terraform state bucket and the GCP APIs (infra/bootstrap, local state)
-#   up.sh base   the base stack, k3s on k3s-cp, kubeconfig, API tunnel; waits for k3s-cp and CoreDNS
-#   up.sh all    make up: the stages in ALL_STAGES below, in order. init is not one of them: spec
-#                §11's make up starts at base, and spec §3.1 applies the bootstrap stack once, by hand
+#   up.sh init       make init: the Terraform state bucket and the GCP APIs (infra/bootstrap, local state)
+#   up.sh base       the base stack, k3s on k3s-cp, kubeconfig, API tunnel; waits for k3s-cp and CoreDNS
+#   up.sh workers    the workers stack (CPU worker VMs and their firewall rules), sync-peers, then
+#                    join-node.sh for every worker (a Ready worker is left alone)
+#   up.sh system     metrics-server, the nvidia-gpu RuntimeClass, the NVIDIA device plugin (Helm)
+#   up.sh workloads  k8s/nettest, k8s/hello and the gpu-test namespace; waits for their rollouts
+#   up.sh all        make up: the stages in ALL_STAGES below, in order. init is not one of them: spec
+#                    §11's make up starts at base, and spec §3.1 applies the bootstrap stack once, by hand
 #
 # Each terraform apply shows its plan and asks first (AUTO_APPROVE=1 skips the question). The base
 # stage applies with --no-destroy, since spec §3.1 applies the base stack only after a manual review
@@ -12,17 +16,22 @@
 # refused, so an unattended make up never recreates the control plane. A deliberate replacement of
 # k3s-cp (a change Terraform can only make by recreating it, such as a new zone) runs `make up`
 # interactively, where the plan's destroys are listed and confirmed. A plan without changes applies
-# nothing.
+# nothing. The workers stage applies with --no-destroy too: make up only ever adds workers, and a
+# worker that left the inventory without `make cpu-remove` was never drained, so an unattended run
+# refuses to destroy it (interactively the destroy is listed and asked). Scaling down is
+# scripts/cpu-pool.sh's job: it drains and deletes the node before its apply.
 set -euo pipefail
 
 # shellcheck disable=SC1091  # common.sh is linted on its own
 source "$(dirname -- "${BASH_SOURCE[0]}")/lib/common.sh"
 
-# Stages of `all`, in order. Later tasks append workers, system and workloads.
-ALL_STAGES="base"
+# Stages of `all`, in order (spec §11: base -> workers and their join -> system components -> workloads).
+ALL_STAGES="base workers system workloads"
+# The bound of every rollout wait in the system and workloads stages.
+ROLLOUT_TIMEOUT=300s
 
 usage() {
-  log "usage: ${0##*/} init|base|all"
+  log "usage: ${0##*/} init|base|workers|system|workloads|all"
   exit 2
 }
 
@@ -50,12 +59,10 @@ stage_base() {
   cp_resolve
 
   wait_for 'cp_ssh true' 300 || die "IAP SSH to $CP_NAME not available after 300s"
-  # A fresh staging directory every run, created by the operator's account with mode 0700. mkdir
-  # (no -p) fails if anything recreated the path after rm, and the owner check catches a mkdir
-  # that is not atomic, so nobody else on k3s-cp can place files there for root to run. node/'s
-  # entries go into it, so the script stays at /tmp/k3s-node/server-bootstrap.sh. Exit 255 is ssh's
-  # own failure (e.g. IAP dropped the connection), not the remote check: it gets its own message.
-  cp_ssh 'rm -rf /tmp/k3s-node && mkdir -m 0700 /tmp/k3s-node && [ ! -L /tmp/k3s-node ] && [ -O /tmp/k3s-node ]' || {
+  # A fresh private staging directory every run (NODE_STAGING_CMD in common.sh). node/'s entries go
+  # into it, so the script stays at /tmp/k3s-node/server-bootstrap.sh. Exit 255 is ssh's own failure
+  # (e.g. IAP dropped the connection), not the remote check: it gets its own message.
+  cp_ssh "$NODE_STAGING_CMD" || {
     rc=$?
     [[ $rc == 255 ]] && die "SSH to $CP_NAME failed while preparing /tmp/k3s-node (exit 255); re-run make up"
     die "cannot create a private /tmp/k3s-node on $CP_NAME (it exists, is a symlink, or is owned by another user): remove it on the CP and re-run make up"
@@ -72,18 +79,56 @@ stage_base() {
   log "base: k3s-cp and CoreDNS Ready"
 }
 
+# Task 14: the CPU workers (spec §3.1, §5.2, §5.3).
+stage_workers() {
+  log "==> workers: CPU worker VMs and their firewall rules (infra/workers), sync-peers, join each worker"
+  tf_init workers
+  tf_apply workers --no-destroy
+  join_workers
+  log "workers: every CPU worker is joined and Ready"
+}
+
+# Task 15: the system components (spec §4.4, §6.2): the three manifests, then the device plugin
+# chart. Its DaemonSet runs on GPU nodes only; with none yet, --wait returns at once.
+stage_system() {
+  local sys="$REPO_ROOT/k8s/system"
+  log "==> system: metrics-server, RuntimeClass nvidia-gpu, NVIDIA device plugin"
+  kc apply -f "$sys/metrics-server.yaml" -f "$sys/nvidia-gpu-runtimeclass.yaml" \
+    -f "$sys/nvidia-device-plugin-namespace.yaml"
+  helm repo add nvdp https://nvidia.github.io/k8s-device-plugin
+  helm repo update nvdp
+  helm --kubeconfig "$KUBECONFIG_FILE" upgrade -i nvdp nvdp/nvidia-device-plugin --namespace nvidia-device-plugin \
+    --version 0.20.1 -f "$sys/nvdp-values.yaml" --wait --timeout 5m
+  kc -n kube-system rollout status deployment/metrics-server --timeout="$ROLLOUT_TIMEOUT"
+  log "system: metrics-server and the device plugin are rolled out"
+}
+
+# Task 16: the workloads (spec §7). limits-demo and the GPU test Pods belong to make verify.
+stage_workloads() {
+  local k8s="$REPO_ROOT/k8s"
+  log "==> workloads: nettest, hello, the gpu-test namespace"
+  kc apply -f "$k8s/nettest/" -f "$k8s/hello/" -f "$k8s/gpu-test/namespace.yaml"
+  kc -n nettest rollout status daemonset/echo --timeout="$ROLLOUT_TIMEOUT"
+  kc -n nettest rollout status daemonset/probe --timeout="$ROLLOUT_TIMEOUT"
+  kc -n hello rollout status deployment/hello --timeout="$ROLLOUT_TIMEOUT"
+  log "workloads: nettest and hello are rolled out"
+}
+
 [[ $# -eq 1 ]] || usage
 case "$1" in
-  init | base | all) ;;
+  init | base | workers | system | workloads | all) ;;
   *) usage ;;
 esac
 load_env
-# No stage here needs the Lambda API key: keep it out of terraform, gcloud, kubectl and the tunnel
-# (scripts/gpuctl, should a later stage run it, loads .env itself).
+# No stage here needs the Lambda API key: keep it out of terraform, gcloud, kubectl, helm and the
+# tunnel. scripts/gpuctl (sync-peers, in the workers stage) loads .env itself.
 unset LAMBDA_API_KEY
 case "$1" in
   init) stage_init ;;
   base) stage_base ;;
+  workers) stage_workers ;;
+  system) stage_system ;;
+  workloads) stage_workloads ;;
   all)
     for stage in $ALL_STAGES; do
       "stage_$stage"

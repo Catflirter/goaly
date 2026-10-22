@@ -242,3 +242,192 @@ wait_for() {
   done
   rm -f -- "$last"
 }
+
+# ---- CPU workers and GPU nodes (Task 14) ------------------------------------------------------
+
+# Node names (global constraints): CPU workers k3s-cpu-<n>, GPU nodes k3s-gpu-<pool>-<n> (gpuctl's
+# planner: pool [a-z0-9]{1,20}). Anchored, so k3s-cp is neither, and no number has a leading zero.
+CPU_NODE_RE='^k3s-cpu-[1-9][0-9]*$'
+GPU_NODE_RE='^k3s-gpu-[a-z0-9]{1,20}-[1-9][0-9]*$'
+# The private staging directory for node/ on a host, made fresh by the operator's account with mode
+# 0700. mkdir (no -p) fails if anything recreated the path after rm, and the owner check catches a
+# mkdir that is not atomic, so nobody else on the host can place files there for root to run.
+# Used by up.sh (k3s-cp) and join-node.sh (workers, GPU nodes).
+# shellcheck disable=SC2034
+NODE_STAGING_CMD='rm -rf /tmp/k3s-node && mkdir -m 0700 /tmp/k3s-node && [ ! -L /tmp/k3s-node ] && [ -O /tmp/k3s-node ]'
+
+# is_ipv4 TEXT: one dotted-quad IPv4 address (each octet 0-255, no leading zeros).
+is_ipv4() {
+  local octet='(25[0-5]|2[0-4][0-9]|1[0-9][0-9]|[1-9]?[0-9])'
+  [[ "$1" =~ ^$octet\.$octet\.$octet\.$octet$ ]]
+}
+
+# node_kind NAME: prints cpu or gpu; fails (1) for any other name.
+node_kind() {
+  if [[ "$1" =~ $CPU_NODE_RE ]]; then
+    echo cpu
+  elif [[ "$1" =~ $GPU_NODE_RE ]]; then
+    echo gpu
+  else
+    return 1
+  fi
+}
+
+# _worker_zone NAME: set _ZONE to NAME's zone from `tf_out_json workers worker_zones`. The output is
+# read once per shell (_WORKER_ZONES); call it outside $(...) so that cache survives.
+_worker_zone() {
+  [[ "$1" =~ $CPU_NODE_RE ]] || die "not a CPU worker name: '$1'"
+  if [[ -z "${_WORKER_ZONES:-}" ]]; then
+    _WORKER_ZONES="$(tf_out_json workers worker_zones)" || die "cannot read worker_zones from the workers stack"
+  fi
+  _ZONE="$(jq -r --arg n "$1" 'if type == "object" then .[$n] // "" else error("not an object") end' \
+    <<< "$_WORKER_ZONES")" || die "unexpected worker_zones output from the workers stack"
+  [[ -n "$_ZONE" ]] || die "$1 is not in the workers stack (worker_zones)"
+  [[ "$_ZONE" =~ ^[a-z]+-[a-z]+[0-9]+-[a-z]$ ]] || die "unexpected zone for $1: '$_ZONE'"
+}
+
+# worker_ssh NAME CMD: run CMD on CPU worker NAME over IAP SSH (OS Login), as cp_ssh does on k3s-cp;
+# stdin is forwarded.
+worker_ssh() {
+  tf_env
+  _worker_zone "$1"
+  gcloud compute ssh "$1" --project "$GCP_PROJECT" --zone "$_ZONE" --tunnel-through-iap --quiet \
+    --ssh-flag=-oConnectTimeout=20 --ssh-flag=-oServerAliveInterval=30 --command "$2"
+}
+
+# worker_scp NAME SRC... DST: copy local SRCs (recursively) to DST on CPU worker NAME over IAP.
+worker_scp() {
+  (( $# >= 3 )) || die "usage: worker_scp NAME SRC... DST"
+  local name="$1" dst="${!#}"
+  shift
+  tf_env
+  _worker_zone "$name"
+  gcloud compute scp --project "$GCP_PROJECT" --zone "$_ZONE" --tunnel-through-iap --quiet \
+    --recurse --scp-flag=-oConnectTimeout=20 "${@:1:$#-1}" "$name:$dst"
+}
+
+# gpu_target NAME: ubuntu@IP for GPU node NAME. IP is GPU_SSH_IP (join-node.sh sets it to the IP it
+# was given) or else what `scripts/gpuctl ip NAME` reports; either way it must be one IPv4 address.
+gpu_target() {
+  local ip="${GPU_SSH_IP:-}"
+  [[ "$1" =~ $GPU_NODE_RE ]] || die "not a GPU node name: '$1'"
+  if [[ -z "$ip" ]]; then
+    ip="$("$REPO_ROOT/scripts/gpuctl" ip "$1")" || die "cannot look up the IP of $1 (scripts/gpuctl ip)"
+  fi
+  is_ipv4 "$ip" || die "the IP of $1 is not an IPv4 address: '$ip'"
+  printf 'ubuntu@%s\n' "$ip"
+}
+
+# _gpu_ssh_opts NAME: set _GPU_SSH_OPTS, the ssh/scp options for GPU node NAME. One known_hosts file
+# per node (.run/known_hosts_NAME, which gpuctl deletes with the node): Lambda hands old IPs to new
+# instances, so one shared file would reject a new node's key or vouch for the wrong host.
+_gpu_ssh_opts() {
+  [[ -n "${SSH_PRIVATE_KEY_PATH:-}" && -f "$SSH_PRIVATE_KEY_PATH" ]] \
+    || die "SSH_PRIVATE_KEY_PATH in .env must name the Lambda SSH private key: '${SSH_PRIVATE_KEY_PATH:-}'" 2
+  run_dir || die "cannot create $RUN_DIR"
+  _GPU_SSH_OPTS=(-i "$SSH_PRIVATE_KEY_PATH" -o StrictHostKeyChecking=accept-new
+    -o "UserKnownHostsFile=$RUN_DIR/known_hosts_$1" -o ConnectTimeout=20 -o ServerAliveInterval=30)
+}
+
+# gpu_ssh NAME CMD: run CMD on GPU node NAME as ubuntu over plain SSH (Lambda admits tcp/22 from
+# OPERATOR_IP only); stdin is forwarded.
+gpu_ssh() {
+  local target
+  target="$(gpu_target "$1")" || return
+  _gpu_ssh_opts "$1"
+  # shellcheck disable=SC2029  # CMD is meant to run remotely, as with cp_ssh's --command
+  ssh "${_GPU_SSH_OPTS[@]}" "$target" "$2"
+}
+
+# gpu_scp NAME SRC... DST: copy local SRCs (recursively) to DST on GPU node NAME.
+gpu_scp() {
+  (( $# >= 3 )) || die "usage: gpu_scp NAME SRC... DST"
+  local name="$1" dst="${!#}" target
+  shift
+  target="$(gpu_target "$name")" || return
+  _gpu_ssh_opts "$name"
+  scp -r "${_GPU_SSH_OPTS[@]}" "${@:1:$#-1}" "$target:$dst"
+}
+
+# node_ssh NAME CMD / node_scp NAME SRC... DST: worker_* for k3s-cpu-<n>, gpu_* for k3s-gpu-*.
+node_ssh() {
+  case "$(node_kind "$1")" in
+    cpu) worker_ssh "$@" ;;
+    gpu) gpu_ssh "$@" ;;
+    *) die "not a CPU worker or GPU node name: '$1'" ;;
+  esac
+}
+
+node_scp() {
+  case "$(node_kind "$1")" in
+    cpu) worker_scp "$@" ;;
+    gpu) gpu_scp "$@" ;;
+    *) die "not a CPU worker or GPU node name: '$1'" ;;
+  esac
+}
+
+# node_ready NAME: 0 when node NAME is Ready, 1 when it is not Ready or not registered. Any other
+# kubectl failure (the tunnel is down, another cluster) dies: it says nothing about the node.
+node_ready() {
+  local out rc=0
+  out="$(kc get node "$1" -o 'jsonpath={.status.conditions[?(@.type=="Ready")].status}' 2>&1)" || rc=$?
+  if (( rc != 0 )); then
+    [[ "$out" == *"nodes \"$1\" not found"* ]] && return 1
+    die "cannot read node $1 from the cluster (is the API tunnel up? make tunnel): $out"
+  fi
+  [[ "$out" == True ]]
+}
+
+# _kc_node_gone_ok NAME ARGS...: kc ARGS, where "node NAME not found" counts as success (Review
+# Focus #3). Only that message: a generic NotFound (another server) or another node's name still
+# fails, as in gpuctl's Infra.drain_and_delete_node.
+_kc_node_gone_ok() {
+  local name="$1" out rc=0
+  shift
+  out="$(kc "$@" 2>&1)" || rc=$?
+  (( rc == 0 )) && return 0
+  if [[ "$out" == *"nodes \"$name\" not found"* || "$out" == *"node \"$name\" not found"* ]]; then
+    log "node $name is not in the cluster: nothing to $1"
+    return 0
+  fi
+  log "$out"
+  return "$rc"
+}
+
+# drain_and_delete_node NAME: drain NAME (bounded) and delete it from the cluster, with the flags
+# gpuctl uses for GPU nodes. A node that is already gone counts as success.
+drain_and_delete_node() {
+  log "draining $1 and deleting it from the cluster"
+  _kc_node_gone_ok "$1" drain "$1" --ignore-daemonsets --delete-emptydir-data --force --timeout=120s \
+    || die "cannot drain $1"
+  _kc_node_gone_ok "$1" delete node "$1" || die "cannot delete node $1"
+}
+
+# worker_ip_lines: "NAME IP" for every CPU worker in `tf_out_json workers worker_ips`, in numeric
+# order (k3s-cpu-9 before k3s-cpu-10). Every name and IP is checked: both reach command lines.
+worker_ip_lines() {
+  local json lines name ip
+  json="$(tf_out_json workers worker_ips)" || die "cannot read worker_ips from the workers stack"
+  lines="$(jq -r 'if type == "object" then to_entries[] | "\(.key) \(.value)" else error("not an object") end' \
+    <<< "$json")" || die "unexpected worker_ips output from the workers stack"
+  while read -r name ip; do
+    [[ -n "$name" ]] || continue
+    [[ "$name" =~ $CPU_NODE_RE ]] || die "unexpected worker name in worker_ips: '$name'"
+    is_ipv4 "$ip" || die "worker_ips: $name has no IPv4 address: '$ip'"
+    printf '%s %s\n' "$name" "$ip"
+  done <<< "$lines" | sort -t- -k3,3n
+}
+
+# join_workers: sync the peer allow-lists once, so every worker IP is in k3s-cp's k3s_peers set
+# before its agent connects (spec §5.2 step 1), then join-node.sh --skip-sync for every worker in
+# the workers stack. join-node.sh leaves a Ready worker alone, so this is safe to re-run.
+join_workers() {
+  local lines name ip
+  lines="$(worker_ip_lines)" || exit
+  "$REPO_ROOT/scripts/gpuctl" sync-peers || die "sync-peers failed"
+  while read -r name ip; do
+    [[ -n "$name" ]] || continue
+    "$REPO_ROOT/scripts/join-node.sh" --node "$name" --external-ip "$ip" --skip-sync < /dev/null \
+      || die "join-node.sh failed for $name"
+  done <<< "$lines"
+}
