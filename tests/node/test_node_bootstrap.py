@@ -134,8 +134,13 @@ def test_agent_dropin_orders_k3s_agent_after_the_guard(tmp_path):
 
 def test_sysctl_values(tmp_path):
     assert run_agent(tmp_path, "--no-gpu").returncode == 0
-    lines = {l.strip() for l in rendered(tmp_path, "etc/sysctl.d/90-kubelet.conf").splitlines() if l.strip()}
-    assert lines == {"vm.panic_on_oom=0", "vm.overcommit_memory=1", "kernel.panic=10", "kernel.panic_on_oops=1"}
+    lines = {l.strip() for l in rendered(tmp_path, "etc/sysctl.d/90-kubelet.conf").splitlines()
+             if l.strip() and not l.lstrip().startswith("#")}
+    assert lines == {"vm.panic_on_oom=0", "vm.overcommit_memory=1", "kernel.panic=10", "kernel.panic_on_oops=1",
+                     "net.ipv4.ip_forward=1", "net.ipv4.conf.all.forwarding=1",
+                     "net.ipv4.conf.all.accept_redirects=0", "net.ipv4.conf.default.accept_redirects=0",
+                     "net.ipv4.conf.all.send_redirects=0", "net.ipv4.conf.default.send_redirects=0",
+                     "net.ipv4.conf.all.accept_source_route=0", "net.ipv4.conf.default.accept_source_route=0"}
 
 
 def test_renders_exactly_the_expected_files(tmp_path):
@@ -470,6 +475,13 @@ def run_host(tmp, bindir, *flags, node="k3s-cpu-1", ext="34.29.20.20", extra_env
                           capture_output=True, text=True, env=env)
 
 
+def snapshot_sysctl(bindir, tmp):
+    """Make the sysctl stub copy the 90-kubelet.conf that `sysctl --system` would apply."""
+    stub = bindir / "sysctl"
+    stub.write_text(stub.read_text() + f'cp "{tmp}/sys/etc/sysctl.d/90-kubelet.conf" "{tmp}/sysctl-saw.conf" '
+                    f'2>/dev/null || echo MISSING > "{tmp}/sysctl-saw.conf"\n')
+
+
 def host_calls(log):
     # The staging dir is a mktemp path; normalise it. The GPU audit's probes are checked separately.
     probes = ("nvidia-smi", "lsb_release", "uname", "dpkg", "iptables", "ip -4 addr", "systemctl is-enabled")
@@ -623,3 +635,18 @@ def test_host_mode_requires_root_without_test_root(tmp_path):
                        capture_output=True, text=True, env=env)
     assert r.returncode == 1 and "run as root" in r.stderr
     assert calls(log) == []
+
+
+def test_host_rerun_applies_the_new_sysctl_file_without_restarting_k3s_agent(tmp_path):
+    # As on the server: a re-run installs the new 90-kubelet.conf before `sysctl --system` and does not
+    # restart k3s-agent for a sysctl-only change.
+    bindir, log = host_stubs(tmp_path)
+    assert run_host(tmp_path, bindir, "--no-gpu").returncode == 0
+    (tmp_path / "agent-active").touch()
+    (tmp_path / "sys/etc/sysctl.d/90-kubelet.conf").write_text("vm.panic_on_oom=0\nvm.overcommit_memory=1\nkernel.panic=10\nkernel.panic_on_oops=1\n")
+    snapshot_sysctl(bindir, tmp_path)
+    log.write_text("")
+    r = run_host(tmp_path, bindir, "--no-gpu")
+    assert r.returncode == 0, r.stderr
+    assert "net.ipv4.ip_forward=1" in (tmp_path / "sysctl-saw.conf").read_text().splitlines()
+    assert not any(c.startswith("systemctl restart") for c in calls(log)), calls(log)
