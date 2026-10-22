@@ -86,7 +86,12 @@ Verification checks (Task 18) script their answers instead, with rules tried bef
                                           successive calls get successive answers (the last one repeats).
                                           An answer with "serve": TEXT (kubectl port-forward L:R) listens on
                                           127.0.0.1:L, prints kubectl's "Forwarding from" line and answers
-                                          every HTTP GET with TEXT until it is killed. "sleep": SECONDS
+                                          every HTTP GET with TEXT until it is killed. "serve" may instead
+                                          be {PATH: REPLY, ...}: a GET whose URL-decoded path and query
+                                          contain PATH (the first such key) gets REPLY, any other a 404.
+                                          REPLY is TEXT, {"body": TEXT, "status": N, "sleep": SECONDS}
+                                          (sleep: answer that late) or a list of those that successive
+                                          GETs get in turn (the last one repeats). "sleep": SECONDS
                                           waits that long after printing, before exiting (a capture or a
                                           stalled call that is still running). "run_with": {TOOL: rc}
                                           runs the command after `--` (kubectl exec) for real, here, with
@@ -121,6 +126,7 @@ import re
 import subprocess
 import sys
 import time
+import urllib.parse
 from pathlib import Path
 
 TOOL = sys.argv[1]
@@ -417,14 +423,29 @@ def gpuctl(entry):
     return 1
 
 
-def serve(text):
-    """kubectl port-forward LOCAL:REMOTE: answer HTTP GETs on 127.0.0.1:LOCAL until killed."""
+def serve(routes):
+    """kubectl port-forward LOCAL:REMOTE: answer HTTP GETs on 127.0.0.1:LOCAL until killed. ROUTES is the
+    answer's "serve": one TEXT for every GET, or {PATH: REPLY} (see the module docstring)."""
     local, remote = next(a for a in ARGS if re.fullmatch(r"\d+:\d+", a)).split(":")
-    body = text.encode()
+    if not isinstance(routes, dict):
+        routes = {"": routes}
+    asked = {}
+
+    def reply(path):
+        for key, answers in routes.items():
+            if key in path:
+                answers = answers if isinstance(answers, list) else [answers]
+                answer = answers[min(asked.get(key, 0), len(answers) - 1)]
+                asked[key] = asked.get(key, 0) + 1
+                return answer if isinstance(answer, dict) else {"body": answer}
+        return {"body": "404 page not found\n", "status": 404}
 
     class Handler(http.server.BaseHTTPRequestHandler):
         def do_GET(self):  # noqa: N802 (http.server's name)
-            self.send_response(200)
+            answer = reply(urllib.parse.unquote_plus(self.path))
+            time.sleep(answer.get("sleep", 0))
+            body = answer.get("body", "").encode()
+            self.send_response(answer.get("status", 200))
             self.send_header("Content-Length", str(len(body)))
             self.end_headers()
             self.wfile.write(body)

@@ -7,8 +7,12 @@
 #                    join-node.sh for every worker (a Ready worker is left alone), sync-peers last
 #   up.sh system     metrics-server, the nvidia-gpu RuntimeClass, the NVIDIA device plugin (Helm)
 #   up.sh workloads  k8s/nettest, k8s/hello and the gpu-test namespace; waits for their rollouts
-#   up.sh all        make up: the stages in ALL_STAGES below, in order. init is not one of them: spec
-#                    §11's make up starts at base, and spec §3.1 applies the bootstrap stack once, by hand
+#   up.sh monitoring stretch S0 (spec §10.0): the monitoring stack, scripts/monitoring.sh install (the
+#                    same as make monitoring)
+#   up.sh all        make up: the stages in ALL_STAGES below, in order, then monitoring when STRETCH=1
+#                    (make up STRETCH=1); without STRETCH=1 make up is the core one. init is not one of
+#                    them: spec §11's make up starts at base, and spec §3.1 applies the bootstrap stack
+#                    once, by hand
 #
 # Each terraform apply shows its plan and asks first (AUTO_APPROVE=1 skips the question). The base
 # stage applies with --no-destroy, since spec §3.1 applies the base stack only after a manual review
@@ -32,7 +36,7 @@ ALL_STAGES="base workers system workloads"
 ROLLOUT_TIMEOUT=300s
 
 usage() {
-  log "usage: ${0##*/} init|base|workers|system|workloads|all"
+  log "usage: ${0##*/} init|base|workers|system|workloads|monitoring|all"
   exit 2
 }
 
@@ -117,9 +121,17 @@ stage_workloads() {
   log "workloads: nettest and hello are rolled out"
 }
 
+# Stretch S0 (spec §10.0): Prometheus, the exporters and Grafana in k8s/monitoring/. scripts/monitoring.sh
+# warns when k3s-cpu-1 is smaller than the e2-standard-2 the stack is sized for, and shows a new Grafana
+# admin password once, on the terminal only.
+stage_monitoring() {
+  log "==> monitoring (stretch): Prometheus, node-exporter, kube-state-metrics, DCGM exporter, Grafana"
+  "$REPO_ROOT/scripts/monitoring.sh" install
+}
+
 [[ $# -eq 1 ]] || usage
 case "$1" in
-  init | base | workers | system | workloads | all) ;;
+  init | base | workers | system | workloads | monitoring | all) ;;
   *) usage ;;
 esac
 load_env
@@ -132,9 +144,13 @@ case "$1" in
   workers) stage_workers ;;
   system) stage_system ;;
   workloads) stage_workloads ;;
+  monitoring) stage_monitoring ;;
   all)
     for stage in $ALL_STAGES; do
       "stage_$stage"
     done
+    if [[ "${STRETCH:-0}" == 1 ]]; then
+      stage_monitoring
+    fi
     ;;
 esac

@@ -55,7 +55,7 @@ tf-test: ## terraform init + validate every infra/ stack, then terraform test wh
 init: ## Create the Terraform state bucket and enable the GCP APIs (infra/bootstrap; one-time, billable)
 	$(ROOT)/scripts/up.sh init
 
-up: ## Bring the cluster up: base, k3s-cp, kubeconfig, tunnel, CPU workers, system components, workloads (safe to re-run)
+up: ## Bring the cluster up: base, k3s-cp, kubeconfig, tunnel, CPU workers, system components, workloads (safe to re-run; STRETCH=1 adds the monitoring stack)
 	$(ROOT)/scripts/up.sh all
 
 # Ordered teardown (spec §11): asks once for the GCP project id; the bootstrap stack (state bucket)
@@ -105,9 +105,11 @@ lint: ## Run all pre-commit hooks, the repo secret scan, the Terraform tests, th
 	$(MAKE) tf-test
 	$(MAKE) test
 
-# RESILIENCE=1 (make verify RESILIENCE=1) reaches verify.sh through the environment and adds group E.
+# RESILIENCE=1 (make verify RESILIENCE=1) reaches verify.sh through the environment and adds group E;
+# STRETCH=1 likewise adds group S, the stretch checks (S0: the monitoring stack). make up STRETCH=1 also
+# installs the monitoring stack after the workloads.
 .PHONY: verify
-verify: ## Run verification checks A-D (RESILIENCE=1 adds E) into verification/<timestamp>/
+verify: ## Run verification checks A-D (STRETCH=1 adds S, RESILIENCE=1 adds E) into verification/<timestamp>/
 	$(ROOT)/scripts/verify.sh
 
 # RUN is a path to the run, as the shell sees it from where make runs (make -C <repo> for a repo-relative one).
