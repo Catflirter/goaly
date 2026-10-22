@@ -25,7 +25,7 @@ from typing import TextIO
 
 from gpuctl.infra import CommandError, Infra, SubprocessShell
 from gpuctl.lambda_api import FirewallRule, Instance, LambdaAPIError, LambdaClient
-from gpuctl.lock import LockError, lock_path, write_lock
+from gpuctl.lock import LockError, LockWaitInterrupted, lock_path, write_lock
 from gpuctl.output import write
 from gpuctl.peers import ruleset_name
 from gpuctl.planner import (
@@ -45,6 +45,7 @@ SSH_KEY_ENV = "LAMBDA_SSH_KEY_NAME"
 RULESET_PREFIX = ruleset_name("")  # "k3s-gpu-": the rulesets gpuctl owns, one per region
 
 EXIT_OK, EXIT_FAILED, EXIT_REFUSED, EXIT_DRIFT = 0, 1, 2, 3
+EXIT_INTERRUPTED = 130  # Ctrl-C (128 + SIGINT)
 
 
 class _Refused(Exception):
@@ -310,10 +311,19 @@ def _parser() -> argparse.ArgumentParser:
     return parser
 
 
-def _waiting(command: str, out: TextIO) -> None:
+def _waiting(command: str, out: TextIO, waited: float) -> None:
+    """Said when the command starts to wait for the write lock, and again every lock.WAIT_REPEAT_S (review S4-r3-3)."""
     then = "gpu-down runs as soon as it ends" if command == "down" else f"{command} runs as soon as it ends"
-    _emit(out, f"Waiting for the gpuctl apply/down/sync-peers that holds {LOCK_PATH} (the autoscaler's gpu_scale, "
-               f"or a make gpu-apply in another terminal): {then} (Ctrl-C stops waiting; nothing has changed yet)")
+    find = f"`fuser -v {LOCK_PATH}` (or `lsof {LOCK_PATH}`) shows the process"
+    if waited == 0:  # the first time
+        _emit(out, f"Waiting for {LOCK_PATH}: another gpuctl apply, down or sync-peers holds it: a make gpu-apply or "
+                   "make gpu-down in another terminal (it may be waiting at its y/N confirmation prompt), the "
+                   "autoscaler's gpu_scale (make autoscale), or the sync-peers of scripts/cpu-pool.sh or "
+                   f"scripts/join-node.sh (make cpu-scale, make up). {find}. {then} "
+                   "(Ctrl-C stops waiting; nothing has changed yet)")
+    else:
+        _emit(out, f"Still waiting for {LOCK_PATH} ({waited:.0f}s): a gpuctl apply/down/sync-peers holds it (one at "
+                   f"its confirmation prompt waits for an answer); {find}. {then} (Ctrl-C stops waiting)")
 
 
 def _load_spec(path: Path) -> Spec:
@@ -362,7 +372,7 @@ def main(argv: list[str] | None = None, *, env: Mapping[str, str] = os.environ, 
             client = _client(env, client)
             if args.command == "status":
                 return handler(args, spec, client, infra, env, out)
-            with write_lock(LOCK_PATH, env=env, waiting=lambda: _waiting(args.command, out)):
+            with write_lock(LOCK_PATH, env=env, waiting=lambda waited: _waiting(args.command, out, waited)):
                 return handler(args, spec, client, infra, env, out)
         handler = {"rules": _rules, "list-nodes": _list_nodes, "ip": _ip}[args.command]
         return handler(args, _client(env, client), out)
@@ -375,6 +385,12 @@ def main(argv: list[str] | None = None, *, env: Mapping[str, str] = os.environ, 
     except LambdaAPIError as e:
         write(sys.stderr, _clean(f"gpuctl: Lambda API error: {e}") + "\n")
         return EXIT_FAILED
+    except LockWaitInterrupted:  # Ctrl-C while another write held the lock (review S4-r3-5)
+        write(sys.stderr, f"gpuctl: stopped waiting for {LOCK_PATH}: nothing was changed\n")
+        return EXIT_INTERRUPTED
+    except KeyboardInterrupt:  # the commands clean up what they started first, then raise it again
+        write(sys.stderr, "gpuctl: interrupted (Ctrl-C): check with make gpu-status before running it again\n")
+        return EXIT_INTERRUPTED
 
 
 if __name__ == "__main__":
