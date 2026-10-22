@@ -448,6 +448,8 @@ def scripted():
         answer = rule
         if "seq" in rule:
             answer = rule["seq"][min(counter(f"answer-{i}"), len(rule["seq"]) - 1)]
+        if READYZ_PROBE:  # a scripted /readyz probe has its answer now: logged before it prints, sleeps or serves
+            log()
         sys.stdout.write(answer.get("stdout", ""))
         sys.stdout.flush()
         sys.stderr.write(answer.get("stderr", ""))
@@ -475,12 +477,10 @@ def run_with(stubs):
 
 if __name__ == "__main__":
     ENTRY = None
-    if not READYZ_PROBE:  # a /readyz probe logs itself once it has its answer (kubectl)
+    if not READYZ_PROBE:  # a /readyz probe logs itself once it has its answer (scripted or kubectl)
         ENTRY = log()
     rc = scripted()
     if rc is not None:
-        if READYZ_PROBE:  # a scripted answer to a /readyz probe: log it now that it is answered
-            log()
         sys.exit(rc)
     if TOOL == "gpuctl":  # never a /readyz probe, so ENTRY is set (gpuctl tfguard reads its logged stdin)
         sys.exit(gpuctl(ENTRY))
