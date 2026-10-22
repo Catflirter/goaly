@@ -123,11 +123,16 @@ _vr_reap() {
 # run_check ID TITLE FUNC [ARGS…]: run FUNC ARGS in a subshell (so exit and set -e failures end only
 # the check) with stdin from /dev/null, stdout+stderr redacted into $VR_DIR/<NN>-<ID>.txt.
 # FUNC's status: 0 PASS, 77 SKIP, anything else FAIL; a failed redact filter (lost evidence) is a FAIL
-# too. Always returns 0; vr_finish reports the outcome.
+# too. Returns 0; vr_finish reports the outcome.
+# Interrupted: a Ctrl-C reaches the whole process group. The filter ignores SIGINT and SIGTERM (sed
+# inherits that) and ends when the check's output does, so a check cleaning up after the signal
+# (_vr_guarded) can still record, and so run, its cleanup commands (Task 21a review C0-3/X0-2). This
+# shell notes the signal instead of dying of it at once; once the check has ended and its result is
+# recorded, it ends itself by that signal (the caller's own trap, if any, runs), so the run stops.
 run_check() {
   local id="$1" title="$2" func="$3"
   shift 3
-  local seq file rc redact_rc result errexit=0
+  local seq file rc redact_rc result errexit=0 traps signal=""
   VR_SEQ=$((VR_SEQ + 1))
   printf -v seq '%02d' "$VR_SEQ"
   file="$VR_DIR/$seq-$id.txt"
@@ -142,12 +147,20 @@ run_check() {
   # The check keeps the caller's errexit; run_check itself must survive the check failing.
   [[ $- == *e* ]] && errexit=1
   set +e
+  traps="$(trap -p INT TERM)"
+  trap 'signal=${signal:-INT}' INT
+  trap 'signal=${signal:-TERM}' TERM
   (
     if ((errexit)); then set -e; fi
     trap _vr_reap EXIT
     "$func" "$@"
-  ) </dev/null 2>&1 | redact >>"$file"
+  ) </dev/null 2>&1 | (
+    trap '' INT TERM
+    redact
+  ) >>"$file"
   local -a status=("${PIPESTATUS[@]}")
+  trap - INT TERM
+  eval "$traps"
   if ((errexit)); then set -e; fi
   rc=${status[0]}
   redact_rc=${status[1]}
@@ -171,6 +184,10 @@ run_check() {
   printf '# finished: %s — %s (exit %d)\n' "$(_vr_now)" "$result" "$rc" >>"$file"
   printf '| %d | %s | %s | %s |\n' "$VR_SEQ" "$id" "${title//|/\\|}" "$result" >>"$VR_DIR/SUMMARY.md"
   printf '[%s] %-4s %-4s %s\n' "$seq" "$id" "$result" "$title"
+  if [[ -n "$signal" ]]; then
+    printf 'interrupted (SIG%s) during %s: stopping\n' "$signal" "$id" >&2
+    kill -s "$signal" "${BASHPID:-$$}"
+  fi
   return 0
 }
 
@@ -243,9 +260,14 @@ vr_env() {
   _VR_ENV_LOADED=1
 }
 
-# _vr_sleep SECONDS: sleep; VR_NO_WAIT=1 (the offline tests) skips it.
+# _vr_sleep SECONDS: sleep; VR_NO_WAIT=1 (the offline tests) skips it and says so in the evidence, so
+# the tests can see the wait (D6's 30 s).
 _vr_sleep() {
-  [[ "${VR_NO_WAIT:-}" == 1 ]] || sleep "$1"
+  if [[ "${VR_NO_WAIT:-}" == 1 ]]; then
+    echo "(wait ${1}s skipped)" >&2
+  else
+    sleep "$1"
+  fi
 }
 
 # vr_retry TIMEOUT_S INTERVAL_S CMD…: run CMD (in this shell) until it succeeds, every INTERVAL_S
@@ -1088,17 +1110,39 @@ _VR_CONTAINERD_NVIDIA='sudo grep -A3 nvidia /var/lib/rancher/k3s/agent/etc/conta
 _VR_GPU_TYPE_RE='^[a-z0-9]+([_-][a-z0-9]+)*$'
 
 # _vr_guarded CLEANUP FUNC: run FUNC in a subshell whose EXIT trap runs CLEANUP however FUNC ends: it
-# returns, exits (die, set -e) or is stopped by SIGINT/SIGTERM (an interrupted make verify). The trap
-# lives in the subshell, so the caller's own EXIT trap (run_check's _vr_reap, the demo's) is kept.
-# Returns FUNC's status; 1 when FUNC passed but CLEANUP failed.
+# returns or exits (die, set -e). The trap lives in the subshell, so the caller's own EXIT trap
+# (run_check's _vr_reap, the demo's) is kept. Returns FUNC's status; 1 when FUNC passed but CLEANUP
+# failed. When SIGINT or SIGTERM stops FUNC (Ctrl-C during make verify or the demo), _vr_guard_signal
+# runs CLEANUP and ends the subshell by that signal, so verify.sh and the demo stop as they would
+# without the trap.
 _vr_guarded() {
   (
     # shellcheck disable=SC2064,SC2154 # CLEANUP ($1) is expanded now, on purpose; _vr_g and $? when it runs
     trap "_vr_g=\$?; trap - EXIT; if ! $1; then echo 'cleanup failed'; ((_vr_g)) || _vr_g=1; fi; exit \$_vr_g" EXIT
-    trap 'exit 130' INT
-    trap 'exit 143' TERM
+    # shellcheck disable=SC2064 # CLEANUP ($1) is expanded now, on purpose
+    trap "_vr_guard_signal INT $1" INT
+    # shellcheck disable=SC2064
+    trap "_vr_guard_signal TERM $1" TERM
     "$2"
   )
+}
+
+# _vr_guard_signal SIGNAL CLEANUP: the INT/TERM trap of _vr_guarded. Runs CLEANUP, then kills its own
+# subshell with SIGNAL. If the evidence can no longer be written (run_check's filter keeps it open,
+# but a caller's pipe may have died with the Ctrl-C), output goes to /dev/null: a closed pipe must
+# not stop CLEANUP (vr_cmd runs nothing it cannot record) and leave a billed GPU allocated.
+_vr_guard_signal() {
+  set +e
+  trap - EXIT INT TERM
+  trap '' PIPE
+  _vr_reap
+  if ! printf 'interrupted (SIG%s); cleaning up\n' "$1" 2>/dev/null; then
+    exec >/dev/null 2>&1
+  fi
+  "$2" </dev/null 2>&1 || echo 'cleanup failed'
+  trap - PIPE
+  kill -s "$1" "$BASHPID"
+  exit 1
 }
 
 # _vr_gpu_nodes: VR_GPU_NODES = the nodes labelled $_VR_GPU_LABEL. Returns 77 (SKIP) when there are
@@ -1190,9 +1234,32 @@ check_d3_device_plugin() {
   return 1
 }
 
-# _vr_gpu_pod_delete POD: delete Pod POD in gpu-test (if it exists), bounded.
+# _vr_gpu_pod_delete POD: delete Pod POD in gpu-test (if it exists), bounded: --timeout the wait for
+# the deletion, $_VR_RT each request (a stalled tunnel).
 _vr_gpu_pod_delete() {
-  vr_cmd kc -n gpu-test delete pod "$1" --ignore-not-found --timeout=120s
+  vr_cmd kc -n gpu-test delete pod "$1" --ignore-not-found --timeout=120s "$_VR_RT"
+}
+
+# _vr_gpu_pod_wait POD: poll POD's phase every 5 s until it is Succeeded (0), for at most 300 s (1). A
+# Pod that Failed never succeeds, so that ends the wait at once (1) instead of after 300 billed seconds.
+_vr_gpu_pod_wait() {
+  local phase="" waited=0
+  while :; do
+    phase="$(vr_cap kc -n gpu-test get pod "$1" "$_VR_RT" -o 'jsonpath={.status.phase}')" || phase=""
+    case "$phase" in
+      Succeeded) return 0 ;;
+      Failed)
+        echo "$1 Failed"
+        return 1
+        ;;
+    esac
+    if ((waited + 5 > 300)); then
+      echo "$1 did not succeed within 300 s (phase '$phase')"
+      return 1
+    fi
+    _vr_sleep 5
+    waited=$((waited + 5))
+  done
 }
 
 # _vr_gpu_pod_run POD: apply k8s/gpu-test/POD.yaml, wait (at most 300 s) until it Succeeded, and set
@@ -1201,8 +1268,7 @@ _vr_gpu_pod_run() {
   local pod="$1"
   VR_POD_LOG=""
   vr_cmd kc apply -f "$REPO_ROOT/k8s/gpu-test/$pod.yaml" "$_VR_RT" || return 1
-  if ! vr_cmd kc -n gpu-test wait "pod/$pod" '--for=jsonpath={.status.phase}=Succeeded' --timeout=300s; then
-    echo "$pod did not succeed within 300 s"
+  if ! _vr_gpu_pod_wait "$pod"; then
     vr_cmd kc -n gpu-test describe pod "$pod" "$_VR_RT" || true
     return 1
   fi
@@ -1261,13 +1327,13 @@ check_d5_vectoradd() {
 # Holders are deleted by their label: they have generated names (gpu-hold-xxxxx).
 _vr_d6_cleanup() {
   local rc=0
-  vr_cmd kc -n gpu-test delete pod -l app=gpu-hold --ignore-not-found --timeout=120s || rc=1
+  vr_cmd kc -n gpu-test delete pod -l app=gpu-hold --ignore-not-found --timeout=120s "$_VR_RT" || rc=1
   _vr_gpu_pod_delete gpu-overflow || rc=1
   return "$rc"
 }
 
 _vr_d6() {
-  local out n alloc total=0 i running phase events
+  local out n alloc total=0 i running phase uid events
   out="$(vr_cap kc get nodes -l "$_VR_GPU_LABEL" "$_VR_RT" \
     -o 'jsonpath={range .items[*]}{.metadata.name}{" "}{.status.allocatable.nvidia\.com/gpu}{"\n"}{end}')" || return 1
   while read -r n alloc; do
@@ -1288,11 +1354,15 @@ _vr_d6() {
   running="$(grep -c . <<< "$out" || true)"
   ((running == total)) || { echo "D6: $running gpu-hold Pod(s) Running; want $total"; return 1; }
   vr_cmd kc apply -f "$REPO_ROOT/k8s/gpu-test/gpu-overflow.yaml" "$_VR_RT" || return 1
+  # Events outlive their Pod (about an hour): only this gpu-overflow's, by its uid, count.
+  uid="$(vr_cap kc -n gpu-test get pod gpu-overflow "$_VR_RT" -o 'jsonpath={.metadata.uid}')" || return 1
+  [[ "$uid" =~ ^[0-9a-f-]+$ ]] || { echo "D6: gpu-overflow has no valid uid: '$uid'"; return 1; }
   echo "D6: every GPU is held; looking at gpu-overflow after 30 s"
   _vr_sleep 30
   phase="$(vr_cap kc -n gpu-test get pod gpu-overflow "$_VR_RT" -o 'jsonpath={.status.phase}')" || return 1
-  events="$(vr_cap kc -n gpu-test get events --field-selector=involvedObject.kind=Pod,involvedObject.name=gpu-overflow \
-    "$_VR_RT")" || return 1
+  events="$(vr_cap kc -n gpu-test get events \
+    "--field-selector=involvedObject.kind=Pod,involvedObject.name=gpu-overflow,involvedObject.uid=$uid" "$_VR_RT")" \
+    || return 1
   if [[ "$phase" == Pending && "$events" == *"Insufficient nvidia.com/gpu"* ]]; then
     echo "D6: gpu-overflow is Pending with 'Insufficient nvidia.com/gpu'"
     return 0
@@ -1303,7 +1373,8 @@ _vr_d6() {
 
 # D6: one gpu-hold Pod per allocatable GPU (on every GPU node), all Running within 300 s; then
 # gpu-overflow is still Pending 30 s after it was applied, with an "Insufficient nvidia.com/gpu"
-# event. The holders (by label) and gpu-overflow are deleted before and after.
+# event of that Pod (its uid, not an earlier run's). The holders (by label) and gpu-overflow are
+# deleted before and after.
 check_d6_overflow() {
   _vr_gpu_nodes || return
   _vr_guarded _vr_d6_cleanup _vr_d6

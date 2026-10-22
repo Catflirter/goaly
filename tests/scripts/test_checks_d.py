@@ -6,7 +6,12 @@ and a scripted healthy cluster. Here it has a GPU node, k3s-gpu-a6000-1, as the 
 labelled gpu-type=a10 and nvidia-smi prints "NVIDIA A10". Each test breaks one thing and runs one check through
 run_check, as make verify does. Nothing here reaches Lambda, a cluster or the network.
 """
+import os
 import re
+import shlex
+import signal
+import subprocess
+import time
 
 import pytest
 
@@ -31,6 +36,7 @@ SMI = ("+-----------------------------------------------------------------------
 VECTORADD = "[Vector addition of 50000 elements]\nCopy input data from the host memory to the CUDA device\nTest PASSED\nDone\n"
 REGISTERED = ("I1022 05:24:41.123456       1 server.go:165] Starting GRPC server for 'nvidia.com/gpu'\n"
               "I1022 05:24:41.223456       1 server.go:117] Registered device plugin for 'nvidia.com/gpu' with Kubelet\n")
+OVERFLOW_UID = "0f5e3c1a-7b2d-4e8f-9a6b-1c2d3e4f5a6b"
 EVENTS = ("LAST SEEN   TYPE      REASON             OBJECT             MESSAGE\n"
           "31s         Warning   FailedScheduling   pod/gpu-overflow   0/3 nodes are available: 1 Insufficient "
           "nvidia.com/gpu, 2 node(s) didn't match Pod's node affinity/selector.\n")
@@ -61,7 +67,8 @@ def gpu_answers(gpus=(GPU1,), allocatable=None, gpu_type="a10", smi=SMI):
         kc("apply -f", "gpu-smoke.yaml", stdout="pod/gpu-smoke created\n"),
         kc("apply -f", "vectoradd.yaml", stdout="pod/vectoradd created\n"),
         kc("apply -f", "gpu-overflow.yaml", stdout="pod/gpu-overflow created\n"),
-        kc("-n gpu-test wait pod/", stdout="pod/x condition met\n"),
+        kc("-n gpu-test get pod gpu-smoke", "phase", stdout="Succeeded"),
+        kc("-n gpu-test get pod vectoradd", "phase", stdout="Succeeded"),
         kc("-n gpu-test get pod gpu-smoke", "nodeName", stdout=gpus[0]),
         kc("-n gpu-test get pod vectoradd", "nodeName", stdout=gpus[0]),
         kc("-n gpu-test logs gpu-smoke", stdout=smi),
@@ -71,7 +78,10 @@ def gpu_answers(gpus=(GPU1,), allocatable=None, gpu_type="a10", smi=SMI):
         kc("-n gpu-test get pods -l app=gpu-hold", "status.phase=Running",
            stdout="".join(f"gpu-hold-{i}\n" for i in range(sum(int(v or 0) for v in allocatable.values())))),
         kc("-n gpu-test get pod gpu-overflow", "phase", stdout="Pending"),
-        kc("-n gpu-test get events", "involvedObject.name=gpu-overflow", stdout=EVENTS),
+        kc("-n gpu-test get pod gpu-overflow", "{.metadata.uid}", stdout=OVERFLOW_UID),
+        kc("-n gpu-test get events", "involvedObject.name=gpu-overflow", f"involvedObject.uid={OVERFLOW_UID}",
+           stdout=EVENTS),
+        kc("-n gpu-test get events", stdout="No resources found in gpu-test namespace.\n"),
         kc("-n gpu-test describe pod"),
     ]
     for g in gpus:
@@ -247,17 +257,54 @@ def pod_calls(env, pod):
     return [a for a in gpu_test_calls(env) if pod in " ".join(a)]
 
 
+def delete(pod):
+    """Bounded twice: the wait for the deletion and, through a stalled tunnel, the request (review X0-3)."""
+    return ["-n", "gpu-test", "delete", "pod", pod, "--ignore-not-found", "--timeout=120s", "--request-timeout=60s"]
+
+
+def phase_polls(env, pod):
+    return [a for a in pod_calls(env, pod) if a[-1] == "jsonpath={.status.phase}"]
+
+
 @pytest.mark.parametrize("func, pod", [("check_d4_gpu_smoke", "gpu-smoke"), ("check_d5_vectoradd", "vectoradd")])
 def test_d4_d5_delete_apply_wait_logs_then_delete(gpu, func, pod):
     result, text = gpu.check(func)
     assert result == "PASS", text
     calls = pod_calls(gpu, pod)
-    delete = ["-n", "gpu-test", "delete", "pod", pod, "--ignore-not-found", "--timeout=120s"]
-    assert calls[0] == delete and calls[-1] == delete
+    assert calls[0] == delete(pod) and calls[-1] == delete(pod)
     assert calls[1][:2] == ["apply", "-f"] and calls[1][2].endswith(f"/k8s/gpu-test/{pod}.yaml")
-    assert ["-n", "gpu-test", "wait", f"pod/{pod}", "--for=jsonpath={.status.phase}=Succeeded",
-            "--timeout=300s"] in calls
+    assert calls[2] == ["-n", "gpu-test", "get", "pod", pod, "--request-timeout=60s", "-o", "jsonpath={.status.phase}"]
     assert ["-n", "gpu-test", "logs", pod, "--request-timeout=60s"] in calls
+
+
+@pytest.mark.parametrize("func, pod", [("check_d4_gpu_smoke", "gpu-smoke"), ("check_d5_vectoradd", "vectoradd")])
+def test_d4_d5_wait_up_to_300_seconds_for_succeeded(gpu, func, pod):
+    gpu.first(kc(f"-n gpu-test get pod {pod}", "phase", seq=[{"stdout": "Pending"}, {"stdout": "Running"},
+                                                              {"stdout": "Succeeded"}]))
+    result, text = gpu.check(func)
+    assert result == "PASS", text
+    assert len(phase_polls(gpu, pod)) == 3 and text.count("(wait 5s skipped)") == 2
+
+
+@pytest.mark.parametrize("func, pod", [("check_d4_gpu_smoke", "gpu-smoke"), ("check_d5_vectoradd", "vectoradd")])
+def test_d4_d5_give_up_after_300_seconds(gpu, func, pod):
+    gpu.first(kc(f"-n gpu-test get pod {pod}", "phase", stdout="Pending"))
+    result, text = gpu.check(func)
+    assert result == "FAIL", text
+    assert len(phase_polls(gpu, pod)) == 61  # every 5 s for 300 s
+    assert f"{pod} did not succeed within 300 s (phase 'Pending')" in text
+    assert pod_calls(gpu, pod)[-1] == delete(pod)
+
+
+@pytest.mark.parametrize("func, pod", [("check_d4_gpu_smoke", "gpu-smoke"), ("check_d5_vectoradd", "vectoradd")])
+def test_d4_d5_stop_waiting_when_the_pod_failed(gpu, func, pod):
+    """A Pod that Failed (non-root nvidia-smi denied, spec section 12 #9) never succeeds: no 5 more billed minutes."""
+    gpu.first(kc(f"-n gpu-test get pod {pod}", "phase", seq=[{"stdout": "Pending"}, {"stdout": "Failed"}]))
+    result, text = gpu.check(func)
+    assert result == "FAIL", text
+    assert len(phase_polls(gpu, pod)) == 2 and f"{pod} Failed" in text
+    assert ["-n", "gpu-test", "describe", "pod", pod, "--request-timeout=60s"] in gpu.kubectl()
+    assert pod_calls(gpu, pod)[-1] == delete(pod)
 
 
 def test_d4_needs_nvidia_smi_and_the_gpu_type_of_the_node(gpu):
@@ -277,8 +324,7 @@ def test_d4_fails_on_a_wrong_output_and_still_deletes(tmp_path, change):
     env = GpuCluster(tmp_path, **change)
     result, text = env.check("check_d4_gpu_smoke")
     assert result == "FAIL", text
-    assert pod_calls(env, "gpu-smoke")[-1] == ["-n", "gpu-test", "delete", "pod", "gpu-smoke", "--ignore-not-found",
-                                              "--timeout=120s"]
+    assert pod_calls(env, "gpu-smoke")[-1] == delete("gpu-smoke")
 
 
 def test_d4_matches_the_first_part_of_a_long_gpu_type_label(tmp_path):
@@ -288,18 +334,18 @@ def test_d4_matches_the_first_part_of_a_long_gpu_type_label(tmp_path):
 
 
 @pytest.mark.parametrize("func, pod", [("check_d4_gpu_smoke", "gpu-smoke"), ("check_d5_vectoradd", "vectoradd")])
-@pytest.mark.parametrize("answer", ["wait", "apply", "logs"])
+@pytest.mark.parametrize("answer", ["phase", "apply", "logs"])
 def test_d4_d5_fail_when_a_step_fails_and_still_delete(gpu, func, pod, answer):
-    has = {"wait": ("-n gpu-test wait", f"pod/{pod}"), "apply": ("apply -f", f"{pod}.yaml"),
+    has = {"phase": (f"-n gpu-test get pod {pod}", "phase"), "apply": ("apply -f", f"{pod}.yaml"),
            "logs": ("-n gpu-test logs", pod)}[answer]
-    gpu.first(kc(*has, rc=1, stderr="error: timed out waiting for the condition\n"))
+    gpu.first(kc(*has, rc=1, stderr="error: the server is currently unable to handle the request\n"))
     result, text = gpu.check(func)
     assert result == "FAIL", text
-    assert pod_calls(gpu, pod)[-1] == ["-n", "gpu-test", "delete", "pod", pod, "--ignore-not-found", "--timeout=120s"]
+    assert pod_calls(gpu, pod)[-1] == delete(pod)
 
 
 def test_d4_shows_the_pod_when_it_does_not_succeed(gpu):
-    gpu.first(kc("-n gpu-test wait", "pod/gpu-smoke", rc=1, stderr="error: timed out waiting for the condition\n"))
+    gpu.first(kc("-n gpu-test get pod gpu-smoke", "phase", stdout="Pending"))
     assert gpu.check("check_d4_gpu_smoke")[0] == "FAIL"
     assert ["-n", "gpu-test", "describe", "pod", "gpu-smoke", "--request-timeout=60s"] in gpu.kubectl()
 
@@ -311,8 +357,9 @@ def test_d5_needs_test_passed(gpu):
 
 # ---- D6 overflow ------------------------------------------------------------------------------
 
-HOLD_DELETE = ["-n", "gpu-test", "delete", "pod", "-l", "app=gpu-hold", "--ignore-not-found", "--timeout=120s"]
-OVERFLOW_DELETE = ["-n", "gpu-test", "delete", "pod", "gpu-overflow", "--ignore-not-found", "--timeout=120s"]
+HOLD_DELETE = ["-n", "gpu-test", "delete", "pod", "-l", "app=gpu-hold", "--ignore-not-found", "--timeout=120s",
+               "--request-timeout=60s"]
+OVERFLOW_DELETE = delete("gpu-overflow")
 
 
 def creates(env):
@@ -331,6 +378,16 @@ def test_d6_holds_every_gpu_then_overflow_stays_pending(gpu):
     overflow = next(i for i, c in enumerate(order) if "gpu-overflow.yaml" in c)
     assert next(i for i, c in enumerate(order) if "create" in c) < wait < overflow
     assert "Insufficient nvidia.com/gpu" in text
+    # the events of this gpu-overflow only, not those an earlier run's left behind (review S0-2)
+    assert ["-n", "gpu-test", "get", "events", "--field-selector=involvedObject.kind=Pod,"
+            f"involvedObject.name=gpu-overflow,involvedObject.uid={OVERFLOW_UID}", "--request-timeout=60s"] in calls
+    # brief: gpu-overflow is looked at 30 s after it was applied (review S0-3)
+    lines = text.splitlines()
+    applied = next(i for i, line in enumerate(lines) if line.startswith("$ kc apply -f") and "gpu-overflow" in line)
+    waited = lines.index("(wait 30s skipped)")
+    phase = next(i for i, line in enumerate(lines) if "get pod gpu-overflow" in line and "status.phase" in line)
+    events = next(i for i, line in enumerate(lines) if "get events" in line)
+    assert applied < waited < phase < events, lines
 
 
 def test_d6_creates_one_holder_per_allocatable_gpu_on_every_node(tmp_path):
@@ -343,6 +400,9 @@ def test_d6_creates_one_holder_per_allocatable_gpu_on_every_node(tmp_path):
 @pytest.mark.parametrize("answer", [
     kc("-n gpu-test get pod gpu-overflow", "phase", stdout="Running"),
     kc("-n gpu-test get events", stdout="No resources found in gpu-test namespace.\n"),
+    # the Insufficient event belongs to an earlier gpu-overflow: this one has another uid
+    kc("-n gpu-test get pod gpu-overflow", "{.metadata.uid}", stdout="7a1b2c3d-0000-4000-8000-000000000001"),
+    kc("-n gpu-test get pod gpu-overflow", "{.metadata.uid}", stdout=""),
     kc("-n gpu-test wait pod -l app=gpu-hold", rc=1, stderr="error: timed out waiting for the condition\n"),
     kc("-n gpu-test get pods -l app=gpu-hold", "status.phase=Running", stdout=""),   # not all holders run
     kc("-n gpu-test create -f", rc=1, stderr="Error from server (Forbidden): pods is forbidden\n"),
@@ -363,10 +423,20 @@ def test_d6_fails_without_an_allocatable_gpu_and_creates_nothing(tmp_path, alloc
     assert creates(env) == []
 
 
-def test_d6_failed_cleanup_is_a_fail(gpu):
+def test_d6_failed_pre_clean_is_a_fail(gpu):
     gpu.first(kc("-n gpu-test delete pod -l app=gpu-hold", rc=1, stderr="error: timed out\n"))
     result, text = gpu.check("check_d6_overflow")
-    assert result == "FAIL" and "gpu-hold" in text
+    assert result == "FAIL" and "cannot delete the gpu-hold and gpu-overflow Pods left from an earlier run" in text
+    assert creates(gpu) == []
+
+
+def test_d6_passing_body_with_a_failed_final_cleanup_is_a_fail(gpu):  # review C0-6
+    gpu.first(kc("-n gpu-test delete pod -l app=gpu-hold", seq=[{"rc": 0}, {"rc": 1, "stderr": "error: timed out\n"}]))
+    result, text = gpu.check("check_d6_overflow")
+    assert result == "FAIL", text
+    assert "D6: gpu-overflow is Pending with 'Insufficient nvidia.com/gpu'" in text  # the body passed
+    assert "cleanup failed" in text
+    assert gpu_test_calls(gpu)[-2:] == [HOLD_DELETE, OVERFLOW_DELETE]
 
 
 # ---- _vr_guarded: the cleanup also runs when a check is cut short --------------------------------
@@ -409,6 +479,53 @@ def test_d6_check_killed_while_waiting_still_deletes_the_holders(gpu):
     calls = gpu_test_calls(gpu)
     assert not any("wait" in a for a in calls)  # killed before kubectl wait ran
     assert calls[-2:] == [HOLD_DELETE, OVERFLOW_DELETE], calls
+
+
+def test_guarded_cleanup_runs_after_a_signal_even_when_its_output_pipe_is_gone(no_gpu):  # review C0-3 / X0-2
+    """vr_cmd runs nothing it cannot record; after a signal a dead output pipe must not stop the cleanup."""
+    mark = no_gpu.repo / "cleaned"
+    code = ("source scripts/lib/checks.sh; "
+            f"cleanup() {{ vr_cmd touch {mark}; }}; body() {{ sleep 0.5; kill -INT $BASHPID; }}; "
+            "_vr_guarded cleanup body")
+    proc = no_gpu.run(["bash", "-c", f"bash -c {shlex.quote(code)} | true"])
+    assert mark.exists(), proc.stderr
+
+
+def test_ctrl_c_of_the_whole_run_still_deletes_the_holders_and_stops_the_run(gpu):  # review C0-3 / X0-2
+    """A terminal Ctrl-C sends SIGINT to the whole foreground process group: the check, kubectl, and run_check's
+    evidence filter (redact). The filter must outlive the check's cleanup, or the cleanup's logging fails and the
+    gpu-hold Pods (restartPolicy Always) keep every GPU allocated. The run then stops: no later check starts."""
+    run = gpu.repo / "verification" / "t"
+    waiting = gpu.repo / "waiting"
+    code = (f"set -euo pipefail; source scripts/lib/checks.sh; vr_init {run}; "
+            "kc() { if [[ \"$*\" == *'wait pod -l app=gpu-hold'* ]]; then "
+            f"touch {waiting}; sleep 30; fi; "
+            "kubectl --kubeconfig \"$KUBECONFIG_FILE\" \"$@\"; }; "
+            "run_check T title check_d6_overflow; run_check U later check_d1_gpu_stack")
+    proc = subprocess.Popen(["bash", "-c", code], cwd=gpu.repo, env=gpu.environ({"VR_NO_WAIT": "1"}),
+                            stdin=subprocess.DEVNULL, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True,
+                            start_new_session=True)
+    try:
+        for _ in range(200):
+            if waiting.exists():
+                break
+            time.sleep(0.05)
+        assert waiting.exists(), "D6 never reached the holder wait"
+        time.sleep(0.2)
+        os.killpg(proc.pid, signal.SIGINT)
+        proc.communicate(timeout=60)
+    finally:
+        if proc.poll() is None:
+            os.killpg(proc.pid, signal.SIGKILL)
+    calls = gpu_test_calls(gpu)
+    assert calls[-2:] == [HOLD_DELETE, OVERFLOW_DELETE], calls
+    evidence = (run / "01-T.txt").read_text()
+    # the evidence filter survived: the cleanup is on record
+    assert "interrupted (SIGINT); cleaning up" in evidence and "redact failed" not in evidence, evidence
+    assert "delete pod -l app=gpu-hold" in evidence.split("interrupted (SIGINT); cleaning up")[1], evidence
+    assert not (run / "02-U.txt").exists()  # the run stopped
+    assert "| 1 | T | title | FAIL |" in (run / "SUMMARY.md").read_text()  # after recording the check
+    assert proc.returncode == -signal.SIGINT  # by the signal, as without the traps: make stops too
 
 
 # ---- make verify with a GPU node --------------------------------------------------------------
