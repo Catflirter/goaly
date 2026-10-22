@@ -283,6 +283,7 @@ def test_a_comment_naming_a_forbidden_variable_is_not_blamed(env, comment):
     assert "remove that line" not in proc.stderr
     assert_nothing_changed(env)
 
+
 def test_a_non_private_env_keeps_load_envs_own_message(env):
     """load_env's own refusal (exit 2, .env not 600) is not rewritten as a failed .env line."""
     env.write_env(f"GCP_PROJECT={PROJECT}\n", mode=0o644)

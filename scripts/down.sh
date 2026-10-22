@@ -91,14 +91,15 @@ interrupted() {
 # env_refused STATUS: the EXIT trap while .env loads. load_env exits 2 itself, with its reason, for a
 # missing or non-private .env; any other non-zero status is a line of .env that failed (bash printed
 # why): an assignment to one of the readonly PINNED_NAMES, or a line that fails on its own (a command
-# that fails, say). The message names a readonly variable only when .env mentions it.
+# that fails, say). The message names a readonly variable only when a non-comment line of .env mentions it.
 env_refused() {
   local name named=""
   (( $1 != 0 )) || return 0
   [[ -f "$REPO_ROOT/.env" && "$(_file_mode "$REPO_ROOT/.env" 2>/dev/null)" == 600 ]] || return 0
   for name in $PINNED_NAMES; do
     # Only a line that is not a comment can set the name.
-    if grep -Ev '^[[:space:]]*#' "$REPO_ROOT/.env" | grep -Eq "(^|[^A-Za-z0-9_])$name([^A-Za-z0-9_]|\$)"; then
+    # No -q on the second grep: an early exit would SIGPIPE the first and, under pipefail, read as "not named".
+    if grep -aEv '^[[:space:]]*#' "$REPO_ROOT/.env" | grep -aE "(^|[^A-Za-z0-9_])$name([^A-Za-z0-9_]|\$)" >/dev/null; then
       named="$named${named:+, }$name"
     fi
   done
