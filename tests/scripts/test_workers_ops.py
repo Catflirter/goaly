@@ -1475,7 +1475,7 @@ def test_up_all_runs_base_workers_system_workloads_in_order(env):
     assert proc.returncode == 0, proc.stderr
     chdirs = [a[0] for a in env.argvs("terraform") if a[1] == "apply"]
     assert chdirs == [f"-chdir={env.repo.resolve()}/infra/base", f"-chdir={env.repo.resolve()}/infra/workers"]
-    non_tf(env)  # its checks: one tunnel, started after the kubeconfig fetch and probed before the first wait
+    non_tf(env, proc)  # its checks: one tunnel after the kubeconfig fetch, the API ready before the first wait
     everything = [c for c in calls(env) if c[1][2:] != READYZ and "-N" not in c[1]]
     assert everything == [*base_sequence(env), *cpu_join(env), ("gpuctl", ["sync-peers"]), *system_sequence(env),
                           *workloads_sequence(env)]

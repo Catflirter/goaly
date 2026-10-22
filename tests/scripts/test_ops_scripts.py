@@ -1184,11 +1184,14 @@ def base_sequence(env, mtu="1460"):
 READYZ = ["--request-timeout=5s", "get", "--raw", "/readyz"]
 
 
-def non_tf(env):
+def non_tf(env, proc):
     """gcloud/kubectl calls in order, without the tunnel and the /readyz probes: the backgrounded
     fake tunnel logs its call concurrently with tunnel.sh's first probes. What is deterministic is
-    checked here: one tunnel, started after the kubeconfig fetch, and a successful probe after it
-    (the fake logs a probe once it has its answer) and before the first `kc wait`."""
+    checked here: one tunnel, started after the kubeconfig fetch; probes before the first `kc wait`;
+    and, in up.sh's own stderr (PROC, the up.sh run), tunnel.sh reporting the API ready before up.sh
+    starts that wait. That last check replaces `tunnel_at < probes[-1]` (M-3): fake_tools.py logs a
+    probe only once it has its answer and answers ok only while the tunnel runs, so a successful last
+    probe always came after the tunnel's line and that assertion could not fail."""
     calls = [(c["tool"], c["argv"]) for c in env.calls() if c["tool"] != "terraform"]
     assert tunnels(env) == [tunnel_argv(env)]
     tunnel_at = calls.index(("gcloud", tunnel_argv(env)))
@@ -1196,7 +1199,10 @@ def non_tf(env):
     first_wait = next(i for i, (_, argv) in enumerate(calls) if "wait" in argv)
     before = [argv for _, argv in calls[:tunnel_at] if argv[2:] != READYZ]
     assert before[-1][-1] == "sudo cat /etc/rancher/k3s/k3s.yaml"
-    assert probes and tunnel_at < probes[-1] < first_wait
+    assert probes and probes[-1] < first_wait
+    ready = proc.stderr.find("tunnel up (pid ")
+    assert 0 <= ready < proc.stderr.index("waiting up to 300s for: kc wait --for=condition=Ready node/k3s-cp"), \
+        "up.sh waits for k3s-cp only once tunnel.sh has seen the API answer /readyz"
     return [c for c in calls if c[1][2:] != READYZ and "-N" not in c[1]]
 
 
@@ -1206,7 +1212,7 @@ def test_up_base_runs_the_whole_sequence(env):
     tf = tf_subcommands(env)
     assert tf[:4] == ["init", "plan", "show", "apply"]
     assert env.argvs("terraform")[0][-2:] == [f"-backend-config=bucket={BUCKET}", "-backend-config=prefix=base"]
-    assert non_tf(env) == base_sequence(env)
+    assert non_tf(env, proc) == base_sequence(env)
     assert env.kubeconfig.read_text() == KUBECONFIG
     assert alive(int(env.pidfile.read_text()))
     # The brief's waits (C0-2): IAP SSH 300s, k3s-cp Ready 300s, CoreDNS Ready 300s, tunnel 30s.
@@ -1295,14 +1301,16 @@ def test_up_base_refuses_to_replace_the_cp_under_auto_approve(env):
 
 def test_up_base_passes_underlay_mtu_from_env(env):
     env.write_env(f"GCP_PROJECT={PROJECT}\nUNDERLAY_MTU=1380\n")
-    assert env.script("up.sh", "base", AUTO_APPROVE="1").returncode == 0
-    assert non_tf(env) == base_sequence(env, mtu="1380")
+    proc = env.script("up.sh", "base", AUTO_APPROVE="1")
+    assert proc.returncode == 0, proc.stderr
+    assert non_tf(env, proc) == base_sequence(env, mtu="1380")
 
 
 def test_up_base_defaults_an_empty_underlay_mtu(env):
     env.write_env(f"GCP_PROJECT={PROJECT}\nUNDERLAY_MTU=\n")
-    assert env.script("up.sh", "base", AUTO_APPROVE="1").returncode == 0
-    assert non_tf(env) == base_sequence(env, mtu="1460")
+    proc = env.script("up.sh", "base", AUTO_APPROVE="1")
+    assert proc.returncode == 0, proc.stderr
+    assert non_tf(env, proc) == base_sequence(env, mtu="1460")
 
 
 @pytest.mark.parametrize("mtu", ["1460; reboot", "abc", "0", "99999"])
@@ -1344,7 +1352,7 @@ def test_up_all_runs_every_stage_but_init(env):
     assert chdirs == {tf_base_dir(env), f"-chdir={env.repo.resolve()}/infra/workers"}, \
         "make up must not re-apply the bootstrap stack (make init does)"
     # Every stage's calls, in order: tests/scripts/test_workers_ops.py (Task 14, Ruling R38).
-    assert non_tf(env)[:len(base_sequence(env))] == base_sequence(env)
+    assert non_tf(env, proc)[:len(base_sequence(env))] == base_sequence(env)
 
 
 @pytest.mark.parametrize("args", [[], ["nosuch"], ["base", "extra"]])
