@@ -24,7 +24,9 @@
 #      left running by an earlier join holds that join's token, which is deleted. The node's clock is
 #      read right after the stop (for step 5). GPU node only: a
 #      Node of exactly NAME that was NotReady in step 2 is read again and, if still NotReady, deleted
-#      now, after SSH worked and just before the token install, since k3s then drops its node-password
+#      now (once Node k3s-cp's ExternalIP is again found to be the base stack's cp_ip: in another
+#      cluster nothing is deleted and the join stops, review F2b-2), after SSH worked and just before
+#      the token install, since k3s then drops its node-password
 #      secret, which would reject the new Lambda machine under that name (Ruling R55); never a Ready
 #      node (also not one that became Ready since step 2: refused as in step 2 if its ExternalIP is not
 #      IP), another name or a CPU worker, whose VM re-registers with the password it has. A join token (TTL
@@ -131,6 +133,20 @@ ready_node_is_this_machine() {
     || die "cannot read the ExternalIP of the Ready node $NODE: $NODE was not joined; nothing was deleted or labelled"
   [[ "$seen" == "$IP" ]] \
     || die "node $NODE is Ready at $seen, not at $IP: another machine (a lost instance that came back?) holds the name, and k3s would reject this machine's agent (Node password rejected). $NODE was not joined; nothing was deleted or labelled. Terminate the machine at $seen, or drain and delete node $NODE, then re-run"
+}
+
+# this_projects_cluster: dies unless the cluster the kubeconfig reaches is this project's: Node k3s-cp's
+# ExternalIP must be the base stack's cp_ip (read in step 3), as scripts/down.sh's same_cluster and
+# gpuctl check (D-2). ~/.kube/hybrid-gpu.yaml and the tunnel port are one per operator, not one per
+# project, and gpuctl's check was minutes before step 4's delete (the IP wait, SSH, the bootstrap): a
+# NotReady Node of NAME in another cluster is that cluster's, so it is not deleted and the join stops
+# (review F2b-2).
+this_projects_cluster() {
+  local seen
+  seen="$(node_external_ip "$CP_NAME")" \
+    || die "cannot read the ExternalIP of Node $CP_NAME, so nothing tells whether the cluster $KUBECONFIG_FILE reaches is this project's: the stale NotReady node $NODE was not deleted and $NODE was not joined (start make tunnel, or run make kubeconfig if it reaches another cluster, then re-run)"
+  [[ "$seen" == "$cp_ip" ]] \
+    || die "the cluster $KUBECONFIG_FILE reaches is not this project's: Node $CP_NAME has ExternalIP $seen, the base stack's cp_ip is $cp_ip. The stale NotReady node $NODE was not deleted there, and $NODE was not joined: point the kubeconfig and make tunnel at this project's cluster (make kubeconfig), then re-run"
 }
 
 # node_joined NAME IP SINCE: 0 once node NAME is Ready at ExternalIP IP with a Ready heartbeat after
@@ -275,6 +291,7 @@ if [[ "$KIND" == gpu && "$NODE" =~ ^k3s-gpu- && "$state" == NotReady ]]; then
   state="$(node_state "$NODE")" || exit
   case "$state" in
     NotReady)
+      this_projects_cluster
       log "WARNING: node $NODE is registered but NotReady: deleting it (and so k3s's $NODE.node-password.k3s secret) before the join"
       _kc_node_gone_ok "$NODE" delete node "$NODE" --request-timeout="$KC_REQUEST_TIMEOUT" \
         || die "cannot delete the stale NotReady node $NODE: $NODE was not joined (delete it with kubectl delete node $NODE and re-run)"

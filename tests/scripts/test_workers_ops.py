@@ -158,7 +158,8 @@ def gpu_join(env, stale=False, second="False", ready=False):
         gpu(env, STOP_AGENT),
         *([get_node(env, GPU)] if stale else []),
         *([get_ip(env, GPU)] if stale and second == "True" else []),
-        *([delete_stale(env, GPU)] if stale and second == "False" else []),
+        # Just before the delete: is the cluster the kubeconfig reaches still this project's? (review F2b-2)
+        *([get_ip(env, "k3s-cp"), delete_stale(env, GPU)] if stale and second == "False" else []),
         cp(f"sudo k3s token create --ttl 15m --description {GPU}"),
         gpu(env, INSTALL),
         joined(env, GPU),
@@ -696,6 +697,42 @@ def test_join_stops_when_the_stale_node_cannot_be_deleted(env):
     assert proc.returncode == 1 and f"cannot delete the stale NotReady node {GPU}" in proc.stderr
     expected = gpu_join(env, stale=True)
     assert calls(env) == expected[:expected.index(delete_stale(env, GPU)) + 1] and piped(env) == []
+
+
+OTHER_CP_IP = "35.199.7.7"  # k3s-cp of another project's cluster, reached through the same kubeconfig/tunnel
+
+
+def stopped_before_the_delete(env):
+    """A stale-Node join that stops at the cluster check just before the delete: nothing deleted, no token."""
+    expected = gpu_join(env, stale=True)
+    return expected[:expected.index(delete_stale(env, GPU))]
+
+
+def test_join_deletes_no_stale_node_in_another_cluster(env):
+    """PR #104 review F2b-2: gpuctl checked the cluster before the launch, minutes before the delete (the IP wait,
+    SSH, the bootstrap). Just before it, join-node checks again that Node k3s-cp's ExternalIP is the base stack's
+    cp_ip (as down.sh's same_cluster): through a kubeconfig or tunnel that now reaches another project's cluster,
+    a NotReady Node of this name is that project's, and is not deleted; the join stops with both IPs named."""
+    env.scenario["registered"] = [GPU]
+    env.scenario["cp_node_ip"] = OTHER_CP_IP
+    proc = gpuctl_join(env)
+    assert proc.returncode == 1
+    assert calls(env) == stopped_before_the_delete(env) and no_node_deleted(env) and piped(env) == []
+    assert OTHER_CP_IP in proc.stderr and "34.82.10.10" in proc.stderr and "not this project's" in proc.stderr
+    assert f"stale NotReady node {GPU} was not deleted" in proc.stderr and "not joined" in proc.stderr
+    assert "make kubeconfig" in proc.stderr and "WARNING" not in proc.stderr
+
+
+def test_join_deletes_no_stale_node_when_the_cluster_check_fails(env):
+    env.scenario["registered"] = [GPU]
+    env.scenario["answers"] = [{"tool": "kubectl", "has": ["get node k3s-cp"], "rc": 1,
+                                "stderr": "Unable to connect to the server: dial tcp 127.0.0.1:6443: connect: "
+                                          "connection refused"}]
+    proc = gpuctl_join(env)
+    assert proc.returncode == 1
+    assert calls(env) == stopped_before_the_delete(env) and no_node_deleted(env) and piped(env) == []
+    assert "cannot read the ExternalIP of Node k3s-cp" in proc.stderr
+    assert f"stale NotReady node {GPU} was not deleted" in proc.stderr and "make tunnel" in proc.stderr
 
 
 def test_join_deletes_no_stale_node_when_ssh_never_comes_up(env):
