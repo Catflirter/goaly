@@ -258,6 +258,53 @@ def test_env_cannot_redirect_the_teardown(env, tmp_path, line):
     assert (other / "known_hosts_x").exists() and (other / "kubeconfig").exists()
 
 
+@pytest.mark.parametrize("line", ["false", "FOO=$(cat /no/such/file)", "BAR=$(exit 3)"])
+def test_a_failing_env_line_is_not_blamed_on_a_forbidden_variable(env, line):
+    """A .env line that fails for its own reason refuses the run (exit 2, nothing changed), but the message does
+    not say .env set AUTO_APPROVE or a readonly name it never mentions (C2-2, X2-2)."""
+    env.write_env(f"GCP_PROJECT={PROJECT}\n{line}\n")
+    proc = down(env, AUTO_APPROVE="1")
+    assert proc.returncode == 2, proc.stderr
+    assert "a line of" in proc.stderr and ".env failed" in proc.stderr and "nothing was changed" in proc.stderr
+    assert "AUTO_APPROVE" not in proc.stderr and "DESTROY_STACKS" not in proc.stderr
+    assert_nothing_changed(env)
+
+
+def test_a_non_private_env_keeps_load_envs_own_message(env):
+    """load_env's own refusal (exit 2, .env not 600) is not rewritten as a failed .env line."""
+    env.write_env(f"GCP_PROJECT={PROJECT}\n", mode=0o644)
+    proc = down(env, AUTO_APPROVE="1")
+    assert proc.returncode == 2 and "must be 600" in proc.stderr and "a line of" not in proc.stderr
+    assert_nothing_changed(env)
+
+
+def test_a_forbidden_line_is_named_when_it_is_there(env):
+    """When .env does name a readonly variable, the message says which one to remove."""
+    env.write_env(f"GCP_PROJECT={PROJECT}\n# a comment\nRUN_DIR=/tmp/elsewhere\n")
+    proc = down(env, AUTO_APPROVE="1")
+    assert_env_refused(env, proc, "RUN_DIR")
+    assert "names RUN_DIR" in proc.stderr and "AUTO_APPROVE" not in proc.stderr
+
+
+@pytest.mark.parametrize("line", ["TF_WORKSPACE=other", "TF_DATA_DIR=/tmp/elsewhere", "TF_CLI_ARGS=-target=x",
+                                  "TF_CLI_ARGS_destroy=-target=google_compute_firewall.x",
+                                  "TF_CLI_ARGS_init=-backend-config=prefix=other", "export TF_WORKSPACE=other"])
+def test_env_cannot_point_terraform_elsewhere(env, line):
+    """.env is sourced with set -a, so it could export Terraform's own overrides: TF_WORKSPACE (another
+    workspace's empty state 'destroys' fine), TF_DATA_DIR, TF_CLI_ARGS[_*] (-target). make down would report
+    every stack destroyed and leave the resources running. It refuses before the question instead (S2-1)."""
+    env.write_env(f"GCP_PROJECT={PROJECT}\n{line}\n")
+    proc = down(env, AUTO_APPROVE="1")
+    assert_env_refused(env, proc, line.split("=")[0].split()[-1])
+
+
+def test_the_callers_terraform_overrides_are_refused_too(env):
+    """terraform sees the caller's environment as well: TF_WORKSPACE there refuses the run the same way."""
+    proc = down(env, AUTO_APPROVE="1", TF_WORKSPACE="other")
+    assert proc.returncode == 2 and "TF_WORKSPACE" in proc.stderr and "nothing was changed" in proc.stderr
+    assert_nothing_changed(env)
+
+
 @pytest.mark.parametrize("line", ["APPROVE=1", "PINNED_REPO_ROOT={other}", "PINNED_RUN_DIR={other}",
                                   "PINNED_KUBECONFIG_FILE={other}/kubeconfig"])
 def test_env_cannot_reach_the_old_pinned_names(env, tmp_path, line):
@@ -421,10 +468,23 @@ def test_a_node_still_live_after_the_window_stops_before_any_destroy(env, line):
     proc = down(env, AUTO_APPROVE="1", DOWN_LAMBDA_WAIT_S="1")
     assert proc.returncode == 1
     assert time.monotonic() - start < 10
-    got = calls(env)
-    assert got[:3] == [GPU_DOWN, LIST_GPU, LIST_GPU] and all(call == LIST_GPU for call in got[1:])
+    # A 1 s window: asked once, a 1 s pause, asked once more (C2-1, X2-1: exactly, not "at least").
+    assert calls(env) == [GPU_DOWN, LIST_GPU, LIST_GPU]
+    assert "asking again in 1 s, for up to 1 s" in proc.stderr
     assert line in proc.stderr and "nothing was destroyed" in proc.stderr
     assert env.kubeconfig.exists()
+
+
+@pytest.mark.parametrize("wait, asks", [("1", 2), ("6", 3)])
+def test_a_slow_lambda_api_does_not_shorten_the_window(env, wait, asks):
+    """The window counts the pauses (5 s at most each), not the wall clock: however long each list-nodes call
+    takes, a DOWN_LAMBDA_WAIT_S=N window asks 1 + ceil(N/5) times (C2-1, X2-1). Before, a 1.1 s list-nodes
+    call used up a 1 s window measured with bash's whole-second SECONDS, and Lambda was asked only once."""
+    env.scenario.update(gpu_down_rc=1, gpu_nodes=[GPU_LINE], list_nodes_sleep=1.1)
+    proc = down(env, AUTO_APPROVE="1", DOWN_LAMBDA_WAIT_S=wait)
+    assert proc.returncode == 1
+    assert calls(env) == [GPU_DOWN, *[LIST_GPU] * asks]
+    assert "nothing was destroyed" in proc.stderr
 
 
 def test_the_window_defaults_to_60_seconds(env):

@@ -3,10 +3,12 @@
 #
 #   1. ask once: type the GCP project id (GCP_PROJECT in .env) to go on; anything else, or end of input,
 #      exits 2 with nothing changed. AUTO_APPROVE=1 (exactly 1, from the caller's environment) skips the
-#      question. Nothing after it asks again. .env is sourced (load_env), but it may not set AUTO_APPROVE
-#      or anything that decides what is destroyed, drained or removed (REPO_ROOT, RUN_DIR,
-#      KUBECONFIG_FILE, CPU_NODE_RE, CP_NAME, KC_REQUEST_TIMEOUT, DESTROY_STACKS): they are readonly
-#      while it loads, and a .env that sets or unsets one refuses the run (exit 2, nothing changed).
+#      question. Nothing after it asks again. .env is sourced (load_env), but it may not set or unset
+#      AUTO_APPROVE, REPO_ROOT, RUN_DIR, KUBECONFIG_FILE, CPU_NODE_RE, CP_NAME, KC_REQUEST_TIMEOUT or
+#      DESTROY_STACKS: they are readonly while it loads, and a .env line that touches one, or that fails
+#      for any other reason, refuses the run (exit 2, nothing changed). Terraform's own overrides
+#      TF_WORKSPACE, TF_DATA_DIR and TF_CLI_ARGS[_*] would point the destroys at another workspace, data
+#      directory or -target: set in .env or in the caller's environment, they refuse the run too.
 #   2. scripts/gpuctl down --auto-approve: every Lambda GPU node of this cluster (drained, deleted from
 #      the cluster, terminated) and the autoscaler overrides.
 #   3. drain every CPU worker (k3s-cpu-<n>) the cluster lists and delete its Node. An unreachable
@@ -30,9 +32,10 @@
 #      make gpu-down drains each node through the cluster, which is gone by then.
 #
 # Asking Lambda (steps 2 and 7). Lambda may still list an instance as active for a moment after its
-# terminate call returned, so a listed node is asked about again every 5 s for up to DOWN_LAMBDA_WAIT_S
-# seconds (default 60; 0 asks once). A terminating or terminated instance is gone (it no longer bills);
-# an active, booting or unhealthy one still listed when the window ends is live.
+# terminate call returned, so a listed node is asked about again after a pause, until the pauses add up
+# to DOWN_LAMBDA_WAIT_S seconds (default 60; 5 s at most each; 0 asks once): N seconds ask 1 + ceil(N/5)
+# times, however long each list-nodes call takes. A terminating or terminated instance is gone (it no
+# longer bills); an active, booting or unhealthy one still listed after the last ask is live.
 #
 # Failures, Ctrl-C and re-runs. Every step is safe to repeat, so a teardown that stopped part-way is
 # finished by running make down again. The first failing step stops the run (exit 1) and says what is
@@ -86,12 +89,35 @@ interrupted() {
 }
 
 # env_refused STATUS: the EXIT trap while .env loads. load_env exits 2 itself, with its reason, for a
-# missing or non-private .env; status 1 is a line of .env that failed, such as an assignment to one of the
-# readonly variables above (bash names it).
+# missing or non-private .env; any other non-zero status is a line of .env that failed (bash printed
+# why): an assignment to one of the readonly PINNED_NAMES, or a line that fails on its own (a command
+# that fails, say). The message names a readonly variable only when .env mentions it.
 env_refused() {
-  (( $1 == 1 )) || return 0
-  log "error: $REPO_ROOT/.env could not be loaded (see above): it must not set or unset AUTO_APPROVE (only the caller's environment may), $PINNED_NAMES; remove that line from .env. make down refused; nothing was changed"
+  local name named=""
+  (( $1 != 0 )) || return 0
+  [[ -f "$REPO_ROOT/.env" && "$(_file_mode "$REPO_ROOT/.env" 2>/dev/null)" == 600 ]] || return 0
+  for name in $PINNED_NAMES; do
+    if grep -Eq "(^|[^A-Za-z0-9_])$name([^A-Za-z0-9_]|\$)" "$REPO_ROOT/.env"; then
+      named="$named${named:+, }$name"
+    fi
+  done
+  if [[ -n "$named" ]]; then
+    log "error: a line of $REPO_ROOT/.env failed (see the bash error above), and .env names $named: make down keeps it readonly, since it decides whether the question is asked or what is destroyed, drained or removed; remove that line from .env. make down refused; nothing was changed"
+  else
+    log "error: a line of $REPO_ROOT/.env failed (see the bash error above); fix or remove it. make down refused; nothing was changed"
+  fi
   exit 2
+}
+
+# tf_overrides_refused: Terraform's own environment overrides would make every terraform destroy below
+# act on another workspace (TF_WORKSPACE: its empty state "destroys" fine), another data directory
+# (TF_DATA_DIR) or only -target'ed resources (TF_CLI_ARGS, TF_CLI_ARGS_<command>), while make down
+# reports each stack destroyed. Exported by .env (set -a) or by the caller, they refuse the run (S2-1).
+tf_overrides_refused() {
+  local set_names
+  set_names="$(compgen -e | grep -E '^(TF_WORKSPACE|TF_DATA_DIR|TF_CLI_ARGS(_.*)?)$' | paste -sd ' ' -)" || true
+  [[ -z "$set_names" ]] && return 0
+  die "$set_names set (in $REPO_ROOT/.env or the environment make down runs in): terraform destroy would act on another workspace, data directory or -target, not this project's stacks. Remove it from .env or unset it, then re-run make down. make down refused; nothing was changed" 2
 }
 
 # live_gpu_nodes: Lambda's GPU nodes of this cluster that still bill, one line each (list-nodes' third
@@ -102,19 +128,21 @@ live_gpu_nodes() {
   printf '%s\n' "$listed" | awk 'NF && $3 != "terminating" && $3 != "terminated"'
 }
 
-# lambda_clear: ask Lambda until it lists no live GPU node of this cluster, for up to LAMBDA_WAIT_S
-# seconds (see "Asking Lambda" in the header). Returns 0 when none is live, 1 when LIVE_NODES (set
-# here) are still live at the end of the window, 2 when Lambda cannot be asked.
+# lambda_clear: ask Lambda until it lists no live GPU node of this cluster, pausing up to LAMBDA_WAIT_S
+# seconds in all (see "Asking Lambda" in the header). The window counts the pauses, not the clock, so a
+# slow list-nodes call never shortens it. Returns 0 when none is live, 1 when LIVE_NODES (set here) are
+# still live after the last ask, 2 when Lambda cannot be asked.
 lambda_clear() {
-  local deadline=$(( SECONDS + LAMBDA_WAIT_S )) pause
+  local waited=0 pause
   while true; do
     LIVE_NODES="$(live_gpu_nodes)" || return 2
     [[ -z "$LIVE_NODES" ]] && return 0
-    (( SECONDS < deadline )) || return 1
-    pause=$(( deadline - SECONDS ))
+    (( waited < LAMBDA_WAIT_S )) || return 1
+    pause=$(( LAMBDA_WAIT_S - waited ))
     (( pause <= 5 )) || pause=5
     log "Lambda still lists a GPU node of this cluster as live (a node just terminated can be listed as active for a moment): asking again in $pause s, for up to $LAMBDA_WAIT_S s in all"
     sleep "$pause"
+    waited=$(( waited + pause ))
   done
 }
 
@@ -228,14 +256,16 @@ check_lambda() {
 # Brief step 4: destroyed in this order. gpu-access and workers read the base stack's state.
 DESTROY_STACKS="gpu-access workers base"
 # Frozen before .env is sourced (load_env exports every line of it, F2-1): the caller's AUTO_APPROVE (set
-# or unset) is the only one that skips the question, and .env cannot change what is destroyed, drained or
-# removed. A line of .env that sets or unsets one of them fails, and env_refused stops the run.
-PINNED_NAMES="REPO_ROOT, RUN_DIR, KUBECONFIG_FILE, CPU_NODE_RE, CP_NAME, KC_REQUEST_TIMEOUT or DESTROY_STACKS"
-readonly AUTO_APPROVE REPO_ROOT RUN_DIR KUBECONFIG_FILE CPU_NODE_RE CP_NAME KC_REQUEST_TIMEOUT DESTROY_STACKS
-readonly PINNED_NAMES
+# or unset) is the only one that skips the question, and .env cannot change the paths, names and stacks
+# that decide what is destroyed, drained or removed. A line of .env that sets or unsets one of them
+# fails, and env_refused stops the run; tf_overrides_refused then stops one that redirects terraform.
+PINNED_NAMES="AUTO_APPROVE REPO_ROOT RUN_DIR KUBECONFIG_FILE CPU_NODE_RE CP_NAME KC_REQUEST_TIMEOUT DESTROY_STACKS"
+# shellcheck disable=SC2086  # PINNED_NAMES is a list of variable names
+readonly $PINNED_NAMES PINNED_NAMES
 trap 'env_refused $?' EXIT
 load_env
 trap - EXIT
+tf_overrides_refused
 KC_KILL_S="${DOWN_KC_KILL_S:-180}"
 [[ "$KC_KILL_S" =~ ^[1-9][0-9]*$ ]] \
   || die "DOWN_KC_KILL_S='$KC_KILL_S' is not a whole number of seconds (default 180): nothing was changed" 2

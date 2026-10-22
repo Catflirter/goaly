@@ -63,6 +63,7 @@ Teardown (Task 22a, scripts/down.sh):
   gpu_nodes_then [line]                   from its second call on, printed instead of gpu_nodes (a node Lambda
                                           still listed as active right after its terminate call)
   list_nodes_rc  rc                       exit code of `scripts/gpuctl list-nodes` (default 0)
+  list_nodes_sleep s                      `scripts/gpuctl list-nodes` takes this long (seconds; a slow Lambda API)
 
 `scripts/gpuctl down` and `list-nodes` log what they read on stdin as "stdin" (down.sh gives them /dev/null).
 """
@@ -284,6 +285,7 @@ def gpuctl():
                 return 1
         return SCENARIO.get("gpu_down_rc", 0)
     if ARGS[:1] == ["list-nodes"]:
+        time.sleep(SCENARIO.get("list_nodes_sleep", 0))
         later = counter("list-nodes") > 0
         late = SCENARIO.get("late_gpu_nodes", []) if later else []
         nodes = SCENARIO["gpu_nodes_then"] if later and "gpu_nodes_then" in SCENARIO else SCENARIO.get("gpu_nodes", [])
