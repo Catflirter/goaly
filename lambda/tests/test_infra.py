@@ -11,8 +11,8 @@ import pytest
 
 from fakes import FakeInfra, FakeShell, fail, ok
 from gpuctl.infra import (
-    CP_SSH_TIMEOUT_S, TF_INIT_MARKER, TF_INIT_TIMEOUT_S, TF_READ_TIMEOUT_S, CommandError, Infra, MissingStackError,
-    SubprocessShell, posix_cksum,
+    CP_SSH_TIMEOUT_S, DRAIN_PROCESS_TIMEOUT_S, NODE_DELETE_PROCESS_TIMEOUT_S, TF_INIT_MARKER, TF_INIT_TIMEOUT_S,
+    TF_READ_TIMEOUT_S, CommandError, Infra, MissingStackError, SubprocessShell, posix_cksum,
 )
 from gpuctl.planner import gpu_type_label
 
@@ -446,9 +446,46 @@ def test_drain_and_delete_commands():
     sh = FakeShell([ok(), ok()])
     Infra(sh, ROOT, {"HOME": "/h"}).drain_and_delete_node("k3s-gpu-a6000-1")
     assert [c.args[3:] for c in sh.calls] == [
-        ["drain", "k3s-gpu-a6000-1", "--ignore-daemonsets", "--delete-emptydir-data", "--force", "--timeout=120s"],
-        ["delete", "node", "k3s-gpu-a6000-1"],
+        ["drain", "k3s-gpu-a6000-1", "--ignore-daemonsets", "--delete-emptydir-data", "--force", "--timeout=120s",
+         "--request-timeout=60s"],
+        ["delete", "node", "k3s-gpu-a6000-1", "--request-timeout=60s"],
     ]
+
+
+def test_drain_and_delete_are_bounded():
+    """Review F3-5: every request has kubectl's own bound and the whole process a timeout, so a stalled tunnel
+    cannot hang gpu-down (the drain: its 120 s eviction wait plus room for its requests)."""
+    sh = FakeShell([ok(), ok()])
+    Infra(sh, ROOT, {"HOME": "/h"}).drain_and_delete_node("k3s-gpu-a6000-1")
+    assert [c.timeout for c in sh.calls] == [DRAIN_PROCESS_TIMEOUT_S, NODE_DELETE_PROCESS_TIMEOUT_S]
+    assert DRAIN_PROCESS_TIMEOUT_S > 120 + 60 and NODE_DELETE_PROCESS_TIMEOUT_S > 60
+
+
+def test_a_stalled_drain_is_cut_off_and_raises(tmp_path, monkeypatch):
+    """A real kubectl that never returns (a half-open tunnel) is killed at the process timeout: the drain fails,
+    so gpu-down decides what to do, instead of hanging; the node is not deleted."""
+    import time
+
+    import gpuctl.infra as infra_module
+    bin_dir = tmp_path / "bin"
+    bin_dir.mkdir()
+    stall = bin_dir / "kubectl"
+    stall.write_text("#!/bin/sh\nexec sleep 30\n")
+    stall.chmod(0o755)
+    monkeypatch.setattr(infra_module, "DRAIN_PROCESS_TIMEOUT_S", 1.0)
+    env = {"HOME": str(tmp_path), "PATH": f"{bin_dir}:{os.environ['PATH']}"}
+    start = time.monotonic()
+    with pytest.raises(CommandError) as error:
+        Infra(SubprocessShell(), ROOT, env).drain_and_delete_node("k3s-gpu-a6000-1")
+    assert time.monotonic() - start < 10
+    assert error.value.returncode == -1 and "timed out" in str(error.value)
+
+
+def test_kubeconfig_missing(tmp_path):
+    """Review F3-1 / Ruling R54: no kubeconfig file is one sign that the cluster is gone."""
+    assert Infra(FakeShell([]), ROOT, {"HOME": "/h"}).kubeconfig_missing() == \
+        "no kubeconfig at /h/.kube/hybrid-gpu.yaml"
+    assert Infra(FakeShell([]), ROOT, kubeconfig(tmp_path)).kubeconfig_missing() is None
 
 
 def test_drain_and_delete_tolerate_notfound():  # Review Focus #3
@@ -489,6 +526,63 @@ def test_this_node_not_found_is_tolerated_by_both_steps():
     sh = FakeShell([fail(1, gone), fail(1, gone)])
     Infra(sh, ROOT, {}).drain_and_delete_node("k3s-gpu-a6000-1")
     assert [c.args[3] for c in sh.calls] == ["drain", "delete"]
+
+
+# --- api_unreachable: may gpu-down terminate a node it could not drain? (review F2-3 / G-1) --------
+
+def kubeconfig(tmp_path):
+    path = tmp_path / "hybrid-gpu.yaml"
+    path.write_text("apiVersion: v1\n")
+    return {"KUBECONFIG": str(path)}
+
+
+def test_api_unreachable_without_a_kubeconfig_runs_nothing():
+    sh = FakeShell([])
+    reason = Infra(sh, ROOT, {"HOME": "/h"}).api_unreachable()
+    assert reason == "no kubeconfig at /h/.kube/hybrid-gpu.yaml" and sh.calls == []
+
+
+def test_api_unreachable_asks_the_api_server_bounded(tmp_path):
+    env = kubeconfig(tmp_path)
+    sh = FakeShell([ok("ok")])
+    assert Infra(sh, ROOT, env).api_unreachable() is None
+    [call] = sh.calls
+    assert call.args == ["kubectl", "--kubeconfig", env["KUBECONFIG"], "get", "--raw=/readyz",
+                         "--request-timeout=15s"]
+    assert call.timeout == 30 and call.check is False
+
+
+@pytest.mark.parametrize("stderr", [
+    "The connection to the server 127.0.0.1:6443 was refused - did you specify the right host or port?",
+    'Unable to connect to the server: dial tcp 127.0.0.1:6443: connect: connection refused',
+    "Unable to connect to the server: net/http: TLS handshake timeout",
+    'Get "https://127.0.0.1:6443/readyz?timeout=15s": dial tcp 127.0.0.1:6443: i/o timeout',
+    "Unable to connect to the server: net/http: request canceled (Client.Timeout exceeded while awaiting headers)",
+])
+def test_api_unreachable_when_nothing_answers(tmp_path, stderr):
+    reason = Infra(FakeShell([fail(1, stderr)]), ROOT, kubeconfig(tmp_path)).api_unreachable()
+    assert reason is not None and "API server" in reason and stderr[:30] in reason
+
+
+def test_api_unreachable_when_kubectl_hangs(tmp_path):
+    sh = FakeShell([CommandError(["kubectl"], -1, "timed out after 30s")])
+    assert "did not answer within 30s" in Infra(sh, ROOT, kubeconfig(tmp_path)).api_unreachable()
+
+
+@pytest.mark.parametrize("stderr", [
+    "Error from server (Forbidden): forbidden: User \"x\" cannot get path \"/readyz\"",
+    "Error from server (InternalError): an error on the server (\"[-]etcd failed\") has prevented the request",
+    "error: You must be logged in to the server (Unauthorized)",
+])
+def test_an_api_server_that_answers_is_reachable(tmp_path, stderr):
+    """An answer, even an error, means a cluster is there: gpu-down must not terminate an undrained node of it."""
+    assert Infra(FakeShell([fail(1, stderr)]), ROOT, kubeconfig(tmp_path)).api_unreachable() is None
+
+
+def test_api_unreachable_raises_when_kubectl_cannot_run(tmp_path):
+    sh = FakeShell([CommandError(["kubectl"], 127, "kubectl: command not found")])
+    with pytest.raises(CommandError):
+        Infra(sh, ROOT, kubeconfig(tmp_path)).api_unreachable()
 
 
 # --- join-node, host keys, operator IP, cp guard ------------------------------------------------

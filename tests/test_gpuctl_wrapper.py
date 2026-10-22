@@ -103,7 +103,7 @@ def test_wrapper_runs_the_package_from_the_venv_with_env_loaded(repo, tmp_path_f
     assert proc.returncode == 0, proc.stderr
     assert proc.stdout.splitlines() == [
         f"PYTHONPATH={repo.resolve()}/lambda", "KEY=k-123",
-        "ARG=-P", "ARG=-m", "ARG=gpuctl", "ARG=plan", "ARG=--set-count", "ARG=a6000=2", "ARG=two words",
+        "ARG=-u", "ARG=-P", "ARG=-m", "ARG=gpuctl", "ARG=plan", "ARG=--set-count", "ARG=a6000=2", "ARG=two words",
     ]
 
 

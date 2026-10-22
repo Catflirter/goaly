@@ -28,8 +28,8 @@
 #   7. ask Lambda once more (scripts/gpuctl list-nodes): a GPU node of this cluster that is still live
 #      (started after step 2 by a stretch autoscaler still running, or by a concurrent gpu-apply) keeps
 #      billing with nothing left to join, the largest cost risk of spec §13. A listed node, or a list
-#      that fails, fails the run (exit 1) and says what to do: terminate it in the Lambda console, since
-#      make gpu-down drains each node through the cluster, which is gone by then.
+#      that fails, fails the run (exit 1) and says what to do: run make gpu-down, which terminates it
+#      without the drain now that the cluster is gone (Ruling R54); the Lambda console is the last resort.
 #
 # Asking Lambda (steps 2 and 7). Lambda may still list an instance as active for a moment after its
 # terminate call returned, so a listed node is asked about again after a pause, until the pauses add up
@@ -238,19 +238,20 @@ stacks_after() {
 }
 
 # Step 7 (spec §13): no GPU node of this cluster may be left billing on Lambda.
-# make gpu-down cannot help here: gpuctl down drains each node through the cluster before it terminates
-# it, and k3s-cp, the base stack and the kubeconfig are gone.
+# make gpu-down is the way out (Ruling R54, review F8-2): the base stack and the kubeconfig are gone, so
+# gpuctl down terminates each GPU node of this cluster without draining it. scripts/gpuctl down --no-drain
+# if it still refuses an undrained terminate; the Lambda console only if gpuctl cannot do it at all.
 check_lambda() {
-  local clear=0 why="make gpu-down cannot do it now: it drains each node through the cluster first, and the cluster is destroyed"
+  local clear=0 how="run make gpu-down (the cluster is gone, so it terminates every GPU node of this cluster without draining it; if it refuses an undrained terminate, run scripts/gpuctl down --no-drain), or, if that fails, terminate them in the Lambda console"
   log "==> Lambda: is any GPU node of this cluster still live?"
   lambda_clear || clear=$?
   if (( clear == 2 )); then
-    die "everything else is torn down, but Lambda could not be asked whether a GPU node of this cluster is still live (error above): run scripts/gpuctl list-nodes, and terminate any node it lists in the Lambda console ($why)"
+    die "everything else is torn down, but Lambda could not be asked whether a GPU node of this cluster is still live (error above): run scripts/gpuctl list-nodes; if it lists a node, $how"
   fi
   if (( clear == 1 )); then
     log "GPU nodes still billing on Lambda:"
     log "$(printf '%s\n' "$LIVE_NODES" | sed 's/^/  /')"
-    die "GPU nodes still billing on Lambda: terminate them in the Lambda console ($why), then check that scripts/gpuctl list-nodes prints nothing. Everything else is torn down; the bootstrap stack is kept"
+    die "GPU nodes still billing on Lambda: $how; then check that scripts/gpuctl list-nodes prints nothing. Everything else is torn down; the bootstrap stack is kept"
   fi
 }
 

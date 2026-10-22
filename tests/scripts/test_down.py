@@ -418,6 +418,16 @@ def test_a_failed_gpu_down_warns_about_leftover_autoscaler_overrides(env):
 
 # ---- the last step: Lambda is asked once more (spec §13) ---------------------------------------
 
+def assert_final_hint_names_gpu_down(err):
+    """The last Lambda check's hint (Ruling R54, review F8-2): with the cluster gone (base destroyed, kubeconfig
+    removed) make gpu-down terminates this cluster's GPU nodes without draining them, so it is the way out;
+    scripts/gpuctl down --no-drain if gpuctl still refuses an undrained terminate; the Lambda console last."""
+    assert "make gpu-down cannot" not in err and "drains each node through the cluster first" not in err
+    assert "run make gpu-down" in err and "without draining" in err
+    assert "scripts/gpuctl down --no-drain" in err
+    assert err.index("make gpu-down") < err.index("scripts/gpuctl down --no-drain") < err.index("Lambda console")
+
+
 def test_a_gpu_node_still_on_lambda_after_the_teardown_fails_the_run(env):
     """gpuctl down only removes what it listed: a node started meanwhile (a stretch autoscaler still running, a
     concurrent gpu-apply) would keep billing after base is gone. make down says so and exits 1."""
@@ -426,8 +436,8 @@ def test_a_gpu_node_still_on_lambda_after_the_teardown_fails_the_run(env):
     assert proc.returncode == 1
     assert calls(env) == sequence(env)
     assert GPU_LINE in proc.stderr and "still billing" in proc.stderr and "Lambda console" in proc.stderr
-    # make gpu-down drains each node through the cluster first, and the cluster is gone (F2-2).
-    assert "make gpu-down, or" not in proc.stderr and "make gpu-down cannot" in proc.stderr
+    # The cluster is gone, so make gpu-down terminates its nodes without the drain (Ruling R54, review F8-2).
+    assert_final_hint_names_gpu_down(proc.stderr)
     assert "make down: done" not in proc.stderr
     # Everything else was finished: the local cleanup ran.
     assert known_hosts(env) == [] and not env.kubeconfig.exists()
@@ -447,8 +457,7 @@ def test_a_failed_last_lambda_check_fails_the_run(env):
     assert proc.returncode == 1
     assert calls(env) == sequence(env)
     assert "could not" in proc.stderr and "scripts/gpuctl list-nodes" in proc.stderr
-    assert "Lambda console" in proc.stderr
-    assert "make gpu-down, or" not in proc.stderr and "make gpu-down cannot" in proc.stderr
+    assert_final_hint_names_gpu_down(proc.stderr)
     assert "make down: done" not in proc.stderr
 
 

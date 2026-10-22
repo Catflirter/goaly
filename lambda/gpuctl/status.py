@@ -50,6 +50,7 @@ def render_capacity(rows: list[CapacityRow]) -> str:
 
 SKIPPED_PREFIX = "skipped: "
 SECURITY_PREFIX = "SECURITY: "
+NOTE_PREFIX = "note: "
 # The sources find_drift compares, in the order of its "skipped: <source> unavailable" lines.
 DRIFT_SOURCES = ("target counts", "Lambda instances", "cluster nodes", "gpu-access state", "cp k3s_peers set")
 
@@ -68,7 +69,10 @@ def find_drift(*, counts: Mapping[str, int] | None, instances: Iterable[Instance
     """Compare the four sources of truth and return one line per problem, "SECURITY: " lines first.
 
     Any source may be None (it could not be read): that adds a "skipped: <source> unavailable" line, which is not
-    a problem, and every comparison needing it is left out. `nft_elements` holds only the GPU entries of k3s_peers
+    a problem, and every comparison needing it is left out. A pool with more live instances than `counts` wants is a
+    problem; one with fewer only adds a "note: " line at the end, also not a problem: gpuctl keeps no local state
+    (spec section 5.4), so it cannot tell a pool gpu-down emptied (Task 21 Step 7: no drift) from one never applied
+    (live finding L21-1, Task 21a review S0-1). `nft_elements` holds only the GPU entries of k3s_peers
     (the caller removes the cp and worker addresses). Instances that are not ours or not live are ignored.
     """
     sources = dict(zip(DRIFT_SOURCES, (counts, instances, cluster_nodes, tf_ips, nft_elements), strict=True))
@@ -81,6 +85,7 @@ def find_drift(*, counts: Mapping[str, int] | None, instances: Iterable[Instance
 
     security: list[str] = []
     problems: list[str] = []
+    notes: list[str] = []
     if cluster_nodes is not None:
         problems += [f"{name} is not in the cluster" for name in sorted(live_names - set(cluster_nodes))]
         problems += [f"stale node {name}" for name in sorted(set(cluster_nodes) - live_names)]
@@ -93,11 +98,19 @@ def find_drift(*, counts: Mapping[str, int] | None, instances: Iterable[Instance
         have = Counter(parsed[0] for parsed in map(parse_node_name, (i.name for i in live)) if parsed is not None)
         for pool in [*counts, *sorted(set(have) - set(counts))]:
             wanted = counts.get(pool, 0)
-            if have[pool] != wanted:
+            if have[pool] > wanted:
                 problems.append(f"pool {pool} has {have[pool]}, wants {wanted}")
-    return skipped + security + problems
+            elif have[pool] < wanted:
+                notes.append(f"{NOTE_PREFIX}pool {pool}: {have[pool]} of {wanted} running "
+                             "(make gpu-apply starts the rest)")
+    return skipped + security + problems + notes
 
 
 def is_problem(line: str) -> bool:
-    """A find_drift line that is drift, as opposed to a source that could not be read."""
-    return not line.startswith(SKIPPED_PREFIX)
+    """A find_drift line that is drift, as opposed to a source that could not be read or a note."""
+    return not line.startswith((SKIPPED_PREFIX, NOTE_PREFIX))
+
+
+def is_skipped(line: str) -> bool:
+    """A find_drift line for a source that could not be read."""
+    return line.startswith(SKIPPED_PREFIX)
