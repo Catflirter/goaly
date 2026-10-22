@@ -10,7 +10,9 @@
 #     --flannel-external-ip the kubelets are scraped on their ExternalIP:10250, which only CP_IP may reach);
 #   - nodeSelector node-role.kubernetes.io/control-plane: "true" (replaces kubernetes.io/os: linux), so it
 #     runs on k3s-cp; the upstream CriticalAddonsOnly toleration (no effect: matches the cp's NoExecute
-#     taint) and control-plane toleration are kept.
+#     taint) and control-plane toleration are kept;
+#   - the readinessProbe's `initialDelaySeconds: 0` is left out. 0 is the default, and the API server omits
+#     it, so with the line every `kubectl apply` reported the Deployment "configured" with no change (M-7).
 ---
 kind: ClusterRole
 apiVersion: rbac.authorization.k8s.io/v1
@@ -131,7 +133,6 @@ spec:
             path: /readyz
             port: https
             scheme: HTTPS
-          initialDelaySeconds: 0
           periodSeconds: 2
           timeoutSeconds: 1
           successThreshold: 1
