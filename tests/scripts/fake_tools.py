@@ -63,8 +63,8 @@ The plan guardrail (stretch S3, cpu-pool.sh --guarded):
                                           while it is read (another run's plan lands mid-guard)
   drain_plan     "keep" | "replace" | "remove"  `kubectl drain` stands in for another cpu-pool.sh run during the
                                           drain: it leaves the saved plan (the last plan -out file) alone,
-                                          overwrites it with other bytes, or deletes it, and copies what
-                                          .run/workers.lock holds then ("" when absent) to $FAKE_LOG.lock_at_drain
+                                          overwrites it with other bytes, or deletes it, and writes "held" or
+                                          "free" (whether .run/workers.lock is flock(1)ed then) to $FAKE_LOG.lock_at_drain
 
 Teardown (Task 22a, scripts/down.sh):
 
@@ -305,7 +305,8 @@ def other_run():
     """drain_plan: another cpu-pool.sh run touches the saved plan while this one drains."""
     plan = Path(Path(os.environ["FAKE_LOG"] + ".plan_out").read_text())
     lock = plan.parent / "workers.lock"
-    Path(os.environ["FAKE_LOG"] + ".lock_at_drain").write_text(lock.read_text() if lock.exists() else "")
+    free = subprocess.run(["flock", "-n", str(lock), "true"]).returncode == 0
+    Path(os.environ["FAKE_LOG"] + ".lock_at_drain").write_text("free" if free else "held")
     if SCENARIO["drain_plan"] == "replace":
         plan.write_text("another run's plan")
     elif SCENARIO["drain_plan"] == "remove":

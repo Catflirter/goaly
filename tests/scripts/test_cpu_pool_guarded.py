@@ -6,9 +6,12 @@ and applies it only when the guard passes. The fake gpuctl runs the real tfguard
 (tests/scripts/fake_tools.py), so these tests also prove the pipe carries the plan the fake terraform showed.
 Same harness as test_workers_ops.py: nothing reaches a cloud or a cluster.
 """
+import contextlib
 import json
 import os
 import select
+import shutil
+import signal
 import subprocess
 import time
 from pathlib import Path
@@ -238,54 +241,57 @@ def test_guarded_scale_fails_closed_when_the_guards_show_fails(env):
 LOCK = ".run/workers.lock"
 
 
+def lock_free(env):
+    """Nobody holds .run/workers.lock (flock(1), as the guarded run takes it)."""
+    return subprocess.run(["flock", "-n", str(env.repo / LOCK), "true"]).returncode == 0
+
+
+@contextlib.contextmanager
+def other_guarded_run(env):
+    """Another guarded run holds the lock: `flock .run/workers.lock sleep 60` in its own process group."""
+    (env.repo / ".run").mkdir(exist_ok=True)
+    holder = subprocess.Popen(["flock", str(env.repo / LOCK), "sleep", "60"], start_new_session=True)
+    try:
+        deadline = time.monotonic() + 10
+        while lock_free(env):
+            assert time.monotonic() < deadline and holder.poll() is None, "the holder never took the lock"
+            time.sleep(0.02)
+        yield holder
+    finally:
+        if holder.poll() is None:
+            os.killpg(holder.pid, signal.SIGKILL)
+        holder.wait()
+
+
 @pytest.mark.parametrize("args", [["scale", "2"], ["scale", "1"], ["remove", "k3s-cpu-2"]])
 def test_a_guarded_run_refuses_while_another_holds_the_lock(env, args):
-    """The holder is alive (this test process stands in for the other run)."""
     set_pool(env, ["k3s-cpu-1", "k3s-cpu-2"])
-    (env.repo / ".run").mkdir()
-    holder = f"{os.getpid()}\n"
-    (env.repo / LOCK).write_text(holder)
     before = env.tfvars.read_text()
-    proc = guarded(env, *args, AUTO_APPROVE="1")
+    with other_guarded_run(env):
+        proc = guarded(env, *args, AUTO_APPROVE="1")
+        assert not lock_free(env), "the other run still holds it"
     assert proc.returncode == 2
-    assert "workers.lock" in proc.stderr and f"pid {os.getpid()}" in proc.stderr
+    assert "another guarded cpu-pool.sh run holds" in proc.stderr and "workers.lock" in proc.stderr
+    assert "nothing was changed" in proc.stderr
     assert env.calls() == [], "nothing planned, drained or applied"
-    assert (env.repo / LOCK).read_text() == holder, "the other run's lock is left alone"
     assert env.tfvars.read_text() == before
 
 
-def dead_pid():
-    child = subprocess.Popen(["true"])
-    child.wait()
-    return child.pid
-
-
-def test_a_stale_lock_of_a_dead_run_is_taken_over(env):
-    """A guarded run SIGKILLed (or a reboot) leaves its lock behind: its PID is gone, so the next guarded run removes
-    it, says so, runs, and releases its own lock (X1-2: the autoscaler is never stuck on it)."""
-    (env.repo / ".run").mkdir()
-    pid = dead_pid()
-    (env.repo / LOCK).write_text(f"{pid}\n")
+@pytest.mark.parametrize("left_behind", ["", "4242\n"])
+def test_a_crashed_holder_leaves_no_stale_lock(env, left_behind):
+    """A guarded run SIGKILLed (or a reboot): the kernel released its lock, so the next guarded run proceeds, whatever
+    the file holds (an old PID-style lock included). The S4 loop is never stuck on it (S3-L1)."""
+    with other_guarded_run(env) as holder:
+        os.killpg(holder.pid, signal.SIGKILL)
+        holder.wait()
+    (env.repo / LOCK).write_text(left_behind)
     workers(env, ips(1), after=ips(1, 2))
     env.scenario["changes"] = {"workers": creates("k3s-cpu-2")}
     env.scenario["ready"] = ["k3s-cpu-1"]
     proc = guarded(env, "scale", "2", AUTO_APPROVE="1")
     assert proc.returncode == 0, proc.stderr
-    assert f"removing a stale lock of pid {pid}" in proc.stderr
     assert tf(env)[-1] == "apply"
-    assert not (env.repo / LOCK).exists()
-    assert not list((env.repo / ".run").glob("workers.lock*")), "no leftover lock files"
-
-
-@pytest.mark.parametrize("content", ["", "not-a-pid\n"])
-def test_a_lock_without_a_pid_is_never_taken_over(env, content):
-    """An empty lock may be one another run has just created and not yet written: only a dead PID is stale."""
-    (env.repo / ".run").mkdir()
-    (env.repo / LOCK).write_text(content)
-    proc = guarded(env, "scale", "2", AUTO_APPROVE="1")
-    assert proc.returncode == 2 and "workers.lock" in proc.stderr
-    assert env.calls() == []
-    assert (env.repo / LOCK).read_text() == content
+    assert lock_free(env)
 
 
 def test_a_guarded_run_holds_the_lock_from_plan_to_apply_then_releases_it(env):
@@ -296,10 +302,9 @@ def test_a_guarded_run_holds_the_lock_from_plan_to_apply_then_releases_it(env):
     env.scenario["ready"] = ["k3s-cpu-1", "k3s-cpu-2"]
     proc = guarded(env, "scale", "1", AUTO_APPROVE="1")
     assert proc.returncode == 0, proc.stderr
-    pid = Path(str(env.log) + ".lock_at_drain").read_text().strip()
-    assert pid.isdigit(), "the lock is held during the drain, and names the run"
+    assert Path(str(env.log) + ".lock_at_drain").read_text() == "held", "the lock is held during the drain"
     assert tf(env)[-1] == "apply"
-    assert not (env.repo / LOCK).exists()
+    assert lock_free(env)
 
 
 def test_a_failed_guarded_run_releases_the_lock(env):
@@ -307,19 +312,48 @@ def test_a_failed_guarded_run_releases_the_lock(env):
     env.scenario["changes"] = {"workers": [*creates("k3s-cpu-2"), CP_UPDATE]}
     proc = guarded(env, "scale", "2", AUTO_APPROVE="1")
     assert proc.returncode == 1
-    assert not (env.repo / LOCK).exists()
+    assert lock_free(env)
 
 
 def test_without_guarded_the_lock_is_not_used(env):
     """Core behaviour is unchanged without --guarded (task scope): an unguarded run neither takes nor honours it.
     A guarded run is protected from an unguarded one by the plan check below."""
-    (env.repo / ".run").mkdir()
-    (env.repo / LOCK).write_text("4242\n")
     workers(env, ips(1, 2))
     env.scenario["ready"] = ["k3s-cpu-1"]
-    proc = env.script("cpu-pool.sh", "scale", "2", AUTO_APPROVE="1")
+    with other_guarded_run(env):
+        proc = env.script("cpu-pool.sh", "scale", "2", AUTO_APPROVE="1")
     assert proc.returncode == 0, proc.stderr
-    assert (env.repo / LOCK).read_text() == "4242\n"
+
+
+def path_without_flock(env, tmp_path):
+    """env's PATH with the fakes first, then every other directory's commands linked into one, flock left out."""
+    dirs = [d for d in env.environ({})["PATH"].split(":") if d != str(env.bin)]
+    tools = tmp_path / "no-flock-bin"
+    tools.mkdir()
+    for d in dirs:
+        if not os.path.isdir(d):
+            continue
+        for name in os.listdir(d):
+            target = tools / name
+            if name != "flock" and not target.exists() and os.access(os.path.join(d, name), os.X_OK):
+                target.symlink_to(os.path.join(d, name))
+    path = f"{env.bin}:{tools}"
+    assert shutil.which("flock", path=path) is None
+    return path
+
+
+def test_guarded_refuses_without_flock_and_unguarded_runs_unchanged(env, tmp_path):
+    path = path_without_flock(env, tmp_path)
+    set_pool(env, ["k3s-cpu-1", "k3s-cpu-2"])
+    before = env.tfvars.read_text()
+    proc = env.run([str(env.repo / "scripts/cpu-pool.sh"), "scale", "1", "--guarded"], AUTO_APPROVE="1", PATH=path)
+    assert proc.returncode == 2
+    assert "--guarded needs flock" in proc.stderr and "nothing was changed" in proc.stderr
+    assert env.calls() == [] and env.tfvars.read_text() == before
+    workers(env, ips(1, 2))
+    env.scenario["ready"] = ["k3s-cpu-1", "k3s-cpu-2"]
+    proc = env.run([str(env.repo / "scripts/cpu-pool.sh"), "scale", "2"], AUTO_APPROVE="1", PATH=path)
+    assert proc.returncode == 0, proc.stderr
 
 
 @pytest.mark.parametrize("args, changes", [(["scale", "1"], deletes("k3s-cpu-2")),
@@ -339,7 +373,7 @@ def test_a_plan_replaced_after_the_guard_is_never_applied(env, args, changes):
     assert "apply" not in tf(env)
     assert (env.repo / ".run/workers.tfplan").read_text() == "another run's plan"
     assert ("gpuctl", ["sync-peers"]) not in calls(env)
-    assert not (env.repo / LOCK).exists()
+    assert lock_free(env)
 
 
 def test_a_plan_replaced_while_the_guard_reads_it_is_never_applied(env):
@@ -438,7 +472,7 @@ def test_an_interactive_guarded_run_never_applies_a_plan_replaced_while_it_asks(
     assert "apply" not in tf(env)
     assert plan.read_text() == "another run's plan", "the other run's plan is left where it was"
     assert ("gpuctl", ["sync-peers"]) not in calls(env)
-    assert not (env.repo / LOCK).exists()
+    assert lock_free(env)
 
 
 @pytest.mark.parametrize("key", list(SCENARIOS))
@@ -453,6 +487,9 @@ def test_an_interactive_guarded_run_asks_once_then_applies_the_checked_plan(env,
     rc, err = interactive(env, args, answer)
     assert rc == 0, err
     assert questions.count(APPLY_Q) == 1, "the apply is asked exactly once"
+    # The evidence log says the operator approved it, not AUTO_APPROVE (S3-L3).
+    assert "AUTO_APPROVE" not in err
+    assert err.count("the operator confirmed the apply of the workers plan") == 1
     assert tf(env)[-1] == "apply"
     assert not (env.repo / ".run/workers.tfplan").exists()
 
@@ -465,11 +502,32 @@ def test_an_interactive_guarded_run_declined_at_the_apply_applies_nothing(env):
     assert not (env.repo / ".run/workers.tfplan").exists()
 
 
+def test_an_interactive_decline_leaves_a_plan_another_run_wrote_while_it_asked(env):
+    """S3-L2: the saved plan is removed on a decline only while it is still the one this run's guard passed."""
+    args = scenario(env, "scale up")
+    plan = env.repo / ".run/workers.tfplan"
+
+    def answer(question):
+        if question == APPLY_Q:
+            plan.write_text("another run's plan")
+            return "n\n"
+        return "y\n"
+
+    rc, err = interactive(env, args, answer)
+    assert rc == 2 and "not applied: workers" in err
+    assert "not this run's plan" in err and "left" in err
+    assert "apply" not in tf(env)
+    assert plan.read_text() == "another run's plan"
+    assert lock_free(env)
+
+
 def test_an_unattended_guarded_run_says_the_apply_question_once(env):
     args = scenario(env, "scale up")
     proc = guarded(env, *args, AUTO_APPROVE="1")
     assert proc.returncode == 0, proc.stderr
     assert proc.stderr.count("Apply this plan to the workers stack?") == 1
+    assert proc.stderr.count("Apply this plan to the workers stack? [AUTO_APPROVE=1: yes]") == 1
+    assert "operator confirmed" not in proc.stderr
 
 
 # ---- remove ----------------------------------------------------------------------------------------
