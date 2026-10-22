@@ -23,7 +23,7 @@ from pathlib import Path
 
 import pytest
 
-from test_ops_scripts import Env, make_kubeconfig
+from test_ops_scripts import PROJECT, Env, make_kubeconfig
 
 ROOT = Path(__file__).resolve().parents[2]
 K3S_TOKEN = "K10" + "e" * 64 + "::server:" + "fedcba9876543210"
@@ -147,16 +147,31 @@ def test_the_scripts_are_executable_bash():
 def make_mini_repo(tmp_path):
     repo = tmp_path / "repo"
     (repo / "scripts/lib").mkdir(parents=True)
-    for rel in ("scripts/demo.sh", "scripts/lib/checks.sh", "scripts/lib/common.sh"):
-        shutil.copy2(ROOT / rel, repo / rel)
+    shutil.copy2(ROOT / "scripts/demo.sh", repo / "scripts/demo.sh")
+    for lib in (ROOT / "scripts/lib").glob("*.sh"):
+        shutil.copy2(lib, repo / "scripts/lib" / lib.name)
     return repo
 
 
 # --- the demo run, in a repo copy with fakes -----------------------------------------------------
 
+# A command that stops gracefully on Ctrl-C (terraform, cpu-pool.sh, down.sh, tunnel.sh start): while it runs
+# it holds $GRACEFUL_MARK.started; on SIGINT it prints, waits, prints again, writes $GRACEFUL_MARK, exits 130.
+# A broken pipe on either print kills it (SIGPIPE) before the mark is written.
+GRACEFUL = r"""
+graceful() {
+  trap 'echo "Interrupt received, stopping gracefully"; sleep 0.5; echo "stopped cleanly"; : > "$GRACEFUL_MARK"; exit 130' INT
+  : > "$GRACEFUL_MARK.started"
+  # A background job ignores SIGINT: off the pipes (and the step's fd 3), so they close when the command ends.
+  sleep 30 >/dev/null 2>&1 3>&- &
+  wait $!
+}
+"""
+
 CPU_POOL_STUB = r"""#!/usr/bin/env bash
 # Test stub of scripts/cpu-pool.sh: logs "AUTO_APPROVE|args", renders N workers, "scales".
 printf '%s|%s\n' "${AUTO_APPROVE:-}" "$*" >> "$CPU_POOL_LOG"
+""" + GRACEFUL + r"""
 case "$1" in
   render)
     printf '{"cpu_workers": {'
@@ -167,25 +182,40 @@ case "$1" in
     printf '}}\n' ;;
   scale)
     echo "cpu-pool stub: scale $2 $3 (token: scale-secret-$2)"
+    echo "cpu-pool stub: state in gs://@PROJECT@-k3s-tfstate/workers, k3s-worker@@PROJECT@.iam.gserviceaccount.com"
+    [[ -z "${GRACEFUL_MARK:-}" || "$*" != "${GRACEFUL_ON:-}" ]] || graceful
     [[ "$2" != 2 ]] || sleep "${CPU_POOL_SLEEP:-0}"
     echo "cpu-pool stub: scale $2 done"
     exit "${CPU_POOL_RC:-0}" ;;
 esac
-"""
+""".replace("@PROJECT@", PROJECT)
 
-DOWN_STUB = """#!/usr/bin/env bash
-printf 'down.sh %s\\n' "$*" >> "$CPU_POOL_LOG"
+DOWN_STUB = r"""#!/usr/bin/env bash
+printf 'down.sh %s AUTO_APPROVE=%s\n' "$*" "${AUTO_APPROVE:-}" >> "$CPU_POOL_LOG"
+""" + GRACEFUL + r"""
+answer=""
 read -r answer || true
-printf 'down.sh read: %s\\n' "$answer" >> "$CPU_POOL_LOG"
+printf 'down.sh read: %s\n' "$answer" >> "$CPU_POOL_LOG"
+echo "make down destroys, in GCP project @PROJECT@:" >&2
+[[ -z "${GRACEFUL_MARK:-}" ]] || graceful
 echo "down.sh stub ran"
+""".replace("@PROJECT@", PROJECT)
+
+# scripts/tunnel.sh for the preflight's interrupt test: down, and its start stops gracefully on Ctrl-C.
+TUNNEL_STUB = r"""#!/usr/bin/env bash
+""" + GRACEFUL + r"""
+[[ "$1" == start ]] || exit 1
+graceful
 """
 
 
 class DemoEnv(Env):
     def __init__(self, tmp):
         super().__init__(tmp)
-        for rel in ("demo.sh", "preflight.sh", "lib/checks.sh"):
+        for rel in ("demo.sh", "preflight.sh"):
             shutil.copy2(ROOT / "scripts" / rel, self.repo / "scripts" / rel)
+        for lib in (ROOT / "scripts/lib").glob("*.sh"):
+            shutil.copy2(lib, self.repo / "scripts/lib" / lib.name)
         shutil.copy2(ROOT / "Makefile", self.repo / "Makefile")
         shutil.copy2(ROOT / ".gitleaks.toml", self.repo / ".gitleaks.toml")
         (self.repo / "lambda").mkdir()
@@ -201,9 +231,12 @@ class DemoEnv(Env):
         (self.bin / "curl").write_text('#!/bin/sh\n[ "$1" = --version ] && { echo "curl 8.0.0 (stub)"; exit 0; }\n'
                                        'echo "curl stub: $*" >&2\nexit 7\n')
         (self.bin / "curl").chmod(0o755)
-        self.write_env(f"GCP_PROJECT=k3s-demo-123456\nLAMBDA_API_KEY=x\nUNDERLAY_MTU=1460\n"
-                       f"SSH_PRIVATE_KEY_PATH={self.ssh_key}\nOPERATOR_IP={OPERATOR_IP}\n")
+        self.write_demo_env()
         make_kubeconfig(self)
+
+    def write_demo_env(self, operator_ip=OPERATOR_IP):
+        self.write_env(f"GCP_PROJECT={PROJECT}\nLAMBDA_API_KEY=x\nUNDERLAY_MTU=1460\n"
+                       f"SSH_PRIVATE_KEY_PATH={self.ssh_key}\nOPERATOR_IP={operator_ip}\n")
 
     def environ(self, extra):
         env = super().environ(extra)
@@ -323,6 +356,51 @@ def test_the_screen_and_the_recording_are_redacted(denv):
     assert "from <operator_ip>/32" in r.stdout and "from <operator_ip>/32" in rec
 
 
+def test_the_project_id_is_masked_on_the_screen_and_in_the_recording(denv):
+    # GCP_PROJECT from .env, in any case (terraform and gcloud print it in buckets, FQDNs and SA emails).
+    code = (f'check_a1_nodes() {{ echo "state in gs://{PROJECT}-k3s-tfstate/workers"; '
+            f'echo "k3s-cp.us-west1-b.c.{PROJECT.upper()}.internal" >&2; _vr_tell "cleanup in {PROJECT}"; }}\n')
+    r = run_demo(denv, "1", code=code)
+    assert r.returncode == 0, r.stderr
+    rec = (denv.the_run() / "ch1.txt").read_text()
+    for text in (r.stdout, r.stderr, rec):
+        assert PROJECT not in text.lower(), text
+    for masked in ("gs://<GCP_PROJECT>-k3s-tfstate/workers", "k3s-cp.us-west1-b.c.<GCP_PROJECT>.internal",
+                   "cleanup in <GCP_PROJECT>"):
+        assert masked in rec, (masked, rec)
+    assert "gs://<GCP_PROJECT>-k3s-tfstate/workers" in r.stdout and "cleanup in <GCP_PROJECT>" in r.stderr
+
+
+def test_a_project_id_in_the_caller_s_environment_is_masked_too(denv):
+    other = "k3s-other-654321"
+    code = f'check_a1_nodes() {{ echo "plan for {other} and {PROJECT}"; }}\n'
+    r = run_demo(denv, "1", code=code, GCP_PROJECT=other)
+    assert r.returncode == 0, r.stderr
+    assert "plan for <GCP_PROJECT> and <GCP_PROJECT>" in r.stdout
+    assert other not in (denv.the_run() / "ch1.txt").read_text()
+
+
+def test_the_demo_refuses_to_run_when_the_operator_ip_is_unknown(denv):
+    # No OPERATOR_IP in .env and checkip unreachable (the curl stub fails): nothing could mask the IP.
+    denv.write_demo_env(operator_ip="")
+    r = run_demo(denv, "3")
+    assert r.returncode == 2, r.stderr
+    assert "OPERATOR_IP" in r.stderr and "DEMO_ALLOW_UNMASKED_IP=1" in r.stderr
+    assert denv.demo_dirs() == [] and stub_log(denv) == []
+    r = run_demo(denv, "3", DEMO_ALLOW_UNMASKED_IP="1")
+    assert r.returncode == 0, r.stderr
+    assert "warning" in r.stderr and stub_log(denv) == CHECKS[3]
+
+
+def test_replay_masks_the_operator_ip_and_the_project_id(denv, tmp_path):
+    final = tmp_path / "final"
+    (final / "demo").mkdir(parents=True)
+    (final / "demo/ch2.txt").write_text(f"rule {OPERATOR_IP}/32 in {PROJECT}\n")
+    r = denv.script("demo.sh", "replay", "2", VERIFICATION_FINAL=str(final))
+    assert r.returncode == 0, r.stderr
+    assert r.stdout == "rule <operator_ip>/32 in <GCP_PROJECT>\n"
+
+
 def test_a_failed_step_names_the_replay_and_the_demo_goes_on(denv):
     r = run_demo(denv, "3,1", code=stubs(check_b1_matrix=1))
     assert r.returncode == 1, r.stderr
@@ -358,6 +436,70 @@ def test_ctrl_c_runs_the_check_s_cleanup_and_stops_the_demo(denv):
     assert "cleanup done" in err and "make demo-reset" in err
     assert stub_log(denv) == [], "chapter 3 did not run"
     assert "ch1 interrupted after" in (denv.the_run() / "timings.txt").read_text()
+
+
+def interrupt_when_started(denv, args, mark, stdin="", **extra):
+    """Run ARGS in its own process group; once $GRACEFUL_MARK.started exists, Ctrl-C the whole group (as a
+    terminal does) and return (returncode, stdout, stderr)."""
+    stdin_file = denv.repo.parent / "stdin.txt"
+    stdin_file.write_text(stdin)
+    with stdin_file.open() as fin:
+        proc = subprocess.Popen(args, cwd=denv.repo, env=denv.environ({"GRACEFUL_MARK": str(mark), **extra}),
+                                stdin=fin, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True,
+                                start_new_session=True)
+        try:
+            started = Path(f"{mark}.started")
+            deadline = time.monotonic() + 30
+            while not started.exists():
+                assert proc.poll() is None and time.monotonic() < deadline, proc.communicate()
+                time.sleep(0.05)
+            os.killpg(proc.pid, signal.SIGINT)
+            out, err = proc.communicate(timeout=60)
+        finally:
+            if proc.poll() is None:
+                os.killpg(proc.pid, signal.SIGKILL)
+    return proc.returncode, out, err
+
+
+@pytest.mark.parametrize("chapter", [6, 8])
+def test_ctrl_c_lets_a_step_stop_gracefully_through_the_screen_filter(denv, chapter):
+    """Ctrl-C reaches redact and tee too: they must outlive the interrupted command (terraform, cpu-pool.sh,
+    down.sh), whose last words would otherwise kill it by SIGPIPE before it has stopped cleanly."""
+    gpuctl_ok(denv)
+    terraform_plans(denv)
+    denv.scenario["ready"] = ["k3s-cpu-2"]
+    mark = denv.repo.parent / "graceful"
+    args = ["bash", "-c", f"source scripts/demo.sh --source-only\n{stubs()}\ndemo_main run"]
+    rc, out, err = interrupt_when_started(
+        denv, args, mark, stdin=f"\n\ny\n{PROJECT}\n" if chapter == 8 else "", CHAPTERS=str(chapter),
+        DEMO_NO_PAUSE="" if chapter == 8 else "1", GRACEFUL_ON="scale 1 --guarded",
+        STUB_LOG=str(denv.repo / "stub.log"))
+    assert rc in (-signal.SIGINT, 130), (rc, out, err)
+    assert mark.exists(), (out, err)
+    rec = (denv.the_run() / f"ch{chapter}.txt").read_text()
+    assert "Interrupt received, stopping gracefully" in rec and "stopped cleanly" in rec, rec
+    assert "stopped cleanly" in out and "exit 141" not in out + rec
+    assert "make demo-reset" in err
+
+
+def test_ctrl_c_lets_the_reset_s_scale_stop_gracefully_and_stops_the_reset(denv):
+    mark = denv.repo.parent / "graceful"
+    rc, out, err = interrupt_when_started(denv, [str(denv.repo / "scripts/demo.sh"), "reset"], mark,
+                                          GRACEFUL_ON="scale 1 --guarded")
+    assert mark.exists(), (out, err)
+    assert "stopped cleanly" in out and "exit 141" not in out + err
+    assert rc in (-signal.SIGINT, 130) and "interrupted" in err, (rc, out, err)
+
+
+def test_ctrl_c_lets_the_preflight_s_tunnel_start_stop_gracefully_and_stops_the_preflight(denv):
+    preflight_ok(denv)
+    (denv.repo / "scripts/tunnel.sh").write_text(TUNNEL_STUB)
+    mark = denv.repo.parent / "graceful"
+    rc, out, err = interrupt_when_started(denv, [str(denv.repo / "scripts/preflight.sh")], mark)
+    assert mark.exists(), (out, err)
+    assert "stopped cleanly" in out
+    assert rc in (-signal.SIGINT, 130) and "interrupted" in out + err, (rc, out, err)
+    assert not re.search(r"^(OK|FAIL) +nodes", out, re.M), "no later item ran"
 
 
 def test_a_skipped_check_is_not_a_failure(denv):
@@ -472,9 +614,10 @@ def gpuctl_ok(denv):
 def terraform_plans(denv, destroy_lines=3):
     denv.scenario.setdefault("answers", []).extend([
         {"tool": "terraform", "has": ["plan", "-destroy"],
-         "stdout": "".join(f"destroy line {i}\n" for i in range(1, destroy_lines + 1))},
+         "stdout": f"destroy in {PROJECT}\n" + "".join(f"destroy line {i}\n" for i in range(1, destroy_lines + 1))},
         {"tool": "terraform", "has": ["plan", "-var-file="],
-         "stdout": "  # google_compute_instance.worker[\"k3s-cpu-2\"] will be created\nPlan: 4 to add, 0 to change, 0 to destroy.\n"},
+         "stdout": "  # google_compute_instance.worker[\"k3s-cpu-2\"] will be created\n"
+                   f"      + project = \"{PROJECT}\"\nPlan: 4 to add, 0 to change, 0 to destroy.\n"},
     ])
 
 
@@ -551,6 +694,40 @@ def test_chapter_6_gives_up_waiting_but_leaves_the_scale_running(denv):
     assert (log_file.stat().st_mode & 0o777) == 0o600
 
 
+def test_chapter_6_records_the_log_so_far_when_it_gives_up_waiting(denv):
+    gpuctl_ok(denv)
+    terraform_plans(denv)
+    r = run_demo(denv, "6", DEMO_SCALE_TIMEOUT_S="2", CPU_POOL_SLEEP="5")
+    assert r.returncode == 1
+    ch6 = (denv.the_run() / "ch6.txt").read_text()
+    assert "still running" in ch6 and "cpu-pool stub: scale 2 --guarded (token: <redacted>" in ch6, ch6
+    assert "cpu-pool stub: scale 2 done" not in ch6
+    assert "scale-secret" not in ch6 and PROJECT not in ch6
+    # The log itself stays in .run/ and the scale goes on to its end.
+    rc_file, log_file = denv.repo / ".run/demo-scale.rc", denv.repo / ".run/demo-scale.log"
+    deadline = time.monotonic() + 30
+    while not rc_file.exists():
+        assert time.monotonic() < deadline, "the background scale did not finish"
+        time.sleep(0.1)
+    assert "cpu-pool stub: scale 2 done" in log_file.read_text()
+
+
+def test_chapters_6_and_8_and_reset_mask_the_project_id(denv):
+    gpuctl_ok(denv)
+    terraform_plans(denv)
+    denv.scenario["ready"] = ["k3s-cpu-2"]
+    r = run_demo(denv, "6,8", stdin=f"\n\n\n\n\n\ny\n{PROJECT}\n", DEMO_NO_PAUSE="")
+    assert r.returncode == 0, (r.stdout, r.stderr)
+    run = denv.the_run()
+    ch6, ch8 = (run / "ch6.txt").read_text(), (run / "ch8.txt").read_text()
+    assert "project = \"<GCP_PROJECT>\"" in ch6 and "gs://<GCP_PROJECT>-k3s-tfstate" in ch6
+    assert "destroy in <GCP_PROJECT>" in ch8 and "in GCP project <GCP_PROJECT>" in ch8
+    assert PROJECT not in r.stdout + r.stderr + ch6 + ch8
+    r = denv.script("demo.sh", "reset")
+    assert r.returncode == 0, r.stderr
+    assert "gs://<GCP_PROJECT>-k3s-tfstate" in r.stdout and PROJECT not in r.stdout + r.stderr
+
+
 def test_chapter_6_fails_when_the_new_node_is_not_ready(denv):
     gpuctl_ok(denv)
     terraform_plans(denv)
@@ -573,13 +750,40 @@ def test_chapter_8_previews_the_teardown_and_runs_make_down_only_on_yes(denv):
     assert not any(c.startswith("down.sh") for c in denv.pool_calls()), "declined: make down did not run"
 
 
-def test_chapter_8_runs_make_down_on_yes_with_the_terminal_as_its_stdin(denv):
+def test_chapter_8_takes_the_project_id_unseen_then_runs_make_down_approved(denv):
+    # The demo asks for the project id itself, without echoing it, so the id never reaches the screen;
+    # make down then runs with AUTO_APPROVE=1 and no terminal.
     gpuctl_ok(denv)
     terraform_plans(denv)
-    r = run_demo(denv, "8", stdin="\n\ny\nk3s-demo-123456\n", DEMO_NO_PAUSE="")
+    r = run_demo(denv, "8", stdin=f"\n\ny\n{PROJECT}\n", DEMO_NO_PAUSE="")
     assert r.returncode == 0, r.stderr
-    assert "down.sh " in denv.pool_calls() and "down.sh read: k3s-demo-123456" in denv.pool_calls()
+    calls = denv.pool_calls()
+    assert "down.sh  AUTO_APPROVE=1" in calls and "down.sh read: " in calls, calls
     assert "down.sh stub ran" in r.stdout
+    ch8 = (denv.the_run() / "ch8.txt").read_text()
+    assert "make down destroys, in GCP project <GCP_PROJECT>:" in ch8
+    assert PROJECT not in r.stdout + r.stderr + ch8
+    assert "project id" in r.stderr
+
+
+@pytest.mark.parametrize("typed", ["k3s-other-654321", "", PROJECT.upper(), PROJECT + "7"])
+def test_chapter_8_does_not_run_make_down_on_a_wrong_project_id(denv, typed):
+    gpuctl_ok(denv)
+    terraform_plans(denv)
+    r = run_demo(denv, "8", stdin=f"\n\nyes\n{typed}\n", DEMO_NO_PAUSE="")
+    assert r.returncode == 0, r.stderr
+    assert not any(c.startswith("down.sh") for c in denv.pool_calls())
+    assert "make down was not run" in r.stdout
+    assert PROJECT not in r.stdout + r.stderr
+
+
+def test_chapter_8_asks_for_the_project_id_even_with_auto_approve_set(denv):
+    # make demo AUTO_APPROVE=1 (or an exported AUTO_APPROVE=1) must not turn one "y" into a teardown.
+    gpuctl_ok(denv)
+    terraform_plans(denv)
+    r = run_demo(denv, "8", stdin="\n\ny\n", DEMO_NO_PAUSE="", AUTO_APPROVE="1")
+    assert r.returncode == 0, r.stderr
+    assert not any(c.startswith("down.sh") for c in denv.pool_calls())
 
 
 @pytest.mark.parametrize("stdin, extra", [("", {"DEMO_NO_PAUSE": ""}), ("y\n", {"DEMO_NO_PAUSE": "1"})])
@@ -709,14 +913,52 @@ def test_preflight_fails_one_item_and_still_checks_the_rest(denv, rule, item):
     assert re.search(r"^OK +.*nodes Ready", r.stdout, re.M) or item == "nodes", "later items still ran"
 
 
-def test_preflight_takes_gpuctl_drift_as_ok(denv):
+@pytest.mark.parametrize("drift", ["SECURITY: firewall rule for 198.51.100.9 has no live instance",
+                                   "k3s-gpu-a6000-1 is not in the cluster", "pool a6000 has 2, wants 1"])
+def test_preflight_fails_on_gpuctl_drift(denv, drift):
+    # On main, gpuctl status exits 3 only for real drift (a pool below its count is a note, exit 0).
     preflight_ok(denv)
-    denv.scenario["answers"].insert(0, {"tool": "gpuctl", "has": ["status"], "rc": 3,
-                                        "stdout": "drift: pool a6000 has 0, wants 1\n"})
+    denv.scenario["answers"].insert(0, {"tool": "gpuctl", "has": ["status"], "rc": 3, "stdout": drift + "\n"})
+    assert denv.script("tunnel.sh", "start").returncode == 0
+    r = preflight(denv)
+    assert r.returncode == 1, r.stdout
+    fails = [line for line in r.stdout.splitlines() if line.startswith("FAIL")]
+    assert len(fails) == 1 and "gpuctl status" in fails[0] and "exit 3" in fails[0], r.stdout
+    assert "make gpu-apply" in fails[0] and "make gpu-down" in fails[0]
+
+
+def test_preflight_takes_a_pool_below_its_count_as_ok(denv):
+    preflight_ok(denv)
+    denv.scenario["answers"].insert(0, {"tool": "gpuctl", "has": ["status"], "rc": 0,
+                                        "stdout": "note: pool a6000: 0 of 1 running (make gpu-apply)\n"})
     assert denv.script("tunnel.sh", "start").returncode == 0
     r = preflight(denv)
     assert r.returncode == 0, r.stdout
-    assert re.search(r"^OK +gpuctl status.*drift.*make gpu-apply", r.stdout, re.M), r.stdout
+    assert re.search(r"^OK +gpuctl status", r.stdout, re.M), r.stdout
+
+
+def test_preflight_redacts_what_it_prints(denv):
+    preflight_ok(denv)
+    denv.scenario["answers"].insert(0, {"tool": "gpuctl", "has": ["sync-peers"],
+                                        "stdout": f"operator {OPERATOR_IP}/32\njoin {K3S_TOKEN}\n"
+                                                  f"state gs://{PROJECT}-k3s-tfstate\n"})
+    assert denv.script("tunnel.sh", "start").returncode == 0
+    r = preflight(denv)
+    assert r.returncode == 0, r.stdout
+    out = r.stdout + r.stderr
+    assert OPERATOR_IP not in out and K3S_TOKEN not in out and PROJECT not in out
+    for masked in ("operator <operator_ip>/32", "join <redacted>", "gs://<GCP_PROJECT>-k3s-tfstate"):
+        assert masked in r.stdout, (masked, r.stdout)
+
+
+def test_preflight_fails_when_the_operator_ip_cannot_be_masked(denv):
+    denv.write_demo_env(operator_ip="")          # and checkip (the curl stub) fails
+    preflight_ok(denv)
+    assert denv.script("tunnel.sh", "start").returncode == 0
+    r = preflight(denv)
+    assert r.returncode == 1, r.stdout
+    fails = [line for line in r.stdout.splitlines() if line.startswith("FAIL")]
+    assert len(fails) == 1 and "operator" in fails[0] and "OPERATOR_IP" in fails[0], r.stdout
 
 
 def test_preflight_fails_when_the_tunnel_cannot_start(denv):

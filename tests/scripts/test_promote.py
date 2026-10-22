@@ -1074,3 +1074,106 @@ def test_a_failed_rename_in_a_verify_promotion_keeps_the_demo(repo, tmp_path):
     assert r.returncode == 1, r.stderr
     assert snapshot(repo / "verification/final/demo") == demo
     assert (repo / "verification/final/99-old.txt").exists()
+
+
+# --- promote.sh demo: the GCP project id and failed chapters (Task 25 fix round 1) --------------
+
+DEMO_PROJECT = "k3s-demo-123456"
+
+
+def no_project_env(**extra):
+    return {**{k: v for k, v in os.environ.items() if k not in ("GCP_PROJECT", "PROMOTE_ALLOW_FAIL")}, **extra}
+
+
+@pytest.mark.parametrize("text", [f"state in gs://{DEMO_PROJECT}-k3s-tfstate/workers\n",
+                                  f"k3s-worker@{DEMO_PROJECT.upper()}.iam.gserviceaccount.com\n"])
+def test_promote_demo_fails_on_the_project_id_and_changes_nothing(repo, text):
+    before = previous_final(repo)
+    make_demo(repo, files={**DEMO_FILES, "ch6.txt": "--- [ch6.1] plan\n" + text})
+    r = promote_demo(repo, env=no_project_env(GCP_PROJECT=DEMO_PROJECT))
+    assert r.returncode == 1, r.stderr
+    assert snapshot(repo / "verification/final") == before
+    assert verification_entries(repo) == [".gitkeep", DEMO_TS, "final"]
+    assert "ch6.txt" in r.stderr and "ch1.txt" not in r.stderr and "GCP_PROJECT" in r.stderr
+    assert DEMO_PROJECT not in (r.stdout + r.stderr).lower()
+
+
+def test_promote_demo_reads_the_project_id_from_env_file(repo):
+    before = previous_final(repo)
+    (repo / ".env").write_text(f"GCP_PROJECT={DEMO_PROJECT}\n")
+    (repo / ".env").chmod(0o600)
+    make_demo(repo, files={**DEMO_FILES, "ch8.txt": f"make down destroys, in GCP project {DEMO_PROJECT}:\n"})
+    r = promote_demo(repo, env=no_project_env())
+    assert r.returncode == 1, r.stderr
+    assert snapshot(repo / "verification/final") == before
+    assert "ch8.txt" in r.stderr
+
+
+def test_promote_demo_without_a_project_id_warns_and_promotes(repo):
+    run = make_demo(repo)
+    r = promote_demo(repo, env=no_project_env())
+    assert r.returncode == 0, r.stderr
+    assert snapshot(repo / "verification/final/demo") == snapshot(run)
+    assert "WARNING" in r.stderr and "project" in r.stderr
+
+
+def test_promote_demo_with_a_masked_project_id_promotes(repo):
+    run = make_demo(repo, files={**DEMO_FILES, "ch6.txt": "state in gs://<GCP_PROJECT>-k3s-tfstate\n"})
+    r = promote_demo(repo, env=no_project_env(GCP_PROJECT=DEMO_PROJECT))
+    assert r.returncode == 0, r.stderr
+    assert snapshot(repo / "verification/final/demo") == snapshot(run)
+
+
+def test_promote_demo_refuses_a_project_id_that_is_not_one(repo):
+    before = previous_final(repo)
+    make_demo(repo)
+    r = promote_demo(repo, env=no_project_env(GCP_PROJECT="Not A Project"))
+    assert r.returncode == 2, r.stderr
+    assert snapshot(repo / "verification/final") == before
+
+
+def test_a_verify_promotion_refuses_a_kept_demo_with_the_project_id(repo):
+    demo_in_final(repo)
+    (repo / "verification/final/demo/ch6.txt").write_text(f"gs://{DEMO_PROJECT}-k3s-tfstate\n")
+    before = snapshot(repo / "verification/final")
+    make_run(repo)
+    r = promote(repo, "verify", f"verification/{TS}", env=no_project_env(GCP_PROJECT=DEMO_PROJECT))
+    assert r.returncode == 1, r.stderr
+    assert snapshot(repo / "verification/final") == before
+    assert "final/demo" in r.stderr and "GCP_PROJECT" in r.stderr
+    assert DEMO_PROJECT not in r.stdout + r.stderr
+
+
+FAILED_TIMINGS = ("ch1 120s (commands 40s; 3 step(s), 0 failed, 0 skipped) Architecture\n"
+                  "ch3 60s (commands 30s; 1 step(s), 1 failed, 0 skipped) Cross-node connectivity matrix (B1)\n"
+                  "total 180s; chapters 1-6: 3m00s (target 25 min)\n")
+INTERRUPTED_TIMINGS = ("ch1 120s (commands 40s; 3 step(s), 0 failed, 0 skipped) Architecture\n"
+                       "ch3 interrupted after 12s\n")
+
+
+@pytest.mark.parametrize("timings", [FAILED_TIMINGS, INTERRUPTED_TIMINGS], ids=["failed", "interrupted"])
+def test_promote_demo_refuses_a_run_with_a_failed_chapter(repo, timings):
+    before = previous_final(repo)
+    make_demo(repo, files={**DEMO_FILES, "timings.txt": timings})
+    r = promote_demo(repo, env=no_project_env())
+    assert r.returncode == 2, r.stderr
+    assert snapshot(repo / "verification/final") == before
+    assert "ch3" in r.stderr and "ch1" not in r.stderr and "PROMOTE_ALLOW_FAIL=1" in r.stderr
+    assert verification_entries(repo) == [".gitkeep", DEMO_TS, "final"]
+
+
+def test_promote_demo_promotes_a_failed_chapter_with_promote_allow_fail(repo):
+    run = make_demo(repo, files={**DEMO_FILES, "timings.txt": FAILED_TIMINGS})
+    r = promote_demo(repo, env=no_project_env(PROMOTE_ALLOW_FAIL="1"))
+    assert r.returncode == 0, r.stderr
+    assert snapshot(repo / "verification/final/demo") == snapshot(run)
+    assert "WARNING" in r.stderr and "ch3" in r.stderr
+
+
+def test_promote_demo_takes_a_run_whose_chapters_all_passed(repo):
+    timings = ("ch1 120s (commands 40s; 3 step(s), 0 failed, 1 skipped) Architecture\n"
+               "total 120s; chapters 1-6: 2m00s (target 25 min)\n")
+    run = make_demo(repo, files={**DEMO_FILES, "timings.txt": timings})
+    r = promote_demo(repo, env=no_project_env())
+    assert r.returncode == 0, r.stderr
+    assert snapshot(repo / "verification/final/demo") == snapshot(run)

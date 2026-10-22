@@ -7,7 +7,8 @@
 #                      (a relative VERIFICATION_FINAL is read from the repository root); exit 1 without one
 #   demo.sh reset      delete what the demo creates (limits-demo Pods, the np-denied namespace, the gpu-test
 #                      Pods by name and the gpu-hold Pods by label, the stretch load Job), then scale the CPU
-#                      pool back to 1 worker (AUTO_APPROVE=1 scripts/cpu-pool.sh scale 1 --guarded)
+#                      pool back to 1 worker (AUTO_APPROVE=1 scripts/cpu-pool.sh scale 1 --guarded); a Ctrl-C
+#                      lets the running command stop, then ends the reset (exit 130)
 #   demo.sh list       the chapters, what each shows and its estimated length
 #   demo.sh --source-only   (sourced) load the functions only, for the tests
 #
@@ -17,10 +18,14 @@
 # check: in a subshell (a check's exit, its set -e failure and the INT/TERM traps _vr_on_signal sets end there,
 # not in the demo), with stdin from /dev/null, its stdout and stderr through redact and then tee (screen safety:
 # nothing reaches the screen or a recording unredacted), and with its cleanup messages (_vr_tell) on the
-# terminal and in the recording. The operator's public IP is found first (vr_operator_ip), so it is masked too.
+# terminal and in the recording. The operator's public IP and the GCP project id are found first
+# (screen_masks, scripts/lib/screen.sh), so they are masked too, as <operator_ip> and <GCP_PROJECT>; when
+# the IP cannot be found the demo does not start (exit 2) unless DEMO_ALLOW_UNMASKED_IP=1. The filter and tee
+# ignore SIGINT and end when the step does: a Ctrl-C stops the step's command, never them first (which would
+# kill terraform, cpu-pool.sh or down.sh by SIGPIPE while they stop gracefully); then the demo stops.
 # A failed step does not stop the demo: it names the fallback, make demo-replay CHAPTER=n, and the demo goes
 # on; a check that SKIPs (no GPU node) says so. The exit status is 1 when a step failed, 2 for an unknown
-# chapter (nothing has run then), 0 otherwise.
+# chapter or an operator IP that cannot be masked (nothing has run then), 0 otherwise.
 #
 # Recordings: verification/demo-<YYYY-MM-DDTHHMM-0700>/chN.txt (what was on the screen for chapter N) and
 # timings.txt (each chapter's wall time, pauses included, and its command time; then the total of chapters 1-6,
@@ -32,16 +37,21 @@
 # Chapter 6 (Ruling R63): a read-only terraform plan of the workers stack with the inventory scaled to 2 (what
 # scaling adds); AUTO_APPROVE=1 scripts/cpu-pool.sh scale 2 --guarded in the background (its own session, so
 # a Ctrl-C of the demo does not stop a terraform apply half way; its log goes to ch6.txt, redacted, once it is
-# done, and meanwhile to .run/demo-scale.log), while kubectl get nodes -w shows the new node join, for at most
-# DEMO_SCALE_TIMEOUT_S (default 900) seconds; then AUTO_APPROVE=1 scripts/cpu-pool.sh scale 1 --guarded; then
-# scripts/gpuctl plan --set-count <pool>=2, the pool being the first in lambda/gpu-nodes.yaml. Chapter 8:
-# gpuctl plan --set-count <pool>=0 and the last lines of terraform plan -destroy of the workers stack, then it
-# asks whether to run make down for real; only y or yes runs it (never under DEMO_NO_PAUSE=1).
+# done, or as far as it got when the wait gives up, and meanwhile to .run/demo-scale.log), while kubectl get
+# nodes -w shows the new node join, for at most DEMO_SCALE_TIMEOUT_S (default 900) seconds; then
+# AUTO_APPROVE=1 scripts/cpu-pool.sh scale 1 --guarded; then scripts/gpuctl plan --set-count <pool>=2, the
+# pool being the first in lambda/gpu-nodes.yaml. Chapter 8: gpuctl plan --set-count <pool>=0 and the last
+# lines of terraform plan -destroy of the workers stack, then it asks whether to run make down for real: y or
+# yes, then the GCP project id typed without echo (make down's own confirmation, asked here so the id never
+# shows), runs AUTO_APPROVE=1 scripts/down.sh; anything else runs nothing (never asked under DEMO_NO_PAUSE=1;
+# a caller's AUTO_APPROVE skips neither question).
 set -euo pipefail
 
-# checks.sh (and common.sh) are linted on their own; pre-commit runs shellcheck without -x.
+# checks.sh (and common.sh) and screen.sh are linted on their own; pre-commit runs shellcheck without -x.
 # shellcheck disable=SC1091
 source "$(dirname -- "${BASH_SOURCE[0]}")/lib/checks.sh"
+# shellcheck disable=SC1091
+source "$(dirname -- "${BASH_SOURCE[0]}")/lib/screen.sh"
 
 DEMO_CHAPTERS_ALL=(1 2 3 4 5 6 7 8)
 # Seconds between two looks at the background scale of chapter 6.
@@ -136,15 +146,25 @@ demo_replay() {
   [[ "$final" == /* ]] || final="$REPO_ROOT/$final"
   file="$final/demo/ch$n.txt"
   [[ -f "$file" ]] || die "no recording for chapter $n ($file; make promote-demo RUN=verification/demo-<ts> records one)" 1
-  # Recordings were redacted when they were made; once more, as everything the demo puts on the screen.
+  # Recordings were redacted when they were made; once more, as everything the demo puts on the screen, with
+  # the operator's IP and the project id as they are now (a recording made while the IP was unknown, or
+  # before it changed, may still hold it). An unknown IP is not masked here: replay is the fallback, so it
+  # plays anyway.
+  cd -- "$REPO_ROOT"
+  screen_masks
   redact <"$file"
 }
 
 # --- run: steps ------------------------------------------------------------------------------------
 
-# _demo_show: the screen and the chapter's recording, redacted (spec section 9.1, screen safety).
+# _demo_show: the screen and the chapter's recording, redacted (spec section 9.1, screen safety). Both
+# ignore SIGINT and end when the step closes the pipe (screen_filter in scripts/lib/screen.sh): a Ctrl-C
+# then cannot kill terraform, cpu-pool.sh or down.sh by SIGPIPE while they stop gracefully.
 _demo_show() {
-  redact | tee -a -- "$DEMO_FILE"
+  (
+    trap '' INT
+    redact | tee -a -- "$DEMO_FILE"
+  )
 }
 
 # demo_pause: wait for Enter on the demo's stdin (the terminal); DEMO_NO_PAUSE=1, or no more input, goes on.
@@ -346,8 +366,14 @@ demo_scale_up() {
   done
   _vr_stop "$watch"
   if [[ ! -s "$rcfile" ]]; then
-    echo "cpu-pool.sh scale $n has not finished after ${timeout}s; it goes on in the background (its log:"
-    echo ".run/demo-scale.log). Once it is done, make demo-reset scales the pool back to 1."
+    # The log so far goes to the recording; the file itself stays, and the scale goes on writing to it.
+    {
+      printf -- '--- the log so far of AUTO_APPROVE=1 scripts/cpu-pool.sh scale %s --guarded (still running) ---\n' "$n"
+      cat -- "$logfile"
+      printf -- '--- the rest is in .run/demo-scale.log ---\n'
+    } | redact >>"$DEMO_FILE"
+    echo "cpu-pool.sh scale $n has not finished after ${timeout}s; it goes on in the background (its log so far"
+    echo "is in ch$DEMO_CH.txt, all of it in .run/demo-scale.log). Once it is done, make demo-reset scales the pool back to 1."
     return 1
   fi
   rc="$(head -n 1 -- "$rcfile")"
@@ -404,35 +430,50 @@ demo_destroy_summary() {
   (tf_init workers) || return 1
   echo "\$ terraform -chdir=infra/workers plan -destroy -input=false -lock-timeout=120s -no-color | tail -n $DEMO_TAIL_LINES"
   set +e
+  # tail ignores SIGINT, as _demo_show does: a Ctrl-C must not kill the plan (it holds the state lock) by SIGPIPE.
   terraform -chdir=infra/workers plan -destroy -input=false -lock-timeout=120s -no-color 2>&1 \
-    | tail -n "$DEMO_TAIL_LINES"
+    | (
+      trap '' INT
+      tail -n "$DEMO_TAIL_LINES"
+    )
   status=("${PIPESTATUS[@]}")
   set -e
   return "${status[0]}"
 }
 
-# demo_ask_down: ask whether to run make down now; only y or yes runs it, in the foreground with the demo's
-# stdin (it asks for the GCP project id itself) and its output redacted. Never asked under DEMO_NO_PAUSE=1.
+# demo_ask_down: ask whether to run make down now. Only y or yes, then the GCP project id (GCP_PROJECT in
+# .env) typed without echo, runs it: make down's own confirmation, asked by the demo so the id never shows
+# on the screen (down.sh's prompt would echo it). Then AUTO_APPROVE=1 scripts/down.sh runs in the
+# foreground, no stdin, its output redacted. A caller's AUTO_APPROVE never skips either question. Never
+# asked under DEMO_NO_PAUSE=1.
 demo_ask_down() {
-  local answer="" rc=0 started
+  local answer="" typed="" project rc=0 started
   if [[ "${DEMO_NO_PAUSE:-}" == 1 ]]; then
     demo_note "make down was not run (DEMO_NO_PAUSE=1: nobody to ask); run it by hand when you are done."
     return 0
   fi
-  printf 'Tear everything down now with make down (it asks for the GCP project id)? [y/N] ' >&2
+  printf 'Tear everything down now with make down? [y/N] ' >&2
   read -r answer || true
   if [[ ! "$answer" =~ ^([yY]|[yY][eE][sS])$ ]]; then
     demo_note "make down was not run; the cluster stays up."
+    return 0
+  fi
+  printf 'Type the GCP project id (GCP_PROJECT in .env; not shown as you type) to destroy everything: ' >&2
+  read -rs typed || true
+  printf '\n' >&2
+  project="$(screen_env_project)" || project=""
+  if [[ -z "$project" || "$typed" != "$project" ]]; then
+    demo_note "make down was not run: the answer was not the project id (GCP_PROJECT in .env); the cluster stays up."
     return 0
   fi
   DEMO_STEP=$((DEMO_STEP + 1))
   DEMO_STEPS=$((DEMO_STEPS + 1))
   {
     printf '\n--- [ch%s.%d] %s\n' "$DEMO_CH" "$DEMO_STEP" "make down: tear everything down"
-    printf '$ scripts/down.sh   # make down; type the GCP project id when it asks (its prompt shows after your answer)\n'
+    printf '$ AUTO_APPROVE=1 scripts/down.sh   # make down, confirmed above with the project id\n'
   } | _demo_show
   started=$SECONDS
-  scripts/down.sh 2>&1 | _demo_show || rc=$?
+  env AUTO_APPROVE=1 scripts/down.sh </dev/null 2>&1 | _demo_show || rc=$?
   DEMO_RUN_S=$((DEMO_RUN_S + SECONDS - started))
   _demo_outcome "$rc" "make down"
 }
@@ -493,10 +534,20 @@ demo_run() {
   (($# == 0)) || { usage; die "usage: run takes no arguments (CHAPTERS=1,3 picks the chapters)" 2; }
   chapters="$(parse_chapters "${CHAPTERS:-}")" || exit 2
   cd -- "$REPO_ROOT"
-  # Before the first redact starts: from here on the operator's IP is masked on the screen and in recordings.
-  if ! vr_operator_ip; then
-    log "warning: cannot determine the operator's public IP, so the screen and the recordings cannot mask it"
-    log "(set OPERATOR_IP in .env to the address gpuctl uses)"
+  # Before the first redact starts: from here on the operator's IP and the project id are masked on the
+  # screen and in the recordings. Without the IP (Lambda's operator rule shows it) the demo does not start.
+  screen_masks
+  if ((!SCREEN_IP_MASKED)); then
+    if [[ "${DEMO_ALLOW_UNMASKED_IP:-}" != 1 ]]; then
+      log "cannot determine the operator's public IP (OPERATOR_IP in .env is empty or not an IPv4 address, and"
+      log "checkip.amazonaws.com did not answer), so the screen and the recordings could not mask it."
+      log "Set OPERATOR_IP in .env to the address gpuctl uses and run make preflight; DEMO_ALLOW_UNMASKED_IP=1 runs anyway."
+      exit 2
+    fi
+    log "warning: the operator's public IP is unknown and NOT masked on the screen or in the recordings (DEMO_ALLOW_UNMASKED_IP=1)"
+  fi
+  if ((!SCREEN_PROJECT_MASKED)); then
+    log "warning: GCP_PROJECT in .env is missing or not a project id, so the screen and the recordings cannot mask it"
   fi
   ts="${DEMO_TS:-$(TZ="$VR_TZ" date +%Y-%m-%dT%H%M%z)}"
   DEMO_DIR="$REPO_ROOT/verification/demo-$ts"
@@ -544,17 +595,27 @@ demo_run() {
 # RESET_FAILED and the reset goes on.
 _demo_reset_do() {
   local rc=0
-  (vr_cmd "$@") </dev/null 2>&1 | redact || rc=$?
+  (vr_cmd "$@") </dev/null 2>&1 | screen_filter || rc=$?
   if ((rc != 0)); then
     RESET_FAILED+=("$(_vr_quote "$@") (exit $rc)")
+  fi
+  # Ctrl-C: the command has stopped (the filter outlived it, so nothing was killed by SIGPIPE); no later one runs.
+  if ((RESET_INTERRUPTED)); then
+    log "demo-reset interrupted; re-run make demo-reset to finish"
+    exit 130
   fi
 }
 
 demo_reset() {
   (($# == 0)) || { usage; die "usage: reset takes no arguments" 2; }
   cd -- "$REPO_ROOT"
-  vr_operator_ip || true
+  screen_masks
+  if ((!SCREEN_IP_MASKED)); then
+    log "warning: cannot determine the operator's public IP, so the output cannot mask it (set OPERATOR_IP in .env)"
+  fi
   RESET_FAILED=()
+  RESET_INTERRUPTED=0
+  trap 'RESET_INTERRUPTED=1' INT
   echo "demo-reset: deleting what the demo created, then scaling the CPU pool back to 1"
   _demo_reset_do kc -n limits-demo delete pod oom cpu-burn --ignore-not-found --timeout=120s "$_VR_RT"
   _demo_reset_do kc delete namespace np-denied --ignore-not-found --timeout=120s "$_VR_RT"
@@ -567,7 +628,7 @@ demo_reset() {
   _demo_reset_do env AUTO_APPROVE=1 scripts/cpu-pool.sh scale 1 --guarded
   if ((${#RESET_FAILED[@]})); then
     log "demo-reset: failed (the rest ran; re-run make demo-reset once the cause is fixed):"
-    printf '  %s\n' "${RESET_FAILED[@]}" | redact >&2
+    printf '  %s\n' "${RESET_FAILED[@]}" | screen_filter >&2
     return 1
   fi
   echo "demo-reset: done"

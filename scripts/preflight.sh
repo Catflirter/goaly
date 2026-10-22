@@ -6,23 +6,32 @@
 #      flock (chapter 6's guarded cpu-pool.sh runs need it); each with its version
 #   2. gcloud auth list --filter=status:ACTIVE lists an account
 #   3. gcloud auth application-default print-access-token succeeds (its token is never printed)
-#   4. scripts/gpuctl status succeeds: the Lambda API key works and today's capacity is listed. Its exit 3
-#      (drift: the inventory wants a GPU node that is not there, as before make gpu-apply) counts as OK, with
-#      a note: the command itself worked
+#   4. scripts/gpuctl status exits 0: the Lambda API key works, today's capacity is listed and nothing drifts
+#      (a pool below its count, as before make gpu-apply, is only a note, exit 0). Its exit 3 is real drift
+#      (a firewall rule with no live instance, a GPU node not in the cluster, a stale node or peer, a pool
+#      over its count): a FAIL, which make gpu-apply or make gpu-down reconciles
 #   5. scripts/gpuctl sync-peers: the operator's current public IP (the demo's network may not be the usual
 #      one) goes into the Lambda firewall and k3s-cp's peer set
 #   6. scripts/tunnel.sh status; when the tunnel is not up, scripts/tunnel.sh start
 #   7. every node is Ready (and there is at least one)
+#   8. screen safety: the operator's public IP (OPERATOR_IP in .env, else checkip.amazonaws.com) and the GCP
+#      project id (GCP_PROJECT in .env) are known, so make demo can mask them (it refuses to start without
+#      the IP)
 #
 # Everything it prints goes through redact (scripts/lib/checks.sh), with the operator's public IP masked as
-# <operator_ip> (spec section 9.1, screen safety).
+# <operator_ip> and the GCP project id as <GCP_PROJECT> (scripts/lib/screen.sh; spec section 9.1, screen
+# safety). The filter ignores SIGINT, so a Ctrl-C lets the running command (sync-peers, tunnel.sh start)
+# stop cleanly instead of dying by SIGPIPE; the item it interrupted is the last one (exit 130).
 set -euo pipefail
 
 # checks.sh (and common.sh) are linted on their own; pre-commit runs shellcheck without -x.
 # shellcheck disable=SC1091
 source "$(dirname -- "${BASH_SOURCE[0]}")/lib/checks.sh"
+# shellcheck disable=SC1091
+source "$(dirname -- "${BASH_SOURCE[0]}")/lib/screen.sh"
 
 FAILS=0
+INTERRUPTED=0
 
 ok() {
   printf 'OK   %s\n' "$*"
@@ -118,7 +127,7 @@ check_gpuctl() {
   scripts/gpuctl status </dev/null || rc=$?
   case "$rc" in
     0) ok "gpuctl status: the Lambda API answers; capacity above" ;;
-    3) ok "gpuctl status: the Lambda API answers (exit 3: drift from the inventory; make gpu-apply reconciles it)" ;;
+    3) fail "gpuctl status (exit 3): drift, see the lines above; make gpu-apply or make gpu-down reconciles it" ;;
     *) fail "gpuctl status (exit $rc): the Lambda API key or the inventory check failed" ;;
   esac
   rc=0
@@ -165,13 +174,33 @@ check_nodes() {
   fi
 }
 
+check_screen() {
+  if ((SCREEN_IP_MASKED)); then
+    ok "screen safety: the operator IP is masked as <operator_ip> ($VR_OPERATOR_IP_FROM)"
+  else
+    fail "screen safety: the operator IP is unknown (set OPERATOR_IP in .env; checkip.amazonaws.com did not answer), so make demo cannot mask it"
+  fi
+  if ((SCREEN_PROJECT_MASKED)); then
+    ok "screen safety: the GCP project id is masked as <GCP_PROJECT>"
+  else
+    fail "screen safety: GCP_PROJECT in .env is missing or not a project id, so make demo cannot mask it"
+  fi
+}
+
 main() {
+  # Ctrl-C: the running item's command stops (the filter outlives it), then no later item runs.
+  trap 'INTERRUPTED=1' INT
   echo "preflight (spec section 9.1)"
   check_tools
-  check_gcloud
-  check_gpuctl
-  check_tunnel
-  check_nodes
+  if ((!INTERRUPTED)); then check_gcloud; fi
+  if ((!INTERRUPTED)); then check_gpuctl; fi
+  if ((!INTERRUPTED)); then check_tunnel; fi
+  if ((!INTERRUPTED)); then check_nodes; fi
+  if ((!INTERRUPTED)); then check_screen; fi
+  if ((INTERRUPTED)); then
+    echo "preflight interrupted"
+    return 130
+  fi
   if ((FAILS > 0)); then
     echo "preflight: $FAILS item(s) FAILED"
     return 1
@@ -180,10 +209,10 @@ main() {
 }
 
 cd -- "$REPO_ROOT"
-# Before redact starts: from then on the operator's public IP is masked in everything shown.
-vr_operator_ip || true
+# Before redact starts: from then on the operator's public IP and the project id are masked in everything shown.
+screen_masks
 set +e
-main "$@" 2>&1 | redact
+main "$@" 2>&1 | screen_filter
 status=("${PIPESTATUS[@]}")
 set -e
 ((status[1] == 0)) || exit 1
