@@ -19,8 +19,8 @@
 #      Every kubectl call is killed after DOWN_KC_KILL_S seconds (default 180), so a half-open tunnel
 #      cannot hang the teardown.
 #   4. terraform destroy -auto-approve -input=false for gpu-access, workers and base, in that order,
-#      each after tf_init and with the TF_VAR_* that tf_env sets. A stack with nothing in its state
-#      (never applied, or destroyed by an earlier run) destroys nothing and succeeds.
+#      each after tf_init and with the TF_VAR_* that tf_env sets. A stack whose state lists no
+#      resource (terraform state list; never applied, or destroyed by an earlier run) is skipped.
 #   5. scripts/tunnel.sh stop; remove .run/known_hosts_* (the GPU nodes' host keys) and the kubeconfig
 #      ~/.kube/hybrid-gpu.yaml: it is the admin credential of a cluster that no longer exists, and
 #      make up (make kubeconfig) writes a new one.
@@ -44,11 +44,24 @@
 #   - gpuctl down failed: the run asks Lambda (scripts/gpuctl list-nodes) whether any GPU node of this
 #     cluster is still live (see "Asking Lambda"). If one is, or Lambda cannot be asked, it stops
 #     before any destroy: a GPU node left running after gpu-access and base are gone keeps billing,
-#     outside the firewall model, with no cluster to join. If none is, the failure was in gpuctl down's firewall and peer step
-#     (on a re-run after the workers or base stack is destroyed, sync-peers cannot read their outputs,
-#     Ruling R29), which the destroys below make moot: the run goes on.
+#     outside the firewall model, with no cluster to join. If none is, the failure was in gpuctl down's
+#     firewall and peer step (a terraform or IAP error reading or writing them, Ruling R29), which the
+#     destroys below make moot: the run goes on.
 #   - a terraform init or destroy failed: the stacks after it are not touched (each one reads the base
 #     stack's state, so base goes last).
+#
+# Re-runs after a run that stopped between its destroys (Ctrl-C, network loss; minors 2b, D-3):
+#   - workers (and gpu-access) destroyed, base not: gpuctl down reads the emptied workers stack
+#     (terraform output -json prints {}) as no CPU workers; only a real terraform error reading it fails
+#     gpuctl down (Ruling R29), and then the workers destroy, which meets the same error, stops the run.
+#     The destroys skip the stacks whose state lists no resource and destroy base as usual. The workers'
+#     Nodes may still be listed (NotReady): their drains fail and are only warnings.
+#   - base destroyed, workers (or gpu-access) not, an order make down never leaves but a hand-run
+#     destroy can: gpuctl down finds the cluster gone (Ruling R54) and does not read the workers stack;
+#     the drains are skipped (no API server answers). A destroy that refreshes workers or gpu-access
+#     cannot evaluate their configuration without the base stack's outputs ("Unsupported attribute"),
+#     so once base's state lists no resource they are destroyed with -refresh=false (from the state as
+#     recorded); a state that cannot be listed is destroyed as usual.
 #
 # The Lambda API key reaches scripts/gpuctl only (it loads .env itself): it is unset here, as in up.sh.
 set -euo pipefail
@@ -218,13 +231,43 @@ drain_workers() {
   done <<< "$(printf '%s\n' "${workers[@]}" | sort -t- -k3,3n)"
 }
 
-# Step 4, for one stack.
+# stack_resources STACK: the resources in STACK's state, one address per line (data sources are not
+# resources: terraform_remote_state is read, not created, and a destroy removes it with the rest).
+# The caller has run tf_init. Fails when the state cannot be listed.
+stack_resources() {
+  local dir listed
+  dir="$(tf_dir "$1")" || exit
+  listed="$(terraform -chdir="$dir" state list)" || return 1
+  printf '%s\n' "$listed" | grep -Ev '^(module\.[^.[]+(\[[^]]*\])?\.)*data\.' || true
+}
+
+# base_destroyed: true when the base stack's state lists no resource. A state that cannot be listed is
+# not destroyed (not knowing is not "gone").
+base_destroyed() {
+  local resources
+  tf_init base
+  resources="$(stack_resources base)" || return 1
+  [[ -z "$resources" ]]
+}
+
+# Step 4, for one stack (see "Re-runs" in the header for the two cases below).
 destroy_stack() {
-  local stack="$1" dir rc=0
+  local stack="$1" dir rc=0 resources
+  local -a no_refresh=()
   log "==> terraform destroy $stack"
   dir="$(tf_dir "$stack")" || exit
   tf_init "$stack"
-  terraform -chdir="$dir" destroy -auto-approve -input=false || rc=$?
+  if resources="$(stack_resources "$stack")"; then
+    if [[ -z "$resources" ]]; then
+      log "$stack: nothing in its state (destroyed by an earlier run, or never applied); skipping terraform destroy"
+      return 0
+    fi
+    if [[ "$stack" != base ]] && base_destroyed; then
+      log "warning: the base stack is already destroyed but $stack is not: a destroy that refreshes $stack cannot evaluate its configuration without the base stack's outputs, so it is destroyed from its state as recorded (terraform destroy -refresh=false)"
+      no_refresh=(-refresh=false)
+    fi
+  fi
+  terraform -chdir="$dir" destroy -auto-approve -input=false ${no_refresh[@]+"${no_refresh[@]}"} || rc=$?
   (( rc == 0 )) \
     || die "terraform destroy failed for $stack (exit $rc): the stacks after it ($(stacks_after "$stack")) were not touched; fix the cause and re-run make down (it repeats every step; what is destroyed stays destroyed). 'Error acquiring the state lock' means another gpuctl or terraform run held this stack's state lock: re-run make down once that run has ended"
   log "$stack: destroyed"
