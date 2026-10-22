@@ -444,7 +444,7 @@ def test_d6_passing_body_with_a_failed_final_cleanup_is_a_fail(gpu):  # review C
     assert result == "FAIL", text
     assert "D6: gpu-overflow is Pending with 'Insufficient nvidia.com/gpu'" in text  # the body passed
     assert "cleanup FAILED (exit 1); may remain: the gpu-hold Pods" in text
-    assert f"kc {' '.join(D6_DROP)}" in text  # how to remove what may be left (F2-2)
+    assert D6_REMOVAL in text  # how to remove what may be left (F2-2)
     assert gpu_test_calls(gpu)[-2:] == [HOLD_DELETE, OVERFLOW_DELETE]
 
 
@@ -522,11 +522,22 @@ SMOKE_DROP = ["-n", "gpu-test", "delete", "pod", "gpu-smoke", "--ignore-not-foun
               "--request-timeout=60s"]
 VECTORADD_DROP = ["-n", "gpu-test", "delete", "pod", "vectoradd", "--ignore-not-found", "--wait=false",
                   "--request-timeout=60s"]
-D6_DROP = ["-n", "gpu-test", "delete", "pods", "--all", "--ignore-not-found", "--wait=false", "--request-timeout=60s"]
-INTERRUPTED = [  # (check, a call the check waits on, the answer that makes it wait, its interrupt cleanup)
-    ("check_d4_gpu_smoke", "{.status.phase}", kc("-n gpu-test get pod gpu-smoke", "phase", sleep=30), SMOKE_DROP),
-    ("check_d5_vectoradd", "{.status.phase}", kc("-n gpu-test get pod vectoradd", "phase", sleep=30), VECTORADD_DROP),
-    ("check_d6_overflow", "--for=condition=Ready", kc("-n gpu-test wait pod -l app=gpu-hold", sleep=30), D6_DROP),
+# D6's interrupt cleanup deletes the holders by their label and gpu-overflow by name, not every Pod in gpu-test (the
+# stretch gpu-burn workload runs there too: review F8-1). Two requests, so it is the function _vr_d6_drop.
+HOLD_DROP = ["-n", "gpu-test", "delete", "pod", "-l", "app=gpu-hold", "--ignore-not-found", "--wait=false",
+             "--request-timeout=60s"]
+OVERFLOW_DROP = ["-n", "gpu-test", "delete", "pod", "gpu-overflow", "--ignore-not-found", "--wait=false",
+                 "--request-timeout=60s"]
+D6_DROP = [HOLD_DROP, OVERFLOW_DROP]
+D6_REMOVAL = "bash -c 'source scripts/lib/checks.sh && vr_env && _vr_d6_drop'"
+INTERRUPTED = [  # (check, a call the check waits on, the answer that makes it wait, its interrupt cleanup's calls,
+    #               the cleanup as the operator is told it runs)
+    ("check_d4_gpu_smoke", "{.status.phase}", kc("-n gpu-test get pod gpu-smoke", "phase", sleep=30), [SMOKE_DROP],
+     f"kc {' '.join(SMOKE_DROP)}"),
+    ("check_d5_vectoradd", "{.status.phase}", kc("-n gpu-test get pod vectoradd", "phase", sleep=30),
+     [VECTORADD_DROP], f"kc {' '.join(VECTORADD_DROP)}"),
+    ("check_d6_overflow", "--for=condition=Ready", kc("-n gpu-test wait pod -l app=gpu-hold", sleep=30), D6_DROP,
+     "_vr_d6_drop"),
 ]
 LEFT_D6 = "may remain: the gpu-hold Pods (each holds a billed GPU) and gpu-overflow in namespace gpu-test"
 
@@ -566,25 +577,25 @@ def test_the_d_checks_use_the_one_redacted_operator_channel():
 
 
 @pytest.mark.parametrize("sig", [signal.SIGINT, signal.SIGTERM])
-@pytest.mark.parametrize("func, when, waits, drop", INTERRUPTED)
-def test_an_interrupted_d_check_deletes_its_gpu_pods_and_stops(gpu, func, when, waits, drop, sig):
+@pytest.mark.parametrize("func, when, waits, drops, said", INTERRUPTED)
+def test_an_interrupted_d_check_deletes_its_gpu_pods_and_stops(gpu, func, when, waits, drops, said, sig):
     """Ctrl-C (or a TERM) while D4-D6 wait: their Pods are deleted (a leftover gpu-hold, restartPolicy Always, keeps
     a billed GPU allocated), the operator sees it, the evidence records it, and the run stops by the signal."""
     gpu.first(waits)
     assert gpu.interrupt(func, when, sig) == -sig
-    assert gpu_test_calls(gpu)[-1] == drop, gpu.interrupted
+    assert gpu_test_calls(gpu)[-len(drops):] == drops, gpu.interrupted
     err, text = gpu.interrupted
     for out in (err, text):
-        assert f"interrupted ({sig.name}); cleaning up (at most 120 s): kc {' '.join(drop)}" in out
+        assert f"interrupted ({sig.name}); cleaning up (at most 120 s): {said}" in out
         assert "cleanup done" in out and "may remain" not in out
     assert "T: cleanup done" in err
 
 
 def test_a_second_ctrl_c_does_not_stop_the_gpu_cleanup(gpu):  # review F2-2
-    gpu.first(kc("-n gpu-test wait pod -l app=gpu-hold", sleep=30), kc(" ".join(D6_DROP[:5]), sleep=2))
+    gpu.first(kc("-n gpu-test wait pod -l app=gpu-hold", sleep=30), kc(" ".join(HOLD_DROP[:6]), "--wait=false", sleep=2))
     assert gpu.interrupt("check_d6_overflow", "--for=condition=Ready", signal.SIGINT,
                          again="--wait=false") == -signal.SIGINT
-    assert gpu_test_calls(gpu)[-1] == D6_DROP
+    assert gpu_test_calls(gpu)[-2:] == D6_DROP
     err, text = gpu.interrupted
     for out in (err, text):
         assert "cleanup done" in out and "FAILED" not in out
@@ -592,19 +603,49 @@ def test_a_second_ctrl_c_does_not_stop_the_gpu_cleanup(gpu):  # review F2-2
 
 def test_a_failed_gpu_cleanup_after_ctrl_c_says_what_may_remain_and_how_to_remove_it(gpu):  # review F2-2
     gpu.first(kc("-n gpu-test wait pod -l app=gpu-hold", sleep=30),
-              kc(" ".join(D6_DROP[:5]), rc=1, stderr="Unable to connect to the server: dial tcp 127.0.0.1:6443\n"))
+              kc(" ".join(HOLD_DROP[:6]), "--wait=false", rc=1,
+                 stderr="Unable to connect to the server: dial tcp 127.0.0.1:6443\n"))
     assert gpu.interrupt("check_d6_overflow", "--for=condition=Ready", signal.SIGINT) == -signal.SIGINT
+    # the holders' delete failed: gpu-overflow is still deleted
+    assert gpu_test_calls(gpu)[-2:] == D6_DROP
     err, text = gpu.interrupted
     for out in (err, text):
         assert f"cleanup FAILED (exit 1); {LEFT_D6}" in out
-        assert ("to remove it, run from the repository root: bash -c 'source scripts/lib/checks.sh && vr_env && "
-                f"kc {' '.join(D6_DROP)}'") in out
+        assert f"to remove it, run from the repository root: {D6_REMOVAL}" in out
     # the command it names, run in a child shell, does the cleanup once the API answers again
     cmd = next(line for line in err.splitlines() if "to remove it" in line).split("repository root: ", 1)[1]
     gpu.scenario["answers"] = gpu_answers()
     r = gpu.run(["bash", "-c", cmd])
     assert r.returncode == 0, r.stderr
-    assert gpu.kubectl()[-1] == D6_DROP
+    assert gpu.kubectl()[-2:] == D6_DROP
+    assert_d6_deletes_only_its_own_pods(gpu)
+
+
+def assert_d6_deletes_only_its_own_pods(env):
+    """Every delete D6 makes in gpu-test names its holders (label app=gpu-hold) or gpu-overflow: another Pod there
+    (the stretch gpu-burn workload) survives D6, its interrupt and the removal command (review F8-1)."""
+    deletes = [a for a in gpu_test_calls(env) if "delete" in a]
+    assert deletes
+    for a in deletes:
+        assert "--all" not in a and "pods" not in a, a
+        assert a[3:6] == ["pod", "-l", "app=gpu-hold"] or a[3:5] == ["pod", "gpu-overflow"], a
+
+
+@pytest.mark.parametrize("sig", [signal.SIGINT, signal.SIGTERM])
+def test_an_interrupted_d6_leaves_other_pods_in_gpu_test_alone(gpu, sig):  # review F8-1
+    gpu.first(kc("-n gpu-test wait pod -l app=gpu-hold", sleep=30))
+    assert gpu.interrupt("check_d6_overflow", "--for=condition=Ready", sig) == -sig
+    assert_d6_deletes_only_its_own_pods(gpu)
+    err, _ = gpu.interrupted
+    # the operator sees which Pods the cleanup deletes
+    assert f"$ kc {' '.join(HOLD_DROP)}" in err and f"$ kc {' '.join(OVERFLOW_DROP)}" in err
+
+
+def test_a_passing_d6_leaves_other_pods_in_gpu_test_alone(gpu):  # review F8-1
+    result, text = gpu.check("check_d6_overflow")
+    assert result == "PASS", text
+    assert_d6_deletes_only_its_own_pods(gpu)
+    assert "delete pods --all" not in (ROOT / "scripts/lib/checks.sh").read_text()
 
 
 def run_d6(env):
@@ -624,7 +665,7 @@ def test_a_failed_final_gpu_cleanup_is_told_to_the_operator_with_the_removal_com
     proc, text = run_d6(gpu)
     for out in (proc.stderr, text):
         assert f"cleanup FAILED (exit 1); {LEFT_D6}" in out
-        assert f"bash -c 'source scripts/lib/checks.sh && vr_env && kc {' '.join(D6_DROP)}'" in out
+        assert D6_REMOVAL in out
     assert "T: cleanup FAILED" in proc.stderr
 
 
@@ -642,7 +683,8 @@ def test_d_evidence_is_redacted(gpu):
 
 def test_what_an_interrupted_d_check_tells_the_operator_is_redacted(gpu):
     gpu.first(kc("-n gpu-test wait pod -l app=gpu-hold", sleep=30),
-              kc(" ".join(D6_DROP[:5]), rc=1, stderr=f"error: dial tcp {OPERATOR}:6443: bootstrap {TOKEN}\n"))
+              kc(" ".join(HOLD_DROP[:6]), "--wait=false", rc=1,
+                 stderr=f"error: dial tcp {OPERATOR}:6443: bootstrap {TOKEN}\n"))
     assert gpu.interrupt("check_d6_overflow", "--for=condition=Ready", signal.SIGINT) == -signal.SIGINT
     err, text = gpu.interrupted
     for out in (err, text):

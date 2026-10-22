@@ -1727,6 +1727,17 @@ _vr_d6_cleanup() {
   return "$rc"
 }
 
+# _vr_d6_drop: D6's interrupt cleanup, and the command printed to run it by hand: the same Pods as
+# _vr_d6_cleanup (the holders by their label, gpu-overflow by name), without the wait. Never every Pod in
+# gpu-test: the stretch gpu-burn workload runs there too (review F8-1). Both deletes run (each bounded by
+# $_VR_RT); it fails if either fails.
+_vr_d6_drop() {
+  local rc=0
+  vr_cmd kc -n gpu-test delete pod -l app=gpu-hold --ignore-not-found --wait=false "$_VR_RT" || rc=1
+  vr_cmd kc -n gpu-test delete pod gpu-overflow --ignore-not-found --wait=false "$_VR_RT" || rc=1
+  return "$rc"
+}
+
 _vr_d6() {
   local out n alloc total=0 i running phase uid events window VR_RT
   out="$(vr_cap kc get nodes -l "$_VR_GPU_LABEL" "$_VR_RT" \
@@ -1782,9 +1793,8 @@ _vr_d6() {
 # label) and gpu-overflow are deleted before and after.
 check_d6_overflow() {
   _vr_gpu_nodes || return
-  # On an interrupt one request deletes them all: gpu-test holds only the D checks' Pods.
   _vr_gpu_guarded "the gpu-hold Pods (each holds a billed GPU) and gpu-overflow in namespace gpu-test" \
-    _vr_d6 _vr_d6_cleanup kc -n gpu-test delete pods --all --ignore-not-found --wait=false "$_VR_RT"
+    _vr_d6 _vr_d6_cleanup _vr_d6_drop
 }
 
 # --- run summary --------------------------------------------------------------------------------
