@@ -100,6 +100,12 @@ lint: ## Run all pre-commit hooks, the repo secret scan, the Terraform tests, th
 verify: ## Run verification checks A-D (RESILIENCE=1 adds E) into verification/<timestamp>/
 	$(ROOT)/scripts/verify.sh
 
+# RUN is a path to the run, as the shell sees it from where make runs (make -C <repo> for a repo-relative one).
+.PHONY: promote-verify
+promote-verify: ## Copy a verify run to verification/final/ if gitleaks finds no secrets (make promote-verify RUN=verification/<ts>)
+	@[ -n "$(RUN)" ] || { echo "usage: make promote-verify RUN=verification/<YYYY-MM-DDTHHMM-0700>" >&2; exit 2; }
+	$(ROOT)/scripts/promote.sh verify "$(RUN)"
+
 # AUTO_APPROVE=1 (or yes/true) skips the confirmation prompt of gpu-apply and gpu-down.
 GPU_AUTO_APPROVE := $(if $(filter 1 yes true,$(AUTO_APPROVE)), --auto-approve)
 
