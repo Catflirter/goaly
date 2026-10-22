@@ -1,9 +1,11 @@
 #!/usr/bin/env bash
 # make verify: run the registered checks into verification/<YYYY-MM-DDTHHMM-0700>/ (spec section 9).
 #
-#   scripts/verify.sh [GROUP…]   GROUP is A, B, C, D or E; groups run in the order given
+#   scripts/verify.sh [GROUP…]   GROUP is A, B, C, D or E (S with STRETCH=1); groups run in the order given
 #
-# Without arguments it runs A B C D, plus E when RESILIENCE=1 (E reboots nodes; slow and costly).
+# Without arguments it runs A B C D, plus S when STRETCH=1 (the stretch checks: S0 the monitoring stack,
+# spec §10.0), plus E when RESILIENCE=1 (E reboots nodes; slow and costly). Without STRETCH=1 group S
+# does not exist: no S check is registered and the run is exactly the core one.
 # Exit status: 0 when no check failed (SKIP is not a failure) and gitleaks found nothing in the
 # run directory, 1 otherwise, 2 for an unknown group or when the run directory already holds files (a
 # second run in the same minute: its name has minute resolution; wait and run again).
@@ -14,6 +16,9 @@ set -euo pipefail
 source "$(dirname -- "${BASH_SOURCE[0]}")/lib/checks.sh"
 
 VR_GROUPS=(A B C D E)
+if [[ "${STRETCH:-0}" == 1 ]]; then
+  VR_GROUPS+=(S)
+fi
 VR_REG_GROUP=()
 VR_REG_ID=()
 VR_REG_TITLE=()
@@ -58,17 +63,28 @@ register_check D D3 'Device plugin registered' check_d_pending
 register_check D D4 'gpu-smoke: nvidia-smi' check_d_pending
 register_check D D5 'vectoradd: Test PASSED' check_d_pending
 register_check D D6 'gpu-overflow stays Pending' check_d_pending
+# Stretch checks (group S), registered only with STRETCH=1 (make verify STRETCH=1). S0: stretch S0b;
+# S1 (check_s1_hpa) is added by stretch S1.
+if [[ "${STRETCH:-0}" == 1 ]]; then
+  register_check S S0 'Monitoring: scrape targets up, DCGM data on GPU nodes, Grafana healthy' check_s0_metrics
+fi
 # --- end of registered checks ---
 
 main() {
   local groups=("$@") group i ran
   if (($# == 0)); then
     groups=(A B C D)
+    if [[ "${STRETCH:-0}" == 1 ]]; then
+      groups+=(S)
+    fi
     if [[ "${RESILIENCE:-0}" == 1 ]]; then
       groups+=(E)
     fi
   fi
   for group in "${groups[@]}"; do
+    if [[ "$group" == S && " ${VR_GROUPS[*]} " != *" S "* ]]; then
+      die "check group S (the stretch checks) needs STRETCH=1: make verify STRETCH=1" 2
+    fi
     [[ " ${VR_GROUPS[*]} " == *" $group "* ]] \
       || die "unknown check group '$group' (groups: ${VR_GROUPS[*]})" 2
   done

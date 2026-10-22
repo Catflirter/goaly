@@ -13,12 +13,14 @@
 #   vr_finish                       write the totals, scan the run with gitleaks; 1 on any FAIL or leak
 #
 # The check functions check_<id>_<name> (A–C: Task 18; D: Task 21, a SKIP placeholder until then; E:
-# Task 22) are registered in scripts/verify.sh; the demo (Task 25) calls them directly. Each returns 0
+# Task 22; S, the stretch checks, only with STRETCH=1: S0 stretch S0b) are registered in
+# scripts/verify.sh; the demo (Task 25) calls them directly. Each returns 0
 # (PASS), 1 (FAIL) or 77 (SKIP); one that cannot read .env exits 2 (a FAIL), so call it in a subshell.
 # Every command a check runs goes through vr_cmd, vr_cap or vr_bg, so its evidence shows what ran
 # (node_external_ip, probe_on and echo_on appear by name; their kubectl queries are in common.sh;
 # so do cp_resolve and _worker_zone, the SSH zone lookups from Terraform outputs).
-# The offline tests set VR_NO_WAIT=1 (no fixed sleeps) and VR_PF_PORT (C3's local port).
+# The offline tests set VR_NO_WAIT=1 (no fixed sleeps), VR_PF_PORT (C3's local port) and
+# VR_S0_PROM_PORT / VR_S0_GRAFANA_PORT (S0's).
 # Rules for check functions:
 #   - bound every wait (kubectl wait --timeout=…, curl --max-time …): run_check has no timeout of its own;
 #     kubectl exec runs under kc_within SECONDS and other network calls under bounded SECONDS;
@@ -1430,6 +1432,190 @@ check_c8_netpol() {
 check_d_pending() {
   echo "D: the GPU checks D1-D6 are added by Task 21; skipped until then"
   return 77
+}
+
+# --- S: stretch (make verify STRETCH=1; spec §10.0) ---------------------------------------------
+
+# The admin-only label of a GPU node (join-node.sh sets it); the DCGM exporter runs on these nodes only.
+VR_GPU_LABEL='node-restriction.kubernetes.io/accelerator=nvidia'
+# How long S0 waits (wall clock, vr_retry) for the scrape targets, for DCGM data (its Pod is Ready about
+# 45 s after it starts, then one 15 s scrape) and for Grafana's health.
+VR_S0_TARGETS_WAIT_S=120
+VR_S0_DCGM_WAIT_S=180
+VR_S0_GRAFANA_WAIT_S=60
+VR_S0_UP_QUERY='up{job=~"node-exporter|kube-state-metrics"}'
+
+# _vr_s0_forward LOG SVC LOCAL REMOTE: kubectl port-forward svc/SVC in namespace monitoring on
+# 127.0.0.1:LOCAL only (C3's pattern: vr_bg, wait for "Forwarding from", at most 30 s); VR_S0_PF is
+# its PID, which _vr_s0_unforward stops. Prometheus and Grafana have no other way in (spec §10.0; the
+# API server's service proxy is blocked by the namespace's default-deny NetworkPolicy, S0a).
+_vr_s0_forward() {
+  vr_bg "$1" kc -n monitoring port-forward --address 127.0.0.1 "svc/$2" "$3:$4"
+  VR_S0_PF="$VR_BG_PID"
+  _vr_wait_text "$1" "Forwarding from 127.0.0.1:$3" "$VR_S0_PF" 30
+}
+
+# _vr_s0_unforward LOG SVC: stop the port-forward and show its output.
+_vr_s0_unforward() {
+  _vr_stop "$VR_S0_PF"
+  echo "S0: $2 port-forward stopped"
+  _vr_show "$1" "port-forward svc/$2"
+}
+
+# _vr_s0_query PORT QUERY: the JSON of a Prometheus instant query (through the port-forward).
+_vr_s0_query() {
+  vr_cap --no-echo curl -fsS -m 5 --get --data-urlencode "query=$2" "http://127.0.0.1:$1/api/v1/query"
+}
+
+# _vr_s0_result JSON JQ: the lines JQ makes of each series of a successful query; fails (with the
+# reason) on an error status or anything that is not a query result.
+_vr_s0_result() {
+  jq -r 'if .status == "success" and (.data.result | type) == "array" then .data.result[] | '"$2"'
+         else error("Prometheus answered status \(.status // "?"): \(.error // "no result")") end' <<< "$1"
+}
+
+# _vr_s0_targets PORT: S0 ①, one attempt: every node-exporter and kube-state-metrics target is up (1),
+# kube-state-metrics has one, and every node in VR_NODES has an up node-exporter target. A node whose
+# node-exporter Pod is not Running has no target at all (Prometheus discovers Running Pods only), which
+# is why each node is looked for by name.
+_vr_s0_targets() {
+  local json lines job node inst val ksm=0 bad=0 n
+  local -a ne=()
+  json="$(_vr_s0_query "$1" "$VR_S0_UP_QUERY")" || return 1
+  lines="$(_vr_s0_result "$json" '"\(.metric.job) \(.metric.node // "-") \(.metric.instance // "-") \(.value[1])"')" \
+    || { echo "S0 ①: not a usable Prometheus answer"; return 1; }
+  echo "S0 ①: targets (job node instance up):"
+  [[ -n "$lines" ]] || echo "  (none)"
+  while read -r job node inst val; do
+    [[ -n "$job" ]] || continue
+    echo "  $job $node $inst $val"
+    if [[ "$val" != 1 ]]; then
+      echo "S0 ①: $job target $inst (node $node) is down (up=$val)"
+      bad=1
+    elif [[ "$job" == kube-state-metrics ]]; then
+      ksm=$((ksm + 1))
+    elif [[ "$job" == node-exporter ]]; then
+      ne+=("$node")
+    fi
+  done <<< "$lines"
+  ((ksm > 0)) || { echo "S0 ①: no kube-state-metrics target is up"; bad=1; }
+  for n in "${VR_NODES[@]}"; do
+    _vr_in "$n" ${ne[@]+"${ne[@]}"} || { echo "S0 ①: no node-exporter target up on node $n"; bad=1; }
+  done
+  return "$bad"
+}
+
+# _vr_s0_dcgm PORT GPU_NODE…: S0 ②, one attempt: DCGM_FI_DEV_GPU_UTIL has a series from each GPU node.
+_vr_s0_dcgm() {
+  local port="$1" json lines node gpu val bad=0 g
+  local -a seen=()
+  shift
+  json="$(_vr_s0_query "$port" DCGM_FI_DEV_GPU_UTIL)" || return 1
+  lines="$(_vr_s0_result "$json" '"\(.metric.node // "-") \(.metric.gpu // "-") \(.value[1])"')" \
+    || { echo "S0 ②: not a usable Prometheus answer"; return 1; }
+  while read -r node gpu val; do
+    [[ -n "$node" ]] || continue
+    echo "S0 ②: DCGM_FI_DEV_GPU_UTIL node $node gpu $gpu: $val%"
+    seen+=("$node")
+  done <<< "$lines"
+  for g in "$@"; do
+    _vr_in "$g" ${seen[@]+"${seen[@]}"} || { echo "S0 ②: no DCGM_FI_DEV_GPU_UTIL from $g"; bad=1; }
+  done
+  return "$bad"
+}
+
+# _vr_s0_grafana PORT: S0 ③, one attempt: Grafana's /api/health (no login needed) says database ok.
+_vr_s0_grafana() {
+  local body db
+  body="$(vr_cap curl -fsS -m 5 "http://127.0.0.1:$1/api/health")" || return 1
+  db="$(jq -r '.database // empty' <<< "$body" 2>/dev/null)" || db=""
+  [[ "$db" == ok ]] && return 0
+  echo "S0 ③: Grafana /api/health says database '${db:-?}'; want ok"
+  return 1
+}
+
+# _vr_s0 PROM_PORT GRAFANA_PORT DIR: S0's work (check_s0_metrics), the port-forward logs in DIR.
+# Called in an || list, so errexit is off here: every failure is handled and the caller cleans up.
+_vr_s0() {
+  local pport="$1" gport="$2" dir="$3" out g fail=0
+  local -a gpus=()
+  vr_cmd kc -n monitoring get pods -o wide "$_VR_RT" || true
+  vr_cmd kc -n monitoring-host get pods -o wide "$_VR_RT" || true
+  _vr_load_nodes || return 1
+  out="$(vr_cap kc get nodes -l "$VR_GPU_LABEL" "$_VR_RT" \
+    -o 'jsonpath={range .items[*]}{.metadata.name}{"\n"}{end}')" || return 1
+  while read -r g; do
+    [[ -n "$g" ]] || continue
+    [[ "$g" =~ $K8S_NAME_RE ]] || { echo "S0: unexpected GPU node name from the cluster: '$g'"; return 1; }
+    gpus+=("$g")
+  done <<< "$out"
+
+  if _vr_s0_forward "$dir/prometheus.log" prometheus "$pport" 9090; then
+    if vr_retry "$VR_S0_TARGETS_WAIT_S" 10 _vr_s0_targets "$pport"; then
+      echo "S0 ①: every node-exporter (${#VR_NODES[@]} nodes) and kube-state-metrics target is up"
+    else
+      echo "S0 ①: FAILED: not every node-exporter and kube-state-metrics target was up within ${VR_S0_TARGETS_WAIT_S} s"
+      fail=1
+    fi
+    if ((${#gpus[@]} == 0)); then
+      echo "S0 ②: no GPU node (label $VR_GPU_LABEL): the DCGM part is skipped"
+    elif vr_retry "$VR_S0_DCGM_WAIT_S" 10 _vr_s0_dcgm "$pport" "${gpus[@]}"; then
+      echo "S0 ②: DCGM_FI_DEV_GPU_UTIL has data from every GPU node (${gpus[*]})"
+    else
+      echo "S0 ②: FAILED: no DCGM_FI_DEV_GPU_UTIL from every GPU node (${gpus[*]}) within ${VR_S0_DCGM_WAIT_S} s"
+      fail=1
+    fi
+  else
+    echo "S0 ①②: FAILED: the prometheus port-forward did not start"
+    fail=1
+  fi
+  _vr_s0_unforward "$dir/prometheus.log" prometheus
+
+  if _vr_s0_forward "$dir/grafana.log" grafana "$gport" 3000; then
+    if vr_retry "$VR_S0_GRAFANA_WAIT_S" 5 _vr_s0_grafana "$gport"; then
+      echo "S0 ③: Grafana /api/health: database ok"
+    else
+      echo "S0 ③: FAILED: Grafana was not healthy within ${VR_S0_GRAFANA_WAIT_S} s"
+      fail=1
+    fi
+  else
+    echo "S0 ③: FAILED: the grafana port-forward did not start"
+    fail=1
+  fi
+  _vr_s0_unforward "$dir/grafana.log" grafana
+  return "$fail"
+}
+
+# S0 (stretch, STRETCH=1): the monitoring stack (k8s/monitoring/, make monitoring) works. ① Prometheus'
+# `up` is 1 for every node-exporter target (one on every node) and every kube-state-metrics target;
+# ② with a GPU node (label VR_GPU_LABEL), DCGM_FI_DEV_GPU_UTIL has data from each GPU node (without one
+# this part is skipped and said so); ③ Grafana's /api/health says database ok. Prometheus and Grafana
+# are reached through a kubectl port-forward on 127.0.0.1 (never another address), one at a time, each
+# stopped when its part is done; their logs are in a private temporary directory that is removed after,
+# pass, fail or interrupt. SKIP when the stack is not installed (no namespace monitoring).
+# VR_S0_PROM_PORT (default 19090) and VR_S0_GRAFANA_PORT (default 13000) are the local ports; they
+# differ from make prometheus / make grafana's 9090 and 3000, so an open dashboard is not in the way.
+check_s0_metrics() {
+  local pport="${VR_S0_PROM_PORT:-19090}" gport="${VR_S0_GRAFANA_PORT:-13000}" p out dir rc=0
+  for p in "$pport" "$gport"; do
+    if [[ ! "$p" =~ ^[1-9][0-9]{0,4}$ ]] || ((p > 65535)); then
+      echo "S0: VR_S0_PROM_PORT / VR_S0_GRAFANA_PORT: not a port: '$p'"
+      return 1
+    fi
+  done
+  out="$(vr_cap kc get namespace monitoring --ignore-not-found -o name "$_VR_RT")" \
+    || { echo "S0: cannot tell whether the monitoring stack is installed (kubectl failed)"; return 1; }
+  if [[ -z "$out" ]]; then
+    echo "S0: SKIP: the monitoring stack is not installed (no namespace monitoring); install it with"
+    echo "S0: make monitoring (or make up STRETCH=1), then run make verify STRETCH=1 again"
+    return 77
+  fi
+  dir="$(umask 077 && mktemp -d)" || return 1
+  _vr_on_signal --left "the port-forward logs in $dir" rm -rf -- "$dir"
+  _vr_s0 "$pport" "$gport" "$dir" || rc=$?
+  rm -rf -- "$dir"
+  _vr_on_signal
+  return "$rc"
 }
 
 # --- run summary --------------------------------------------------------------------------------

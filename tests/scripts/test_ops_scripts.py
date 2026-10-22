@@ -107,7 +107,7 @@ class Env:
         env = {k: v for k, v in os.environ.items()
                if k not in ("AUTO_APPROVE", "GCP_PROJECT", "UNDERLAY_MTU", "KUBECONFIG", "REPO_ROOT",
                             "LAMBDA_API_KEY", "TUNNEL_TIMEOUT_S", "GPU_SSH_IP", "SSH_PRIVATE_KEY_PATH",
-                            "CPU_ZONE", "CPU_TYPE", "WORKERS_TFVARS")
+                            "CPU_ZONE", "CPU_TYPE", "WORKERS_TFVARS", "STRETCH", "RESILIENCE")
                and not k.startswith("TF_VAR_")}
         env.update(PATH=f"{self.bin}:{os.environ['PATH']}", HOME=str(self.home), FAKE_LOG=str(self.log),
                    FAKE_SCENARIO=str(self.scenario_file), WAIT_INTERVAL_S="0",
