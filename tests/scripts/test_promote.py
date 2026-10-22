@@ -530,6 +530,40 @@ def test_the_operator_ip_fails_and_keeps_the_previous_final(repo, via_make):
     assert "06-B6.txt" in r.stderr and "01-A1.txt" not in r.stderr and "OPERATOR_IP" in r.stderr
 
 
+# F3-2: the address is matched as a whole number token, not as a substring of a longer one.
+@pytest.mark.parametrize("ip, line", [
+    ("73.15.40.4", "allowed 73.15.40.4\n"),                   # end of line
+    ("73.15.40.4", "73.15.40.4 allowed\n"),                   # start of line
+    ("73.15.40.4", "73.15.40.4"),                             # end of file, no newline
+    ("73.15.40.4", "src ip=73.15.40.4, port 22\n"),
+    ("73.15.40.4", "server: https://73.15.40.4:6443\n"),
+    ("73.15.40.4", "fw-ssh-operator  73.15.40.4/32\n"),
+    ("73.15.40.4", "reached 73.15.40.4.\n"),                  # end of a sentence
+    ("73.15.40.4", "connecting...73.15.40.4\n"),
+])
+def test_the_operator_ip_is_found_between_any_non_digits(repo, ip, line):
+    before = previous_final(repo)
+    make_run(repo, files={"01-A1.txt": "fine\n", "06-B6.txt": line})
+    r = promote(repo, "verify", f"verification/{TS}", env={**os.environ, "OPERATOR_IP": ip})
+    assert r.returncode == 1, r.stderr
+    assert snapshot(repo / "verification/final") == before
+    assert "06-B6.txt" in r.stderr and "01-A1.txt" not in r.stderr
+
+
+@pytest.mark.parametrize("ip, line", [
+    ("73.15.40.4", "fw-ssh-operator  73.15.40.40/32\n"),     # a longer last octet
+    ("73.15.40.4", "peer 73.15.40.41\n"),
+    ("3.15.40.4", "peer 73.15.40.4\n"),                      # a longer first octet
+    ("73.15.40.4", "version 173.15.40.49\n"),
+    ("73.15.40.4", "id 73x15-40/4\n"),                       # a dot matches only a dot
+])
+def test_a_longer_address_is_not_the_operator_ip(repo, ip, line):
+    run = make_run(repo, files={"01-A1.txt": "fine\n", "06-B6.txt": line})
+    r = promote(repo, "verify", f"verification/{TS}", env={**os.environ, "OPERATOR_IP": ip})
+    assert r.returncode == 0, r.stderr
+    assert snapshot(repo / "verification/final") == snapshot(run)
+
+
 def test_success_reminds_the_operator_ip_check(repo):
     make_run(repo)
     r = promote(repo, "verify", f"verification/{TS}", env={**os.environ, "OPERATOR_IP": OPERATOR_IP})
@@ -569,23 +603,30 @@ def test_a_blank_operator_ip_is_unset(repo, value):
     assert "checkip.amazonaws.com" in r.stderr
 
 
-# F2-1: what is scanned and promoted is the staged copy, so the copy itself must be a flat, finished,
-# passing run of regular files. An entry that reaches the run after it was checked (here: added by a cp
-# wrapper just before the copy) fails the promotion instead of reaching final unscanned.
+# F2-1, F3-1: what is scanned and promoted is the staged copy, so the copy itself must be a flat,
+# finished, passing run of regular files with the run's skip count. An entry that reaches the run after it
+# was checked (here: added by a cp wrapper just before the copy) fails the promotion at the copy's check,
+# before gitleaks runs. Every injected file is clean, so only that check (not gitleaks) can stop it.
 def fake_cp(tmp_path, kind):
     bin_dir = tmp_path / "fakecp"
     bin_dir.mkdir()
-    secret = tmp_path / "secret.env"
-    secret.write_text("token " + K3S_TOKEN + "\n")
+    clean = tmp_path / "clean.txt"
+    clean.write_text("# C1 - nothing secret here\nok\n")
+    for name, text in {"failed.md": FAILED_SUMMARY, "skipped.md": SKIPPED_SUMMARY, "passed.md": SUMMARY,
+                       "one-skip.md": summary_of("PASS", "PASS", "SKIP")}.items():
+        (tmp_path / name).write_text(text)
     add = {
-        "dir": f'mkdir "$run/03-C1.txt" && cp {secret} "$run/03-C1.txt/04-x.txt"',
-        "symlink": f'ln -s {secret} "$run/03-C1.txt"',
+        "none": ":",
+        "dir": f'mkdir "$run/03-C1.txt" && cp {clean} "$run/03-C1.txt/04-x.txt"',
+        "symlink": f'ln -s {clean} "$run/03-C1.txt"',
         "fifo": 'mkfifo "$run/03-C1.txt"',
-        "badname": f'cp {secret} "$run/03-C1.png"',
+        "badname": f'cp {clean} "$run/03-C1.png"',
         "no-summary": 'rm "$run/SUMMARY.md"',
         "failed": f'cp {tmp_path / "failed.md"} "$run/SUMMARY.md"',
+        "skip-added": f'cp {tmp_path / "skipped.md"} "$run/SUMMARY.md"',
+        "skip-removed": f'cp {tmp_path / "passed.md"} "$run/SUMMARY.md"',
+        "skip-changed": f'cp {tmp_path / "one-skip.md"} "$run/SUMMARY.md"',
     }[kind]
-    (tmp_path / "failed.md").write_text(FAILED_SUMMARY)
     real_cp = shutil.which("cp")
     # promote.sh runs `cp -R -- RUN COPY`; the wrapper changes RUN first. Other cp calls pass through.
     (bin_dir / "cp").write_text(
@@ -596,16 +637,43 @@ def fake_cp(tmp_path, kind):
     return {**os.environ, "PATH": f"{bin_dir}:{os.environ['PATH']}"}
 
 
-@pytest.mark.parametrize("kind", ["dir", "symlink", "fifo", "badname", "no-summary", "failed"])
-def test_an_entry_that_reaches_the_run_after_its_check_fails_the_promotion(repo, tmp_path, kind):
+COPY_OF = f"the copy of verification/{TS}"
+NOT_WRITTEN = f"{COPY_OF} holds entries verify.sh does not write (only regular files named SUMMARY.md, " \
+              "NN-<ID>.txt or <name>.log):"
+
+
+@pytest.mark.parametrize("kind, summary, error", [
+    ("dir", SUMMARY, f"{NOT_WRITTEN} 03-C1.txt"),
+    ("symlink", SUMMARY, f"{NOT_WRITTEN} 03-C1.txt"),
+    ("fifo", SUMMARY, f"{NOT_WRITTEN} 03-C1.txt"),
+    ("badname", SUMMARY, f"{NOT_WRITTEN} 03-C1.png"),
+    ("no-summary", SUMMARY, f"{COPY_OF} has no SUMMARY.md"),
+    ("failed", SUMMARY, f"{COPY_OF} has 2 failed check(s)"),
+    # PROMOTE_ALLOW_SKIP=1 lets both pass their check; the copy must still have the run's skip count.
+    ("skip-added", SUMMARY, f"{COPY_OF} has 2 skipped check(s), the run had 0"),
+    ("skip-removed", SKIPPED_SUMMARY, f"{COPY_OF} has 0 skipped check(s), the run had 2"),
+    ("skip-changed", SKIPPED_SUMMARY, f"{COPY_OF} has 1 skipped check(s), the run had 2"),
+], ids=["dir", "symlink", "fifo", "badname", "no-summary", "failed", "skip-added", "skip-removed",
+        "skip-changed"])
+def test_an_entry_that_reaches_the_run_after_its_check_fails_the_promotion(repo, tmp_path, kind, summary, error):
     before = previous_final(repo)
-    make_run(repo)
-    r = promote(repo, "verify", f"verification/{TS}", env=fake_cp(tmp_path, kind))
+    make_run(repo, summary=summary)
+    r = promote(repo, "verify", f"verification/{TS}", env={**fake_cp(tmp_path, kind), "PROMOTE_ALLOW_SKIP": "1"})
     assert r.returncode == 1, (r.returncode, r.stderr)
     assert snapshot(repo / "verification/final") == before
     assert verification_entries(repo) == [".gitkeep", TS, "final"], "the copy is removed"
-    assert "copy" in r.stderr, r.stderr
-    assert K3S_TOKEN not in r.stdout + r.stderr
+    assert error in r.stderr, r.stderr
+    assert "scanning each file" not in r.stderr and "gitleaks:" not in r.stderr, "stopped before the scan"
+
+
+@pytest.mark.parametrize("summary", [SUMMARY, SKIPPED_SUMMARY], ids=["passed", "skipped"])
+def test_the_same_cp_wrapper_injecting_nothing_promotes(repo, tmp_path, summary):
+    # Positive control of the test above.
+    run = make_run(repo, summary=summary)
+    r = promote(repo, "verify", f"verification/{TS}", env={**fake_cp(tmp_path, "none"), "PROMOTE_ALLOW_SKIP": "1"})
+    assert r.returncode == 0, r.stderr
+    got, want = snapshot(repo / "verification/final"), snapshot(run)
+    assert got.pop("SUMMARY.md").startswith(want.pop("SUMMARY.md")) and got == want
 
 
 def fake_gitleaks(tmp_path, output):

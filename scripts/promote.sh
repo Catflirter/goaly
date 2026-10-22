@@ -21,7 +21,7 @@
 # inline gitleaks:allow markers ignored; a file passes only when gitleaks exits 0, says "no leaks found"
 # and logs no error or warning (gitleaks stdin exits 0 when it cannot read its input). When OPERATOR_IP
 # is set (surrounding whitespace dropped, as gpuctl reads it; it must be one IPv4 address), the copy
-# must not contain it either (Task 24 Step 4). Only a clean copy replaces
+# must not contain it (as a whole address, between non-digits) either (Task 24 Step 4). Only a clean copy replaces
 # verification/final/: the old final is moved aside, the copy renamed into its place, and the old one
 # removed (not merged into). Interrupts are ignored during that swap, and on any failure the old final is
 # moved back, so verification/final is always either the previous final or the whole scanned copy.
@@ -271,8 +271,10 @@ promote_verify() {
     exit 1
   fi
   if [[ -n "$ip" ]]; then
-    # The copy is flat (check_run), so the names grep prints are the run's file names.
-    ip_files="$(cd -- "$copy" && grep -lF -e "$ip" ./*)" && rc=0 || rc=$?
+    # The copy is flat (check_run), so the names grep prints are the run's file names. The address is
+    # matched whole, between non-digits (73.15.40.4 is not in 73.15.40.40 or 173.15.40.4); ip is a
+    # validated dotted quad, so escaping its dots makes it a literal. LC_ALL=C: [^0-9] matches any byte.
+    ip_files="$(cd -- "$copy" && LC_ALL=C grep -lE -e "(^|[^0-9])${ip//./\\.}([^0-9]|\$)" ./*)" && rc=0 || rc=$?
     ip_files="${ip_files//.\//}"
     if ((rc != 1)); then
       log "error: the operator IP (OPERATOR_IP) appears in (or grep failed on): ${ip_files//$'\n'/ }"
