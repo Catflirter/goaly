@@ -35,8 +35,9 @@ reads (spec section 10.2); this process neither loads nor prints it. Every --int
 The autoscaler writes only lambda/.autoscale-state.json and its own state file, both atomically (temp file and
 rename). The state is saved with last_action_at = now before an action starts, so a restart during or right after
 it waits out the cooldown (Review Focus #1), and again when it ends: the cooldown counts from the end of the action;
-a state file that cannot be written starts no action. Results: exit 0 is ok; cpu-pool.sh exit 2 (another guarded
-run holds .run/workers.lock, or a plan was refused) is retried at the next tick without a cooldown, and
+a state file that cannot be written starts no action (decided again next tick: not a failure of that action, and
+said once per kind of error on stderr) and never ends the loop. Results: exit 0 is ok; cpu-pool.sh exit 2 (another
+guarded run holds .run/workers.lock, or a plan was refused) is retried at the next tick without a cooldown, and
 REFUSED_RETRIES refusals in a row count as one failure; any other exit is a failure and starts the cooldown. After
 FAILURE_LIMITS[kind] failures in a row (GPU scale-up, GPU scale-down, CPU scale-up, CPU removal) that kind of action
 is off until the autoscaler is restarted, and every tick says so: a broken join or apply never becomes an endless
@@ -367,6 +368,7 @@ class Autoscaler:
         self.memory_state: State | None = None  # --dry-run: the state is kept here, never saved
         self.log_path: Path | None = None
         self.log_errors: set[int | None] = set()  # errnos of log writes that failed (each said once)
+        self.state_errors: set[int | None] = set()  # errnos of state saves that failed (each said once)
         if args.log:
             self.log_path = Path(args.log) / "autoscaler.log"
         elif not args.dry_run:
@@ -418,11 +420,20 @@ class Autoscaler:
         return State.from_json(_read_text(self.paths.state) or "")
 
     def _save_state(self, state: State) -> str | None:
-        """Save the state file; the error text if it cannot be written (never a crash without a log line)."""
+        """Save the state file; the error text if it cannot be written. A full disk or a removed directory never ends
+        the loop and turns nothing off: each kind of error is said once on stderr (and in the log); no action starts
+        while the state cannot be saved, and the override file never depends on it (review S4-r4-3)."""
         try:
             atomic_write(self.paths.state, state.to_json() + "\n", mode=0o600)
         except OSError as e:
-            return f"cannot write {self.paths.state}: {e.strerror or e}"
+            error = f"cannot write {self.paths.state}: {e.strerror or e}"
+            if e.errno not in self.state_errors:  # once per kind of error
+                self.state_errors.add(e.errno)
+                print(f"autoscaler: {error}; the autoscaler goes on but starts no action while its state cannot be "
+                      "saved (the cooldown is saved before every action) (said once per kind of error)",
+                      file=sys.stderr)
+                self.record("notice", reason=error, result="logged", started=self.deps.clock())
+            return error
         return None
 
     def _kubectl_json(self, what: str, path: str | None) -> dict:
@@ -659,9 +670,8 @@ class Autoscaler:
         self.record("none", reason=f"{head}: {reason}", result=result, started=started)
         if self.args.dry_run:
             self.memory_state = state
-        elif (error := self._save_state(state)) is not None:
-            self.say(f"{self._ts(now)} notice: {error}")
-            self.record("notice", reason=error, result="logged", started=started)
+        else:
+            self._save_state(state)  # a failure is said once (review S4-r4-3)
         return "none"
 
     def _failed(self, kind: str, result: str) -> str:
@@ -680,10 +690,11 @@ class Autoscaler:
         kind = self._failure_kind(snap, action)
         extra = {"target": action.target, "node": action.node, "pool": action.pool}
         self.say(f"{self._ts(snap.now)} {describe(action)}: {action.reason}")
-        # Review Focus #1: the cooldown is on disk before anything changes; if it cannot be, nothing starts
+        # Review Focus #1: the cooldown is on disk before anything changes; if it cannot be, nothing starts. That is
+        # no failure of the action (nothing is turned off): it is decided again next tick (review S4-r4-3)
         error = self._save_state(state)
         if error is not None:
-            result = self._failed(kind, f"failed: {error}; not started")
+            result = f"not started: {error}; decided again next tick"
             self.say(f"{self._ts(self.deps.clock())} {describe(action)} -> {result}")
             self.record(action.kind, **extra, reason=action.reason, result=result, started=started)
             return "failed"

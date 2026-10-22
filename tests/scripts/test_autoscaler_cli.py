@@ -1147,3 +1147,58 @@ def test_an_unwritable_log_never_stops_the_loop(harness, capsys):  # review S4-r
     assert "gpu_scale pool=a6000 target=2 -> failed" in out and "no action" in out
     err = capsys.readouterr().err
     assert err.count("cannot write the log") == 1 and str(h.log_dir / "autoscaler.log") in err
+
+
+def failing_state_saves(h, autoscaler, monkeypatch, fails):
+    """The state file cannot be saved (a full disk) on the saves `fails(n)` picks (n counts from 1)."""
+    real, saves = autoscaler.atomic_write, []
+
+    def atomic_write(path, text, **kw):
+        if path == h.state_path:
+            saves.append(text)
+            if fails(len(saves)):
+                raise OSError(28, "No space left on device")
+        real(path, text, **kw)
+
+    monkeypatch.setattr(autoscaler, "atomic_write", atomic_write)
+    return saves
+
+
+def test_a_state_file_that_cannot_be_saved_never_stops_the_loop(harness, autoscaler, monkeypatch, capsys):
+    """Review S4-r4-3: no action starts while the state cannot be saved (Review Focus #1), but that is no failure
+    of the action: nothing is turned off, and the action starts once the disk has room again."""
+    h = harness(pods=[CPU_PENDING])
+    failing_state_saves(h, autoscaler, monkeypatch, lambda n: n <= 4)
+    assert h.main("--loop", ticks=5, interval=20) == 0
+    assert len(h.of("kubectl")) == 10  # every tick ran
+    assert len(h.acted()) == 1  # only the fifth tick's save worked
+    results = [x["result"] for x in h.log() if x["action"] == "cpu_scale"]
+    assert len(results) == 5 and results[-1] == "ok"
+    assert all(r.startswith("not started") and "No space left on device" in r for r in results[:4])
+    assert not any("disabled" in x["reason"] or "disabled" in x["result"] for x in h.log())
+    err = capsys.readouterr().err
+    assert err.count("No space left on device") == 1 and str(h.state_path) in err
+
+
+def test_an_unsavable_state_is_said_once_not_every_tick(harness, autoscaler, monkeypatch, capsys):  # S4-r4-3
+    h = harness()
+    failing_state_saves(h, autoscaler, monkeypatch, lambda n: True)
+    assert h.main("--loop", ticks=3, interval=20) == 0
+    assert [x["action"] for x in h.log()].count("none") == 3
+    assert sum("No space left on device" in x["reason"] for x in h.log()) == 1
+    assert h.out.getvalue().count("No space left on device") == 0
+    assert capsys.readouterr().err.count("No space left on device") == 1
+
+
+@pytest.mark.parametrize("apply_rc, pools", [(1, {"a6000": 1}), (0, {"a6000": 2})])
+def test_the_override_never_depends_on_the_state_save(harness, autoscaler, monkeypatch, capsys, apply_rc, pools):
+    """Review S4-r4-3: the save before the action worked, the one after it fails: a failed scale-up still puts the
+    override file back, a successful one keeps its target, and the loop goes on."""
+    h = harness(**GPU_CLUSTER, overrides={"a6000": 1}, rc={"gpuctl-apply": apply_rc})
+    failing_state_saves(h, autoscaler, monkeypatch, lambda n: n >= 2)
+    assert h.main("--loop", ticks=2, interval=20) == 0
+    assert h.overrides() == {"pools": pools}
+    assert len(h.of("kubectl")) == 4  # the second tick ran
+    (line,) = [x for x in h.log() if x["action"] == "gpu_scale"]
+    assert "state not saved" in line["result"] and "No space left on device" in line["result"]
+    assert capsys.readouterr().err.count("No space left on device") == 1
