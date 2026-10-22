@@ -287,28 +287,33 @@ class Reconciler:
                     self._warn("Cancelled: nothing was changed")
                     return 2
             # 4. deletes before creates
-            gone, failures = self._delete(plan)
+            gone, attempted, failures = self._delete(plan)
             if failures:
-                return self._delete_failed(spec, gone, failures)
+                return self._delete_failed(spec, gone, attempted, failures)
         return self._create_and_join(spec, plan, types, keep_on_failure=keep_on_failure, gone=gone)
 
-    def _delete(self, plan: Plan) -> tuple[set[str], list[str]]:
-        """Step 4, best effort: returns (ids terminated, failures). A failing delete does not stop the others;
-        Ctrl-C stops the remaining ones. Either way the caller still removes the terminated IPs from the firewalls.
+    def _delete(self, plan: Plan) -> tuple[set[str], set[str], list[str]]:
+        """Step 4, best effort: returns (ids terminated, ids a terminate was sent for, failures). A failing delete
+        does not stop the others; Ctrl-C stops the remaining ones. Either way the caller still removes the
+        terminated IPs from the firewalls. A terminate that raised may still have been accepted by Lambda (Ctrl-C
+        or a network error after the request went out), so its id is in the second set but not the first.
         """
         duplicate_ids = {i.id for i in plan.duplicates}
         gone: set[str] = set()
+        attempted: set[str] = set()
         failures: list[str] = []
         try:
             for instance in plan.delete:
                 try:
                     if instance.id in duplicate_ids:
                         # Ruling R17: the node name and host key belong to the instance that is kept, so by id only
+                        attempted.add(instance.id)
                         self.client.terminate([instance.id])
                         gone.add(instance.id)
                         self._emit(f"Terminated duplicate {instance.name} {instance.id}")
                         continue
                     self.infra.drain_and_delete_node(instance.name)
+                    attempted.add(instance.id)
                     self.client.terminate([instance.id])
                     gone.add(instance.id)
                     self.infra.forget_host_key(instance.name)
@@ -317,14 +322,15 @@ class Reconciler:
                     failures.append(f"delete {instance.name} ({instance.id}): {e}")
         except KeyboardInterrupt:
             failures.append("deletes interrupted (KeyboardInterrupt); the remaining deletes were not attempted")
-        return gone, failures
+        return gone, attempted, failures
 
-    def _delete_failed(self, spec: Spec, gone: set[str], failures: list[str]) -> int:
+    def _delete_failed(self, spec: Spec, gone: set[str], attempted: set[str], failures: list[str]) -> int:
         """A delete failed: launch nothing, but drop the IPs of the instances that were terminated from every
-        allow-list (step 7), since Lambda may hand those IPs to another tenant."""
+        allow-list (step 7), since Lambda may hand those IPs to another tenant. This runs whenever a terminate was
+        sent, even one that raised: step 7 reads the live instances, so one Lambda accepted is left out anyway."""
         for failure in failures:
             self._warn(f"error: {failure}")
-        if gone:
+        if attempted:
             try:
                 self._reconcile_firewall(spec, gone)
             except (Exception, KeyboardInterrupt) as e:
@@ -435,27 +441,48 @@ class Reconciler:
     def _clean_up(self, spec: Spec, failed: list[_Launched], unknown: list[str], gone: set[str]) -> None:
         """Step 9: terminate this run's failed new instances, drop their nodes and host keys, redo step 7.
 
-        Best effort: one failing step does not stop the others, and each is reported. A launch whose outcome is
-        unknown is looked up by name; Lambda may list an accepted launch only a moment later, so names not found
-        are looked up once more after poll_s, and any still missing is reported for the operator to check.
+        Best effort: one failing step does not stop the others, and each is reported. The instances whose ids are
+        known go first, so nothing that follows (the wait for a lagging listing, a second Ctrl-C) can leak them;
+        then the launches whose outcome is unknown (see _clean_up_unknown).
         """
-        victims = [(new.id, new.name) for new in failed]
+        self._terminate_victims([(new.id, new.name) for new in failed], gone)
         if unknown:
-            known = {new.id for new in failed}
-            try:
-                found = self._find_unknown(unknown, known)
-                missing = [name for name in unknown if name not in {n for _, n in found}]
-                if missing:
-                    self.sleep(self.settings.poll_s)
-                    found += self._find_unknown(missing, known | {i for i, _ in found})
-                    missing = [name for name in missing if name not in {n for _, n in found}]
-                victims += found
-                for name in missing:
-                    self._warn(f"cleanup: launch outcome of {name} unknown and no instance found yet; run "
-                               "make gpu-status in a minute and make gpu-down if it appears")
-            except Exception as e:
-                self._warn(f"cleanup: cannot list instances to find {', '.join(unknown)}: {e}; check by hand "
-                           "(make gpu-status)")
+            self._clean_up_unknown(unknown, {new.id for new in failed}, gone)
+        try:
+            self._reconcile_firewall(spec, gone)
+        except Exception as e:
+            self._warn(f"cleanup: firewall reconcile failed: {e}; re-run make gpu-apply or make sync-peers")
+
+    def _clean_up_unknown(self, unknown: list[str], known: set[str], gone: set[str]) -> None:
+        """Terminate the instances of launches whose outcome is unknown, looked up by name. Lambda may list an
+        accepted launch only a moment later, so the names not found are looked up once more after poll_s, and
+        any still missing is reported for the operator to check. A failed or interrupted (Ctrl-C) lookup or wait
+        ends only this search: what was already found is terminated and the caller still redoes step 7."""
+        try:
+            found = self._find_unknown(unknown, known)
+        except (Exception, KeyboardInterrupt) as e:
+            self._warn(f"cleanup: cannot list instances to find {', '.join(unknown)}: {str(e) or type(e).__name__}; "
+                       "check by hand (make gpu-status, and make gpu-down if one appears)")
+            return
+        self._terminate_victims(found, gone)
+        missing = [name for name in unknown if name not in {n for _, n in found}]
+        if not missing:
+            return
+        self._emit(f"cleanup: waiting {self.settings.poll_s:g}s for {', '.join(missing)} to appear")
+        why = ""
+        try:
+            self.sleep(self.settings.poll_s)
+            late = self._find_unknown(missing, known | {i for i, _ in found})
+        except (Exception, KeyboardInterrupt) as e:
+            late, why = [], f" (the second look was cut short: {str(e) or type(e).__name__})"
+        self._terminate_victims(late, gone)
+        for name in missing:
+            if name not in {n for _, n in late}:
+                self._warn(f"cleanup: launch outcome of {name} unknown and no instance found yet{why}; run "
+                           "make gpu-status in a minute and make gpu-down if it appears")
+
+    def _terminate_victims(self, victims: list[tuple[str, str]], gone: set[str]) -> None:
+        """Terminate each (id, name), delete its node and forget its host key; terminated ids go into `gone`."""
         for instance_id, name in victims:
             for what, step in (("terminate", lambda: self.client.terminate([instance_id])),
                                ("delete node", lambda: self.infra.drain_and_delete_node(name)),
@@ -467,10 +494,6 @@ class Reconciler:
                 except Exception as e:
                     self._warn(f"cleanup: {what} {name} ({instance_id}) failed: {e}")
             self._emit(f"Cleaned up {name} {instance_id}")
-        try:
-            self._reconcile_firewall(spec, gone)
-        except Exception as e:
-            self._warn(f"cleanup: firewall reconcile failed: {e}; re-run make gpu-apply or make sync-peers")
 
     # --- drift ----------------------------------------------------------------------------------
 

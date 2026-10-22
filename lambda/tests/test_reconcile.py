@@ -633,3 +633,78 @@ def test_a_transient_poll_error_does_not_terminate_a_healthy_launch():  # C0-3, 
     flaky_get_instance(fake, [LambdaAPIError("gpuctl/network-error", 0, "timed out")])
     assert make_rec(fake, infra).apply(SPEC, auto_approve=True, keep_on_failure=False) == 0
     assert fake.terminated == [] and infra.joined == [("k3s-gpu-a6000-1", "129.80.30.30", "a6000")]
+
+
+# --- review round 2: an interrupted terminate, a second Ctrl-C during the cleanup's wait --------
+
+@pytest.mark.parametrize("error", [KeyboardInterrupt(), LambdaAPIError("gpuctl/network-error", 0, "timed out")])
+def test_a_terminate_interrupted_after_lambda_accepted_it_still_reconciles_the_firewall(error):  # S1-1 / C1-1
+    fake, infra = FakeLambda(types=TYPES, instances=[inst()]), FakeInfra()
+    terminate = fake.terminate
+
+    def accepted_then_interrupted(instance_ids):  # Lambda terminates it, then the response is lost
+        terminate(instance_ids)
+        raise error
+
+    fake.terminate = accepted_then_interrupted
+    assert make_rec(fake, infra).down(SPEC, auto_approve=True) == 1
+    assert fake.terminated == ["id-k3s-gpu-a6000-1"]
+    assert "nft" in infra.events and infra.applied_gpu_ips[-1] == []
+    sources = {r.source_network for r in fake.ruleset_by_name("k3s-gpu-us-west-2").rules}
+    assert "129.80.30.30/32" not in sources
+
+
+def two_node_spec():
+    data = copy.deepcopy(VALID)
+    data["pools"]["a6000"]["count"] = 2
+    data["budget_usd_per_hour"] = 5.0  # the limit check prices each node at its dearest fallback type
+    return parse_spec(data)
+
+
+def interrupted_wait(rec, fake, seen):
+    def sleep(seconds):  # the operator presses Ctrl-C a second time while the cleanup waits
+        seen.append(list(fake.terminated))
+        raise KeyboardInterrupt
+
+    rec.sleep = sleep
+
+
+def test_a_second_ctrl_c_during_the_cleanup_wait_still_terminates_the_failed_launch(capsys):  # X1-1
+    fake, infra = FakeLambda(types=TYPES), FakeInfra()
+    launch = fake.launch
+
+    def interrupt_second(**kwargs):  # the first launch returns; Ctrl-C during the second, nothing listed
+        if kwargs["name"] == "k3s-gpu-a6000-2":
+            raise KeyboardInterrupt
+        return launch(**kwargs)
+
+    fake.launch = interrupt_second
+    out, seen = io.StringIO(), []
+    rec = make_rec(fake, infra, out=out)
+    interrupted_wait(rec, fake, seen)
+    assert rec.apply(two_node_spec(), auto_approve=True, keep_on_failure=False) == 1
+    assert seen == [["i-1"]]  # terminated before the wait, not after it
+    assert fake.terminated == ["i-1"] and infra.applied_gpu_ips[-1] == []
+    assert "waiting 10s for k3s-gpu-a6000-2" in out.getvalue()
+    err = capsys.readouterr().err
+    assert "launch outcome of k3s-gpu-a6000-2 unknown" in err and "gpu-status" in err and "gpu-down" in err
+
+
+def test_a_second_ctrl_c_during_the_cleanup_wait_still_terminates_names_found_first(capsys):  # S1-2
+    fake, infra = FakeLambda(types=TYPES), FakeInfra()
+    launch = fake.launch
+
+    def lost(**kwargs):  # the first launch is accepted but its response lost; the second never starts
+        if kwargs["name"] == "k3s-gpu-a6000-1":
+            launch(**kwargs)
+        raise LambdaAPIError("gpuctl/network-error", 0, "timed out")
+
+    fake.launch = lost
+    seen = []
+    rec = make_rec(fake, infra)
+    interrupted_wait(rec, fake, seen)
+    assert rec.apply(two_node_spec(), auto_approve=True, keep_on_failure=False) == 1
+    assert seen == [["i-1"]] and fake.terminated == ["i-1"] and infra.applied_gpu_ips[-1] == []
+    err = capsys.readouterr().err
+    assert "launch outcome of k3s-gpu-a6000-2 unknown" in err and "gpu-down" in err
+    assert "k3s-gpu-a6000-1 unknown" not in err
