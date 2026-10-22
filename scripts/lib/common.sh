@@ -130,22 +130,62 @@ _tf_output() {
   terraform -chdir="$dir" output "$2" "$3"
 }
 
-# tf_apply STACK [--no-destroy]: plan STACK into a saved plan, then apply exactly that plan once
-# confirm agrees (under AUTO_APPROVE=1 confirm agrees outright, as the brief says). No changes:
-# nothing is asked or applied, so re-runs are quiet. A plan that destroys or replaces anything
-# lists those addresses first. --no-destroy is opt-in, for a stack that must never be recreated
-# unattended (up.sh base: k3s-cp). Under AUTO_APPROVE=1 it refuses such a plan (exit 2);
-# interactively it still asks. Declining exits 2. STACK must be initialised already (tf_init;
-# `terraform init` for bootstrap).
+# tf_apply STACK [--var-file FILE] [--no-destroy | --destroy-only NAME...]: tf_plan, then
+# tf_apply_plan: plan STACK into a saved plan, then apply exactly that plan once confirm agrees (under
+# AUTO_APPROVE=1 confirm agrees outright, as the brief says). No changes: nothing is asked or applied,
+# so re-runs are quiet. A plan that destroys or replaces anything lists those addresses first.
+#
+# The two guard options are opt-in for plans that spec §3.1 has a human review (base; workers when
+# scaled by hand). Under AUTO_APPROVE=1 they refuse a plan (exit 2) that destroys or replaces
+# anything they do not allow; interactively the unexpected addresses are listed again and the
+# question is still asked.
+#   --no-destroy           allows no destroy at all. Callers: up.sh base (k3s-cp), up.sh workers and
+#                          an add-only cpu-pool.sh scale (a worker that left the inventory without
+#                          cpu-pool.sh was never drained).
+#   --destroy-only NAME... allows only addresses keyed ["NAME"] (for_each keys: a worker's instance,
+#                          address and per-worker rules). Callers: cpu-pool.sh scale-down and remove,
+#                          with exactly the workers they drain, so k3s-cpu-1 or any other worker is
+#                          never destroyed or replaced unattended.
+#   --var-file FILE        plans with -var-file=FILE (an absolute path): its values override the
+#                          stack's *.auto.tfvars files, and the saved plan keeps them. cpu-pool.sh plans
+#                          the new inventory this way before it drains anything or writes the file.
+# Declining exits 2. STACK must be initialised already (tf_init; `terraform init` for bootstrap).
 tf_apply() {
-  local stack="$1" opt="${2:-}" dir plan rc=0 doomed
-  [[ -z "$opt" || "$opt" == --no-destroy ]] || die "tf_apply: unknown option $opt"
+  tf_plan "$@"
+  tf_apply_plan "$1"
+}
+
+# tf_plan STACK [options]: the first half of tf_apply (same options): plan, list what the plan
+# destroys or replaces, apply the guard (refusing exits 2 and keeps no plan), and set TF_PLAN to the
+# saved plan, $RUN_DIR/STACK.tfplan, or to "" when there is nothing to change. Call it outside $(...)
+# so TF_PLAN survives. A caller can do work between the check and the apply (cpu-pool.sh drains the
+# workers the plan destroys) and then call tf_apply_plan STACK.
+tf_plan() {
+  local stack="$1" opt dir plan rc=0 doomed unexpected addr name ok
+  local -a allowed=() extra=()
+  TF_PLAN=""
+  shift
+  if [[ "${1:-}" == --var-file ]]; then
+    (( $# >= 2 )) || die "tf_plan: --var-file needs a file"
+    [[ "$2" == /* && -f "$2" ]] || die "tf_plan: --var-file needs an existing absolute path: '$2'"
+    extra=("-var-file=$2")
+    shift 2
+  fi
+  opt="${1:-}"
+  case "$opt" in
+    "" | --no-destroy) (( $# <= 1 )) || die "tf_apply: unexpected arguments after $opt" ;;
+    --destroy-only)
+      (( $# >= 2 )) || die "tf_apply: --destroy-only needs at least one name"
+      allowed=("${@:2}") ;;
+    *) die "tf_apply: unknown option $opt" ;;
+  esac
   dir="$(tf_dir "$stack")" || exit
   tf_env
   run_dir || die "cannot create $RUN_DIR"
   plan="$RUN_DIR/$stack.tfplan"
   rm -f -- "$plan"
-  terraform -chdir="$dir" plan -input=false -lock-timeout=120s -detailed-exitcode -out="$plan" || rc=$?
+  terraform -chdir="$dir" plan -input=false -lock-timeout=120s -detailed-exitcode ${extra[@]+"${extra[@]}"} \
+    -out="$plan" || rc=$?
   case "$rc" in
     0) rm -f -- "$plan"; log "$stack: no changes"; return 0 ;;
     2) ;;
@@ -157,18 +197,44 @@ tf_apply() {
   if [[ -n "$doomed" ]]; then
     log "WARNING: this plan DESTROYS or REPLACES in the $stack stack:"
     log "$(printf '%s\n' "$doomed" | sed 's/^/  - /')"
-    if [[ "${AUTO_APPROVE:-}" == 1 && "$opt" == --no-destroy ]]; then
-      rm -f -- "$plan"
-      die "refusing to destroy or replace resources in $stack under AUTO_APPROVE=1; run it interactively to review" 2
+    if [[ -n "$opt" ]]; then
+      unexpected=""
+      while read -r addr; do
+        ok=0
+        for name in ${allowed[@]+"${allowed[@]}"}; do
+          [[ "$addr" == *"[\"$name\"]"* ]] && ok=1
+        done
+        (( ok )) || unexpected+="  - $addr"$'\n'
+      done <<< "$doomed"
+      if [[ -n "$unexpected" ]]; then
+        log "WARNING: of these, NOT expected by this command (${allowed[*]:-no destroys allowed}):"
+        log "${unexpected%$'\n'}"
+        if [[ "${AUTO_APPROVE:-}" == 1 ]]; then
+          rm -f -- "$plan"
+          die "refusing to destroy or replace unexpected resources in $stack under AUTO_APPROVE=1: nothing was applied; run it interactively to review" 2
+        fi
+      fi
     fi
   fi
+  TF_PLAN="$plan"
+}
+
+# tf_apply_plan STACK: the second half of tf_apply: ask, then apply exactly the plan tf_plan saved
+# ($TF_PLAN) and remove it. Nothing to do when TF_PLAN is "" (no changes).
+tf_apply_plan() {
+  local stack="$1" dir plan="${TF_PLAN:-}" rc=0
+  [[ -n "$plan" ]] || return 0
+  [[ "$plan" == "$RUN_DIR/$stack.tfplan" && -f "$plan" ]] || die "tf_apply_plan: no saved plan for $stack"
+  dir="$(tf_dir "$stack")" || exit
+  tf_env
   if ! confirm "Apply this plan to the $stack stack?"; then
     rm -f -- "$plan"
+    TF_PLAN=""
     die "not applied: $stack" 2
   fi
-  rc=0
   terraform -chdir="$dir" apply -input=false -lock-timeout=120s "$plan" || rc=$?
   rm -f -- "$plan"
+  TF_PLAN=""
   [[ "$rc" == 0 ]] || die "terraform apply failed for $stack (exit $rc)"
 }
 
@@ -218,20 +284,30 @@ confirm() {
   [[ "$answer" =~ ^([yY]|[yY][eE][sS])$ ]]
 }
 
-# wait_for CMD TIMEOUT_S: eval CMD (a string, so shell functions such as kc and cp_ssh work) every
-# WAIT_INTERVAL_S seconds (default 5) until it succeeds. Returns 1 after TIMEOUT_S seconds, with
-# the last attempt's output on stderr. Each attempt runs in a subshell: a CMD that dies (cp_ssh ->
-# tf_out -> die) is a failed attempt whose message is shown, not a silent exit of the whole script;
-# variables CMD sets do not outlive the attempt. CMD must bound its own runtime (kubectl --timeout,
-# ConnectTimeout), or one hung attempt outlasts TIMEOUT_S.
+# wait_for CMD TIMEOUT_S [STOP_RC]: eval CMD (a string, so shell functions such as kc and cp_ssh
+# work) every WAIT_INTERVAL_S seconds (default 5) until it succeeds. Returns 1 after TIMEOUT_S
+# seconds, with the last attempt's output on stderr (TIMEOUT_S counts bash SECONDS, which step on
+# whole wall-clock seconds: a TIMEOUT_S of 1 can expire after a few ms; N gives at least N-1 s).
+# With STOP_RC, an attempt that exits STOP_RC (a failure that no retry can clear) ends the wait
+# at once: wait_for returns STOP_RC, with that attempt's output on stderr. Each attempt runs in a
+# subshell: a CMD that dies (cp_ssh -> tf_out -> die) is a failed attempt whose message is shown,
+# not a silent exit of the whole script; variables CMD sets do not outlive the attempt. CMD must
+# bound its own runtime (kubectl --timeout, ConnectTimeout), or one hung attempt outlasts TIMEOUT_S.
 wait_for() {
-  local cmd="$1" timeout="$2" interval="${WAIT_INTERVAL_S:-5}" deadline last
+  local cmd="$1" timeout="$2" stop="${3:-}" interval="${WAIT_INTERVAL_S:-5}" deadline last rc
   [[ "$timeout" =~ ^[0-9]+$ ]] || die "wait_for: bad timeout '$timeout'"
+  [[ -z "$stop" || "$stop" =~ ^[1-9][0-9]{0,2}$ ]] || die "wait_for: bad stop code '$stop'"
   [[ "$interval" =~ ^[0-9]+$ ]] || die "wait_for: bad WAIT_INTERVAL_S '$interval'"
   last="$(mktemp)" || die "wait_for: mktemp failed"
   deadline=$((SECONDS + timeout))
   log "waiting up to ${timeout}s for: $cmd"
-  until (eval "$cmd") > "$last" 2>&1; do
+  while rc=0; (eval "$cmd") > "$last" 2>&1 || rc=$?; (( rc != 0 )); do
+    if [[ -n "$stop" ]] && (( rc == stop )); then
+      log "stopped waiting for: $cmd (exit $rc, which no retry clears); the attempt said:"
+      tail -n 20 -- "$last" >&2
+      rm -f -- "$last"
+      return "$rc"
+    fi
     if (( SECONDS >= deadline )); then
       log "timed out after ${timeout}s waiting for: $cmd; the last attempt said:"
       tail -n 20 -- "$last" >&2
@@ -241,4 +317,251 @@ wait_for() {
     sleep "$interval"
   done
   rm -f -- "$last"
+}
+
+# ---- CPU workers and GPU nodes (Task 14) ------------------------------------------------------
+
+# Node names (global constraints): CPU workers k3s-cpu-<n>, GPU nodes k3s-gpu-<pool>-<n> (gpuctl's
+# planner: pool [a-z0-9]{1,20}). Anchored, so k3s-cp is neither, and no number has a leading zero.
+CPU_NODE_RE='^k3s-cpu-[1-9][0-9]*$'
+GPU_NODE_RE='^k3s-gpu-[a-z0-9]{1,20}-[1-9][0-9]*$'
+# The private staging directory for node/ on a host, made fresh by the operator's account with mode
+# 0700. mkdir (no -p) fails if anything recreated the path after rm, and the owner check catches a
+# mkdir that is not atomic, so nobody else on the host can place files there for root to run.
+# Used by up.sh (k3s-cp) and join-node.sh (workers, GPU nodes).
+# shellcheck disable=SC2034
+NODE_STAGING_CMD='rm -rf /tmp/k3s-node && mkdir -m 0700 /tmp/k3s-node && [ ! -L /tmp/k3s-node ] && [ -O /tmp/k3s-node ]'
+
+# is_ipv4 TEXT: one dotted-quad IPv4 address (each octet 0-255, no leading zeros).
+is_ipv4() {
+  local octet='(25[0-5]|2[0-4][0-9]|1[0-9][0-9]|[1-9]?[0-9])'
+  [[ "$1" =~ ^$octet\.$octet\.$octet\.$octet$ ]]
+}
+
+# node_kind NAME: prints cpu or gpu; fails (1) for any other name.
+node_kind() {
+  if [[ "$1" =~ $CPU_NODE_RE ]]; then
+    echo cpu
+  elif [[ "$1" =~ $GPU_NODE_RE ]]; then
+    echo gpu
+  else
+    return 1
+  fi
+}
+
+# _worker_zone NAME: set _ZONE to NAME's zone from `tf_out_json workers worker_zones`. The output is
+# read once per shell (_WORKER_ZONES); call it outside $(...) so that cache survives.
+_worker_zone() {
+  [[ "$1" =~ $CPU_NODE_RE ]] || die "not a CPU worker name: '$1'"
+  if [[ -z "${_WORKER_ZONES:-}" ]]; then
+    _WORKER_ZONES="$(tf_out_json workers worker_zones)" || die "cannot read worker_zones from the workers stack"
+  fi
+  _ZONE="$(jq -r --arg n "$1" 'if type == "object" then .[$n] // "" else error("not an object") end' \
+    <<< "$_WORKER_ZONES")" || die "unexpected worker_zones output from the workers stack"
+  [[ -n "$_ZONE" ]] || die "$1 is not in the workers stack (worker_zones)"
+  [[ "$_ZONE" =~ ^[a-z]+-[a-z]+[0-9]+-[a-z]$ ]] || die "unexpected zone for $1: '$_ZONE'"
+}
+
+# vm_status NAME: the GCE status of CPU worker NAME's VM (RUNNING, TERMINATED, SUSPENDED, ...) in
+# VM_STATUS, and its zone in _ZONE. Call it outside $(...): _worker_zone caches worker_zones for the
+# shell. Used by cpu-pool.sh (scale step 4) and join-node.sh (a stopped VM fails at once).
+vm_status() {
+  tf_env
+  _worker_zone "$1"
+  VM_STATUS="$(gcloud compute instances describe "$1" --project "$GCP_PROJECT" --zone "$_ZONE" \
+    --format='value(status)')" || die "cannot read the status of the VM $1"
+  [[ "$VM_STATUS" =~ ^[A-Z_]+$ ]] || die "unexpected status for the VM $1: '$VM_STATUS'"
+}
+
+# worker_ssh NAME CMD: run CMD on CPU worker NAME over IAP SSH (OS Login), as cp_ssh does on k3s-cp;
+# stdin is forwarded.
+worker_ssh() {
+  tf_env
+  _worker_zone "$1"
+  gcloud compute ssh "$1" --project "$GCP_PROJECT" --zone "$_ZONE" --tunnel-through-iap --quiet \
+    --ssh-flag=-oConnectTimeout=20 --ssh-flag=-oServerAliveInterval=30 --command "$2"
+}
+
+# worker_scp NAME SRC... DST: copy local SRCs (recursively) to DST on CPU worker NAME over IAP.
+worker_scp() {
+  (( $# >= 3 )) || die "usage: worker_scp NAME SRC... DST"
+  local name="$1" dst="${!#}"
+  shift
+  tf_env
+  _worker_zone "$name"
+  gcloud compute scp --project "$GCP_PROJECT" --zone "$_ZONE" --tunnel-through-iap --quiet \
+    --recurse --scp-flag=-oConnectTimeout=20 "${@:1:$#-1}" "$name:$dst"
+}
+
+# gpu_target NAME: ubuntu@IP for GPU node NAME. IP is GPU_SSH_IP (join-node.sh sets it to the IP it
+# was given) or else what `scripts/gpuctl ip NAME` reports; either way it must be one IPv4 address.
+gpu_target() {
+  local ip="${GPU_SSH_IP:-}"
+  [[ "$1" =~ $GPU_NODE_RE ]] || die "not a GPU node name: '$1'"
+  if [[ -z "$ip" ]]; then
+    ip="$("$REPO_ROOT/scripts/gpuctl" ip "$1")" || die "cannot look up the IP of $1 (scripts/gpuctl ip)"
+  fi
+  is_ipv4 "$ip" || die "the IP of $1 is not an IPv4 address: '$ip'"
+  printf 'ubuntu@%s\n' "$ip"
+}
+
+# _gpu_ssh_opts NAME: set _GPU_SSH_OPTS, the ssh/scp options for GPU node NAME. One known_hosts file
+# per node (.run/known_hosts_NAME, which gpuctl deletes with the node): Lambda hands old IPs to new
+# instances, so one shared file would reject a new node's key or vouch for the wrong host.
+_gpu_ssh_opts() {
+  [[ -n "${SSH_PRIVATE_KEY_PATH:-}" && -f "$SSH_PRIVATE_KEY_PATH" ]] \
+    || die "SSH_PRIVATE_KEY_PATH in .env must name the Lambda SSH private key: '${SSH_PRIVATE_KEY_PATH:-}'" 2
+  run_dir || die "cannot create $RUN_DIR"
+  # BatchMode: never a password or passphrase prompt. IdentitiesOnly: only this key, not every key an
+  # ssh-agent holds (those could use up the server's MaxAuthTries first).
+  _GPU_SSH_OPTS=(-i "$SSH_PRIVATE_KEY_PATH" -o StrictHostKeyChecking=accept-new
+    -o "UserKnownHostsFile=$RUN_DIR/known_hosts_$1" -o ConnectTimeout=20 -o ServerAliveInterval=30
+    -o BatchMode=yes -o IdentitiesOnly=yes)
+}
+
+# gpu_ssh NAME CMD: run CMD on GPU node NAME as ubuntu over plain SSH (Lambda admits tcp/22 from
+# OPERATOR_IP only); stdin is forwarded.
+gpu_ssh() {
+  local target
+  target="$(gpu_target "$1")" || return
+  _gpu_ssh_opts "$1"
+  # shellcheck disable=SC2029  # CMD is meant to run remotely, as with cp_ssh's --command
+  ssh "${_GPU_SSH_OPTS[@]}" "$target" "$2"
+}
+
+# gpu_scp NAME SRC... DST: copy local SRCs (recursively) to DST on GPU node NAME.
+gpu_scp() {
+  (( $# >= 3 )) || die "usage: gpu_scp NAME SRC... DST"
+  local name="$1" dst="${!#}" target
+  shift
+  target="$(gpu_target "$name")" || return
+  _gpu_ssh_opts "$name"
+  scp -r "${_GPU_SSH_OPTS[@]}" "${@:1:$#-1}" "$target:$dst"
+}
+
+# node_ssh NAME CMD / node_scp NAME SRC... DST: worker_* for k3s-cpu-<n>, gpu_* for k3s-gpu-*.
+node_ssh() {
+  case "$(node_kind "$1")" in
+    cpu) worker_ssh "$@" ;;
+    gpu) gpu_ssh "$@" ;;
+    *) die "not a CPU worker or GPU node name: '$1'" ;;
+  esac
+}
+
+node_scp() {
+  case "$(node_kind "$1")" in
+    cpu) worker_scp "$@" ;;
+    gpu) gpu_scp "$@" ;;
+    *) die "not a CPU worker or GPU node name: '$1'" ;;
+  esac
+}
+
+# KC_REQUEST_TIMEOUT: the bound of one kubectl request (get, apply, label, delete) through the API
+# tunnel, so a half-stalled tunnel fails instead of hanging. Waits carry their own --timeout.
+KC_REQUEST_TIMEOUT=60s
+
+# node_state NAME: prints Ready, NotReady (registered, not Ready) or Absent (not registered). Any
+# other kubectl failure (the tunnel is down, another cluster) dies: it says nothing about the node.
+# Only stdout is the jsonpath value: kubectl can succeed and still print a warning or a discovery
+# error on stderr, which must not make a Ready node look NotReady.
+node_state() {
+  local out err errf rc=0
+  errf="$(mktemp)" || die "node_state: mktemp failed"
+  out="$(kc get node "$1" --request-timeout="$KC_REQUEST_TIMEOUT" \
+    -o 'jsonpath={.status.conditions[?(@.type=="Ready")].status}' 2> "$errf")" || rc=$?
+  err="$(cat -- "$errf")"
+  rm -f -- "$errf"
+  if (( rc != 0 )); then
+    if [[ "$err" == *"nodes \"$1\" not found"* ]]; then
+      echo Absent
+      return 0
+    fi
+    die "cannot read node $1 from the cluster (is the API tunnel up? make tunnel): $err"
+  fi
+  if [[ "$out" == True ]]; then echo Ready; else echo NotReady; fi
+}
+
+# node_ready NAME: 0 when node NAME is Ready, 1 when it is not Ready or not registered; dies as
+# node_state does.
+node_ready() {
+  local state
+  state="$(node_state "$1")" || exit
+  [[ "$state" == Ready ]]
+}
+
+# _kc_node_gone_ok NAME ARGS...: kc ARGS, where "node NAME not found" counts as success (Review
+# Focus #3). Only that message: a generic NotFound (another server) or another node's name still
+# fails, as in gpuctl's Infra.drain_and_delete_node.
+_kc_node_gone_ok() {
+  local name="$1" out rc=0
+  shift
+  out="$(kc "$@" 2>&1)" || rc=$?
+  (( rc == 0 )) && return 0
+  if [[ "$out" == *"nodes \"$name\" not found"* || "$out" == *"node \"$name\" not found"* ]]; then
+    log "node $name is not in the cluster: nothing to $1"
+    return 0
+  fi
+  log "$out"
+  return "$rc"
+}
+
+# drain_and_delete_node NAME: drain NAME (bounded) and delete it from the cluster, with the flags
+# gpuctl uses for GPU nodes. A node that is already gone counts as success.
+drain_and_delete_node() {
+  log "draining $1 and deleting it from the cluster"
+  _kc_node_gone_ok "$1" drain "$1" --ignore-daemonsets --delete-emptydir-data --force --timeout=120s \
+    || die "cannot drain $1"
+  _kc_node_gone_ok "$1" delete node "$1" --request-timeout="$KC_REQUEST_TIMEOUT" || die "cannot delete node $1"
+}
+
+# worker_ip_lines: "NAME IP" for every CPU worker in `tf_out_json workers worker_ips`, in numeric
+# order (k3s-cpu-9 before k3s-cpu-10). Every name and IP is checked: both reach command lines.
+worker_ip_lines() {
+  local json lines name ip
+  json="$(tf_out_json workers worker_ips)" || die "cannot read worker_ips from the workers stack"
+  lines="$(jq -r 'if type == "object" then to_entries[] | "\(.key) \(.value)" else error("not an object") end' \
+    <<< "$json")" || die "unexpected worker_ips output from the workers stack"
+  while read -r name ip; do
+    [[ -n "$name" ]] || continue
+    [[ "$name" =~ $CPU_NODE_RE ]] || die "unexpected worker name in worker_ips: '$name'"
+    is_ipv4 "$ip" || die "worker_ips: $name has no IPv4 address: '$ip'"
+    printf '%s %s\n' "$name" "$ip"
+  done <<< "$lines" | sort -t- -k3,3n
+}
+
+# join_workers --all | join_workers [NAME...]: join-node.sh --skip-sync for every worker in the
+# workers stack's worker_ips (up.sh workers), or only for the NAMEs (cpu-pool.sh scale: the workers
+# that have not joined yet; none is fine), in numeric order. Each NAME must be in worker_ips. When
+# any worker is to be joined, sync-peers runs once first, so its IP is in k3s-cp's k3s_peers set
+# before its agent connects (spec §5.2 step 1); sync-peers also runs last, every time (Task 14
+# brief: the up.sh workers stage, scale step 5). join-node.sh leaves a Ready worker alone, so this
+# is safe to re-run.
+join_workers() {
+  local lines name ip line want
+  local -a join=()
+  lines="$(worker_ip_lines)" || exit
+  if [[ "${1:-}" == --all ]]; then
+    while read -r line; do
+      [[ -n "$line" ]] && join+=("$line")
+    done <<< "$lines"
+  else
+    for want in "$@"; do
+      [[ "$want" =~ $CPU_NODE_RE ]] || die "not a CPU worker name: '$want'"
+      grep -q "^$want " <<< "$lines" || die "$want is not in the workers stack's worker_ips: it cannot be joined"
+    done
+    while read -r name ip; do
+      for want in "$@"; do
+        [[ "$name" == "$want" ]] && join+=("$name $ip")
+      done
+    done <<< "$lines"
+  fi
+  if (( ${#join[@]} )); then
+    "$REPO_ROOT/scripts/gpuctl" sync-peers || die "sync-peers failed"
+    for line in "${join[@]}"; do
+      read -r name ip <<< "$line"
+      "$REPO_ROOT/scripts/join-node.sh" --node "$name" --external-ip "$ip" --skip-sync < /dev/null \
+        || die "join-node.sh failed for $name"
+    done
+  fi
+  "$REPO_ROOT/scripts/gpuctl" sync-peers || die "sync-peers failed"
 }

@@ -23,9 +23,12 @@ ROOT = Path(__file__).resolve().parents[2]
 FAKES = Path(__file__).with_name("fake_tools.py")
 PROJECT = "k3s-demo-123456"
 BUCKET = f"{PROJECT}-k3s-tfstate"
-SCRIPTS = ["up.sh", "kubeconfig.sh", "tunnel.sh", "lib/common.sh"]
+SCRIPTS = ["up.sh", "kubeconfig.sh", "tunnel.sh", "lib/common.sh", "join-node.sh", "cpu-pool.sh"]
+TOOLS = ("terraform", "gcloud", "kubectl", "helm", "ssh", "scp")
 OUTPUTS = {"base": {"cp_zone": "us-west1-b", "cp_ip": "34.82.10.10", "cp_internal_ip": "10.10.0.2"},
-           "bootstrap": {"state_bucket": BUCKET}}
+           "bootstrap": {"state_bucket": BUCKET},
+           "workers": {"worker_ips": {"k3s-cpu-1": "34.10.0.11"}, "worker_zones": {"k3s-cpu-1": "us-central1-a"}},
+           "gpu-access": {"gpu_ips": ["129.80.1.2"]}}
 KUBECONFIG = """apiVersion: v1
 clusters:
 - cluster:
@@ -56,21 +59,35 @@ class Env:
         for rel in SCRIPTS:
             (self.repo / "scripts" / rel).parent.mkdir(parents=True, exist_ok=True)
             shutil.copy2(ROOT / "scripts" / rel, self.repo / "scripts" / rel)
-        for stack in ("bootstrap", "base"):
+        for stack in ("bootstrap", "base", "workers", "gpu-access"):
             (self.repo / "infra" / stack).mkdir(parents=True)
+        shutil.copy2(ROOT / "infra/workers/workers.auto.tfvars.json", self.tfvars)
         shutil.copytree(ROOT / "node", self.repo / "node")
+        shutil.copytree(ROOT / "k8s", self.repo / "k8s")
         self.home.mkdir()
         self.bin.mkdir()
-        for tool in ("terraform", "gcloud", "kubectl"):
+        for tool in TOOLS:
             (self.bin / tool).write_text(f'#!/bin/sh\nexec "{sys.executable}" "{FAKES}" {tool} "$@"\n')
             (self.bin / tool).chmod(0o755)
+        # scripts/gpuctl (sync-peers, ip) is the fake too: it would reach Lambda and the cluster.
+        (self.repo / "scripts/gpuctl").write_text(f'#!/bin/sh\nexec "{sys.executable}" "{FAKES}" gpuctl "$@"\n')
+        (self.repo / "scripts/gpuctl").chmod(0o755)
+        self.ssh_key = self.home / ".ssh/lambda"
+        self.ssh_key.parent.mkdir(mode=0o700)
+        self.ssh_key.write_text("not a key\n")
+        self.ssh_key.chmod(0o600)
         self.log = tmp / "calls.jsonl"
         self.scenario_file = tmp / "scenario.json"
         self.tmpdir = tmp / "tmp"  # TMPDIR of the scripts, so tests can see a leaked temp file
         self.tmpdir.mkdir()
         self.scenario = {"outputs": OUTPUTS, "kubeconfig": KUBECONFIG}
         self.port = free_port()
-        self.write_env(f"GCP_PROJECT={PROJECT}\nLAMBDA_API_KEY=x\nUNDERLAY_MTU=1460\n")
+        self.write_env(f"GCP_PROJECT={PROJECT}\nLAMBDA_API_KEY=x\nUNDERLAY_MTU=1460\n"
+                       f"SSH_PRIVATE_KEY_PATH={self.ssh_key}\n")
+
+    @property
+    def tfvars(self):
+        return self.repo / "infra/workers/workers.auto.tfvars.json"
 
     def write_env(self, text, mode=0o600):
         env = self.repo / ".env"
@@ -89,13 +106,14 @@ class Env:
         self.scenario_file.write_text(json.dumps(self.scenario))
         env = {k: v for k, v in os.environ.items()
                if k not in ("AUTO_APPROVE", "GCP_PROJECT", "UNDERLAY_MTU", "KUBECONFIG", "REPO_ROOT",
-                            "LAMBDA_API_KEY", "TUNNEL_TIMEOUT_S")
+                            "LAMBDA_API_KEY", "TUNNEL_TIMEOUT_S", "GPU_SSH_IP", "SSH_PRIVATE_KEY_PATH",
+                            "CPU_ZONE", "CPU_TYPE", "WORKERS_TFVARS")
                and not k.startswith("TF_VAR_")}
         env.update(PATH=f"{self.bin}:{os.environ['PATH']}", HOME=str(self.home), FAKE_LOG=str(self.log),
                    FAKE_SCENARIO=str(self.scenario_file), WAIT_INTERVAL_S="0",
                    K3S_TUNNEL_TEST_PORT=str(self.port), TMPDIR=str(self.tmpdir))
         env.update(extra)
-        for tool in ("terraform", "gcloud", "kubectl"):  # never the real CLIs
+        for tool in TOOLS:  # never the real CLIs
             assert shutil.which(tool, path=env["PATH"]) == str(self.bin / tool)
         return env
 
@@ -436,6 +454,24 @@ def test_wait_for_gives_up_after_the_timeout(env):
     assert "still-down" in proc.stderr, "the last attempt's output helps the operator"
 
 
+def test_wait_for_stops_at_once_on_the_stop_code(env):
+    """wait_for CMD TIMEOUT STOP_RC: an attempt that exits STOP_RC can never succeed (M4-2: a rejected
+    host key); the wait ends at once and returns STOP_RC, showing that attempt's output."""
+    start = time.time()
+    proc = env.lib('f="$TMPDIR/tries"; : > "$f"; rc=0; wait_for "echo . >> $f; echo key-rejected >&2; exit 7" 30 7'
+                   ' || rc=$?; echo "rc=$rc tries=$(( $(wc -l < "$f") ))"; rm -f "$f"', WAIT_INTERVAL_S="1")
+    assert proc.stdout.strip() == "rc=7 tries=1" and time.time() - start < 10
+    assert "key-rejected" in proc.stderr
+    assert list(env.tmpdir.iterdir()) == []
+
+
+def test_wait_for_retries_other_failures_when_given_a_stop_code(env):
+    proc = env.lib('f="$TMPDIR/tries"; : > "$f"; wait_for "echo . >> $f; (( \\$(wc -l < $f) >= 3 ))" 30 7; '
+                   'echo "tries=$(( $(wc -l < "$f") ))"; rm -f "$f"', WAIT_INTERVAL_S="0")
+    assert proc.returncode == 0, proc.stderr
+    assert proc.stdout.strip() == "tries=3"
+
+
 # ---- common.sh: tf_apply ---------------------------------------------------------------------
 
 def tf_subcommands(env):
@@ -480,7 +516,7 @@ def test_tf_apply_auto_approve_applies_a_destroying_plan_but_lists_it(env):
     """Brief contract (S0-1): under AUTO_APPROVE=1 confirm passes outright, so Task 14's
     `AUTO_APPROVE=1 scripts/cpu-pool.sh scale 1` can remove a worker with a plain tf_apply."""
     env.scenario["deletes"] = {"workers": ["google_compute_instance.cpu[1]"]}
-    (env.repo / "infra/workers").mkdir()
+    (env.repo / "infra/workers").mkdir(exist_ok=True)
     proc = env.lib("load_env; tf_apply workers", AUTO_APPROVE="1")
     assert proc.returncode == 0, proc.stderr
     assert tf_subcommands(env)[-1] == "apply"
@@ -1022,8 +1058,10 @@ def test_up_all_runs_every_stage_but_init(env):
     proc = env.script("up.sh", "all", AUTO_APPROVE="1")
     assert proc.returncode == 0, proc.stderr
     chdirs = {a[0] for a in env.argvs("terraform")}
-    assert chdirs == {tf_base_dir(env)}, "make up must not re-apply the bootstrap stack (make init does)"
-    assert non_tf(env) == base_sequence(env)
+    assert chdirs == {tf_base_dir(env), f"-chdir={env.repo.resolve()}/infra/workers"}, \
+        "make up must not re-apply the bootstrap stack (make init does)"
+    # Every stage's calls, in order: tests/scripts/test_workers_ops.py (Task 14, Ruling R38).
+    assert non_tf(env)[:len(base_sequence(env))] == base_sequence(env)
 
 
 @pytest.mark.parametrize("args", [[], ["nosuch"], ["base", "extra"]])
