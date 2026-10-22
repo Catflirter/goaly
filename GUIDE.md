@@ -118,8 +118,8 @@ builds a WireGuard mesh between those public endpoints.
   - the operator on TCP 22;
   - the control plane on TCP 10250;
   - the cluster nodes on UDP 51820, plus ICMP.
-- **Two layers of rules.** Global rules carry only the operator's SSH. Per-region rulesets carry
-  the cluster rules and are attached at launch.
+- **Two layers of rules.** Global rules carry only the operator's SSH. Per-region rulesets repeat
+  the operator's SSH rule, add the cluster rules, and are attached at launch.
 
 ## 3. Operations guide
 
@@ -129,7 +129,7 @@ The times below were measured live on 2026-10-22.
 ### 3.1 Prerequisites (once)
 
 - Tools: `gcloud` (logged in, plus `gcloud auth application-default login`), `terraform`,
-  `kubectl`, `helm`, `jq`, Python ≥ 3.11, bash ≥ 4.1, `flock` (util-linux), `gitleaks`.
+  `kubectl`, `helm`, `jq`, Python ≥ 3.11, bash ≥ 4.1, `flock` (util-linux), `gitleaks`; Terraform ≥ 1.9.
   On macOS: `brew install bash util-linux`.
 - `make venv` creates `.venv` with the Python dependencies.
 - Copy `.env.example` to `.env`, run `chmod 600 .env`, and fill in:
@@ -153,7 +153,7 @@ The times below were measured live on 2026-10-22.
 | 4 | `make gpu-apply` | ~6 min | launch the Lambda GPU node(s), update the firewalls on both clouds, join the cluster |
 
 Every command that changes infrastructure shows its plan and asks before applying.
-`AUTO_APPROVE=1` skips the question.
+`AUTO_APPROVE=1` skips the question (`make down` accepts only the exact value `1`).
 
 ### 3.3 Day-to-day operations
 
@@ -210,7 +210,8 @@ export KUBECONFIG=$HOME/.kube/hybrid-gpu.yaml && kubectl get nodes -o wide
 
 Expect:
 - k3s-cp with InternalIP `10.10.0.x` (core VPC);
-- k3s-cpu-1 and k3s-cpu-2 with InternalIP `10.20.0.x` (edge VPC, no peering with core);
+- k3s-cpu-1 (and k3s-cpu-2 after `make cpu-scale N=2`; `make up` creates only k3s-cpu-1) with
+  InternalIP `10.20.0.x` (edge VPC, no peering with core);
 - GPU nodes with Lambda private IPs;
 - a `-gcp` kernel on the GCP nodes.
 
@@ -257,7 +258,8 @@ Expect the `nvidia-smi` table for the GPU, with the Pod placed on a GPU node.
 
 ### 4.4 The two CPU nodes communicate
 
-From a Pod on k3s-cpu-1 to a Pod IP on k3s-cpu-2:
+From a Pod on k3s-cpu-1 to a Pod IP on k3s-cpu-2. This needs a second CPU worker first:
+`make cpu-scale N=2` (`make up` creates only k3s-cpu-1).
 
 ```bash
 export KUBECONFIG=$HOME/.kube/hybrid-gpu.yaml && P=$(kubectl -n nettest get pod -l app=probe --field-selector spec.nodeName=k3s-cpu-1 -o name | head -1) && E=$(kubectl -n nettest get pod -l app=echo --field-selector spec.nodeName=k3s-cpu-2 -o jsonpath='{.items[0].status.podIP}') && echo "$P -> $E" && kubectl -n nettest exec $P -- curl -sS -m 5 http://$E:8080/
