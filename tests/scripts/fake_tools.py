@@ -57,7 +57,11 @@ Verification checks (Task 18) script their answers instead, with rules tried bef
                                           127.0.0.1:L, prints kubectl's "Forwarding from" line and answers
                                           every HTTP GET with TEXT until it is killed. "sleep": SECONDS
                                           waits that long after printing, before exiting (a capture or a
-                                          stalled call that is still running).
+                                          stalled call that is still running). "run_with": {TOOL: rc}
+                                          runs the command after `--` (kubectl exec) for real, here, with
+                                          only stubs of the named tools (each exits its rc) in front of
+                                          /usr/bin:/bin, and exits with its status: the exec'd script's
+                                          own logic is tested, not a canned exit code.
 """
 import http.server
 import json
@@ -290,8 +294,22 @@ def scripted():
         if "serve" in answer:
             serve(answer["serve"])
         time.sleep(answer.get("sleep", 0))
+        if "run_with" in answer:
+            return run_with(answer["run_with"])
         return answer.get("rc", 0)
     return None
+
+
+def run_with(stubs):
+    """Run the command after `--` with stub tools STUBS {name: rc} first on PATH; its exit status."""
+    stub_dir = Path(os.environ["FAKE_LOG"] + ".run_with")
+    stub_dir.mkdir(exist_ok=True)
+    for name, rc in stubs.items():
+        stub = stub_dir / name
+        stub.write_text(f"#!/bin/sh\nexit {int(rc)}\n")
+        stub.chmod(0o755)
+    command = ARGS[ARGS.index("--") + 1:]
+    return subprocess.run(command, env={"PATH": f"{stub_dir}:/usr/bin:/bin"}).returncode
 
 
 if __name__ == "__main__":
