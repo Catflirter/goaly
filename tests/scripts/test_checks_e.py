@@ -7,6 +7,7 @@ Each test scripts what the reboot, the GPU node replacement or the firewall drif
 runs one check through run_check, as make verify does. Nothing here reboots, launches, deletes or applies anything
 real: gpuctl and terraform are the fakes, and `timeout` is the real one (the checks bound gpuctl's reads with it).
 """
+import datetime
 import json
 import os
 import re
@@ -20,21 +21,33 @@ import shutil
 import pytest
 
 from test_checks_abc import CP, CPU1, GPU1, NODES, Cluster, kc, on, rule
-from test_checks_d import GpuCluster
+from test_checks_d import GPU2, GpuCluster
 from test_ops_scripts import FAKES, PROJECT, ROOT, free_port
 
 REAL_TIMEOUT = '() { command timeout "$@"; }'  # B5's tests fake `timeout`; E uses the real one
 READY = 'Ready")].status'
 TRANSITION = 'Ready")].lastTransitionTime'
-T0, T1 = "2026-10-21T08:00:00Z", "2026-10-22T09:15:42Z"
+STARTED = "running.startedAt"
+
+
+def iso(offset_s):
+    """A Kubernetes timestamp OFFSET_S seconds from now (UTC, whole seconds, Z), as the API server prints it."""
+    t = datetime.datetime.now(datetime.timezone.utc) + datetime.timedelta(seconds=offset_s)
+    return t.strftime("%Y-%m-%dT%H:%M:%SZ")
+
+
+# T0: Ready's lastTransitionTime before the reboot (a day ago); T1: after it, within E1's 120 s window.
+T0, T1 = iso(-86400), iso(10)
 BOOT1, BOOT2 = "6b1f3c1e-0d2a-4e5b-9c8d-7e6f5a4b3c21", "f0e1d2c3-b4a5-4968-8776-655443322110"
 UID1, UID2 = "11111111-2222-4333-8444-555555555555", "99999999-8888-4777-8666-555555555555"
 GPU_IP, NEW_IP = NODES[GPU1]["ext"], "203.0.113.44"
 EXTRA = "198.51.100.99"
 LIST_BEFORE = f"{GPU1} {GPU_IP} active gpu_1x_a10 us-west-1\n"
 LIST_AFTER = f"{GPU1} {NEW_IP} active gpu_1x_a10 us-east-1\n"
-STATUS_HEAD = ("Capacity (in the order gpu-apply tries them):\nPOOL   TYPE          REGION     AVAILABLE  PRICE\n"
-               "a6000  gpu_1x_a6000  us-west-1  no         $0.80/h\n\nGPU instances (k3s-gpu-*): 1\n" + LIST_BEFORE +
+CAPACITY = ("Capacity (in the order gpu-apply tries them):\nPOOL   TYPE          REGION     AVAILABLE  PRICE\n"
+            "a6000  gpu_1x_a6000  us-west-1  no         $0.80/h\n"
+            "a6000  gpu_1x_a10    us-east-1  yes        $0.75/h\n")
+STATUS_HEAD = (CAPACITY + "\nGPU instances (k3s-gpu-*): 1\n" + LIST_BEFORE +
                "\nDrift check (Lambda instances, cluster nodes, gpu-access state, k3s-cp k3s_peers):\n")
 STATUS_OK = STATUS_HEAD + "  No drift\n"
 STATUS_DRIFT = (STATUS_HEAD + f"  SECURITY: firewall rule for {EXTRA} has no live instance\n"
@@ -61,8 +74,9 @@ def check(env, func, **extra):
 
 
 def gpuctl_calls(env):
-    """Each scripts/gpuctl call as its subcommand and options, e.g. "apply --auto-approve"."""
-    return [" ".join(a) for a in env.argvs("gpuctl")]
+    """Each scripts/gpuctl call as its subcommand and options, e.g. "apply --auto-approve"; not `ip NAME`, the
+    read-only lookup node_ssh makes for D1's SSH to a GPU node."""
+    return [" ".join(a) for a in env.argvs("gpuctl") if a[:1] != ["ip"]]
 
 
 def tf_applies(env):
@@ -100,15 +114,22 @@ def wait_for_file(path, seconds=20):
 # ---- E1: a CPU worker reboots ----------------------------------------------------------------
 
 def e1(env, ready=("True", "True", "Unknown", "Unknown", "True"), boots=(BOOT1, BOOT2), reboot_rc=255,
-       transitions=(T0, T1)):
-    """k3s-cpu-1 is Ready, goes NotReady after the reboot command and comes back Ready with a new boot ID."""
+       transitions=(T0, T1), started=None):
+    """k3s-cpu-1 is Ready, goes NotReady after the reboot command and comes back Ready with a new boot ID; its
+    nettest probe and echo containers (re)started after the reboot command (STARTED: their startedAt answers)."""
+    started = started or (iso(60),)
     env.first(kc(f"get node {CPU1} ", READY, seq=seq(*ready)),
               kc(f"get node {CPU1} ", TRANSITION, seq=seq(*transitions)),
               kc(f"get node {CPU1} ", "bootID", seq=seq(*boots)),
+              kc("-n nettest get pods", f"spec.nodeName={CPU1},", STARTED, seq=seq(*(f"true {s}\n" for s in started))),
               on(CPU1, "sudo systemctl reboot", rc=reboot_rc,
                  stderr="Connection to compute.1234567890 closed by remote host.\n" if reboot_rc == 255 else ""),
               kc("-n nettest rollout status", stdout='daemon set "probe" successfully rolled out\n'))
     return env
+
+
+def started_polls(env):
+    return [a for a in env.kubectl() if a[:3] == ["-n", "nettest", "get"] and any(STARTED in x for x in a)]
 
 
 @pytest.fixture
@@ -135,13 +156,15 @@ def test_e1_reboots_the_worker_sees_notready_then_ready_and_runs_b1(env):
     notready = next(i for i, line in enumerate(lines) if "NotReady" in line and line.startswith("E1"))
     ready = next(i for i, line in enumerate(lines) if "Ready again" in line)
     rollout = next(i for i, line in enumerate(lines) if "rollout status ds/probe" in line)
+    restarted = next(i for i, line in enumerate(lines) if "restarted after the reboot" in line)
     b1 = next(i for i, line in enumerate(lines) if line.startswith("B1: N x N matrix"))
-    assert reboot < notready < ready < rollout < b1, lines
+    assert reboot < notready < ready < rollout < restarted < b1, lines
     assert ["-n", "nettest", "rollout", "status", "ds/echo", "--timeout=300s"] in env.kubectl()
     assert len(polls(env, CPU1)) == 5                   # before, 2 until NotReady, 2 until Ready
+    assert len(started_polls(env)) == 2                 # the probe and the echo Pod on k3s-cpu-1
     assert BOOT1 in text and BOOT2 in text
     # every kubectl request of the waits is bounded, and never beyond the time left
-    for argv in polls(env, CPU1):
+    for argv in polls(env, CPU1) + started_polls(env):
         assert any(re.fullmatch(r"--request-timeout=([1-9]|1[0-5])s", a) for a in argv), argv
 
 
@@ -149,10 +172,19 @@ def test_e1_accepts_a_reboot_command_that_returns_0(env):
     assert check(e1(env, reboot_rc=0), "check_e1_worker_reboot")[0] == "PASS"
 
 
-def test_e1_fails_when_the_reboot_command_fails_and_waits_for_nothing(env):
+def test_e1_reboot_command_that_fails_but_reboots_the_node_passes(env):
+    """An IAP SSH can exit with neither 0 nor 255 when the tunnel drops under the reboot: the boot ID decides."""
     result, text = check(e1(env, reboot_rc=1), "check_e1_worker_reboot")
+    assert result == "PASS", text
+    assert "exit 1" in text and BOOT2 in text
+
+
+def test_e1_reboot_command_that_fails_still_waits_then_fails_when_the_node_did_not_reboot(env):
+    result, text = check(e1(env, reboot_rc=1, ready=("True",), transitions=(T0,), boots=(BOOT1, BOOT1)),
+                         "check_e1_worker_reboot")
     assert result == "FAIL" and "the reboot command failed (exit 1)" in text
-    assert len(polls(env, CPU1)) == 1                   # only the check before the reboot
+    assert len(polls(env, CPU1)) == 1 + 61              # the whole 120 s window, every 2 s: E2 must not start early
+    assert "B1: N x N matrix" not in text
 
 
 @pytest.mark.parametrize("state", ["False", "Unknown", ""])
@@ -165,8 +197,8 @@ def test_e1_refuses_to_reboot_a_worker_that_is_not_ready(env, state):
 def test_e1_fails_when_the_worker_never_goes_notready_within_120_s(env):
     result, text = check(e1(env, ready=("True",), transitions=(T0,)), "check_e1_worker_reboot")
     assert result == "FAIL" and "never NotReady within 120 s" in text
-    # bounded: every 2 s for 120 s after the reboot command (the real time the test takes counts too)
-    assert 1 + 45 <= len(polls(env, CPU1)) <= 1 + 61
+    # bounded: every 2 s for 120 s after the reboot command (VR_NO_WAIT: the clock is the skipped sleeps)
+    assert len(polls(env, CPU1)) == 1 + 61
     # the evidence says whether the node rebooted anyway (faster than the node-monitor grace period)
     assert "boot ID changed" in text
     assert "B1: N x N matrix" not in text
@@ -186,11 +218,36 @@ def test_e1_counts_a_notready_between_two_polls_from_the_ready_condition_transit
     assert "B1: N x N matrix" in text
 
 
+def test_e1_does_not_count_a_ready_transition_later_than_120_s_after_the_reboot(env):
+    """The brief wants NotReady seen within 120 s: a Ready transition after that window does not show it."""
+    late = iso(3600)
+    result, text = check(e1(env, ready=("True",), transitions=(T0, late)), "check_e1_worker_reboot")
+    assert result == "FAIL", text
+    assert late in text and "more than 120 s after the reboot command" in text
+    assert "B1: N x N matrix" not in text
+
+
 def test_e1_fails_when_the_worker_does_not_come_back_within_600_s(env):
     result, text = check(e1(env, ready=("True", "Unknown")), "check_e1_worker_reboot")
     assert result == "FAIL" and "not Ready again within 600 s" in text
-    # bounded: every 10 s until 600 s after the reboot command (the real time the test takes counts too)
-    assert 1 + 1 + 50 <= len(polls(env, CPU1)) <= 1 + 1 + 61
+    # bounded: every 10 s until 600 s after the reboot command (VR_NO_WAIT: the clock is the skipped sleeps)
+    assert len(polls(env, CPU1)) == 1 + 1 + 61
+    assert "B1: N x N matrix" not in text
+    # the evidence says how to bring the worker back
+    assert f"gcloud compute instances reset {CPU1}" in text and "get-serial-port-output" in text
+
+
+def test_e1_waits_for_the_nettest_pods_to_restart_before_b1(env):
+    """A fast reboot can leave the Pods' Ready status stale: B1 waits for containers started after the reboot."""
+    result, text = check(e1(env, started=(iso(-3600), iso(-3600), iso(60))), "check_e1_worker_reboot")
+    assert result == "PASS", text
+    assert len(started_polls(env)) == 2 + 2              # probe stale twice, then probe and echo restarted
+
+
+def test_e1_fails_when_the_nettest_pods_never_restart(env):
+    result, text = check(e1(env, started=(iso(-3600),)), "check_e1_worker_reboot")
+    assert result == "FAIL" and "did not restart after the reboot within 300 s" in text
+    assert len(started_polls(env)) == 1 + 60            # the probe Pod every 5 s for 300 s
     assert "B1: N x N matrix" not in text
 
 
@@ -228,20 +285,82 @@ def e2(env, status=STATUS_OK, status_rc=0, lists=(LIST_BEFORE, "", LIST_AFTER), 
     return env
 
 
-def test_e2_replaces_the_gpu_node_then_runs_d2_d4_and_b1(gpu):
+def test_e2_replaces_the_gpu_node_then_runs_every_d_check_and_b1(gpu):
+    """Spec section 9 E2: the node rejoins, and the matrix and all of D pass on it."""
     result, text = check(e2(gpu), "check_e2_gpu_replace")
     assert result == "PASS", text
     assert gpuctl_calls(gpu) == ["status", "list-nodes", "down --auto-approve", "list-nodes",
                                  "apply --auto-approve", "list-nodes"]
     lines = text.splitlines()
     apply = next(i for i, line in enumerate(lines) if "gpuctl apply --auto-approve" in line)
+    d1 = next(i for i, line in enumerate(lines) if line.startswith("D1: ") and "gpu-audit.txt has content" in line)
     d2 = next(i for i, line in enumerate(lines) if line.startswith("D2: "))
+    d3 = next(i for i, line in enumerate(lines) if line.startswith("D3: the device plugin registered"))
     d4 = next(i for i, line in enumerate(lines) if line.startswith("D4: gpu-smoke ran"))
+    d5 = next(i for i, line in enumerate(lines) if line.startswith("D5: vectoradd: Test PASSED"))
+    d6 = next(i for i, line in enumerate(lines) if line.startswith("D6: gpu-overflow is Pending"))
     b1 = next(i for i, line in enumerate(lines) if line.startswith("B1: N x N matrix"))
-    assert apply < d2 < d4 < b1, lines
+    assert apply < d1 < d2 < d3 < d4 < d5 < d6 < b1, lines
     assert f"{GPU1}: {GPU_IP} -> {NEW_IP}" in text
     # the read-only gpuctl calls are bounded; down and apply bound their own steps
     assert re.search(r"^\$ timeout --foreground \d+ \S*scripts/gpuctl status$", text, re.M), text
+
+
+@pytest.mark.parametrize("check_name, broken", [
+    ("D1", kc("get runtimeclass nvidia-gpu", rc=1, stderr='Error from server (NotFound): runtimeclasses "nvidia-gpu"\n')),
+    ("D3", kc("-n nvidia-device-plugin logs", stdout="I1022 starting\n")),
+    ("D5", kc("-n gpu-test logs vectoradd", stdout="Test FAILED\n")),
+    ("D6", kc("-n gpu-test get pod gpu-overflow", "phase", stdout="Running")),
+])
+def test_e2_fails_when_any_d_check_fails_on_the_new_node_and_still_runs_b1(gpu, check_name, broken):
+    e2(gpu).first(broken)
+    result, text = check(gpu, "check_e2_gpu_replace")
+    assert result == "FAIL", text
+    assert "B1: N x N matrix" in text
+    assert gpuctl_calls(gpu).count("down --auto-approve") == 1   # the replacement finished: nothing to sweep
+
+
+def test_e2_waits_for_lambda_to_stop_listing_the_terminated_instance(gpu):
+    """Lambda can list a terminated instance as active for a moment after the terminate call returns."""
+    result, text = check(e2(gpu, lists=(LIST_BEFORE, LIST_BEFORE, LIST_BEFORE, "", LIST_AFTER)),
+                         "check_e2_gpu_replace")
+    assert result == "PASS", text
+    assert gpuctl_calls(gpu) == ["status", "list-nodes", "down --auto-approve", "list-nodes", "list-nodes",
+                                 "list-nodes", "apply --auto-approve", "list-nodes"]
+
+
+def test_e2_reads_only_the_stdout_of_list_nodes(gpu):
+    """A warning on stderr (urllib3, the wrapper's terraform init) goes into the evidence, never into the node list."""
+    warning = "/usr/lib/python3/dist-packages/urllib3/connectionpool.py:1061: InsecureRequestWarning: x\n"
+    e2(gpu)
+    gpu.first(gpuctl("list-nodes", seq=[{"stdout": s, "stderr": warning} for s in (LIST_BEFORE, "", LIST_AFTER)]))
+    result, text = check(gpu, "check_e2_gpu_replace")
+    assert result == "PASS", text
+    assert "InsecureRequestWarning" in text and "unexpected line" not in text
+
+
+def test_e2_accepts_the_replacement_under_the_lowest_free_name(gpu):
+    """gpuctl apply names a new node by the lowest free index: k3s-gpu-a6000-2 comes back as k3s-gpu-a6000-1."""
+    before = f"{GPU2} 203.0.113.13 active gpu_1x_a10 us-west-1\n"
+    e2(gpu, lists=(before, "", LIST_AFTER), uids=(UID2,))
+    gpu.first(kc(f"get node {GPU2} ", "metadata.uid", stdout=UID1))
+    result, text = check(gpu, "check_e2_gpu_replace")
+    assert result == "PASS", text
+    assert "more GPU instances" not in text
+    assert f"{GPU1}" in text and NEW_IP in text
+
+
+@pytest.mark.parametrize("rows", [
+    "a6000  gpu_1x_a6000  us-west-1  no         $0.80/h\n",
+    "a6000  gpu_1x_a6000  us-west-1  no         $0.80/h\na6000  gpu_1x_a10    us-east-1  no         $0.75/h\n",
+], ids=["one-type", "every-fallback"])
+def test_e2_skips_and_keeps_the_gpu_node_when_lambda_has_no_capacity_to_relaunch_it(gpu, rows):
+    status = STATUS_OK.replace(CAPACITY, "Capacity (in the order gpu-apply tries them):\n"
+                                         "POOL   TYPE          REGION     AVAILABLE  PRICE\n" + rows)
+    result, text = check(e2(gpu, status=status), "check_e2_gpu_replace")
+    assert result == "SKIP", text
+    assert "no capacity" in text
+    assert "down --auto-approve" not in gpuctl_calls(gpu)
 
 
 def test_e2_skips_without_a_gpu_node_and_without_reading_env(no_gpu):
@@ -268,11 +387,15 @@ def test_e2_changes_nothing_while_autoscaler_overrides_exist(gpu):
     assert "down --auto-approve" not in gpuctl_calls(gpu)
 
 
-def test_e2_fails_loudly_when_apply_brings_back_more_gpu_nodes_than_it_replaced(gpu):
+def test_e2_fails_loudly_when_apply_brings_back_more_gpu_nodes_than_it_replaced_and_removes_them(gpu):
+    """No extra GPU instance is left billing: the cleanup sweeps them all (make gpu-apply restores the spec)."""
     extra = "k3s-gpu-a6000-2 203.0.113.45 active gpu_1x_a10 us-east-1\n"
-    result, text = check(e2(gpu, lists=(LIST_BEFORE, "", LIST_AFTER + extra)), "check_e2_gpu_replace")
+    result, text = check(e2(gpu, lists=(LIST_BEFORE, "", LIST_AFTER + extra, LIST_AFTER + extra, "")),
+                         "check_e2_gpu_replace")
     assert result == "FAIL"
-    assert "k3s-gpu-a6000-2" in text and "make gpu-status" in text
+    assert "more GPU instances than the check replaced" in text and "k3s-gpu-a6000-2" in text
+    assert gpuctl_calls(gpu)[-3:] == ["list-nodes", "down --auto-approve", "list-nodes"]
+    assert "no GPU instance is left running" in text and "make gpu-apply" in text
 
 
 @pytest.mark.parametrize("status, rc", [
@@ -297,12 +420,15 @@ def test_e2_fails_when_gpu_down_fails_and_makes_sure_no_instance_is_left(gpu):
     assert "no GPU instance is left running" in text
 
 
-def test_e2_fails_when_the_node_is_still_listed_after_gpu_down(gpu):
-    e2(gpu, lists=(LIST_BEFORE, LIST_BEFORE, LIST_BEFORE, ""))
+def test_e2_fails_when_the_node_is_still_listed_120_s_after_gpu_down(gpu):
+    # 1 before, 25 while waiting (every 5 s for 120 s), 1 for the sweep; after the sweep's gpuctl down: none
+    e2(gpu, lists=(LIST_BEFORE,) * 27 + ("",))
     result, text = check(gpu, "check_e2_gpu_replace")
-    assert result == "FAIL" and f"{GPU1} is still listed after gpuctl down" in text
+    assert result == "FAIL" and f"{GPU1} is still listed 120 s after gpuctl down" in text
     assert "apply --auto-approve" not in gpuctl_calls(gpu)
-    assert gpuctl_calls(gpu)[-2:] == ["down --auto-approve", "list-nodes"]
+    assert gpuctl_calls(gpu) == (["status", "list-nodes", "down --auto-approve"] + ["list-nodes"] * 25
+                                 + ["list-nodes", "down --auto-approve", "list-nodes"])
+    assert "no GPU instance is left running" in text
 
 
 def test_e2_failed_apply_that_cleaned_up_after_itself_needs_no_second_down(gpu):
@@ -325,6 +451,19 @@ def test_e2_says_loudly_when_an_instance_may_still_be_billing(gpu):
     result, text = check(e2(gpu, lists=(LIST_BEFORE, "", LIST_AFTER, LIST_AFTER), apply_rc=1), "check_e2_gpu_replace")
     assert result == "FAIL"
     assert "may still be running" in text and "make gpu-down" in text and GPU1 in text
+    # R54: gpuctl down refuses an undrained terminate while the API is unreachable: the tunnel comes first
+    assert "make tunnel" in text
+    # the sweep waited for Lambda to stop listing it (every 5 s for 120 s) before it said so
+    assert gpuctl_calls(gpu)[-27:] == ["list-nodes", "down --auto-approve"] + ["list-nodes"] * 25
+
+
+def test_e2_sweep_waits_for_lambda_to_stop_listing_before_it_warns_of_billing(gpu):
+    """The sweep's gpuctl down terminated it; Lambda still lists it as active for a moment: no false alarm."""
+    result, text = check(e2(gpu, lists=(LIST_BEFORE, "", LIST_AFTER, LIST_AFTER, LIST_AFTER, ""), apply_rc=1),
+                         "check_e2_gpu_replace")
+    assert result == "FAIL" and "gpuctl apply failed" in text
+    assert "no GPU instance is left running" in text and "may still be running" not in text
+    assert gpuctl_calls(gpu).count("down --auto-approve") == 2
 
 
 def test_e2_sweep_downs_when_list_nodes_fails(gpu):
@@ -345,13 +484,13 @@ def test_e2_fails_when_the_node_object_was_not_replaced(gpu):
 
 def test_e2_fails_when_the_node_is_not_listed_after_apply(gpu):
     result, text = check(e2(gpu, lists=(LIST_BEFORE, "", "")), "check_e2_gpu_replace")
-    assert result == "FAIL" and f"{GPU1} is not listed after gpuctl apply" in text
+    assert result == "FAIL" and "did not bring back every replaced GPU node" in text and "a6000" in text
 
 
 def test_e2_waits_a_bounded_time_for_the_new_node_to_be_ready(gpu):
     result, text = check(e2(gpu, ready="False"), "check_e2_gpu_replace")
     assert result == "FAIL" and "not Ready within 300 s" in text
-    assert 25 <= len(polls(gpu, GPU1)) <= 31            # every 10 s for 300 s (real time counts too)
+    assert len(polls(gpu, GPU1)) == 31                  # every 10 s for 300 s (VR_NO_WAIT: the skipped sleeps)
     assert "B1: N x N matrix" not in text
 
 
@@ -376,10 +515,21 @@ def test_e2_masks_the_project_and_the_operator_ip(gpu):
 
 # ---- E3: drift in the gpu-access firewall stack is found and repaired ----------------------------
 
-def e3(env, statuses=(STATUS_OK, STATUS_DRIFT, STATUS_OK), status_rcs=(0, 3, 0), states=(ORIG,), apply_rc=0):
+def addresses(ips_json):
+    """`terraform state list` of the gpu-access stack holding a rule pair for each IP of IPS_JSON."""
+    return "".join(f'google_compute_firewall.gpu_to_{to}["{ip}"]\n' for ip in json.loads(ips_json)
+                   for to in ("cp", "workers"))
+
+
+def e3(env, statuses=(STATUS_OK, STATUS_DRIFT, STATUS_OK), status_rcs=(0, 3, 0), states=(ORIG,), apply_rc=0,
+       lists=None):
+    """STATES: the gpu_ips output, read before the injection and then by the cleanup (before and after a restore);
+    LISTS: the cleanup's `terraform state list` answers (default: the rules for the cleanup's STATES)."""
+    lists = lists or [addresses(s) for s in (states[1:] or states)]
     env.first(gpuctl("status", seq=[{"stdout": s, "rc": r} for s, r in zip(statuses, status_rcs, strict=True)]),
               gpuctl("apply", "--auto-approve", rc=apply_rc),
-              rule("terraform", ["output", "-json", "gpu_ips"], seq=seq(*states)))
+              rule("terraform", ["output", "-json", "gpu_ips"], seq=seq(*states)),
+              rule("terraform", ["state", "list"], seq=seq(*lists)))
     return env
 
 
@@ -465,6 +615,27 @@ def test_e3_fails_when_status_still_shows_drift_after_the_repair(gpu):
     assert result == "FAIL" and "E3 ④: after the repair gpuctl status exits 3; want 0" in text
 
 
+def test_e3_restore_that_fails_never_says_restored_even_when_the_output_looks_clean(gpu):
+    """gpu_ips echoes the input variable: a failed apply can leave it clean while the rule is still in the state."""
+    e3(gpu, statuses=(STATUS_OK, STATUS_DRIFT, STATUS_DRIFT), status_rcs=(0, 3, 3), states=(ORIG, WITH_EXTRA, ORIG),
+       apply_rc=1, lists=(addresses(WITH_EXTRA),))
+    gpu.first(rule("terraform", ["apply", RESTORE_VAR], rc=1,
+                   stderr="Error: deleting fw-gpu-198-51-100-99-to-cp: googleapi: Error 503\n"))
+    result, text = check(gpu, "check_e3_firewall_drift")
+    assert result == "FAIL"
+    assert f"may STILL allow {EXTRA}" in text and "restored" not in text
+
+
+def test_e3_cleanup_restores_a_rule_left_in_the_state_behind_a_clean_output(gpu):
+    """gpuctl apply (③) failed half way: gpu_ips is back to the real IPs, the rule for the extra IP is not gone."""
+    e3(gpu, statuses=(STATUS_OK, STATUS_DRIFT, STATUS_DRIFT), status_rcs=(0, 3, 3), states=(ORIG,), apply_rc=1,
+       lists=(addresses(WITH_EXTRA), addresses(ORIG)))
+    result, text = check(gpu, "check_e3_firewall_drift")
+    assert result == "FAIL"
+    assert [a[-1] for a in tf_applies(gpu)] == [INJECT_VAR, RESTORE_VAR]
+    assert "restored" in text and "may STILL allow" not in text
+
+
 def test_e3_says_loudly_when_the_extra_rule_may_remain(gpu):
     e3(gpu, statuses=(STATUS_OK, STATUS_DRIFT, STATUS_DRIFT), status_rcs=(0, 3, 3),
        states=(ORIG, WITH_EXTRA, WITH_EXTRA), apply_rc=1)
@@ -493,6 +664,81 @@ def test_e3_masks_the_project_in_terraform_output(gpu):
 
 
 # ---- interrupted: the cleanup runs, and a second Ctrl-C does not stop it ----------------------------
+
+# The cleanup runs for the SIGHUP itself: run_check's subshell no longer dies at once and sends the check its
+# _vr_reap SIGTERM while the check still runs.
+HUNG_UP = re.compile(r"^interrupted \(SIGHUP\); cleaning up$", re.M)
+
+
+def run_hung_up(env, func, first, outcome):
+    """Run FUNC through run_check in its own session and hang up (SIGHUP to the whole process group, as a dropped
+    SSH session does) once FIRST exists. run_check's shell dies at once; its redact filter and the cleanup go on.
+    Waits for OUTCOME (the cleanup's last line) in the evidence and for the cleanup to end; returns the evidence."""
+    run = env.repo / "verification" / "t"
+    code = f"set -euo pipefail; source scripts/lib/checks.sh; vr_init {run}; run_check T title {func}; " \
+           "run_check U later check_a1_nodes"
+    proc = subprocess.Popen(["bash", "-c", code], cwd=env.repo,
+                            env=env.environ({"VR_NO_WAIT": "1", "BASH_FUNC_timeout%%": REAL_TIMEOUT}),
+                            stdin=subprocess.DEVNULL, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True,
+                            start_new_session=True)
+    try:
+        assert wait_for_file(first), f"{first.name} never appeared"
+        time.sleep(0.2)
+        os.killpg(proc.pid, signal.SIGHUP)
+        proc.communicate(timeout=60)
+        log = run / "01-T.txt"
+        deadline = time.time() + 60
+        while time.time() < deadline and outcome not in (log.read_text() if log.exists() else ""):
+            time.sleep(0.1)
+        # the cleanup is over once its subshell has ended by the signal it was given (no process left in the group)
+        while time.time() < deadline:
+            try:
+                os.killpg(proc.pid, 0)
+            except ProcessLookupError:
+                break
+            time.sleep(0.1)
+    finally:
+        try:
+            os.killpg(proc.pid, signal.SIGKILL)
+        except ProcessLookupError:
+            pass
+    assert proc.returncode == -signal.SIGHUP
+    assert not (run / "02-U.txt").exists()             # the run stopped
+    return log.read_text()
+
+
+def test_cleanup_output_goes_to_the_run_directory_when_its_reader_is_gone(env):
+    """A caller's pipe that died with a hangup must not stop a cleanup: its output goes to $VR_DIR/cleanup.log."""
+    run = env.repo / "verification" / "t"
+    code = (f"source scripts/lib/checks.sh; vr_init {run}; "
+            "( trap '' PIPE; sleep 1; _vr_cleanup_say 'cleaning up'; echo 'still running'; vr_cmd true ) | true; "
+            f"cat {run}/cleanup.log; stat -c %a {run}/cleanup.log")
+    proc = env.run(["bash", "-c", code])
+    assert proc.stdout.splitlines() == ["cleaning up", "still running", "$ true", "600"], proc.stdout + proc.stderr
+
+
+def test_e3_hangup_during_the_repair_still_removes_the_extra_rule(gpu):
+    marks = gpu.tmpdir / "marks"
+    marks.mkdir()
+    e3(gpu, statuses=(STATUS_OK, STATUS_DRIFT), status_rcs=(0, 3), states=(ORIG, WITH_EXTRA, ORIG))
+    script(gpu.repo / "scripts/gpuctl", f'if [ "$1" = apply ]; then touch {marks}/applying; sleep 30; fi\n'
+                                        f'exec "{sys.executable}" "{FAKES}" gpuctl "$@"\n')
+    log = run_hung_up(gpu, "check_e3_firewall_drift", marks / "applying", "restored: the gpu-access state has no rule")
+    assert [a[-1] for a in tf_applies(gpu)] == [INJECT_VAR, RESTORE_VAR]
+    assert HUNG_UP.search(log) and "may STILL allow" not in log, log
+
+
+def test_e2_hangup_during_apply_still_sweeps(gpu):  # no orphan
+    marks = gpu.tmpdir / "marks"
+    marks.mkdir()
+    e2(gpu, lists=(LIST_BEFORE, "", LIST_AFTER, ""))
+    script(gpu.repo / "scripts/gpuctl",
+           f'case "$1" in\n  apply) touch {marks}/applying; sleep 30 ;;\nesac\n'
+           f'exec "{sys.executable}" "{FAKES}" gpuctl "$@"\n')
+    log = run_hung_up(gpu, "check_e2_gpu_replace", marks / "applying", "no GPU instance is left running")
+    assert gpuctl_calls(gpu)[-3:] == ["list-nodes", "down --auto-approve", "list-nodes"]
+    assert HUNG_UP.search(log) and "may still be running" not in log, log
+
 
 def run_interrupted(env, func, first, second=None, last=None):
     """Run FUNC through run_check in its own session; Ctrl-C (SIGINT to the process group) once FIRST exists, again
