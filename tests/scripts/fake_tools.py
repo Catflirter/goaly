@@ -53,9 +53,16 @@ Teardown (Task 22a, scripts/down.sh):
   nodes          [node]                   `kubectl get nodes -o name` lists these (default k3s-cp, k3s-cpu-1);
                                           it fails like a dead tunnel under api_down
   kubectl_hang   true                     every kubectl call except /readyz hangs (a half-open tunnel)
+  cp_node_ip     ip                       `kubectl get node k3s-cp -o jsonpath=...ExternalIP...` prints it
+                                          (default: the base stack's cp_ip output)
   gpu_down_rc    rc                       exit code of `scripts/gpuctl down` (default 0)
+  gpu_down_hang  true                     `scripts/gpuctl down` hangs; Ctrl-C ends it with exit 1, as the real
+                                          gpuctl does (it catches KeyboardInterrupt)
   gpu_nodes      [line]                   what `scripts/gpuctl list-nodes` prints, one line each (default none)
+  late_gpu_nodes [line]                   ... and these too, from its second call on (a node started meanwhile)
   list_nodes_rc  rc                       exit code of `scripts/gpuctl list-nodes` (default 0)
+
+`scripts/gpuctl down` and `list-nodes` log what they read on stdin as "stdin" (down.sh gives them /dev/null).
 """
 import json
 import os
@@ -77,6 +84,8 @@ CONTAINERD_NVIDIA = "[plugins.'io.containerd.cri.v1.runtime'.containerd.runtimes
 
 def log():
     entry = {"tool": TOOL, "argv": ARGS, "env": {k: os.environ[k] for k in LOGGED_ENV if k in os.environ}}
+    if TOOL == "gpuctl" and ARGS[:1] in (["down"], ["list-nodes"]):
+        entry["stdin"] = sys.stdin.read()
     with open(os.environ["FAKE_LOG"], "a") as f:
         f.write(json.dumps(entry) + "\n")
 
@@ -222,6 +231,9 @@ def kubectl():
         for node in SCENARIO.get("nodes", ["k3s-cp", "k3s-cpu-1"]):
             print(f"node/{node}")
         return 0
+    if args[:3] == ["get", "node", "k3s-cp"] and any("ExternalIP" in a for a in args):
+        sys.stdout.write(SCENARIO.get("cp_node_ip", SCENARIO["outputs"]["base"]["cp_ip"]))
+        return 0
     if args[:2] == ["get", "node"]:
         node = args[2]
         if SCENARIO.get("api_down"):
@@ -263,9 +275,15 @@ def gpuctl():
         sys.stdout.write(SCENARIO.get("gpu_ip", "") + "\n")
         return 0
     if ARGS[:1] == ["down"]:
+        if SCENARIO.get("gpu_down_hang"):
+            try:
+                time.sleep(300)
+            except KeyboardInterrupt:
+                return 1
         return SCENARIO.get("gpu_down_rc", 0)
     if ARGS[:1] == ["list-nodes"]:
-        for line in SCENARIO.get("gpu_nodes", []):
+        late = SCENARIO.get("late_gpu_nodes", []) if counter("list-nodes") else []
+        for line in SCENARIO.get("gpu_nodes", []) + late:
             print(line)
         return SCENARIO.get("list_nodes_rc", 0)
     return 1

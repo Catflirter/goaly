@@ -2,11 +2,14 @@
 # make down (spec §11): tear the whole environment down, in order. Takes no arguments.
 #
 #   1. ask once: type the GCP project id (GCP_PROJECT in .env) to go on; anything else, or end of input,
-#      exits 2 with nothing changed. AUTO_APPROVE=1 skips the question. Nothing after it asks again.
+#      exits 2 with nothing changed. AUTO_APPROVE=1 (exactly 1, from the caller's environment, never
+#      from .env) skips the question. Nothing after it asks again.
 #   2. scripts/gpuctl down --auto-approve: every Lambda GPU node of this cluster (drained, deleted from
 #      the cluster, terminated) and the autoscaler overrides.
 #   3. drain every CPU worker (k3s-cpu-<n>) the cluster lists and delete its Node. An unreachable
-#      cluster (tunnel down, k3s-cp gone, no kubeconfig) skips this step with a warning, and a failed
+#      cluster (tunnel down, k3s-cp gone, no kubeconfig) skips this step with a warning, and so does a
+#      cluster that is not this project's (Node k3s-cp's ExternalIP is not the base stack's cp_ip:
+#      ~/.kube/hybrid-gpu.yaml and the tunnel port are one per user, not one per project). A failed
 #      drain or delete is only a warning: the destroys below remove the VMs and the cluster anyway.
 #      Every kubectl call is killed after DOWN_KC_KILL_S seconds (default 180), so a half-open tunnel
 #      cannot hang the teardown.
@@ -17,9 +20,15 @@
 #      ~/.kube/hybrid-gpu.yaml: it is the admin credential of a cluster that no longer exists, and
 #      make up (make kubeconfig) writes a new one.
 #   6. the bootstrap stack (the state bucket <GCP_PROJECT>-k3s-tfstate, the enabled APIs) is KEPT.
+#   7. ask Lambda once more (scripts/gpuctl list-nodes): a GPU node of this cluster that is still live
+#      (started after step 2 by a stretch autoscaler still running, or by a concurrent gpu-apply) keeps
+#      billing with nothing left to join, the largest cost risk of spec §13. A listed node, or a list
+#      that fails, fails the run (exit 1) and says what to do.
 #
-# Failures and re-runs. Every step is safe to repeat, so a teardown that stopped part-way is finished
-# by running make down again. The first failing step stops the run (exit 1) and says what is left:
+# Failures, Ctrl-C and re-runs. Every step is safe to repeat, so a teardown that stopped part-way is
+# finished by running make down again. The first failing step stops the run (exit 1) and says what is
+# left. Ctrl-C stops the run where it is (exit 130): kubectl runs under timeout --foreground, so the
+# interrupt reaches it, and the INT trap keeps every later step from running.
 #   - gpuctl down failed: the run asks Lambda (scripts/gpuctl list-nodes) whether any GPU node of this
 #     cluster is still live. If one is, or Lambda cannot be asked, it stops before any destroy: a GPU
 #     node left running after gpu-access and base are gone keeps billing, outside the firewall model,
@@ -35,10 +44,6 @@ set -euo pipefail
 # shellcheck disable=SC1091  # common.sh is linted on its own
 source "$(dirname -- "${BASH_SOURCE[0]}")/lib/common.sh"
 
-# Brief step 4: destroyed in this order. gpu-access and workers read the base stack's state.
-DESTROY_STACKS="gpu-access workers base"
-KC_KILL_S="${DOWN_KC_KILL_S:-180}"
-
 usage() {
   log "usage: ${0##*/}   (make down; AUTO_APPROVE=1 skips the question)"
   exit 2
@@ -52,13 +57,23 @@ confirm_project() {
   log "  - the CPU workers, the gpu-access, workers and base stacks: k3s-cp, the worker VMs, the VPCs,"
   log "    the static IPs and the firewall rules"
   log "It keeps the bootstrap stack: the Terraform state bucket gs://$GCP_PROJECT-k3s-tfstate and the enabled APIs."
-  if [[ "${AUTO_APPROVE:-}" == 1 ]]; then
+  log "Stop the stretch autoscaler first if it is running (Ctrl-C it): it could start a GPU node again."
+  if [[ "$APPROVE" == 1 ]]; then
     log "[AUTO_APPROVE=1: going on without asking]"
     return 0
   fi
   printf 'Type the GCP project id (%s) to destroy all of this: ' "$GCP_PROJECT" >&2
   read -r answer || true
-  [[ "$answer" == "$GCP_PROJECT" ]] || die "not confirmed (the answer was not the project id): nothing was changed" 2
+  if [[ "$answer" != "$GCP_PROJECT" ]]; then
+    log "make down cancelled: the answer was not the project id; nothing was changed"
+    exit 2
+  fi
+}
+
+# interrupted CODE: the INT/TERM trap. bash runs it as soon as the command it was waiting for ends.
+interrupted() {
+  log "make down interrupted: it stopped here, and no later step runs (what is destroyed stays destroyed); re-run make down to finish"
+  exit "$1"
 }
 
 # Step 2. On failure, Lambda decides whether the teardown may go on (see the header).
@@ -77,11 +92,29 @@ gpu_down() {
     die "scripts/gpuctl down did not remove them, so nothing was destroyed: the gpu-access and base stacks stay until they are gone. If the cluster is unreachable, bring the API tunnel up (make tunnel) and re-run make down; if it cannot be reached at all, terminate them in the Lambda console and re-run make down"
   fi
   log "warning: Lambda lists no GPU node of this cluster, so no GPU node is left outside the firewall model; going on (the destroys below remove the gpu-access stack and k3s-cp)"
+  # gpuctl down removes the autoscaler overrides only when it succeeds.
+  if [[ -e "$REPO_ROOT/lambda/.autoscale-state.json" ]]; then
+    log "warning: lambda/.autoscale-state.json (the autoscaler's per-pool GPU targets) is still there, and the next scripts/gpuctl apply would start GPU nodes from it: remove it (rm lambda/.autoscale-state.json)"
+  fi
 }
 
-# kc_bounded ARGS...: kc, killed after KC_KILL_S seconds.
+# kc_bounded ARGS...: kubectl on the cluster kubeconfig, killed after KC_KILL_S seconds. --foreground
+# keeps timeout and kubectl in the terminal's process group, so Ctrl-C reaches kubectl at once.
 kc_bounded() {
-  timeout "$KC_KILL_S" kubectl --kubeconfig "$KUBECONFIG_FILE" "$@"
+  timeout --foreground "$KC_KILL_S" kubectl --kubeconfig "$KUBECONFIG_FILE" "$@"
+}
+
+# same_cluster: true when the cluster the kubeconfig reaches is this project's, i.e. Node k3s-cp's
+# ExternalIP (node-external-ip, the static IP) is the base stack's cp_ip. The internal IP would not
+# tell: two projects built from this repo give k3s-cp the same internal address.
+same_cluster() {
+  local node_ip base_ip
+  node_ip="$(kc_bounded get node "$CP_NAME" -o 'jsonpath={.status.addresses[?(@.type=="ExternalIP")].address}' \
+    --request-timeout=20s)" || node_ip=""
+  base_ip="$(tf_out base cp_ip)" || base_ip=""
+  [[ -n "$node_ip" && "$node_ip" == "$base_ip" ]] && return 0
+  log "warning: the cluster $KUBECONFIG_FILE reaches may not be GCP project $GCP_PROJECT's: Node $CP_NAME has ExternalIP '${node_ip:-unknown}', the base stack's cp_ip is '${base_ip:-unknown}'; skipping the drains (the destroys below remove this project's workers anyway)"
+  return 1
 }
 
 # Step 3. Never fails the run: the cluster is destroyed with k3s-cp in step 4.
@@ -101,6 +134,7 @@ drain_workers() {
     log "no CPU worker in the cluster"
     return 0
   fi
+  same_cluster || return 0
   while read -r name; do
     log "draining $name and deleting it from the cluster"
     kc_bounded drain "$name" --ignore-daemonsets --delete-emptydir-data --force --timeout=120s \
@@ -119,7 +153,7 @@ destroy_stack() {
   tf_init "$stack"
   terraform -chdir="$dir" destroy -auto-approve -input=false || rc=$?
   (( rc == 0 )) \
-    || die "terraform destroy failed for $stack (exit $rc): the stacks after it ($(stacks_after "$stack")) were not touched; fix the cause and re-run make down (it repeats every step; what is destroyed stays destroyed)"
+    || die "terraform destroy failed for $stack (exit $rc): the stacks after it ($(stacks_after "$stack")) were not touched; fix the cause and re-run make down (it repeats every step; what is destroyed stays destroyed). 'Error acquiring the state lock' means another gpuctl or terraform run held this stack's state lock: re-run make down once that run has ended"
   log "$stack: destroyed"
 }
 
@@ -130,13 +164,41 @@ stacks_after() {
   printf '%s\n' "${after:-none}"
 }
 
+# Step 7 (spec §13): no GPU node of this cluster may be left billing on Lambda.
+check_lambda() {
+  local nodes
+  log "==> Lambda: is any GPU node of this cluster still live?"
+  if ! nodes="$("$REPO_ROOT/scripts/gpuctl" list-nodes < /dev/null)"; then
+    die "everything else is torn down, but Lambda could not be asked whether a GPU node of this cluster is still live (error above): run scripts/gpuctl list-nodes, and terminate any node it lists (make gpu-down, or the Lambda console)"
+  fi
+  if [[ -n "$nodes" ]]; then
+    log "GPU nodes still billing on Lambda:"
+    log "$(printf '%s\n' "$nodes" | sed 's/^/  /')"
+    die "GPU nodes still billing on Lambda: terminate them (make gpu-down, or the Lambda console), then check that scripts/gpuctl list-nodes prints nothing. Everything else is torn down; the bootstrap stack is kept"
+  fi
+}
+
 (( $# == 0 )) || usage
+# Read before .env is sourced (load_env exports every line of it): only the caller's AUTO_APPROVE skips
+# the question, and .env cannot change what is destroyed, drained or removed.
+APPROVE="${AUTO_APPROVE:-}"
+PINNED_REPO_ROOT="$REPO_ROOT" PINNED_RUN_DIR="$RUN_DIR" PINNED_KUBECONFIG_FILE="$KUBECONFIG_FILE"
+PINNED_CPU_NODE_RE="$CPU_NODE_RE" PINNED_KC_REQUEST_TIMEOUT="$KC_REQUEST_TIMEOUT" PINNED_CP_NAME="$CP_NAME"
 load_env
+REPO_ROOT="$PINNED_REPO_ROOT" RUN_DIR="$PINNED_RUN_DIR" KUBECONFIG_FILE="$PINNED_KUBECONFIG_FILE"
+CPU_NODE_RE="$PINNED_CPU_NODE_RE" KC_REQUEST_TIMEOUT="$PINNED_KC_REQUEST_TIMEOUT" CP_NAME="$PINNED_CP_NAME"
+# Brief step 4: destroyed in this order. gpu-access and workers read the base stack's state.
+DESTROY_STACKS="gpu-access workers base"
+KC_KILL_S="${DOWN_KC_KILL_S:-180}"
+[[ "$KC_KILL_S" =~ ^[1-9][0-9]*$ ]] \
+  || die "DOWN_KC_KILL_S='$KC_KILL_S' is not a whole number of seconds (default 180): nothing was changed" 2
 # Only scripts/gpuctl needs the Lambda API key, and it loads .env itself: keep the key out of terraform,
 # kubectl and the tunnel.
 unset LAMBDA_API_KEY
 tf_env
 confirm_project
+trap 'interrupted 130' INT
+trap 'interrupted 143' TERM
 
 gpu_down
 drain_workers
@@ -148,4 +210,5 @@ log "==> API tunnel, GPU host keys, kubeconfig"
   || die "tunnel.sh stop failed; every stack is destroyed already: re-run make down to finish (it also removes .run/known_hosts_* and $KUBECONFIG_FILE)"
 rm -f -- "$RUN_DIR"/known_hosts_*
 rm -f -- "$KUBECONFIG_FILE"
-log "make down: done. Kept: the bootstrap stack (gs://$GCP_PROJECT-k3s-tfstate, the enabled APIs). scripts/gpuctl list-nodes (Lambda) should print nothing."
+check_lambda
+log "make down: done. Lambda lists no GPU node of this cluster. Kept: the bootstrap stack (gs://$GCP_PROJECT-k3s-tfstate, the enabled APIs)."

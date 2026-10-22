@@ -58,8 +58,11 @@ init: ## Create the Terraform state bucket and enable the GCP APIs (infra/bootst
 up: ## Bring the cluster up: base, k3s-cp, kubeconfig, tunnel, CPU workers, system components, workloads (safe to re-run)
 	$(ROOT)/scripts/up.sh all
 
-# Ordered teardown (spec §11): asks once for the GCP project id (AUTO_APPROVE=1 skips it); the
-# bootstrap stack (state bucket) is kept. Safe to re-run after a partial teardown.
+# Ordered teardown (spec §11): asks once for the GCP project id; the bootstrap stack (state bucket)
+# is kept. Only AUTO_APPROVE=1 skips the question (unlike gpu-apply/gpu-down, yes and true do not),
+# and only on the command line or in the environment, never from .env. Declining changes nothing
+# and exits 2, so make reports "Error 2". Ends by asking Lambda that no GPU node is left. Safe to
+# re-run after a partial teardown.
 .PHONY: down
 down: ## Tear everything down: GPU nodes, CPU workers, gpu-access/workers/base stacks, tunnel (keeps bootstrap)
 	$(ROOT)/scripts/down.sh
