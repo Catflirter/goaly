@@ -3,16 +3,18 @@
 Same harness as test_ops_scripts.py: a repo copy whose terraform, gcloud, kubectl, helm, ssh, scp and
 scripts/gpuctl are tests/scripts/fake_tools.py, which records every call. Nothing reaches a cloud or a cluster.
 """
+import json
 import os
 import shutil
 import signal
 import stat
 import subprocess
+import sys
 import time
 
 import pytest
 
-from test_ops_scripts import BUCKET, KUBECONFIG, PROJECT, ROOT, Env, make_kubeconfig, wait_gone
+from test_ops_scripts import BUCKET, KUBECONFIG, OUTPUTS, PROJECT, ROOT, Env, make_kubeconfig, wait_gone
 
 STACKS = ("gpu-access", "workers", "base")  # brief step 4: destroyed in this order
 RT = "--request-timeout=60s"
@@ -56,8 +58,14 @@ def init(env, stack):
                           f"-backend-config=bucket={BUCKET}", f"-backend-config=prefix={stack}"])
 
 
-def destroy(env, stack):
-    return ("terraform", [tf_dir(env, stack), "destroy", "-auto-approve", "-input=false"])
+def destroy(env, stack, *extra):
+    return ("terraform", [tf_dir(env, stack), "destroy", "-auto-approve", "-input=false", *extra])
+
+
+def state_list(env, stack):
+    """Before each destroy (D-3): a stack whose state lists no resource is not destroyed again. The fake terraform
+    fails `state list` unless a test scripts it, and a state that cannot be listed is destroyed as before."""
+    return ("terraform", [tf_dir(env, stack), "state", "list"])
 
 
 def kc(env, *args):
@@ -73,7 +81,7 @@ def list_nodes(env):
 
 
 def destroys(env, stacks=STACKS, base_initialised=False):
-    return [call for stack in stacks for call in (init(env, stack), destroy(env, stack))
+    return [call for stack in stacks for call in (init(env, stack), state_list(env, stack), destroy(env, stack))
             if not (base_initialised and call == init(env, "base"))]
 
 
@@ -173,7 +181,8 @@ def test_a_second_run_finds_nothing_left_and_succeeds(env):
     proc = down(env, AUTO_APPROVE="1")
     assert proc.returncode == 0, proc.stderr
     # tf_init's marker: the stacks are not initialised again.
-    assert calls(env) == [GPU_DOWN, list_nodes(env), *[destroy(env, s) for s in STACKS], LIST_GPU]
+    assert calls(env) == [GPU_DOWN, list_nodes(env), *[c for s in STACKS for c in (state_list(env, s), destroy(env, s))],
+                          LIST_GPU]
 
 
 # ---- step 1: the one confirmation --------------------------------------------------------------
@@ -382,6 +391,11 @@ def test_a_failed_gpu_down_with_gpu_nodes_left_stops_before_any_destroy(env):
     assert GPU_LINE in proc.stderr
     assert "make tunnel" in proc.stderr and "Lambda console" in proc.stderr and "make down" in proc.stderr
     assert "nothing was destroyed" in proc.stderr
+    # PR #104 review X0-4: gpuctl down may have refused another cluster (D-2): make kubeconfig points the kubeconfig
+    # back here; --no-drain abandons the cluster through gpuctl (firewall and peers kept right); the console last.
+    err = " ".join(proc.stderr.split())
+    assert "another cluster" in err and "make kubeconfig" in err
+    assert err.index("make kubeconfig") < err.index("scripts/gpuctl down --no-drain") < err.index("Lambda console")
     assert known_hosts(env) == ["known_hosts_k3s-gpu-a6000-1", "known_hosts_k3s-gpu-a6000-2"]
     assert env.kubeconfig.exists()
 
@@ -692,6 +706,178 @@ def test_a_failed_tunnel_stop_fails_the_run_after_the_destroys(env):
     assert proc.returncode == 1
     assert calls(env) == sequence(env, final=False)
     assert "tunnel.sh stop failed" in proc.stderr and "make down" in proc.stderr
+
+
+# ---- re-running a make down that stopped between its destroys (minors 2b, D-3) ------------------
+
+WORKER_RESOURCES = 'google_compute_address.worker["k3s-cpu-1"]\ngoogle_compute_instance.worker["k3s-cpu-1"]\n'
+BASE_RESOURCES = "google_compute_instance.cp\ngoogle_compute_network.core\n"
+
+
+def listed(stack, stdout="", rc=0, stderr=""):
+    """An "answers" rule for fake terraform: `terraform -chdir=.../infra/STACK state list` prints STDOUT."""
+    return {"tool": "terraform", "has": [f"/infra/{stack} ", "state list"], "stdout": stdout, "stderr": stderr,
+            "rc": rc}
+
+
+def tf_outputs(stack, outputs=None, rc=0, stderr=""):
+    """An "answers" rule for gpuctl's `terraform output -no-color -json` of STACK (the fake answers only one name)."""
+    stdout = "" if outputs is None else json.dumps({k: {"value": v} for k, v in outputs.items()})
+    return {"tool": "terraform", "has": [f"/infra/{stack} ", "output -no-color -json"], "stdout": stdout,
+            "stderr": stderr, "rc": rc}
+
+
+def destroyed(env):
+    return [c for c in calls(env) if c[1][1:2] == ["destroy"]]
+
+
+def test_a_stack_with_nothing_in_its_state_is_not_destroyed_again(env):
+    """Interrupted after the workers destroy: the re-run skips gpu-access and workers, whose states list no
+    resource, and destroys base as usual."""
+    env.scenario["answers"] = [listed("gpu-access"), listed("workers"), listed("base", BASE_RESOURCES)]
+    proc = down(env, AUTO_APPROVE="1")
+    assert proc.returncode == 0, proc.stderr
+    assert destroyed(env) == [destroy(env, "base")]
+    for stack in ("gpu-access", "workers"):
+        assert state_list(env, stack) in calls(env)
+        assert f"{stack}: nothing in its state (destroyed by an earlier run, or never applied); skipping" in proc.stderr
+    assert "make down: done" in proc.stderr
+
+
+def test_data_sources_alone_are_nothing_to_destroy(env):
+    """terraform_remote_state is read, not created: a state that lists only data sources has no resource."""
+    env.scenario["answers"] = [listed("workers", "data.terraform_remote_state.base\n")]
+    assert down(env, AUTO_APPROVE="1").returncode == 0
+    assert destroyed(env) == [destroy(env, "gpu-access"), destroy(env, "base")]
+
+
+def test_a_state_that_cannot_be_listed_is_still_destroyed(env):
+    """Not knowing is not "empty": the destroy runs, and says what is wrong if the state really is unreadable."""
+    env.scenario["answers"] = [listed("workers", rc=1, stderr="Error: Failed to load state: Error 503")]
+    assert down(env, AUTO_APPROVE="1").returncode == 0
+    assert destroyed(env) == [destroy(env, s) for s in STACKS]
+
+
+def test_workers_left_after_base_are_destroyed_without_a_refresh(env):
+    """Base destroyed, workers not (an order make down never leaves, but a hand-run destroy can): a refreshing
+    destroy of workers cannot evaluate local.base.* without base's outputs ("Unsupported attribute", measured
+    with terraform 1.17), so workers is destroyed from its state as recorded (-refresh=false)."""
+    env.scenario["answers"] = [listed("gpu-access"), listed("workers", WORKER_RESOURCES), listed("base")]
+    env.scenario["api_down"] = True  # k3s-cp is gone, so is the tunnel's far end
+    proc = down(env, AUTO_APPROVE="1")
+    assert proc.returncode == 0, proc.stderr
+    assert destroyed(env) == [destroy(env, "workers", "-refresh=false")]
+    assert "the base stack is already destroyed" in proc.stderr and "-refresh=false" in proc.stderr
+
+
+@pytest.mark.parametrize("base", ["base-has-resources", "base-unknown"])
+def test_workers_are_refreshed_as_usual_while_base_may_exist(env, base):
+    rule = listed("base", BASE_RESOURCES) if base == "base-has-resources" else listed("base", rc=1)
+    env.scenario["answers"] = [listed("workers", WORKER_RESOURCES), rule]
+    assert down(env, AUTO_APPROVE="1").returncode == 0
+    assert destroy(env, "workers") in destroyed(env)
+    assert all("-refresh=false" not in c[1] for c in destroyed(env))
+
+
+# The same re-runs end to end with the real gpuctl (lambda/gpuctl; Lambda is tests' in-memory FakeLambda) in place
+# of the fake scripts/gpuctl: its terraform, gcloud and kubectl calls reach the fake tools like down.sh's own.
+REAL_GPUCTL = """\
+import json
+import os
+import sys
+from pathlib import Path
+
+sys.path[:0] = [{lambda_dir!r}, {tests_dir!r}]
+import gpuctl.__main__ as cli  # noqa: E402
+from fakes import FakeLambda  # noqa: E402
+from gpuctl.infra import Infra, SubprocessShell  # noqa: E402
+
+with open(os.environ["FAKE_LOG"], "a") as log:  # logged like the fake gpuctl's calls
+    log.write(json.dumps({{"tool": "gpuctl", "argv": sys.argv[1:], "env": {{}}}}) + "\\n")
+repo = Path({repo!r})
+cli.OVERRIDES_PATH = repo / "lambda/.autoscale-state.json"
+env = {{**os.environ, "LAMBDA_API_KEY": "k", "OPERATOR_IP": "73.15.40.40"}}  # scripts/gpuctl loads .env
+sys.exit(cli.main(sys.argv[1:], env=env, client=FakeLambda(), infra=Infra(SubprocessShell(), repo, env)))
+"""
+
+
+@pytest.fixture
+def real_gpuctl(env, tmp_path):
+    launcher = tmp_path / "real_gpuctl.py"
+    launcher.write_text(REAL_GPUCTL.format(lambda_dir=str(ROOT / "lambda"), tests_dir=str(ROOT / "lambda/tests"),
+                                           repo=str(env.repo)))
+    (env.repo / "scripts/gpuctl").write_text(f'#!/bin/sh\nexec "{sys.executable}" "{launcher}" "$@"\n')
+    return env
+
+
+def guard_pushes(env):
+    return [c for c in env.calls("gcloud") if "sudo /usr/local/sbin/k3s-guard-peers" in c["argv"]]
+
+
+def test_rerun_after_the_workers_destroy_completes_end_to_end(real_gpuctl):
+    """The D-3 state: gpu-access and workers destroyed, base not. gpu-down reads the emptied workers stack as no
+    CPU peers ({} from terraform output -json), the destroys skip what is gone, base goes, exit 0."""
+    env = real_gpuctl
+    env.scenario["answers"] = [tf_outputs("base", OUTPUTS["base"]), tf_outputs("workers", {}),
+                               listed("gpu-access"), listed("workers"), listed("base", BASE_RESOURCES)]
+    env.scenario["nodes"] = ["k3s-cp"]  # the stale k3s-cpu-1 Node is not listed here: no drain wait
+    proc = down(env, AUTO_APPROVE="1")
+    assert proc.returncode == 0, proc.stderr
+    assert "0 CPU worker(s)" in proc.stdout  # gpuctl down's sync-peers, on make down's stdout
+    assert len(guard_pushes(env)) == 1  # k3s-cp's peer set was rewritten without the worker
+    assert destroyed(env) == [destroy(env, "base")]
+    assert "workers: nothing in its state" in proc.stderr and "make down: done" in proc.stderr
+    assert "scripts/gpuctl down failed" not in proc.stderr
+    assert "Traceback" not in proc.stdout + proc.stderr
+
+
+def test_rerun_after_the_workers_destroy_warns_about_the_stale_worker_node_end_to_end(real_gpuctl):
+    """PR #104 review S0-3/C0-4: in the real D-3 state k3s-cp still lists the destroyed worker's Node, NotReady. Its
+    drain fails (on a real cluster after its 120 s timeout): only a warning, the Node is deleted, base goes, exit 0."""
+    env = real_gpuctl
+    env.scenario["answers"] = [tf_outputs("base", OUTPUTS["base"]), tf_outputs("workers", {}),
+                               listed("gpu-access"), listed("workers"), listed("base", BASE_RESOURCES)]
+    env.scenario["nodes"] = ["k3s-cp", "k3s-cpu-1"]
+    env.scenario["drain_fail"] = ["k3s-cpu-1"]
+    proc = down(env, AUTO_APPROVE="1")
+    assert proc.returncode == 0, proc.stderr
+    assert "warning: cannot drain k3s-cpu-1; deleting its Node anyway" in proc.stderr
+    assert kc(env, "delete", "node", "k3s-cpu-1", RT) in calls(env)
+    assert destroyed(env) == [destroy(env, "base")]
+    assert "make down: done" in proc.stderr
+    assert "Traceback" not in proc.stdout + proc.stderr
+
+
+def test_rerun_with_a_real_terraform_error_fails_loudly_end_to_end(real_gpuctl):
+    """Not "no outputs": a backend error reading workers fails gpu-down (no peer-list write), and the workers
+    destroy, which hits the same error, stops make down before base. The operator sees both errors."""
+    env = real_gpuctl
+    error = "Error: Failed to load state: googleapi: Error 503: Backend Error"
+    env.scenario["answers"] = [tf_outputs("base", OUTPUTS["base"]), tf_outputs("workers", rc=1, stderr=error),
+                               listed("gpu-access"), listed("workers", rc=1, stderr=error)]
+    env.scenario["destroy_rc"] = {"workers": 1}
+    env.scenario["nodes"] = ["k3s-cp"]
+    proc = down(env, AUTO_APPROVE="1")
+    assert proc.returncode == 1
+    assert guard_pushes(env) == []
+    assert "cannot read infra/workers outputs" in proc.stderr and "Error 503: Backend Error" in proc.stderr
+    assert "scripts/gpuctl down failed (exit 1)" in proc.stderr
+    assert "terraform destroy failed for workers" in proc.stderr
+    assert destroy(env, "base") not in destroyed(env)
+    assert "Traceback" not in proc.stdout + proc.stderr
+
+
+def test_rerun_with_base_destroyed_and_workers_left_completes_end_to_end(real_gpuctl):
+    env = real_gpuctl
+    env.scenario["answers"] = [tf_outputs("base", {}), listed("gpu-access"), listed("workers", WORKER_RESOURCES),
+                               listed("base")]
+    env.scenario["api_down"] = True
+    proc = down(env, AUTO_APPROVE="1")
+    assert proc.returncode == 0, proc.stderr
+    assert "k3s-cp k3s_peers: skipped" in proc.stdout and guard_pushes(env) == []
+    assert destroyed(env) == [destroy(env, "workers", "-refresh=false")]
+    assert "make down: done" in proc.stderr
+    assert "Traceback" not in proc.stdout + proc.stderr
 
 
 # ---- the script and the Makefile ---------------------------------------------------------------

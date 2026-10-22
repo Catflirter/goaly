@@ -389,6 +389,18 @@ class Infra:
         config = Path(self._kubeconfig())
         return None if config.is_file() else f"no kubeconfig at {config}"
 
+    def cp_external_ip(self) -> str | None:
+        """Node k3s-cp's ExternalIP in the cluster the kubeconfig reaches, or None when it reports none (D-2).
+
+        The same read as scripts/down.sh same_cluster, bounded like api_unreachable's probe: the kubeconfig and
+        the tunnel port are one per operator, so only this address (the static IP, never the internal one, which
+        every project gives k3s-cp alike) tells this project's cluster from another. A failed read (no API
+        server, no Node k3s-cp) raises CommandError."""
+        stdout = self.kubectl("get", "node", CP_NAME, "-o",
+                              'jsonpath={.status.addresses[?(@.type=="ExternalIP")].address}',
+                              f"--request-timeout={API_PROBE_REQUEST_TIMEOUT_S}s", timeout=API_PROBE_TIMEOUT_S).stdout
+        return stdout.strip() or None
+
     def cluster_gpu_nodes(self) -> dict[str, str | None]:
         """GPU nodes (k3s-gpu-*) in the cluster, each with its ExternalIP (None if it reports none)."""
         # kubectl runs outside the try: its own errors (CommandError, a KUBECONFIG list) surface unchanged.
