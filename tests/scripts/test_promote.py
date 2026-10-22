@@ -550,6 +550,19 @@ def test_the_operator_ip_is_found_between_any_non_digits(repo, ip, line):
     assert "06-B6.txt" in r.stderr and "01-A1.txt" not in r.stderr
 
 
+def test_the_operator_ip_is_found_after_a_byte_that_is_not_utf8(repo):
+    # In a UTF-8 locale grep's [^0-9] does not match an invalid byte such as \xff, so the address
+    # right after it would be missed; promote.sh runs its grep under LC_ALL=C for this reason.
+    before = previous_final(repo)
+    run = make_run(repo, files={"01-A1.txt": "fine\n", "06-B6.txt": "placeholder\n"})
+    (run / "06-B6.txt").write_bytes(b"x\xff73.15.40.4\n")
+    env = {**os.environ, "LC_ALL": "C.UTF-8", "LANG": "C.UTF-8", "OPERATOR_IP": "73.15.40.4"}
+    r = promote(repo, "verify", f"verification/{TS}", env=env)
+    assert r.returncode == 1, r.stderr
+    assert snapshot(repo / "verification/final") == before
+    assert "06-B6.txt" in r.stderr
+
+
 @pytest.mark.parametrize("ip, line", [
     ("73.15.40.4", "fw-ssh-operator  73.15.40.40/32\n"),     # a longer last octet
     ("73.15.40.4", "peer 73.15.40.41\n"),
