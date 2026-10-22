@@ -250,14 +250,15 @@ def _tfguard(args: argparse.Namespace, out: TextIO) -> int:
     add, remove = set(args.add), set(args.remove)
     try:
         check_names(add, remove)
-    except ValueError as e:
-        raise _Refused(f"tfguard: {e}") from None
-    try:
-        plan = json.loads(sys.stdin.read())
-    except (ValueError, UnicodeDecodeError) as e:  # fail closed: a plan the guard cannot read is never applied
-        violations = [f"stdin is not the JSON of terraform show -json: {e}"]
+    except ValueError as e:  # a violation too (exit 1): the brief's CLI contract is 0 pass, 1 violations
+        violations = [f"bad --add/--remove: {e}"]
     else:
-        violations = check_workers_plan(plan, add=add, remove=remove)
+        try:
+            plan = json.loads(sys.stdin.read())
+        except (ValueError, UnicodeDecodeError) as e:  # fail closed: a plan the guard cannot read is never applied
+            violations = [f"stdin is not the JSON of terraform show -json: {e}"]
+        else:
+            violations = check_workers_plan(plan, add=add, remove=remove)
     for line in violations:
         _emit(out, f"violation: {line}")
     if violations:

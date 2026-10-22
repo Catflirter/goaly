@@ -130,10 +130,27 @@ def test_unknown_or_malformed_actions_are_violations(actions):
 
 @pytest.mark.parametrize("doc", [[], "x", None, {"resource_changes": {}}, {"resource_changes": [1]},
                                  {"resource_changes": [{"change": {"actions": ["create"]}}]},
-                                 {"resource_changes": [{"address": "a"}]}])
+                                 {"resource_changes": [{"address": "a"}]},
+                                 # Not a plan at all: these must not count as "no changes" (C0-3, X0-2).
+                                 {}, {"format_version": "1.0", "values": {}}, {"planned_values": {}},
+                                 {"format_version": 1, "planned_values": {}}, {"format_version": "1.2"}])
 def test_a_malformed_plan_is_a_violation_not_an_exception(doc):
     assert check_workers_plan(doc, add={"k3s-cpu-2"}, remove=set())
     assert check_workers_plan(doc, add=set(), remove=set())
+
+
+def test_a_state_document_is_named_as_not_a_plan():
+    """`terraform show -json` without a plan file prints the state: refused, and the violation says why."""
+    v = check_workers_plan({"format_version": "1.0", "terraform_version": "1.9.8", "values": {}},
+                           add=set(), remove=set())
+    assert v == ["not a Terraform plan: no resource_changes, and no format_version + planned_values"]
+
+
+def test_a_real_plan_without_resource_changes_is_an_empty_plan():
+    """terraform show -json PLAN leaves out resource_changes when nothing changes; it always writes the landmarks."""
+    doc = {"format_version": "1.2", "terraform_version": "1.9.8", "planned_values": {"root_module": {}}}
+    assert check_workers_plan(doc, add=set(), remove=set()) == []
+    assert check_workers_plan(doc, add={"k3s-cpu-2"}, remove=set())
 
 
 def test_an_empty_plan_with_nothing_expected_passes():
@@ -194,10 +211,20 @@ def test_cli_fails_closed_on_input_that_is_not_utf8(monkeypatch, capsys):
     assert main(["tfguard", "--add", "k3s-cpu-2"], env={}) == 1
 
 
-@pytest.mark.parametrize("args", [["--remove", "k3s-cpu-1"], ["--add", "k3s-cp"], ["--add", "k3s-cpu-x"],
-                                  ["--add", "k3s-cpu-2", "--remove", "k3s-cpu-2"], ["--frobnicate"]])
-def test_cli_refuses_bad_names_with_exit_2(monkeypatch, capsys, args):
+@pytest.mark.parametrize("args, said", [
+    (["--remove", "k3s-cpu-1"], "k3s-cpu-1 is never removed"), (["--add", "k3s-cp"], "'k3s-cp'"),
+    (["--add", "k3s-cpu-x"], "'k3s-cpu-x'"), (["--add", "k3s-cpu-2", "--remove", "k3s-cpu-2"], "in both")])
+def test_cli_reports_bad_names_as_a_violation(monkeypatch, capsys, args, said):
+    """The brief's contract has two exit codes: 0 passes, 1 prints each violation (S0-1). A bad name is one."""
     code, cap = run_cli(monkeypatch, capsys, json.dumps(plan()), *args)
+    assert code == 1
+    assert cap.out.startswith("violation: ") and said in cap.out
+    assert len(cap.out.splitlines()) == 1, "the plan is not judged against names the guard cannot trust"
+
+
+def test_cli_unknown_option_is_a_usage_error(monkeypatch, capsys):
+    """argparse's usage error (exit 2), as for every gpuctl subcommand; cpu-pool.sh never passes one."""
+    code, cap = run_cli(monkeypatch, capsys, json.dumps(plan()), "--frobnicate")
     assert code == 2
     assert cap.out == ""
 
@@ -226,7 +253,10 @@ def wrapper_repo(tmp_path):
     shutil.copy2(ROOT / "scripts/lib/common.sh", repo / "scripts/lib/common.sh")
     shutil.copytree(ROOT / "lambda/gpuctl", repo / "lambda/gpuctl")
     (repo / ".venv/bin").mkdir(parents=True)
-    os.symlink(sys.executable, repo / ".venv/bin/python")
+    # A shim, not a symlink: a symlinked interpreter loses the venv (sys.prefix would be the system's), so the
+    # child would import yaml only if it happened to be installed system-wide (C0-1; tests/test_gpuctl_wrapper.py).
+    (repo / ".venv/bin/python").write_text(f'#!/usr/bin/env bash\nexec "{sys.executable}" "$@"\n')
+    (repo / ".venv/bin/python").chmod(0o755)
     return repo
 
 
@@ -246,8 +276,10 @@ def test_the_wrapper_hides_the_lambda_key_from_tfguard(wrapper_repo, tmp_path):
     probe.write_text("")
     (wrapper_repo / "lambda/gpuctl/__main__.py").write_text(
         "import os, sys\n"
-        f"open({str(probe)!r}, 'w').write(os.environ.get('LAMBDA_API_KEY', '<unset>'))\n")
+        f"open({str(probe)!r}, 'w').write(os.environ.get('LAMBDA_API_KEY', '<unset>') + '\\n' + sys.prefix)\n")
     env = {**os.environ, "LAMBDA_API_KEY": "secret-key"}
     subprocess.run([str(wrapper_repo / "scripts/gpuctl"), "tfguard"], input="", capture_output=True, text=True,
                    env=env, timeout=60)
-    assert probe.read_text() == "<unset>"
+    key, prefix = probe.read_text().split("\n")
+    assert key == "<unset>"
+    assert prefix == sys.prefix, "the child runs in this test's environment (the venv), not the system interpreter"

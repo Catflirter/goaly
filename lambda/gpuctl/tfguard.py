@@ -14,10 +14,13 @@ A plan passes when every resource change is one of:
 and the plan holds exactly 4 x len(add) creates and 4 x len(remove) deletes. Anything else is a violation: a replace
 (["delete", "create"] or ["create", "delete"]), an update, any other action, a change to any other address (k3s-cp,
 another worker, a shared rule), the same address twice, and a plan that is not the JSON `terraform show -json`
-writes (fail closed: a guard that cannot read the plan never lets it through).
+writes (fail closed: a guard that cannot read the plan never lets it through). A document without resource_changes is
+a plan with no changes only when it carries a plan's landmarks (a string format_version and planned_values, which
+terraform always writes for a plan); `{}` or a state document (`terraform show -json` without a plan file) is not.
 
 Names are k3s-cpu-<n> (n >= 1, no leading zero); k3s-cpu-1 is never in remove (spec section 10.2) and a name is never
-in both sets. A bad name is the caller's error (ValueError, exit 2 from the CLI), not a violation.
+in both sets. check_workers_plan raises ValueError for a bad name; the CLI reports it as a violation (exit 1), so
+`gpuctl tfguard` keeps the brief's two exit codes (argparse usage errors aside, exit 2 as for every subcommand).
 """
 
 from __future__ import annotations
@@ -72,7 +75,12 @@ def check_workers_plan(plan: object, *, add: set[str], remove: set[str]) -> list
     check_names(add, remove)
     if not isinstance(plan, dict):
         return [f"not a Terraform plan (JSON {type(plan).__name__}, expected an object)"]
-    changes = plan.get("resource_changes", [])
+    if "resource_changes" in plan:
+        changes = plan["resource_changes"]
+    elif isinstance(plan.get("format_version"), str) and "planned_values" in plan:
+        changes = []  # terraform show -json PLAN leaves resource_changes out when nothing changes
+    else:  # {} or the state document `terraform show -json` prints without a plan: never "no changes"
+        return ["not a Terraform plan: no resource_changes, and no format_version + planned_values"]
     if not isinstance(changes, list):
         return ["not a Terraform plan: resource_changes is not a list"]
 
