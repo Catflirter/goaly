@@ -264,36 +264,105 @@ sys.path[:0] = [sys.argv[1], sys.argv[2]]
 import gpuctl.__main__ as cli
 from fakes import FakeInfra, FakeLambda
 cli.LOCK_PATH = Path(sys.argv[3])
-sys.exit(cli.main(["down", "--auto-approve"], env={"LAMBDA_API_KEY": "k"}, client=FakeLambda(), infra=FakeInfra()))
+cli.run(["down", "--auto-approve"], env={"LAMBDA_API_KEY": "k"}, client=FakeLambda(), infra=FakeInfra())
 """
+# A calling script without an INT trap (cpu-pool.sh and lib/common.sh: `scripts/gpuctl sync-peers || die ...`)
+CALLER = '"$@" || echo "the failure branch ran"; echo "the script went on"'
 
 
-def test_ctrl_c_while_waiting_exits_130_without_a_traceback(lock_path):
-    """Review S4-r3-5: the message invites Ctrl-C; a real SIGINT while waiting ends with one line and exit 130."""
+def read_line(stream, timeout=10.0):
+    """The next line a child prints, or a test failure after `timeout`: a child that waits without printing it
+    fails the test instead of hanging it (and make lint) (review S4-r4-2)."""
+    import queue
+
+    lines = queue.Queue()
+    threading.Thread(target=lambda: lines.put(stream.readline()), daemon=True).start()
+    try:
+        return lines.get(timeout=timeout)
+    except queue.Empty:
+        pytest.fail(f"the child printed no line within {timeout}s")
+
+
+def test_read_line_fails_instead_of_hanging_on_a_silent_child():  # review S4-r4-2
+    import subprocess
+
+    proc = subprocess.Popen(["sleep", "30"], stdout=subprocess.PIPE, text=True, stdin=subprocess.DEVNULL)
+    try:
+        started = time.monotonic()
+        with pytest.raises(pytest.fail.Exception, match="no line within 0.3s"):
+            read_line(proc.stdout, timeout=0.3)
+        assert time.monotonic() - started < 5
+    finally:
+        proc.kill()
+        proc.wait()
+
+
+def ctrl_c_while_waiting(lock_path, *, caller=False):
+    """Run gpuctl down (fakes, the real entry point run()) in a new session while another process holds the lock,
+    press Ctrl-C (SIGINT to the process group, as a terminal does) once it waits; returns (returncode, out, err)."""
     import signal
     import subprocess
     import sys
     from pathlib import Path
 
     tests = Path(__file__).resolve().parent
+    argv = [sys.executable, "-u", "-c", DRIVER, str(tests.parent), str(tests), str(lock_path)]
+    if caller:
+        argv = ["bash", "-c", CALLER, "bash", *argv]
     held = hold(lock_path)
     try:
-        proc = subprocess.Popen([sys.executable, "-u", "-c", DRIVER, str(tests.parent), str(tests), str(lock_path)],
-                                stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True, stdin=subprocess.DEVNULL)
+        proc = subprocess.Popen(argv, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True,
+                                stdin=subprocess.DEVNULL, start_new_session=True)
         try:
-            first = proc.stdout.readline()
+            first = read_line(proc.stdout)
             assert "Waiting for" in first
-            proc.send_signal(signal.SIGINT)
+            os.killpg(proc.pid, signal.SIGINT)
             out, err = proc.communicate(timeout=10)
         finally:
             if proc.poll() is None:
-                proc.kill()
+                os.killpg(proc.pid, signal.SIGKILL)
                 proc.wait()
     finally:
         os.close(held)
-    assert proc.returncode == 130
+    return proc.returncode, out, err
+
+
+def test_ctrl_c_while_waiting_dies_by_sigint_without_a_traceback(lock_path):
+    """Review S4-r3-5 and S4-r4-1: the message invites Ctrl-C; a real SIGINT while waiting prints one line, then
+    gpuctl dies by SIGINT (a shell's $? is 130), not a plain exit 130."""
+    import signal
+
+    rc, _, err = ctrl_c_while_waiting(lock_path)
+    assert rc == -signal.SIGINT
     assert "Traceback" not in err and "KeyboardInterrupt" not in err
     assert err.strip().splitlines() == [f"gpuctl: stopped waiting for {lock_path}: nothing was changed"]
+
+
+def test_ctrl_c_stops_a_calling_script_without_an_int_trap(lock_path):
+    """Review S4-r4-1: bash stops on Ctrl-C only when its child died by SIGINT; a plain exit 130 would run
+    `|| die "sync-peers failed"` (cpu-pool.sh, lib/common.sh) and report a failure instead."""
+    import signal
+
+    rc, out, err = ctrl_c_while_waiting(lock_path, caller=True)
+    assert "the failure branch ran" not in out and "the script went on" not in out
+    assert rc == -signal.SIGINT  # the script itself stopped by SIGINT
+    assert err.strip().splitlines() == [f"gpuctl: stopped waiting for {lock_path}: nothing was changed"]
+
+
+def test_the_module_entry_point_is_run():  # review S4-r4-1: python -m gpuctl goes through run()
+    import ast
+    from pathlib import Path
+
+    tree = ast.parse(Path(cli.__file__).read_text(encoding="utf-8"))
+    (block,) = [n for n in tree.body if isinstance(n, ast.If) and ast.unparse(n.test) == "__name__ == '__main__'"]
+    assert [ast.unparse(n) for n in block.body] == ["run()"]
+
+
+def test_run_exits_with_the_code_of_main(monkeypatch):
+    monkeypatch.setattr(cli, "main", lambda argv=None, **kw: 3)
+    with pytest.raises(SystemExit) as exc:
+        cli.run(["status"])
+    assert exc.value.code == 3
 
 
 def test_ctrl_c_during_a_command_exits_130_with_one_line(capsys):

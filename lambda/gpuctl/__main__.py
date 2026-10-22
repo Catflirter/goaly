@@ -9,7 +9,8 @@ tfguard checks a saved workers-stack plan (`terraform show -json` on stdin) for 
 Lambda API key and exits 1 on any violation.
 
 Exit codes: 0 success; 1 an operation failed or the target was not found; 2 refused or a usage error
-(no LAMBDA_API_KEY, invalid spec or override file, over budget, over max_nodes, not confirmed); 3 status found drift.
+(no LAMBDA_API_KEY, invalid spec or override file, over budget, over max_nodes, not confirmed); 3 status found drift;
+130 Ctrl-C: one line, then the process dies by SIGINT (see run()), so a calling script stops too.
 """
 
 from __future__ import annotations
@@ -18,10 +19,11 @@ import argparse
 import ipaddress
 import json
 import os
+import signal
 import sys
 from collections.abc import Callable, Iterable, Mapping
 from pathlib import Path
-from typing import TextIO
+from typing import NoReturn, TextIO
 
 from gpuctl.infra import CommandError, Infra, SubprocessShell
 from gpuctl.lambda_api import FirewallRule, Instance, LambdaAPIError, LambdaClient
@@ -393,5 +395,23 @@ def main(argv: list[str] | None = None, *, env: Mapping[str, str] = os.environ, 
         return EXIT_INTERRUPTED
 
 
+def run(argv: list[str] | None = None, **kw) -> NoReturn:
+    """The process entry point (python -m gpuctl): exit with main()'s code. After Ctrl-C (main() has printed its
+    one line and returned EXIT_INTERRUPTED) the process dies by SIGINT instead, so the shell's $? is still 130 and a
+    calling script without an INT trap stops too: bash stops on a Ctrl-C only when its child died by SIGINT; a plain
+    exit 130 would run `scripts/gpuctl sync-peers || die ...` in cpu-pool.sh and lib/common.sh and report a failure
+    (review S4-r4-1)."""
+    code = main(argv, **kw)
+    if code == EXIT_INTERRUPTED:
+        for stream in (sys.stdout, sys.stderr):  # death by a signal skips Python's own flush at exit
+            try:
+                stream.flush()
+            except (OSError, ValueError):
+                pass
+        signal.signal(signal.SIGINT, signal.SIG_DFL)
+        os.kill(os.getpid(), signal.SIGINT)
+    sys.exit(code)  # not reached after the SIGINT
+
+
 if __name__ == "__main__":
-    sys.exit(main())
+    run()
