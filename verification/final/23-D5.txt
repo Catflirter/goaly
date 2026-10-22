@@ -1,5 +1,23 @@
 # D5 — vectoradd: Test PASSED
-# started: 2026-10-22T12:55:05-07:00
+# started: 2026-10-22T13:25:31-07:00
 $ kc get nodes -l node-restriction.kubernetes.io/accelerator=nvidia --request-timeout=60s -o 'jsonpath={range .items[*]}{.metadata.name}{"\n"}{end}'
-D: no node has the label node-restriction.kubernetes.io/accelerator=nvidia (no GPU node): skipped
-# finished: 2026-10-22T12:55:06-07:00 — SKIP (exit 77)
+k3s-gpu-a6000-1
+D: GPU nodes: k3s-gpu-a6000-1
+$ kc -n gpu-test delete pod vectoradd --ignore-not-found --timeout=120s --request-timeout=60s
+$ kc apply -f /home/catflirter/goaly/k8s/gpu-test/vectoradd.yaml --request-timeout=60s
+pod/vectoradd created
+$ kc -n gpu-test get pod vectoradd --request-timeout=60s -o 'jsonpath={.status.phase}'
+Pending
+$ kc -n gpu-test get pod vectoradd --request-timeout=60s -o 'jsonpath={.status.phase}'
+Succeeded
+$ kc -n gpu-test logs vectoradd --request-timeout=60s
+[Vector addition of 50000 elements]
+Copy input data from the host memory to the CUDA device
+CUDA kernel launch with 196 blocks of 256 threads
+Copy output data from the CUDA device to the host memory
+Test PASSED
+Done
+D5: vectoradd: Test PASSED
+$ kc -n gpu-test delete pod vectoradd --ignore-not-found --timeout=120s --request-timeout=60s
+pod "vectoradd" deleted from gpu-test namespace
+# finished: 2026-10-22T13:25:38-07:00 — PASS (exit 0)

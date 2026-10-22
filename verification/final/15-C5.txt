@@ -1,5 +1,5 @@
 # C5 — cgroup memory.max and cpu.max
-# started: 2026-10-22T12:52:40-07:00
+# started: 2026-10-22T13:22:52-07:00
 $ kc -n hello get pods -l app=hello --field-selector=status.phase=Running --request-timeout=60s -o 'jsonpath={range .items[*]}{.metadata.name}{" "}{.spec.nodeName}{" "}{.status.containerStatuses[0].containerID}{"\n"}{end}'
 hello-849b58876f-7mzbr k3s-cpu-1 containerd://d78464720e0c294590fa23da1278853af86e1c8d9f5656cb9e29b1e13dba1d41
 hello-849b58876f-wjgt5 k3s-cpu-1 containerd://db0f704fb09e3e84639152b62be205815ed1be8c6bc89458273ae7667e01bedb
@@ -21,4 +21,4 @@ please see https://cloud.google.com/iap/docs/using-tcp-forwarding#increasing_the
 67108864
 10000 100000
 C5: memory.max 67108864, cpu.max 10000 100000
-# finished: 2026-10-22T12:52:47-07:00 — PASS (exit 0)
+# finished: 2026-10-22T13:22:59-07:00 — PASS (exit 0)

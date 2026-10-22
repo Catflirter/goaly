@@ -1,6 +1,6 @@
 # Verification run
 
-Started: 2026-10-22T12:50:46-07:00 (America/Los_Angeles)
+Started: 2026-10-22T13:20:22-07:00 (America/Los_Angeles)
 
 Operator IP: masked as <operator_ip> (checkip.amazonaws.com)
 
@@ -26,15 +26,13 @@ GCP project id: masked as <GCP_PROJECT>
 | 16 | C6 | kubectl top pod | PASS |
 | 17 | C7 | limits-demo: OOMKilled and CPU throttling | PASS |
 | 18 | C8 | NetworkPolicy: allowed from nettest, denied elsewhere | PASS |
-| 19 | D1 | GPU stack: audit, containerd, RuntimeClass | SKIP |
-| 20 | D2 | GPU capacity and allocatable | SKIP |
-| 21 | D3 | Device plugin registered | SKIP |
-| 22 | D4 | gpu-smoke: nvidia-smi | SKIP |
-| 23 | D5 | vectoradd: Test PASSED | SKIP |
-| 24 | D6 | gpu-overflow stays Pending | SKIP |
+| 19 | D1 | GPU stack: audit, containerd, RuntimeClass | PASS |
+| 20 | D2 | GPU capacity and allocatable | PASS |
+| 21 | D3 | Device plugin registered | PASS |
+| 22 | D4 | gpu-smoke: nvidia-smi | PASS |
+| 23 | D5 | vectoradd: Test PASSED | PASS |
+| 24 | D6 | gpu-overflow stays Pending | PASS |
 
-**Result:** 18 passed, 0 failed, 6 skipped
+**Result:** 24 passed, 0 failed, 0 skipped
 
 **Secret scan:** gitleaks found no leaks
-
-**Promoted with skipped checks:** 6 skipped check(s) accepted with PROMOTE_ALLOW_SKIP=1 by scripts/promote.sh at 2026-10-22T12:55:14-0700

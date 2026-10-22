@@ -1,8 +1,9 @@
 # A2 — kubectl describe every node
-# started: 2026-10-22T12:50:47-07:00
+# started: 2026-10-22T13:20:23-07:00
 $ kc get nodes --request-timeout=60s -o 'jsonpath={range .items[*]}{.metadata.name}{"\n"}{end}'
 k3s-cp
 k3s-cpu-1
+k3s-gpu-a6000-1
 $ kc describe node k3s-cp --request-timeout=60s
 Name:               k3s-cp
 Roles:              control-plane
@@ -36,14 +37,14 @@ Unschedulable:      false
 Lease:
   HolderIdentity:  k3s-cp
   AcquireTime:     <unset>
-  RenewTime:       Thu, 22 Oct 2026 19:50:46 +0000
+  RenewTime:       Thu, 22 Oct 2026 20:20:20 +0000
 Conditions:
   Type             Status  LastHeartbeatTime                 LastTransitionTime                Reason                       Message
   ----             ------  -----------------                 ------------------                ------                       -------
-  MemoryPressure   False   Thu, 22 Oct 2026 19:49:57 +0000   Thu, 22 Oct 2026 17:20:40 +0000   KubeletHasSufficientMemory   kubelet has sufficient memory available
-  DiskPressure     False   Thu, 22 Oct 2026 19:49:57 +0000   Thu, 22 Oct 2026 17:20:40 +0000   KubeletHasNoDiskPressure     kubelet has no disk pressure
-  PIDPressure      False   Thu, 22 Oct 2026 19:49:57 +0000   Thu, 22 Oct 2026 17:20:40 +0000   KubeletHasSufficientPID      kubelet has sufficient PID available
-  Ready            True    Thu, 22 Oct 2026 19:49:57 +0000   Thu, 22 Oct 2026 17:20:40 +0000   KubeletReady                 kubelet is posting ready status
+  MemoryPressure   False   Thu, 22 Oct 2026 20:15:28 +0000   Thu, 22 Oct 2026 17:20:40 +0000   KubeletHasSufficientMemory   kubelet has sufficient memory available
+  DiskPressure     False   Thu, 22 Oct 2026 20:15:28 +0000   Thu, 22 Oct 2026 17:20:40 +0000   KubeletHasNoDiskPressure     kubelet has no disk pressure
+  PIDPressure      False   Thu, 22 Oct 2026 20:15:28 +0000   Thu, 22 Oct 2026 17:20:40 +0000   KubeletHasSufficientPID      kubelet has sufficient PID available
+  Ready            True    Thu, 22 Oct 2026 20:15:28 +0000   Thu, 22 Oct 2026 17:20:40 +0000   KubeletReady                 kubelet is posting ready status
 Addresses:
   InternalIP:  10.10.0.2
   ExternalIP:  136.87.143.58
@@ -78,11 +79,11 @@ ProviderID:                   k3s://k3s-cp
 Non-terminated Pods:          (5 in total)
   Namespace                   Name                                       CPU Requests  CPU Limits  Memory Requests  Memory Limits  Age
   ---------                   ----                                       ------------  ----------  ---------------  -------------  ---
-  kube-system                 coredns-7cfb7bc9c7-q9n5d                   100m (5%)     0 (0%)      70Mi (1%)        170Mi (4%)     150m
-  kube-system                 local-path-provisioner-77b9867795-dp89r    0 (0%)        0 (0%)      0 (0%)           0 (0%)         150m
-  kube-system                 metrics-server-5bff977ff5-fgfrr            100m (5%)     0 (0%)      70Mi (1%)        0 (0%)         146m
-  nettest                     echo-qb27z                                 50m (2%)      50m (2%)    32Mi (0%)        32Mi (0%)      146m
-  nettest                     probe-kkl5q                                500m (25%)    500m (25%)  128Mi (3%)       128Mi (3%)     146m
+  kube-system                 coredns-7cfb7bc9c7-q9n5d                   100m (5%)     0 (0%)      70Mi (1%)        170Mi (4%)     179m
+  kube-system                 local-path-provisioner-77b9867795-dp89r    0 (0%)        0 (0%)      0 (0%)           0 (0%)         179m
+  kube-system                 metrics-server-5bff977ff5-fgfrr            100m (5%)     0 (0%)      70Mi (1%)        0 (0%)         176m
+  nettest                     echo-qb27z                                 50m (2%)      50m (2%)    32Mi (0%)        32Mi (0%)      176m
+  nettest                     probe-kkl5q                                500m (25%)    500m (25%)  128Mi (3%)       128Mi (3%)     176m
 Allocated resources:
   (Total limits may be over 100 percent, i.e., overcommitted.)
   Resource           Requests    Limits
@@ -124,14 +125,14 @@ Unschedulable:      false
 Lease:
   HolderIdentity:  k3s-cpu-1
   AcquireTime:     <unset>
-  RenewTime:       Thu, 22 Oct 2026 19:50:38 +0000
+  RenewTime:       Thu, 22 Oct 2026 20:20:18 +0000
 Conditions:
   Type             Status  LastHeartbeatTime                 LastTransitionTime                Reason                       Message
   ----             ------  -----------------                 ------------------                ------                       -------
-  MemoryPressure   False   Thu, 22 Oct 2026 19:46:58 +0000   Thu, 22 Oct 2026 19:26:34 +0000   KubeletHasSufficientMemory   kubelet has sufficient memory available
-  DiskPressure     False   Thu, 22 Oct 2026 19:46:58 +0000   Thu, 22 Oct 2026 19:26:34 +0000   KubeletHasNoDiskPressure     kubelet has no disk pressure
-  PIDPressure      False   Thu, 22 Oct 2026 19:46:58 +0000   Thu, 22 Oct 2026 19:26:34 +0000   KubeletHasSufficientPID      kubelet has sufficient PID available
-  Ready            True    Thu, 22 Oct 2026 19:46:58 +0000   Thu, 22 Oct 2026 19:26:34 +0000   KubeletReady                 kubelet is posting ready status
+  MemoryPressure   False   Thu, 22 Oct 2026 20:17:36 +0000   Thu, 22 Oct 2026 19:26:34 +0000   KubeletHasSufficientMemory   kubelet has sufficient memory available
+  DiskPressure     False   Thu, 22 Oct 2026 20:17:36 +0000   Thu, 22 Oct 2026 19:26:34 +0000   KubeletHasNoDiskPressure     kubelet has no disk pressure
+  PIDPressure      False   Thu, 22 Oct 2026 20:17:36 +0000   Thu, 22 Oct 2026 19:26:34 +0000   KubeletHasSufficientPID      kubelet has sufficient PID available
+  Ready            True    Thu, 22 Oct 2026 20:17:36 +0000   Thu, 22 Oct 2026 19:26:34 +0000   KubeletReady                 kubelet is posting ready status
 Addresses:
   InternalIP:  10.20.0.2
   ExternalIP:  34.28.157.143
@@ -166,10 +167,10 @@ ProviderID:                   k3s://k3s-cpu-1
 Non-terminated Pods:          (4 in total)
   Namespace                   Name                      CPU Requests  CPU Limits  Memory Requests  Memory Limits  Age
   ---------                   ----                      ------------  ----------  ---------------  -------------  ---
-  hello                       hello-849b58876f-7mzbr    100m (5%)     100m (5%)   64Mi (0%)        64Mi (0%)      146m
-  hello                       hello-849b58876f-wjgt5    100m (5%)     100m (5%)   64Mi (0%)        64Mi (0%)      146m
-  nettest                     echo-zlljg                50m (2%)      50m (2%)    32Mi (0%)        32Mi (0%)      146m
-  nettest                     probe-v54jv               500m (25%)    500m (25%)  128Mi (1%)       128Mi (1%)     146m
+  hello                       hello-849b58876f-7mzbr    100m (5%)     100m (5%)   64Mi (0%)        64Mi (0%)      176m
+  hello                       hello-849b58876f-wjgt5    100m (5%)     100m (5%)   64Mi (0%)        64Mi (0%)      176m
+  nettest                     echo-zlljg                50m (2%)      50m (2%)    32Mi (0%)        32Mi (0%)      176m
+  nettest                     probe-v54jv               500m (25%)    500m (25%)  128Mi (1%)       128Mi (1%)     176m
 Allocated resources:
   (Total limits may be over 100 percent, i.e., overcommitted.)
   Resource           Requests    Limits
@@ -182,6 +183,103 @@ Allocated resources:
 Events:
   Type    Reason                   Age                 From              Message
   ----    ------                   ----                ----              -------
-  Normal  NodeNotReady             25m (x3 over 118m)  node-controller   Node k3s-cpu-1 status is now: NodeNotReady
-  Normal  CertificateExpirationOK  24m                 k3s-cert-monitor  Node and Certificate Authority certificates managed by k3s are OK
-# finished: 2026-10-22T12:50:48-07:00 — PASS (exit 0)
+  Normal  NodeNotReady             55m (x3 over 148m)  node-controller   Node k3s-cpu-1 status is now: NodeNotReady
+  Normal  CertificateExpirationOK  53m                 k3s-cert-monitor  Node and Certificate Authority certificates managed by k3s are OK
+$ kc describe node k3s-gpu-a6000-1 --request-timeout=60s
+Name:               k3s-gpu-a6000-1
+Roles:              <none>
+Labels:             beta.kubernetes.io/arch=amd64
+                    beta.kubernetes.io/instance-type=k3s
+                    beta.kubernetes.io/os=linux
+                    gpu-type=a10
+                    kubernetes.io/arch=amd64
+                    kubernetes.io/hostname=k3s-gpu-a6000-1
+                    kubernetes.io/os=linux
+                    node-restriction.kubernetes.io/accelerator=nvidia
+                    node.kubernetes.io/instance-type=k3s
+                    nvidia.com/gpu.present=true
+Annotations:        alpha.kubernetes.io/provided-node-ip: 10.19.62.104
+                    flannel.alpha.coreos.com/backend-data: {"PublicKey":"zi3BMizqUvwM7/N432PbNl159StuozWBR3uHNB6hSG8=","Port":51820}
+                    flannel.alpha.coreos.com/backend-type: wireguard
+                    flannel.alpha.coreos.com/kube-subnet-manager: true
+                    flannel.alpha.coreos.com/public-ip: 155.248.202.136
+                    flannel.alpha.coreos.com/public-ip-overwrite: 155.248.202.136
+                    k3s.io/external-ip: 155.248.202.136
+                    k3s.io/hostname: k3s-gpu-a6000-1
+                    k3s.io/internal-ip: 10.19.62.104
+                    k3s.io/node-args:
+                      ["agent","--server","https://136.87.143.58:6443","--token-file","/etc/rancher/k3s/token","--node-name","k3s-gpu-a6000-1","--node-external-...
+                    k3s.io/node-config-hash: IZEZJZGX23FKI4EGN3SY2AA2WWGVOY3VHUEPFAJ5GJB4FD3WPBFQ====
+                    k3s.io/node-env: {}
+                    node.alpha.kubernetes.io/ttl: 0
+                    volumes.kubernetes.io/controller-managed-attach-detach: true
+CreationTimestamp:  Thu, 22 Oct 2026 20:19:56 +0000
+Taints:             nvidia.com/gpu=present:NoSchedule
+Unschedulable:      false
+Lease:
+  HolderIdentity:  k3s-gpu-a6000-1
+  AcquireTime:     <unset>
+  RenewTime:       Thu, 22 Oct 2026 20:20:16 +0000
+Conditions:
+  Type             Status  LastHeartbeatTime                 LastTransitionTime                Reason                       Message
+  ----             ------  -----------------                 ------------------                ------                       -------
+  MemoryPressure   False   Thu, 22 Oct 2026 20:20:06 +0000   Thu, 22 Oct 2026 20:19:56 +0000   KubeletHasSufficientMemory   kubelet has sufficient memory available
+  DiskPressure     False   Thu, 22 Oct 2026 20:20:06 +0000   Thu, 22 Oct 2026 20:19:56 +0000   KubeletHasNoDiskPressure     kubelet has no disk pressure
+  PIDPressure      False   Thu, 22 Oct 2026 20:20:06 +0000   Thu, 22 Oct 2026 20:19:56 +0000   KubeletHasSufficientPID      kubelet has sufficient PID available
+  Ready            True    Thu, 22 Oct 2026 20:20:06 +0000   Thu, 22 Oct 2026 20:19:56 +0000   KubeletReady                 kubelet is posting ready status
+Addresses:
+  InternalIP:  10.19.62.104
+  ExternalIP:  155.248.202.136
+  Hostname:    k3s-gpu-a6000-1
+Capacity:
+  cpu:                30
+  ephemeral-storage:  1422559648Ki
+  hugepages-1Gi:      0
+  hugepages-2Mi:      0
+  memory:             232955420Ki
+  nvidia.com/gpu:     1
+  pods:               110
+Allocatable:
+  cpu:                30
+  ephemeral-storage:  1383866024490
+  hugepages-1Gi:      0
+  hugepages-2Mi:      0
+  memory:             232955420Ki
+  nvidia.com/gpu:     1
+  pods:               110
+System Info:
+  Machine ID:                 13f67d1e24343d075105014a90898442
+  System UUID:                05defc3b-fd2b-43f5-ba0a-a70726ee7b0e
+  Boot ID:                    fe7a5d29-b7d5-4c29-b139-e8d1c4fd8339
+  Kernel Version:             6.8.0-1046-nvidia
+  OS Image:                   Ubuntu 22.04.5 LTS
+  Operating System:           linux
+  Architecture:               amd64
+  Container Runtime Version:  containerd://2.3.4-k3s1.36
+  Kubelet Version:            v1.36.5+k3s1
+PodCIDR:                      10.42.6.0/24
+PodCIDRs:                     10.42.6.0/24
+ProviderID:                   k3s://k3s-gpu-a6000-1
+Non-terminated Pods:          (3 in total)
+  Namespace                   Name                               CPU Requests  CPU Limits  Memory Requests  Memory Limits  Age
+  ---------                   ----                               ------------  ----------  ---------------  -------------  ---
+  nettest                     echo-jknhj                         50m (0%)      50m (0%)    32Mi (0%)        32Mi (0%)      29s
+  nettest                     probe-9tqsr                        500m (1%)     500m (1%)   128Mi (0%)       128Mi (0%)     29s
+  nvidia-device-plugin        nvdp-nvidia-device-plugin-sv6tz    0 (0%)        0 (0%)      0 (0%)           0 (0%)         29s
+Allocated resources:
+  (Total limits may be over 100 percent, i.e., overcommitted.)
+  Resource           Requests    Limits
+  --------           --------    ------
+  cpu                550m (1%)   550m (1%)
+  memory             160Mi (0%)  160Mi (0%)
+  ephemeral-storage  0 (0%)      0 (0%)
+  hugepages-1Gi      0 (0%)      0 (0%)
+  hugepages-2Mi      0 (0%)      0 (0%)
+  nvidia.com/gpu     0           0
+Events:
+  Type    Reason                   Age   From                   Message
+  ----    ------                   ----  ----                   -------
+  Normal  CertificateExpirationOK  31s   k3s-cert-monitor       Node and Certificate Authority certificates managed by k3s are OK
+  Normal  Synced                   29s   cloud-node-controller  Node synced successfully
+  Normal  RegisteredNode           28s   node-controller        Node k3s-gpu-a6000-1 event: Registered Node k3s-gpu-a6000-1 in Controller
+# finished: 2026-10-22T13:20:25-07:00 — PASS (exit 0)

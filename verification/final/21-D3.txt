@@ -1,5 +1,67 @@
 # D3 — Device plugin registered
-# started: 2026-10-22T12:55:05-07:00
+# started: 2026-10-22T13:25:22-07:00
 $ kc get nodes -l node-restriction.kubernetes.io/accelerator=nvidia --request-timeout=60s -o 'jsonpath={range .items[*]}{.metadata.name}{"\n"}{end}'
-D: no node has the label node-restriction.kubernetes.io/accelerator=nvidia (no GPU node): skipped
-# finished: 2026-10-22T12:55:05-07:00 — SKIP (exit 77)
+k3s-gpu-a6000-1
+D: GPU nodes: k3s-gpu-a6000-1
+$ kc -n nvidia-device-plugin get pods -o wide --request-timeout=60s
+NAME                              READY   STATUS    RESTARTS   AGE     IP          NODE              NOMINATED NODE   READINESS GATES
+nvdp-nvidia-device-plugin-sv6tz   1/1     Running   0          5m27s   10.42.6.2   k3s-gpu-a6000-1   <none>           <none>
+$ kc -n nvidia-device-plugin logs -l app.kubernetes.io/name=nvidia-device-plugin --tail=100 --request-timeout=60s
+I1022 20:20:06.061037       1 main.go:269] "Starting NVIDIA Device Plugin" version=<
+	487d7a93
+	commit: 487d7a93894b0f3ad08097169593972eb3ca8206
+ >
+I1022 20:20:06.061088       1 main.go:272] Starting FS watcher for /var/lib/kubelet/device-plugins
+I1022 20:20:06.061117       1 main.go:279] Starting OS watcher.
+I1022 20:20:06.061295       1 main.go:294] Starting Plugins.
+I1022 20:20:06.061314       1 main.go:351] Loading configuration.
+I1022 20:20:06.061929       1 main.go:377] Updating config with default resource matching patterns.
+I1022 20:20:06.062078       1 main.go:388] 
+Running with config:
+{
+  "version": "v1",
+  "flags": {
+    "migStrategy": "none",
+    "failOnInitError": true,
+    "mpsRoot": "/run/nvidia/mps",
+    "nvidiaDriverRoot": "/",
+    "nvidiaDevRoot": "/",
+    "gdrcopyEnabled": false,
+    "gdsEnabled": false,
+    "mofedEnabled": false,
+    "useNodeFeatureAPI": null,
+    "deviceDiscoveryStrategy": "auto",
+    "plugin": {
+      "passDeviceSpecs": false,
+      "deviceListStrategy": [
+        "envvar"
+      ],
+      "deviceIDStrategy": "uuid",
+      "cdiAnnotationPrefix": "cdi.k8s.io/",
+      "nvidiaCTKPath": "/usr/bin/nvidia-ctk",
+      "containerDriverRoot": "/driver-root",
+      "sharedDevicesAllocationPolicy": "distributed"
+    }
+  },
+  "resources": {
+    "gpus": [
+      {
+        "pattern": "*",
+        "name": "nvidia.com/gpu"
+      }
+    ]
+  },
+  "sharing": {
+    "timeSlicing": {}
+  },
+  "imex": {}
+}
+I1022 20:20:06.062090       1 main.go:391] Retrieving plugins.
+I1022 20:20:06.080827       1 plugin-manager.go:101] Detected platform: nvml
+I1022 20:20:06.080843       1 plugin-manager.go:50] Using device discovery strategy: nvml
+I1022 20:20:06.092587       1 server.go:198] Starting GRPC server for 'nvidia.com/gpu'
+I1022 20:20:06.093214       1 server.go:142] Starting to serve 'nvidia.com/gpu' on /var/lib/kubelet/device-plugins/nvidia-gpu.sock
+I1022 20:20:06.094612       1 server.go:149] Registered device plugin for 'nvidia.com/gpu' with Kubelet
+I1022 20:20:06.095750       1 health.go:64] Ignoring the following XIDs for health checks: map[13:true 31:true 43:true 45:true 68:true 109:true]
+D3: the device plugin registered with the kubelet
+# finished: 2026-10-22T13:25:23-07:00 — PASS (exit 0)

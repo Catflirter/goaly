@@ -1,7 +1,7 @@
 # C4 — QoS class Guaranteed
-# started: 2026-10-22T12:52:40-07:00
+# started: 2026-10-22T13:22:52-07:00
 $ kc -n hello get pods -l app=hello --request-timeout=60s -o 'jsonpath={range .items[*]}{.metadata.name}{" "}{.status.qosClass}{"\n"}{end}'
 hello-849b58876f-7mzbr Guaranteed
 hello-849b58876f-wjgt5 Guaranteed
 C4: all 2 hello Pods are Guaranteed
-# finished: 2026-10-22T12:52:40-07:00 — PASS (exit 0)
+# finished: 2026-10-22T13:22:52-07:00 — PASS (exit 0)

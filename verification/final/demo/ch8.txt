@@ -1,0 +1,30 @@
+
+=== Chapter 8: Wrap-up: the teardown plan; make down only if you say so (about 1 min) ===
+
+--- [ch8.1] GPU nodes: the plan with the pool a6000 at 0 (read-only)
+$ scripts/gpuctl plan --set-count a6000=0
+delete k3s-gpu-a6000-1 05defc3bfd2b43f5ba0aa70726ee7b0e (active)
+GPU nodes after apply: 0 (max_nodes 3)
+Hourly cost: $0.00/h (budget $3.00/h; new nodes priced at their pool's most expensive candidate type)
+=> OK
+
+--- [ch8.2] The workers stack: what terraform plan -destroy removes (last lines, read-only)
+$ demo_destroy_summary
+$ terraform -chdir=infra/workers plan -destroy -input=false -lock-timeout=120s -no-color | tail -n 15
+Changes to Outputs:
+  - worker_internal_ips = {
+      - k3s-cpu-1 = "10.20.0.2"
+    } -> null
+  - worker_ips          = {
+      - k3s-cpu-1 = "34.28.157.143"
+    } -> null
+  - worker_zones        = {
+      - k3s-cpu-1 = "us-central1-a"
+    } -> null
+
+─────────────────────────────────────────────────────────────────────────────
+
+Note: You didn't use the -out option to save this plan, so Terraform can't
+guarantee to take exactly these actions if you run "terraform apply" now.
+=> OK
+make down was not run (DEMO_NO_PAUSE=1: nobody to ask); run it by hand when you are done.

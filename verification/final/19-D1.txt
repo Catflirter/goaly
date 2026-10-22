@@ -1,5 +1,154 @@
 # D1 — GPU stack: audit, containerd, RuntimeClass
-# started: 2026-10-22T12:55:04-07:00
+# started: 2026-10-22T13:25:18-07:00
 $ kc get nodes -l node-restriction.kubernetes.io/accelerator=nvidia --request-timeout=60s -o 'jsonpath={range .items[*]}{.metadata.name}{"\n"}{end}'
-D: no node has the label node-restriction.kubernetes.io/accelerator=nvidia (no GPU node): skipped
-# finished: 2026-10-22T12:55:05-07:00 — SKIP (exit 77)
+k3s-gpu-a6000-1
+D: GPU nodes: k3s-gpu-a6000-1
+$ node_ssh k3s-gpu-a6000-1 'sudo cat /var/log/gpu-audit.txt'
+===== gpu-audit before
+$ date -Is
+2026-10-22T20:19:26+00:00
+$ nvidia-smi
+Thu Oct 22 20:19:26 2026       
++-----------------------------------------------------------------------------------------+
+| NVIDIA-SMI 580.105.08             Driver Version: 580.105.08     CUDA Version: 13.0     |
++-----------------------------------------+------------------------+----------------------+
+| GPU  Name                 Persistence-M | Bus-Id          Disp.A | Volatile Uncorr. ECC |
+| Fan  Temp   Perf          Pwr:Usage/Cap |           Memory-Usage | GPU-Util  Compute M. |
+|                                         |                        |               MIG M. |
+|=========================================+========================+======================|
+|   0  NVIDIA A10                     On  |   00000000:06:00.0 Off |                    0 |
+|  0%   34C    P8             10W /  150W |       0MiB /  23028MiB |      0%      Default |
+|                                         |                        |                  N/A |
++-----------------------------------------+------------------------+----------------------+
+
++-----------------------------------------------------------------------------------------+
+| Processes:                                                                              |
+|  GPU   GI   CI              PID   Type   Process name                        GPU Memory |
+|        ID   ID                                                               Usage      |
+|=========================================================================================|
+|  No running processes found                                                             |
++-----------------------------------------------------------------------------------------+
+$ nvidia-smi --query-gpu=name,driver_version --format=csv
+name, driver_version
+NVIDIA A10, 580.105.08
+$ lsb_release -a
+No LSB modules are available.
+Distributor ID:	Ubuntu
+Description:	Ubuntu 22.04.5 LTS
+Release:	22.04
+Codename:	jammy
+$ uname -r
+6.8.0-1046-nvidia
+$ command -v nvidia-container-runtime
+/usr/bin/nvidia-container-runtime
+$ grep -i mode /etc/nvidia-container-runtime/config.toml
+mode = "auto"
+[nvidia-container-runtime.modes]
+[nvidia-container-runtime.modes.cdi]
+[nvidia-container-runtime.modes.csv]
+[nvidia-container-runtime.modes.legacy]
+cuda-compat-mode = "ldconfig"
+skip-mode-detection = false
+$ dpkg -l | grep -E 'nvidia-container|libnvidia-container'
+ii  libnvidia-container-tools                        1.18.1+ds-0lambda0.22.04.1                    amd64        Package for configuring containers with NVIDIA hardware (CLI tool)
+ii  libnvidia-container1:amd64                       1.18.1+ds-0lambda0.22.04.1                    amd64        Package for configuring containers with NVIDIA hardware (shared library)
+ii  nvidia-container-toolkit                         1.18.1-0lambda0.22.04.1                       amd64        OCI hook for configuring containers for NVIDIA hardware
+ii  nvidia-container-toolkit-base                    1.18.1-0lambda0.22.04.1                       amd64        Container runtime for NVIDIA hardware
+$ iptables -V
+iptables v1.8.7 (nf_tables)
+$ iptables -S FORWARD | head -3
+-P FORWARD DROP
+-A FORWARD -j DOCKER-USER
+-A FORWARD -j DOCKER-FORWARD
+$ ip -4 addr show eno1
+2: eno1: <BROADCAST,MULTICAST,UP,LOWER_UP> mtu 1500 qdisc mq state UP group default qlen 1000
+    altname enp5s0
+    inet 10.19.62.104/20 brd 10.19.63.255 scope global eno1
+       valid_lft forever preferred_lft forever
+$ cat /sys/class/net/eno1/mtu
+1500
+$ systemctl is-enabled lambda-jupyter docker
+enabled
+enabled
+===== gpu-audit after
+$ date -Is
+2026-10-22T20:19:43+00:00
+$ nvidia-smi
+Thu Oct 22 20:19:43 2026       
++-----------------------------------------------------------------------------------------+
+| NVIDIA-SMI 580.105.08             Driver Version: 580.105.08     CUDA Version: 13.0     |
++-----------------------------------------+------------------------+----------------------+
+| GPU  Name                 Persistence-M | Bus-Id          Disp.A | Volatile Uncorr. ECC |
+| Fan  Temp   Perf          Pwr:Usage/Cap |           Memory-Usage | GPU-Util  Compute M. |
+|                                         |                        |               MIG M. |
+|=========================================+========================+======================|
+|   0  NVIDIA A10                     On  |   00000000:06:00.0 Off |                    0 |
+|  0%   34C    P8             10W /  150W |       0MiB /  23028MiB |      0%      Default |
+|                                         |                        |                  N/A |
++-----------------------------------------+------------------------+----------------------+
+
++-----------------------------------------------------------------------------------------+
+| Processes:                                                                              |
+|  GPU   GI   CI              PID   Type   Process name                        GPU Memory |
+|        ID   ID                                                               Usage      |
+|=========================================================================================|
+|  No running processes found                                                             |
++-----------------------------------------------------------------------------------------+
+$ nvidia-smi --query-gpu=name,driver_version --format=csv
+name, driver_version
+NVIDIA A10, 580.105.08
+$ lsb_release -a
+No LSB modules are available.
+Distributor ID:	Ubuntu
+Description:	Ubuntu 22.04.5 LTS
+Release:	22.04
+Codename:	jammy
+$ uname -r
+6.8.0-1046-nvidia
+$ command -v nvidia-container-runtime
+/usr/bin/nvidia-container-runtime
+$ grep -i mode /etc/nvidia-container-runtime/config.toml
+mode = "auto"
+[nvidia-container-runtime.modes]
+[nvidia-container-runtime.modes.cdi]
+[nvidia-container-runtime.modes.csv]
+[nvidia-container-runtime.modes.legacy]
+cuda-compat-mode = "ldconfig"
+skip-mode-detection = false
+$ dpkg -l | grep -E 'nvidia-container|libnvidia-container'
+ii  libnvidia-container-tools                        1.18.1+ds-0lambda0.22.04.1                    amd64        Package for configuring containers with NVIDIA hardware (CLI tool)
+ii  libnvidia-container1:amd64                       1.18.1+ds-0lambda0.22.04.1                    amd64        Package for configuring containers with NVIDIA hardware (shared library)
+ii  nvidia-container-toolkit                         1.18.1-0lambda0.22.04.1                       amd64        OCI hook for configuring containers for NVIDIA hardware
+ii  nvidia-container-toolkit-base                    1.18.1-0lambda0.22.04.1                       amd64        Container runtime for NVIDIA hardware
+$ iptables -V
+iptables v1.8.7 (nf_tables)
+$ iptables -S FORWARD | head -3
+-P FORWARD DROP
+-A FORWARD -j DOCKER-USER
+-A FORWARD -j DOCKER-FORWARD
+$ ip -4 addr show eno1
+2: eno1: <BROADCAST,MULTICAST,UP,LOWER_UP> mtu 1460 qdisc mq state UP group default qlen 1000
+    altname enp5s0
+    inet 10.19.62.104/20 brd 10.19.63.255 scope global eno1
+       valid_lft forever preferred_lft forever
+$ cat /sys/class/net/eno1/mtu
+1460
+$ systemctl is-enabled lambda-jupyter docker
+disabled
+disabled
+[exit 1]
+D1: k3s-gpu-a6000-1: /var/log/gpu-audit.txt has content
+$ node_ssh k3s-gpu-a6000-1 'sudo grep -A3 nvidia /var/lib/rancher/k3s/agent/etc/containerd/config.toml'
+[plugins.'io.containerd.cri.v1.runtime'.containerd.runtimes.'nvidia']
+  runtime_type = "io.containerd.runc.v2"
+
+[plugins.'io.containerd.cri.v1.runtime'.containerd.runtimes.'nvidia'.options]
+  BinaryName = "/usr/bin/nvidia-container-runtime"
+  SystemdCgroup = true
+
+[plugins.'io.containerd.cri.v1.images'.registry]
+D1: k3s-gpu-a6000-1: containerd has the nvidia runtime
+$ kc get runtimeclass nvidia-gpu --request-timeout=60s
+NAME         HANDLER   AGE
+nvidia-gpu   nvidia    3h1m
+# finished: 2026-10-22T13:25:21-07:00 — PASS (exit 0)

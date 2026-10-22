@@ -1,0 +1,1089 @@
+
+=== Chapter 6: Scaling by inventory: workers plan, CPU pool 1 -> 2 -> 1, GPU plan with the pool at 2 (about 5 min) ===
+
+--- [ch6.1] What scaling the CPU pool to 2 adds: terraform plan of the workers stack (read-only)
+$ demo_workers_plan 2
+$ scripts/cpu-pool.sh render 2 > .run/demo-workers.2.tfvars.json
+$ terraform -chdir=infra/workers plan -input=false -lock-timeout=120s -no-color -var-file=/home/catflirter/goaly/.run/demo-workers.2.tfvars.json
+data.terraform_remote_state.base: Reading...
+google_compute_address.worker["k3s-cpu-1"]: Refreshing state... [id=projects/<GCP_PROJECT>/regions/us-central1/addresses/k3s-cpu-1-ip]
+data.terraform_remote_state.base: Read complete after 1s
+google_compute_firewall.workers_iap_ssh: Refreshing state... [id=projects/<GCP_PROJECT>/global/firewalls/fw-workers-allow-iap-ssh]
+google_compute_firewall.cp_to_workers: Refreshing state... [id=projects/<GCP_PROJECT>/global/firewalls/fw-cp-to-workers]
+google_compute_firewall.worker_mesh["k3s-cpu-1"]: Refreshing state... [id=projects/<GCP_PROJECT>/global/firewalls/fw-k3s-cpu-1-mesh]
+google_compute_firewall.worker_to_cp["k3s-cpu-1"]: Refreshing state... [id=projects/<GCP_PROJECT>/global/firewalls/fw-k3s-cpu-1-to-cp]
+google_compute_instance.worker["k3s-cpu-1"]: Refreshing state... [id=projects/<GCP_PROJECT>/zones/us-central1-a/instances/k3s-cpu-1]
+
+Terraform used the selected providers to generate the following execution
+plan. Resource actions are indicated with the following symbols:
+  + create
+
+Terraform will perform the following actions:
+
+  # google_compute_address.worker["k3s-cpu-2"] will be created
+  + resource "google_compute_address" "worker" {
+      + address            = (known after apply)
+      + address_id         = (known after apply)
+      + address_type       = "EXTERNAL"
+      + creation_timestamp = (known after apply)
+      + deletion_policy    = "DELETE"
+      + effective_labels   = {
+          + "goog-terraform-provisioned" = "true"
+        }
+      + id                 = (known after apply)
+      + label_fingerprint  = (known after apply)
+      + name               = "k3s-cpu-2-ip"
+      + network_tier       = (known after apply)
+      + prefix_length      = (known after apply)
+      + project            = "<GCP_PROJECT>"
+      + purpose            = (known after apply)
+      + region             = "us-central1"
+      + self_link          = (known after apply)
+      + subnetwork         = (known after apply)
+      + terraform_labels   = {
+          + "goog-terraform-provisioned" = "true"
+        }
+      + users              = (known after apply)
+    }
+
+  # google_compute_firewall.worker_mesh["k3s-cpu-2"] will be created
+  + resource "google_compute_firewall" "worker_mesh" {
+      + creation_timestamp      = (known after apply)
+      + deletion_policy         = "DELETE"
+      + destination_ranges      = (known after apply)
+      + direction               = "INGRESS"
+      + enable_logging          = (known after apply)
+      + id                      = (known after apply)
+      + name                    = "fw-k3s-cpu-2-mesh"
+      + network                 = "k3s-edge"
+      + priority                = 1000
+      + project                 = "<GCP_PROJECT>"
+      + self_link               = (known after apply)
+      + source_ranges           = (known after apply)
+      + target_service_accounts = [
+          + "k3s-worker@<GCP_PROJECT>.iam.gserviceaccount.com",
+        ]
+
+      + allow {
+          + ports    = [
+              + "51820",
+            ]
+          + protocol = "udp"
+        }
+      + allow {
+          + ports    = []
+          + protocol = "icmp"
+        }
+
+      + log_config {
+          + metadata = "INCLUDE_ALL_METADATA"
+        }
+    }
+
+  # google_compute_firewall.worker_to_cp["k3s-cpu-2"] will be created
+  + resource "google_compute_firewall" "worker_to_cp" {
+      + creation_timestamp      = (known after apply)
+      + deletion_policy         = "DELETE"
+      + destination_ranges      = (known after apply)
+      + direction               = "INGRESS"
+      + enable_logging          = (known after apply)
+      + id                      = (known after apply)
+      + name                    = "fw-k3s-cpu-2-to-cp"
+      + network                 = "k3s-core"
+      + priority                = 1000
+      + project                 = "<GCP_PROJECT>"
+      + self_link               = (known after apply)
+      + source_ranges           = (known after apply)
+      + target_service_accounts = [
+          + "k3s-cp@<GCP_PROJECT>.iam.gserviceaccount.com",
+        ]
+
+      + allow {
+          + ports    = [
+              + "51820",
+            ]
+          + protocol = "udp"
+        }
+      + allow {
+          + ports    = [
+              + "6443",
+            ]
+          + protocol = "tcp"
+        }
+      + allow {
+          + ports    = []
+          + protocol = "icmp"
+        }
+
+      + log_config {
+          + metadata = "INCLUDE_ALL_METADATA"
+        }
+    }
+
+  # google_compute_instance.worker["k3s-cpu-2"] will be created
+  + resource "google_compute_instance" "worker" {
+      + allow_stopping_for_update = true
+      + can_ip_forward            = false
+      + cpu_platform              = (known after apply)
+      + creation_timestamp        = (known after apply)
+      + current_status            = (known after apply)
+      + deletion_policy           = "DELETE"
+      + deletion_protection       = false
+      + effective_labels          = {
+          + "goog-terraform-provisioned" = "true"
+        }
+      + id                        = (known after apply)
+      + instance_id               = (known after apply)
+      + label_fingerprint         = (known after apply)
+      + machine_type              = "e2-small"
+      + metadata                  = {
+          + "block-project-ssh-keys" = "TRUE"
+          + "enable-oslogin"         = "TRUE"
+        }
+      + metadata_fingerprint      = (known after apply)
+      + min_cpu_platform          = (known after apply)
+      + name                      = "k3s-cpu-2"
+      + project                   = "<GCP_PROJECT>"
+      + self_link                 = (known after apply)
+      + tags_fingerprint          = (known after apply)
+      + terraform_labels          = {
+          + "goog-terraform-provisioned" = "true"
+        }
+      + zone                      = "us-central1-a"
+
+      + boot_disk {
+          + auto_delete                = true
+          + device_name                = (known after apply)
+          + disk_encryption_key_sha256 = (known after apply)
+          + guest_os_features          = (known after apply)
+          + kms_key_self_link          = (known after apply)
+          + mode                       = "READ_WRITE"
+          + source                     = (known after apply)
+
+          + initialize_params {
+              + architecture           = (known after apply)
+              + image                  = "ubuntu-os-cloud/ubuntu-2404-lts-amd64"
+              + labels                 = (known after apply)
+              + provisioned_iops       = (known after apply)
+              + provisioned_throughput = (known after apply)
+              + resource_policies      = (known after apply)
+              + size                   = 20
+              + snapshot               = (known after apply)
+              + type                   = "pd-balanced"
+            }
+        }
+
+      + confidential_instance_config (known after apply)
+
+      + guest_accelerator (known after apply)
+
+      + network_interface {
+          + igmp_query                  = (known after apply)
+          + internal_ipv6_prefix_length = (known after apply)
+          + ipv6_access_type            = (known after apply)
+          + ipv6_address                = (known after apply)
+          + name                        = (known after apply)
+          + network                     = (known after apply)
+          + network_attachment          = (known after apply)
+          + network_ip                  = (known after apply)
+          + parent_nic_name             = (known after apply)
+          + stack_type                  = (known after apply)
+          + subnetwork                  = "projects/<GCP_PROJECT>/regions/us-central1/subnetworks/k3s-edge"
+          + subnetwork_project          = (known after apply)
+
+          + access_config {
+              + nat_ip       = (known after apply)
+              + network_tier = (known after apply)
+            }
+        }
+
+      + reservation_affinity (known after apply)
+
+      + scheduling (known after apply)
+
+      + service_account {
+          + email  = "k3s-worker@<GCP_PROJECT>.iam.gserviceaccount.com"
+          + scopes = [
+              + "https://www.googleapis.com/auth/userinfo.email",
+            ]
+        }
+
+      + shielded_instance_config {
+          + enable_integrity_monitoring = true
+          + enable_secure_boot          = true
+          + enable_vtpm                 = true
+        }
+    }
+
+Plan: 4 to add, 0 to change, 0 to destroy.
+
+Changes to Outputs:
+  ~ worker_internal_ips = {
+      + k3s-cpu-2 = (known after apply)
+        # (1 unchanged attribute hidden)
+    }
+  ~ worker_ips          = {
+      + k3s-cpu-2 = (known after apply)
+        # (1 unchanged attribute hidden)
+    }
+  ~ worker_zones        = {
+      + k3s-cpu-2 = "us-central1-a"
+        # (1 unchanged attribute hidden)
+    }
+
+─────────────────────────────────────────────────────────────────────────────
+
+Note: You didn't use the -out option to save this plan, so Terraform can't
+guarantee to take exactly these actions if you run "terraform apply" now.
+=> OK
+
+--- [ch6.2] Scale the CPU pool to 2 in the background; watch the new worker join
+$ demo_scale_up 2
+$ AUTO_APPROVE=1 scripts/cpu-pool.sh scale 2 --guarded &   # in the background; its log goes to ch6.txt
+$ kc get nodes -w
+NAME              STATUS   ROLES           AGE     VERSION
+k3s-cp            Ready    control-plane   3h13m   v1.36.5+k3s1
+k3s-cpu-1         Ready    <none>          3h11m   v1.36.5+k3s1
+k3s-gpu-a6000-1   Ready    <none>          14m     v1.36.5+k3s1
+k3s-gpu-a6000-1   Ready    <none>          15m     v1.36.5+k3s1
+k3s-cp            Ready    control-plane   3h15m   v1.36.5+k3s1
+k3s-cpu-2         NotReady   <none>          0s      v1.36.5+k3s1
+k3s-cpu-2         NotReady   <none>          0s      v1.36.5+k3s1
+k3s-cpu-2         NotReady   <none>          0s      v1.36.5+k3s1
+k3s-cpu-2         NotReady   <none>          0s      v1.36.5+k3s1
+k3s-cpu-2         NotReady   <none>          0s      v1.36.5+k3s1
+k3s-cpu-2         NotReady   <none>          0s      v1.36.5+k3s1
+k3s-cpu-2         NotReady   <none>          0s      v1.36.5+k3s1
+k3s-cpu-2         NotReady   <none>          0s      v1.36.5+k3s1
+k3s-cpu-2         Ready      <none>          0s      v1.36.5+k3s1
+k3s-cpu-2         Ready      <none>          0s      v1.36.5+k3s1
+k3s-cpu-2         Ready      <none>          1s      v1.36.5+k3s1
+--- the log of AUTO_APPROVE=1 scripts/cpu-pool.sh scale 2 --guarded (exit 0) ---
+[0m[1mdata.terraform_remote_state.base: Reading...[0m[0m
+[0m[1mgoogle_compute_address.worker["k3s-cpu-1"]: Refreshing state... [id=projects/<GCP_PROJECT>/regions/us-central1/addresses/k3s-cpu-1-ip][0m
+[0m[1mdata.terraform_remote_state.base: Read complete after 1s[0m
+[0m[1mgoogle_compute_firewall.workers_iap_ssh: Refreshing state... [id=projects/<GCP_PROJECT>/global/firewalls/fw-workers-allow-iap-ssh][0m
+[0m[1mgoogle_compute_firewall.worker_mesh["k3s-cpu-1"]: Refreshing state... [id=projects/<GCP_PROJECT>/global/firewalls/fw-k3s-cpu-1-mesh][0m
+[0m[1mgoogle_compute_firewall.cp_to_workers: Refreshing state... [id=projects/<GCP_PROJECT>/global/firewalls/fw-cp-to-workers][0m
+[0m[1mgoogle_compute_firewall.worker_to_cp["k3s-cpu-1"]: Refreshing state... [id=projects/<GCP_PROJECT>/global/firewalls/fw-k3s-cpu-1-to-cp][0m
+[0m[1mgoogle_compute_instance.worker["k3s-cpu-1"]: Refreshing state... [id=projects/<GCP_PROJECT>/zones/us-central1-a/instances/k3s-cpu-1][0m
+
+Terraform used the selected providers to generate the following execution
+plan. Resource actions are indicated with the following symbols:
+  [32m+[0m create[0m
+
+Terraform will perform the following actions:
+
+[1m  # google_compute_address.worker["k3s-cpu-2"][0m will be created
+[0m  [32m+[0m[0m resource "google_compute_address" "worker" {
+      [32m+[0m[0m address            = (known after apply)
+      [32m+[0m[0m address_id         = (known after apply)
+      [32m+[0m[0m address_type       = "EXTERNAL"
+      [32m+[0m[0m creation_timestamp = (known after apply)
+      [32m+[0m[0m deletion_policy    = "DELETE"
+      [32m+[0m[0m effective_labels   = {
+          [32m+[0m[0m "goog-terraform-provisioned" = "true"
+        }
+      [32m+[0m[0m id                 = (known after apply)
+      [32m+[0m[0m label_fingerprint  = (known after apply)
+      [32m+[0m[0m name               = "k3s-cpu-2-ip"
+      [32m+[0m[0m network_tier       = (known after apply)
+      [32m+[0m[0m prefix_length      = (known after apply)
+      [32m+[0m[0m project            = "<GCP_PROJECT>"
+      [32m+[0m[0m purpose            = (known after apply)
+      [32m+[0m[0m region             = "us-central1"
+      [32m+[0m[0m self_link          = (known after apply)
+      [32m+[0m[0m subnetwork         = (known after apply)
+      [32m+[0m[0m terraform_labels   = {
+          [32m+[0m[0m "goog-terraform-provisioned" = "true"
+        }
+      [32m+[0m[0m users              = (known after apply)
+    }
+
+[1m  # google_compute_firewall.worker_mesh["k3s-cpu-2"][0m will be created
+[0m  [32m+[0m[0m resource "google_compute_firewall" "worker_mesh" {
+      [32m+[0m[0m creation_timestamp      = (known after apply)
+      [32m+[0m[0m deletion_policy         = "DELETE"
+      [32m+[0m[0m destination_ranges      = (known after apply)
+      [32m+[0m[0m direction               = "INGRESS"
+      [32m+[0m[0m enable_logging          = (known after apply)
+      [32m+[0m[0m id                      = (known after apply)
+      [32m+[0m[0m name                    = "fw-k3s-cpu-2-mesh"
+      [32m+[0m[0m network                 = "k3s-edge"
+      [32m+[0m[0m priority                = 1000
+      [32m+[0m[0m project                 = "<GCP_PROJECT>"
+      [32m+[0m[0m self_link               = (known after apply)
+      [32m+[0m[0m source_ranges           = (known after apply)
+      [32m+[0m[0m target_service_accounts = [
+          [32m+[0m[0m "k3s-worker@<GCP_PROJECT>.iam.gserviceaccount.com",
+        ]
+
+      [32m+[0m[0m allow {
+          [32m+[0m[0m ports    = [
+              [32m+[0m[0m "51820",
+            ]
+          [32m+[0m[0m protocol = "udp"
+        }
+      [32m+[0m[0m allow {
+          [32m+[0m[0m ports    = []
+          [32m+[0m[0m protocol = "icmp"
+        }
+
+      [32m+[0m[0m log_config {
+          [32m+[0m[0m metadata = "INCLUDE_ALL_METADATA"
+        }
+    }
+
+[1m  # google_compute_firewall.worker_to_cp["k3s-cpu-2"][0m will be created
+[0m  [32m+[0m[0m resource "google_compute_firewall" "worker_to_cp" {
+      [32m+[0m[0m creation_timestamp      = (known after apply)
+      [32m+[0m[0m deletion_policy         = "DELETE"
+      [32m+[0m[0m destination_ranges      = (known after apply)
+      [32m+[0m[0m direction               = "INGRESS"
+      [32m+[0m[0m enable_logging          = (known after apply)
+      [32m+[0m[0m id                      = (known after apply)
+      [32m+[0m[0m name                    = "fw-k3s-cpu-2-to-cp"
+      [32m+[0m[0m network                 = "k3s-core"
+      [32m+[0m[0m priority                = 1000
+      [32m+[0m[0m project                 = "<GCP_PROJECT>"
+      [32m+[0m[0m self_link               = (known after apply)
+      [32m+[0m[0m source_ranges           = (known after apply)
+      [32m+[0m[0m target_service_accounts = [
+          [32m+[0m[0m "k3s-cp@<GCP_PROJECT>.iam.gserviceaccount.com",
+        ]
+
+      [32m+[0m[0m allow {
+          [32m+[0m[0m ports    = [
+              [32m+[0m[0m "51820",
+            ]
+          [32m+[0m[0m protocol = "udp"
+        }
+      [32m+[0m[0m allow {
+          [32m+[0m[0m ports    = [
+              [32m+[0m[0m "6443",
+            ]
+          [32m+[0m[0m protocol = "tcp"
+        }
+      [32m+[0m[0m allow {
+          [32m+[0m[0m ports    = []
+          [32m+[0m[0m protocol = "icmp"
+        }
+
+      [32m+[0m[0m log_config {
+          [32m+[0m[0m metadata = "INCLUDE_ALL_METADATA"
+        }
+    }
+
+[1m  # google_compute_instance.worker["k3s-cpu-2"][0m will be created
+[0m  [32m+[0m[0m resource "google_compute_instance" "worker" {
+      [32m+[0m[0m allow_stopping_for_update = true
+      [32m+[0m[0m can_ip_forward            = false
+      [32m+[0m[0m cpu_platform              = (known after apply)
+      [32m+[0m[0m creation_timestamp        = (known after apply)
+      [32m+[0m[0m current_status            = (known after apply)
+      [32m+[0m[0m deletion_policy           = "DELETE"
+      [32m+[0m[0m deletion_protection       = false
+      [32m+[0m[0m effective_labels          = {
+          [32m+[0m[0m "goog-terraform-provisioned" = "true"
+        }
+      [32m+[0m[0m id                        = (known after apply)
+      [32m+[0m[0m instance_id               = (known after apply)
+      [32m+[0m[0m label_fingerprint         = (known after apply)
+      [32m+[0m[0m machine_type              = "e2-small"
+      [32m+[0m[0m metadata                  = {
+          [32m+[0m[0m "block-project-ssh-keys" = "TRUE"
+          [32m+[0m[0m "enable-oslogin"         = "TRUE"
+        }
+      [32m+[0m[0m metadata_fingerprint      = (known after apply)
+      [32m+[0m[0m min_cpu_platform          = (known after apply)
+      [32m+[0m[0m name                      = "k3s-cpu-2"
+      [32m+[0m[0m project                   = "<GCP_PROJECT>"
+      [32m+[0m[0m self_link                 = (known after apply)
+      [32m+[0m[0m tags_fingerprint          = (known after apply)
+      [32m+[0m[0m terraform_labels          = {
+          [32m+[0m[0m "goog-terraform-provisioned" = "true"
+        }
+      [32m+[0m[0m zone                      = "us-central1-a"
+
+      [32m+[0m[0m boot_disk {
+          [32m+[0m[0m auto_delete                = true
+          [32m+[0m[0m device_name                = (known after apply)
+          [32m+[0m[0m disk_encryption_key_sha256 = (known after apply)
+          [32m+[0m[0m guest_os_features          = (known after apply)
+          [32m+[0m[0m kms_key_self_link          = (known after apply)
+          [32m+[0m[0m mode                       = "READ_WRITE"
+          [32m+[0m[0m source                     = (known after apply)
+
+          [32m+[0m[0m initialize_params {
+              [32m+[0m[0m architecture           = (known after apply)
+              [32m+[0m[0m image                  = "ubuntu-os-cloud/ubuntu-2404-lts-amd64"
+              [32m+[0m[0m labels                 = (known after apply)
+              [32m+[0m[0m provisioned_iops       = (known after apply)
+              [32m+[0m[0m provisioned_throughput = (known after apply)
+              [32m+[0m[0m resource_policies      = (known after apply)
+              [32m+[0m[0m size                   = 20
+              [32m+[0m[0m snapshot               = (known after apply)
+              [32m+[0m[0m type                   = "pd-balanced"
+            }
+        }
+
+      [32m+[0m[0m confidential_instance_config (known after apply)
+
+      [32m+[0m[0m guest_accelerator (known after apply)
+
+      [32m+[0m[0m network_interface {
+          [32m+[0m[0m igmp_query                  = (known after apply)
+          [32m+[0m[0m internal_ipv6_prefix_length = (known after apply)
+          [32m+[0m[0m ipv6_access_type            = (known after apply)
+          [32m+[0m[0m ipv6_address                = (known after apply)
+          [32m+[0m[0m name                        = (known after apply)
+          [32m+[0m[0m network                     = (known after apply)
+          [32m+[0m[0m network_attachment          = (known after apply)
+          [32m+[0m[0m network_ip                  = (known after apply)
+          [32m+[0m[0m parent_nic_name             = (known after apply)
+          [32m+[0m[0m stack_type                  = (known after apply)
+          [32m+[0m[0m subnetwork                  = "projects/<GCP_PROJECT>/regions/us-central1/subnetworks/k3s-edge"
+          [32m+[0m[0m subnetwork_project          = (known after apply)
+
+          [32m+[0m[0m access_config {
+              [32m+[0m[0m nat_ip       = (known after apply)
+              [32m+[0m[0m network_tier = (known after apply)
+            }
+        }
+
+      [32m+[0m[0m reservation_affinity (known after apply)
+
+      [32m+[0m[0m scheduling (known after apply)
+
+      [32m+[0m[0m service_account {
+          [32m+[0m[0m email  = "k3s-worker@<GCP_PROJECT>.iam.gserviceaccount.com"
+          [32m+[0m[0m scopes = [
+              [32m+[0m[0m "https://www.googleapis.com/auth/userinfo.email",
+            ]
+        }
+
+      [32m+[0m[0m shielded_instance_config {
+          [32m+[0m[0m enable_integrity_monitoring = true
+          [32m+[0m[0m enable_secure_boot          = true
+          [32m+[0m[0m enable_vtpm                 = true
+        }
+    }
+
+[1mPlan:[0m [0m4 to add, 0 to change, 0 to destroy.
+
+Changes to Outputs:
+  [33m~[0m[0m worker_internal_ips = {
+      [32m+[0m[0m k3s-cpu-2 = (known after apply)
+        [90m# (1 unchanged attribute hidden)[0m[0m
+    }
+  [33m~[0m[0m worker_ips          = {
+      [32m+[0m[0m k3s-cpu-2 = (known after apply)
+        [90m# (1 unchanged attribute hidden)[0m[0m
+    }
+  [33m~[0m[0m worker_zones        = {
+      [32m+[0m[0m k3s-cpu-2 = "us-central1-a"
+        [90m# (1 unchanged attribute hidden)[0m[0m
+    }
+[90m
+─────────────────────────────────────────────────────────────────────────────[0m
+
+Saved the plan to: /home/catflirter/goaly/.run/workers.tfplan
+
+To perform exactly these actions, run the following command to apply:
+    terraform apply "/home/catflirter/goaly/.run/workers.tfplan"
+checking the saved plan with gpuctl tfguard --add k3s-cpu-2
+the workers plan passed the guard
+wrote /home/catflirter/goaly/infra/workers/workers.auto.tfvars.json
+Apply this plan to the workers stack? [AUTO_APPROVE=1: yes]
+[0m[1mgoogle_compute_address.worker["k3s-cpu-2"]: Creating...[0m[0m
+[0m[1mgoogle_compute_address.worker["k3s-cpu-2"]: Still creating... [00m10s elapsed][0m[0m
+[0m[1mgoogle_compute_address.worker["k3s-cpu-2"]: Creation complete after 13s [id=projects/<GCP_PROJECT>/regions/us-central1/addresses/k3s-cpu-2-ip][0m
+[0m[1mgoogle_compute_firewall.worker_mesh["k3s-cpu-2"]: Creating...[0m[0m
+[0m[1mgoogle_compute_firewall.worker_to_cp["k3s-cpu-2"]: Creating...[0m[0m
+[0m[1mgoogle_compute_instance.worker["k3s-cpu-2"]: Creating...[0m[0m
+[0m[1mgoogle_compute_firewall.worker_to_cp["k3s-cpu-2"]: Still creating... [00m10s elapsed][0m[0m
+[0m[1mgoogle_compute_firewall.worker_mesh["k3s-cpu-2"]: Still creating... [00m10s elapsed][0m[0m
+[0m[1mgoogle_compute_instance.worker["k3s-cpu-2"]: Still creating... [00m10s elapsed][0m[0m
+[0m[1mgoogle_compute_firewall.worker_mesh["k3s-cpu-2"]: Creation complete after 12s [id=projects/<GCP_PROJECT>/global/firewalls/fw-k3s-cpu-2-mesh][0m
+[0m[1mgoogle_compute_firewall.worker_to_cp["k3s-cpu-2"]: Creation complete after 12s [id=projects/<GCP_PROJECT>/global/firewalls/fw-k3s-cpu-2-to-cp][0m
+[0m[1mgoogle_compute_instance.worker["k3s-cpu-2"]: Still creating... [00m20s elapsed][0m[0m
+[0m[1mgoogle_compute_instance.worker["k3s-cpu-2"]: Creation complete after 28s [id=projects/<GCP_PROJECT>/zones/us-central1-a/instances/k3s-cpu-2][0m
+[0m[1m[32m
+Apply complete! Resources: 4 added, 0 changed, 0 destroyed.[0m
+[0m[1m[32m
+Outputs:
+
+[0mworker_internal_ips = {
+  "k3s-cpu-1" = "10.20.0.2"
+  "k3s-cpu-2" = "10.20.0.3"
+}
+worker_ips = {
+  "k3s-cpu-1" = "34.28.157.143"
+  "k3s-cpu-2" = "34.67.80.97"
+}
+worker_zones = {
+  "k3s-cpu-1" = "us-central1-a"
+  "k3s-cpu-2" = "us-central1-a"
+}
+sync-peers: operator 104.194.11.x, cp 136.87.143.58 (10.10.0.2), 2 CPU worker(s), 1 GPU node(s)
+  k3s-cp k3s_peers: 5 addresses
+  Lambda global rules: operator ssh only
+  Lambda rulesets: k3s-gpu-us-west-1, k3s-gpu-us-west-2, k3s-gpu-us-east-1
+==> joining k3s-cpu-2 (34.67.80.97) to the cluster at 136.87.143.58
+waiting up to 300s for: ssh_probe k3s-cpu-2
+WARNING: 
+
+To increase the performance of the tunnel, consider installing NumPy. For instructions,
+please see https://cloud.google.com/iap/docs/using-tcp-forwarding#increasing_the_tcp_upload_bandwidth
+
+WARNING: 
+
+To increase the performance of the tunnel, consider installing NumPy. For instructions,
+please see https://cloud.google.com/iap/docs/using-tcp-forwarding#increasing_the_tcp_upload_bandwidth
+
+WARNING: 
+
+To increase the performance of the tunnel, consider installing NumPy. For instructions,
+please see https://cloud.google.com/iap/docs/using-tcp-forwarding#increasing_the_tcp_upload_bandwidth
+
+* Applying /usr/lib/sysctl.d/10-apparmor.conf ...
+* Applying /etc/sysctl.d/10-bufferbloat.conf ...
+* Applying /etc/sysctl.d/10-console-messages.conf ...
+* Applying /etc/sysctl.d/10-ipv6-privacy.conf ...
+* Applying /etc/sysctl.d/10-kernel-hardening.conf ...
+* Applying /etc/sysctl.d/10-magic-sysrq.conf ...
+* Applying /etc/sysctl.d/10-map-count.conf ...
+* Applying /etc/sysctl.d/10-network-security.conf ...
+* Applying /etc/sysctl.d/10-ptrace.conf ...
+* Applying /etc/sysctl.d/10-zeropage.conf ...
+* Applying /usr/lib/sysctl.d/50-pid-max.conf ...
+* Applying /etc/sysctl.d/60-gce-network-security.conf ...
+* Applying /etc/sysctl.d/90-kubelet.conf ...
+* Applying /etc/sysctl.d/99-cloudimg-ipv6.conf ...
+* Applying /usr/lib/sysctl.d/99-protect-links.conf ...
+* Applying /etc/sysctl.d/99-sysctl.conf ...
+* Applying /etc/sysctl.conf ...
+kernel.apparmor_restrict_unprivileged_userns = 1
+net.core.default_qdisc = fq_codel
+kernel.printk = 4 4 1 7
+net.ipv6.conf.all.use_tempaddr = 2
+net.ipv6.conf.default.use_tempaddr = 2
+kernel.kptr_restrict = 1
+kernel.sysrq = 176
+vm.max_map_count = 1048576
+net.ipv4.conf.default.rp_filter = 2
+net.ipv4.conf.all.rp_filter = 2
+kernel.yama.ptrace_scope = 1
+vm.mmap_min_addr = 65536
+kernel.pid_max = 4194304
+net.ipv4.tcp_syncookies = 1
+net.ipv4.conf.all.accept_source_route = 0
+net.ipv4.conf.default.accept_source_route = 0
+net.ipv4.conf.all.accept_redirects = 0
+net.ipv4.conf.default.accept_redirects = 0
+net.ipv4.conf.all.secure_redirects = 1
+net.ipv4.conf.default.secure_redirects = 1
+net.ipv4.ip_forward = 0
+net.ipv4.conf.all.send_redirects = 0
+net.ipv4.conf.default.send_redirects = 0
+net.ipv4.conf.all.rp_filter = 1
+net.ipv4.conf.default.rp_filter = 1
+net.ipv4.icmp_echo_ignore_broadcasts = 1
+net.ipv4.icmp_ignore_bogus_error_responses = 1
+net.ipv4.conf.all.log_martians = 1
+net.ipv4.conf.default.log_martians = 1
+kernel.randomize_va_space = 2
+kernel.panic = 10
+vm.panic_on_oom = 0
+vm.overcommit_memory = 1
+kernel.panic = 10
+kernel.panic_on_oops = 1
+net.ipv4.ip_forward = 1
+net.ipv4.conf.all.forwarding = 1
+net.ipv4.conf.all.accept_redirects = 0
+net.ipv4.conf.default.accept_redirects = 0
+net.ipv4.conf.all.send_redirects = 0
+net.ipv4.conf.default.send_redirects = 0
+net.ipv4.conf.all.accept_source_route = 0
+net.ipv4.conf.default.accept_source_route = 0
+net.ipv6.conf.all.use_tempaddr = 0
+net.ipv6.conf.default.use_tempaddr = 0
+fs.protected_fifos = 1
+fs.protected_hardlinks = 1
+fs.protected_regular = 2
+fs.protected_symlinks = 1
+Get:1 http://security.ubuntu.com/ubuntu noble-security InRelease [126 kB]
+Hit:2 http://us-central1.gce.archive.ubuntu.com/ubuntu noble InRelease
+Get:3 http://us-central1.gce.archive.ubuntu.com/ubuntu noble-updates InRelease [126 kB]
+Get:4 http://us-central1.gce.archive.ubuntu.com/ubuntu noble-backports InRelease [126 kB]
+Get:5 http://us-central1.gce.archive.ubuntu.com/ubuntu noble/universe amd64 Packages [15.0 MB]
+Get:6 http://us-central1.gce.archive.ubuntu.com/ubuntu noble/universe Translation-en [5,982 kB]
+Get:7 http://us-central1.gce.archive.ubuntu.com/ubuntu noble/universe amd64 Components [3,871 kB]
+Get:8 http://us-central1.gce.archive.ubuntu.com/ubuntu noble/universe amd64 c-n-f Metadata [301 kB]
+Get:9 http://us-central1.gce.archive.ubuntu.com/ubuntu noble/multiverse amd64 Packages [269 kB]
+Get:10 http://us-central1.gce.archive.ubuntu.com/ubuntu noble/multiverse Translation-en [118 kB]
+Get:11 http://us-central1.gce.archive.ubuntu.com/ubuntu noble/multiverse amd64 Components [35.0 kB]
+Get:12 http://us-central1.gce.archive.ubuntu.com/ubuntu noble/multiverse amd64 c-n-f Metadata [8,328 B]
+Get:13 http://us-central1.gce.archive.ubuntu.com/ubuntu noble-updates/main amd64 Packages [1,400 kB]
+Get:14 http://us-central1.gce.archive.ubuntu.com/ubuntu noble-updates/main Translation-en [310 kB]
+Get:15 http://us-central1.gce.archive.ubuntu.com/ubuntu noble-updates/main amd64 Components [181 kB]
+Get:16 http://us-central1.gce.archive.ubuntu.com/ubuntu noble-updates/universe amd64 Packages [1,706 kB]
+Get:17 http://security.ubuntu.com/ubuntu noble-security/main amd64 Packages [1,146 kB]
+Get:18 http://us-central1.gce.archive.ubuntu.com/ubuntu noble-updates/universe Translation-en [342 kB]
+Get:19 http://us-central1.gce.archive.ubuntu.com/ubuntu noble-updates/universe amd64 Components [388 kB]
+Get:20 http://us-central1.gce.archive.ubuntu.com/ubuntu noble-updates/universe amd64 c-n-f Metadata [34.9 kB]
+Get:21 http://us-central1.gce.archive.ubuntu.com/ubuntu noble-updates/multiverse amd64 Packages [50.7 kB]
+Get:22 http://us-central1.gce.archive.ubuntu.com/ubuntu noble-updates/multiverse Translation-en [14.0 kB]
+Get:23 http://us-central1.gce.archive.ubuntu.com/ubuntu noble-updates/multiverse amd64 Components [940 B]
+Get:24 http://us-central1.gce.archive.ubuntu.com/ubuntu noble-updates/multiverse amd64 c-n-f Metadata [656 B]
+Get:25 http://us-central1.gce.archive.ubuntu.com/ubuntu noble-backports/main amd64 Packages [40.6 kB]
+Get:26 http://us-central1.gce.archive.ubuntu.com/ubuntu noble-backports/main Translation-en [9,172 B]
+Get:27 http://us-central1.gce.archive.ubuntu.com/ubuntu noble-backports/main amd64 Components [5,764 B]
+Get:28 http://us-central1.gce.archive.ubuntu.com/ubuntu noble-backports/main amd64 c-n-f Metadata [368 B]
+Get:29 http://us-central1.gce.archive.ubuntu.com/ubuntu noble-backports/universe amd64 Packages [31.0 kB]
+Get:30 http://us-central1.gce.archive.ubuntu.com/ubuntu noble-backports/universe Translation-en [18.6 kB]
+Get:31 http://us-central1.gce.archive.ubuntu.com/ubuntu noble-backports/universe amd64 Components [12.6 kB]
+Get:32 http://us-central1.gce.archive.ubuntu.com/ubuntu noble-backports/universe amd64 c-n-f Metadata [1,588 B]
+Get:33 http://us-central1.gce.archive.ubuntu.com/ubuntu noble-backports/restricted amd64 Components [212 B]
+Get:34 http://us-central1.gce.archive.ubuntu.com/ubuntu noble-backports/restricted amd64 c-n-f Metadata [116 B]
+Get:35 http://us-central1.gce.archive.ubuntu.com/ubuntu noble-backports/multiverse amd64 Packages [748 B]
+Get:36 http://us-central1.gce.archive.ubuntu.com/ubuntu noble-backports/multiverse Translation-en [340 B]
+Get:37 http://us-central1.gce.archive.ubuntu.com/ubuntu noble-backports/multiverse amd64 Components [212 B]
+Get:38 http://us-central1.gce.archive.ubuntu.com/ubuntu noble-backports/multiverse amd64 c-n-f Metadata [116 B]
+Get:39 http://security.ubuntu.com/ubuntu noble-security/main Translation-en [231 kB]
+Get:40 http://security.ubuntu.com/ubuntu noble-security/main amd64 Components [46.4 kB]
+Get:41 http://security.ubuntu.com/ubuntu noble-security/universe amd64 Packages [1,222 kB]
+Get:42 http://security.ubuntu.com/ubuntu noble-security/universe Translation-en [246 kB]
+Get:43 http://security.ubuntu.com/ubuntu noble-security/universe amd64 Components [76.2 kB]
+Get:44 http://security.ubuntu.com/ubuntu noble-security/universe amd64 c-n-f Metadata [24.2 kB]
+Get:45 http://security.ubuntu.com/ubuntu noble-security/multiverse amd64 Packages [45.4 kB]
+Get:46 http://security.ubuntu.com/ubuntu noble-security/multiverse Translation-en [12.1 kB]
+Get:47 http://security.ubuntu.com/ubuntu noble-security/multiverse amd64 Components [208 B]
+Get:48 http://security.ubuntu.com/ubuntu noble-security/multiverse amd64 c-n-f Metadata [468 B]
+Fetched 33.6 MB in 6s (5,396 kB/s)
+Reading package lists...
+Reading package lists...
+Building dependency tree...
+Reading state information...
+nftables is already the newest version (1.0.9-1ubuntu0.1).
+nftables set to manually installed.
+The following NEW packages will be installed:
+  wireguard-tools
+0 upgraded, 1 newly installed, 0 to remove and 1 not upgraded.
+Need to get 89.1 kB of archives.
+After this operation, 330 kB of additional disk space will be used.
+Get:1 http://us-central1.gce.archive.ubuntu.com/ubuntu noble/main amd64 wireguard-tools amd64 1.0.20210914-1ubuntu4 [89.1 kB]
+Fetched 89.1 kB in 0s (189 kB/s)
+Selecting previously unselected package wireguard-tools.
+(Reading database ... (Reading database ... 5%(Reading database ... 10%(Reading database ... 15%(Reading database ... 20%(Reading database ... 25%(Reading database ... 30%(Reading database ... 35%(Reading database ... 40%(Reading database ... 45%(Reading database ... 50%(Reading database ... 55%(Reading database ... 60%(Reading database ... 65%(Reading database ... 70%(Reading database ... 75%(Reading database ... 80%(Reading database ... 85%(Reading database ... 90%(Reading database ... 95%(Reading database ... 100%(Reading database ... 80304 files and directories currently installed.)
+Preparing to unpack .../wireguard-tools_1.0.20210914-1ubuntu4_amd64.deb ...
+Unpacking wireguard-tools (1.0.20210914-1ubuntu4) ...
+Setting up wireguard-tools (1.0.20210914-1ubuntu4) ...
+wg-quick.target is a disabled or a static unit, not starting it.
+Processing triggers for man-db (2.12.0-4build2) ...
+
+Running kernel seems to be up-to-date.
+
+No services need to be restarted.
+
+No containers need to be restarted.
+
+No user sessions are running outdated binaries.
+
+No VM guests are running outdated hypervisor (qemu) binaries on this host.
+Created symlink /etc/systemd/system/nftables.service → /dev/null.
+Created symlink /etc/systemd/system/multi-user.target.wants/k3s-guard.service → /etc/systemd/system/k3s-guard.service.
+[INFO]  Using v1.36.5+k3s1 as release
+[INFO]  Downloading hash https://github.com/k3s-io/k3s/releases/download/v1.36.5%2Bk3s1/sha256sum-amd64.txt
+[INFO]  Downloading binary https://github.com/k3s-io/k3s/releases/download/v1.36.5%2Bk3s1/k3s
+[INFO]  Verifying binary download
+[INFO]  Installing k3s to /usr/local/bin/k3s
+[INFO]  Skipping installation of SELinux RPM
+[INFO]  Creating /usr/local/bin/kubectl symlink to k3s
+[INFO]  Creating /usr/local/bin/crictl symlink to k3s
+[INFO]  Creating /usr/local/bin/ctr symlink to k3s
+[INFO]  Creating killall script /usr/local/bin/k3s-killall.sh
+[INFO]  Creating uninstall script /usr/local/bin/k3s-agent-uninstall.sh
+[INFO]  env: Creating environment file /etc/systemd/system/k3s-agent.service.env
+[INFO]  systemd: Creating service file /etc/systemd/system/k3s-agent.service
+[INFO]  systemd: Enabling k3s-agent unit
+Created symlink /etc/systemd/system/multi-user.target.wants/k3s-agent.service → /etc/systemd/system/k3s-agent.service.
+[node-bootstrap.sh] k3s agent v1.36.5+k3s1 installed as k3s-cpu-2; join-node.sh now installs the join token and starts k3s-agent
+WARNING: 
+
+To increase the performance of the tunnel, consider installing NumPy. For instructions,
+please see https://cloud.google.com/iap/docs/using-tcp-forwarding#increasing_the_tcp_upload_bandwidth
+
+WARNING: 
+
+To increase the performance of the tunnel, consider installing NumPy. For instructions,
+please see https://cloud.google.com/iap/docs/using-tcp-forwarding#increasing_the_tcp_upload_bandwidth
+
+WARNING: 
+
+To increase the performance of the tunnel, consider installing NumPy. For instructions,
+please see https://cloud.google.com/iap/docs/using-tcp-forwarding#increasing_the_tcp_upload_bandwidth
+
+waiting up to 300s for: node_joined k3s-cpu-2 34.67.80.97 2026-10-22T20:36:35Z
+WARNING: 
+
+To increase the performance of the tunnel, consider installing NumPy. For instructions,
+please see https://cloud.google.com/iap/docs/using-tcp-forwarding#increasing_the_tcp_upload_bandwidth
+
+bootstrap token "z9ndj0" deleted
+k3s-cpu-2 joined and Ready
+sync-peers: operator 104.194.11.x, cp 136.87.143.58 (10.10.0.2), 2 CPU worker(s), 1 GPU node(s)
+  k3s-cp k3s_peers: 5 addresses
+  Lambda global rules: operator ssh only
+  Lambda rulesets: k3s-gpu-us-west-1, k3s-gpu-us-west-2, k3s-gpu-us-east-1
+CPU pool: 2 worker(s)
+--- end of the log ---
+cpu-pool.sh scale 2 --guarded finished (exit 0); its log is in ch6.txt
+$ kc get node k3s-cpu-2 -o 'jsonpath={.status.conditions[?(@.type=="Ready")].status}' --request-timeout=60s
+True
+k3s-cpu-2 is Ready
+=> OK
+
+--- [ch6.3] Scale back to 1: drain the new worker, delete it, destroy its VM
+$ env AUTO_APPROVE=1 scripts/cpu-pool.sh scale 1 --guarded
+scaling down to 1: k3s-cpu-2 will be drained, deleted from the cluster and destroyed
+[0m[1mdata.terraform_remote_state.base: Reading...[0m[0m
+[0m[1mgoogle_compute_address.worker["k3s-cpu-1"]: Refreshing state... [id=projects/<GCP_PROJECT>/regions/us-central1/addresses/k3s-cpu-1-ip][0m
+[0m[1mgoogle_compute_address.worker["k3s-cpu-2"]: Refreshing state... [id=projects/<GCP_PROJECT>/regions/us-central1/addresses/k3s-cpu-2-ip][0m
+[0m[1mdata.terraform_remote_state.base: Read complete after 1s[0m
+[0m[1mgoogle_compute_firewall.workers_iap_ssh: Refreshing state... [id=projects/<GCP_PROJECT>/global/firewalls/fw-workers-allow-iap-ssh][0m
+[0m[1mgoogle_compute_firewall.cp_to_workers: Refreshing state... [id=projects/<GCP_PROJECT>/global/firewalls/fw-cp-to-workers][0m
+[0m[1mgoogle_compute_firewall.worker_to_cp["k3s-cpu-2"]: Refreshing state... [id=projects/<GCP_PROJECT>/global/firewalls/fw-k3s-cpu-2-to-cp][0m
+[0m[1mgoogle_compute_firewall.worker_mesh["k3s-cpu-2"]: Refreshing state... [id=projects/<GCP_PROJECT>/global/firewalls/fw-k3s-cpu-2-mesh][0m
+[0m[1mgoogle_compute_firewall.worker_mesh["k3s-cpu-1"]: Refreshing state... [id=projects/<GCP_PROJECT>/global/firewalls/fw-k3s-cpu-1-mesh][0m
+[0m[1mgoogle_compute_firewall.worker_to_cp["k3s-cpu-1"]: Refreshing state... [id=projects/<GCP_PROJECT>/global/firewalls/fw-k3s-cpu-1-to-cp][0m
+[0m[1mgoogle_compute_instance.worker["k3s-cpu-2"]: Refreshing state... [id=projects/<GCP_PROJECT>/zones/us-central1-a/instances/k3s-cpu-2][0m
+[0m[1mgoogle_compute_instance.worker["k3s-cpu-1"]: Refreshing state... [id=projects/<GCP_PROJECT>/zones/us-central1-a/instances/k3s-cpu-1][0m
+
+Terraform used the selected providers to generate the following execution
+plan. Resource actions are indicated with the following symbols:
+  [31m-[0m destroy[0m
+
+Terraform will perform the following actions:
+
+[1m  # google_compute_address.worker["k3s-cpu-2"][0m will be [1m[31mdestroyed[0m
+  # (because key ["k3s-cpu-2"] is not in for_each map)
+[0m  [31m-[0m[0m resource "google_compute_address" "worker" {
+      [31m-[0m[0m address            = "34.67.80.97" [90m-> null[0m[0m
+      [31m-[0m[0m address_id         = "5783960631517891981" [90m-> null[0m[0m
+      [31m-[0m[0m address_type       = "EXTERNAL" [90m-> null[0m[0m
+      [31m-[0m[0m creation_timestamp = "2026-10-22T13:34:42.375-07:00" [90m-> null[0m[0m
+      [31m-[0m[0m deletion_policy    = "DELETE" [90m-> null[0m[0m
+      [31m-[0m[0m effective_labels   = {
+          [31m-[0m[0m "goog-terraform-provisioned" = "true"
+        } [90m-> null[0m[0m
+      [31m-[0m[0m id                 = "projects/<GCP_PROJECT>/regions/us-central1/addresses/k3s-cpu-2-ip" [90m-> null[0m[0m
+      [31m-[0m[0m label_fingerprint  = "vezUS-42LLM=" [90m-> null[0m[0m
+      [31m-[0m[0m labels             = {} [90m-> null[0m[0m
+      [31m-[0m[0m name               = "k3s-cpu-2-ip" [90m-> null[0m[0m
+      [31m-[0m[0m network_tier       = "PREMIUM" [90m-> null[0m[0m
+      [31m-[0m[0m prefix_length      = 0 [90m-> null[0m[0m
+      [31m-[0m[0m project            = "<GCP_PROJECT>" [90m-> null[0m[0m
+      [31m-[0m[0m region             = "us-central1" [90m-> null[0m[0m
+      [31m-[0m[0m self_link          = "https://www.googleapis.com/compute/v1/projects/<GCP_PROJECT>/regions/us-central1/addresses/k3s-cpu-2-ip" [90m-> null[0m[0m
+      [31m-[0m[0m terraform_labels   = {
+          [31m-[0m[0m "goog-terraform-provisioned" = "true"
+        } [90m-> null[0m[0m
+      [31m-[0m[0m users              = [
+          [31m-[0m[0m "https://www.googleapis.com/compute/v1/projects/<GCP_PROJECT>/zones/us-central1-a/instances/k3s-cpu-2",
+        ] [90m-> null[0m[0m
+        [90m# (7 unchanged attributes hidden)[0m[0m
+    }
+
+[1m  # google_compute_firewall.worker_mesh["k3s-cpu-2"][0m will be [1m[31mdestroyed[0m
+  # (because key ["k3s-cpu-2"] is not in for_each map)
+[0m  [31m-[0m[0m resource "google_compute_firewall" "worker_mesh" {
+      [31m-[0m[0m creation_timestamp      = "2026-10-22T13:34:55.723-07:00" [90m-> null[0m[0m
+      [31m-[0m[0m deletion_policy         = "DELETE" [90m-> null[0m[0m
+      [31m-[0m[0m destination_ranges      = [] [90m-> null[0m[0m
+      [31m-[0m[0m direction               = "INGRESS" [90m-> null[0m[0m
+      [31m-[0m[0m disabled                = false [90m-> null[0m[0m
+      [31m-[0m[0m id                      = "projects/<GCP_PROJECT>/global/firewalls/fw-k3s-cpu-2-mesh" [90m-> null[0m[0m
+      [31m-[0m[0m name                    = "fw-k3s-cpu-2-mesh" [90m-> null[0m[0m
+      [31m-[0m[0m network                 = "https://www.googleapis.com/compute/v1/projects/<GCP_PROJECT>/global/networks/k3s-edge" [90m-> null[0m[0m
+      [31m-[0m[0m priority                = 1000 [90m-> null[0m[0m
+      [31m-[0m[0m project                 = "<GCP_PROJECT>" [90m-> null[0m[0m
+      [31m-[0m[0m self_link               = "https://www.googleapis.com/compute/v1/projects/<GCP_PROJECT>/global/firewalls/fw-k3s-cpu-2-mesh" [90m-> null[0m[0m
+      [31m-[0m[0m source_ranges           = [
+          [31m-[0m[0m "34.67.80.97/32",
+        ] [90m-> null[0m[0m
+      [31m-[0m[0m source_service_accounts = [] [90m-> null[0m[0m
+      [31m-[0m[0m source_tags             = [] [90m-> null[0m[0m
+      [31m-[0m[0m target_service_accounts = [
+          [31m-[0m[0m "k3s-worker@<GCP_PROJECT>.iam.gserviceaccount.com",
+        ] [90m-> null[0m[0m
+      [31m-[0m[0m target_tags             = [] [90m-> null[0m[0m
+        [90m# (1 unchanged attribute hidden)[0m[0m
+
+      [31m-[0m[0m allow {
+          [31m-[0m[0m ports    = [
+              [31m-[0m[0m "51820",
+            ] [90m-> null[0m[0m
+          [31m-[0m[0m protocol = "udp" [90m-> null[0m[0m
+        }
+      [31m-[0m[0m allow {
+          [31m-[0m[0m ports    = [] [90m-> null[0m[0m
+          [31m-[0m[0m protocol = "icmp" [90m-> null[0m[0m
+        }
+
+      [31m-[0m[0m log_config {
+          [31m-[0m[0m metadata = "INCLUDE_ALL_METADATA" [90m-> null[0m[0m
+        }
+    }
+
+[1m  # google_compute_firewall.worker_to_cp["k3s-cpu-2"][0m will be [1m[31mdestroyed[0m
+  # (because key ["k3s-cpu-2"] is not in for_each map)
+[0m  [31m-[0m[0m resource "google_compute_firewall" "worker_to_cp" {
+      [31m-[0m[0m creation_timestamp      = "2026-10-22T13:34:55.720-07:00" [90m-> null[0m[0m
+      [31m-[0m[0m deletion_policy         = "DELETE" [90m-> null[0m[0m
+      [31m-[0m[0m destination_ranges      = [] [90m-> null[0m[0m
+      [31m-[0m[0m direction               = "INGRESS" [90m-> null[0m[0m
+      [31m-[0m[0m disabled                = false [90m-> null[0m[0m
+      [31m-[0m[0m id                      = "projects/<GCP_PROJECT>/global/firewalls/fw-k3s-cpu-2-to-cp" [90m-> null[0m[0m
+      [31m-[0m[0m name                    = "fw-k3s-cpu-2-to-cp" [90m-> null[0m[0m
+      [31m-[0m[0m network                 = "https://www.googleapis.com/compute/v1/projects/<GCP_PROJECT>/global/networks/k3s-core" [90m-> null[0m[0m
+      [31m-[0m[0m priority                = 1000 [90m-> null[0m[0m
+      [31m-[0m[0m project                 = "<GCP_PROJECT>" [90m-> null[0m[0m
+      [31m-[0m[0m self_link               = "https://www.googleapis.com/compute/v1/projects/<GCP_PROJECT>/global/firewalls/fw-k3s-cpu-2-to-cp" [90m-> null[0m[0m
+      [31m-[0m[0m source_ranges           = [
+          [31m-[0m[0m "34.67.80.97/32",
+        ] [90m-> null[0m[0m
+      [31m-[0m[0m source_service_accounts = [] [90m-> null[0m[0m
+      [31m-[0m[0m source_tags             = [] [90m-> null[0m[0m
+      [31m-[0m[0m target_service_accounts = [
+          [31m-[0m[0m "k3s-cp@<GCP_PROJECT>.iam.gserviceaccount.com",
+        ] [90m-> null[0m[0m
+      [31m-[0m[0m target_tags             = [] [90m-> null[0m[0m
+        [90m# (1 unchanged attribute hidden)[0m[0m
+
+      [31m-[0m[0m allow {
+          [31m-[0m[0m ports    = [
+              [31m-[0m[0m "51820",
+            ] [90m-> null[0m[0m
+          [31m-[0m[0m protocol = "udp" [90m-> null[0m[0m
+        }
+      [31m-[0m[0m allow {
+          [31m-[0m[0m ports    = [
+              [31m-[0m[0m "6443",
+            ] [90m-> null[0m[0m
+          [31m-[0m[0m protocol = "tcp" [90m-> null[0m[0m
+        }
+      [31m-[0m[0m allow {
+          [31m-[0m[0m ports    = [] [90m-> null[0m[0m
+          [31m-[0m[0m protocol = "icmp" [90m-> null[0m[0m
+        }
+
+      [31m-[0m[0m log_config {
+          [31m-[0m[0m metadata = "INCLUDE_ALL_METADATA" [90m-> null[0m[0m
+        }
+    }
+
+[1m  # google_compute_instance.worker["k3s-cpu-2"][0m will be [1m[31mdestroyed[0m
+  # (because key ["k3s-cpu-2"] is not in for_each map)
+[0m  [31m-[0m[0m resource "google_compute_instance" "worker" {
+      [31m-[0m[0m allow_stopping_for_update  = true [90m-> null[0m[0m
+      [31m-[0m[0m can_ip_forward             = false [90m-> null[0m[0m
+      [31m-[0m[0m cpu_platform               = "Intel Broadwell" [90m-> null[0m[0m
+      [31m-[0m[0m creation_timestamp         = "2026-10-22T13:34:56.423-07:00" [90m-> null[0m[0m
+      [31m-[0m[0m current_status             = "RUNNING" [90m-> null[0m[0m
+      [31m-[0m[0m deletion_policy            = "DELETE" [90m-> null[0m[0m
+      [31m-[0m[0m deletion_protection        = false [90m-> null[0m[0m
+      [31m-[0m[0m effective_labels           = {
+          [31m-[0m[0m "goog-terraform-provisioned" = "true"
+        } [90m-> null[0m[0m
+      [31m-[0m[0m enable_display             = false [90m-> null[0m[0m
+      [31m-[0m[0m id                         = "projects/<GCP_PROJECT>/zones/us-central1-a/instances/k3s-cpu-2" [90m-> null[0m[0m
+      [31m-[0m[0m instance_id                = "7108397437432614303" [90m-> null[0m[0m
+      [31m-[0m[0m label_fingerprint          = "vezUS-42LLM=" [90m-> null[0m[0m
+      [31m-[0m[0m labels                     = {} [90m-> null[0m[0m
+      [31m-[0m[0m machine_type               = "e2-small" [90m-> null[0m[0m
+      [31m-[0m[0m metadata                   = {
+          [31m-[0m[0m "block-project-ssh-keys" = "TRUE"
+          [31m-[0m[0m "enable-oslogin"         = "TRUE"
+        } [90m-> null[0m[0m
+      [31m-[0m[0m metadata_fingerprint       = "26Nf_gWBtO8=" [90m-> null[0m[0m
+      [31m-[0m[0m name                       = "k3s-cpu-2" [90m-> null[0m[0m
+      [31m-[0m[0m project                    = "<GCP_PROJECT>" [90m-> null[0m[0m
+      [31m-[0m[0m resource_policies          = [] [90m-> null[0m[0m
+      [31m-[0m[0m self_link                  = "https://www.googleapis.com/compute/v1/projects/<GCP_PROJECT>/zones/us-central1-a/instances/k3s-cpu-2" [90m-> null[0m[0m
+      [31m-[0m[0m tags                       = [] [90m-> null[0m[0m
+      [31m-[0m[0m tags_fingerprint           = "42WmSpB8rSM=" [90m-> null[0m[0m
+      [31m-[0m[0m terraform_labels           = {
+          [31m-[0m[0m "goog-terraform-provisioned" = "true"
+        } [90m-> null[0m[0m
+      [31m-[0m[0m zone                       = "us-central1-a" [90m-> null[0m[0m
+        [90m# (4 unchanged attributes hidden)[0m[0m
+
+      [31m-[0m[0m boot_disk {
+          [31m-[0m[0m auto_delete                     = true [90m-> null[0m[0m
+          [31m-[0m[0m device_name                     = "persistent-disk-0" [90m-> null[0m[0m
+          [31m-[0m[0m force_attach                    = false [90m-> null[0m[0m
+          [31m-[0m[0m guest_os_features               = [
+              [31m-[0m[0m "VIRTIO_SCSI_MULTIQUEUE",
+              [31m-[0m[0m "SEV_CAPABLE",
+              [31m-[0m[0m "SEV_SNP_CAPABLE",
+              [31m-[0m[0m "SEV_LIVE_MIGRATABLE",
+              [31m-[0m[0m "SEV_LIVE_MIGRATABLE_V2",
+              [31m-[0m[0m "SNP_SVSM_CAPABLE",
+              [31m-[0m[0m "IDPF",
+              [31m-[0m[0m "TDX_CAPABLE",
+              [31m-[0m[0m "UEFI_COMPATIBLE",
+              [31m-[0m[0m "GVNIC",
+            ] [90m-> null[0m[0m
+          [31m-[0m[0m mode                            = "READ_WRITE" [90m-> null[0m[0m
+          [31m-[0m[0m source                          = "https://www.googleapis.com/compute/v1/projects/<GCP_PROJECT>/zones/us-central1-a/disks/k3s-cpu-2" [90m-> null[0m[0m
+            [90m# (6 unchanged attributes hidden)[0m[0m
+
+          [31m-[0m[0m initialize_params {
+              [31m-[0m[0m architecture                = "X86_64" [90m-> null[0m[0m
+              [31m-[0m[0m enable_confidential_compute = false [90m-> null[0m[0m
+              [31m-[0m[0m image                       = "https://www.googleapis.com/compute/v1/projects/ubuntu-os-cloud/global/images/ubuntu-2404-noble-amd64-v20261021" [90m-> null[0m[0m
+              [31m-[0m[0m labels                      = {} [90m-> null[0m[0m
+              [31m-[0m[0m provisioned_iops            = 0 [90m-> null[0m[0m
+              [31m-[0m[0m provisioned_throughput      = 0 [90m-> null[0m[0m
+              [31m-[0m[0m replica_zones               = [] [90m-> null[0m[0m
+              [31m-[0m[0m resource_manager_tags       = {} [90m-> null[0m[0m
+              [31m-[0m[0m resource_policies           = [] [90m-> null[0m[0m
+              [31m-[0m[0m size                        = 20 [90m-> null[0m[0m
+              [31m-[0m[0m type                        = "pd-balanced" [90m-> null[0m[0m
+                [90m# (2 unchanged attributes hidden)[0m[0m
+            }
+        }
+
+      [31m-[0m[0m network_interface {
+          [31m-[0m[0m enable_vpc_scoped_dns       = false [90m-> null[0m[0m
+          [31m-[0m[0m internal_ipv6_prefix_length = 0 [90m-> null[0m[0m
+          [31m-[0m[0m name                        = "nic0" [90m-> null[0m[0m
+          [31m-[0m[0m network                     = "https://www.googleapis.com/compute/v1/projects/<GCP_PROJECT>/global/networks/k3s-edge" [90m-> null[0m[0m
+          [31m-[0m[0m network_ip                  = "10.20.0.3" [90m-> null[0m[0m
+          [31m-[0m[0m queue_count                 = 0 [90m-> null[0m[0m
+          [31m-[0m[0m stack_type                  = "IPV4_ONLY" [90m-> null[0m[0m
+          [31m-[0m[0m subnetwork                  = "https://www.googleapis.com/compute/v1/projects/<GCP_PROJECT>/regions/us-central1/subnetworks/k3s-edge" [90m-> null[0m[0m
+          [31m-[0m[0m subnetwork_project          = "<GCP_PROJECT>" [90m-> null[0m[0m
+          [31m-[0m[0m vlan                        = 0 [90m-> null[0m[0m
+            [90m# (7 unchanged attributes hidden)[0m[0m
+
+          [31m-[0m[0m access_config {
+              [31m-[0m[0m nat_ip                 = "34.67.80.97" [90m-> null[0m[0m
+              [31m-[0m[0m network_tier           = "PREMIUM" [90m-> null[0m[0m
+                [90m# (1 unchanged attribute hidden)[0m[0m
+            }
+        }
+
+      [31m-[0m[0m scheduling {
+          [31m-[0m[0m automatic_restart           = true [90m-> null[0m[0m
+          [31m-[0m[0m availability_domain         = 0 [90m-> null[0m[0m
+          [31m-[0m[0m host_error_timeout_seconds  = 0 [90m-> null[0m[0m
+          [31m-[0m[0m min_node_cpus               = 0 [90m-> null[0m[0m
+          [31m-[0m[0m on_host_maintenance         = "MIGRATE" [90m-> null[0m[0m
+          [31m-[0m[0m preemptible                 = false [90m-> null[0m[0m
+          [31m-[0m[0m provisioning_model          = "STANDARD" [90m-> null[0m[0m
+            [90m# (2 unchanged attributes hidden)[0m[0m
+        }
+
+      [31m-[0m[0m service_account {
+          [31m-[0m[0m email  = "k3s-worker@<GCP_PROJECT>.iam.gserviceaccount.com" [90m-> null[0m[0m
+          [31m-[0m[0m scopes = [
+              [31m-[0m[0m "https://www.googleapis.com/auth/userinfo.email",
+            ] [90m-> null[0m[0m
+        }
+
+      [31m-[0m[0m shielded_instance_config {
+          [31m-[0m[0m enable_integrity_monitoring = true [90m-> null[0m[0m
+          [31m-[0m[0m enable_secure_boot          = true [90m-> null[0m[0m
+          [31m-[0m[0m enable_vtpm                 = true [90m-> null[0m[0m
+        }
+    }
+
+[1mPlan:[0m [0m0 to add, 0 to change, 4 to destroy.
+
+Changes to Outputs:
+  [33m~[0m[0m worker_internal_ips = {
+      [31m-[0m[0m k3s-cpu-2 = "10.20.0.3"
+        [90m# (1 unchanged attribute hidden)[0m[0m
+    }
+  [33m~[0m[0m worker_ips          = {
+      [31m-[0m[0m k3s-cpu-2 = "34.67.80.97"
+        [90m# (1 unchanged attribute hidden)[0m[0m
+    }
+  [33m~[0m[0m worker_zones        = {
+      [31m-[0m[0m k3s-cpu-2 = "us-central1-a"
+        [90m# (1 unchanged attribute hidden)[0m[0m
+    }
+[90m
+─────────────────────────────────────────────────────────────────────────────[0m
+
+Saved the plan to: /home/catflirter/goaly/.run/workers.tfplan
+
+To perform exactly these actions, run the following command to apply:
+    terraform apply "/home/catflirter/goaly/.run/workers.tfplan"
+WARNING: this plan DESTROYS or REPLACES in the workers stack:
+  - google_compute_address.worker["k3s-cpu-2"]
+  - google_compute_firewall.worker_mesh["k3s-cpu-2"]
+  - google_compute_firewall.worker_to_cp["k3s-cpu-2"]
+  - google_compute_instance.worker["k3s-cpu-2"]
+checking the saved plan with gpuctl tfguard --remove k3s-cpu-2
+the workers plan passed the guard
+Drain and delete k3s-cpu-2, then apply the workers stack (destroys their VMs)? [AUTO_APPROVE=1: yes]
+draining k3s-cpu-2 and deleting it from the cluster
+wrote /home/catflirter/goaly/infra/workers/workers.auto.tfvars.json
+Apply this plan to the workers stack? [AUTO_APPROVE=1: yes]
+[0m[1mgoogle_compute_firewall.worker_mesh["k3s-cpu-2"]: Destroying... [id=projects/<GCP_PROJECT>/global/firewalls/fw-k3s-cpu-2-mesh][0m[0m
+[0m[1mgoogle_compute_firewall.worker_to_cp["k3s-cpu-2"]: Destroying... [id=projects/<GCP_PROJECT>/global/firewalls/fw-k3s-cpu-2-to-cp][0m[0m
+[0m[1mgoogle_compute_instance.worker["k3s-cpu-2"]: Destroying... [id=projects/<GCP_PROJECT>/zones/us-central1-a/instances/k3s-cpu-2][0m[0m
+[0m[1mgoogle_compute_firewall.worker_mesh["k3s-cpu-2"]: Still destroying... [id=projects/<GCP_PROJECT>/global/firewalls/fw-k3s-cpu-2-mesh, 00m10s elapsed][0m[0m
+[0m[1mgoogle_compute_firewall.worker_to_cp["k3s-cpu-2"]: Still destroying... [id=projects/<GCP_PROJECT>/global/firewalls/fw-k3s-cpu-2-to-cp, 00m10s elapsed][0m[0m
+[0m[1mgoogle_compute_instance.worker["k3s-cpu-2"]: Still destroying... [id=projects/<GCP_PROJECT>/zones/us-central1-a/instances/k3s-cpu-2, 00m10s elapsed][0m[0m
+[0m[1mgoogle_compute_firewall.worker_to_cp["k3s-cpu-2"]: Destruction complete after 11s[0m
+[0m[1mgoogle_compute_firewall.worker_mesh["k3s-cpu-2"]: Destruction complete after 11s[0m
+[0m[1mgoogle_compute_instance.worker["k3s-cpu-2"]: Still destroying... [id=projects/<GCP_PROJECT>/zones/us-central1-a/instances/k3s-cpu-2, 00m20s elapsed][0m[0m
+[0m[1mgoogle_compute_instance.worker["k3s-cpu-2"]: Still destroying... [id=projects/<GCP_PROJECT>/zones/us-central1-a/instances/k3s-cpu-2, 00m30s elapsed][0m[0m
+[0m[1mgoogle_compute_instance.worker["k3s-cpu-2"]: Still destroying... [id=projects/<GCP_PROJECT>/zones/us-central1-a/instances/k3s-cpu-2, 00m40s elapsed][0m[0m
+[0m[1mgoogle_compute_instance.worker["k3s-cpu-2"]: Still destroying... [id=projects/<GCP_PROJECT>/zones/us-central1-a/instances/k3s-cpu-2, 00m50s elapsed][0m[0m
+[0m[1mgoogle_compute_instance.worker["k3s-cpu-2"]: Still destroying... [id=projects/<GCP_PROJECT>/zones/us-central1-a/instances/k3s-cpu-2, 01m00s elapsed][0m[0m
+[0m[1mgoogle_compute_instance.worker["k3s-cpu-2"]: Still destroying... [id=projects/<GCP_PROJECT>/zones/us-central1-a/instances/k3s-cpu-2, 01m10s elapsed][0m[0m
+[0m[1mgoogle_compute_instance.worker["k3s-cpu-2"]: Still destroying... [id=projects/<GCP_PROJECT>/zones/us-central1-a/instances/k3s-cpu-2, 01m20s elapsed][0m[0m
+[0m[1mgoogle_compute_instance.worker["k3s-cpu-2"]: Still destroying... [id=projects/<GCP_PROJECT>/zones/us-central1-a/instances/k3s-cpu-2, 01m30s elapsed][0m[0m
+[0m[1mgoogle_compute_instance.worker["k3s-cpu-2"]: Still destroying... [id=projects/<GCP_PROJECT>/zones/us-central1-a/instances/k3s-cpu-2, 01m40s elapsed][0m[0m
+[0m[1mgoogle_compute_instance.worker["k3s-cpu-2"]: Still destroying... [id=projects/<GCP_PROJECT>/zones/us-central1-a/instances/k3s-cpu-2, 01m50s elapsed][0m[0m
+[0m[1mgoogle_compute_instance.worker["k3s-cpu-2"]: Still destroying... [id=projects/<GCP_PROJECT>/zones/us-central1-a/instances/k3s-cpu-2, 02m00s elapsed][0m[0m
+[0m[1mgoogle_compute_instance.worker["k3s-cpu-2"]: Still destroying... [id=projects/<GCP_PROJECT>/zones/us-central1-a/instances/k3s-cpu-2, 02m10s elapsed][0m[0m
+[0m[1mgoogle_compute_instance.worker["k3s-cpu-2"]: Still destroying... [id=projects/<GCP_PROJECT>/zones/us-central1-a/instances/k3s-cpu-2, 02m20s elapsed][0m[0m
+[0m[1mgoogle_compute_instance.worker["k3s-cpu-2"]: Destruction complete after 2m23s[0m
+[0m[1mgoogle_compute_address.worker["k3s-cpu-2"]: Destroying... [id=projects/<GCP_PROJECT>/regions/us-central1/addresses/k3s-cpu-2-ip][0m[0m
+[0m[1mgoogle_compute_address.worker["k3s-cpu-2"]: Still destroying... [id=projects/<GCP_PROJECT>...ons/us-central1/addresses/k3s-cpu-2-ip, 00m10s elapsed][0m[0m
+[0m[1mgoogle_compute_address.worker["k3s-cpu-2"]: Destruction complete after 10s[0m
+[0m[1m[32m
+Apply complete! Resources: 0 added, 0 changed, 4 destroyed.[0m
+[0m[1m[32m
+Outputs:
+
+[0mworker_internal_ips = {
+  "k3s-cpu-1" = "10.20.0.2"
+}
+worker_ips = {
+  "k3s-cpu-1" = "34.28.157.143"
+}
+worker_zones = {
+  "k3s-cpu-1" = "us-central1-a"
+}
+sync-peers: operator 104.194.11.x, cp 136.87.143.58 (10.10.0.2), 1 CPU worker(s), 1 GPU node(s)
+  k3s-cp k3s_peers: 4 addresses
+  Lambda global rules: operator ssh only
+  Lambda rulesets: k3s-gpu-us-west-1, k3s-gpu-us-west-2, k3s-gpu-us-east-1
+CPU pool: 1 worker(s)
+=> OK
+
+--- [ch6.4] gpu-plan with the inventory's pool a6000 at 2 (read-only; nothing is started)
+$ scripts/gpuctl plan --set-count a6000=2
+create k3s-gpu-a6000-2 (pool a6000)
+keep k3s-gpu-a6000-1 155.248.202.136 (active)
+GPU nodes after apply: 2 (max_nodes 3)
+Hourly cost: $3.28/h (budget $3.00/h; new nodes priced at their pool's most expensive candidate type)
+gpuctl: plan refused: budget_usd_per_hour: plan costs $3.28/h, budget is $3.00/h
+=> FAILED (exit 2); fallback: make demo-replay CHAPTER=6, then go on
