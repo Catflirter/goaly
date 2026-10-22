@@ -177,9 +177,9 @@ def test_e1_reboots_the_worker_sees_notready_then_ready_and_runs_b1(env):
     assert len(polls(env, CPU1)) == 5                   # before, 2 until NotReady, 2 until Ready
     assert len(started_polls(env)) == 2                 # the probe and the echo Pod on k3s-cpu-1
     assert BOOT1 in text and BOOT2 in text
-    # every kubectl request of the waits is bounded, and never beyond the time left
+    # every kubectl request of the waits is bounded (KC_REQUEST_TIMEOUT, 60 s), and never beyond the time left
     for argv in polls(env, CPU1) + started_polls(env):
-        assert any(re.fullmatch(r"--request-timeout=([1-9]|1[0-5])s", a) for a in argv), argv
+        assert any(re.fullmatch(r"--request-timeout=([1-9]|[1-5][0-9]|60)s", a) for a in argv), argv
 
 
 def test_e1_accepts_a_reboot_command_that_returns_0(env):
@@ -197,7 +197,7 @@ def test_e1_reboot_command_that_fails_still_waits_then_fails_when_the_node_did_n
     result, text = check(e1(env, reboot_rc=1, ready=("True",), transitions=(T0,), boots=(BOOT1, BOOT1)),
                          "check_e1_worker_reboot")
     assert result == "FAIL" and "the reboot command failed (exit 1)" in text
-    assert len(polls(env, CPU1)) == 1 + 61              # the whole 120 s window, every 2 s: E2 must not start early
+    assert len(polls(env, CPU1)) == 1 + 60              # the whole 120 s window, every 2 s: E2 must not start early
     assert "B1: N x N matrix" not in text
 
 
@@ -212,7 +212,7 @@ def test_e1_fails_when_the_worker_never_goes_notready_within_120_s(env):
     result, text = check(e1(env, ready=("True",), transitions=(T0,)), "check_e1_worker_reboot")
     assert result == "FAIL" and "never NotReady within 120 s" in text
     # bounded: every 2 s for 120 s after the reboot command (VR_NO_WAIT: the clock is the skipped sleeps)
-    assert len(polls(env, CPU1)) == 1 + 61
+    assert len(polls(env, CPU1)) == 1 + 60
     # the evidence says whether the node rebooted anyway (faster than the node-monitor grace period)
     assert "boot ID changed" in text
     assert "B1: N x N matrix" not in text
@@ -272,7 +272,7 @@ def test_e1_fails_when_the_worker_does_not_come_back_within_600_s(env):
     result, text = check(e1(env, ready=("True", "Unknown")), "check_e1_worker_reboot")
     assert result == "FAIL" and "not Ready again within 600 s" in text
     # bounded: every 10 s until 600 s after the reboot command (VR_NO_WAIT: the clock is the skipped sleeps)
-    assert len(polls(env, CPU1)) == 1 + 1 + 61
+    assert len(polls(env, CPU1)) == 1 + 1 + 60
     assert "B1: N x N matrix" not in text
     # the evidence says how to bring the worker back
     assert f"gcloud compute instances reset {CPU1}" in text and "get-serial-port-output" in text
@@ -288,7 +288,7 @@ def test_e1_waits_for_the_nettest_pods_to_restart_before_b1(env):
 def test_e1_fails_when_the_nettest_pods_never_restart(env):
     result, text = check(e1(env, started=(iso(-3600),)), "check_e1_worker_reboot")
     assert result == "FAIL" and "did not restart after the reboot within 300 s" in text
-    assert len(started_polls(env)) == 1 + 60            # the probe Pod every 5 s for 300 s
+    assert len(started_polls(env)) == 60                # the probe Pod every 5 s for 300 s
     assert "B1: N x N matrix" not in text
 
 
@@ -409,14 +409,96 @@ def test_e2_skips_and_keeps_the_gpu_node_when_lambda_has_no_capacity_to_relaunch
 def test_e2_replaces_the_node_when_the_only_capacity_is_the_unit_it_holds(gpu):
     """Lambda reports no free capacity for the pool, but the node under test runs one of its candidate type/region
     pairs: terminating it frees that unit, so E2 replaces it (with a warning) instead of skipping (review C1-1)."""
-    status = STATUS_OK.replace(CAPACITY, "Capacity (in the order gpu-apply tries them):\n"
-                                         "POOL   TYPE          REGION     AVAILABLE  PRICE\n"
-                                         "a6000  gpu_1x_a6000  us-west-1  no         $0.80/h\n"
-                                         "a6000  gpu_1x_a10    us-west-1  no         $0.75/h\n")
-    result, text = check(e2(gpu, status=status), "check_e2_gpu_replace")
+    e2(gpu).first(gpuctl("status", seq=seq(held_status("no"), held_status("yes"))))
+    result, text = check(gpu, "check_e2_gpu_replace")
     assert result == "PASS", text
     assert f"{GPU1} holds a gpu_1x_a10 in us-west-1" in text
     assert gpuctl_calls(gpu).count("down --auto-approve") == 1 and "apply --auto-approve" in gpuctl_calls(gpu)
+
+
+def held_status(a10_west):
+    """gpuctl status for the held-unit path: no free capacity for pool a6000, except (A10_WEST) the gpu_1x_a10 in
+    us-west-1 that k3s-gpu-a6000-1 holds (LIST_BEFORE) once gpuctl down has freed it."""
+    return STATUS_OK.replace(CAPACITY, "Capacity (in the order gpu-apply tries them):\n"
+                                       "POOL   TYPE          REGION     AVAILABLE  PRICE\n"
+                                       "a6000  gpu_1x_a6000  us-west-1  no         $0.80/h\n"
+                                       f"a6000  gpu_1x_a10    us-west-1  {a10_west:<3}        $0.75/h\n")
+
+
+NO_CAPACITY = ("error: k3s-gpu-a6000-1: no capacity for any candidate type in any region of pool a6000\n"
+               "No new GPU nodes were launched; fix the error and re-run\n")
+
+
+def test_e2_held_unit_waits_for_the_freed_unit_to_show_as_capacity_before_the_apply(gpu):
+    """F-CAP (Ruling R61): Lambda can show the unit gpuctl down freed as capacity only a while after it stops listing
+    the instance; an apply before that fails at once. E2 polls gpuctl status (every 15 s) until it shows it."""
+    e2(gpu)
+    gpu.first(gpuctl("status", seq=seq(held_status("no"), held_status("no"), held_status("no"), held_status("yes"))))
+    result, text = check(gpu, "check_e2_gpu_replace")
+    assert result == "PASS", text
+    assert gpuctl_calls(gpu) == ["status", "list-nodes", "down --auto-approve", "list-nodes",
+                                 "status", "status", "status", "apply --auto-approve", "list-nodes"]
+    assert "waiting up to 300 s" in text and "(VR_NO_WAIT: skipped sleep 15)" in text
+
+
+def test_e2_held_unit_fails_when_the_freed_unit_never_shows_within_300_s(gpu):
+    """F-CAP: bounded (300 s on the clock, every 15 s); no apply; the evidence says why and that nothing is left
+    billing (the cleanup's listing), and how to bring the node back."""
+    e2(gpu, lists=(LIST_BEFORE, ""))
+    gpu.first(gpuctl("status", stdout=held_status("no")))
+    result, text = check(gpu, "check_e2_gpu_replace")
+    assert result == "FAIL", text
+    calls = gpuctl_calls(gpu)
+    assert "apply --auto-approve" not in calls
+    assert calls[:4] == ["status", "list-nodes", "down --auto-approve", "list-nodes"]
+    assert calls[4:-1] == ["status"] * 20 and calls[-1] == "list-nodes"     # every 15 s for 300 s, then the sweep
+    assert "shows no capacity for GPU pool a6000 within 300 s" in text
+    assert "no GPU instance is left running; make gpu-apply brings the GPU node back" in text
+
+
+def test_e2_held_unit_retries_an_apply_that_finds_no_capacity(gpu):
+    """F-CAP: status can show the unit before the launch call gets it: an apply that fails with gpuctl's 'no
+    capacity for any candidate type' is tried again (after 15 s, then 30 s, …) within the same 300 s."""
+    e2(gpu)
+    gpu.first(gpuctl("status", seq=seq(held_status("no"), held_status("yes"))),
+              gpuctl("apply", "--auto-approve", seq=[{"rc": 1, "stderr": NO_CAPACITY}] * 2 + [{"rc": 0}]))
+    result, text = check(gpu, "check_e2_gpu_replace")
+    assert result == "PASS", text
+    assert gpuctl_calls(gpu).count("apply --auto-approve") == 3
+    assert "(VR_NO_WAIT: skipped sleep 15)" in text and "(VR_NO_WAIT: skipped sleep 30)" in text
+
+
+def test_e2_held_unit_gives_up_retrying_the_apply_at_the_bound(gpu):
+    e2(gpu, lists=(LIST_BEFORE, "", ""))
+    gpu.first(gpuctl("status", seq=seq(held_status("no"), held_status("yes"))),
+              gpuctl("apply", "--auto-approve", rc=1, stderr=NO_CAPACITY))
+    result, text = check(gpu, "check_e2_gpu_replace")
+    assert result == "FAIL", text
+    # 0, 15, 45, 105, 225 s on the clock; the next try (465 s) is past 300 s
+    assert gpuctl_calls(gpu).count("apply --auto-approve") == 5
+    assert "no capacity until 300 s after gpuctl down" in text
+    assert "no GPU instance is left running" in text
+
+
+@pytest.mark.parametrize("held", [False, True], ids=["capacity", "held-unit"])
+def test_e2_does_not_retry_an_apply_that_failed_for_another_reason(gpu, held):
+    e2(gpu, lists=(LIST_BEFORE, "", ""), apply_rc=1)
+    if held:
+        gpu.first(gpuctl("status", seq=seq(held_status("no"), held_status("yes"))))
+    result, text = check(gpu, "check_e2_gpu_replace")
+    assert result == "FAIL", text
+    assert gpuctl_calls(gpu).count("apply --auto-approve") == 1
+
+
+def test_e2_without_a_held_unit_does_not_wait_for_capacity_or_retry(gpu):
+    """The pool showed capacity before: no capacity poll after gpuctl down, and no retry of an apply that finds
+    none (it is not the freed unit that is missing)."""
+    e2(gpu, lists=(LIST_BEFORE, "", ""))
+    gpu.first(gpuctl("apply", "--auto-approve", rc=1, stderr=NO_CAPACITY))
+    result, text = check(gpu, "check_e2_gpu_replace")
+    assert result == "FAIL", text
+    assert gpuctl_calls(gpu) == ["status", "list-nodes", "down --auto-approve", "list-nodes", "apply --auto-approve",
+                                 "list-nodes"]
 
 
 def test_e2_skips_without_a_gpu_node_and_without_reading_env(no_gpu):
@@ -477,12 +559,12 @@ def test_e2_fails_when_gpu_down_fails_and_makes_sure_no_instance_is_left(gpu):
 
 
 def test_e2_fails_when_the_node_is_still_listed_120_s_after_gpu_down(gpu):
-    # 1 before, 25 while waiting (every 5 s for 120 s), 1 for the sweep; after the sweep's gpuctl down: none
-    e2(gpu, lists=(LIST_BEFORE,) * 27 + ("",))
+    # 1 before, 24 while waiting (every 5 s for 120 s), 1 for the sweep; after the sweep's gpuctl down: none
+    e2(gpu, lists=(LIST_BEFORE,) * 26 + ("",))
     result, text = check(gpu, "check_e2_gpu_replace")
     assert result == "FAIL" and f"{GPU1} is still listed 120 s after gpuctl down" in text
     assert "apply --auto-approve" not in gpuctl_calls(gpu)
-    assert gpuctl_calls(gpu) == (["status", "list-nodes", "down --auto-approve"] + ["list-nodes"] * 25
+    assert gpuctl_calls(gpu) == (["status", "list-nodes", "down --auto-approve"] + ["list-nodes"] * 24
                                  + ["list-nodes", "down --auto-approve", "list-nodes"])
     assert "no GPU instance is left running" in text
 
@@ -510,7 +592,7 @@ def test_e2_says_loudly_when_an_instance_may_still_be_billing(gpu):
     # R54: gpuctl down refuses an undrained terminate while the API is unreachable: the tunnel comes first
     assert "make tunnel" in text
     # the sweep waited for Lambda to stop listing it (every 5 s for 120 s) before it said so
-    assert gpuctl_calls(gpu)[-27:] == ["list-nodes", "down --auto-approve"] + ["list-nodes"] * 25
+    assert gpuctl_calls(gpu)[-26:] == ["list-nodes", "down --auto-approve"] + ["list-nodes"] * 24
 
 
 def test_e2_sweep_waits_for_lambda_to_stop_listing_before_it_warns_of_billing(gpu):
@@ -546,7 +628,7 @@ def test_e2_fails_when_the_node_is_not_listed_after_apply(gpu):
 def test_e2_waits_a_bounded_time_for_the_new_node_to_be_ready(gpu):
     result, text = check(e2(gpu, ready="False"), "check_e2_gpu_replace")
     assert result == "FAIL" and "not Ready within 300 s" in text
-    assert len(polls(gpu, GPU1)) == 31                  # every 10 s for 300 s (VR_NO_WAIT: the skipped sleeps)
+    assert len(polls(gpu, GPU1)) == 30                  # every 10 s for 300 s (VR_NO_WAIT: the skipped sleeps)
     assert "B1: N x N matrix" not in text
 
 
@@ -721,9 +803,10 @@ def test_e3_masks_the_project_in_terraform_output(gpu):
 
 # ---- interrupted: the cleanup runs, and a second Ctrl-C does not stop it ----------------------------
 
-# The cleanup runs for the SIGHUP itself: run_check's subshell no longer dies at once and sends the check its
-# _vr_reap SIGTERM while the check still runs.
-HUNG_UP = re.compile(r"^interrupted \(SIGHUP\); cleaning up$", re.M)
+# The cleanup runs for the SIGHUP itself (the harness's _vr_signalled, armed by _vr_e_guarded): run_check's subshell
+# no longer dies at once and sends the check its _vr_reap SIGTERM (and, after 5 s, SIGKILL) while the check still
+# runs (Ruling R62).
+HUNG_UP = re.compile(r"^interrupted \(SIGHUP\); cleaning up \(at most 1800 s\): _vr_e[23]_cleanup$", re.M)
 
 
 def hup_default():
@@ -772,14 +855,23 @@ def run_hung_up(env, func, first, outcome, code=None):
     return text
 
 
-def test_cleanup_output_goes_to_the_run_directory_when_its_reader_is_gone(env):
-    """A caller's pipe that died with a hangup must not stop a cleanup: its output goes to $VR_DIR/cleanup.log."""
-    run = env.repo / "verification" / "t"
-    code = (f"source scripts/lib/checks.sh; vr_init {run}; "
-            "( trap '' PIPE; sleep 1; _vr_cleanup_say 'cleaning up'; echo 'still running'; vr_cmd true ) | true; "
-            f"cat {run}/cleanup.log; stat -c %a {run}/cleanup.log")
+def test_the_e_checks_use_the_harness_clock_and_operator_channel():
+    """After the sync with main (SYNC-2): E waits on _vr_clock/_vr_wait/_vr_poll and reports through _vr_tell and
+    _vr_on_signal, the same helpers as the D checks; 22b's own copies are gone."""
+    text = (ROOT / "scripts/lib/checks.sh").read_text()
+    for gone in ("_vr_e_now", "_vr_e_wait", "_vr_e_until", "_vr_e_rt", "_VR_E_SLEPT", "VR_E_DEADLINE",
+                 "_vr_cleanup_say", "cleanup.log", "_vr_guard_signal", "_vr_guarded "):
+        assert gone not in text, gone
+
+
+def test_on_signal_hup_is_armed_only_when_asked_and_disarms_to_run_checks_trap(env):
+    code = ("source scripts/lib/checks.sh; trap 'exit 129' HUP; _vr_on_signal true; trap -p HUP; "
+            "_vr_on_signal; _vr_on_signal --hup --within 5 --left x --hint y true; trap -p HUP; "
+            "echo \"$_VR_ON_SIGNAL_WITHIN|$_VR_ON_SIGNAL_LEFT|$_VR_ON_SIGNAL_HINT|${_VR_ON_SIGNAL[*]}\"; "
+            "_vr_on_signal; trap -p HUP INT")
     proc = env.run(["bash", "-c", code])
-    assert proc.stdout.splitlines() == ["cleaning up", "still running", "$ true", "600"], proc.stdout + proc.stderr
+    assert proc.stdout.splitlines() == ["trap -- 'exit 129' SIGHUP", "trap -- '_vr_signalled HUP' SIGHUP",
+                                        "5|x|y|true", "trap -- 'exit 129' SIGHUP"], proc.stdout + proc.stderr
 
 
 def test_run_check_ends_a_hung_up_check_only_after_its_foreground_command(env):
@@ -794,6 +886,24 @@ def test_run_check_ends_a_hung_up_check_only_after_its_foreground_command(env):
             "run_check T title t; run_check U later check_a1_nodes")
     log = run_hung_up(env, "t", marks / "started", "command finished", code=code)
     assert "check went on" not in log, log
+
+
+def test_a_hangup_during_an_e_cleanup_is_not_killed_after_5_s(gpu):
+    """Ruling R62 with H-1's _vr_reap (TERM, then KILL after 5 s): a hangup during E3's step ③ runs the cleanup, whose
+    restore takes longer than 5 s; the check's subshell waits for it (`trap 'exit 129' HUP`), so its _vr_reap never
+    KILLs the cleanup's shell, and the cleanup's outcome is reported to the end (SYNC-2)."""
+    marks = gpu.tmpdir / "marks"
+    marks.mkdir()
+    e3(gpu, statuses=(STATUS_OK, STATUS_DRIFT), status_rcs=(0, 3), states=(ORIG, WITH_EXTRA, ORIG))
+    script(gpu.repo / "scripts/gpuctl", f'if [ "$1" = apply ]; then touch {marks}/applying; sleep 2; fi\n'
+                                        f'exec "{sys.executable}" "{FAKES}" gpuctl "$@"\n')
+    script(gpu.bin / "terraform", f'if [ "$2" = apply ]; then case "$*" in *{EXTRA}*) ;; *) sleep 7; '
+                                  f'touch {marks}/restored ;; esac; fi\n'
+                                  f'exec "{sys.executable}" "{FAKES}" terraform "$@"\n')
+    log = run_hung_up(gpu, "check_e3_firewall_drift", marks / "applying", "cleanup done")
+    assert (marks / "restored").exists(), log
+    assert HUNG_UP.search(log) and "restored: the gpu-access state has no rule" in log, log
+    assert "cleanup FAILED" not in log and "may STILL allow" not in log, log
 
 
 def test_e3_hangup_during_the_injection_lets_terraform_finish_then_removes_the_extra_rule(gpu):
@@ -928,7 +1038,7 @@ def test_e2_sweep_blocked_by_a_state_lock_names_the_force_unlock(gpu):
 
 def run_interrupted(env, func, first, second=None, last=None):
     """Run FUNC through run_check in its own session; Ctrl-C (SIGINT to the process group) once FIRST exists, again
-    once SECOND exists; wait for the end. Returns (returncode, evidence, SUMMARY.md)."""
+    once SECOND exists; wait for the end. Returns (returncode, evidence, the operator's stderr)."""
     run = env.repo / "verification" / "t"
     code = f"set -euo pipefail; source scripts/lib/checks.sh; vr_init {run}; run_check T title {func}; " \
            "run_check U later check_a1_nodes"
@@ -943,12 +1053,22 @@ def run_interrupted(env, func, first, second=None, last=None):
         if second is not None:
             assert wait_for_file(second), f"{second.name} never appeared"
             os.killpg(proc.pid, signal.SIGINT)
-        proc.communicate(timeout=60)
+        _, err = proc.communicate(timeout=60)
+        # Ctrl-C ends the outer shell once the check's shell has cleaned up; wait for the whole group
+        deadline = time.time() + 60
+        while time.time() < deadline:
+            try:
+                os.killpg(proc.pid, 0)
+            except ProcessLookupError:
+                break
+            time.sleep(0.05)
     finally:
-        if proc.poll() is None:
+        try:
             os.killpg(proc.pid, signal.SIGKILL)
+        except ProcessLookupError:
+            pass
     assert not (run / "02-U.txt").exists()             # the run stopped after the interrupted check
-    return proc.returncode, (run / "01-T.txt").read_text(), (run / "SUMMARY.md").read_text()
+    return proc.returncode, (run / "01-T.txt").read_text(), err
 
 
 def script(path, body):
@@ -966,11 +1086,14 @@ def test_e3_ctrl_c_during_the_repair_still_removes_the_extra_rule_despite_a_seco
     script(gpu.bin / "terraform", f'if [ "$2" = apply ]; then case "$*" in *{EXTRA}*) ;; *) touch {marks}/restoring; '
                                   f'sleep 2; touch {marks}/restored ;; esac; fi\n'
                                   f'exec "{sys.executable}" "{FAKES}" terraform "$@"\n')
-    rc, text, summary = run_interrupted(gpu, "check_e3_firewall_drift", marks / "applying", marks / "restoring")
+    rc, text, err = run_interrupted(gpu, "check_e3_firewall_drift", marks / "applying", marks / "restoring")
     assert (marks / "restored").exists(), text
     assert [a[-1] for a in tf_applies(gpu)] == [INJECT_VAR, RESTORE_VAR]
-    assert "interrupted (SIGINT); cleaning up" in text and "restored" in text.split("cleaning up")[1]
-    assert "| 1 | T | title | FAIL |" in summary
+    # the operator sees the cleanup (_vr_tell on run_check's stderr), and the evidence records it
+    for out in (text, err):
+        assert "interrupted (SIGINT); cleaning up (at most 1800 s): _vr_e3_cleanup" in out, out
+        assert "restored" in out.split("cleaning up")[1] and "cleanup done" in out, out
+    assert "T: cleanup done" in err
     assert rc == -signal.SIGINT
 
 
@@ -982,11 +1105,48 @@ def test_e2_ctrl_c_during_apply_still_sweeps_despite_a_second_ctrl_c(gpu):  # no
            f'case "$1" in\n  apply) touch {marks}/applying; sleep 30 ;;\n'
            f'  down) if [ -e {marks}/down1 ]; then touch {marks}/sweeping; sleep 2; touch {marks}/swept; '
            f'else touch {marks}/down1; fi ;;\nesac\nexec "{sys.executable}" "{FAKES}" gpuctl "$@"\n')
-    rc, text, summary = run_interrupted(gpu, "check_e2_gpu_replace", marks / "applying", marks / "sweeping")
+    rc, text, err = run_interrupted(gpu, "check_e2_gpu_replace", marks / "applying", marks / "sweeping")
     assert (marks / "swept").exists(), text
     assert gpuctl_calls(gpu)[-3:] == ["list-nodes", "down --auto-approve", "list-nodes"]
-    assert "no GPU instance is left running" in text
-    assert "| 1 | T | title | FAIL |" in summary
+    for out in (text, err):
+        assert "interrupted (SIGINT); cleaning up (at most 1800 s): _vr_e2_cleanup" in out, out
+        assert "no GPU instance is left running" in out and "cleanup done" in out, out
+    assert rc == -signal.SIGINT
+
+
+def test_e2_failed_sweep_after_ctrl_c_tells_the_operator_what_may_be_billing(gpu):
+    """The interrupt cleanup could not confirm that no GPU instance runs: the operator is told what may remain and
+    what to run (the tunnel, make gpu-down, make gpu-status), not a removal command that would do nothing."""
+    marks = gpu.tmpdir / "marks"
+    marks.mkdir()
+    e2(gpu, lists=(LIST_BEFORE, "", LIST_AFTER))
+    script(gpu.repo / "scripts/gpuctl",
+           f'case "$1" in\n  apply) touch {marks}/applying; sleep 30 ;;\nesac\n'
+           f'exec "{sys.executable}" "{FAKES}" gpuctl "$@"\n')
+    rc, text, err = run_interrupted(gpu, "check_e2_gpu_replace", marks / "applying")
+    for out in (text, err):
+        assert "cleanup FAILED (exit 1); may remain: GPU instance(s)" in out, out
+        assert "make tunnel" in out and "make gpu-down" in out and "make gpu-status" in out, out
+    assert "bash -c 'source scripts/lib/checks.sh" not in err
+    assert rc == -signal.SIGINT
+
+
+def test_a_ctrl_c_during_the_final_e3_cleanup_does_not_cut_it_short(gpu):
+    """Not interrupted until the cleanup: step ③ failed, the restore runs, then a Ctrl-C. The restore goes on (its
+    apply is out of the Ctrl-C's reach), its outcome reaches the evidence and the operator (the evidence filter died
+    with the Ctrl-C), and the run then stops by the signal."""
+    marks = gpu.tmpdir / "marks"
+    marks.mkdir()
+    e3(gpu, statuses=(STATUS_OK, STATUS_DRIFT, STATUS_DRIFT), status_rcs=(0, 3, 3), states=(ORIG, WITH_EXTRA, ORIG),
+       apply_rc=1)
+    script(gpu.bin / "terraform", f'if [ "$2" = apply ]; then case "$*" in *{EXTRA}*) ;; *) touch {marks}/restoring; '
+                                  f'sleep 2; touch {marks}/restored ;; esac; fi\n'
+                                  f'exec "{sys.executable}" "{FAKES}" terraform "$@"\n')
+    rc, text, err = run_interrupted(gpu, "check_e3_firewall_drift", marks / "restoring")
+    assert (marks / "restored").exists(), text
+    for out in (text, err):
+        assert "restored: the gpu-access state has no rule" in out, out
+    assert "may STILL allow" not in text
     assert rc == -signal.SIGINT
 
 
