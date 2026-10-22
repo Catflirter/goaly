@@ -36,10 +36,13 @@ secrets: ## Scan committed history and uncommitted tracked changes for secrets
 # Offline only: -backend=false and the tests' mock provider need no cloud credentials.
 # -lockfile=readonly: init verifies providers against the committed .terraform.lock.hcl and
 # never rewrites it. To change providers, run tf-lock deliberately and commit the result.
+# TF_DATA_DIR keeps this offline init in .run/tf-test/<stack>, never in infra/<stack>/.terraform: a
+# -backend=false init there leaves a .terraform with providers but no backend, which the real
+# (GCS) init used by gpuctl and scripts/up.sh would otherwise have to undo.
 .PHONY: tf-test tf-lock
 tf-test: ## terraform init + validate every infra/ stack, then terraform test where it has tests/
 	@for d in $(ROOT)/infra/*/; do \
-	  d=$${d%/}; echo "==> $$d"; \
+	  d=$${d%/}; echo "==> $$d"; export TF_DATA_DIR="$(ROOT)/.run/tf-test/$${d##*/}"; \
 	  terraform -chdir="$$d" init -backend=false -input=false -lockfile=readonly; \
 	  terraform -chdir="$$d" validate; \
 	  if [ -d "$$d/tests" ]; then terraform -chdir="$$d" test; fi; \

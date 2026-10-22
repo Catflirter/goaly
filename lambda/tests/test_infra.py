@@ -9,7 +9,8 @@ import pytest
 
 from fakes import FakeInfra, FakeShell, fail, ok
 from gpuctl.infra import (
-    CP_SSH_TIMEOUT_S, TF_INIT_TIMEOUT_S, TF_READ_TIMEOUT_S, CommandError, Infra, MissingStackError, SubprocessShell,
+    CP_SSH_TIMEOUT_S, TF_INIT_MARKER, TF_INIT_TIMEOUT_S, TF_READ_TIMEOUT_S, CommandError, Infra, MissingStackError,
+    SubprocessShell,
 )
 from gpuctl.planner import gpu_type_label
 
@@ -20,6 +21,20 @@ BASE_OUTPUTS = ok(json.dumps({
     "cp_zone": {"value": "us-west1-b", "type": "string", "sensitive": False},
 }))
 NOT_FOUND = 'Error from server (NotFound): nodes "x" not found'
+
+
+def initialised(root, *stacks, bucket="demo-proj-k3s-tfstate"):
+    """Mark infra/<stack> as initialised against `bucket`, the way a successful ensure_init (or tf_init) leaves it."""
+    for stack in stacks:
+        (root / "infra" / stack / ".terraform").mkdir(parents=True, exist_ok=True)
+        (root / "infra" / stack / ".terraform" / TF_INIT_MARKER).write_text(f"gcs {bucket} {stack}\n")
+    return root
+
+
+def init_args(root, stack, bucket="demo-proj-k3s-tfstate"):
+    return ["terraform", f"-chdir={root}/infra/{stack}", "init", "-no-color", "-input=false",
+            "-lockfile=readonly",  # never rewrite the committed .terraform.lock.hcl (R26(b))
+            "-reconfigure", f"-backend-config=bucket={bucket}", f"-backend-config=prefix={stack}"]
 
 
 def public_methods(cls):
@@ -37,7 +52,7 @@ def test_fake_infra_has_exactly_the_infra_methods_with_the_same_signatures():
 def test_tf_output_unwraps_values():
     sh = FakeShell([ok('{"cp_ip":{"value":"34.82.10.10","type":"string"}}')])
     assert Infra(sh, ROOT, {}).tf_output("base") == {"cp_ip": "34.82.10.10"}
-    assert sh.calls[0].args == ["terraform", f"-chdir={ROOT}/infra/base", "output", "-json"]
+    assert sh.calls[0].args == ["terraform", f"-chdir={ROOT}/infra/base", "output", "-no-color", "-json"]
 
 
 def test_terraform_env_carries_project_and_state_bucket():
@@ -58,18 +73,51 @@ def test_tf_output_refuses_unknown_stacks():
         Infra(FakeShell([]), ROOT, {}).tf_output("../base")
 
 
-def test_ensure_init_runs_init_once_per_uninitialised_stack(tmp_path):
+def test_ensure_init_runs_init_once_and_records_a_marker(tmp_path):
     (tmp_path / "infra/gpu-access").mkdir(parents=True)
     sh = FakeShell([ok()])
     infra = Infra(sh, tmp_path, ENV)
     infra.ensure_init("gpu-access")
-    assert sh.calls[0].args == ["terraform", f"-chdir={tmp_path}/infra/gpu-access", "init", "-input=false",
-                                "-lockfile=readonly",  # never rewrite the committed .terraform.lock.hcl (R26(b))
-                                "-backend-config=bucket=demo-proj-k3s-tfstate", "-backend-config=prefix=gpu-access"]
+    assert sh.calls[0].args == init_args(tmp_path, "gpu-access")
     assert sh.calls[0].env["TF_VAR_state_bucket"] == "demo-proj-k3s-tfstate"
-    (tmp_path / "infra/gpu-access/.terraform").mkdir()
+    # the same file and text scripts/lib/common.sh tf_init writes, so both agree on "initialised"
+    marker = tmp_path / "infra/gpu-access/.terraform" / TF_INIT_MARKER
+    assert marker.read_text() == "gcs demo-proj-k3s-tfstate gpu-access\n"
     infra.ensure_init("gpu-access")
+    Infra(sh, tmp_path, ENV).ensure_init("gpu-access")  # a later run trusts the marker too
     assert len(sh.calls) == 1
+
+
+def test_a_terraform_dir_from_an_offline_validate_is_not_initialised(tmp_path):  # B-1
+    # make tf-test used to run `terraform init -backend=false` in the stack, leaving .terraform/providers and no
+    # backend: every later terraform output/apply then failed with "Backend initialization required".
+    providers = tmp_path / "infra/workers/.terraform/providers/registry.terraform.io/hashicorp/google"
+    providers.mkdir(parents=True)
+    sh = FakeShell([ok()])
+    Infra(sh, tmp_path, ENV).ensure_init("workers")
+    assert [c.args for c in sh.calls] == [init_args(tmp_path, "workers")]  # -reconfigure: whatever was there
+    assert (tmp_path / "infra/workers/.terraform" / TF_INIT_MARKER).read_text() == "gcs demo-proj-k3s-tfstate workers\n"
+
+
+@pytest.mark.parametrize("marker", ["gcs other-proj-k3s-tfstate base", "gcs demo-proj-k3s-tfstate workers", ""])
+def test_a_marker_for_another_bucket_or_stack_triggers_a_reinit(tmp_path, marker):  # B-1
+    (tmp_path / "infra/base/.terraform").mkdir(parents=True)
+    (tmp_path / "infra/base/.terraform" / TF_INIT_MARKER).write_text(marker + "\n")
+    sh = FakeShell([ok()])
+    Infra(sh, tmp_path, ENV).ensure_init("base")
+    assert [c.args for c in sh.calls] == [init_args(tmp_path, "base")]
+    assert (tmp_path / "infra/base/.terraform" / TF_INIT_MARKER).read_text() == "gcs demo-proj-k3s-tfstate base\n"
+
+
+def test_a_failed_reinit_removes_the_stale_marker(tmp_path):  # B-1: never trusted again after GCP_PROJECT changed
+    initialised(tmp_path, "base", bucket="other-proj-k3s-tfstate")
+    sh = FakeShell([fail(1, "Error: Failed to get existing workspaces"), ok()])
+    infra = Infra(sh, tmp_path, ENV)
+    with pytest.raises(CommandError):
+        infra.ensure_init("base")
+    assert not (tmp_path / "infra/base/.terraform").exists()
+    infra.ensure_init("base")
+    assert [c.args for c in sh.calls] == [init_args(tmp_path, "base")] * 2
 
 
 def test_ensure_init_needs_gcp_project(tmp_path):
@@ -124,14 +172,14 @@ def test_apply_gpu_access_sorted_compact_json(tmp_path):
     (tmp_path / "infra/gpu-access").mkdir(parents=True)
     sh = FakeShell([ok(), ok()])
     Infra(sh, tmp_path, ENV).apply_gpu_access(["129.80.30.31", "129.80.30.30"], max_nodes=3)
-    assert [c.args[2] for c in sh.calls] == ["init", "apply"]
+    assert [c.args[2:4] for c in sh.calls] == [["init", "-no-color"], ["apply", "-no-color"]]
     assert sh.calls[-1].args[:2] == ["terraform", f"-chdir={tmp_path}/infra/gpu-access"]
     assert sh.calls[-1].args[-1] == '-var=gpu_ips=["129.80.30.30","129.80.30.31"]'
     assert "-auto-approve" in sh.calls[-1].args and "-input=false" in sh.calls[-1].args
 
 
 def test_apply_gpu_access_passes_max_nodes_alongside_gpu_ips(tmp_path):  # Ruling R27
-    (tmp_path / "infra/gpu-access/.terraform").mkdir(parents=True)
+    initialised(tmp_path, "gpu-access")
     sh = FakeShell([ok()])
     Infra(sh, tmp_path, ENV).apply_gpu_access(["129.80.30.30"], max_nodes=5)
     assert sh.calls[-1].args[-2:] == ["-var=max_nodes=5", '-var=gpu_ips=["129.80.30.30"]']
@@ -148,7 +196,7 @@ def test_apply_gpu_access_refuses_a_bad_max_nodes(tmp_path, bad):
 
 
 def test_apply_gpu_access_deduplicates_and_sorts_numerically(tmp_path):
-    (tmp_path / "infra/gpu-access/.terraform").mkdir(parents=True)
+    initialised(tmp_path, "gpu-access")
     sh = FakeShell([ok()])
     Infra(sh, tmp_path, ENV).apply_gpu_access(["129.80.30.30", "9.1.1.1", "129.80.30.30"], max_nodes=3)
     assert sh.calls[-1].args[-1] == '-var=gpu_ips=["9.1.1.1","129.80.30.30"]'
@@ -179,7 +227,7 @@ def test_fake_infra_join_node_accepts_underscore_gpu_types():
 
 
 def test_apply_gpu_access_empty_list(tmp_path):
-    (tmp_path / "infra/gpu-access/.terraform").mkdir(parents=True)
+    initialised(tmp_path, "gpu-access")
     sh = FakeShell([ok()])
     Infra(sh, tmp_path, ENV).apply_gpu_access([], max_nodes=3)
     assert sh.calls[-1].args[-1] == "-var=gpu_ips=[]"
@@ -194,7 +242,7 @@ def test_apply_gpu_access_never_passes_a_bad_ip_to_terraform(tmp_path, bad):  # 
 
 
 def test_terraform_failure_raises_command_error(tmp_path):
-    (tmp_path / "infra/gpu-access/.terraform").mkdir(parents=True)
+    initialised(tmp_path, "gpu-access")
     sh = FakeShell([fail(1, "Error: Invalid value for variable")])
     with pytest.raises(CommandError) as e:
         Infra(sh, tmp_path, ENV).apply_gpu_access(["129.80.30.30"], max_nodes=3)
@@ -203,9 +251,9 @@ def test_terraform_failure_raises_command_error(tmp_path):
 
 # --- cp over IAP, kubectl -----------------------------------------------------------------------
 
-def test_cp_ssh_uses_iap_and_zone():
+def test_cp_ssh_uses_iap_and_zone(tmp_path):
     sh = FakeShell([BASE_OUTPUTS, ok("hello\n"), ok("again\n")])
-    infra = Infra(sh, ROOT, ENV)
+    infra = Infra(sh, initialised(tmp_path, "base"), ENV)
     assert infra.cp_ssh("sudo true", input="payload") == "hello\n"
     infra.cp_ssh("uptime")
     ssh = sh.calls[1]
@@ -213,6 +261,15 @@ def test_cp_ssh_uses_iap_and_zone():
                         "--tunnel-through-iap", "--quiet", "--command", "sudo true"]
     assert ssh.input == "payload"
     assert len(sh.calls) == 3 and sh.calls[2].args[-1] == "uptime"  # the zone is read once
+
+
+def test_cp_ssh_in_a_fresh_checkout_initialises_base_before_reading_the_zone(tmp_path):  # B-1 (c)
+    (tmp_path / "infra/base").mkdir(parents=True)
+    sh = FakeShell([ok(), BASE_OUTPUTS, ok("hello\n")])
+    assert Infra(sh, tmp_path, ENV).cp_ssh("sudo true") == "hello\n"
+    assert [c.args[:3] for c in sh.calls] == [
+        ["terraform", f"-chdir={tmp_path}/infra/base", "init"],
+        ["terraform", f"-chdir={tmp_path}/infra/base", "output"], ["gcloud", "compute", "ssh"]]
 
 
 def test_reading_base_outputs_caches_the_cp_zone():  # C0-4: sync-peers reads infra/base once
@@ -223,10 +280,10 @@ def test_reading_base_outputs_caches_the_cp_zone():  # C0-4: sync-peers reads in
     assert len(sh.calls) == 2 and sh.calls[1].args[:4] == ["gcloud", "compute", "ssh", "k3s-cp"]
 
 
-def test_an_invalid_cp_zone_in_base_outputs_is_not_cached():
+def test_an_invalid_cp_zone_in_base_outputs_is_not_cached(tmp_path):
     bad = ok(json.dumps({"cp_zone": {"value": "us-west1-b; id", "type": "string"}}))
     sh = FakeShell([bad, bad])
-    infra = Infra(sh, ROOT, ENV)
+    infra = Infra(sh, initialised(tmp_path, "base"), ENV)
     infra.tf_output("base")
     with pytest.raises(ValueError, match="cp_zone"):
         infra.cp_ssh("sudo true")
@@ -234,6 +291,7 @@ def test_an_invalid_cp_zone_in_base_outputs_is_not_cached():
 
 def test_reads_are_bounded_by_a_timeout_and_apply_is_not(tmp_path):  # X0-4
     (tmp_path / "infra/gpu-access").mkdir(parents=True)
+    initialised(tmp_path, "base")
     sh = FakeShell([BASE_OUTPUTS, ok(), ok(), ok()])
     infra = Infra(sh, tmp_path, ENV)
     infra.cp_ssh("sudo true")
@@ -245,7 +303,7 @@ def test_reads_are_bounded_by_a_timeout_and_apply_is_not(tmp_path):  # X0-4
 
 
 def test_child_processes_never_get_the_lambda_api_key(tmp_path):  # X0-3
-    (tmp_path / "infra/gpu-access/.terraform").mkdir(parents=True)
+    initialised(tmp_path, "gpu-access", "base")
     env = {**ENV, "HOME": "/h", "PATH": "/usr/bin", "LAMBDA_API_KEY": "secret_abc"}
     sh = FakeShell([BASE_OUTPUTS, ok(), ok(), ok(), ok(), ok("73.15.40.40\n")])
     infra = Infra(sh, tmp_path, env)
@@ -424,26 +482,27 @@ def test_operator_ip_must_be_a_global_ipv4_address(bad):
         Infra(FakeShell([]), ROOT, {"OPERATOR_IP": bad}).detect_operator_ip()
 
 
-def test_cp_guard_elements_parses_nft_json():
+def test_cp_guard_elements_parses_nft_json(tmp_path):
     listing = {"nftables": [
         {"metainfo": {"version": "1.0.9", "json_schema_version": 1}},
         {"set": {"family": "inet", "name": "k3s_peers", "table": "k3s_guard", "type": "ipv4_addr", "handle": 2,
                  "elem": ["34.82.10.10", "10.10.0.2", "129.80.30.30"]}},
     ]}
     sh = FakeShell([BASE_OUTPUTS, ok(json.dumps(listing))])
-    assert Infra(sh, ROOT, ENV).cp_guard_elements() == ["10.10.0.2", "34.82.10.10", "129.80.30.30"]
+    assert Infra(sh, initialised(tmp_path, "base"), ENV).cp_guard_elements() == ["10.10.0.2", "34.82.10.10", "129.80.30.30"]
     assert sh.calls[1].args[-1] == "sudo nft -j list set inet k3s_guard k3s_peers"
 
 
-def test_cp_guard_elements_of_an_empty_set():
+def test_cp_guard_elements_of_an_empty_set(tmp_path):
     listing = {"nftables": [{"set": {"family": "inet", "name": "k3s_peers", "table": "k3s_guard"}}]}
-    assert Infra(FakeShell([BASE_OUTPUTS, ok(json.dumps(listing))]), ROOT, ENV).cp_guard_elements() == []
+    infra = Infra(FakeShell([BASE_OUTPUTS, ok(json.dumps(listing))]), initialised(tmp_path, "base"), ENV)
+    assert infra.cp_guard_elements() == []
 
 
 @pytest.mark.parametrize("stdout", ["garbage", '{"nftables": []}', '{"nftables": [{"set": {"elem": [{"x": 1}]}}]}'])
-def test_cp_guard_elements_rejects_unexpected_output(stdout):
+def test_cp_guard_elements_rejects_unexpected_output(tmp_path, stdout):
     with pytest.raises(ValueError):
-        Infra(FakeShell([BASE_OUTPUTS, ok(stdout)]), ROOT, ENV).cp_guard_elements()
+        Infra(FakeShell([BASE_OUTPUTS, ok(stdout)]), initialised(tmp_path, "base"), ENV).cp_guard_elements()
 
 
 # --- SubprocessShell ----------------------------------------------------------------------------

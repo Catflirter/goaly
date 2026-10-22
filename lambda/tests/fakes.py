@@ -234,7 +234,8 @@ DEFAULT_OUTPUTS = {
 class FakeInfra:
     """Terraform outputs, cp SSH, kubectl and join-node in memory.
 
-    `outputs[stack]` is what tf_output returns; a stack missing from it raises CommandError (it cannot be read).
+    `outputs[stack]` is what tf_output returns; a stack missing from it, or not passed to ensure_init first (like
+    terraform on a stack never initialised against its backend), raises CommandError (it cannot be read).
     ensure_init raises MissingStackError for a stack in `missing` (not in the checkout, like Infra) and
     CommandError for a stack in `init_fail`. `events` records the side effects in order:
     "tf:<gpu ips>" for apply_gpu_access (its max_nodes go to `applied_max_nodes`), "nft" for the cp peer-set push,
@@ -273,7 +274,9 @@ class FakeInfra:
         self.initialised.append(stack)
 
     def tf_output(self, stack: str) -> dict:
-        if stack not in self.outputs:
+        # Like terraform output on a stack never initialised against its backend (B-1): every caller must run
+        # ensure_init(stack) first, or a fresh clone fails here.
+        if stack not in self.initialised or stack not in self.outputs:
             raise CommandError(["terraform", f"-chdir=infra/{stack}", "output", "-json"], 1,
                                "Backend initialization required")
         return dict(self.outputs[stack])

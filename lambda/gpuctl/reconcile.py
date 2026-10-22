@@ -129,7 +129,8 @@ class Reconciler:
 
         Empty only when there are provably no workers: infra/workers is not in this checkout (warning on stderr),
         or the stack has no worker_ips (never applied: init succeeds and the outputs are {}). ensure_init comes
-        first, so a checkout without infra/workers/.terraform (fresh clone, git worktree) is not "no workers".
+        first, so a checkout whose infra/workers was never initialised against GCS (fresh clone, git worktree, or
+        only `make tf-test`) is not "no workers".
         Any other CommandError (init, GCS, a timeout) fails the sync: treating it as empty would drop every CPU
         worker from k3s-cp's k3s_peers and from the Lambda rulesets.
         """
@@ -153,6 +154,8 @@ class Reconciler:
         return tuple(workers)
 
     def _base_outputs(self) -> dict:
+        # A fresh clone or worktree has never initialised infra/base (gpu-down's final sync-peers included).
+        self.infra.ensure_init("base")
         base = self.infra.tf_output("base")
         missing = [key for key in ("cp_ip", "cp_internal_ip") if not base.get(key)]
         if missing:
