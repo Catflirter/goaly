@@ -162,6 +162,19 @@ def test_background_jobs_of_a_check_do_not_block_the_run(tmp_path):
     assert "started" in (tmp_path / "01-A1.txt").read_text()
 
 
+def test_a_job_that_misses_the_first_term_does_not_block_the_run(tmp_path):
+    # Until a job forked from the check's subshell has exec'd its program, it runs the TERM handler bash
+    # installed there for the EXIT trap, which drops a TERM that arrives in that window (seen under load:
+    # `sleep 30 &` outlived the reap). This job drops the first TERM on purpose; it ends by itself in ~15s.
+    job = f"(trap 'trap - TERM' TERM; : >{tmp_path}/armed; for _ in $(seq 300); do sleep 0.05; done) &"
+    r = subprocess.run(["bash", "-c", f"set -euo pipefail; source {ROOT}/scripts/lib/checks.sh; vr_init {tmp_path}/run; "
+                        f"bg(){{ {job} until [[ -e {tmp_path}/armed ]]; do sleep 0.01; done; echo started; }}; "
+                        "run_check A1 bg bg; vr_finish"],
+                       capture_output=True, text=True, env=LA_ENV, timeout=10)
+    assert r.returncode == 0, r.stderr
+    assert "| 1 | A1 | bg | PASS |" in (tmp_path / "run/SUMMARY.md").read_text()
+
+
 def wg_key(seed):
     """A WireGuard-shaped key (44 base64 chars); built at run time so this file holds no key literal."""
     return base64.b64encode(bytes((seed * 37 + i * 11) % 256 for i in range(32))).decode()

@@ -224,7 +224,11 @@ gpu_audit() {
           rc=abandoned
           break
         fi
-        sleep 0.1
+        # Not a foreground sleep: bash ignores a SIGINT that came while it waited for a foreground
+        # command which then exits normally (it assumes the command handled it), so a Ctrl-C as the
+        # sleep ends would stop the probe but not the bootstrap. In `wait` the SIGINT ends bash.
+        sleep 0.1 &
+        wait "$!"
       done
       if [[ $rc == abandoned ]]; then
         printf '[exit 124 abandoned: still running after %d s]\n' "$(( limit + 2 * grace ))"

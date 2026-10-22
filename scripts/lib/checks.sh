@@ -101,14 +101,22 @@ vr_init() {
   )
 }
 
-# EXIT trap of a check's subshell: kill the background jobs it left running (see the header).
+# EXIT trap of a check's subshell: kill the background jobs it left running (see the header). TERM
+# again until they are gone, KILL what is left after 5s: one TERM is not enough. This trap makes bash
+# catch TERM, and a job runs that handler until it has exec'd its program, so a TERM that arrives
+# before then can be dropped and the program runs on, holding the check's output open.
 _vr_reap() {
-  local pids
-  pids="$(jobs -p)"
-  if [[ -n "$pids" ]]; then
+  local pids i
+  for ((i = 0; i < 50; i++)); do
+    pids="$(jobs -pr)"
+    [[ -n "$pids" ]] || return 0
     # shellcheck disable=SC2086 # one PID per word
     kill $pids 2>/dev/null || true
-  fi
+    sleep 0.1
+  done
+  pids="$(jobs -pr)"
+  # shellcheck disable=SC2086 # one PID per word
+  [[ -z "$pids" ]] || kill -KILL $pids 2>/dev/null || true
 }
 
 # run_check ID TITLE FUNC [ARGS…]: run FUNC ARGS in a subshell (so exit and set -e failures end only

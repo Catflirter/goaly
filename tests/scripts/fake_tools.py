@@ -3,7 +3,9 @@ scripts/ (never the real CLIs).
 
 The stub bin/ directory holds one wrapper per tool, `exec python fake_tools.py <tool> "$@"` (the repo
 copy's scripts/gpuctl is such a wrapper too). Every call appends one JSON line {"tool", "argv", "env"}
-to $FAKE_LOG. $FAKE_SCENARIO (a JSON file) steers the answers:
+to $FAKE_LOG; a /readyz probe does so only once it has its answer, so a probe that found the tunnel up
+is always logged after the tunnel's own call (that tunnel runs concurrently, in the background).
+$FAKE_SCENARIO (a JSON file) steers the answers:
 
   outputs        {stack: {name: value}}   terraform output -raw/-json
   init_rc        {stack: rc}              terraform init exit code (default 0). Like the real one, the fake
@@ -77,6 +79,7 @@ from pathlib import Path
 TOOL = sys.argv[1]
 ARGS = sys.argv[2:]
 SCENARIO = json.loads(Path(os.environ["FAKE_SCENARIO"]).read_text())
+READYZ_PROBE = TOOL == "kubectl" and "--raw" in ARGS and "/readyz" in ARGS
 LOGGED_ENV = ("TF_VAR_project_id", "TF_VAR_state_bucket", "AUTO_APPROVE", "LAMBDA_API_KEY", "GPU_SSH_IP")
 
 TOKEN = "K10fakejointoken0123456789abcdef::server:s3cr3t-join"
@@ -215,10 +218,14 @@ def not_found(node):
 
 
 def kubectl():
-    if "--raw" in ARGS and "/readyz" in ARGS:
+    if READYZ_PROBE:
         n = counter("readyz")
         answer = SCENARIO.get("readyz", "ok")
-        if answer != "ok" or n < SCENARIO.get("readyz_fail_first", 0) or not tunnel_running():
+        up = answer == "ok" and n >= SCENARIO.get("readyz_fail_first", 0) and tunnel_running()
+        # Logged after the answer: the tunnel logs its call before it writes $FAKE_LOG.tunnel, so a probe
+        # that saw the tunnel up comes after the tunnel in $FAKE_LOG however the two were scheduled.
+        log()
+        if not up:
             return 1
         sys.stdout.write("ok")
         return 0
@@ -296,6 +303,7 @@ def gpuctl():
 
 
 if __name__ == "__main__":
-    log()
+    if not READYZ_PROBE:  # a /readyz probe logs itself once it has its answer (kubectl)
+        log()
     sys.exit({"terraform": terraform, "gcloud": gcloud, "kubectl": kubectl, "helm": helm, "ssh": ssh, "scp": scp,
               "gpuctl": gpuctl}[TOOL]())
