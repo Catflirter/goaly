@@ -91,7 +91,7 @@ INSTANCE_1 = "k3s-gpu-a6000-1 129.80.1.2 active gpu_1x_a6000 us-west-1"
 
 # --- in-process harness ------------------------------------------------------------------------
 
-def make_root(tmp_path, workers=("k3s-cpu-1",), overrides=None, gpu_down=False):
+def make_root(tmp_path, workers=("k3s-cpu-1",), overrides=None):
     root = tmp_path / "root"
     (root / "lambda").mkdir(parents=True)
     shutil.copy(REPO / "lambda" / "gpu-nodes.yaml", root / "lambda" / "gpu-nodes.yaml")
@@ -100,8 +100,6 @@ def make_root(tmp_path, workers=("k3s-cpu-1",), overrides=None, gpu_down=False):
     (root / "infra" / "workers" / "workers.auto.tfvars.json").write_text(json.dumps(inventory))
     if overrides is not None:
         (root / "lambda" / ".autoscale-state.json").write_text(json.dumps({"pools": overrides}))
-    if gpu_down:
-        (root / "lambda" / ".gpu-down").write_text("2026-10-22T01:00:00-0700\n")
     return root
 
 
@@ -124,6 +122,12 @@ class Harness:
         self.calls = []
         self.out = io.StringIO()
         self.log_dir = tmp_path / "log"
+        self.hooks = {}  # tool -> fn(harness), run when that tool is called (it may raise KeyboardInterrupt)
+        self.on_wait = None  # fn(harness, tick) between the ticks of a --loop run
+
+    @property
+    def overrides_path(self):
+        return self.root / "lambda" / ".autoscale-state.json"
 
     # the fake runner -------------------------------------------------------------------------
     def tool(self, argv):
@@ -145,6 +149,8 @@ class Harness:
                            "state": self.state_path.read_text() if self.state_path.exists() else None,
                            "overrides": overrides.read_text() if overrides.exists() else None})
         result = self.module.Result
+        if tool in self.hooks:
+            self.hooks[tool](self)
         if tool == "kubectl":
             rc = self.next_rc("kubectl")
             if rc:
@@ -171,9 +177,12 @@ class Harness:
     # running ----------------------------------------------------------------------------------
     def main(self, *args, ticks=1, interval=20.0, env=None):
         waits = iter([False] * (ticks - 1) + [True])
+        done = iter(range(1, ticks + 1))
 
         def wait(seconds):
             self.now += seconds
+            if self.on_wait is not None:
+                self.on_wait(self, next(done))
             return next(waits)
 
         deps = self.module.Deps(clock=lambda: self.now, run=self.run, wait=wait, out=self.out)
@@ -430,18 +439,147 @@ def test_gpu_counts_prefer_the_override_and_scale_down_the_idle_highest_node(har
     assert json.loads(h.of("gpuctl-apply")[0]["overrides"]) == {"pools": {"a6000": 1}}
 
 
-def test_gpu_down_record_blocks_gpu_scaling(harness):
-    h = harness(**{**GPU_CLUSTER, "pods": [GPU_PENDING, GPU1_BUSY, CPU_PENDING]}, gpu_down=True)
+def gpu_down(h, tick=None):
+    """What make gpu-down does from another terminal: delete the override file, terminate every GPU instance."""
+    h.overrides_path.unlink(missing_ok=True)
+    h.instances = []
+
+
+def test_gpu_down_while_running_turns_gpu_scaling_off_until_restart(harness):  # spec section 10.4
+    h = harness(**GPU_CLUSTER)
+    h.on_wait = lambda h, tick: gpu_down(h) if tick == 1 else h.instances.append(INSTANCE_1)
+    h.main("--loop", ticks=3, interval=200)
+    assert len(h.of("gpuctl-apply")) == 1  # tick 1 scaled up; gpu-down then deleted the file it wrote
+    assert len(h.of("gpuctl-plan")) == 1  # ... and no GPU decision after that, even with an instance back
+    assert h.overrides() is None
+    notices = [x["reason"] for x in h.log() if x["action"] == "notice"]
+    assert sum("deleted outside the autoscaler" in n and "make gpu-down" in n for n in notices) == 2
+    nones = [x["reason"] for x in h.log() if x["action"] == "none"]
+    assert len(nones) == 2 and all("deleted outside the autoscaler" in n for n in nones)
+    assert not any("no GPU pool has autoscale" in n for n in nones)
+
+
+def test_pool_below_its_target_holds_gpu_scaling(harness):  # gpu-down ran, or gpu-apply has not yet
+    h = harness(**{**GPU_CLUSTER, "pods": [GPU_PENDING, CPU_PENDING], "nodes": [CP, CPU1], "instances": []})
     h.main()
     assert h.of("gpuctl-plan") == [] and h.of("gpuctl-apply") == [] and h.overrides() is None
     assert [c["argv"][1:] for c in h.acted()] == [["scale", "2", "--guarded"]]  # CPU rules unaffected
     notices = [x["reason"] for x in h.log() if x["action"] == "notice"]
-    assert any(".gpu-down" in n for n in notices)
+    assert any("a6000" in n and "0 of 1" in n and "make gpu-apply" in n for n in notices)
     h.now += 200
-    h.pods = klist(GPU_PENDING, GPU1_BUSY)
+    h.pods = klist(GPU_PENDING)
     h.main()
     (none,) = [x for x in h.log() if x["action"] == "none"]
-    assert "gpu-down" in none["reason"] and "no GPU pool has autoscale" not in none["reason"]
+    assert "0 of 1" in none["reason"] and "no GPU pool has autoscale" not in none["reason"]
+
+
+def test_pool_below_its_target_still_scales_down_an_idle_node(harness):
+    nodes = [CP, CPU1, node("k3s-gpu-a6000-1", ready=False), node("k3s-gpu-a6000-2")]
+    h = harness(nodes=nodes, instances=[INSTANCE_1.replace("-1 ", "-2 ")], overrides={"a6000": 2},
+                pods=[GPU_PENDING], state={"last_action_at": None, "idle_since": {"k3s-gpu-a6000-2": NOW - 301}})
+    h.main()
+    assert h.of("gpuctl-plan")[0]["argv"][1:] == ["plan", "--set-count", "a6000=1"]  # never more nodes, only fewer
+    assert h.overrides() == {"pools": {"a6000": 1}}
+
+
+def test_override_file_changed_after_the_read_aborts_the_gpu_scale(harness):
+    h = harness(**GPU_CLUSTER, overrides={"a6000": 1}, state={"last_action_at": NOW - 500, "idle_since": {}})
+    h.hooks["gpuctl-plan"] = gpu_down  # gpu-down lands between this tick's read and its write
+    assert h.main("--loop", ticks=2, interval=200) == 0
+    assert h.of("gpuctl-apply") == [] and h.overrides() is None
+    assert len(h.of("gpuctl-plan")) == 1  # GPU scaling stays off
+    (line,) = [x for x in h.log() if x["action"] == "gpu_scale"]
+    assert line["result"].startswith("not started") and "changed" in line["result"]
+    assert h.state()["last_action_at"] == NOW - 500  # nothing ran: no cooldown
+
+
+def test_gpu_down_during_a_failed_apply_is_not_undone(harness):
+    h = harness(**GPU_CLUSTER, overrides={"a6000": 1}, rc={"gpuctl-apply": 1})
+    h.hooks["gpuctl-apply"] = gpu_down
+    assert h.main() == 1
+    assert h.overrides() is None  # the restore does not bring back what gpu-down deleted
+    (line,) = [x for x in h.log() if x["action"] == "gpu_scale"]
+    assert "left as it is" in line["result"]
+
+
+def test_second_ctrl_c_during_gpu_apply_restores_the_override(harness, capsys):
+    h = harness(**GPU_CLUSTER, overrides={"a6000": 1})
+
+    def interrupt(h):
+        raise KeyboardInterrupt
+
+    h.hooks["gpuctl-apply"] = interrupt
+    assert h.main() == 130
+    assert h.overrides() == {"pools": {"a6000": 1}}  # gpuctl's cleanup terminates the new node: no target 2 left
+    err = capsys.readouterr().err
+    assert ".autoscale-state.json" in err and "make gpu-status" in err
+
+
+def test_failed_gpu_scale_down_keeps_the_lower_target(harness):
+    nodes = [CP, CPU1, node("k3s-gpu-a6000-1"), node("k3s-gpu-a6000-2")]
+    h = harness(nodes=nodes, instances=[INSTANCE_1, INSTANCE_1.replace("-1 ", "-2 ")], overrides={"a6000": 2},
+                pods=[GPU1_BUSY], state={"last_action_at": None, "idle_since": {"k3s-gpu-a6000-2": NOW - 301}},
+                rc={"gpuctl-apply": 1})
+    assert h.main() == 1
+    assert h.overrides() == {"pools": {"a6000": 1}}  # never a target above what may still run: no relaunch
+
+
+def test_repeated_gpu_apply_failures_disable_gpu_scale_up(harness):
+    h = harness(**GPU_CLUSTER, rc={"gpuctl-apply": 1})
+    h.main("--loop", ticks=6, interval=200)  # every tick is past the cooldown
+    assert len(h.of("gpuctl-apply")) == 2  # never a loop of paid launches
+    results = [x["result"] for x in h.log() if x["action"] == "gpu_scale"]
+    assert "disabled after 2 failures" in results[-1]
+    notices = [x["reason"] for x in h.log() if x["action"] == "notice"]
+    assert sum("GPU scale-up disabled after 2 failures" in n and "make autoscale" in n for n in notices) == 4
+
+
+def test_repeated_cpu_pool_failures_disable_cpu_scale_up(harness):
+    h = harness(pods=[CPU_PENDING], rc={"cpu-pool": 1})
+    h.main("--loop", ticks=6, interval=200)
+    assert len(h.acted()) == 3
+    assert any("CPU scale-up disabled after 3 failures" in x["reason"] for x in h.log() if x["action"] == "none")
+
+
+def test_gpu_plan_refusal_is_remembered_for_the_cooldown(harness):
+    h = harness(**GPU_CLUSTER, rc={"gpuctl-plan": 2})
+    h.main("--loop", ticks=3, interval=20)
+    assert len(h.of("gpuctl-plan")) == 1  # no Lambda API call every tick
+    nones = [x["reason"] for x in h.log() if x["action"] == "none"]
+    assert len(nones) == 3 and all("refused by gpuctl plan" in n for n in nones)
+    assert "checked again in" in nones[-1]
+    h.now += 200
+    h.main()
+    assert len(h.of("gpuctl-plan")) == 2
+
+
+def test_unwritable_override_file_is_a_logged_failure(harness, autoscaler, monkeypatch):
+    h = harness(**GPU_CLUSTER)
+    real = autoscaler.atomic_write
+
+    def atomic_write(path, text, **kw):
+        if path.name == ".autoscale-state.json":
+            raise OSError(28, "No space left on device")
+        return real(path, text, **kw)
+
+    monkeypatch.setattr(autoscaler, "atomic_write", atomic_write)
+    assert h.main() == 1
+    assert h.of("gpuctl-apply") == []
+    (line,) = [x for x in h.log() if x["action"] == "gpu_scale"]
+    assert line["result"].startswith("failed") and "No space left on device" in line["result"]
+
+
+def test_unwritable_state_file_starts_no_action(harness, autoscaler, monkeypatch):
+    h = harness(pods=[CPU_PENDING])
+
+    def atomic_write(path, text, **kw):
+        raise PermissionError(13, "Permission denied")
+
+    monkeypatch.setattr(autoscaler, "atomic_write", atomic_write)
+    assert h.main() == 1
+    assert h.acted() == []  # its cooldown cannot be saved first (Review Focus #1)
+    (line,) = [x for x in h.log() if x["action"] == "cpu_scale"]
+    assert "cannot write" in line["result"] and "Permission denied" in line["result"]
 
 
 @pytest.mark.parametrize("instance, why", [
@@ -455,7 +593,9 @@ def test_launching_instance_holds_gpu_scale_up(harness, instance, why):  # Revie
     log = h.log()
     assert any(x["action"] == "notice" and why in x["reason"] and "k3s-gpu-a6000-2" in x["reason"] for x in log)
     (none,) = [x for x in log if x["action"] == "none"]
-    assert "booting" in none["reason"] or "launching" in none["reason"]
+    assert why in none["reason"] and "k3s-gpu-a6000-2" in none["reason"]  # the real reason, not a generic one
+    if why != "booting":
+        assert "booting" not in none["reason"]
 
 
 def test_list_nodes_failure_holds_gpu_scale_up(harness):
@@ -463,6 +603,8 @@ def test_list_nodes_failure_holds_gpu_scale_up(harness):
     h.main()
     assert h.acted() == []
     assert any(x["action"] == "notice" and "list-nodes" in x["reason"] for x in h.log())
+    (none,) = [x for x in h.log() if x["action"] == "none"]
+    assert "list-nodes failed" in none["reason"] and "booting" not in none["reason"]
 
 
 def test_not_ready_gpu_node_is_logged_every_tick_with_nothing_pending(harness):
@@ -530,7 +672,7 @@ def test_ctrl_c_while_reading_starts_no_action(autoscaler, harness):
 
     def run(argv, **kw):
         if "nodes" in argv:
-            stopper.event.set()  # Ctrl-C lands while the tick reads the cluster
+            stopper.request()  # Ctrl-C lands while the tick reads the cluster
         return fake_run(argv, **kw)
 
     deps = autoscaler.Deps(clock=lambda: h.now, run=run, wait=lambda s: False, out=h.out, stopper=stopper)
@@ -564,21 +706,69 @@ def test_default_log_dir_is_verification_autoscale_ts(autoscaler, tmp_path):
     assert json.loads(log.read_text().splitlines()[0])["action"] == "none"
 
 
+def test_startup_says_to_stop_it_before_gpu_down(harness):  # spec section 10.4
+    h = harness()
+    h.main()
+    assert "Ctrl-C" in h.out.getvalue() and "before make gpu-down" in h.out.getvalue()
+
+
 def test_makefile_autoscale_target():
     text = (REPO / "Makefile").read_text()
     assert "\nautoscale: ## " in text and "scripts/autoscaler.py" in text
     assert ".PHONY: autoscale" in text
 
 
+# --- Ctrl-C ---------------------------------------------------------------------------------------
+
+def test_stopper_takes_no_lock_in_the_signal_handler(autoscaler, capfd):
+    stopper = autoscaler.Stopper()
+    stopper._handle(signal.SIGINT, None)
+    assert stopper.requested and stopper.wait(30) is True  # returns at once once a stop was asked for
+    assert "stopping" in capfd.readouterr().err
+    assert not hasattr(stopper, "event")  # threading.Event.set() in a handler can deadlock against Event.wait()
+
+
+def test_second_ctrl_c_while_reading_stops_at_once(autoscaler, capfd):
+    stopper = autoscaler.Stopper()
+    with stopper.reading():
+        stopper._handle(signal.SIGINT, None)
+        assert "Ctrl-C again stops at once" in capfd.readouterr().err
+        with pytest.raises(KeyboardInterrupt):
+            stopper._handle(signal.SIGINT, None)
+    stopper._handle(signal.SIGINT, None)  # outside a read or an action (saving state): never raised there
+
+
+def test_ctrl_c_during_the_read_phase_exits_without_the_action_hint(harness, autoscaler, capsys):
+    h = harness(pods=[CPU_PENDING])
+
+    def interrupt(h):
+        raise KeyboardInterrupt
+
+    h.hooks["gpuctl-list-nodes"] = interrupt
+    assert h.main() == 130
+    err = capsys.readouterr().err
+    assert "nothing was changing" in err and "an action was interrupted" not in err
+    assert h.acted() == [] and not h.state_path.exists()
+
+
 # --- Ctrl-C (subprocess) -------------------------------------------------------------------------
 
 def start_loop(tmp_path, scenario):
-    """The autoscaler as the leader of its own process group, like a foreground job in a terminal."""
+    """The autoscaler as the leader of its own process group, like a foreground job in a terminal; its stderr goes
+    to tmp_path/stderr.txt so a test can wait for what the Ctrl-C handler writes."""
     root, bin_dir = stub_root(tmp_path, scenario)
     env = script_env(tmp_path, root, bin_dir, now=None)
-    return subprocess.Popen([sys.executable, str(SCRIPT), "--interval", "30", "--log", str(tmp_path / "log")],
-                            env=env, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True,
-                            stdin=subprocess.DEVNULL, start_new_session=True)
+    stderr = open(tmp_path / "stderr.txt", "w")
+    try:
+        return subprocess.Popen([sys.executable, str(SCRIPT), "--interval", "30", "--log", str(tmp_path / "log")],
+                                env=env, stdout=subprocess.PIPE, stderr=stderr, text=True,
+                                stdin=subprocess.DEVNULL, start_new_session=True)
+    finally:
+        stderr.close()
+
+
+def stderr_of(tmp_path):
+    return (tmp_path / "stderr.txt").read_text()
 
 
 def ctrl_c(proc):
@@ -604,10 +794,10 @@ def test_ctrl_c_finishes_the_current_action_then_exits(tmp_path):
     try:
         assert wait_for(lambda: any(c["tool"] == "cpu-pool" for c in fake_calls(tmp_path)))
         ctrl_c(proc)
-        out, err = proc.communicate(timeout=30)
+        out, _ = proc.communicate(timeout=30)
     finally:
         proc.kill()
-    assert proc.returncode == 0, out + err
+    assert proc.returncode == 0, out + stderr_of(tmp_path)
     assert (tmp_path / "calls.jsonl.done").exists()  # the action was not interrupted
     state = json.loads((tmp_path / "state.json").read_text())
     assert state["last_action_at"] is not None
@@ -620,13 +810,14 @@ def test_second_ctrl_c_interrupts_the_action_and_says_how_to_clean_up(tmp_path):
     proc = start_loop(tmp_path, {"pods": klist(pending_now()), "nodes": klist(CP, CPU1), "sleep": {"cpu-pool": 20}})
     try:
         assert wait_for(lambda: any(c["tool"] == "cpu-pool" for c in fake_calls(tmp_path)))
-        time.sleep(0.3)
         ctrl_c(proc)
-        time.sleep(0.3)
+        # the first handler has run (it wrote this) before the second Ctrl-C: two signals never merge into one
+        assert wait_for(lambda: "stopping after the current action" in stderr_of(tmp_path))
         ctrl_c(proc)
-        out, err = proc.communicate(timeout=30)
+        out, _ = proc.communicate(timeout=30)
     finally:
         proc.kill()
+    err = stderr_of(tmp_path)
     assert proc.returncode == 130, out + err
     assert not (tmp_path / "calls.jsonl.done").exists()
     assert "make cpu-scale N=1" in err and "make gpu-status" in err
@@ -640,10 +831,10 @@ def test_ctrl_c_between_ticks_exits_at_once(tmp_path):
     proc = start_loop(tmp_path, {"pods": klist(), "nodes": klist(CP, CPU1)})
     try:
         assert wait_for(lambda: (tmp_path / "log" / "autoscaler.log").exists())
-        started = time.monotonic()
         ctrl_c(proc)
-        out, err = proc.communicate(timeout=10)
+        out, _ = proc.communicate(timeout=10)  # well inside the 30 s interval: the wait ended at once
     finally:
         proc.kill()
-    assert proc.returncode == 0 and time.monotonic() - started < 5, out + err
-    assert "Traceback" not in err
+    assert proc.returncode == 0, out + stderr_of(tmp_path)
+    assert "Traceback" not in stderr_of(tmp_path)
+    assert [c["tool"] for c in fake_calls(tmp_path)] == ["kubectl", "kubectl", "gpuctl"]  # no second tick

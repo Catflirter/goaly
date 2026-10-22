@@ -13,27 +13,40 @@ reads (spec section 10.2); this process neither loads nor prints it. Every --int
      own targets, the override clamped to autoscale.min..max, else count), and `scripts/gpuctl list-nodes`;
   2. gpu_launching (Review Focus #4): a Lambda instance that is booting, or live without a registered Node; decide()
      adds NotReady, unlabeled and joining k3s-gpu-* nodes. GPU nodes that are NotReady or unlabeled, instances that
-     launch, a clock skew against a node's Ready time and the make gpu-down record are logged every tick, Pending
-     Pods or not (a node NotReady for ever holds GPU scale-up for ever: the log says so each time);
+     launch, a clock skew against a node's Ready time and every reason GPU scaling is off are logged every tick,
+     Pending Pods or not (a node NotReady for ever holds GPU scale-up for ever: the log says so each time);
   3. decide() (lambda/gpuctl/autoscale.py) returns at most one action;
   4. run it:
        cpu_scale  -> AUTO_APPROVE=1 scripts/cpu-pool.sh scale <target> --guarded
        cpu_remove -> AUTO_APPROVE=1 scripts/cpu-pool.sh remove <node> --guarded
        gpu_scale  -> `scripts/gpuctl plan --set-count <pool>=<target>` first (budget_usd_per_hour and max_nodes at
-                     live prices, spec section 10.5; a refusal skips it and the CPU rules still get this tick), then
-                     {pool: target} merged into lambda/.autoscale-state.json and `scripts/gpuctl apply --auto-approve`
-                     (a failed apply puts the override file back as it was);
+                     live prices, spec section 10.5; a refusal skips it, is remembered for COOLDOWN_S so the Lambda
+                     API is not asked again every tick, and the CPU rules still get this tick), then {pool: target}
+                     merged into lambda/.autoscale-state.json and `scripts/gpuctl apply --auto-approve`. A scale-up
+                     that fails or is interrupted puts the override file back as it was (gpuctl terminates the new
+                     node it could not join); a failed scale-down keeps the lower target (its terminate may have gone
+                     through, and a lower target never relaunches anything). Neither touches a file someone else
+                     changed meanwhile;
   5. save .run/autoscaler-state.json.
 
 The autoscaler writes only lambda/.autoscale-state.json and its own state file, both atomically (temp file and
 rename). The state is saved with last_action_at = now before an action starts, so a restart during or right after
-it waits out the cooldown (Review Focus #1), and again when it ends: the cooldown counts from the end of the action.
-Results: exit 0 is ok; cpu-pool.sh exit 2 (another guarded run holds .run/workers.lock, or a plan was refused) is
-retried at the next tick without a cooldown, but after REFUSED_RETRIES refusals in a row the cooldown starts, so it
-never loops on an error; any other failure is logged and starts the cooldown (the next decision repeats it after).
+it waits out the cooldown (Review Focus #1), and again when it ends: the cooldown counts from the end of the action;
+a state file that cannot be written starts no action. Results: exit 0 is ok; cpu-pool.sh exit 2 (another guarded
+run holds .run/workers.lock, or a plan was refused) is retried at the next tick without a cooldown, and
+REFUSED_RETRIES refusals in a row count as one failure; any other exit is a failure and starts the cooldown. After
+FAILURE_LIMITS[kind] failures in a row (GPU scale-up, GPU scale-down, CPU scale-up, CPU removal) that kind of action
+is off until the autoscaler is restarted, and every tick says so: a broken join or apply never becomes an endless
+loop of paid launches or Terraform runs.
 
-make gpu-down always wins (spec section 10.4): it deletes the override file, and while its record lambda/.gpu-down
-exists (Ruling R53) the autoscaler makes no GPU decision at all (a gpu-apply would clear the record), which it logs.
+make gpu-down always wins (spec section 10.4), and the autoscaler should be stopped (Ctrl-C) before it, which the
+startup line says. gpuctl keeps no record of a gpu-down (spec section 5.4), so the autoscaler protects itself:
+  - once it has written the override file, finding that file deleted or changed by someone else (make gpu-down, or a
+    hand edit) turns GPU scaling off until it is restarted; a write re-reads the file first and stops if it changed
+    since the tick read it;
+  - an autoscaled pool with fewer live Lambda instances than its target (gpu-down terminated them, or make gpu-apply
+    has not run yet) holds GPU scale-up (scaling up from a target nobody runs would launch two nodes at once);
+    scale-down, which never launches anything, stays on.
 
 A tick that cannot read its inputs (kubectl failed, a list without items, a malformed state, override, inventory or
 spec file) is skipped and logged (Ruling SR7(a)): a failed read must never look like an empty cluster.
@@ -43,10 +56,12 @@ Every tick writes JSON lines {"ts", "action", "reason", "result", "duration_s"} 
 (with why), "notice" lines and "skip_tick" lines. --dry-run prints the action instead of running it, saves no
 state (it keeps it in memory, so a dry loop shows the cooldown) and writes a log only with --log.
 
-Ctrl-C between ticks stops at once; during an action the action finishes first (its process runs in its own
-session, so the terminal's SIGINT does not reach it), then the loop stops. A second Ctrl-C interrupts the action
-(SIGINT to its process group); then check with make gpu-status and finish with make cpu-scale N=1 / make gpu-down,
-or run the autoscaler again.
+Ctrl-C between ticks stops at once; while the tick reads (kubectl, gpuctl list-nodes, gpuctl plan) the read
+finishes and the loop stops, and a second Ctrl-C stops it at once (nothing is changing then); during an action the
+action finishes first (its process runs in its own session, so the terminal's SIGINT does not reach it), then the
+loop stops. A second Ctrl-C interrupts the action (SIGINT to its process group); then check with make gpu-status
+and the override file, and finish with make cpu-scale N=1 / make gpu-down, or run the autoscaler again. The
+signal handler only sets a flag (never a lock), and every first Ctrl-C says what will happen.
 
 Test hooks: AUTOSCALER_STATE (state file), AUTOSCALER_ROOT (repo root for every file and script above),
 AUTOSCALER_NOW (a fixed clock, epoch seconds).
@@ -56,6 +71,7 @@ from __future__ import annotations
 
 import argparse
 import collections
+import contextlib
 import json
 import math
 import os
@@ -63,7 +79,6 @@ import signal
 import subprocess
 import sys
 import tempfile
-import threading
 import time
 from collections.abc import Callable, Mapping
 from dataclasses import dataclass, field, replace
@@ -75,9 +90,9 @@ REPO = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(REPO / "lambda"))
 
 from gpuctl.autoscale import (  # noqa: E402
-    COOLDOWN_S, GPU_ADMIN_LABEL, Action, NodeObs, State, decide, node_observations, pending_pods,
+    COOLDOWN_S, GPU_ADMIN_LABEL, PROTECTED_CPU_NODE, Action, NodeObs, State, decide, node_observations, pending_pods,
 )
-from gpuctl.planner import LIVE_STATUSES, PlanError, target_counts  # noqa: E402
+from gpuctl.planner import LIVE_STATUSES, PlanError, parse_node_name, target_counts  # noqa: E402
 from gpuctl.reconcile import load_overrides  # noqa: E402
 from gpuctl.spec import load_spec  # noqa: E402
 
@@ -86,13 +101,25 @@ DEFAULT_CPU_MAX = 3
 # cpu-pool.sh --guarded exit 2 (lock held, plan refused) is retried at the next tick this many times in a row; then
 # the cooldown starts like after any other failure.
 REFUSED_RETRIES = 3
+# Failures in a row after which a kind of action is off until the autoscaler is restarted: every GPU attempt is a
+# paid launch (or a terminate), every CPU attempt a Terraform run.
+FAILURE_LIMITS = {"gpu_up": 2, "gpu_down": 2, "cpu_scale": 3, "cpu_remove": 3}
+KIND_LABELS = {"gpu_up": "GPU scale-up", "gpu_down": "GPU scale-down", "cpu_scale": "CPU scale-up",
+               "cpu_remove": "CPU worker removal"}
 # A node's Ready lastTransitionTime this far ahead of the local clock is logged (it keeps the node 'joining').
 SKEW_WARN_S = 60.0
 READ_TIMEOUT_S = 120
-CLEANUP_HINT = ("an action was interrupted: check with make gpu-status and kubectl get nodes, then finish with "
-                "make cpu-scale N=1 (CPU) or make gpu-down / make gpu-apply (GPU), or run make autoscale again")
+CLEANUP_HINT = ("an action was interrupted: check with make gpu-status and kubectl get nodes, and check "
+                "lambda/.autoscale-state.json (the GPU targets make gpu-apply launches) before any make gpu-apply; "
+                "then finish with make cpu-scale N=1 (CPU) or make gpu-down (GPU), or run make autoscale again")
+STARTUP_HINT = ("autoscaler: stop it with Ctrl-C before make gpu-down or make cpu-scale (spec section 10.4); "
+                "Ctrl-C waits for a running action, a second Ctrl-C interrupts it")
 # decide()'s wording when no pool is autoscaled; replaced by the real reason when GPU scaling is off
 NO_AUTOSCALE = "no GPU pool has autoscale"
+# decide()'s wording when the caller says a GPU instance is launching; replaced by the instances' real state
+LAUNCHING = "a GPU instance is still booting"
+# _gpu_scale's result when the override file changed since the tick read it: nothing was started
+ABORTED_RC = -1
 
 
 @dataclass(frozen=True)
@@ -107,7 +134,6 @@ class Paths:
     root: Path
     state: Path
     overrides: Path
-    gpu_down: Path
     spec: Path
     tfvars: Path
     gpuctl: Path
@@ -119,34 +145,62 @@ class Paths:
         root = Path(env.get("AUTOSCALER_ROOT") or REPO)
         state = env.get("AUTOSCALER_STATE")
         return cls(root=root, state=Path(state) if state else root / ".run" / "autoscaler-state.json",
-                   overrides=root / "lambda" / ".autoscale-state.json", gpu_down=root / "lambda" / ".gpu-down",
-                   spec=root / "lambda" / "gpu-nodes.yaml",
+                   overrides=root / "lambda" / ".autoscale-state.json", spec=root / "lambda" / "gpu-nodes.yaml",
                    tfvars=root / "infra" / "workers" / "workers.auto.tfvars.json",
                    gpuctl=root / "scripts" / "gpuctl", cpu_pool=root / "scripts" / "cpu-pool.sh",
                    kubeconfig=Path.home() / ".kube" / "hybrid-gpu.yaml")
 
 
 class Stopper:
-    """SIGINT/SIGTERM: the first asks the loop to stop after the current action; a second one during an action
-    raises KeyboardInterrupt there (run_command passes it on to the action's process group)."""
+    """SIGINT/SIGTERM: the first asks the loop to stop after the current read or action and says so; a second one
+    during an action or a read raises KeyboardInterrupt there (run_command passes it on to the child's process
+    group). Elsewhere (saving the state, writing the log) a second one only repeats the message.
+
+    The handler sets plain attributes and writes with os.write: it takes no lock, because a lock the interrupted
+    main thread holds (threading.Event.wait's Condition, a buffered stream) would deadlock it."""
 
     def __init__(self) -> None:
-        self.event = threading.Event()
+        self.requested = False
         self.in_action = False
+        self.in_read = False
 
     def install(self) -> None:
         signal.signal(signal.SIGINT, self._handle)
         signal.signal(signal.SIGTERM, self._handle)
 
+    def request(self) -> None:
+        self.requested = True
+
+    @contextlib.contextmanager
+    def reading(self):
+        """Read-only commands run inside: a second Ctrl-C stops them (and the loop) at once."""
+        self.in_read = True
+        try:
+            yield
+        finally:
+            self.in_read = False
+
     def _handle(self, signum, frame) -> None:
-        if self.in_action and self.event.is_set():
+        if self.requested and (self.in_action or self.in_read):
             raise KeyboardInterrupt
-        self.event.set()
-        if self.in_action:  # os.write: never re-enter a buffered stream the main code may be writing
-            os.write(2, b"autoscaler: stopping after the current action (Ctrl-C again interrupts it)\n")
+        self.requested = True
+        if self.in_action:
+            message = "stopping after the current action (Ctrl-C again interrupts it)"
+        elif self.in_read:
+            message = "stopping after this read (Ctrl-C again stops at once; nothing is changing)"
+        else:
+            message = "stopping"
+        os.write(2, f"autoscaler: {message}\n".encode())
 
     def wait(self, seconds: float) -> bool:
-        return self.event.wait(seconds)
+        """Sleep up to `seconds` in short slices; True as soon as a stop was requested."""
+        deadline = time.monotonic() + seconds
+        while not self.requested:
+            left = deadline - time.monotonic()
+            if left <= 0:
+                return False
+            time.sleep(min(left, 0.2))
+        return True
 
 
 def run_command(argv: list[str], *, env: Mapping[str, str] | None = None, stream: bool = False,
@@ -216,9 +270,18 @@ class Snapshot:
     pools: dict
     gpu_counts: dict[str, int]
     overrides: dict[str, int]
+    overrides_text: str | None  # the override file as this tick read it (None: absent)
     launching: list[str]
     gpu_off: str | None  # why GPU scaling is off this tick, or None
+    gpu_short: str | None  # why GPU scale-up is off this tick (a pool below its target), or None
     notices: list[str]
+
+
+def _read_text(path: Path) -> str | None:
+    try:
+        return path.read_text(encoding="utf-8")
+    except FileNotFoundError:
+        return None
 
 
 def atomic_write(path: Path, text: str, *, mode: int = 0o644) -> None:
@@ -255,6 +318,14 @@ class Autoscaler:
         self.args, self.paths, self.deps, self.stopper = args, paths, deps, stopper
         self.out = deps.out
         self.refusals = 0
+        self.failures: dict[str, int] = {}  # action kind (FAILURE_LIMITS) -> failures in a row
+        self.disabled: dict[str, str] = {}  # action kind -> why it is off until a restart
+        self.gpu_disabled: str | None = None  # why GPU scaling is off until a restart (the override file changed)
+        # The override file's text as this process last left it ("" = it removed the file); None until it writes it
+        self.override_written: str | None = None
+        self.plan_refusals: dict[tuple[str, int], tuple[float, str]] = {}  # (pool, target) -> (when, why)
+        self.action_interrupted = False
+        self.notes: list[str] = []  # what the current action did to the override file
         self.memory_state: State | None = None  # --dry-run: the state is kept here, never saved
         self.log_path: Path | None = None
         if args.log:
@@ -297,11 +368,16 @@ class Autoscaler:
     def _read_state(self) -> State:
         if self.args.dry_run and self.memory_state is not None:
             return self.memory_state
+        # malformed -> ValueError -> the tick is skipped (Ruling SR7(a))
+        return State.from_json(_read_text(self.paths.state) or "")
+
+    def _save_state(self, state: State) -> str | None:
+        """Save the state file; the error text if it cannot be written (never a crash without a log line)."""
         try:
-            text = self.paths.state.read_text(encoding="utf-8")
-        except FileNotFoundError:
-            text = ""
-        return State.from_json(text)  # malformed -> ValueError -> the tick is skipped (Ruling SR7(a))
+            atomic_write(self.paths.state, state.to_json() + "\n", mode=0o600)
+        except OSError as e:
+            return f"cannot write {self.paths.state}: {e.strerror or e}"
+        return None
 
     def _kubectl_json(self, what: str, path: str | None) -> dict:
         if path:
@@ -324,24 +400,28 @@ class Autoscaler:
             raise ValueError(f"{self.paths.tfvars}: no cpu_workers inventory")
         return len(workers)
 
-    def _instances(self, registered: set[str]) -> tuple[list[str], str | None]:
-        """Why a GPU instance is launching (booting, or live without a Node), and an error if list-nodes failed."""
+    def _instances(self, registered: set[str]) -> tuple[list[str], dict[str, int], str | None]:
+        """Why a GPU instance is launching (booting, or live without a Node), the live instances per pool, and an
+        error if list-nodes failed."""
         r = self.run([self.paths.gpuctl, "list-nodes"])
         if r.rc != 0:
-            return [], f"gpuctl list-nodes failed (exit {r.rc}): {_last_line(r.err)}"
-        reasons = []
+            return [], {}, f"gpuctl list-nodes failed (exit {r.rc}): {_last_line(r.err)}"
+        reasons, live = [], collections.Counter()
         for line in r.out.splitlines():
             fields = line.split()
             if not fields:
                 continue
             if len(fields) != 5:
-                return [], f"gpuctl list-nodes printed an unexpected line {line[:120]!r}"
+                return [], {}, f"gpuctl list-nodes printed an unexpected line {line[:120]!r}"
             name, _ip, status = fields[:3]
+            parsed = parse_node_name(name)
+            if parsed is not None and status in LIVE_STATUSES:
+                live[parsed[0]] += 1
             if status == "booting":
                 reasons.append(f"Lambda instance {name} is booting")
             elif status in LIVE_STATUSES and name not in registered:
                 reasons.append(f"Lambda instance {name} is {status} but has no registered Node yet")
-        return reasons, None
+        return reasons, dict(live), None
 
     def observe(self, now: float) -> Snapshot:
         try:
@@ -352,6 +432,7 @@ class Autoscaler:
             pending = pending_pods(pods, now)
             cpu_count = self._cpu_count()
             spec = load_spec(self.paths.spec)
+            overrides_text = _read_text(self.paths.overrides)
             overrides = load_overrides(self.paths.overrides)
             gpu_counts = target_counts(spec, overrides=overrides)
         except (ValueError, PlanError, OSError) as e:  # SpecError and JSONDecodeError are ValueErrors
@@ -369,51 +450,78 @@ class Autoscaler:
             if obs.ready_since is not None and obs.ready_since - now > SKEW_WARN_S:
                 notices.append(f"clock skew: {obs.name}'s Ready lastTransitionTime is {obs.ready_since - now:.0f}s "
                                "ahead of this machine's clock (a GPU node stays 'joining' while it lasts; check NTP)")
-        launching, error = self._instances({o.name for o in gpu_nodes})
+        launching, live, error = self._instances({o.name for o in gpu_nodes})
         if error is not None:
             launching = [f"{error}: GPU scale-up held this tick"]
         notices.extend(launching)
-        gpu_off = None
-        if self.paths.gpu_down.exists():
-            gpu_off = (f"make gpu-down record {self.paths.gpu_down} exists: no GPU scaling until a confirmed "
-                       "make gpu-apply removes it")
+
+        # make gpu-down always wins (spec section 10.4): see the module docstring
+        if self.override_written is not None and (overrides_text or "") != self.override_written:
+            self.gpu_disabled = (f"{self.paths.overrides} was {'deleted' if overrides_text is None else 'changed'} "
+                                 "outside the autoscaler (make gpu-down, or a hand edit): GPU scaling is off until "
+                                 "make autoscale is restarted")
+        gpu_off = self.gpu_disabled
+        if gpu_off is not None:
             notices.append(gpu_off)
+        gpu_short = None  # scale-down (it never launches anything) stays on
+        if gpu_off is None and error is None:
+            short = [f"pool {name}: {live.get(name, 0)} of {gpu_counts[name]} GPU instances live"
+                     for name in sorted(spec.pools)
+                     if spec.pools[name].autoscale is not None and live.get(name, 0) < gpu_counts[name]]
+            if short:
+                gpu_short = (f"{', '.join(short)} (make gpu-down ran, or make gpu-apply has not): no GPU scale-up "
+                             "until make gpu-apply brings the pool to its target")
+                if any(p.resource == "gpu" for p in pending):  # a CPU-only demo runs with no GPU node at all
+                    notices.append(gpu_short)
         return Snapshot(now=now, state=state, pending=pending, nodes=nodes, cpu_count=cpu_count,
-                        pools=dict(spec.pools), gpu_counts=gpu_counts, overrides=overrides, launching=launching,
-                        gpu_off=gpu_off, notices=notices)
+                        pools=dict(spec.pools), gpu_counts=gpu_counts, overrides=overrides,
+                        overrides_text=overrides_text, launching=launching, gpu_off=gpu_off, gpu_short=gpu_short,
+                        notices=notices)
 
     # --- one tick ------------------------------------------------------------------------------
 
     def decide(self, snap: Snapshot, *, gpu: bool = True) -> tuple[Action | None, State]:
-        return decide(now=snap.now, pending=snap.pending, nodes=snap.nodes, state=snap.state,
+        """decide() without GPU scaling when it is off, and without the kinds of action FAILURE_LIMITS turned off."""
+        pending, nodes = snap.pending, snap.nodes
+        if "gpu_up" in self.disabled or snap.gpu_short:
+            pending = [p for p in pending if p.resource != "gpu"]
+        if "cpu_scale" in self.disabled:
+            pending = [p for p in pending if p.resource == "gpu"]
+        if "gpu_down" in self.disabled:
+            gpu = False
+        if "cpu_remove" in self.disabled:  # a busy node gets no idle clock, so rule 4 cannot pick it
+            nodes = [replace(o, busy=True) if o.kind == "cpu" and o.name != PROTECTED_CPU_NODE else o for o in nodes]
+        return decide(now=snap.now, pending=pending, nodes=nodes, state=snap.state,
                       cpu_count=snap.cpu_count, cpu_max=self.args.cpu_max,
                       gpu_counts=snap.gpu_counts if gpu else {}, pools=snap.pools if gpu else {},
                       gpu_launching=bool(snap.launching))
+
+    @staticmethod
+    def _failure_kind(snap: Snapshot, action: Action) -> str:
+        if action.kind == "gpu_scale":
+            return "gpu_up" if action.target > snap.gpu_counts.get(action.pool, 0) else "gpu_down"
+        return action.kind
 
     def tick(self) -> str:
         """One tick; returns "ok", "none", "dry-run", "skipped", "refused" or "failed"."""
         started = now = self.deps.clock()
         try:
-            snap = self.observe(now)
+            with self.stopper.reading():
+                snap = self.observe(now)
         except SkipTick as e:
             self.say(f"{self._ts(now)} tick skipped: {e}")
             self.record("skip_tick", reason=str(e), result="skipped", started=started)
             return "skipped"
-        for notice in snap.notices:
+        for notice in snap.notices + [self.disabled[kind] for kind in sorted(self.disabled)]:
             self.say(f"{self._ts(now)} notice: {notice}")
             self.record("notice", reason=notice, result="logged", started=started)
 
         gpu_off = snap.gpu_off
         action, state = self.decide(snap, gpu=gpu_off is None)
         if action is not None and action.kind == "gpu_scale":
-            check = self.run([self.paths.gpuctl, "plan", "--set-count", f"{action.pool}={action.target}"])
-            if check.rc != 0:  # budget_usd_per_hour / max_nodes (spec section 10.5), or the check failed
-                why = _last_line(check.err) or _last_line(check.out)
-                result = f"refused by gpuctl plan (exit {check.rc}): {why}"
-                self.say(f"{self._ts(now)} {describe(action)}: {action.reason} -> {result}")
-                self.record("gpu_scale", pool=action.pool, target=action.target, reason=action.reason,
-                            result=result, started=started)
-                gpu_off = f"GPU scale-up refused by gpuctl plan: {why}"
+            refused = self._plan_check(action, now, started)
+            if refused is not None:
+                gpu_off = refused
                 action, state = self.decide(snap, gpu=False)  # the CPU rules still get this tick
         if action is None:
             return self._no_action(snap, state, gpu_off, started)
@@ -423,19 +531,47 @@ class Autoscaler:
             self.record(action.kind, target=action.target, node=action.node, pool=action.pool,
                         reason=action.reason, result="dry-run", started=started)
             return "dry-run"
-        if self.stopper.event.is_set():  # Ctrl-C came while this tick read the cluster: start nothing new
+        if self.stopper.requested:  # Ctrl-C came while this tick read the cluster: start nothing new
             self.say(f"{self._ts(now)} {describe(action)}: not started (stopping)")
             self.record(action.kind, target=action.target, node=action.node, pool=action.pool,
                         reason=action.reason, result="not started (Ctrl-C)", started=started)
             return "none"
         return self._act(snap, action, state, started)
 
+    def _plan_check(self, action: Action, now: float, started: float) -> str | None:
+        """`gpuctl plan --set-count` for this gpu_scale (budget_usd_per_hour, max_nodes: spec section 10.5): why it
+        is refused, or None. A refusal is remembered for COOLDOWN_S: no Lambda API call and no log line every tick."""
+        key = (action.pool, action.target)
+        if key in self.plan_refusals:
+            when, why = self.plan_refusals[key]
+            if now - when < COOLDOWN_S:
+                return (f"gpu_scale {action.pool}={action.target} refused by gpuctl plan {now - when:.0f}s ago "
+                        f"(checked again in {COOLDOWN_S - (now - when):.0f}s): {why}")
+        with self.stopper.reading():
+            check = self.run([self.paths.gpuctl, "plan", "--set-count", f"{action.pool}={action.target}"])
+        if check.rc == 0:
+            self.plan_refusals.pop(key, None)
+            return None
+        why = _last_line(check.err) or _last_line(check.out)
+        result = f"refused by gpuctl plan (exit {check.rc}): {why}"
+        self.say(f"{self._ts(now)} {describe(action)}: {action.reason} -> {result}")
+        self.record("gpu_scale", pool=action.pool, target=action.target, reason=action.reason, result=result,
+                    started=started)
+        self.plan_refusals[key] = (now, why)
+        return f"gpu_scale {action.pool}={action.target} refused by gpuctl plan: {why}"
+
     def _no_action(self, snap: Snapshot, state: State, gpu_off: str | None, started: float) -> str:
         now = snap.now
         held = state.held or ""
-        if gpu_off:
-            held = held.replace(f"waiting: {NO_AUTOSCALE}", f"waiting: {gpu_off}")
+        off = gpu_off or self.disabled.get("gpu_down")
+        if off:
+            held = held.replace(f"waiting: {NO_AUTOSCALE}", f"waiting: {off}")
+        if snap.launching:  # decide() knows only that something launches; the log names what
+            held = held.replace(f"waiting: {LAUNCHING}", "waiting: " + "; ".join(snap.launching))
         parts = [held] if held else []
+        if snap.gpu_short and off is None and any(p.resource == "gpu" for p in snap.pending):
+            parts.append(snap.gpu_short)
+        parts.extend(self.disabled[kind] for kind in sorted(self.disabled) if self.disabled[kind] != off)
         idle = ", ".join(f"{name} idle {now - since:.0f}s" for name, since in sorted(state.idle_since.items()))
         if idle:
             parts.append(idle)
@@ -449,17 +585,35 @@ class Autoscaler:
         self.record("none", reason=f"{head}: {reason}", result=result, started=started)
         if self.args.dry_run:
             self.memory_state = state
-        else:
-            atomic_write(self.paths.state, state.to_json() + "\n", mode=0o600)
+        elif (error := self._save_state(state)) is not None:
+            self.say(f"{self._ts(now)} notice: {error}")
+            self.record("notice", reason=error, result="logged", started=started)
         return "none"
+
+    def _failed(self, kind: str, result: str) -> str:
+        """Count a failure of this kind of action; after FAILURE_LIMITS[kind] in a row it is off until a restart."""
+        count = self.failures.get(kind, 0) + 1
+        self.failures[kind] = count
+        limit, label = FAILURE_LIMITS[kind], KIND_LABELS[kind]
+        if count < limit:
+            return f"{result}; retried after the cooldown ({count}/{limit} failures)"
+        self.disabled[kind] = (f"{label} disabled after {count} failures in a row (last: {result}); fix the cause "
+                               "and run make autoscale again")
+        return f"{result}; {label} disabled after {count} failures in a row until make autoscale is restarted"
 
     def _act(self, snap: Snapshot, action: Action, state: State, started: float) -> str:
         previous_last = snap.state.last_action_at
-        # Review Focus #1: the cooldown is on disk before anything changes
-        atomic_write(self.paths.state, state.to_json() + "\n", mode=0o600)
-        self.say(f"{self._ts(snap.now)} {describe(action)}: {action.reason}")
+        kind = self._failure_kind(snap, action)
         extra = {"target": action.target, "node": action.node, "pool": action.pool}
-        outcome = "failed"
+        self.say(f"{self._ts(snap.now)} {describe(action)}: {action.reason}")
+        # Review Focus #1: the cooldown is on disk before anything changes; if it cannot be, nothing starts
+        error = self._save_state(state)
+        if error is not None:
+            result = self._failed(kind, f"failed: {error}; not started")
+            self.say(f"{self._ts(self.deps.clock())} {describe(action)} -> {result}")
+            self.record(action.kind, **extra, reason=action.reason, result=result, started=started)
+            return "failed"
+        self.notes = []
         try:
             self.stopper.in_action = True
             if action.kind == "gpu_scale":
@@ -470,16 +624,21 @@ class Autoscaler:
                 r = self.run(argv, env={"AUTO_APPROVE": "1"}, stream=True)
         except KeyboardInterrupt:
             self.stopper.in_action = False
-            state = replace(state, last_action_at=self.deps.clock())
-            atomic_write(self.paths.state, state.to_json() + "\n", mode=0o600)
-            self.record(action.kind, **extra, reason=action.reason, result="interrupted (second Ctrl-C)",
-                        started=started)
+            self.action_interrupted = True
+            self._save_state(replace(state, last_action_at=self.deps.clock()))
+            self.record(action.kind, **extra, reason=action.reason,
+                        result="; ".join(["interrupted (second Ctrl-C)", *self.notes]), started=started)
             raise
         finally:
             self.stopper.in_action = False
 
-        if r.rc == 0:
+        outcome = "failed"
+        if r.rc == ABORTED_RC:
+            outcome, result = "refused", f"not started: {r.out}"
+            state = replace(state, last_action_at=previous_last)
+        elif r.rc == 0:
             self.refusals, outcome, result = 0, "ok", "ok"
+            self.failures.pop(kind, None)
             state = replace(state, last_action_at=self.deps.clock())
         elif r.rc == 2 and action.kind != "gpu_scale":
             self.refusals += 1
@@ -489,33 +648,69 @@ class Autoscaler:
                 result = f"refused (exit 2): {why}; retry next tick ({self.refusals}/{REFUSED_RETRIES})"
                 state = replace(state, last_action_at=previous_last)
             else:
-                result = f"refused (exit 2) {self.refusals} times in a row: {why}; cooldown {COOLDOWN_S}s"
+                result = self._failed(kind, f"refused (exit 2) {self.refusals} times in a row: {why}; "
+                                            f"cooldown {COOLDOWN_S}s")
                 self.refusals = 0
                 state = replace(state, last_action_at=self.deps.clock())
         else:
             self.refusals = 0
-            result = f"failed (exit {r.rc}): {_last_line(r.out)}; the next decision repeats it after the cooldown"
+            result = self._failed(kind, f"failed (exit {r.rc}): {_last_line(r.out)}")
             state = replace(state, last_action_at=self.deps.clock())
-        atomic_write(self.paths.state, state.to_json() + "\n", mode=0o600)
+        result = "; ".join([result, *self.notes])
+        error = self._save_state(state)
+        if error is not None:
+            result += f" (state not saved: {error})"
         self.say(f"{self._ts(self.deps.clock())} {describe(action)} -> {result}")
         self.record(action.kind, **extra, reason=action.reason, result=result, started=started)
         return outcome
 
     def _gpu_scale(self, snap: Snapshot, action: Action) -> Result:
-        """Merge {pool: target} into the override file, run gpuctl apply; put the file back if the apply fails."""
+        """Merge {pool: target} into the override file and run gpuctl apply (see the module docstring)."""
+        path = self.paths.overrides
         try:
-            before = self.paths.overrides.read_text(encoding="utf-8")
-        except FileNotFoundError:
-            before = None
+            before = _read_text(path)
+        except OSError as e:
+            return Result(1, f"cannot read {path}: {e.strerror or e}", "")
+        if before != snap.overrides_text:  # make gpu-down (or a hand edit) since this tick read it
+            self.gpu_disabled = (f"{path} changed while a tick ran (make gpu-down, or a hand edit): GPU scaling is "
+                                 "off until make autoscale is restarted")
+            return Result(ABORTED_RC, f"{path} changed since this tick read it (make gpu-down?); GPU scaling is off "
+                                      "until make autoscale is restarted", "")
         merged = dict(sorted({**snap.overrides, action.pool: action.target}.items()))
-        atomic_write(self.paths.overrides, json.dumps({"pools": merged}) + "\n")
-        r = self.run([self.paths.gpuctl, "apply", "--auto-approve"], stream=True)
-        if r.rc != 0:
+        text = json.dumps({"pools": merged}) + "\n"
+        try:
+            atomic_write(path, text)
+        except OSError as e:
+            return Result(1, f"cannot write {path}: {e.strerror or e}", "")
+        self.override_written = text
+        scale_up = action.target > snap.gpu_counts.get(action.pool, 0)
+        applied = False
+        try:
+            r = self.run([self.paths.gpuctl, "apply", "--auto-approve"], stream=True)
+            applied = r.rc == 0
+            return r
+        finally:  # also on the second Ctrl-C
+            if scale_up and not applied:
+                self._restore_override(written=text, before=before)
+
+    def _restore_override(self, *, written: str, before: str | None) -> None:
+        """Put the override file back as it was before a scale-up that did not complete, unless someone else
+        (make gpu-down) changed it meanwhile: then it is left as it is and GPU scaling is off until a restart."""
+        path = self.paths.overrides
+        try:
+            if _read_text(path) != written:
+                self.gpu_disabled = (f"{path} changed during gpuctl apply (make gpu-down, or a hand edit): GPU "
+                                     "scaling is off until make autoscale is restarted")
+                self.notes.append(f"{path} changed during the apply (make gpu-down?): left as it is")
+                return
             if before is None:
-                self.paths.overrides.unlink(missing_ok=True)
+                path.unlink(missing_ok=True)
             else:
-                atomic_write(self.paths.overrides, before)
-        return r
+                atomic_write(path, before)
+            self.override_written = before or ""
+            self.notes.append(f"{path} put back as it was")
+        except OSError as e:
+            self.notes.append(f"cannot put {path} back: {e.strerror or e}; check it before any make gpu-apply")
 
 
 def _parser() -> argparse.ArgumentParser:
@@ -546,15 +741,19 @@ def main(argv: list[str] | None = None, *, env: Mapping[str, str] = os.environ, 
     scaler = Autoscaler(args, Paths.from_env(env), deps, stopper)
     if scaler.log_path is not None:
         scaler.say(f"autoscaler: logging to {scaler.log_path}")
+    scaler.say(STARTUP_HINT)
     try:
         if args.once:
             return 0 if scaler.tick() in ("ok", "none", "dry-run") else 1
         while True:
             scaler.tick()
-            if stopper.event.is_set() or wait(args.interval):
+            if stopper.requested or wait(args.interval):
                 break
     except KeyboardInterrupt:
-        print(f"autoscaler: {CLEANUP_HINT}", file=sys.stderr)
+        if scaler.action_interrupted:
+            print(f"autoscaler: {CLEANUP_HINT}", file=sys.stderr)
+        else:
+            print("autoscaler: stopped while reading the cluster; nothing was changing", file=sys.stderr)
         return 130
     scaler.say("autoscaler: stopped")
     return 0
