@@ -690,7 +690,7 @@ def test_b4_server_stop_counts_no_iperf3_left_as_done_but_not_pkills_own_errors(
 
 
 @pytest.mark.parametrize("slow, mark", [
-    ("iperf3 -s -1", "iperf3 -s -1"),           # Ctrl-C before the server said it listens
+    ("iperf3 -s -1", "forceflush"),             # Ctrl-C before the server said it listens
     ("iperf3 -c", "50M"),                        # ... while the client runs, after the one-off server ended
 ])
 def test_b4_interrupt_with_no_iperf3_running_is_not_a_false_alarm(env, slow, mark):

@@ -382,10 +382,15 @@ _vr_tell() {
 # _vr_signalled SIGNAL: the trap set by _vr_on_signal. SIGPIPE is ignored and errexit is off while it
 # cleans up (a closed pipe must not end kubectl or gcloud before they have done their work). The
 # cleanup's progress, its output and its outcome go to the operator and the evidence (_vr_tell).
+# A further Ctrl-C is ignored until then, by this shell and (inherited) by the cleanup's commands, so
+# it can neither cut the cleanup short nor hide its outcome. A further SIGTERM stops the cleanup's
+# commands (they keep its default action: TERM is also how the 120 s bound stops them) but not this
+# shell, which still reports the outcome; the first signal then ends the check.
 _vr_signalled() {
   local line rc how
+  trap '' INT
+  trap ':' TERM
   set +e
-  trap - INT TERM
   trap '' PIPE
   _vr_reap
   line="$(_vr_quote "${_VR_ON_SIGNAL[@]}")"
@@ -398,10 +403,13 @@ _vr_signalled() {
   else
     how="exit $rc"
     ((rc != 124)) || how="stopped after 120 s"
+    # In a child shell: pasted into the operator's own bash, a die (exit) ends only that child, and
+    # .env's values and the harness's functions do not stay behind in the operator's shell.
+    line="source scripts/lib/checks.sh && vr_env && $line"
     _vr_tell "cleanup FAILED ($how); may remain: $_VR_ON_SIGNAL_LEFT" \
-      "to remove it, run from the repository root in bash: source scripts/lib/checks.sh && vr_env && $line"
+      "to remove it, run from the repository root: bash -c '${line//\'/\'\\\'\'}'"
   fi
-  trap - PIPE
+  trap - INT TERM PIPE
   kill -s "$1" "${BASHPID:-$$}"
   exit 1
 }
@@ -904,6 +912,12 @@ check_b3_wg() {
   return "$fail"
 }
 
+# Stops the iperf3 servers in a probe (run with sh -c). pkill exits 1 when no process matched: no server
+# is left, the outcome wanted (an interrupt before the server started or after it ended is no failed
+# cleanup); pkill's own errors (2, 3) and a failed kubectl exec still fail.
+# shellcheck disable=SC2016 # expanded by the probe's sh, not here
+_VR_B4_STOP='pkill -x iperf3 || [ $? -eq 1 ]'
+
 # _vr_b4_pair CLIENT_PROBE CLIENT_NODE SERVER_NODE: iperf3 from CLIENT_PROBE to the probe on
 # SERVER_NODE (-n 50M: a bounded transfer, spec §9 B4), and record bits_per_second. The server runs
 # with --forceflush: through kubectl exec without a tty its stdout is a pipe, which iperf3 otherwise
@@ -916,10 +930,11 @@ _vr_b4_pair() {
   sip="$(vr_cap kc -n nettest get pod "$sprobe" "$_VR_RT" -o 'jsonpath={.status.podIP}')" || return 1
   is_ipv4 "$sip" || { echo "B4: $sprobe has no Pod IP: '$sip'"; return 1; }
   logf="$(mktemp)" || return 1
-  # A server left by an interrupted run would hold port 5201: stop it (pkill exits 1 when none is left).
-  vr_cmd kc_within 60 -n nettest exec "$sprobe" -- pkill -x iperf3 || true
+  # A server left by an interrupted run would hold port 5201: stop it.
+  vr_cmd kc_within 60 -n nettest exec "$sprobe" -- sh -c "$_VR_B4_STOP" \
+    || echo "B4: could not stop an iperf3 server left in $sprobe (going on)"
   _vr_on_signal --left "an iperf3 server on port 5201 in $sprobe (it ends by itself within 150 s)" \
-    kc_within 60 -n nettest exec "$sprobe" -- pkill -x iperf3
+    kc_within 60 -n nettest exec "$sprobe" -- sh -c "$_VR_B4_STOP"
   vr_bg "$logf" kc_within 170 -n nettest exec "$sprobe" -- timeout 150 iperf3 -s -1 --forceflush
   pid="$VR_BG_PID"
   if _vr_wait_text "$logf" "Server listening" "$pid" 60; then
@@ -933,7 +948,7 @@ _vr_b4_pair() {
     wait "$pid" || true
   else
     _vr_stop "$pid"
-    vr_cmd kc_within 60 -n nettest exec "$sprobe" -- pkill -x iperf3 || true
+    vr_cmd kc_within 60 -n nettest exec "$sprobe" -- sh -c "$_VR_B4_STOP" || true
   fi
   _vr_on_signal
   _vr_show "$logf" "iperf3 server on $3 ($sprobe)"
