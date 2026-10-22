@@ -159,7 +159,9 @@ run_check() {
     if ((errexit)); then set -e; fi
     trap _vr_reap EXIT
     # A hangup ends this subshell only once its foreground command is over: dying at once would run
-    # _vr_reap while the check still runs, and its SIGTERM would hit a check's cleanup (_vr_guarded).
+    # _vr_reap while the check still runs, and its SIGTERM would hit a check's cleanup (_vr_guarded) or a
+    # command that ignores SIGHUP to finish (E's applies). Keep it when merging H-1's _vr_reap (test:
+    # test_run_check_ends_a_hung_up_check_only_after_its_foreground_command, review C1-2).
     trap 'exit 129' HUP
     "$func" "$@"
   ) </dev/null 2>&1 | (
@@ -1414,14 +1416,19 @@ check_d6_overflow() {
 
 # E1 reboots a CPU worker, E2 replaces every GPU node (a billed launch), E3 puts a deliberate extra rule
 # into the gpu-access firewall stack. E2 and E3 SKIP (77) without a GPU node, as D does; E2 also when
-# the GPU spec asks for none, or when Lambda has no capacity to launch its replacement. Every wait has a
-# deadline on one clock that counts the time its requests take (_vr_e_until; E1's two waits share one
-# from the reboot command), and gpuctl's read-only calls are bounded with timeout. What E2 and E3 change
+# the GPU spec asks for none, or when Lambda has no capacity to launch its replacement and the node does
+# not hold a unit gpuctl down would free (that SKIP leaves E2 unverified, and the evidence says so).
+# Every wait has a deadline on one clock that counts the time its requests take (_vr_e_until; E1's two
+# waits share one from the reboot command), and gpuctl's read-only calls are bounded with timeout; E1
+# compares the node's timestamps with the node's own clock, never the operator's. What E2 and E3 change
 # is put right by a cleanup (_vr_guarded) that runs however the check ends: E2 makes sure no GPU instance
 # is left running when the replacement did not finish (no billed orphan), E3 removes the extra rule. A
-# second Ctrl-C or a hangup does not stop either: the cleanup ignores SIGINT/SIGTERM/SIGHUP, runs its
+# hangup does not kill a terraform apply or gpuctl down/apply half way (they run with SIGHUP ignored,
+# _vr_e_stream --nohup, so no Terraform state lock is orphaned); the cleanup runs once it has finished. A
+# second Ctrl-C or a hangup does not stop the cleanup: it ignores SIGINT/SIGTERM/SIGHUP, runs its
 # commands in a process group of their own (_vr_shielded), and writes to $VR_DIR/cleanup.log once its
-# evidence cannot be written (_vr_cleanup_say). Command output that can carry the project id or the
+# evidence cannot be written (_vr_cleanup_say). A restore or sweep blocked by a state lock names the lock
+# and its force-unlock (_vr_e_lock_hint). Command output that can carry the project id or the
 # operator's IP (gpuctl, terraform, gcloud) goes into the evidence masked (_vr_e_mask); gpuctl masks the
 # operator IP it detects itself.
 
@@ -1431,6 +1438,12 @@ _VR_E_READY_SINCE='{.status.conditions[?(@.type=="Ready")].lastTransitionTime}'
 # E1's look at the nettest Pods on the rebooted node: per Pod, its container's ready flag and when that
 # container started (RFC 3339, UTC).
 _VR_E1_POD_STARTED='{range .items[*]}{.status.containerStatuses[0].ready}{" "}{.status.containerStatuses[0].state.running.startedAt}{"\n"}{end}'
+# E1's reference time is the rebooted node's own clock, not the operator's: its kubelet renews the node's
+# lease (kube-node-lease) every 10 s (renewInterval: a quarter of the 40 s lease duration), on the same host
+# clock as the containers' startedAt and the Ready condition's lastTransitionTime it writes. A skewed
+# operator clock (a laptop or WSL2 after sleep) would otherwise fail a healthy reboot (Task 22b review
+# X1-2). The last renewal read just before the reboot command is at most this many seconds before it.
+_VR_E1_RENEW_S=10
 # How long Lambda may go on listing an instance gpuctl down terminated (gpuctl's Reconciler: it "may still
 # list [it] as active for a moment after the terminate call returns"; down.sh waits 60 s).
 _VR_E2_GONE_S=120
@@ -1460,13 +1473,35 @@ _vr_e_mask() {
   LC_ALL=C "${_VR_SED[@]}" -E "${exprs[@]}"
 }
 
-# _vr_e_stream CMD…: vr_cmd CMD with its stdout and stderr masked (_vr_e_mask) into the evidence as
-# they come (gpuctl apply and terraform run for minutes). The filter ignores SIGINT/SIGTERM, as
-# run_check's does, and SIGHUP, so a Ctrl-C or a hangup ends CMD but not the record of it. Returns
+# _vr_e_stream [--nohup] CMD…: vr_cmd CMD with its stdout and stderr masked (_vr_e_mask) into the
+# evidence as they come (gpuctl apply and terraform run for minutes). The filter ignores SIGINT/SIGTERM,
+# as run_check's does, and SIGHUP, so a Ctrl-C or a hangup ends CMD but not the record of it. Returns
 # CMD's status; 1 when CMD succeeded but its output could not be masked (the evidence is incomplete).
+# --nohup: CMD runs with SIGHUP ignored, for the commands that change something (terraform apply, gpuctl
+# down and apply). Terraform does not handle SIGHUP, so a hangup would kill it half way and orphan the
+# GCS state lock, which never expires; gpuctl runs terraform apply too. Both keep an inherited SIG_IGN
+# for SIGHUP (Go's os/signal does unless SIGHUP is asked for; Python leaves it alone). A hangup then lets
+# CMD finish and release the lock, and the guarded subshell's HUP trap (_vr_guarded) runs the cleanup
+# after it (Task 22b review X1-1). A Ctrl-C still reaches CMD: terraform and gpuctl stop cleanly on it.
+# VR_E_TEE=FILE: the masked output is also appended to FILE (a cleanup looks for a state-lock error in it).
 _vr_e_stream() {
+  local nohup=0
   local -a st=()
-  { vr_cmd "$@" </dev/null 2>&1 | (trap '' INT TERM HUP && _vr_e_mask); st=("${PIPESTATUS[@]}"); } || :
+  if [[ "$1" == --nohup ]]; then
+    nohup=1
+    shift
+  fi
+  {
+    (
+      if ((nohup)); then trap '' HUP; fi
+      vr_cmd "$@"
+    ) </dev/null 2>&1 | (
+      trap '' INT TERM HUP
+      set -o pipefail
+      if [[ -n "${VR_E_TEE:-}" ]]; then _vr_e_mask | tee -a -- "$VR_E_TEE"; else _vr_e_mask; fi
+    )
+    st=("${PIPESTATUS[@]}")
+  } || :
   if ((st[1] != 0)); then
     echo "the output filter failed (exit ${st[1]}): the evidence of this command is incomplete"
     ((st[0] != 0)) || return 1
@@ -1537,6 +1572,27 @@ _vr_shielded() {
   return "$rc"
 }
 
+# _vr_e_lock_hint PREFIX FILE: when FILE (masked terraform or gpuctl output) shows Terraform's "Error
+# acquiring the state lock", say which lock and how to release it: an apply killed half way (kill -9, a
+# crash, a hangup before review X1-1) leaves its GCS lock behind, it never expires, and make gpu-apply
+# would fail on it as well. The lock ID and the stack come from Terraform's "Lock Info" (ID, and Path
+# gs://<bucket>/<stack>/default.tflock); gpu-access when the path names no stack.
+_vr_e_lock_hint() {
+  local prefix="$1" file="$2" id stack
+  [[ -n "$file" && -s "$file" ]] && grep -q 'Error acquiring the state lock' "$file" || return 0
+  id="$(awk '/Lock Info:/ { t = 1 } t && $1 == "ID:" { print $2; exit }' "$file")"
+  stack="$(awk '/Lock Info:/ { t = 1 } t && $1 == "Path:" { print $2; exit }' "$file" \
+    | sed -nE 's#^gs://[^/]+/([a-z][a-z0-9-]*)/default\.tflock$#\1#p')"
+  [[ -n "$stack" ]] || stack=gpu-access
+  if [[ ! "$id" =~ ^[A-Za-z0-9-]+$ ]]; then
+    echo "$prefix: the Terraform state of the $stack stack is locked (no lock ID found in the output above)"
+    return 0
+  fi
+  echo "$prefix: the Terraform state of the $stack stack is locked (lock ID $id), most likely by an apply"
+  echo "$prefix: that was killed half way. Once no terraform, gpuctl or make target runs anywhere, release it:"
+  echo "$prefix:   terraform -chdir=infra/$stack force-unlock $id"
+}
+
 # _vr_e_gpuctl ARGS…: a read-only scripts/gpuctl ARGS (status, list-nodes), bounded, through _vr_e_cap;
 # for list-nodes VR_E_OUT holds its stdout only (one line per node).
 _vr_e_gpuctl() {
@@ -1567,18 +1623,22 @@ _vr_e_no_drift() {
 }
 
 # _vr_e_list_nodes: VR_E_NODES = "NAME IP" for every GPU instance gpuctl list-nodes reports, live in any
-# status (IP "-" while it boots). Fails when the listing fails or holds a line that is not a node's.
+# status (IP "-" while it boots), and VR_E_WHERE = "NAME TYPE REGION" for each (list-nodes prints
+# "<name> <ip|-> <status> <type> <region>"). Fails when the listing fails or holds a line that is not a
+# node's.
 _vr_e_list_nodes() {
-  local name ip rest
+  local name ip status type region rest
   VR_E_NODES=()
+  VR_E_WHERE=()
   _vr_e_gpuctl list-nodes || { echo "E: gpuctl list-nodes failed"; return 1; }
-  while read -r name ip rest; do
+  while read -r name ip status type region rest; do
     [[ -n "$name" ]] || continue
     if [[ ! "$name" =~ $GPU_NODE_RE ]] || { [[ "$ip" != - ]] && ! is_ipv4 "$ip"; }; then
-      echo "E: unexpected line from gpuctl list-nodes: '$name $ip $rest'"
+      echo "E: unexpected line from gpuctl list-nodes: '$name $ip $status $type $region $rest'"
       return 1
     fi
     VR_E_NODES+=("$name $ip")
+    VR_E_WHERE+=("$name ${type:--} ${region:--}")
   done <<< "$VR_E_OUT"
 }
 
@@ -1655,11 +1715,13 @@ _vr_e_rt() {
   printf -- '--request-timeout=%ss\n' "$s"
 }
 
-# _vr_e_epoch TIME: TIME, an RFC 3339 UTC time as the API server prints it (2026-10-22T09:15:42Z), as
-# Unix seconds; fails on anything else.
+# _vr_e_epoch TIME: TIME, an RFC 3339 UTC time as the API server prints it (2026-10-22T09:15:42Z, or a
+# MicroTime such as a lease's renewTime, 2026-10-22T09:15:42.123456Z), as Unix seconds (the fraction cut
+# off); fails on anything else.
 _vr_e_epoch() {
   local s
-  s="$(jq -rn --arg t "$1" '$t | fromdateiso8601' 2>/dev/null)" && [[ "$s" =~ ^[0-9]+$ ]] || return 1
+  s="$(jq -rn --arg t "$1" '$t | sub("\\.[0-9]+Z$"; "Z") | fromdateiso8601' 2>/dev/null)" \
+    && [[ "$s" =~ ^[0-9]+$ ]] || return 1
   printf '%s\n' "$s"
 }
 
@@ -1699,7 +1761,8 @@ _vr_e_nettest_ready() {
 }
 
 # _vr_e1_pods_restarted NODE SINCE: on NODE, the nettest probe Pod and the echo Pod each have a ready
-# container that started at or after SINCE (Unix seconds: the reboot command). After a reboot quicker
+# container that started at or after SINCE (Unix seconds by NODE's clock: just before the reboot command,
+# _vr_e1_node_now). After a reboot quicker
 # than the node controller's grace period the Pods' Ready status can still be the stale one from before,
 # and B1 would exec into a container that is being recreated (Task 22b review C0-3).
 _vr_e1_pods_restarted() {
@@ -1722,6 +1785,13 @@ _vr_e_utc() {
   jq -rn --argjson s "$1" '$s | todateiso8601'
 }
 
+# _vr_e1_node_now NODE: VR_E1_REF = NODE's clock now, as Unix seconds, and VR_E1_RENEW its RFC 3339 form:
+# the renewTime of its node lease (at most $_VR_E1_RENEW_S s old). Fails when it cannot be read.
+_vr_e1_node_now() {
+  VR_E1_RENEW="$(vr_cap kc -n kube-node-lease get lease "$1" "$_VR_RT" -o 'jsonpath={.spec.renewTime}')" \
+    && VR_E1_REF="$(_vr_e_epoch "$VR_E1_RENEW")"
+}
+
 # E1: reboot k3s-cpu-1 (`sudo systemctl reboot`; ssh's exit 255 when the connection drops is expected).
 # PASS: it is NotReady within 120 s of the reboot command and Ready again within 600 s of it, with a new
 # boot ID (it did reboot); its nettest probe and echo containers started again after the reboot command;
@@ -1733,8 +1803,13 @@ _vr_e_utc() {
 # other exit of the reboot command than 0 and 255 is waited out too (an IAP SSH whose tunnel drops under
 # the reboot can exit with another code): the boot ID says whether the node rebooted, so the next check
 # never starts while it is still rebooting.
+# The waits run on the operator's E clock (_vr_e_now: elapsed time only). The node's timestamps
+# (lastTransitionTime, startedAt) are compared with the node's own clock read just before the reboot
+# command (its lease's renewTime, at most $_VR_E1_RENEW_S s earlier; _vr_e1_node_now): "no later than 120 s
+# after the reboot command" is no later than that reading + 120 + $_VR_E1_RENEW_S s, and "started after the
+# reboot" is started at or after that reading. The operator's clock is never compared with them.
 check_e1_worker_reboot() {
-  local node="$_VR_E1_NODE" boot1 boot2 since1 since2 s2 t0 w0 rc=0
+  local node="$_VR_E1_NODE" boot1 boot2 since1 since2 s2 t0 w0 ref rc=0
   vr_env
   _vr_e_ready_state "$node"
   if [[ "$VR_E_READY" != True ]]; then
@@ -1745,20 +1820,27 @@ check_e1_worker_reboot() {
   [[ -n "$boot1" ]] || { echo "E1: $node reports no boot ID"; return 1; }
   since1="$(_vr_e_node_field "$node" "$_VR_E_READY_SINCE")" || return 1
   [[ -n "$since1" ]] || { echo "E1: $node reports no lastTransitionTime for Ready"; return 1; }
+  if ! _vr_e1_node_now "$node"; then
+    echo "E1: cannot read $node's clock (the renewTime of its lease in kube-node-lease: '${VR_E1_RENEW:-}'): not rebooting it"
+    return 1
+  fi
+  ref="$VR_E1_REF"
   _vr_e_now
   t0="$VR_E_NOW"
   w0="$(date +%s)"
   _vr_e_stream worker_ssh "$node" 'sudo systemctl reboot' || rc=$?
+  echo "E1: $node's clock just before the reboot command: $VR_E1_RENEW (its lease's last renewal; the operator's clock read $(_vr_e_utc "$w0"))"
   case "$rc" in
-    0 | 255) echo "E1: reboot sent to $node at $(_vr_e_utc "$w0") (ssh exit $rc; 255 is the connection closing)" ;;
-    *) echo "E1: the reboot command ended with exit $rc at $(_vr_e_utc "$w0"): waiting to see whether $node reboots anyway (its boot ID decides)" ;;
+    0 | 255) echo "E1: reboot sent to $node (ssh exit $rc; 255 is the connection closing)" ;;
+    *) echo "E1: the reboot command ended with exit $rc: waiting to see whether $node reboots anyway (its boot ID decides)" ;;
   esac
   if _vr_e_until "$((t0 + 120))" 2 _vr_e_not_ready "$node"; then
     echo "E1: $node is NotReady (Ready=$VR_E_READY)"
   elif since2="$(_vr_e_node_field "$node" "$_VR_E_READY_SINCE")" && [[ -n "$since2" && "$since2" != "$since1" ]]; then
     s2="$(_vr_e_epoch "$since2")" || { echo "E1: unexpected Ready lastTransitionTime '$since2'"; return 1; }
-    if ((s2 > w0 + 120)); then
+    if ((s2 > ref + 120 + _VR_E1_RENEW_S)); then
       echo "E1: $node was never seen NotReady; Ready last changed at $since2, more than 120 s after the reboot command"
+      echo "E1: (by $node's clock: more than $((120 + _VR_E1_RENEW_S)) s after its lease's renewal at $VR_E1_RENEW)"
       return 1
     fi
     echo "E1: $node went NotReady and back between two polls (Ready lastTransitionTime $since1 -> $since2)"
@@ -1791,7 +1873,7 @@ check_e1_worker_reboot() {
   echo "E1: boot ID $boot1 -> $boot2"
   _vr_e_nettest_ready || return 1
   _vr_e_now
-  if ! _vr_e_until "$((VR_E_NOW + 300))" 5 _vr_e1_pods_restarted "$node" "$w0"; then
+  if ! _vr_e_until "$((VR_E_NOW + 300))" 5 _vr_e1_pods_restarted "$node" "$ref"; then
     echo "E1: the nettest probe and echo Pods on $node did not restart after the reboot within 300 s"
     return 1
   fi
@@ -1836,7 +1918,10 @@ _vr_e2_sweep() {
     echo "E2: no GPU instance is left running; make gpu-apply brings the GPU node back"
   else
     echo "E2: removing what is left with gpuctl down"
-    _vr_shielded _vr_e_stream "$REPO_ROOT/scripts/gpuctl" down --auto-approve || echo "E2: gpuctl down failed"
+    if ! VR_E_TEE="${f:+$f.out}" _vr_shielded _vr_e_stream --nohup "$REPO_ROOT/scripts/gpuctl" down --auto-approve; then
+      echo "E2: gpuctl down failed"
+      _vr_e_lock_hint E2 "${f:+$f.out}"
+    fi
     # Lambda can list an instance it is terminating as active for a while: no false alarm (review S0-1).
     _vr_e_now
     if _vr_e_until "$((VR_E_NOW + _VR_E2_GONE_S))" 5 _vr_e2_none "$f"; then
@@ -1848,7 +1933,7 @@ _vr_e2_sweep() {
       rc=1
     fi
   fi
-  [[ -z "$f" ]] || rm -f -- "$f"
+  [[ -z "$f" ]] || rm -f -- "$f" "$f.out"
   return "$rc"
 }
 
@@ -1873,15 +1958,33 @@ _vr_e2_pools() {
   for name in "$@"; do _vr_e_pool "$name"; done | LC_ALL=C sort
 }
 
-# _vr_e2_capacity POOL: gpuctl status's capacity table (VR_E2_STATUS) has a row for POOL (one per
-# candidate type and region) whose AVAILABLE column is yes: gpuctl apply has somewhere to launch it.
+# _vr_e2_capacity POOL [TYPE REGION]: gpuctl status's capacity table (VR_E2_STATUS) has a row for POOL (one
+# per candidate type and region) whose AVAILABLE column is yes: gpuctl apply has somewhere to launch it.
+# With TYPE and REGION: the table has the row POOL TYPE REGION, available or not (a candidate of POOL).
 _vr_e2_capacity() {
-  awk -v pool="$1" '/^Capacity / { t = 1; next } t && NF == 0 { exit } t && $1 == pool && $4 == "yes" { f = 1 }
-                    END { exit !f }' <<< "$VR_E2_STATUS"
+  awk -v pool="$1" -v type="${2:-}" -v region="${3:-}" '
+    /^Capacity / { t = 1; next }
+    t && NF == 0 { exit }
+    t && $1 == pool && (type == "" ? $4 == "yes" : ($2 == type && $3 == region)) { f = 1 }
+    END { exit !f }' <<< "$VR_E2_STATUS"
+}
+
+# _vr_e2_holds POOL: the first node of POOL (VR_E_WHERE) that runs one of POOL's candidate type/region pairs,
+# as "NAME TYPE REGION"; fails when none does.
+_vr_e2_holds() {
+  local line name type region
+  for line in ${VR_E_WHERE[@]+"${VR_E_WHERE[@]}"}; do
+    read -r name type region <<< "$line"
+    if [[ "$(_vr_e_pool "$name")" == "$1" ]] && _vr_e2_capacity "$1" "$type" "$region"; then
+      printf '%s\n' "$line"
+      return 0
+    fi
+  done
+  return 1
 }
 
 _vr_e2() {
-  local line name ip new_ip old_ip uid new_uid pool extra missing fail=0
+  local line name ip new_ip old_ip uid new_uid pool extra missing held type region fail=0
   local -a before=() names=() uids=() now=()
   VR_E2_CHANGED=0
   if [[ -e "$_VR_E_OVERRIDES" ]]; then
@@ -1901,18 +2004,32 @@ _vr_e2() {
     names+=("$name")
     uids+=("$uid")
   done
-  # A node taken down that gpuctl apply cannot launch again is lost for the session (review X0-3).
+  # A node taken down that gpuctl apply cannot launch again is lost for the session (review X0-3). Lambda's
+  # capacity says whether a NEW instance can launch now: the node under test may hold the last unit of its
+  # type in its region, which gpuctl down frees for the apply (review C1-1). Then E2 goes ahead, with a
+  # warning; only a pool with no capacity that none of its nodes holds is skipped.
   for pool in $(_vr_e2_pools "${names[@]}" | uniq); do
-    if ! _vr_e2_capacity "$pool"; then
-      echo "E2: gpuctl status shows no capacity for GPU pool $pool (no candidate type available in any of its regions):"
-      echo "E2: gpuctl apply could not bring the node back after gpuctl down, so it is not replaced: skipped"
-      return 77
+    _vr_e2_capacity "$pool" && continue
+    if held="$(_vr_e2_holds "$pool")"; then
+      read -r name type region <<< "$held"
+      echo "E2: warning: gpuctl status shows no free capacity for GPU pool $pool,"
+      echo "E2: but $name holds a $type in $region, one of the pool's candidates: gpuctl down frees that unit"
+      echo "E2: for the apply, so it is replaced anyway. If Lambda hands the unit to someone else first, gpuctl"
+      echo "E2: apply fails, E2 FAILs, no GPU instance is left running, and make gpu-apply brings the node back"
+      echo "E2: once there is capacity"
+      continue
     fi
+    echo "E2: gpuctl status shows no capacity for GPU pool $pool (no candidate type available in any of its"
+    echo "E2: regions), and none of its nodes holds a unit of a candidate that gpuctl down would free: gpuctl apply"
+    echo "E2: could not bring the node back, so it is kept: skipped. E2 is NOT verified by this run (a SKIP counts"
+    echo "E2: as success in the run's result): re-run scripts/verify.sh E once make gpu-status shows capacity, or"
+    echo "E2: replace the node by hand (make gpu-down, then make gpu-apply, then make gpu-status)"
+    return 77
   done
   echo "E2: replacing ${#before[@]} GPU node(s): gpuctl down, then gpuctl apply"
 
   VR_E2_CHANGED=1
-  _vr_e_stream "$REPO_ROOT/scripts/gpuctl" down --auto-approve || { echo "E2: gpuctl down failed"; return 1; }
+  _vr_e_stream --nohup "$REPO_ROOT/scripts/gpuctl" down --auto-approve || { echo "E2: gpuctl down failed"; return 1; }
   # Lambda can list a terminated instance as active for a while (gpuctl's Reconciler; review S0-1).
   _vr_e_now
   if ! _vr_e_until "$((VR_E_NOW + _VR_E2_GONE_S))" 5 _vr_e2_gone "${names[@]}"; then
@@ -1922,7 +2039,7 @@ _vr_e2() {
     echo "E2: gpuctl down did not remove every GPU node within $_VR_E2_GONE_S s (or Lambda could not be listed)"
     return 1
   fi
-  _vr_e_stream "$REPO_ROOT/scripts/gpuctl" apply --auto-approve || { echo "E2: gpuctl apply failed"; return 1; }
+  _vr_e_stream --nohup "$REPO_ROOT/scripts/gpuctl" apply --auto-approve || { echo "E2: gpuctl apply failed"; return 1; }
   # What runs now is what the spec wants: nothing for the cleanup to remove, unless it is more (below).
   VR_E2_CHANGED=0
 
@@ -2004,7 +2121,8 @@ _vr_e_spec_count() {
 # name: the lowest free index), each a new Node object that is Ready within 300 s, and D1-D6 and B1
 # pass on them (spec section 9 E2: "the matrix and all of D"). SKIP without a GPU node, when the spec
 # asks for none (no GPU pool, or every count 0: gpuctl apply would not bring the node back), and when
-# gpuctl status shows no capacity to launch a node of its pool again (the node is kept). Refused (FAIL,
+# gpuctl status shows no capacity to launch a node of its pool again and none of its nodes holds a unit
+# that gpuctl down would free (the node is kept; the evidence says E2 is not verified). Refused (FAIL,
 # nothing changed) while the autoscaler's override file exists. A replacement that does not finish, or
 # that ends with more instances than before, leaves no GPU instance running (_vr_e2_cleanup).
 check_e2_gpu_replace() {
@@ -2053,11 +2171,12 @@ _vr_e3_gone() {
     && ! grep -qF "[\"$_VR_E3_IP\"]" "$1.addr"
 }
 
-# _vr_e3_tf_apply GPU_IPS_JSON [VAR…]: terraform apply of the gpu-access stack for exactly these GPU IPs.
+# _vr_e3_tf_apply GPU_IPS_JSON [VAR…]: terraform apply of the gpu-access stack for exactly these GPU IPs,
+# with SIGHUP ignored (_vr_e_stream --nohup).
 _vr_e3_tf_apply() {
   local ips="$1"
   shift
-  _vr_e_stream terraform -chdir="$VR_E3_DIR" apply -auto-approve -input=false -lock-timeout=120s "$@" \
+  _vr_e_stream --nohup terraform -chdir="$VR_E3_DIR" apply -auto-approve -input=false -lock-timeout=120s "$@" \
     "-var=gpu_ips=$ips"
 }
 
@@ -2084,8 +2203,9 @@ _vr_e3_restore() {
     echo "E3: cleanup: the gpu-access state has no rule for $_VR_E3_IP"
   else
     echo "E3: cleanup: restoring gpu_ips=$VR_E3_ORIG"
-    if ! _vr_shielded _vr_e3_tf_apply "$VR_E3_ORIG"; then
+    if ! VR_E_TEE="${f:+$f.out}" _vr_shielded _vr_e3_tf_apply "$VR_E3_ORIG"; then
       echo "E3: cleanup: terraform apply failed"
+      _vr_e_lock_hint "E3: cleanup" "${f:+$f.out}"
       rc=1
     elif _vr_e3_gone "$f"; then
       echo "E3: cleanup: restored: the gpu-access state has no rule for $_VR_E3_IP"
@@ -2097,7 +2217,7 @@ _vr_e3_restore() {
       echo "E3: cleanup: run make gpu-apply, then make gpu-status (want no drift)"
     fi
   fi
-  [[ -z "$f" ]] || rm -f -- "$f" "$f.addr"
+  [[ -z "$f" ]] || rm -f -- "$f" "$f.addr" "$f.out"
   return "$rc"
 }
 
@@ -2137,7 +2257,7 @@ _vr_e3() {
     echo "E3 ②: gpuctl status exits 3 and names $_VR_E3_IP"
   fi
 
-  if _vr_e_stream "$REPO_ROOT/scripts/gpuctl" apply --auto-approve; then
+  if _vr_e_stream --nohup "$REPO_ROOT/scripts/gpuctl" apply --auto-approve; then
     echo "E3 ③: gpuctl apply repaired the drift"
   else
     echo "E3 ③: gpuctl apply failed"
