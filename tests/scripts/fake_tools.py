@@ -29,12 +29,20 @@ Workers and GPU nodes (Task 14). A remote command reaches the same handler wheth
                                           is appended to $FAKE_LOG.stdin as {"target", "stdin"}, never
                                           to $FAKE_LOG, so a test can prove the token came through a pipe
   containerd     [text, ...]              successive answers to the containerd nvidia grep ("" = no match, exit 1)
+  node_time      [time, ...]              successive answers to a remote command that reads the node's clock
+                                          (`date -u +%Y-%m-%dT%H:%M:%SZ`; default 2026-10-22T10:00:00Z)
   ready          [node]                   `kubectl get node N -o jsonpath=...` prints True for these ...
   registered     [node]                   ... False for these, and NotFound (exit 1) for any other node
   api_down       true                     ... or fails like a dead tunnel, for every node
   kubectl_stderr text                     ... and, when it succeeds, also prints this on stderr (a
                                           warning or discovery error kubectl reports with exit 0)
-  never_ready    [node]                   `kubectl wait ... node/N` times out (exit 1)
+  never_ready    [node]                   `kubectl wait ... node/N` times out (exit 1), and join-node's read
+                                          of N's Ready status, heartbeat and ExternalIP says False
+  external_ip    {node: ip}               N's ExternalIP (`kubectl get node N -o jsonpath=...ExternalIP...`
+                                          alone or in join-node's read). Default: the --external-ip of N's
+                                          node-bootstrap.sh run in this test, else none
+  heartbeat      time                     the Ready heartbeat in join-node's read (default 2026-10-22T10:00:05Z,
+                                          after the default node_time)
   gone           [node]                   `kubectl drain N` / `kubectl delete node N`: NotFound (exit 1)
   drain_fail     [node]                   `kubectl drain N` fails for another reason (exit 1)
   helm_rc        rc                       exit code of `helm upgrade` (default 0)
@@ -75,6 +83,7 @@ TOKEN = "K10fakejointoken0123456789abcdef::server:s3cr3t-join"
 INSTALL_TOKEN = "sudo install -m 600 /dev/stdin /etc/rancher/k3s/token && sudo systemctl enable --now k3s-agent"
 CONTAINERD_GREP = "sudo grep -A3 nvidia /var/lib/rancher/k3s/agent/etc/containerd/config.toml"
 CONTAINERD_NVIDIA = "[plugins.'io.containerd.cri.v1.runtime'.containerd.runtimes.'nvidia']"
+NODE_CLOCK = "date -u +%Y-%m-%dT%H:%M:%SZ"
 
 
 def log():
@@ -163,10 +172,24 @@ def scp():
     return 0
 
 
+def bootstrapped():
+    """{node: external IP} of every node-bootstrap.sh run in this test."""
+    path = Path(os.environ["FAKE_LOG"] + ".bootstrapped")
+    return json.loads(path.read_text()) if path.exists() else {}
+
+
 def remote(target, command):
     """A command run on k3s-cp, a CPU worker or a GPU node."""
     if command in SCENARIO.get("ssh_fail", []):
         return SCENARIO.get("ssh_fail_rc", 1)
+    if "node-bootstrap.sh" in command:
+        name, ip = re.search(r"--node-name (\S+)", command), re.search(r"--external-ip (\S+)", command)
+        if name and ip:
+            Path(os.environ["FAKE_LOG"] + ".bootstrapped").write_text(
+                json.dumps({**bootstrapped(), name.group(1): ip.group(1)}))
+    if NODE_CLOCK in command:
+        times = SCENARIO.get("node_time", ["2026-10-22T10:00:00Z"])
+        sys.stdout.write(times[min(counter("node-time"), len(times) - 1)] + "\n")
     if command == "true":
         return 255 if counter("ssh-true") < SCENARIO.get("ssh_failures", 0) else 0
     if command == "sudo cat /etc/rancher/k3s/k3s.yaml":
@@ -209,12 +232,25 @@ def kubectl():
     args = ARGS[2:]  # after --kubeconfig FILE
     if args[:2] == ["get", "node"]:
         node = args[2]
+        query = opt("-o") or ""
         if SCENARIO.get("api_down"):
             print("Unable to connect to the server: dial tcp 127.0.0.1:6443: connect: connection refused",
                   file=sys.stderr)
             return 1
         if SCENARIO.get("kubectl_stderr") and node in SCENARIO.get("ready", []) + SCENARIO.get("registered", []):
             print(SCENARIO["kubectl_stderr"], file=sys.stderr)
+        if "ExternalIP" in query:
+            # join-node's reads of the address (and, with lastHeartbeatTime, of the Ready condition): a node
+            # bootstrapped in this test counts as registered.
+            if node not in SCENARIO.get("ready", []) + SCENARIO.get("registered", []) + list(bootstrapped()):
+                return not_found(node)
+            ip = SCENARIO.get("external_ip", {}).get(node, bootstrapped().get(node, ""))
+            if "lastHeartbeatTime" in query:
+                status = "False" if node in SCENARIO.get("never_ready", []) else "True"
+                sys.stdout.write(f"{status}|{SCENARIO.get('heartbeat', '2026-10-22T10:00:05Z')}|{ip}")
+            else:
+                sys.stdout.write(ip)
+            return 0
         if node in SCENARIO.get("ready", []):
             sys.stdout.write("True")
         elif node in SCENARIO.get("registered", []):
