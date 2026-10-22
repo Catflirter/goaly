@@ -1,11 +1,13 @@
 """Reconciler.sync_peers (design spec section 3.3): FakeLambda + FakeInfra, no cloud."""
 import io
+import json
 from pathlib import Path
 
 import pytest
 
-from fakes import DEFAULT_OUTPUTS, FakeInfra, FakeLambda
+from fakes import DEFAULT_OUTPUTS, FakeInfra, FakeLambda, FakeShell, ok
 from gpuctl.__main__ import main
+from gpuctl.infra import Infra
 from gpuctl.lambda_api import FirewallRule, Instance, Ruleset
 from gpuctl.peers import PeerSet, global_rules, nft_replace_script, region_ruleset_rules
 from gpuctl.reconcile import Reconciler, ReconcileError, Settings
@@ -115,8 +117,26 @@ def test_sync_initialises_the_workers_stack_before_reading_it():  # X0-1: a miss
     infra.ensure_init = lambda stack: (calls.append(("init", stack)), ensure_init(stack))[1]
     infra.tf_output = lambda stack: (calls.append(("output", stack)), tf_output(stack))[1]
     p = rec(FakeLambda(instances=[GPU]), infra).sync_peers(SPEC)
-    assert calls == [("output", "base"), ("init", "workers"), ("output", "workers")]
+    assert calls == [("init", "base"), ("output", "base"), ("init", "workers"), ("output", "workers")]  # B-1 (c)
     assert p.worker_ips == ("34.29.20.20",)
+
+
+def test_sync_in_a_fresh_checkout_initialises_every_stack_it_reads(tmp_path):  # B-1: real Infra, scripted shell
+    # A fresh clone, a worktree, or one where only `make tf-test` ran (.terraform/providers, no backend):
+    # gpu-down's final sync-peers must not fail on "Backend initialization required" after terminating nodes.
+    for stack in ("base", "workers"):
+        (tmp_path / "infra" / stack / ".terraform/providers").mkdir(parents=True)
+    base = {"cp_ip": "34.82.10.10", "cp_internal_ip": "10.10.0.2", "cp_zone": "us-west1-b"}
+    sh = FakeShell([ok(), ok(json.dumps({k: {"value": v} for k, v in base.items()})),
+                    ok(), ok(json.dumps({"worker_ips": {"value": {"k3s-cpu-1": "34.29.20.20"}}})), ok()])
+    infra = Infra(sh, tmp_path, {"GCP_PROJECT": "demo-proj", "OPERATOR_IP": "73.15.40.40"})
+    p = rec(FakeLambda(instances=[GPU]), infra).sync_peers(SPEC)
+    assert [c.args[1:3] for c in sh.calls] == [
+        [f"-chdir={tmp_path}/infra/base", "init"], [f"-chdir={tmp_path}/infra/base", "output"],
+        [f"-chdir={tmp_path}/infra/workers", "init"], [f"-chdir={tmp_path}/infra/workers", "output"],
+        ["compute", "ssh"]]
+    assert all("-reconfigure" in c.args for c in sh.calls if c.args[2] == "init")
+    assert p.worker_ips == ("34.29.20.20",) and p.cp_ip == "34.82.10.10"
 
 
 def test_sync_tolerates_a_workers_stack_missing_from_the_checkout(capsys):  # brief step 2: empty + warning

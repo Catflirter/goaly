@@ -32,6 +32,11 @@ TF_READ_TIMEOUT_S = 300.0
 # init downloads providers (the Google provider is large), so it gets longer. A failed or killed init removes the
 # .terraform it created, so the next ensure_init runs init again instead of trusting a half-initialised stack.
 TF_INIT_TIMEOUT_S = 900.0
+# Written into infra/<stack>/.terraform only after an init against the GCS backend succeeded; it holds
+# "gcs <bucket> <stack>". scripts/lib/common.sh tf_init uses the same file and text, so the shell scripts and gpuctl
+# agree on what an initialised stack is. A bare .terraform proves nothing: `terraform init -backend=false` (an
+# offline validate) or a killed init leaves one without a usable backend.
+TF_INIT_MARKER = "k3s-tf-init.ok"
 _ZONE_RE = re.compile(r"[a-z0-9]+(?:-[a-z0-9]+)*")
 _NODE_NAME_RE = re.compile(r"[a-z0-9]+(?:-[a-z0-9]+)*")
 # A GPU type label as gpu_type_label() returns it (a6000, a100_80gb_sxm4); also a valid K8s label value (<= 63).
@@ -154,32 +159,47 @@ class Infra:
         return self.repo_root / "infra" / stack
 
     def _terraform(self, stack: str, *args: str, timeout: float | None = None) -> subprocess.CompletedProcess[str]:
-        return self.shell.run(["terraform", f"-chdir={self._stack_dir(stack)}", *args], env=self._tf_env(),
-                              timeout=timeout)
+        # -no-color right after the subcommand: a CommandError carries terraform's stderr to the operator, and
+        # colour codes would reach the terminal as ?[31m junk.
+        command, *rest = args
+        return self.shell.run(["terraform", f"-chdir={self._stack_dir(stack)}", command, "-no-color", *rest],
+                              env=self._tf_env(), timeout=timeout)
 
     def ensure_init(self, stack: str) -> None:
-        """terraform init the stack against its GCS state prefix, unless infra/<stack>/.terraform already exists.
+        """terraform init the stack against its GCS state prefix, unless its last init did exactly that.
 
+        Initialised means .terraform/k3s-tf-init.ok (TF_INIT_MARKER) reads "gcs <GCP_PROJECT>-k3s-tfstate <stack>",
+        the marker scripts/lib/common.sh tf_init writes too. A .terraform without it (an offline
+        `terraform init -backend=false`, an interrupted init, a marker for another project's bucket) is initialised
+        again with -reconfigure, which switches the backend without copying any old state into it.
         A stack that is not in this checkout raises MissingStackError (a CommandError). If init fails or is
-        interrupted (a timeout included), the .terraform it created is removed: terraform writes the backend config
-        there before it downloads providers, and a leftover directory would make every later call skip init.
+        interrupted (a timeout included), .terraform is removed, so nothing half-initialised is left behind.
         -lockfile=readonly (Ruling R26(b)): providers are verified against the committed .terraform.lock.hcl, which
         init never rewrites, so even the read-only `gpuctl status` cannot change a tracked file.
         """
         stack_dir = self._stack_dir(stack)
-        dot_terraform = stack_dir / ".terraform"
-        if dot_terraform.exists():
-            return
         if not stack_dir.is_dir():
             raise MissingStackError(["terraform", f"-chdir={stack_dir}", "init"], 1,
                                     f"infra/{stack} does not exist in this checkout")
         project = self._project()
         if not project:
             raise ValueError(f"GCP_PROJECT is not set: cannot locate the state bucket to init infra/{stack}")
+        bucket = f"{project}-k3s-tfstate"
+        dot_terraform = stack_dir / ".terraform"
+        marker = dot_terraform / TF_INIT_MARKER
+        want = f"gcs {bucket} {stack}"
         try:
-            self._terraform(stack, "init", "-input=false", "-lockfile=readonly",
-                            f"-backend-config=bucket={project}-k3s-tfstate",
-                            f"-backend-config=prefix={stack}", timeout=TF_INIT_TIMEOUT_S)
+            if marker.read_text().rstrip("\n") == want:
+                return
+        except OSError:  # no marker (or no .terraform): not initialised
+            pass
+        try:
+            marker.unlink(missing_ok=True)
+            self._terraform(stack, "init", "-input=false", "-lockfile=readonly", "-reconfigure",
+                            f"-backend-config=bucket={bucket}", f"-backend-config=prefix={stack}",
+                            timeout=TF_INIT_TIMEOUT_S)
+            dot_terraform.mkdir(exist_ok=True)
+            marker.write_text(want + "\n")
         except BaseException:  # CommandError, a timeout, or Ctrl-C mid-download
             shutil.rmtree(dot_terraform, ignore_errors=True)
             raise
@@ -215,6 +235,7 @@ class Infra:
 
     def _zone(self) -> str:
         if self._cp_zone is None:
+            self.ensure_init("base")  # a fresh clone or worktree has never initialised infra/base
             zone = self.tf_output("base").get("cp_zone")
             if not isinstance(zone, str) or not _ZONE_RE.fullmatch(zone):
                 raise ValueError(f"infra/base output cp_zone is missing or invalid: {zone!r}")

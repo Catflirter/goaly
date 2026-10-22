@@ -26,7 +26,7 @@ from gpuctl.planner import (
 )
 from gpuctl.reconcile import Reconciler, ReconcileError, Settings, load_overrides
 from gpuctl.spec import Spec, SpecError, load_spec
-from gpuctl.status import capacity_rows, is_problem, render_capacity
+from gpuctl.status import DRIFT_SOURCES, capacity_rows, is_problem, render_capacity
 
 REPO_ROOT = Path(__file__).resolve().parents[2]
 DEFAULT_SPEC = REPO_ROOT / "lambda" / "gpu-nodes.yaml"
@@ -158,7 +158,10 @@ def _status(args: argparse.Namespace, spec: Spec, client, infra, env: Mapping[st
         _emit(out, f"  {line}")
     problems = [line for line in lines if is_problem(line)]
     if not problems:
-        _emit(out, "  No drift")
+        skipped = len(lines)
+        # A skipped source (the gpu-access state, say) is not an all-clear: never print a bare "No drift" then.
+        _emit(out, f"  No drift in the {len(DRIFT_SOURCES) - skipped} sources read; {skipped} source(s) skipped "
+                   "(see above)" if skipped else "  No drift")
         return EXIT_OK
     _emit(out, f"  {len(problems)} problem(s); make gpu-apply reconciles the firewall and the instance counts")
     return EXIT_DRIFT

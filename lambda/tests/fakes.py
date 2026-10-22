@@ -204,12 +204,17 @@ class FakeShell:
     """Replays `results` in order, one per run(), and records every call in `calls`.
 
     Like SubprocessShell, a non-zero exit code raises CommandError when check=True. A result that is an exception
-    is raised instead. Running out of results fails the test: every command a test causes must be scripted.
+    is raised instead. Running out of results fails the test: every command a test causes must be scripted. So does
+    leaving results unused (conftest.py checks every FakeShell a test made): a test whose commands never ran is
+    vacuous.
     """
+
+    created: list[FakeShell] = []  # every instance, for conftest.py's unused-results check
 
     def __init__(self, results: Iterable[subprocess.CompletedProcess[str] | Exception]) -> None:
         self.results = list(results)
         self.calls: list[ShellCall] = []
+        FakeShell.created.append(self)
 
     def run(self, args: Sequence[str], *, input: str | None = None, check: bool = True,
             timeout: float | None = None, env: Mapping[str, str] | None = None) -> subprocess.CompletedProcess[str]:
@@ -234,7 +239,8 @@ DEFAULT_OUTPUTS = {
 class FakeInfra:
     """Terraform outputs, cp SSH, kubectl and join-node in memory.
 
-    `outputs[stack]` is what tf_output returns; a stack missing from it raises CommandError (it cannot be read).
+    `outputs[stack]` is what tf_output returns; a stack missing from it, or not passed to ensure_init first (like
+    terraform on a stack never initialised against its backend), raises CommandError (it cannot be read).
     ensure_init raises MissingStackError for a stack in `missing` (not in the checkout, like Infra) and
     CommandError for a stack in `init_fail`. `events` records the side effects in order:
     "tf:<gpu ips>" for apply_gpu_access (its max_nodes go to `applied_max_nodes`), "nft" for the cp peer-set push,
@@ -273,7 +279,9 @@ class FakeInfra:
         self.initialised.append(stack)
 
     def tf_output(self, stack: str) -> dict:
-        if stack not in self.outputs:
+        # Like terraform output on a stack never initialised against its backend (B-1): every caller must run
+        # ensure_init(stack) first, or a fresh clone fails here.
+        if stack not in self.initialised or stack not in self.outputs:
             raise CommandError(["terraform", f"-chdir=infra/{stack}", "output", "-json"], 1,
                                "Backend initialization required")
         return dict(self.outputs[stack])
