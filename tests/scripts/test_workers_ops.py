@@ -82,6 +82,11 @@ def worker(name, command, zone="us-central1-a"):
     return ("gcloud", ["compute", "ssh", name, *worker_iap(zone), "--command", command])
 
 
+def vm_status(name, zone="us-central1-a"):
+    return ("gcloud", ["compute", "instances", "describe", name, "--project", PROJECT, "--zone", zone,
+                       "--format=value(status)"])
+
+
 def node_files(env):
     return sorted(str(p) for p in (env.repo.resolve() / "node").iterdir())
 
@@ -121,6 +126,7 @@ def cpu_join(env, name="k3s-cpu-1", ip="34.10.0.11", zone="us-central1-a", mtu="
     return [
         *([("gpuctl", ["sync-peers"])] if sync else []),
         get_node(env, name),
+        vm_status(name, zone),  # a stopped or suspended VM fails at once, not after the SSH wait (M4-2)
         worker(name, "true", zone),  # SSH is up (a VM made seconds ago may not have sshd yet: L3-1)
         worker(name, STAGING, zone),
         ("gcloud", ["compute", "scp", "--project", PROJECT, "--zone", zone, "--tunnel-through-iap", "--quiet",
@@ -294,9 +300,9 @@ def test_join_waits_for_ssh_on_a_vm_created_seconds_ago(env):
     assert proc.returncode == 0, proc.stderr
     probe = worker("k3s-cpu-1", "true")
     expected = cpu_join(env, sync=False)
-    assert calls(env) == [*expected[:1], probe, probe, probe, *expected[1:]]
+    assert calls(env) == [*expected[:2], probe, probe, probe, *expected[2:]]
     assert calls(env).count(worker("k3s-cpu-1", STAGING)) == 1
-    assert "waiting up to 300s for: node_ssh k3s-cpu-1 true" in proc.stderr
+    assert "waiting up to 300s for: ssh_probe k3s-cpu-1" in proc.stderr
     assert_token_only_piped(env, proc, ["k3s-cpu-1"])
 
 
@@ -312,18 +318,25 @@ def test_join_gpu_node_waits_for_ssh_after_the_instance_turns_active(env):
 
 def test_join_gives_up_when_ssh_never_comes_up(env):
     """The SSH wait is bounded: after JOIN_SSH_TIMEOUT_S the join dies naming the node, before any staging,
-    bootstrap or token."""
+    bootstrap or token.
+
+    The budget is 2s, not 1s (S4-1/C4-1/X4-1): wait_for's deadline is SECONDS + TIMEOUT_S and bash's
+    SECONDS steps on whole wall-clock seconds, so a 1s deadline can pass a few ms after the wait
+    starts and end it after a single probe. A 2s deadline is at least 1s of wall time away, so unless
+    the first probe takes over 1s, the wait sleeps WAIT_INTERVAL_S and probes again."""
     env.scenario["ssh_failures"] = 10**6
     start = time.time()
     proc = join(env, "--node", "k3s-cpu-1", "--external-ip", "34.10.0.11", "--skip-sync",
-                JOIN_SSH_TIMEOUT_S="1", WAIT_INTERVAL_S="1")
+                JOIN_SSH_TIMEOUT_S="2", WAIT_INTERVAL_S="1")
     assert time.time() - start < 15
     assert proc.returncode == 1
-    assert "SSH to k3s-cpu-1 not available after 1s" in proc.stderr
+    assert "SSH to k3s-cpu-1 not available after 2s" in proc.stderr
     assert "make cpu-start" in proc.stderr, "a stopped worker has no SSH"
     seq = calls(env)
-    assert seq[0] == get_node(env, "k3s-cpu-1")
-    assert len(seq) >= 2 and all(c == worker("k3s-cpu-1", "true") for c in seq[1:]), "only SSH probes, retried"
+    probe = worker("k3s-cpu-1", "true")
+    assert seq[:2] == [get_node(env, "k3s-cpu-1"), vm_status("k3s-cpu-1")]
+    assert all(c == probe for c in seq[2:]), "only SSH probes after the Ready and VM status checks"
+    assert seq.count(probe) >= 2, "the probe is retried (M4-1)"
     assert piped(env) == []
 
 
@@ -333,6 +346,95 @@ def test_join_gpu_node_gives_up_when_ssh_never_comes_up(env):
     assert proc.returncode == 1
     assert f"SSH to {GPU} not available after 0s" in proc.stderr and f"known_hosts_{GPU}" in proc.stderr
     assert calls(env) == [get_node(env, GPU), gpu(env, "true")]
+
+
+def fast_join(env, *args):
+    """A join that must fail without waiting: SSH is down, and a wait would take 20s, not 0."""
+    env.scenario["ssh_failures"] = 10**6
+    start = time.time()
+    proc = join(env, *args, "--skip-sync", JOIN_SSH_TIMEOUT_S="20", WAIT_INTERVAL_S="1")
+    assert time.time() - start < 15, "it waited for SSH"
+    return proc
+
+
+@pytest.mark.parametrize("status", ["TERMINATED", "STOPPED", "STOPPING"])
+def test_join_of_a_stopped_worker_fails_at_once(env, status):
+    """M4-2: a worker stopped with make cpu-stop never gets SSH: the join reads its VM status and dies at
+    once with the cure, instead of waiting JOIN_SSH_TIMEOUT_S (300s) for nothing (make up joins every
+    worker)."""
+    env.scenario["vm_status"] = {"k3s-cpu-1": status}
+    proc = fast_join(env, "--node", "k3s-cpu-1", "--external-ip", "34.10.0.11")
+    assert proc.returncode == 1
+    assert f"the VM of k3s-cpu-1 is {status}" in proc.stderr and "make cpu-start" in proc.stderr
+    assert calls(env) == [get_node(env, "k3s-cpu-1"), vm_status("k3s-cpu-1")]
+
+
+@pytest.mark.parametrize("status", ["SUSPENDED", "SUSPENDING"])
+def test_join_of_a_suspended_worker_fails_at_once_naming_resume(env, status):
+    """make cpu-start (gcloud compute instances start) does not wake a suspended VM: resume does."""
+    env.scenario["vm_status"] = {"k3s-cpu-1": status}
+    proc = fast_join(env, "--node", "k3s-cpu-1", "--external-ip", "34.10.0.11")
+    assert proc.returncode == 1
+    assert f"the VM of k3s-cpu-1 is {status}" in proc.stderr
+    assert f"gcloud compute instances resume k3s-cpu-1 --project {PROJECT} --zone us-central1-a" in proc.stderr
+    assert "cpu-start" not in proc.stderr
+    assert calls(env) == [get_node(env, "k3s-cpu-1"), vm_status("k3s-cpu-1")]
+
+
+@pytest.mark.parametrize("status", ["PROVISIONING", "STAGING", "RUNNING", "REPAIRING"])
+def test_join_of_a_starting_or_running_worker_waits_for_ssh(env, status):
+    """A VM on its way up (or up) gets the bounded SSH wait (L3-1), not the fail-fast."""
+    env.scenario["vm_status"] = {"k3s-cpu-1": status}
+    env.scenario["ssh_failures"] = 2
+    proc = join(env, "--node", "k3s-cpu-1", "--external-ip", "34.10.0.11", "--skip-sync", WAIT_INTERVAL_S="0")
+    assert proc.returncode == 0, proc.stderr
+    probe = worker("k3s-cpu-1", "true")
+    expected = cpu_join(env, sync=False)
+    assert calls(env) == [*expected[:2], probe, probe, *expected[2:]]
+
+
+def test_join_refuses_an_unexpected_vm_status(env):
+    env.scenario["vm_status"] = {"k3s-cpu-1": "RUNNING; reboot"}
+    proc = fast_join(env, "--node", "k3s-cpu-1", "--external-ip", "34.10.0.11")
+    assert proc.returncode == 1 and "unexpected status" in proc.stderr
+    assert calls(env) == [get_node(env, "k3s-cpu-1"), vm_status("k3s-cpu-1")]
+
+
+HOST_KEY_CHANGED = """@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@
+@    WARNING: REMOTE HOST IDENTIFICATION HAS CHANGED!     @
+@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@
+Host key for 129.80.1.2 has changed and you have requested strict checking.
+Host key verification failed."""
+
+
+@pytest.mark.parametrize("stderr", [HOST_KEY_CHANGED, "Host key verification failed."])
+def test_join_gpu_node_stops_waiting_when_the_host_key_is_rejected(env, stderr):
+    """M4-2: Lambda hands a terminated instance's IP to a new one; the old key in .run/known_hosts_NAME
+    rejects it on every try. The first such probe ends the wait and the join dies naming that file."""
+    env.scenario["ssh_stderr"] = stderr
+    proc = fast_join(env, "--node", GPU, "--external-ip", GPU_IP, "--gpu-type", "a6000")
+    assert proc.returncode == 1
+    assert f"{env.repo.resolve()}/.run/known_hosts_{GPU}" in proc.stderr
+    assert "Host key verification failed" in proc.stderr, "the probe's own ssh error is shown"
+    assert "not available after" not in proc.stderr
+    assert calls(env) == [get_node(env, GPU), gpu(env, "true")]
+
+
+def test_join_cpu_worker_stops_waiting_when_the_host_key_is_rejected(env):
+    env.scenario["ssh_stderr"] = "Host key verification failed."
+    proc = fast_join(env, "--node", "k3s-cpu-1", "--external-ip", "34.10.0.11")
+    assert proc.returncode == 1
+    assert "google_compute_known_hosts" in proc.stderr and "not available after" not in proc.stderr
+    assert calls(env) == [get_node(env, "k3s-cpu-1"), vm_status("k3s-cpu-1"), worker("k3s-cpu-1", "true")]
+
+
+def test_join_keeps_waiting_through_other_ssh_errors(env):
+    """Only a rejected host key ends the wait early: a refused connection (no sshd yet) is retried."""
+    env.scenario["ssh_stderr"] = "ssh: connect to host 129.80.1.2 port 22: Connection refused"
+    env.scenario["ssh_failures"] = 2
+    proc = gpuctl_join(env, WAIT_INTERVAL_S="0")
+    assert proc.returncode == 0, proc.stderr
+    assert calls(env).count(gpu(env, "true")) == 3
 
 
 def test_join_of_a_ready_node_needs_no_ssh(env):
@@ -353,11 +455,11 @@ def test_join_stops_when_the_staging_directory_cannot_be_made_private(env):
 
 
 def test_join_stops_when_the_bootstrap_fails_before_any_token(env):
-    bootstrap = cpu_join(env)[5][1][-1]
+    bootstrap = cpu_join(env)[6][1][-1]
     env.scenario["ssh_fail"] = [bootstrap]
     proc = join(env, "--node", "k3s-cpu-1", "--external-ip", "34.10.0.11")
     assert proc.returncode != 0
-    assert calls(env) == cpu_join(env)[:6] and piped(env) == []
+    assert calls(env) == cpu_join(env)[:7] and piped(env) == []
 
 
 def test_join_deletes_the_token_when_the_node_never_becomes_ready(env):
@@ -409,7 +511,7 @@ def test_join_stops_when_the_agent_cannot_be_stopped(env):
     env.scenario["ssh_fail"] = [STOP_AGENT]
     proc = join(env, "--node", "k3s-cpu-1", "--external-ip", "34.10.0.11", "--skip-sync")
     assert proc.returncode == 1 and "cannot stop k3s-agent" in proc.stderr
-    assert calls(env) == cpu_join(env, sync=False)[:6] and piped(env) == []
+    assert calls(env) == cpu_join(env, sync=False)[:7] and piped(env) == []
 
 
 def test_join_of_a_ready_node_ignores_kubectl_noise_on_stderr(env):
@@ -909,11 +1011,6 @@ def leftovers(env):
     return sorted(p.name for p in run.iterdir() if p.suffix in (".tfplan", ".json")) if run.exists() else []
 
 
-def vm_status(name, zone="us-central1-a"):
-    return ("gcloud", ["compute", "instances", "describe", name, "--project", PROJECT, "--zone", zone,
-                       "--format=value(status)"])
-
-
 def test_scale_up_writes_applies_syncs_then_joins_the_new_worker(env):
     set_workers(env, {"k3s-cpu-1": "34.10.0.11", "k3s-cpu-2": "34.10.0.12"})
     env.scenario["ready"] = ["k3s-cpu-1"]
@@ -1046,6 +1143,12 @@ def test_scale_does_not_join_a_stopped_worker(env, status):
                           ("gpuctl", ["sync-peers"]),
                           *cpu_join(env, "k3s-cpu-3", "34.10.0.13", sync=False), ("gpuctl", ["sync-peers"])]
     assert f"k3s-cpu-2 is registered but NotReady and its VM is {status}" in proc.stderr
+    assert "then make cpu-scale again" not in proc.stderr
+    if status == "SUSPENDED":
+        assert f"gcloud compute instances resume k3s-cpu-2 --project {PROJECT} --zone us-central1-a" in proc.stderr
+        assert "cpu-start" not in proc.stderr
+    else:
+        assert "make cpu-start" in proc.stderr and "resume" not in proc.stderr
 
 
 def test_scale_rerun_after_a_join_timeout_joins_the_running_worker_again(env):

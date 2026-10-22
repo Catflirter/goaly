@@ -454,6 +454,24 @@ def test_wait_for_gives_up_after_the_timeout(env):
     assert "still-down" in proc.stderr, "the last attempt's output helps the operator"
 
 
+def test_wait_for_stops_at_once_on_the_stop_code(env):
+    """wait_for CMD TIMEOUT STOP_RC: an attempt that exits STOP_RC can never succeed (M4-2: a rejected
+    host key); the wait ends at once and returns STOP_RC, showing that attempt's output."""
+    start = time.time()
+    proc = env.lib('f="$TMPDIR/tries"; : > "$f"; rc=0; wait_for "echo . >> $f; echo key-rejected >&2; exit 7" 30 7'
+                   ' || rc=$?; echo "rc=$rc tries=$(( $(wc -l < "$f") ))"; rm -f "$f"', WAIT_INTERVAL_S="1")
+    assert proc.stdout.strip() == "rc=7 tries=1" and time.time() - start < 10
+    assert "key-rejected" in proc.stderr
+    assert list(env.tmpdir.iterdir()) == []
+
+
+def test_wait_for_retries_other_failures_when_given_a_stop_code(env):
+    proc = env.lib('f="$TMPDIR/tries"; : > "$f"; wait_for "echo . >> $f; (( \\$(wc -l < $f) >= 3 ))" 30 7; '
+                   'echo "tries=$(( $(wc -l < "$f") ))"; rm -f "$f"', WAIT_INTERVAL_S="0")
+    assert proc.returncode == 0, proc.stderr
+    assert proc.stdout.strip() == "tries=3"
+
+
 # ---- common.sh: tf_apply ---------------------------------------------------------------------
 
 def tf_subcommands(env):
@@ -887,7 +905,7 @@ def non_tf(env):
     """gcloud/kubectl calls in order, without the tunnel and the /readyz probes: the backgrounded
     fake tunnel logs its call concurrently with tunnel.sh's first probes. What is deterministic is
     checked here: one tunnel, started after the kubeconfig fetch, and a successful probe after it
-    and before the first `kc wait`."""
+    (the fake logs a probe once it has its answer) and before the first `kc wait`."""
     calls = [(c["tool"], c["argv"]) for c in env.calls() if c["tool"] != "terraform"]
     assert tunnels(env) == [tunnel_argv(env)]
     tunnel_at = calls.index(("gcloud", tunnel_argv(env)))

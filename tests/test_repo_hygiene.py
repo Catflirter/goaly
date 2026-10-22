@@ -14,6 +14,9 @@ def ignored(path):
 @pytest.mark.parametrize("path", [
     ".env", ".env.local", ".env.bak", "kubeconfig", "kubeconfig.yaml", "x.tfvars",
     "infra/base/terraform.tfstate", "verification/run1.txt",
+    # Task 24a: every verify run but final/, and promote.sh's staging copy, stay out of git.
+    "verification/2026-10-21T1430-0700/SUMMARY.md", "verification/2026-10-21T1430-0700/01-A1.txt",
+    "verification/.promote-a1B2c3/final/SUMMARY.md", "verification/.promote.lock",
     # The workflow makes .venv a symlink to a shared venv; ".venv/" would match only a directory.
     ".venv"])
 def test_secret_and_state_files_are_ignored(path):
@@ -21,7 +24,8 @@ def test_secret_and_state_files_are_ignored(path):
 
 @pytest.mark.parametrize("path", [
     ".env.example", "scripts/kubeconfig.sh", "x.auto.tfvars.json",
-    "verification/.gitkeep", "verification/final/a.txt"])
+    "verification/.gitkeep", "verification/final/a.txt",
+    "verification/final/SUMMARY.md", "verification/final/01-A1.txt", "verification/final/nested/02-B1.txt"])
 def test_deliverable_files_are_not_ignored(path):
     assert not ignored(path)
 

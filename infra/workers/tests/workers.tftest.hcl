@@ -66,7 +66,7 @@ run "one_worker" {
     condition = (google_compute_instance.worker["k3s-cpu-1"].metadata["enable-oslogin"] == "TRUE"
       && google_compute_instance.worker["k3s-cpu-1"].metadata["block-project-ssh-keys"] == "TRUE"
     && google_compute_instance.worker["k3s-cpu-1"].can_ip_forward == false)
-    error_message = "OS Login on, project SSH keys blocked, no ip forwarding"
+    error_message = "OS Login on, project SSH keys blocked, GCE can_ip_forward off (anti-spoofing at the NIC)"
   }
   assert {
     condition = (google_compute_instance.worker["k3s-cpu-1"].boot_disk[0].initialize_params[0].image == "ubuntu-os-cloud/ubuntu-2404-lts-amd64"
