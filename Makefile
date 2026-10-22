@@ -58,6 +58,12 @@ init: ## Create the Terraform state bucket and enable the GCP APIs (infra/bootst
 up: ## Bring the cluster up: base, k3s-cp, kubeconfig, tunnel, CPU workers, system components, workloads (safe to re-run)
 	$(ROOT)/scripts/up.sh all
 
+# Ordered teardown (spec §11): asks once for the GCP project id (AUTO_APPROVE=1 skips it); the
+# bootstrap stack (state bucket) is kept. Safe to re-run after a partial teardown.
+.PHONY: down
+down: ## Tear everything down: GPU nodes, CPU workers, gpu-access/workers/base stacks, tunnel (keeps bootstrap)
+	$(ROOT)/scripts/down.sh
+
 # The CPU worker pool (spec §5.3). Removing a worker drains it and deletes it from the cluster
 # before the apply destroys its VM; k3s-cpu-1 is never removed.
 .PHONY: cpu-scale cpu-remove cpu-stop cpu-start

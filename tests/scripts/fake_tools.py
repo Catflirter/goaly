@@ -46,6 +46,16 @@ Workers and GPU nodes (Task 14). A remote command reaches the same handler wheth
                                           (default RUNNING)
 
 A plan run with -var-file=FILE copies FILE's text to $FAKE_LOG.var-file, so a test can see what it planned.
+
+Teardown (Task 22a, scripts/down.sh):
+
+  destroy_rc     {stack: rc}              terraform destroy exit code (default 0)
+  nodes          [node]                   `kubectl get nodes -o name` lists these (default k3s-cp, k3s-cpu-1);
+                                          it fails like a dead tunnel under api_down
+  kubectl_hang   true                     every kubectl call except /readyz hangs (a half-open tunnel)
+  gpu_down_rc    rc                       exit code of `scripts/gpuctl down` (default 0)
+  gpu_nodes      [line]                   what `scripts/gpuctl list-nodes` prints, one line each (default none)
+  list_nodes_rc  rc                       exit code of `scripts/gpuctl list-nodes` (default 0)
 """
 import json
 import os
@@ -118,6 +128,8 @@ def terraform():
         return 0
     if sub == "apply":
         return 0
+    if sub == "destroy":
+        return SCENARIO.get("destroy_rc", {}).get(stack, 0)
     return 1
 
 
@@ -199,6 +211,17 @@ def kubectl():
         sys.stdout.write("ok")
         return 0
     args = ARGS[2:]  # after --kubeconfig FILE
+    if SCENARIO.get("kubectl_hang"):
+        time.sleep(300)
+        return 1
+    if args[:2] == ["get", "nodes"]:
+        if SCENARIO.get("api_down"):
+            print("Unable to connect to the server: dial tcp 127.0.0.1:6443: connect: connection refused",
+                  file=sys.stderr)
+            return 1
+        for node in SCENARIO.get("nodes", ["k3s-cp", "k3s-cpu-1"]):
+            print(f"node/{node}")
+        return 0
     if args[:2] == ["get", "node"]:
         node = args[2]
         if SCENARIO.get("api_down"):
@@ -239,6 +262,12 @@ def gpuctl():
     if ARGS[:1] == ["ip"]:
         sys.stdout.write(SCENARIO.get("gpu_ip", "") + "\n")
         return 0
+    if ARGS[:1] == ["down"]:
+        return SCENARIO.get("gpu_down_rc", 0)
+    if ARGS[:1] == ["list-nodes"]:
+        for line in SCENARIO.get("gpu_nodes", []):
+            print(line)
+        return SCENARIO.get("list_nodes_rc", 0)
     return 1
 
 
