@@ -14,8 +14,10 @@
 #   3. drain every CPU worker (k3s-cpu-<n>) the cluster lists and delete its Node. An unreachable
 #      cluster (tunnel down, k3s-cp gone, no kubeconfig) skips this step with a warning, and so does a
 #      cluster that is not this project's (Node k3s-cp's ExternalIP is not the base stack's cp_ip:
-#      ~/.kube/hybrid-gpu.yaml and the tunnel port are one per user, not one per project). A failed
-#      drain or delete is only a warning: the destroys below remove the VMs and the cluster anyway.
+#      ~/.kube/hybrid-gpu.yaml and the tunnel port are one per user, not one per project), and so,
+#      with one line, does a workers stack whose state lists no resource (its VMs are gone; the state
+#      is listed once, and the workers destroy reuses the answer). A failed drain or delete is only a
+#      warning: the destroys below remove the VMs and the cluster anyway.
 #      Every kubectl call is killed after DOWN_KC_KILL_S seconds (default 180), so a half-open tunnel
 #      cannot hang the teardown.
 #   4. terraform destroy -auto-approve -input=false for gpu-access, workers and base, in that order,
@@ -57,7 +59,8 @@
 #     (terraform output -json prints {}) as no CPU workers; only a real terraform error reading it fails
 #     gpuctl down (Ruling R29), and then the workers destroy, which meets the same error, stops the run.
 #     The destroys skip the stacks whose state lists no resource and destroy base as usual. The workers'
-#     Nodes may still be listed (NotReady): their drains fail and are only warnings.
+#     Nodes may still be listed (NotReady): they are not drained (each drain would only wait out its
+#     timeout, review F2b-3), and the base destroy removes them with the cluster.
 #   - base destroyed, workers (or gpu-access) not, an order make down never leaves but a hand-run
 #     destroy can: gpuctl down finds the cluster gone (Ruling R54) and does not read the workers stack;
 #     the drains are skipped (no API server answers). A destroy that refreshes workers or gpu-access
@@ -223,6 +226,10 @@ drain_workers() {
     return 0
   fi
   same_cluster || return 0
+  if workers_destroyed; then
+    log "the workers stack's state lists no resource (destroyed by an earlier run): skipping the drains of ${workers[*]}, whose VMs are gone (each drain would only wait out its timeout); the base destroy removes their Nodes with the cluster"
+    return 0
+  fi
   while read -r name; do
     log "draining $name and deleting it from the cluster"
     kc_bounded drain "$name" --ignore-daemonsets --delete-emptydir-data --force --timeout=120s \
@@ -243,6 +250,35 @@ stack_resources() {
   printf '%s\n' "$listed" | grep -Ev '^(module\.[^.[]+(\[[^]]*\])?\.)*data\.' || true
 }
 
+# list_state STACK: STACK's resources (stack_resources) into STATE_RESOURCES; fails as stack_resources
+# does. The caller has run tf_init. The workers stack is listed once, by drain_workers, and destroy_stack
+# reuses that answer (review F2b-3): only the gpu-access destroy comes between, which leaves the workers
+# state as it is.
+WORKERS_LIST_RC="" WORKERS_RESOURCES="" STATE_RESOURCES=""
+list_state() {
+  local rc=0
+  if [[ "$1" == workers && -n "$WORKERS_LIST_RC" ]]; then
+    STATE_RESOURCES="$WORKERS_RESOURCES"
+    return "$WORKERS_LIST_RC"
+  fi
+  STATE_RESOURCES="$(stack_resources "$1")" || rc=$?
+  if [[ "$1" == workers ]]; then
+    WORKERS_RESOURCES="$STATE_RESOURCES" WORKERS_LIST_RC="$rc"
+  fi
+  return "$rc"
+}
+
+# workers_destroyed: true when the workers stack's state lists no resource (a make down stopped after its
+# workers destroy, D-3). Not knowing is not "gone": a workers stack that cannot be initialised (in a
+# subshell: its error is only a warning here; the workers destroy stops the run on it) or listed is not.
+workers_destroyed() {
+  if ! (tf_init workers) || ! list_state workers; then
+    log "warning: cannot list the workers stack's state (error above): draining the CPU workers as usual"
+    return 1
+  fi
+  [[ -z "$STATE_RESOURCES" ]]
+}
+
 # base_destroyed: true when the base stack's state lists no resource. A state that cannot be listed is
 # not destroyed (not knowing is not "gone").
 base_destroyed() {
@@ -254,13 +290,13 @@ base_destroyed() {
 
 # Step 4, for one stack (see "Re-runs" in the header for the two cases below).
 destroy_stack() {
-  local stack="$1" dir rc=0 resources
+  local stack="$1" dir rc=0
   local -a no_refresh=()
   log "==> terraform destroy $stack"
   dir="$(tf_dir "$stack")" || exit
   tf_init "$stack"
-  if resources="$(stack_resources "$stack")"; then
-    if [[ -z "$resources" ]]; then
+  if list_state "$stack"; then
+    if [[ -z "$STATE_RESOURCES" ]]; then
       log "$stack: nothing in its state (destroyed by an earlier run, or never applied); skipping terraform destroy"
       return 0
     fi

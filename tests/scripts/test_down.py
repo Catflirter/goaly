@@ -80,9 +80,11 @@ def list_nodes(env):
     return kc(env, "get", "nodes", "-o", "name", "--request-timeout=20s")
 
 
-def destroys(env, stacks=STACKS, base_initialised=False):
+def destroys(env, stacks=STACKS, base_initialised=False, workers_listed=False):
+    """`workers_listed`: the drains listed the workers state already (review F2b-3), and its destroy reuses that."""
+    listed_once = [init(env, "workers"), state_list(env, "workers")] if workers_listed else []
     return [call for stack in stacks for call in (init(env, stack), state_list(env, stack), destroy(env, stack))
-            if not (base_initialised and call == init(env, "base"))]
+            if not (base_initialised and call == init(env, "base")) and call not in listed_once]
 
 
 def same_cluster(env):
@@ -95,11 +97,18 @@ GPU_DOWN = ("gpuctl", ["down", "--auto-approve"])
 LIST_GPU = ("gpuctl", ["list-nodes"])
 
 
+def workers_state(env):
+    """Before draining (review F2b-3): a workers stack whose state lists no resource has no VMs left to drain. Listed
+    once: the workers destroy reuses the answer."""
+    return [init(env, "workers"), state_list(env, "workers")]
+
+
 def sequence(env, workers=("k3s-cpu-1",), stacks=STACKS, final=True):
     """The calls of a complete make down, in order (brief steps 2-5, then Lambda is asked once more)."""
-    check = same_cluster(env) if workers else []
+    check = [*same_cluster(env), *workers_state(env)] if workers else []
     return [GPU_DOWN, list_nodes(env), *check, *[call for name in workers for call in drain(env, name)],
-            *destroys(env, stacks, base_initialised=bool(workers)), *([LIST_GPU] if final else [])]
+            *destroys(env, stacks, base_initialised=bool(workers), workers_listed=bool(workers)),
+            *([LIST_GPU] if final else [])]
 
 
 def calls(env):
@@ -668,6 +677,44 @@ def test_only_cpu_workers_are_drained(env):
 
 # ---- step 4: the destroys, failures and re-runs ------------------------------------------------
 
+def test_workers_with_nothing_in_their_state_are_not_drained(env):
+    """PR #104 review F2b-3: a make down stopped after the workers destroy leaves the workers' Nodes listed, NotReady,
+    with no VM behind them; each drain would wait out its 120 s timeout. The workers state is listed once, before
+    the drains: it lists no resource, so the drains are skipped with one line, and the workers destroy reuses the
+    answer (no second state list)."""
+    env.scenario["nodes"] = ["k3s-cp", "k3s-cpu-1", "k3s-cpu-2"]
+    env.scenario["answers"] = [listed("gpu-access"), listed("workers"), listed("base", BASE_RESOURCES)]
+    proc = down(env, AUTO_APPROVE="1")
+    assert proc.returncode == 0, proc.stderr
+    assert calls(env) == [GPU_DOWN, list_nodes(env), *same_cluster(env), *workers_state(env),
+                          init(env, "gpu-access"), state_list(env, "gpu-access"), state_list(env, "base"),
+                          destroy(env, "base"), LIST_GPU]
+    assert "the workers stack's state lists no resource" in proc.stderr
+    assert "skipping the drains of k3s-cpu-1 k3s-cpu-2" in proc.stderr
+    assert "workers: nothing in its state" in proc.stderr and "make down: done" in proc.stderr
+
+
+def test_workers_with_resources_in_their_state_are_drained(env):
+    env.scenario["answers"] = [listed("workers", WORKER_RESOURCES)]
+    proc = down(env, AUTO_APPROVE="1")
+    assert proc.returncode == 0, proc.stderr
+    expected = sequence(env)
+    # A workers state with resources: its destroy asks whether base is destroyed already (-refresh=false).
+    expected.insert(expected.index(destroy(env, "workers")), state_list(env, "base"))
+    assert calls(env) == expected
+    assert [c for c in calls(env) if c == state_list(env, "workers")] == [state_list(env, "workers")]
+    assert "skipping the drains" not in proc.stderr
+
+
+def test_a_workers_state_that_cannot_be_listed_still_drains(env):
+    """Not knowing is not "empty": the Nodes are drained as before, and the workers stack is destroyed."""
+    env.scenario["answers"] = [listed("workers", rc=1, stderr="Error: Failed to load state: Error 503")]
+    proc = down(env, AUTO_APPROVE="1")
+    assert proc.returncode == 0, proc.stderr
+    assert calls(env) == sequence(env)
+    assert "draining the CPU workers as usual" in proc.stderr
+
+
 @pytest.mark.parametrize("failing", STACKS)
 def test_a_failed_destroy_stops_there_and_a_rerun_completes(env, failing):
     env.scenario["destroy_rc"] = {failing: 1}
@@ -691,10 +738,14 @@ def test_a_failed_destroy_stops_there_and_a_rerun_completes(env, failing):
 
 
 def test_a_failed_init_stops_before_that_stacks_destroy(env):
+    """The drains' look at the workers state (review F2b-3) cannot init workers: they drain as usual; the workers
+    destroy fails on the same init and stops the run before workers and base."""
     env.scenario["init_rc"] = {"workers": 1}
     proc = down(env, AUTO_APPROVE="1")
     assert proc.returncode == 1
-    assert calls(env) == [*sequence(env, stacks=("gpu-access",), final=False), init(env, "workers")]
+    assert calls(env) == [GPU_DOWN, list_nodes(env), *same_cluster(env), init(env, "workers"),
+                          *drain(env, "k3s-cpu-1"), *destroys(env, ("gpu-access",)), init(env, "workers")]
+    assert "draining the CPU workers as usual" in proc.stderr and "terraform init failed for workers" in proc.stderr
     assert len(known_hosts(env)) == 2 and env.kubeconfig.exists()
 
 
@@ -831,9 +882,10 @@ def test_rerun_after_the_workers_destroy_completes_end_to_end(real_gpuctl):
     assert "Traceback" not in proc.stdout + proc.stderr
 
 
-def test_rerun_after_the_workers_destroy_warns_about_the_stale_worker_node_end_to_end(real_gpuctl):
-    """PR #104 review S0-3/C0-4: in the real D-3 state k3s-cp still lists the destroyed worker's Node, NotReady. Its
-    drain fails (on a real cluster after its 120 s timeout): only a warning, the Node is deleted, base goes, exit 0."""
+def test_rerun_after_the_workers_destroy_skips_the_stale_worker_node_end_to_end(real_gpuctl):
+    """PR #104 review S0-3/C0-4, F2b-3: in the real D-3 state k3s-cp still lists the destroyed worker's Node,
+    NotReady. The workers state lists no resource, so it is not drained (a drain would wait out its 120 s timeout
+    on a real cluster): one line says so, base goes, exit 0."""
     env = real_gpuctl
     env.scenario["answers"] = [tf_outputs("base", OUTPUTS["base"]), tf_outputs("workers", {}),
                                listed("gpu-access"), listed("workers"), listed("base", BASE_RESOURCES)]
@@ -841,8 +893,8 @@ def test_rerun_after_the_workers_destroy_warns_about_the_stale_worker_node_end_t
     env.scenario["drain_fail"] = ["k3s-cpu-1"]
     proc = down(env, AUTO_APPROVE="1")
     assert proc.returncode == 0, proc.stderr
-    assert "warning: cannot drain k3s-cpu-1; deleting its Node anyway" in proc.stderr
-    assert kc(env, "delete", "node", "k3s-cpu-1", RT) in calls(env)
+    assert "skipping the drains of k3s-cpu-1" in proc.stderr
+    assert not [c for c in env.calls("kubectl") if c["argv"][2:3] in (["drain"], ["delete"])]
     assert destroyed(env) == [destroy(env, "base")]
     assert "make down: done" in proc.stderr
     assert "Traceback" not in proc.stdout + proc.stderr
