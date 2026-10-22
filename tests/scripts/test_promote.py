@@ -21,6 +21,9 @@ FAKE_LAMBDA_KEY = "secret" + "_demo_" + "0123456789abcdef" * 2 + "." + "Q7xZ" * 
 SUMMARY = ("# Verification run\n\nStarted: 2026-10-21T14:30:05-07:00 (America/Los_Angeles)\n\n"
            "| # | ID | Check | Result |\n|---|---|---|---|\n| 1 | A1 | nodes | PASS |\n\n"
            "**Result:** 1 passed, 0 failed, 0 skipped\n\n**Secret scan:** gitleaks found no leaks\n")
+# The caller's environment without GCP_PROJECT: an operator's shell may export one, and promote.sh checks the copy
+# for it (B1-1). A test that wants a project id passes it, or writes the repo copy's .env.
+BASE_ENV = {k: v for k, v in os.environ.items() if k != "GCP_PROJECT"}
 
 
 def make_repo(root):
@@ -60,12 +63,12 @@ def snapshot(path):
 
 def promote(repo, *args, env=None, cwd=None):
     return subprocess.run(["bash", str(repo / "scripts/promote.sh"), *args], capture_output=True, text=True,
-                          cwd=cwd or repo, env=env or os.environ.copy(), timeout=120)
+                          cwd=cwd or repo, env=env or dict(BASE_ENV), timeout=120)
 
 
 def make_target(repo, *args):
     return subprocess.run(["make", "--no-print-directory", "-f", str(repo / "Makefile"), "promote-verify", *args],
-                          capture_output=True, text=True, cwd=repo)
+                          capture_output=True, text=True, cwd=repo, env=dict(BASE_ENV))
 
 
 def verification_entries(repo):
@@ -131,7 +134,8 @@ def test_promote_replaces_a_final_symlink_without_touching_its_target(repo, tmp_
 
 
 def test_promote_accepts_a_run_that_scripts_verify_sh_wrote(repo):
-    # The tests above use a hand-made run; this one is the real harness's output (no checks registered).
+    # The tests above use a hand-made run; this one is what the real harness writes, with one stub check (A1,
+    # always passes) registered in place of the real ones.
     for rel in ("scripts/verify.sh", "scripts/lib/checks.sh"):
         shutil.copy2(ROOT / rel, repo / rel)
     verify_sh = repo / "scripts/verify.sh"
@@ -186,7 +190,7 @@ def test_a_failing_scanner_counts_as_a_leak(repo, tmp_path):
     (bin_dir / "gitleaks").chmod(0o755)
     before = previous_final(repo)
     make_run(repo)
-    r = promote(repo, "verify", f"verification/{TS}", env={**os.environ, "PATH": f"{bin_dir}:{os.environ['PATH']}"})
+    r = promote(repo, "verify", f"verification/{TS}", env={**BASE_ENV, "PATH": f"{bin_dir}:{os.environ['PATH']}"})
     assert r.returncode == 1, r.stderr
     assert snapshot(repo / "verification/final") == before
     assert verification_entries(repo) == [".gitkeep", TS, "final"]
@@ -201,7 +205,7 @@ def test_a_missing_gitleaks_refuses_before_copying(repo, tmp_path):
             (bin_dir / tool).symlink_to(shutil.which(tool))
     before = previous_final(repo)
     make_run(repo)
-    r = promote(repo, "verify", f"verification/{TS}", env={**os.environ, "PATH": str(bin_dir)})
+    r = promote(repo, "verify", f"verification/{TS}", env={**BASE_ENV, "PATH": str(bin_dir)})
     assert r.returncode == 1, r.stderr
     assert "gitleaks" in r.stderr
     assert snapshot(repo / "verification/final") == before
@@ -451,7 +455,7 @@ def test_no_opt_in_promotes_a_failed_check(repo, via_make, summary):
     if via_make:
         r = make_target(repo, f"RUN=verification/{TS}", *(f"{k}={v}" for k, v in opt_in.items()))
     else:
-        r = promote(repo, "verify", f"verification/{TS}", env={**os.environ, **opt_in})
+        r = promote(repo, "verify", f"verification/{TS}", env={**BASE_ENV, **opt_in})
     assert_refused(repo, r, before, "failed check(s)")
 
 
@@ -459,7 +463,7 @@ def test_no_opt_in_promotes_a_failed_check(repo, via_make, summary):
 def test_refuses_a_run_with_skipped_checks(repo, allow):
     before = previous_final(repo)
     make_run(repo, summary=SKIPPED_SUMMARY)
-    env = {k: v for k, v in os.environ.items() if k != "PROMOTE_ALLOW_SKIP"}
+    env = {k: v for k, v in BASE_ENV.items() if k != "PROMOTE_ALLOW_SKIP"}
     if allow is not None:
         env["PROMOTE_ALLOW_SKIP"] = allow
     assert_refused(repo, promote(repo, "verify", f"verification/{TS}", env=env), before,
@@ -472,7 +476,7 @@ def test_promote_allow_skip_promotes_a_skipped_run_and_records_it(repo, via_make
     if via_make:
         r = make_target(repo, f"RUN=verification/{TS}", "PROMOTE_ALLOW_SKIP=1")
     else:
-        r = promote(repo, "verify", f"verification/{TS}", env={**os.environ, "PROMOTE_ALLOW_SKIP": "1"})
+        r = promote(repo, "verify", f"verification/{TS}", env={**BASE_ENV, "PROMOTE_ALLOW_SKIP": "1"})
     assert r.returncode == 0, r.stderr
     final = repo / "verification/final"
     got, want = snapshot(final), snapshot(run)
@@ -487,7 +491,7 @@ def test_promote_allow_skip_promotes_a_skipped_run_and_records_it(repo, via_make
 
 def test_a_passing_run_gets_no_note(repo):
     run = make_run(repo)
-    r = promote(repo, "verify", f"verification/{TS}", env={**os.environ, "PROMOTE_ALLOW_SKIP": "1"})
+    r = promote(repo, "verify", f"verification/{TS}", env={**BASE_ENV, "PROMOTE_ALLOW_SKIP": "1"})
     assert r.returncode == 0, r.stderr
     assert snapshot(repo / "verification/final") == snapshot(run)
 
@@ -528,7 +532,7 @@ def test_the_operator_ip_fails_and_keeps_the_previous_final(repo, via_make):
     if via_make:
         r = make_target(repo, f"RUN=verification/{TS}", f"OPERATOR_IP={OPERATOR_IP}")
     else:
-        r = promote(repo, "verify", f"verification/{TS}", env={**os.environ, "OPERATOR_IP": OPERATOR_IP})
+        r = promote(repo, "verify", f"verification/{TS}", env={**BASE_ENV, "OPERATOR_IP": OPERATOR_IP})
     assert r.returncode == (2 if via_make else 1), r.stderr     # make reports a failed recipe as 2
     assert snapshot(repo / "verification/final") == before
     assert verification_entries(repo) == [".gitkeep", TS, "final"]
@@ -549,7 +553,7 @@ def test_the_operator_ip_fails_and_keeps_the_previous_final(repo, via_make):
 def test_the_operator_ip_is_found_between_any_non_digits(repo, ip, line):
     before = previous_final(repo)
     make_run(repo, files={"01-A1.txt": "fine\n", "06-B6.txt": line})
-    r = promote(repo, "verify", f"verification/{TS}", env={**os.environ, "OPERATOR_IP": ip})
+    r = promote(repo, "verify", f"verification/{TS}", env={**BASE_ENV, "OPERATOR_IP": ip})
     assert r.returncode == 1, r.stderr
     assert snapshot(repo / "verification/final") == before
     assert "06-B6.txt" in r.stderr and "01-A1.txt" not in r.stderr
@@ -561,7 +565,7 @@ def test_the_operator_ip_is_found_after_a_byte_that_is_not_utf8(repo):
     before = previous_final(repo)
     run = make_run(repo, files={"01-A1.txt": "fine\n", "06-B6.txt": "placeholder\n"})
     (run / "06-B6.txt").write_bytes(b"x\xff73.15.40.4\n")
-    env = {**os.environ, "LC_ALL": "C.UTF-8", "LANG": "C.UTF-8", "OPERATOR_IP": "73.15.40.4"}
+    env = {**BASE_ENV, "LC_ALL": "C.UTF-8", "LANG": "C.UTF-8", "OPERATOR_IP": "73.15.40.4"}
     r = promote(repo, "verify", f"verification/{TS}", env=env)
     assert r.returncode == 1, r.stderr
     assert snapshot(repo / "verification/final") == before
@@ -577,14 +581,14 @@ def test_the_operator_ip_is_found_after_a_byte_that_is_not_utf8(repo):
 ])
 def test_a_longer_address_is_not_the_operator_ip(repo, ip, line):
     run = make_run(repo, files={"01-A1.txt": "fine\n", "06-B6.txt": line})
-    r = promote(repo, "verify", f"verification/{TS}", env={**os.environ, "OPERATOR_IP": ip})
+    r = promote(repo, "verify", f"verification/{TS}", env={**BASE_ENV, "OPERATOR_IP": ip})
     assert r.returncode == 0, r.stderr
     assert snapshot(repo / "verification/final") == snapshot(run)
 
 
 def test_success_reminds_the_operator_ip_check(repo):
     make_run(repo)
-    r = promote(repo, "verify", f"verification/{TS}", env={**os.environ, "OPERATOR_IP": OPERATOR_IP})
+    r = promote(repo, "verify", f"verification/{TS}", env={**BASE_ENV, "OPERATOR_IP": OPERATOR_IP})
     assert r.returncode == 0, r.stderr
     assert "checkip.amazonaws.com" in r.stderr
 
@@ -595,7 +599,7 @@ def test_success_reminds_the_operator_ip_check(repo):
 def test_the_operator_ip_is_checked_despite_surrounding_whitespace(repo, value):
     before = previous_final(repo)
     make_run(repo, files={"01-A1.txt": "fine\n", "06-B6.txt": f"fw-ssh-operator  {OPERATOR_IP}/32\n"})
-    r = promote(repo, "verify", f"verification/{TS}", env={**os.environ, "OPERATOR_IP": value})
+    r = promote(repo, "verify", f"verification/{TS}", env={**BASE_ENV, "OPERATOR_IP": value})
     assert r.returncode == 1, r.stderr
     assert snapshot(repo / "verification/final") == before
     assert "06-B6.txt" in r.stderr
@@ -606,7 +610,7 @@ def test_the_operator_ip_is_checked_despite_surrounding_whitespace(repo, value):
 def test_refuses_an_operator_ip_that_is_not_one_ipv4_address(repo, value):
     before = previous_final(repo)
     make_run(repo, files={"01-A1.txt": "fine\n", "06-B6.txt": f"fw-ssh-operator  {OPERATOR_IP}/32\n"})
-    r = promote(repo, "verify", f"verification/{TS}", env={**os.environ, "OPERATOR_IP": value})
+    r = promote(repo, "verify", f"verification/{TS}", env={**BASE_ENV, "OPERATOR_IP": value})
     assert_refused(repo, r, before, "OPERATOR_IP")
 
 
@@ -615,10 +619,213 @@ def test_a_blank_operator_ip_is_unset(repo, value):
     # As in gpuctl (detect_operator_ip): blank means "not given"; the success message then prints the
     # Task 24 Step 4 grep for the operator to run.
     run = make_run(repo)
-    r = promote(repo, "verify", f"verification/{TS}", env={**os.environ, "OPERATOR_IP": value})
+    r = promote(repo, "verify", f"verification/{TS}", env={**BASE_ENV, "OPERATOR_IP": value})
     assert r.returncode == 0, r.stderr
     assert snapshot(repo / "verification/final") == snapshot(run)
     assert "checkip.amazonaws.com" in r.stderr
+
+
+# B1-1: the GCP project id must not reach final either. verify evidence carries it in the GCE FQDN hostname
+# (k3s-cp.<zone>.c.<project-id>.internal, A2's kubectl describe node) and in the state bucket's name. Both
+# GCP_PROJECT from the environment and the one the repo's .env gives (load_env) are looked for (X0-1); neither is
+# ever printed.
+PROJECT_ID = "acme-gpu-lab-7731"
+SKIPPED = "WARNING: no GCP project id (GCP_PROJECT in the environment or .env): the project-id check was skipped"
+
+
+def write_dotenv(repo, text, mode=0o600):
+    env = repo / ".env"
+    env.write_text(text)
+    env.chmod(mode)
+
+
+def assert_no_id(r, *ids):
+    out = (r.stdout + r.stderr).lower()
+    for project_id in ids or (PROJECT_ID,):
+        assert project_id.lower() not in out, "the project id is never printed"
+
+
+def assert_failed_on(repo, r, before, *names):
+    assert r.returncode == 1, r.stderr
+    assert snapshot(repo / "verification/final") == before, "the previous final is untouched"
+    assert verification_entries(repo) == [".gitkeep", TS, "final"], "the scanned copy is removed"
+    assert "GCP_PROJECT" in r.stderr and "verification/final was not changed" in r.stderr
+    for name in names:
+        assert name in r.stderr
+    assert_no_id(r)
+
+
+@pytest.mark.parametrize("via_make", [False, True])
+@pytest.mark.parametrize("line", [
+    f"Hostname:  k3s-cp.us-west1-b.c.{PROJECT_ID}.internal\n",       # the GCE FQDN in kubectl describe node
+    f"state in gs://{PROJECT_ID}-k3s-tfstate/base\n",                # the state bucket
+    f"project: {PROJECT_ID.upper()}\n",                               # any case
+    f"x{PROJECT_ID}y",                                                # anywhere, even inside a word, no newline
+], ids=["fqdn", "bucket", "uppercase", "substring"])
+def test_the_project_id_fails_and_keeps_the_previous_final(repo, line, via_make):
+    before = previous_final(repo)
+    make_run(repo, files={"01-A1.txt": "fine\n", "02-A2.txt": line, "03-B1.txt": "fine too\n"})
+    if via_make:
+        r = subprocess.run(["make", "--no-print-directory", "-f", str(repo / "Makefile"), "promote-verify",
+                            f"RUN=verification/{TS}"], capture_output=True, text=True, cwd=repo,
+                           env={**BASE_ENV, "GCP_PROJECT": PROJECT_ID})
+        assert r.returncode == 2, r.stderr  # make reports a failed recipe as 2
+        r.returncode = 1
+    else:
+        r = promote(repo, "verify", f"verification/{TS}", env={**BASE_ENV, "GCP_PROJECT": PROJECT_ID})
+    assert_failed_on(repo, r, before, "02-A2.txt")
+    assert "01-A1.txt" not in r.stderr and "03-B1.txt" not in r.stderr, "only the files that hold it are named"
+
+
+def test_every_file_that_holds_the_project_id_is_named(repo):
+    before = previous_final(repo)
+    make_run(repo, files={"01-A1.txt": f"node k3s-cp.us-west1-b.c.{PROJECT_ID}.internal\n", "02-A2.txt": "fine\n",
+                          "autoscaler.log": f"bucket {PROJECT_ID}-k3s-tfstate\n"})
+    r = promote(repo, "verify", f"verification/{TS}", env={**BASE_ENV, "GCP_PROJECT": PROJECT_ID})
+    assert_failed_on(repo, r, before, "01-A1.txt", "autoscaler.log")
+    assert "02-A2.txt" not in r.stderr
+
+
+def test_the_project_id_is_found_after_a_byte_that_is_not_utf8(repo):
+    before = previous_final(repo)
+    run = make_run(repo, files={"01-A1.txt": "fine\n", "02-A2.txt": "placeholder\n"})
+    (run / "02-A2.txt").write_bytes(b"x\xff" + PROJECT_ID.upper().encode() + b"\n")
+    env = {**BASE_ENV, "LC_ALL": "C.UTF-8", "LANG": "C.UTF-8", "GCP_PROJECT": PROJECT_ID}
+    assert_failed_on(repo, promote(repo, "verify", f"verification/{TS}", env=env), before, "02-A2.txt")
+
+
+def test_the_project_id_is_read_from_the_dotenv(repo):
+    before = previous_final(repo)
+    write_dotenv(repo, f"GCP_PROJECT={PROJECT_ID}\nLAMBDA_API_KEY=x\n")
+    make_run(repo, files={"01-A1.txt": "fine\n", "02-A2.txt": f"k3s-cp.us-west1-b.c.{PROJECT_ID}.internal\n"})
+    r = promote(repo, "verify", f"verification/{TS}")
+    assert_failed_on(repo, r, before, "02-A2.txt")
+
+
+OTHER_ID = "other-project-42"
+
+
+@pytest.mark.parametrize("leaked", [PROJECT_ID, OTHER_ID], ids=["environment-id", "dotenv-id"])
+def test_both_the_environment_and_the_dotenv_ids_are_looked_for(repo, leaked):
+    """X0-1: verify.sh's load_env sources .env over the caller's environment, so the evidence holds .env's id even
+    when the operator's shell exports another GCP_PROJECT. Neither id may reach final, whichever the copy holds."""
+    write_dotenv(repo, f"GCP_PROJECT={OTHER_ID}\n")
+    before = previous_final(repo)
+    make_run(repo, files={"01-A1.txt": "fine\n", "02-A2.txt": f"k3s-cp.us-west1-b.c.{leaked}.internal\n"})
+    r = promote(repo, "verify", f"verification/{TS}", env={**BASE_ENV, "GCP_PROJECT": PROJECT_ID})
+    assert_failed_on(repo, r, before, "02-A2.txt")
+    assert "01-A1.txt" not in r.stderr
+    assert_no_id(r, PROJECT_ID, OTHER_ID)
+
+
+def test_with_both_ids_a_clean_copy_promotes(repo):
+    write_dotenv(repo, f"GCP_PROJECT={OTHER_ID}\n")
+    run = make_run(repo, files={"01-A1.txt": "k3s-cp.us-west1-b.c.another-project-1.internal\n"})
+    r = promote(repo, "verify", f"verification/{TS}", env={**BASE_ENV, "GCP_PROJECT": PROJECT_ID})
+    assert r.returncode == 0, r.stderr
+    assert snapshot(repo / "verification/final") == snapshot(run)
+    assert "WARNING" not in r.stderr
+    assert_no_id(r, PROJECT_ID, OTHER_ID)
+
+
+@pytest.mark.parametrize("bad", ["env", "dotenv"])
+def test_refuses_when_either_id_is_not_a_project_id(repo, bad):
+    """Both ids are looked for, so both must be project ids: one the check cannot match must not pass silently."""
+    value = "Not_A_Project-1"
+    write_dotenv(repo, f"GCP_PROJECT={value if bad == 'dotenv' else OTHER_ID}\n")
+    before = previous_final(repo)
+    make_run(repo)
+    r = promote(repo, "verify", f"verification/{TS}",
+                env={**BASE_ENV, "GCP_PROJECT": value if bad == "env" else PROJECT_ID})
+    assert_refused(repo, r, before, "GCP_PROJECT", "not a GCP project id")
+    assert_no_id(r, value, PROJECT_ID, OTHER_ID)
+
+
+@pytest.mark.parametrize("source", ["env", "dotenv", "both"])
+def test_the_project_id_never_reaches_a_command_line(repo, tmp_path, source):
+    """X0-2: argv is visible to every local user (ps, /proc/PID/cmdline) and to execve audit logs, so grep gets the
+    id(s) as a pattern file, never as an argument. A grep wrapper records every argument list it is given."""
+    bin_dir = tmp_path / "grepbin"
+    bin_dir.mkdir()
+    record = tmp_path / "grep.argv"
+    (bin_dir / "grep").write_text(f'#!/bin/sh\nprintf \'%s\\n\' "$*" >> "{record}"\nexec "{shutil.which("grep")}" "$@"\n')
+    (bin_dir / "grep").chmod(0o755)
+    env = {**BASE_ENV, "PATH": f"{bin_dir}:{os.environ['PATH']}"}
+    if source in ("env", "both"):
+        env["GCP_PROJECT"] = PROJECT_ID
+    if source in ("dotenv", "both"):
+        write_dotenv(repo, f"GCP_PROJECT={OTHER_ID if source == 'both' else PROJECT_ID}\n")
+    before = previous_final(repo)
+    make_run(repo, files={"01-A1.txt": "fine\n", "02-A2.txt": f"k3s-cp.us-west1-b.c.{PROJECT_ID}.internal\n"})
+    r = promote(repo, "verify", f"verification/{TS}", env=env)
+    assert_failed_on(repo, r, before, "02-A2.txt")
+    text = record.read_text().lower()
+    assert PROJECT_ID not in text and OTHER_ID not in text
+    argvs = record.read_text().splitlines()
+    assert any(" -f " in f" {a} " for a in argvs if "-liF" in a), "the project-id grep ran, with a pattern file"
+
+
+@pytest.mark.parametrize("value", ["Acme-Gpu-Lab-7731", "short", "1starts-with-digit", "ends-with-hyphen-",
+                                   "has space 123", "x" * 31, "acme-gpu;rm -rf x", "acme-gpu-lab-7731 "])
+@pytest.mark.parametrize("source", ["env", "dotenv"])
+def test_refuses_a_project_id_that_is_not_one(repo, value, source):
+    before = previous_final(repo)
+    make_run(repo, files={"01-A1.txt": "fine\n", "02-A2.txt": f"{value}\n"})
+    if source == "env":
+        r = promote(repo, "verify", f"verification/{TS}", env={**BASE_ENV, "GCP_PROJECT": value})
+    else:
+        write_dotenv(repo, f"GCP_PROJECT='{value}'\n")
+        r = promote(repo, "verify", f"verification/{TS}")
+    assert_refused(repo, r, before, "GCP_PROJECT", "not a GCP project id")
+    assert_no_id(r, value.strip())
+
+
+def test_a_dotenv_that_is_not_private_is_refused_as_load_env_refuses_it(repo):
+    before = previous_final(repo)
+    write_dotenv(repo, f"GCP_PROJECT={PROJECT_ID}\n", mode=0o644)
+    make_run(repo)
+    r = promote(repo, "verify", f"verification/{TS}")
+    assert_refused(repo, r, before, "chmod 600")
+    assert_no_id(r)
+
+
+@pytest.mark.parametrize("dotenv", [None, "LAMBDA_API_KEY=x\n", "GCP_PROJECT=\n"], ids=["no-dotenv", "unset", "empty"])
+def test_without_a_project_id_the_check_is_skipped_with_one_warning(repo, dotenv):
+    if dotenv is not None:
+        write_dotenv(repo, dotenv)
+    run = make_run(repo, files={"01-A1.txt": f"k3s-cp.us-west1-b.c.{PROJECT_ID}.internal\n"})
+    r = promote(repo, "verify", f"verification/{TS}", env={**BASE_ENV, "GCP_PROJECT": ""})
+    assert r.returncode == 0, r.stderr
+    assert snapshot(repo / "verification/final") == snapshot(run)
+    assert r.stderr.count(SKIPPED) == 1 and r.stderr.count("WARNING") == 1
+
+
+def test_a_clean_copy_with_a_project_id_promotes_without_a_warning(repo):
+    run = make_run(repo, files={"01-A1.txt": "k3s-cp.us-west1-b.c.another-project-1.internal\n"})
+    r = promote(repo, "verify", f"verification/{TS}", env={**BASE_ENV, "GCP_PROJECT": PROJECT_ID})
+    assert r.returncode == 0, r.stderr
+    assert snapshot(repo / "verification/final") == snapshot(run)
+    assert "WARNING" not in r.stderr
+    assert_no_id(r)
+
+
+def test_the_dotenv_secrets_stay_out_of_the_scan(repo, tmp_path):
+    """.env is read in a subshell for GCP_PROJECT only: its other values (the Lambda API key) do not reach
+    gitleaks or any other command promote.sh runs."""
+    bin_dir = tmp_path / "envbin"
+    bin_dir.mkdir()
+    real = shutil.which("gitleaks")
+    seen = tmp_path / "gitleaks.env"
+    (bin_dir / "gitleaks").write_text(f'#!/bin/sh\nenv >> "{seen}"\nexec "{real}" "$@"\n')
+    (bin_dir / "gitleaks").chmod(0o755)
+    dotenv_key = "lambda-key-" + "from-dotenv"  # assembled: the file never holds a key=value secret shape
+    write_dotenv(repo, f"GCP_PROJECT={PROJECT_ID}\nLAMBDA_API_KEY" + "=" + dotenv_key + "\n")
+    make_run(repo)
+    r = promote(repo, "verify", f"verification/{TS}",
+                env={**BASE_ENV, "PATH": f"{bin_dir}:{os.environ['PATH']}"})
+    assert r.returncode == 0, r.stderr
+    text = seen.read_text()
+    assert "GCP_PROJECT=" not in text and dotenv_key not in text
 
 
 # F2-1, F3-1: what is scanned and promoted is the staged copy, so the copy itself must be a flat,
@@ -652,7 +859,7 @@ def fake_cp(tmp_path, kind):
         f'if [ "$1" = -R ] && [ "$2" = -- ]; then run="$3"; cp() {{ {real_cp} "$@"; }}; {add}; fi\n'
         f'exec {real_cp} "$@"\n')
     (bin_dir / "cp").chmod(0o755)
-    return {**os.environ, "PATH": f"{bin_dir}:{os.environ['PATH']}"}
+    return {**BASE_ENV, "PATH": f"{bin_dir}:{os.environ['PATH']}"}
 
 
 COPY_OF = f"the copy of verification/{TS}"
@@ -701,7 +908,7 @@ def fake_gitleaks(tmp_path, output):
     (tmp_path / "gitleaks.out").write_text(output)
     (bin_dir / "gitleaks").write_text(f"#!/bin/sh\ncat >/dev/null\ncat {tmp_path / 'gitleaks.out'} >&2\nexit 0\n")
     (bin_dir / "gitleaks").chmod(0o755)
-    return {**os.environ, "PATH": f"{bin_dir}:{os.environ['PATH']}"}
+    return {**BASE_ENV, "PATH": f"{bin_dir}:{os.environ['PATH']}"}
 
 
 @pytest.mark.parametrize("output", [
@@ -748,7 +955,7 @@ def fake_mv(tmp_path, mode):
         f'case "$2" in {src}) : >"{marker}"; {action} ;; esac\n'
         f'exec {shutil.which("mv")} "$@"\n')
     (bin_dir / "mv").chmod(0o755)
-    return {**os.environ, "PATH": f"{bin_dir}:{os.environ['PATH']}"}, marker, release
+    return {**BASE_ENV, "PATH": f"{bin_dir}:{os.environ['PATH']}"}, marker, release
 
 
 def wait_for(path, proc, seconds=60):

@@ -21,6 +21,9 @@
 # inventory without `make cpu-remove` was never drained, so an unattended run refuses to destroy it
 # (interactively the destroy is listed and asked). Scaling down is scripts/cpu-pool.sh's job: it
 # drains and deletes the node before its apply, which may destroy only the drained workers.
+# Each stage that plans a stack takes that stack's lock first (common.sh stack_lock, .run/<stack>.lock)
+# and keeps it until up.sh exits: while make down, cpu-pool.sh or another make up holds it, the stage
+# is refused (exit 2) before it plans.
 set -euo pipefail
 
 # shellcheck disable=SC1091  # common.sh is linted on its own

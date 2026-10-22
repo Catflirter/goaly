@@ -228,6 +228,18 @@ def test_background_jobs_of_a_check_do_not_block_the_run(tmp_path):
     assert "started" in (tmp_path / "01-A1.txt").read_text()
 
 
+def test_the_header_states_how_long_a_background_job_gets_after_term():
+    # Ruling R56: the rules for check authors say how long _vr_reap lets a job shut down (minors M-4).
+    text = (ROOT / "scripts/lib/checks.sh").read_text()
+    header = text.split("\n\n", 1)[0]
+    reap = re.search(r"^_vr_reap\(\) \{\n.*?^\}", text, re.M | re.S).group(0)
+    rounds = int(re.search(r"i < (\d+); i\+\+", reap).group(1))
+    step = float(re.search(r"^\s+sleep ([0-9.]+)$", reap, re.M).group(1))
+    assert round(rounds * step, 3) == 5 and "kill -KILL" in reap
+    rules = " ".join(line.lstrip("#").strip() for line in header.split("# Rules for check functions:")[1].splitlines())
+    assert "TERM every 0.1 s" in rules and "KILL after about 5 s" in rules, rules
+
+
 def test_a_job_that_misses_the_first_term_does_not_block_the_run(tmp_path):
     # Until a job forked from the check's subshell has exec'd its program, it runs the TERM handler bash
     # installed there for the EXIT trap, which drops a TERM that arrives in that window (seen under load:

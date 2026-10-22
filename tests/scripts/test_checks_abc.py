@@ -20,7 +20,7 @@ import time
 
 import pytest
 
-from test_ops_scripts import FAKES, ROOT, Env, free_port
+from test_ops_scripts import FAKES, PROJECT, ROOT, Env, free_port
 
 CP, CPU1, GPU1 = "k3s-cp", "k3s-cpu-1", "k3s-gpu-a6000-1"
 NODES = {
@@ -907,6 +907,122 @@ def test_operator_ip_mask_catches_adjacent_occurrences_and_only_whole_addresses(
     assert proc.stdout == want.format(ip=OPERATOR) + "\n", proc.stderr
 
 
+# ---- the GCP project id is masked in all evidence (spec §9; Ruling R39; minors B2-1) -----------
+
+# A2's `kubectl describe node` shows k3s-cp's GCE hostname, which holds the project id.
+FQDN = f"k3s-cp.us-west1-b.c.{PROJECT}.internal"
+MASKED_FQDN = "k3s-cp.us-west1-b.c.<GCP_PROJECT>.internal"
+
+
+def project_summary(run):
+    return re.search(r"^GCP project id: .*$", (run / "SUMMARY.md").read_text(), re.M).group(0)
+
+
+@pytest.mark.parametrize("line, want", [
+    (f"Hostname: {FQDN}", f"Hostname: {MASKED_FQDN}"),
+    (f"gs://{PROJECT}-k3s-tfstate/base/default.tfstate", "gs://<GCP_PROJECT>-k3s-tfstate/base/default.tfstate"),
+    (f"k3s-worker@{PROJECT}.iam.gserviceaccount.com", "k3s-worker@<GCP_PROJECT>.iam.gserviceaccount.com"),
+    (f"BUCKET {PROJECT.upper()}-K3S-TFSTATE", "BUCKET <GCP_PROJECT>-K3S-TFSTATE"),
+    ("projects/K3s-Demo-123456/zones/us-west1-b", "projects/<GCP_PROJECT>/zones/us-west1-b"),
+    (f"{PROJECT},{PROJECT}{PROJECT}", "<GCP_PROJECT>,<GCP_PROJECT><GCP_PROJECT>"),
+])
+def test_vr_init_makes_redact_mask_the_project_id_in_every_form(env, line, want):
+    run = env.repo / "verification" / "p"
+    # vr_init reads .env in a subshell: the caller's redact masks the id without GCP_PROJECT in its shell
+    proc = env.run(["bash", "-c", f'source scripts/lib/checks.sh; vr_init {run}; echo "[${{GCP_PROJECT-unset}}]"; '
+                    "redact"], stdin=line + "\n")
+    assert proc.stdout == "[unset]\n" + want + "\n", proc.stderr
+    assert project_summary(run) == "GCP project id: masked as <GCP_PROJECT>"
+    assert "GCP_PROJECT" not in proc.stderr                         # no warning for a valid id
+
+
+def test_the_project_mask_survives_the_operator_ip_lookup_resetting_its_mask(env):
+    env.write_env(env.repo.joinpath(".env").read_text() + f"OPERATOR_IP={OPERATOR}\n")
+    run = env.repo / "verification" / "p"
+    # Each redact gets its own copy of the line: the second runs after vr_operator_ip set _VR_MASK_EXPRS=() again.
+    code = (f'source scripts/lib/checks.sh; vr_init {run}; redact <<<"$1"; '
+            'unset _VR_OPIP_DONE; vr_operator_ip; redact <<<"$1"')
+    proc = env.run(["bash", "-c", code, "_", f"{FQDN} ssh from {OPERATOR}"])
+    assert proc.stdout == f"{MASKED_FQDN} ssh from <operator_ip>\n" * 2, proc.stderr
+
+
+@pytest.mark.parametrize("setup", ["vr_env", "load_env"])
+def test_a_check_called_without_vr_init_masks_the_project_id_once_env_is_loaded(env, setup):
+    # the demo calls checks directly (Task 25): .env read by vr_env (or load_env) is enough for redact
+    code = f"source scripts/lib/checks.sh; {setup}; redact; _vr_tell 'gs://{PROJECT}-k3s-tfstate' 2>&1"
+    proc = env.run(["bash", "-c", code], stdin=f"{FQDN}\n")
+    assert proc.stdout == f"{MASKED_FQDN}\ncheck: gs://<GCP_PROJECT>-k3s-tfstate\n", proc.stderr
+
+
+@pytest.mark.parametrize("value", ["", "Bad_Project", "k3s"])
+def test_an_empty_or_invalid_project_id_masks_nothing_and_warns_once(env, value):
+    env.write_env(env.repo.joinpath(".env").read_text().replace(f"GCP_PROJECT={PROJECT}", f"GCP_PROJECT={value}"))
+    run = env.repo / "verification" / "p"
+    line = f"{FQDN} {value} {value.upper()}\n"
+    proc = env.run(["bash", "-c", f"source scripts/lib/checks.sh; vr_init {run}; vr_env; redact"], stdin=line)
+    assert proc.stdout == line, proc.stderr
+    assert project_summary(run) == "GCP project id: not masked (GCP_PROJECT in .env is empty or not a project id)"
+    warnings = [w for w in proc.stderr.splitlines() if "GCP_PROJECT" in w]
+    assert len(warnings) == 1 and warnings[0].startswith("warning: "), proc.stderr
+
+
+def test_an_unreadable_env_is_reported_in_the_summary_with_one_warning(env):
+    # A2's describe needs no .env, so its evidence keeps the raw FQDN: the operator is told, once (S0-1).
+    (env.repo / ".env").chmod(0o644)                                # load_env refuses it (exit 2)
+    run = env.repo / "verification" / "p"
+    proc = env.run(["bash", "-c", f"source scripts/lib/checks.sh; vr_init {run}; redact; redact </dev/null"],
+                   stdin=f"{FQDN}\n")
+    assert proc.returncode == 0, proc.stderr
+    assert proc.stdout == f"{FQDN}\n"
+    assert project_summary(run) == "GCP project id: not masked (.env is not readable)"
+    warnings = [w for w in proc.stderr.splitlines() if "project id" in w]
+    assert warnings == ["warning: .env is not readable, so the evidence cannot mask the GCP project id"], proc.stderr
+
+
+@pytest.mark.parametrize("code", [
+    "source scripts/lib/checks.sh; redact",                                          # nothing read .env
+    'source scripts/lib/checks.sh; { vr_env; echo "$GCP_PROJECT"; cat; } | redact',  # redact started first
+    "source scripts/lib/checks.sh; check(){ vr_env; cat; }; check | redact",          # vr_env only in the check
+])
+def test_redact_reads_the_project_id_from_env_when_its_shell_does_not_know_it(env, code):
+    # A pipe to redact may start before vr_init, vr_env or load_env, and a check's vr_env runs in its own
+    # subshell (review X0-1, S0-2): redact then reads .env itself, in a subshell, and still masks the id.
+    proc = env.run(["bash", "-c", code + '; echo "[${GCP_PROJECT-unset}]"'], stdin=f"{FQDN}\n")
+    assert proc.returncode == 0, proc.stderr
+    assert PROJECT not in proc.stdout and f"{MASKED_FQDN}\n" in proc.stdout, proc.stdout
+    assert proc.stdout.endswith("[unset]\n")                        # .env's values stay out of the caller
+
+
+def test_redact_without_a_readable_env_masks_nothing_and_says_nothing(env):
+    (env.repo / ".env").unlink()
+    proc = env.run(["bash", "-c", "source scripts/lib/checks.sh; redact"], stdin=f"{FQDN}\n")
+    assert (proc.returncode, proc.stdout, proc.stderr) == (0, f"{FQDN}\n", "")
+
+
+def test_b6_decides_on_the_raw_project_id_while_its_evidence_masks_it(env):
+    # Masking is for the evidence only: gcloud gets the real id and B6's verdict does not change.
+    rules = json.loads(json.dumps(FIREWALL).replace("@p.iam", f"@{PROJECT}.iam"))
+    env.first(rule("gcloud", ["compute firewall-rules list"], stdout=json.dumps(rules)))
+    result, text = env.check("check_b6_firewall_inventory")
+    assert result == "PASS", text
+    assert env.argvs("gcloud")[0][3:5] == ["--project", PROJECT]
+    assert PROJECT not in text and "k3s-cp@<GCP_PROJECT>.iam.gserviceaccount.com" in text
+    env.scenario["answers"] = healthy()
+    env.first(rule("gcloud", ["compute firewall-rules list"], stdout="[]"))
+    result, text = env.check("check_b6_firewall_inventory")
+    assert result == "FAIL"
+    assert "B6: no firewall rule named fw-* in <GCP_PROJECT>" in text and PROJECT not in text
+
+
+def test_b6_called_without_vr_init_still_masks_the_project_id(env):
+    rules = json.loads(json.dumps(FIREWALL).replace("@p.iam", f"@{PROJECT}.iam"))
+    env.first(rule("gcloud", ["compute firewall-rules list"], stdout=json.dumps(rules)))
+    proc = env.run(["bash", "-c", "source scripts/lib/checks.sh; check_b6_firewall_inventory"])
+    assert proc.returncode == 0, proc.stdout + proc.stderr
+    assert "k3s-cp@<GCP_PROJECT>.iam.gserviceaccount.com" in proc.stdout
+    assert PROJECT not in proc.stdout + proc.stderr
+
+
 @pytest.mark.parametrize("change", [
     {"sourceRanges": ["10.20.0.0/24"]},
     {"sourceRanges": ["198.51.100.11/32", "198.51.100.0/24"]},
@@ -977,9 +1093,19 @@ def test_c3_port_forwards_curls_and_stops_the_forward(env):
     result, text = env.check("check_c3_port_forward", VR_PF_PORT=str(port))
     assert result == "PASS", text
     assert f"$ kc -n hello port-forward svc/hello {port}:80 &" in cmd_lines(text)
-    assert f"$ curl -fsS -m 5 localhost:{port}" in cmd_lines(text)
+    assert f"$ curl --noproxy '*' -fsS -m 5 localhost:{port}" in cmd_lines(text)
     with pytest.raises(OSError):                                   # the forward is gone
         socket.create_connection(("127.0.0.1", port), timeout=1).close()
+
+
+def test_c3_reaches_the_local_forward_past_an_operator_proxy(env):
+    # An operator's proxy variables must not send the localhost request to the proxy (minors B2-2).
+    port = free_port()
+    proxy = f"http://127.0.0.1:{free_port()}"                      # nothing listens there: via it, curl fails
+    proxies = {name: proxy for name in ("http_proxy", "HTTPS_PROXY", "https_proxy", "ALL_PROXY", "all_proxy")}
+    result, text = env.check("check_c3_port_forward", VR_PF_PORT=str(port), no_proxy="", NO_PROXY="", **proxies)
+    assert result == "PASS", text
+    assert f"C3: localhost:{port} answered exactly 'hello world'" in text
 
 
 def test_c3_fails_on_a_wrong_answer_and_still_stops_the_forward(env):
@@ -1296,7 +1422,7 @@ EXPECTED = [("A", "A1", "check_a1_nodes"), ("A", "A2", "check_a2_describe_nodes"
 def test_verify_registers_a_b_c_and_d_in_order():
     text = (ROOT / "scripts/verify.sh").read_text()
     regs = re.findall(r"^register_check (\w) (\w+) (?:'[^']*'|\"[^\"]*\") (\w+)$", text, re.M)
-    assert regs == EXPECTED
+    assert [r for r in regs if r[0] != "E"] == EXPECTED  # E (RESILIENCE=1): tests/scripts/test_checks_e.py
 
 
 def test_every_registered_function_is_defined_in_checks_sh():
@@ -1315,3 +1441,49 @@ def test_make_verify_passes_a_b_c_and_skips_d_on_a_healthy_cluster(env):
     assert proc.returncode == 0, summary + proc.stdout + proc.stderr
     results = re.findall(r"^\| \d+ \| (\w+) \| [^|]+ \| (\w+) \|$", summary, re.M)
     assert results == [(i, "SKIP" if i.startswith("D") else "PASS") for _, i, _ in EXPECTED]
+
+
+def test_make_verify_leaves_no_raw_project_id_in_any_file_of_the_run(env):
+    # Live finding (minors B2-1): A2's describe shows k3s-cp's GCE FQDN, which holds the project id; a run
+    # promoted to verification/final is committed (Ruling R39). The verdicts stay those of the raw output.
+    upper = f"k3s-cpu-1.us-central1-a.c.{PROJECT.upper()}.internal"
+    env.first(kc(f"describe node {CP} ", stdout=f"Name: {CP}\nAddresses:\n  Hostname: {FQDN}\n"),
+              kc(f"describe node {CPU1} ", stdout=f"Name: {CPU1}\nAddresses:\n  Hostname: {upper}\n"),
+              rule("gcloud", ["compute firewall-rules list"],
+                   stdout=json.dumps(FIREWALL).replace("@p.iam", f"@{PROJECT}.iam")))
+    port = free_port()
+    proc = env.run(["bash", str(env.repo / "scripts/verify.sh")], VR_NO_WAIT="1", VR_PF_PORT=str(port),
+                   **{"BASH_FUNC_timeout%%": NOT_REACHABLE, "TZ": "America/Los_Angeles"})
+    [run] = list((env.repo / "verification").iterdir())
+    summary = (run / "SUMMARY.md").read_text()
+    assert proc.returncode == 0, summary + proc.stdout + proc.stderr
+    results = re.findall(r"^\| \d+ \| (\w+) \| [^|]+ \| (\w+) \|$", summary, re.M)
+    assert results == [(i, "SKIP" if i.startswith("D") else "PASS") for _, i, _ in EXPECTED]
+    assert "GCP project id: masked as <GCP_PROJECT>" in summary
+    a2 = next(run.glob("*-A2.txt")).read_text()
+    assert f"Hostname: {MASKED_FQDN}" in a2 and "k3s-cpu-1.us-central1-a.c.<GCP_PROJECT>.internal" in a2
+    files = [p for p in run.rglob("*") if p.is_file()]
+    assert len(files) >= len(EXPECTED) + 1                          # SUMMARY.md and a file per check, at least
+    for path in files:
+        assert PROJECT not in path.read_text().lower(), path.name
+    assert PROJECT not in (proc.stdout + proc.stderr).lower()      # nor on the operator's screen
+
+
+# ---- the fake's scripted answer to a /readyz probe (minors M-6) -------------------------------
+
+@pytest.mark.parametrize("answer, ready", [
+    (dict(stdout="ok\n", sleep=30), "ok"),                                   # a stalled probe
+    (dict(serve="ok\n"), "Forwarding from"),                                 # one that never returns
+])
+def test_the_fake_logs_a_scripted_readyz_probe_once_it_has_its_answer(env, answer, ready):
+    # Like the fake's own /readyz answer (Ruling R58), a scripted one is logged once it is chosen: not only
+    # after its sleep, and not never when it serves. The port argument only gives "serve" a port to bind.
+    env.first(kc("get --raw /readyz", **answer))
+    argv = ["kubectl", "--kubeconfig", "kc.yaml", "get", "--raw", "/readyz", f"{free_port()}:80"]
+    proc = env.popen(argv)
+    try:
+        assert ready in proc.stdout.readline()
+        assert env.argvs("kubectl") == [argv[1:]]
+    finally:
+        proc.kill()
+        proc.communicate()

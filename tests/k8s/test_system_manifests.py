@@ -97,3 +97,42 @@ _PODSPEC = {"containers": [{"name": "c"}], "initContainers": [{"name": "i"}]}
 ])
 def test_helpers_reach_the_pod_spec(doc):
     assert [c["name"] for c in all_containers(pod_spec(doc))] == ["i", "c"]
+
+
+# M-7 (measured live 2026-10-22): `kubectl apply --dry-run=server` reported metrics-server "configured" on every
+# run while `kubectl diff` was empty and the Deployment's generation stayed 1. The API server omits a probe's
+# initialDelaySeconds when it is 0 (the default), so a manifest that sets 0 makes every client-side apply send the
+# field again. 0 is the default: leave the line out.
+PROBES = ("livenessProbe", "readinessProbe", "startupProbe")
+
+
+def zero_delay_probes(docs) -> list[str]:
+    """'Kind/name container probe' for every probe, of every container and initContainer, whose
+    initialDelaySeconds is 0."""
+    found = []
+    for d in docs:
+        spec = pod_spec(d)
+        for c in all_containers(spec) if spec is not None else []:
+            for probe in PROBES:
+                if probe in c and c[probe].get("initialDelaySeconds") == 0:
+                    found.append(f"{d['kind']}/{d['metadata']['name']} {c['name']} {probe}")
+    return found
+
+
+def test_no_manifest_sets_a_probe_initial_delay_of_zero():
+    docs = [d for p in sorted(K8S.rglob("*.y*ml")) if not p.name.endswith("values.yaml") for d in load_docs(p)]
+    probes = [c[p] for d in docs if pod_spec(d) is not None for c in all_containers(pod_spec(d)) for p in PROBES
+              if p in c]
+    assert len(probes) >= 10, "the walk reaches the manifests' probes (metrics-server, hello, nettest, monitoring)"
+    assert zero_delay_probes(docs) == []
+
+
+@pytest.mark.parametrize("where", ["containers", "initContainers"])
+@pytest.mark.parametrize("probe", PROBES)
+def test_the_zero_delay_walk_sees_every_probe_of_every_container(where, probe):
+    bad = {"name": "bad", probe: {"exec": {"command": ["true"]}, "initialDelaySeconds": 0}}
+    fine = {"name": "fine", probe: {"exec": {"command": ["true"]}, "initialDelaySeconds": 5}}
+    podspec = {"containers": [fine], "initContainers": [fine]}
+    podspec[where] = [fine, bad]
+    doc = {"kind": "Deployment", "metadata": {"name": "x"}, "spec": {"template": {"spec": podspec}}}
+    assert zero_delay_probes([doc]) == [f"Deployment/x bad {probe}"]
