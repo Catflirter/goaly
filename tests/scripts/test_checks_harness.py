@@ -310,14 +310,22 @@ def test_vr_cmd_redacts_arguments_that_contain_spaces():
 # --- verify.sh ----------------------------------------------------------------------------------
 
 REGISTRATIONS_MARKER = "# --- registered checks ---"
+REGISTRATIONS_END = "# --- end of registered checks ---"
 
 
 @pytest.fixture
 def repo(tmp_path):
-    """A throwaway repo root holding copies of verify.sh, its libraries and the gitleaks config."""
+    """A throwaway repo root holding copies of verify.sh, its libraries and the gitleaks config. The copy's
+    real registrations (Task 18 on) are removed: they would run kubectl, gcloud and ssh against the
+    operator's cluster. The tests register their own stand-in checks."""
     (tmp_path / "scripts/lib").mkdir(parents=True)
     for rel in ("scripts/verify.sh", "scripts/lib/checks.sh", "scripts/lib/common.sh", ".gitleaks.toml"):
         shutil.copy2(ROOT / rel, tmp_path / rel)
+    verify = tmp_path / "scripts/verify.sh"
+    text = verify.read_text()
+    assert text.count(REGISTRATIONS_MARKER) == 1 and text.count(REGISTRATIONS_END) == 1
+    head, rest = text.split(REGISTRATIONS_MARKER)
+    verify.write_text(head + REGISTRATIONS_MARKER + "\n" + REGISTRATIONS_END + rest.split(REGISTRATIONS_END)[1])
     return tmp_path
 
 

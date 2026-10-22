@@ -418,20 +418,31 @@ gpu_scp() {
   scp -r "${_GPU_SSH_OPTS[@]}" "${@:1:$#-1}" "$target:$dst"
 }
 
-# node_ssh NAME CMD / node_scp NAME SRC... DST: worker_* for k3s-cpu-<n>, gpu_* for k3s-gpu-*.
+# node_ssh NAME CMD / node_scp NAME SRC... DST: cp_* for k3s-cp (the verification checks run on
+# every node), worker_* for k3s-cpu-<n>, gpu_* for k3s-gpu-*. join-node.sh never passes k3s-cp: it
+# accepts only worker and GPU names (node_kind).
 node_ssh() {
+  if [[ "$1" == "$CP_NAME" ]]; then
+    cp_ssh "$2"
+    return
+  fi
   case "$(node_kind "$1")" in
     cpu) worker_ssh "$@" ;;
     gpu) gpu_ssh "$@" ;;
-    *) die "not a CPU worker or GPU node name: '$1'" ;;
+    *) die "not k3s-cp, a CPU worker or a GPU node name: '$1'" ;;
   esac
 }
 
 node_scp() {
+  if [[ "$1" == "$CP_NAME" ]]; then
+    shift
+    cp_scp "$@"
+    return
+  fi
   case "$(node_kind "$1")" in
     cpu) worker_scp "$@" ;;
     gpu) gpu_scp "$@" ;;
-    *) die "not a CPU worker or GPU node name: '$1'" ;;
+    *) die "not k3s-cp, a CPU worker or a GPU node name: '$1'" ;;
   esac
 }
 
@@ -466,6 +477,51 @@ node_ready() {
   local state
   state="$(node_state "$1")" || exit
   [[ "$state" == Ready ]]
+}
+
+# ---- Cluster lookups for the verification checks (Task 18) ------------------------------------
+
+# A Kubernetes object name (RFC 1123 subdomain, as node and Pod names are). Names read back from the
+# cluster are checked before they reach a selector or a command line.
+K8S_NAME_RE='^[a-z0-9]([-a-z0-9.]{0,251}[a-z0-9])?$'
+
+# node_external_ip NAME: NAME's ExternalIP (status.addresses), which is its public IP (k3s
+# node-external-ip). Fails unless the cluster reports exactly one IPv4 address.
+node_external_ip() {
+  local ip
+  [[ "$1" =~ $K8S_NAME_RE ]] || die "not a node name: '$1'"
+  ip="$(kc get node "$1" --request-timeout="$KC_REQUEST_TIMEOUT" \
+    -o 'jsonpath={.status.addresses[?(@.type=="ExternalIP")].address}')" || return
+  is_ipv4 "$ip" || { log "node $1 has no single IPv4 ExternalIP: '$ip'"; return 1; }
+  printf '%s\n' "$ip"
+}
+
+# _nettest_pod_on APP NODE FIELD: FIELD (a jsonpath under the Pod) of the Running nettest Pod of
+# app=APP (the echo and probe DaemonSets, k8s/nettest) on NODE; the first one if there are several.
+_nettest_pod_on() {
+  local out
+  [[ "$2" =~ $K8S_NAME_RE ]] || die "not a node name: '$2'"
+  out="$(kc -n nettest get pods -l "app=$1" --field-selector="spec.nodeName=$2,status.phase=Running" \
+    --request-timeout="$KC_REQUEST_TIMEOUT" -o "jsonpath={.items[*].$3}")" || return
+  out="${out%% *}"
+  [[ -n "$out" ]] || { log "no Running $1 Pod on node $2 (namespace nettest)"; return 1; }
+  printf '%s\n' "$out"
+}
+
+# probe_on NODE: the name of the Running nettest probe Pod (netshoot) on NODE, for kubectl exec.
+probe_on() {
+  local name
+  name="$(_nettest_pod_on probe "$1" metadata.name)" || return
+  [[ "$name" =~ $K8S_NAME_RE ]] || { log "unexpected probe Pod name on $1: '$name'"; return 1; }
+  printf '%s\n' "$name"
+}
+
+# echo_on NODE: the Pod IP of the Running nettest echo Pod (whoami, port 8080) on NODE.
+echo_on() {
+  local ip
+  ip="$(_nettest_pod_on echo "$1" status.podIP)" || return
+  is_ipv4 "$ip" || { log "the echo Pod on $1 has no IPv4 Pod IP: '$ip'"; return 1; }
+  printf '%s\n' "$ip"
 }
 
 # _kc_node_gone_ok NAME ARGS...: kc ARGS, where "node NAME not found" counts as success (Review

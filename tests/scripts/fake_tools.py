@@ -44,9 +44,23 @@ Workers and GPU nodes (Task 14). A remote command reaches the same handler wheth
                                           (default RUNNING)
 
 A plan run with -var-file=FILE copies FILE's text to $FAKE_LOG.var-file, so a test can see what it planned.
+
+Verification checks (Task 18) script their answers instead, with rules tried before every handler above:
+
+  answers        [rule, ...]              the first rule whose "tool" is this tool, whose "has" substrings
+                                          all occur in the call's arguments joined by spaces (for a remote
+                                          command that includes the command) and none of whose "not"
+                                          substrings occur, answers the call: it prints "stdout" and
+                                          "stderr" and exits "rc" (default 0). With "seq": [answer, ...]
+                                          successive calls get successive answers (the last one repeats).
+                                          An answer with "serve": TEXT (kubectl port-forward L:R) listens on
+                                          127.0.0.1:L, prints kubectl's "Forwarding from" line and answers
+                                          every HTTP GET with TEXT until it is killed.
 """
+import http.server
 import json
 import os
+import re
 import subprocess
 import sys
 import time
@@ -236,7 +250,51 @@ def gpuctl():
     return 1
 
 
+def serve(text):
+    """kubectl port-forward LOCAL:REMOTE: answer HTTP GETs on 127.0.0.1:LOCAL until killed."""
+    local, remote = next(a for a in ARGS if re.fullmatch(r"\d+:\d+", a)).split(":")
+    body = text.encode()
+
+    class Handler(http.server.BaseHTTPRequestHandler):
+        def do_GET(self):  # noqa: N802 (http.server's name)
+            self.send_response(200)
+            self.send_header("Content-Length", str(len(body)))
+            self.end_headers()
+            self.wfile.write(body)
+
+        def log_message(self, *args):
+            pass
+
+    server = http.server.HTTPServer(("127.0.0.1", int(local)), Handler)
+    print(f"Forwarding from 127.0.0.1:{local} -> {remote}", flush=True)
+    server.serve_forever()
+
+
+def scripted():
+    """The exit code of the first matching "answers" rule (see the module docstring), or None."""
+    joined = " ".join(ARGS)
+    for i, rule in enumerate(SCENARIO.get("answers", [])):
+        if rule.get("tool") != TOOL or not all(s in joined for s in rule.get("has", [])):
+            continue
+        if any(s in joined for s in rule.get("not", [])):
+            continue
+        answer = rule
+        if "seq" in rule:
+            answer = rule["seq"][min(counter(f"answer-{i}"), len(rule["seq"]) - 1)]
+        sys.stdout.write(answer.get("stdout", ""))
+        sys.stdout.flush()
+        sys.stderr.write(answer.get("stderr", ""))
+        sys.stderr.flush()
+        if "serve" in answer:
+            serve(answer["serve"])
+        return answer.get("rc", 0)
+    return None
+
+
 if __name__ == "__main__":
     log()
+    rc = scripted()
+    if rc is not None:
+        sys.exit(rc)
     sys.exit({"terraform": terraform, "gcloud": gcloud, "kubectl": kubectl, "helm": helm, "ssh": ssh, "scp": scp,
               "gpuctl": gpuctl}[TOOL]())

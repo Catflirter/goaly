@@ -583,7 +583,8 @@ def test_gpu_ssh_refuses_a_bad_ip(env, answer):
     assert proc.returncode != 0 and not env.calls("ssh")
 
 
-@pytest.mark.parametrize("name", ["k3s-cp", "k3s-cpu-", "k3s-cpu-1 x", "k3s-gpu-a6000", "node-1", "k3s-cpu-1;id"])
+# k3s-cp is accepted since Task 18 (node_ssh runs cp_ssh for it: checks B3/B5 run on every node).
+@pytest.mark.parametrize("name", ["k3s-cp2", "k3s-cpu-", "k3s-cpu-1 x", "k3s-gpu-a6000", "node-1", "k3s-cpu-1;id"])
 def test_node_ssh_refuses_names_outside_the_worker_pools(env, name):
     proc = env.lib(f"load_env; node_ssh '{name}' true", GPU_SSH_IP=GPU_IP)
     assert proc.returncode != 0
