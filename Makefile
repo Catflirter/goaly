@@ -119,3 +119,24 @@ gpu-status: ## Show GPU capacity, GPU instances and drift (changes no cloud stat
 .PHONY: sync-peers
 sync-peers: ## Rewrite the peer allow-lists (cp k3s_peers set, Lambda firewall) from the current node IPs
 	$(ROOT)/scripts/gpuctl sync-peers
+
+# Stretch S0 (spec §10.0): the monitoring stack in k8s/monitoring/. Grafana and Prometheus have no
+# exposed Service: they are reached only through kubectl port-forward on 127.0.0.1 (via make tunnel).
+.PHONY: monitoring monitoring-down grafana grafana-stop prometheus prometheus-stop
+monitoring: ## Install or upgrade the monitoring stack (Prometheus, exporters, Grafana); a new Grafana password is shown once
+	$(ROOT)/scripts/monitoring.sh install
+
+monitoring-down: ## Delete the monitoring stack and its data (asks first; AUTO_APPROVE=1 skips)
+	$(ROOT)/scripts/monitoring.sh uninstall
+
+grafana: ## Port-forward Grafana to http://127.0.0.1:3000 in the background (GRAFANA_PORT=... to change)
+	$(ROOT)/scripts/monitoring.sh forward grafana
+
+grafana-stop: ## Stop the Grafana port-forward
+	$(ROOT)/scripts/monitoring.sh stop grafana
+
+prometheus: ## Port-forward Prometheus to http://127.0.0.1:9090 in the background (PROMETHEUS_PORT=...)
+	$(ROOT)/scripts/monitoring.sh forward prometheus
+
+prometheus-stop: ## Stop the Prometheus port-forward
+	$(ROOT)/scripts/monitoring.sh stop prometheus
