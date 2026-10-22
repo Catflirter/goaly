@@ -28,7 +28,7 @@ Architecture and rationale: [README](../README.md). Times are Pacific (PDT).
 | jq, ssh, coreutils `timeout` | any | scripts |
 | gitleaks | >= 8.19 | `make lint`, `make verify`, `make promote-verify` |
 | bash | >= 4.1 (macOS ships 3.2: `brew install bash`) | `make up`, `make down`, `make tunnel`, `make cpu-scale`, `make cpu-remove`: each takes a lock with `exec {fd}>` and refuses an older bash (exit 2) |
-| flock (util-linux; macOS: `brew install flock`) | any | required by `make up`, `make down`, `make tunnel` and `make tunnel-stop` (each runs `tunnel.sh` start or stop, which refuses without it, exit 2) and by `cpu-pool.sh --guarded`; without it, `cpu-scale` and `cpu-remove` run without the workers lock, with a warning |
+| flock(1) (util-linux; macOS: `brew install bash util-linux`, or `brew install flock`) | any | install it, with bash >= 4.1, before `make up` or `make down`: neither refuses up front without it. `make down` warns and runs its stacks unlocked, then `tunnel.sh` exits 2 at the tunnel stop, before the final Lambda check. `tunnel.sh` needs it for `make tunnel`, `make tunnel-stop` and the tunnel stage of `make up`; `cpu-pool.sh --guarded` (and so `make demo` chapter 6) refuses without it; `cpu-scale` and `cpu-remove` run without the workers lock, with a warning |
 | shellcheck | installed by pre-commit (`shellcheck-py`) | `make lint` |
 | kubeconform | any, on `PATH` (a `language: system` hook, like `terraform fmt`) | `make lint` |
 
@@ -91,11 +91,14 @@ The CPU pool is the inventory `infra/workers/workers.auto.tfvars.json`
 `scripts/cpu-pool.sh scale N --guarded` also requires the saved plan to pass `gpuctl tfguard` (only
 the four per-worker resources of the added or removed workers may change).
 
-Every run that plans or applies a stack holds that stack's lock, `.run/<stack>.lock` (flock), until
-it exits: `make up` (each stack from the stage that plans it), every `cpu-scale` and `cpu-remove`
-(`workers.lock`) and `make down` (all three stacks). A second run on the same stack refuses at once
-(exit 2) and says how to find the holder (`fuser -v` or `lsof` on the lock file). The kernel drops
-the lock when the holder exits, however it ends, so there is no stale lock to clean up.
+The scripts that plan or apply the base and workers stacks hold that stack's lock,
+`.run/<stack>.lock` (flock), until they exit: `make up` (each stack from the stage that plans it),
+every `cpu-scale` and `cpu-remove` (`workers.lock`) and `make down` (all three stacks). A second run
+on the same stack refuses at once (exit 2) and says how to find the holder (`fuser -v` or `lsof` on
+the lock file). The kernel drops the lock when the holder exits, however it ends, so there is no
+stale lock to clean up. `gpuctl`'s own applies of `gpu-access` (`gpu-apply`, `gpu-down`,
+`sync-peers`) take no `.run` lock; Terraform's lock on the GCS state serialises them, and a second
+apply fails with a state-lock error instead of waiting.
 
 ## GPU nodes
 
@@ -150,9 +153,12 @@ node by hand (`make gpu-down`, `make gpu-apply`) and re-run `scripts/verify.sh E
 `make promote-verify` refuses a run with a failed check, and a run with a skipped check unless
 `PROMOTE_ALLOW_SKIP=1`. It copies the run to a staging directory and fails if gitleaks finds
 anything, or if the copy contains the GCP project id (from the environment and from `.env`, in any
-case) or `OPERATOR_IP`. The operator-IP check runs only when `OPERATOR_IP` is set in the caller's
+case; [scripts/promote.sh](../scripts/promote.sh)) or `OPERATOR_IP`. The run itself already shows the
+project id as `<GCP_PROJECT>` (`redact` in [scripts/lib/checks.sh](../scripts/lib/checks.sh)), so this
+check is a backstop. The operator-IP check runs only when `OPERATOR_IP` is set in the caller's
 environment (promote.sh does not look the IP up itself), hence the command above. The `grep` after
-it is a required step before the promoted copy is committed.
+it is a required step before the promoted copy is committed. The final from-scratch run is committed
+as `verification/final/SUMMARY.md`.
 
 ## Break-glass
 
@@ -231,18 +237,19 @@ All six print nothing.
 
 ## Demo-day checklist
 
-The demo is run live from the operator's machine. The demo tooling (`make preflight`, `make demo`,
-`make demo-replay`, `make demo-reset`) is added by Task 25, which also records the rehearsal timings
-below; until then each step lists the commands it automates.
+The demo is run live from the operator's machine (`scripts/demo.sh`,
+`scripts/preflight.sh`); `scripts/demo.sh list` prints the chapters and their
+estimated length.
 
 | When | Action |
 |---|---|
 | Day before | `make up`; `make verify`; check `SUMMARY.md` is all PASS (D included only with a GPU node); GCP stays up overnight (see [Cost](../README.md#cost)) |
-| T-60 min | `make preflight`: tool versions; `gcloud auth list`, and `gcloud auth application-default print-access-token > /dev/null && echo 'ADC ok'` (it must succeed; the token is discarded, never shown); `scripts/gpuctl status` (also checks Lambda capacity); `make sync-peers` (refreshes the operator IP for this network); `scripts/tunnel.sh status` or `make tunnel`; every node Ready |
+| T-60 min | `make preflight`, every line OK: tool versions (flock included); an active `gcloud auth list` account; ADC works (as `gcloud auth application-default print-access-token > /dev/null`: the token is never shown); `scripts/gpuctl status` exits 0 (capacity listed, no drift); `gpuctl sync-peers` (the operator IP of this network); the tunnel, started if down; every node Ready; the operator IP and project id known, so the demo can mask them |
 | T-30 min | `make gpu-apply` (5-10 min measured). If no candidate type has capacity in any region, the GPU chapter uses its recorded output |
-| T-5 min | `make demo-reset` (removes demo pods, the `np-denied` namespace, GPU test pods; scales the CPU pool back to 1); `make preflight` again |
-| During | `make demo` (pauses after every step); `make demo CHAPTERS=1,2,4,5` for a shorter slot; `make demo-replay CHAPTER=n` if a live step fails |
-| After | `make gpu-down`, then `make gpu-status` shows no instance; decide whether GCP stays up or `make down` |
+| T-5 min | `make demo-reset` (deletes the limits-demo Pods, the `np-denied` namespace and the GPU test Pods; scales the CPU pool back to 1); `make preflight` again |
+| During | `make demo` (pauses after every step; `DEMO_NO_PAUSE=1` does not); `make demo CHAPTERS=1,2,4,5` for a shorter slot; a failed step names its fallback, `make demo-replay CHAPTER=n`, and the demo goes on |
+| After the demo | review `verification/demo-<ts>/`; `make promote-demo RUN=verification/demo-<ts>` keeps it as the replay source in `verification/final/demo/` |
+| Wrap-up | `make gpu-down`, then `make gpu-status` shows no instance; decide whether GCP stays up or `make down` |
 
 Screen safety: never `cat .env` or the kubeconfig on screen, and never print an access token; demo
 output goes through the same redaction filter as `make verify`.
@@ -251,7 +258,10 @@ output goes through the same redaction filter as `make verify`.
 
 | Symptom | Cause (measured) | Remedy |
 |---|---|---|
-| `make down` warns that it skipped the drains | the API tunnel had died while idle (2026-10-22) | `make tunnel`, then re-run; the destroys remove the VMs either way |
+| `make down` warns that it skipped the drains | the IAP tunnel had died while idle (2026-10-22) | run `make tunnel` before `make down`, so the drains run; the destroys remove the VMs either way |
+| C7 reports the oom Pod's reason as `Error` (exit 137), not `OOMKilled` | containerd reported the wrong reason (1 of 6 runs); the node's kernel log showed `Memory cgroup out of memory: Killed process (tail) anon-rss:64792kB` (`CONSTRAINT_MEMCG`), so the 64Mi limit was enforced | re-run `scripts/verify.sh C`; planned fix: C7 also accepts exit 137 plus a kernel memcg OOM record |
+| B3 reports 3 WireGuard peers instead of 2 | after a GPU node is deleted (`make gpu-down`, or E2's replacement), flannel's wireguard-native backend on `k3s-cp` keeps the deleted node's peer (it carries no traffic) | on `k3s-cp`: `sudo wg show flannel-wg latest-handshakes`, then `sudo wg set flannel-wg peer <stale-public-key> remove` for each key that matches no Node's `flannel.alpha.coreos.com/backend-data` PublicKey (or restart k3s); planned fix: `gpuctl down` removes the peer |
+| `gpuctl plan --set-count a6000=2` prints `plan refused: budget_usd_per_hour ...` | by design: every new GPU node is priced at the pool's most expensive candidate ($1.99/h, the A100), so the 3.0 budget fits one new node per plan | raise `budget_usd_per_hour` or drop the A100 fallback ([GPU nodes](#gpu-nodes)) |
 | `gpu-apply`'s join step takes about 4 minutes | `apt-get update` over the Lambda image's package sources, then the installs (1m03s and 4m06s in two runs) | wait; the join is bounded (SSH 300 s, Ready 300 s) |
 | `gpu-apply` launches an A10 instead of an A6000 | no `gpu_1x_a6000` capacity in any listed region | expected fallback; `make gpu-status` shows capacity. E2 waits a bounded time for a freed unit before it gives up |
 | `make up` waits for `node/k3s-cp` that never appears | the node registered under the GCE FQDN hostname (first live run, before `node-name: k3s-cp`) | current code pins the name; on a cluster built before that, `kubectl delete node <fqdn-name>` |
@@ -261,8 +271,9 @@ output goes through the same redaction filter as `make verify`.
 
 ## Measured timings
 
-From live runs on 2026-10-21 and 2026-10-22. Task 24 re-measures every row from a final from-scratch
-run, and Task 25 adds the per-chapter demo timings after the rehearsals.
+From live runs on 2026-10-21 and 2026-10-22. "Final run" is the last from-scratch run (Task 24,
+2026-10-22); "rehearsal" is the rebuild rehearsal earlier the same day. Each chapter's measured time
+is in the `timings.txt` of a demo run.
 
 **Bootstrap and bring-up**
 
@@ -271,7 +282,8 @@ run, and Task 25 adds the per-chapter demo timings after the rehearsals.
 | `make init`, first run (bucket, APIs) | about 1m15s |
 | `make init`, re-run without changes | 7.5 s |
 | Base stack apply | about 1 min |
-| `make up` from scratch (rebuild rehearsal, 2026-10-22) | 6m59s |
+| `make up` from scratch, final run | 6m19s |
+| `make up` from scratch, rehearsal | 6m59s |
 | `make up` re-run with nothing to change | 92 s (no restart, guard rules unchanged) |
 
 **CPU pool** (each measured twice)
@@ -284,16 +296,17 @@ run, and Task 25 adds the per-chapter demo timings after the rehearsals.
 
 **GPU nodes** (`gpu_1x_a10`)
 
-| Phase of `make gpu-apply` | Task 21 run | Rehearsal run |
-|---|---|---|
-| Total | 5m43s | 9m41s |
-| Launch | 9 s | 10 s |
-| Wait until active with an IP | 3m55s | 4m46s |
-| `terraform apply` gpu-access | 15 s | 15 s |
-| `sync-peers` | 14 s | 18 s |
-| Join | 1m03s | 4m06s |
+| Phase of `make gpu-apply` | Final run | Task 21 run | Rehearsal run |
+|---|---|---|---|
+| Total | 5m59s | 5m43s | 9m41s |
+| Launch | 8 s | 9 s | 10 s |
+| Wait until active with an IP | 4m26s | 3m55s | 4m46s |
+| `terraform apply` gpu-access | 15 s | 15 s | 15 s |
+| `sync-peers` | 15 s | 14 s | 18 s |
+| Join | 50 s | 1m03s | 4m06s |
 
-`make gpu-down`: 36-39 s. `make down`, whole teardown: 6m10s.
+`make gpu-down`: 36-39 s. `make down`, whole teardown, final run: 6m10s (`k3s-cpu-1` drained and
+deleted, then the 6 workers and 10 base resources destroyed).
 
 **Verification**
 

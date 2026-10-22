@@ -234,7 +234,7 @@ Prerequisites (details in the [runbook](docs/runbook.md#prerequisites)):
   rights to create the resources;
 - a Lambda Cloud account, an API key, and an SSH public key uploaded to Lambda;
 - terraform >= 1.9, gcloud, kubectl, helm, python3 >= 3.11, jq, gitleaks, kubeconform, bash >= 4.1
-  and flock (on macOS: `brew install bash flock`);
+  and flock(1) from util-linux (on macOS: `brew install bash util-linux`);
 - `gcloud auth login` and `gcloud auth application-default login`.
 
 ```bash
@@ -275,7 +275,7 @@ check functions in [scripts/lib/checks.sh](scripts/lib/checks.sh)):
 
 Each run writes `verification/<YYYY-MM-DDTHHMM-0700>/`: one numbered file per check, starting with the
 commands it ran, and a `SUMMARY.md` with PASS, FAIL or SKIP. Output passes a redaction filter
-(tokens, kubeconfig keys, private keys, the Lambda key; the operator's IP becomes `<operator_ip>` and
+(`redact` in [scripts/lib/checks.sh](scripts/lib/checks.sh): tokens, kubeconfig keys, private keys, the Lambda key; the operator's IP becomes `<operator_ip>` and
 the GCP project id `<GCP_PROJECT>`, in any case), every check is time-bounded, an interrupt runs each
 check's cleanup, and gitleaks scans the run.
 
@@ -285,12 +285,12 @@ check's cleanup, and gitleaks scans the run.
 | A-D, one A10 (2026-10-21) | 24/24 PASS | 412 s |
 | `RESILIENCE=1` on a cluster rebuilt from scratch (2026-10-22) | 27/27 PASS, 0 skipped, gitleaks clean | 21m54s |
 
-The committed evidence will be `verification/final/SUMMARY.md`. Task 24 produces it from a final
-from-scratch run (`make down`, `make up`, `make gpu-apply`, `make verify RESILIENCE=1`) and promotes
-it with `OPERATOR_IP=$(curl -s https://checkip.amazonaws.com) make promote-verify
-RUN=verification/<ts>`, which copies the run to a staging directory, scans every file with gitleaks
-and for the GCP project id (the environment's and `.env`'s), and only then replaces
-`verification/final/`. It also fails on the operator's IP, but only when `OPERATOR_IP` is set in the
+The final run, from scratch (`make down`, `make up`, `make gpu-apply`, `make verify RESILIENCE=1`,
+2026-10-22), is committed as `verification/final/SUMMARY.md`. It was promoted with
+`OPERATOR_IP=$(curl -s https://checkip.amazonaws.com) make promote-verify RUN=verification/<ts>`
+([scripts/promote.sh](scripts/promote.sh)), which copies the run to a staging directory, scans every
+file with gitleaks, refuses the copy if it contains the GCP project id (the environment's or
+`.env`'s), and only then replaces `verification/final/`. It also fails on the operator's IP, but only when `OPERATOR_IP` is set in the
 caller's environment, as above; it never looks the IP up itself. A
 `grep -r "$(curl -s https://checkip.amazonaws.com)" verification/final` that prints nothing is the
 required last step before the copy is committed ([runbook](docs/runbook.md#verification)).
@@ -300,8 +300,10 @@ new `SUMMARY.md` with the committed one.
 ## Live demo
 
 The demo runs live from the operator's machine with the screen shared; viewers need no access.
-`make demo` (added by Task 25) runs the same check functions as `make verify`, chapter by chapter: it
-prints each step's title and command, runs it through the same redaction filter, and waits for Enter.
+`make demo` (`scripts/demo.sh`) runs the same check functions as `make verify`,
+chapter by chapter: it prints each step's title and command, runs it through the same redaction
+filter (the operator's IP shown as `<operator_ip>`, the project id as `<GCP_PROJECT>`; without a known
+operator IP it does not start), and waits for Enter.
 
 | Chapter | Content | Checks |
 |---|---|---|
@@ -313,16 +315,21 @@ prints each step's title and command, runs it through the same redaction filter,
 | 6 | Spec-driven scaling: `cpu-scale` to 2 and back to 1 (guarded), `gpu-plan` with a changed count (with the committed budget, a second GPU node is refused: the plan is printed, then `plan refused`; see [Cost](#cost)) | - |
 | 8 | Teardown: the `make down` plan, or the real teardown | - |
 
-Chapter 7 (autoscaling) belongs to the optional stretch and is not part of the core demo.
+Chapter 7 (autoscaling) runs only when the optional stretch is installed (`k8s/scale-demo/`); it is
+not part of the core demo. Chapter 8 shows the teardown plan and runs `make down` only after a `y`
+and the project id typed without echo.
 
-Task 25 also adds the other demo targets: `make demo CHAPTERS=1,2,4,5` for a shorter slot,
-`make demo-replay CHAPTER=n` to print a chapter's recorded output if a live step fails,
-`make demo-reset` to remove what a run creates, and `make preflight` to check tools, logins, the
-operator IP and GPU stock beforehand. Until then the [demo-day checklist](docs/runbook.md#demo-day-checklist)
-lists the commands each one automates. Task 25 adds the per-chapter timings
-after the rehearsals; the measured building blocks are `make cpu-scale N=2` 156 s, back to 1 in
-179-182 s, and `make gpu-apply` 5m43s-9m41s, which is why the GPU node is launched about 30 minutes
-ahead ([demo-day checklist](docs/runbook.md#demo-day-checklist)).
+| Target | What it does |
+|---|---|
+| `make preflight` | one OK/FAIL line each: tool versions (flock included), gcloud and ADC logins (the token is never printed), `gpuctl status` (capacity, no drift), `gpuctl sync-peers`, the tunnel (started if down), every node Ready, the operator IP and project id known for masking; exit 1 if any item failed |
+| `make demo` | all chapters (1-6 and 8, plus 7 with the stretch); `CHAPTERS=1,2,4,5` picks chapters, `DEMO_NO_PAUSE=1` does not wait for Enter. A failed step names its fallback and the demo goes on. Each run records `verification/demo-<YYYY-MM-DDTHHMM-0700>/chN.txt` and `timings.txt` |
+| `make demo-replay CHAPTER=n` | prints the promoted recording `verification/final/demo/chN.txt`, the fallback when a live step fails |
+| `make demo-reset` | deletes what the demo creates (the limits-demo Pods, the `np-denied` namespace, the GPU test Pods) and scales the CPU pool back to 1 |
+| `make promote-demo RUN=verification/demo-<ts>` | copies a reviewed demo run to `verification/final/demo/` after a gitleaks scan, for `demo-replay` |
+
+Chapter 6 waits for a CPU worker to join, and the measured building blocks are `make cpu-scale N=2`
+156 s, back to 1 in 179-182 s, and `make gpu-apply` 5m43s-9m41s, which is why the GPU node is
+launched about 30 minutes ahead ([demo-day checklist](docs/runbook.md#demo-day-checklist)).
 
 ## Cost
 
@@ -372,6 +379,16 @@ of this cluster.
 - **Third-party GPU hosts:** Lambda has root on them, and each new host key is trusted on first use.
 - **Bundled containerd 2.3.4** is likely affected by two medium-severity DoS advisories; upgrade with
   the k3s release that fixes it.
+- **Known issues observed live**, each root-caused, with the remedy in the
+  [runbook](docs/runbook.md#troubleshooting): C7 once (1 of 6 runs) saw containerd report the OOM
+  Pod's reason as `Error` (exit 137) although the kernel's memory-cgroup OOM killer had enforced the
+  64Mi limit (planned fix: C7 also accepts exit 137 plus a kernel memcg OOM record); after a GPU node
+  is deleted, `k3s-cp` keeps its stale WireGuard peer, so B3 counts one peer too many on the next run
+  (planned fix: `gpuctl down` removes the peer); the budget guard admits one new GPU node per plan;
+  the IAP tunnel can die while idle, so run `make tunnel` before `make down`.
+- **Not merged before the deadline:** a monitoring check and an autoscaler, implemented and reviewed
+  in separate PRs (#101, #102), on top of the port-forward-only monitoring stack (`make monitoring`)
+  that is already on main.
 
 The [P2 roadmap](docs/p2-roadmap.md) expands each item with why it matters and how it would be built;
 the [threat model](docs/threat-model.md) lists the residual risks in full.
