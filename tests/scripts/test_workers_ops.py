@@ -22,9 +22,17 @@ INSTALL = "sudo install -m 600 /dev/stdin /etc/rancher/k3s/token && sudo systemc
 CONTAINERD_GREP = "sudo grep -A3 nvidia /var/lib/rancher/k3s/agent/etc/containerd/config.toml"
 READY = 'jsonpath={.status.conditions[?(@.type=="Ready")].status}'
 RT = "--request-timeout=60s"
-STOP_AGENT = "sudo systemctl stop k3s-agent"
+NODE_CLOCK = "date -u +%Y-%m-%dT%H:%M:%SZ"
+STOP_AGENT = f"sudo systemctl stop k3s-agent && {NODE_CLOCK}"
+RESTART_AGENT = f"sudo systemctl stop k3s-agent && {NODE_CLOCK} && sudo systemctl start k3s-agent"
+EXTERNAL_IP = 'jsonpath={.status.addresses[?(@.type=="ExternalIP")].address}'
+JOINED = ('jsonpath={.status.conditions[?(@.type=="Ready")].status}{"|"}'
+          '{.status.conditions[?(@.type=="Ready")].lastHeartbeatTime}{"|"}'
+          '{.status.addresses[?(@.type=="ExternalIP")].address}')
+NODE_TIME = "2026-10-22T10:00:00Z"  # fake_tools.py's default node clock, read with the agent stop
 GPU = "k3s-gpu-a6000-1"
 GPU_IP = "129.80.1.2"
+OTHER_IP = "129.80.9.9"  # another (lost) Lambda machine that holds GPU's name
 NODE_TOOLS = ("gcloud", "kubectl", "gpuctl", "helm", "ssh", "scp")
 
 
@@ -54,6 +62,16 @@ def kc(env, *args):
 def get_node(env, name):
     """node_state's one kubectl call: the Ready condition of NAME, bounded by --request-timeout."""
     return kc(env, "get", "node", name, RT, "-o", READY)
+
+
+def get_ip(env, name):
+    """node_external_ip's one kubectl call: NAME's ExternalIP (review F6-1: is a Ready Node this machine?)."""
+    return kc(env, "get", "node", name, RT, "-o", EXTERNAL_IP)
+
+
+def joined(env, name):
+    """Step 5's read, retried for 300s: NAME's Ready status, Ready heartbeat and ExternalIP (review F6-1)."""
+    return kc(env, "get", "node", name, RT, "-o", JOINED)
 
 
 def cp(command):
@@ -93,8 +111,18 @@ def calls(env):
     return out
 
 
+def delete_stale(env, name):
+    """join-node's delete of a registered but NotReady GPU node of exactly its name (review F3-2, Ruling R55)."""
+    return kc(env, "delete", "node", name, RT)
+
+
+def no_node_deleted(env):
+    return not [c for c in env.calls("kubectl") if "delete" in c["argv"]]
+
+
 def cpu_join(env, name="k3s-cpu-1", ip="34.10.0.11", zone="us-central1-a", mtu="1460", sync=True):
-    """The calls of a full join-node.sh for CPU worker NAME (spec §5.2, Task 14 brief steps 1-6)."""
+    """The calls of a full join-node.sh for CPU worker NAME (spec §5.2, Task 14 brief steps 1-6). A registered but
+    NotReady CPU worker is joined the same way: its Node is never deleted (Ruling R55)."""
     return [
         *([("gpuctl", ["sync-peers"])] if sync else []),
         get_node(env, name),
@@ -108,23 +136,32 @@ def cpu_join(env, name="k3s-cpu-1", ip="34.10.0.11", zone="us-central1-a", mtu="
         worker(name, STOP_AGENT, zone),
         cp(f"sudo k3s token create --ttl 15m --description {name}"),
         worker(name, INSTALL, zone),
-        kc(env, "wait", "--for=condition=Ready", f"node/{name}", "--timeout=10s"),
+        joined(env, name),
         cp(token_delete(name)),
     ]
 
 
-def gpu_join(env):
+def gpu_join(env, stale=False, second="False", ready=False):
+    """`stale`: GPU is registered but NotReady, so once SSH works and the agent is stopped, just before the token
+    install, its state is read again and the Node deleted if it is still NotReady (review F3-2/F4-3/F5-1, Ruling
+    R55). `second`: what that read found: "False" (deleted), "True" (Ready: its ExternalIP is read, review F6-1,
+    nothing deleted) or "gone" (nothing deleted). `ready`: GPU was Ready in step 2 (a --force join), so its
+    ExternalIP is read there."""
     return [
         get_node(env, GPU),
+        *([get_ip(env, GPU)] if ready else []),
         gpu(env, "true"),
         gpu(env, STAGING),
         ("scp", ["-r", *gpu_opts(env), *node_files(env), f"ubuntu@{GPU_IP}:/tmp/k3s-node"]),
         gpu(env, f"sudo bash /tmp/k3s-node/node-bootstrap.sh --server-ip 34.82.10.10 --node-name {GPU}"
                  f" --external-ip {GPU_IP} --underlay-mtu 1460 --gpu --gpu-type a6000"),
         gpu(env, STOP_AGENT),
+        *([get_node(env, GPU)] if stale else []),
+        *([get_ip(env, GPU)] if stale and second == "True" else []),
+        *([delete_stale(env, GPU)] if stale and second == "False" else []),
         cp(f"sudo k3s token create --ttl 15m --description {GPU}"),
         gpu(env, INSTALL),
-        kc(env, "wait", "--for=condition=Ready", f"node/{GPU}", "--timeout=10s"),
+        joined(env, GPU),
         cp(token_delete(GPU)),
         kc(env, "label", "node", GPU, "node-restriction.kubernetes.io/accelerator=nvidia", "--overwrite", RT),
         gpu(env, CONTAINERD_GREP),
@@ -166,12 +203,12 @@ def test_join_cpu_worker_runs_the_whole_sequence(env):
                                                                   "-backend-config=prefix=workers"]
     outputs = [c["argv"][-1] for c in env.calls("terraform") if c["argv"][1] == "output"]
     assert outputs[0] == "worker_ips"
-    assert "waiting up to 300s for: kc wait --for=condition=Ready node/k3s-cpu-1 --timeout=10s" in proc.stderr
+    assert f"waiting up to 300s for: node_joined k3s-cpu-1 34.10.0.11 {NODE_TIME}" in proc.stderr
     env.assert_no_lambda_key()
 
 
 def test_join_waits_for_the_node_to_register(env):
-    """`kubectl wait` fails at once for a node that has not registered yet, so it is retried for 300s."""
+    """`kubectl get node` fails at once for a node that has not registered yet, so it is retried for 300s."""
     proc = join(env, "--node", "k3s-cpu-1", "--external-ip", "34.10.0.11", "--skip-sync")
     assert proc.returncode == 0, proc.stderr
     assert calls(env) == cpu_join(env, sync=False)
@@ -200,9 +237,13 @@ def test_join_force_rejoins_a_ready_node(env):
 
 
 def test_join_of_a_registered_but_not_ready_node_bootstraps_again(env):
+    """Review F4-4, Ruling R55: a NotReady CPU worker (k3s-cpu-1 included) is the same VM with its node password:
+    it re-registers as it is, so its Node, and the Pods bound to it, are never deleted by a re-join."""
     env.scenario["registered"] = ["k3s-cpu-1"]
-    assert join(env, "--node", "k3s-cpu-1", "--external-ip", "34.10.0.11").returncode == 0
+    proc = join(env, "--node", "k3s-cpu-1", "--external-ip", "34.10.0.11")
+    assert proc.returncode == 0, proc.stderr
     assert calls(env) == cpu_join(env)
+    assert no_node_deleted(env) and "WARNING" not in proc.stderr
 
 
 def test_join_refuses_an_ip_the_firewall_does_not_know(env):
@@ -430,6 +471,15 @@ def test_join_deletes_the_token_when_the_node_never_becomes_ready(env):
     assert [c for c in calls(env) if c == cp(token_delete("k3s-cpu-1"))] == [cp(token_delete("k3s-cpu-1"))]
 
 
+def test_join_cpu_worker_waits_for_ready_at_its_own_ip(env):
+    """Review F6-1: step 5 also needs the ExternalIP node-bootstrap.sh gave the worker."""
+    env.scenario["answers"] = [{"tool": "kubectl", "has": ["get node k3s-cpu-1", "lastHeartbeatTime"],
+                                "stdout": "True|2026-10-22T10:00:05Z|34.10.0.99"}]
+    proc = join(env, "--node", "k3s-cpu-1", "--external-ip", "34.10.0.11", JOIN_READY_TIMEOUT_S="0")
+    assert proc.returncode == 1 and "node k3s-cpu-1 not Ready at 34.10.0.11" in proc.stderr
+    assert calls(env)[-1] == cp(token_delete("k3s-cpu-1"))
+
+
 def test_join_rerun_after_a_ready_timeout_restarts_the_agent_from_the_new_token(env):
     """A join that timed out leaves k3s-agent running with a token its cleanup deleted; k3s reads the
     token-file only at start and `enable --now` does not restart an active unit. The re-run stops
@@ -442,7 +492,7 @@ def test_join_rerun_after_a_ready_timeout_restarts_the_agent_from_the_new_token(
     env.scenario["registered"] = ["k3s-cpu-1"]  # it registered, but never became Ready
     proc = join(env, "--node", "k3s-cpu-1", "--external-ip", "34.10.0.11")
     assert proc.returncode == 0, proc.stderr
-    assert calls(env) == cpu_join(env)
+    assert calls(env) == cpu_join(env) and no_node_deleted(env)
     seq = calls(env)
     stop = seq.index(worker("k3s-cpu-1", STOP_AGENT))
     assert stop < seq.index(cp("sudo k3s token create --ttl 15m --description k3s-cpu-1")) < seq.index(
@@ -481,7 +531,7 @@ def test_join_deletes_the_token_when_installing_it_fails(env):
     proc = join(env, "--node", "k3s-cpu-1", "--external-ip", "34.10.0.11")
     assert proc.returncode != 0
     assert calls(env)[-1] == cp(token_delete("k3s-cpu-1"))
-    assert not [c for c in calls(env) if "wait" in c[1]]
+    assert joined(env, "k3s-cpu-1") not in calls(env)
 
 
 def test_join_fails_when_the_token_cannot_be_deleted(env):
@@ -574,9 +624,7 @@ def test_join_gpu_node_restarts_k3s_agent_once_when_containerd_lacks_nvidia(env)
     env.scenario["containerd"] = ["", "[plugins.nvidia]"]
     proc = gpuctl_join(env)
     assert proc.returncode == 0, proc.stderr
-    assert calls(env) == [*gpu_join(env), gpu(env, "sudo systemctl restart k3s-agent"),
-                          kc(env, "wait", "--for=condition=Ready", f"node/{GPU}", "--timeout=10s"),
-                          gpu(env, CONTAINERD_GREP)]
+    assert calls(env) == [*gpu_join(env), gpu(env, RESTART_AGENT), joined(env, GPU), gpu(env, CONTAINERD_GREP)]
 
 
 def test_join_gpu_node_fails_when_containerd_never_has_nvidia(env):
@@ -584,7 +632,7 @@ def test_join_gpu_node_fails_when_containerd_never_has_nvidia(env):
     proc = gpuctl_join(env)
     assert proc.returncode == 1 and "nvidia" in proc.stderr
     assert calls(env)[-1] == gpu(env, CONTAINERD_GREP)
-    assert len([c for c in calls(env) if c == gpu(env, "sudo systemctl restart k3s-agent")]) == 1
+    assert len([c for c in calls(env) if c == gpu(env, RESTART_AGENT)]) == 1
 
 
 def test_join_gpu_node_fails_when_the_containerd_config_cannot_be_read(env):
@@ -592,7 +640,7 @@ def test_join_gpu_node_fails_when_the_containerd_config_cannot_be_read(env):
     env.scenario["ssh_fail_rc"] = 255
     proc = gpuctl_join(env)
     assert proc.returncode == 1
-    assert gpu(env, "sudo systemctl restart k3s-agent") not in calls(env)
+    assert gpu(env, RESTART_AGENT) not in calls(env)
 
 
 def test_join_gpu_node_refuses_an_ip_without_firewall_rules(env):
@@ -602,8 +650,233 @@ def test_join_gpu_node_refuses_an_ip_without_firewall_rules(env):
 
 def test_join_gpu_node_ready_is_left_alone(env):
     env.scenario["ready"] = [GPU]
+    env.scenario["external_ip"] = {GPU: GPU_IP}
     proc = gpuctl_join(env)
-    assert proc.returncode == 0 and calls(env) == [get_node(env, GPU)]
+    assert proc.returncode == 0 and calls(env) == [get_node(env, GPU), get_ip(env, GPU)]
+    assert not [c for c in env.calls("kubectl") if "delete" in c["argv"]]
+
+
+def test_join_deletes_a_stale_not_ready_node_of_its_name_first(env):
+    """Review F3-2: a NotReady Node of this name, left by an instance terminated undrained or lost, holds k3s's
+    node-password secret, so the new instance's agent would be rejected ("Node password rejected") after billed
+    minutes. join-node deletes that Node (k3s then removes the secret), loudly, once SSH to the new instance works
+    and its agent is stopped, just before the token install (review F4-3, Ruling R55)."""
+    env.scenario["registered"] = [GPU]
+    proc = gpuctl_join(env)
+    assert proc.returncode == 0, proc.stderr
+    assert calls(env) == gpu_join(env, stale=True)
+    assert f"WARNING: node {GPU} is registered but NotReady" in proc.stderr
+    assert "node-password" in proc.stderr
+
+
+def test_join_never_deletes_another_node(env):
+    """Only exactly NAME: other registered NotReady nodes (another index, a longer name) are left alone."""
+    env.scenario["registered"] = ["k3s-gpu-a6000-2", "k3s-gpu-a6000-10", "k3s-cpu-1"]
+    proc = gpuctl_join(env)
+    assert proc.returncode == 0, proc.stderr
+    assert calls(env) == gpu_join(env)
+    assert not [c for c in env.calls("kubectl") if "delete" in c["argv"]]
+
+
+def test_join_force_never_deletes_a_ready_node(env):
+    env.scenario["ready"] = [GPU]
+    env.scenario["external_ip"] = {GPU: GPU_IP}
+    proc = gpuctl_join(env, "--force")
+    assert proc.returncode == 0, proc.stderr
+    assert calls(env) == gpu_join(env, ready=True)
+
+
+def test_join_stops_when_the_stale_node_cannot_be_deleted(env):
+    """No token for an agent the cluster would reject anyway: the join stops after the bootstrap, the agent stop
+    and the failed delete (review F4-3: the delete comes last before the token install)."""
+    env.scenario["registered"] = [GPU]
+    env.scenario["answers"] = [{"tool": "kubectl", "has": [f"delete node {GPU}"], "rc": 1,
+                                "stderr": 'Error from server (Forbidden): nodes "x" is forbidden'}]
+    proc = gpuctl_join(env)
+    assert proc.returncode == 1 and f"cannot delete the stale NotReady node {GPU}" in proc.stderr
+    expected = gpu_join(env, stale=True)
+    assert calls(env) == expected[:expected.index(delete_stale(env, GPU)) + 1] and piped(env) == []
+
+
+def test_join_deletes_no_stale_node_when_ssh_never_comes_up(env):
+    """Review F4-3, Ruling R55: an instance that never gets sshd fails the join with its stale Node (and the Pods
+    bound to it) untouched: nothing is deleted for a join that cannot happen."""
+    env.scenario["registered"] = [GPU]
+    env.scenario["ssh_failures"] = 10**6
+    proc = gpuctl_join(env, JOIN_SSH_TIMEOUT_S="0")
+    assert proc.returncode == 1 and f"SSH to {GPU} not available after 0s" in proc.stderr
+    assert calls(env) == [get_node(env, GPU), gpu(env, "true")]
+    assert no_node_deleted(env) and "WARNING" not in proc.stderr
+
+
+def test_join_deletes_no_stale_node_when_the_bootstrap_fails(env):
+    """The delete is the last step before the token install: a bootstrap failure leaves the Node too."""
+    env.scenario["registered"] = [GPU]
+    bootstrap = gpu_join(env)[4][1][-1]
+    assert "node-bootstrap.sh" in bootstrap
+    env.scenario["ssh_fail"] = [bootstrap]
+    proc = gpuctl_join(env)
+    assert proc.returncode == 1
+    assert calls(env) == gpu_join(env)[:5] and no_node_deleted(env) and piped(env) == []
+
+
+def test_join_deletes_no_stale_node_when_the_agent_cannot_be_stopped(env):
+    env.scenario["registered"] = [GPU]
+    env.scenario["ssh_fail"] = [STOP_AGENT]
+    proc = gpuctl_join(env)
+    assert proc.returncode == 1 and "cannot stop k3s-agent" in proc.stderr
+    assert calls(env) == gpu_join(env)[:6] and no_node_deleted(env) and piped(env) == []
+
+
+def second_read(state):
+    """A scripted answer for join-node's two `kubectl get node GPU` calls: NotReady in step 2, then STATE
+    (True, False or gone) in the read just before the stale-Node delete."""
+    later = ({"rc": 1, "stderr": f'Error from server (NotFound): nodes "{GPU}" not found'} if state == "gone"
+             else {"stdout": state})
+    return {"tool": "kubectl", "has": [f"get node {GPU}"], "not": ["ExternalIP"],
+            "seq": [{"stdout": "False"}, later]}
+
+
+def test_join_never_deletes_a_node_that_became_ready_during_the_join(env):
+    """Review F5-1, Ruling R55: step 2's NotReady can be minutes old by the delete (the SSH wait, the bootstrap).
+    On a re-run after a Ready timeout the earlier join's agent may have made the Node Ready meanwhile: it is the
+    same machine with its own node password, so its Node and Pods stay; join-node reads the state again and says
+    why it deletes nothing."""
+    env.scenario["answers"] = [second_read("True")]
+    proc = gpuctl_join(env)
+    assert proc.returncode == 0, proc.stderr
+    assert calls(env) == gpu_join(env, stale=True, second="True")
+    assert no_node_deleted(env) and "WARNING" not in proc.stderr
+    assert f"node {GPU} is Ready now" in proc.stderr and "not deleting it" in proc.stderr
+
+
+def test_join_deletes_nothing_when_the_stale_node_left_during_the_join(env):
+    env.scenario["answers"] = [second_read("gone")]
+    proc = gpuctl_join(env)
+    assert proc.returncode == 0, proc.stderr
+    assert calls(env) == gpu_join(env, stale=True, second="gone")
+    assert no_node_deleted(env) and "WARNING" not in proc.stderr
+    assert f"node {GPU} is no longer registered: nothing to delete" in proc.stderr
+
+
+def test_join_deletes_a_node_still_not_ready_at_the_second_read(env):
+    env.scenario["answers"] = [second_read("False")]
+    proc = gpuctl_join(env)
+    assert proc.returncode == 0, proc.stderr
+    assert calls(env) == gpu_join(env, stale=True)
+    assert f"WARNING: node {GPU} is registered but NotReady" in proc.stderr
+
+
+def test_join_deletes_nothing_when_the_second_read_fails(env):
+    """An API that stops answering before the delete fails the join: no delete, no token."""
+    env.scenario["answers"] = [{"tool": "kubectl", "has": [f"get node {GPU}"], "not": ["ExternalIP"], "seq": [
+        {"stdout": "False"},
+        {"rc": 1, "stderr": "Unable to connect to the server: dial tcp 127.0.0.1:6443: connect: connection refused"}]}]
+    proc = gpuctl_join(env)
+    assert proc.returncode == 1 and f"cannot read node {GPU}" in proc.stderr
+    expected = gpu_join(env, stale=True, second="gone")
+    assert calls(env) == expected[:expected.index(gpu(env, STOP_AGENT)) + 2]
+    assert no_node_deleted(env) and piped(env) == []
+
+
+def test_join_tolerates_a_stale_node_that_is_already_gone(env):
+    env.scenario["registered"] = [GPU]
+    env.scenario["gone"] = [GPU]  # deleted by someone else between the read and the delete
+    proc = gpuctl_join(env)
+    assert proc.returncode == 0, proc.stderr
+    assert calls(env) == gpu_join(env, stale=True)
+
+
+def no_label(env):
+    return not [c for c in env.calls("kubectl") if "label" in c["argv"]]
+
+
+@pytest.mark.parametrize("force", [[], ["--force"]])
+def test_join_refuses_a_ready_node_of_its_name_at_another_ip(env, force):
+    """Review F6-1: a Ready Node of this name at another ExternalIP is another machine (a lost instance that came
+    back): k3s would reject this one's agent ("Node password rejected"). join-node says so with both IPs and stops
+    before SSH: nothing is bootstrapped, deleted or labelled, no token is made, even with --force."""
+    env.scenario["ready"] = [GPU]
+    env.scenario["external_ip"] = {GPU: OTHER_IP}
+    proc = gpuctl_join(env, *force)
+    assert proc.returncode == 1
+    assert f"node {GPU} is Ready at {OTHER_IP}, not at {GPU_IP}" in proc.stderr
+    assert calls(env) == [get_node(env, GPU), get_ip(env, GPU)]
+    assert no_node_deleted(env) and no_label(env) and piped(env) == []
+
+
+def test_join_refuses_a_ready_node_without_a_readable_external_ip(env):
+    env.scenario["ready"] = [GPU]
+    proc = gpuctl_join(env)
+    assert proc.returncode == 1 and f"cannot read the ExternalIP of the Ready node {GPU}" in proc.stderr
+    assert calls(env) == [get_node(env, GPU), get_ip(env, GPU)] and piped(env) == []
+
+
+def test_join_refuses_when_the_node_that_became_ready_is_another_machine(env):
+    """Review F6-1: the second read (F5-1) finds the Node Ready, but at another IP: not an earlier join on this
+    machine. Nothing is deleted, no token is made, nothing is labelled."""
+    env.scenario["answers"] = [second_read("True")]
+    env.scenario["external_ip"] = {GPU: OTHER_IP}
+    proc = gpuctl_join(env)
+    assert proc.returncode == 1
+    assert f"node {GPU} is Ready at {OTHER_IP}, not at {GPU_IP}" in proc.stderr
+    expected = gpu_join(env, stale=True, second="True")
+    assert calls(env) == expected[:expected.index(get_ip(env, GPU)) + 1]
+    assert no_node_deleted(env) and no_label(env) and piped(env) == []
+    assert f"node {GPU} is Ready now" not in proc.stderr
+
+
+def joined_answer(name, *answers):
+    """Scripted answers for step 5's read of NAME: "Ready|heartbeat|ExternalIP" (the last one repeats)."""
+    return {"tool": "kubectl", "has": [f"get node {name}", "lastHeartbeatTime"],
+            "seq": [{"stdout": a} for a in answers]}
+
+
+def test_join_never_takes_another_machines_ready_node_for_its_own(env):
+    """Review F6-1: k3s rejects the new agent while another machine's Node of this name stays Ready. Step 5 waits
+    for Ready at this machine's IP, so the join times out (token deleted) instead of labelling that Node."""
+    env.scenario["answers"] = [joined_answer(GPU, f"True|2026-10-22T10:00:05Z|{OTHER_IP}")]
+    proc = gpuctl_join(env, JOIN_READY_TIMEOUT_S="0")
+    assert proc.returncode == 1 and f"node {GPU} not Ready at {GPU_IP}" in proc.stderr
+    assert OTHER_IP in proc.stderr  # the last read, shown on the timeout
+    assert calls(env)[-1] == cp(token_delete(GPU)) and no_label(env)
+
+
+@pytest.mark.parametrize("heartbeat", ["2026-10-22T09:59:30Z", NODE_TIME])
+def test_join_ignores_a_ready_heartbeat_from_before_the_agent_start(env, heartbeat):
+    """Review F6-1: after the agent stop the Node keeps its old Ready condition for the node-monitor grace period.
+    Only a Ready heartbeat posted after the node's clock read at the stop counts."""
+    env.scenario["answers"] = [joined_answer(GPU, f"True|{heartbeat}|{GPU_IP}")]
+    proc = gpuctl_join(env, JOIN_READY_TIMEOUT_S="0")
+    assert proc.returncode == 1 and f"node {GPU} not Ready at {GPU_IP}" in proc.stderr
+    assert calls(env)[-1] == cp(token_delete(GPU)) and no_label(env)
+
+
+def test_join_waits_for_a_fresh_heartbeat_at_its_own_ip(env):
+    env.scenario["answers"] = [joined_answer(GPU, f"True|2026-10-22T09:59:30Z|{GPU_IP}",
+                                             f"False|2026-10-22T10:00:03Z|{GPU_IP}",
+                                             f"True|2026-10-22T10:00:04Z|{OTHER_IP}",
+                                             f"True|2026-10-22T10:00:05Z|{GPU_IP}")]
+    proc = gpuctl_join(env)
+    assert proc.returncode == 0, proc.stderr
+    assert [c for c in calls(env) if c == joined(env, GPU)] == [joined(env, GPU)] * 4
+    assert not no_label(env)
+
+
+def test_join_gpu_node_waits_for_a_heartbeat_after_the_nvidia_restart(env):
+    """Review F6-1: the step 7 restart is a stop, the node's clock, a start; the Ready from before it does not count."""
+    env.scenario["containerd"] = ["", "[plugins.nvidia]"]
+    env.scenario["node_time"] = [NODE_TIME, "2026-10-22T10:00:10Z"]  # the heartbeat stays at 10:00:05
+    proc = gpuctl_join(env, JOIN_READY_TIMEOUT_S="0")
+    assert proc.returncode == 1 and "after restarting k3s-agent" in proc.stderr
+    assert calls(env)[-2:] == [gpu(env, RESTART_AGENT), joined(env, GPU)]
+
+
+def test_join_stops_when_the_node_clock_cannot_be_read(env):
+    env.scenario["answers"] = [{"tool": "ssh", "has": [STOP_AGENT], "stdout": "Thu Oct 22 10:00:00 UTC 2026\n"}]
+    proc = gpuctl_join(env)
+    assert proc.returncode == 1 and f"cannot read the clock of {GPU}" in proc.stderr
+    assert calls(env) == gpu_join(env)[:6] and piped(env) == []
 
 
 def test_join_gpu_node_needs_the_ssh_key(env):
@@ -895,9 +1168,11 @@ def test_scale_rerun_after_a_join_timeout_joins_the_running_worker_again(env):
     env.scenario["plan_rc"] = {"workers": 0}
     proc = env.script("cpu-pool.sh", "scale", "3", AUTO_APPROVE="1")
     assert proc.returncode == 0, proc.stderr
+    # still registered NotReady: the same VM re-registers, its Node is not deleted (Ruling R55)
     rejoin = cpu_join(env, "k3s-cpu-3", "34.10.0.13", sync=False)
     assert calls(env) == [get_node(env, "k3s-cpu-1"), get_node(env, "k3s-cpu-2"), get_node(env, "k3s-cpu-3"),
                           vm_status("k3s-cpu-3"), ("gpuctl", ["sync-peers"]), *rejoin, ("gpuctl", ["sync-peers"])]
+    assert no_node_deleted(env)
     stop = calls(env).index(worker("k3s-cpu-3", STOP_AGENT))
     assert stop < calls(env).index(cp("sudo k3s token create --ttl 15m --description k3s-cpu-3"))
 

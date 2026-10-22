@@ -23,13 +23,14 @@ from typing import TextIO
 
 from gpuctl.infra import CommandError, Infra, SubprocessShell
 from gpuctl.lambda_api import FirewallRule, Instance, LambdaAPIError, LambdaClient
+from gpuctl.output import write
 from gpuctl.peers import ruleset_name
 from gpuctl.planner import (
     LIVE_STATUSES, PlanError, check_limits, keeper_order, make_plan, owned_instances, plan_lines, target_counts,
 )
 from gpuctl.reconcile import Reconciler, ReconcileError, Settings, load_overrides
 from gpuctl.spec import Spec, SpecError, load_spec
-from gpuctl.status import DRIFT_SOURCES, capacity_rows, is_problem, render_capacity
+from gpuctl.status import DRIFT_SOURCES, capacity_rows, is_problem, is_skipped, render_capacity
 from gpuctl.tfguard import check_names, check_workers_plan
 
 REPO_ROOT = Path(__file__).resolve().parents[2]
@@ -64,7 +65,9 @@ def _clean(text: str) -> str:
 
 
 def _emit(out: TextIO, line: str = "") -> None:
-    out.write(_clean(line) + "\n")
+    # Flushed (L21-4: shown as it happens when stdout is a pipe, make gpu-status | tee) and best effort: a reader
+    # that is gone never stops a command half way (gpuctl.output)
+    write(out, _clean(line) + "\n")
 
 
 def _set_counts(items: Iterable[str]) -> dict[str, int]:
@@ -162,12 +165,13 @@ def _status(args: argparse.Namespace, spec: Spec, client, infra, env: Mapping[st
         _emit(out, f"  {line}")
     problems = [line for line in lines if is_problem(line)]
     if not problems:
-        skipped = len(lines)
+        skipped = sum(map(is_skipped, lines))
         # A skipped source (the gpu-access state, say) is not an all-clear: never print a bare "No drift" then.
         _emit(out, f"  No drift in the {len(DRIFT_SOURCES) - skipped} sources read; {skipped} source(s) skipped "
                    "(see above)" if skipped else "  No drift")
         return EXIT_OK
-    _emit(out, f"  {len(problems)} problem(s); make gpu-apply reconciles the firewall and the instance counts")
+    _emit(out, f"  {len(problems)} problem(s); make gpu-apply reconciles them to the spec; make gpu-down removes every "
+               "GPU node and its allow-list entries")
     return EXIT_DRIFT
 
 
@@ -212,8 +216,8 @@ def _ip(args: argparse.Namespace, client, out: TextIO) -> int:
 def _confirm(out: TextIO) -> Callable[[str], bool]:
     """Ask on `out` and read one line from stdin: only y/yes confirms; end of input declines."""
     def confirm(prompt: str) -> bool:
-        out.write(prompt)
-        out.flush()
+        if not write(out, prompt):  # a prompt nobody can see is never answered: decline, nothing changes
+            return False
         return sys.stdin.readline().strip().lower() in ("y", "yes")
     return confirm
 
@@ -239,7 +243,7 @@ def _apply(args: argparse.Namespace, spec: Spec, client, infra, env: Mapping[str
     reconciler = _reconciler(args, client, infra, env, out)
     try:
         if args.command == "down":
-            return reconciler.down(spec, auto_approve=args.auto_approve)
+            return reconciler.down(spec, auto_approve=args.auto_approve, no_drain=args.no_drain)
         return reconciler.apply(spec, auto_approve=args.auto_approve, keep_on_failure=args.keep_on_failure)
     except (ReconcileError, CommandError, ValueError, OSError) as e:
         raise _Failed(f"{args.command}: {e}") from None
@@ -282,6 +286,12 @@ def _parser() -> argparse.ArgumentParser:
                        help="keep new nodes that failed to come up (they keep billing) instead of terminating them")
     down = sub.add_parser("down", help="remove the autoscaler overrides and delete every GPU node")
     down.add_argument("--auto-approve", action="store_true", help="do not ask for confirmation")
+    down.add_argument("--no-drain", action="store_true",
+                      help="terminate the GPU instances without draining or deleting their nodes: for a cluster "
+                           "that still exists but cannot be reached and that you choose to abandon. Without it, "
+                           "gpu-down terminates undrained only when the cluster is gone (no kubeconfig, or "
+                           "infra/base has no cluster outputs); when the API server does not answer it refuses "
+                           "(start make tunnel and re-run)")
     sub.add_parser("status", help="GPU capacity, this cluster's GPU instances and a drift check (exit 3 on drift)")
     sub.add_parser("rules", help="Lambda global firewall rules and the k3s-gpu-<region> rulesets")
     sub.add_parser("list-nodes", help="one line per GPU node: <name> <ip|-> <status> <type> <region>")
@@ -343,13 +353,13 @@ def main(argv: list[str] | None = None, *, env: Mapping[str, str] = os.environ, 
         handler = {"rules": _rules, "list-nodes": _list_nodes, "ip": _ip}[args.command]
         return handler(args, _client(env, client), out)
     except _Refused as e:
-        print(_clean(f"gpuctl: {e}"), file=sys.stderr)
+        write(sys.stderr, _clean(f"gpuctl: {e}") + "\n")
         return EXIT_REFUSED
     except _Failed as e:
-        print(_clean(f"gpuctl: {e}"), file=sys.stderr)
+        write(sys.stderr, _clean(f"gpuctl: {e}") + "\n")
         return EXIT_FAILED
     except LambdaAPIError as e:
-        print(_clean(f"gpuctl: Lambda API error: {e}"), file=sys.stderr)
+        write(sys.stderr, _clean(f"gpuctl: Lambda API error: {e}") + "\n")
         return EXIT_FAILED
 
 

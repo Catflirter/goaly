@@ -9,13 +9,15 @@ from __future__ import annotations
 import json
 import sys
 import time
-from collections.abc import Callable, Iterable, Mapping
+from collections.abc import Callable, Iterable, Iterator, Mapping
+from contextlib import contextmanager
 from dataclasses import dataclass
 from pathlib import Path
 from typing import TextIO
 
-from gpuctl.infra import CommandError, MissingStackError
+from gpuctl.infra import DEFAULT_KUBECONFIG, CommandError, MissingStackError
 from gpuctl.lambda_api import FirewallRule, Instance, InstanceType, InsufficientCapacity, LambdaAPIError, Ruleset
+from gpuctl.output import write
 from gpuctl.peers import (
     PeerSet, cp_guard_elements, global_rules, nft_replace_script, region_ruleset_rules, ruleset_name,
 )
@@ -89,6 +91,22 @@ def _is_transient(error: LambdaAPIError) -> bool:
 CONFIRM_PROMPT = "Apply these changes? [y/N] "
 
 
+def duration(seconds: float) -> str:
+    """A step's duration for the progress lines: 42s, 5m21s."""
+    whole = int(seconds)
+    return f"{whole}s" if whole < 60 else f"{whole // 60}m{whole % 60:02d}s"
+
+
+class _Step:
+    """What a step reports when its block ends without an exception: done, unless the block marked it failed."""
+
+    def __init__(self) -> None:
+        self.ok = True
+
+    def failed(self) -> None:
+        self.ok = False
+
+
 @dataclass(frozen=True)
 class _Launched:
     id: str
@@ -107,10 +125,44 @@ class Reconciler:
         self.clock = clock
         self.sleep = sleep
         self.confirm = confirm
+        self._started = clock()  # reset by each apply/down: the progress stamps count from there
+        self._command = "apply"
+        self._no_drain = False  # gpuctl down --no-drain
+        # Once a gpu-down drain failed (Ruling R54): why the cluster is known to be gone (later nodes are terminated
+        # without a drain), or why an existing cluster cannot be drained now (later nodes are refused at once).
+        self._gone: str | None = None
+        self._refusal: str | None = None
 
     def _emit(self, line: str = "") -> None:
-        out = sys.stdout if self.out is None else self.out
-        out.write(_clean(line) + "\n")
+        # Flushed (L21-4: a piped stdout, make gpu-apply | tee, shows each line as it happens) and best effort: a
+        # reader that is gone never stops the step being reported (review C0-1/C0-2/X0-1, gpuctl.output).
+        write(sys.stdout if self.out is None else self.out, _clean(line) + "\n")
+
+    def _stamp(self, now: float) -> str:
+        """[+MM:SS] since this apply or down started."""
+        elapsed = int(now - self._started)
+        return f"[+{elapsed // 60:02d}:{elapsed % 60:02d}]"
+
+    @contextmanager
+    def _step(self, what: str) -> Iterator[_Step]:
+        """Progress lines around one step of apply or down (L21-4): "[+MM:SS] WHAT ..." when it starts, then
+        "WHAT: done in 12s", or "WHAT: failed after 12s" when it raises or the block calls step.failed()."""
+        step = _Step()
+        start = self.clock()
+        self._emit(f"{self._stamp(start)} {what} ...")
+        try:
+            yield step
+        except BaseException:
+            end = self.clock()
+            self._emit(f"{self._stamp(end)} {what}: failed after {duration(end - start)}")
+            raise
+        end = self.clock()
+        result = "done in" if step.ok else "failed after"
+        self._emit(f"{self._stamp(end)} {what}: {result} {duration(end - start)}")
+
+    def _join_line(self, line: str) -> None:
+        """One line of join-node.sh's output, under its step."""
+        self._emit(f"    | {line}")
 
     def ensure_ruleset(self, region: str, rules: Iterable[FirewallRule]) -> Ruleset:
         """Create k3s-gpu-<region> with `rules`, or replace the rules of every existing ruleset of that name."""
@@ -138,8 +190,7 @@ class Reconciler:
             self.infra.ensure_init("workers")
             outputs = self.infra.tf_output("workers")
         except MissingStackError as e:
-            sys.stderr.write(_clean(f"warning: infra/workers is not in this checkout, treating the CPU worker list "
-                                    f"as empty ({e})") + "\n")
+            self._warn(f"warning: infra/workers is not in this checkout, treating the CPU worker list as empty ({e})")
             return ()
         except CommandError as e:
             raise ReconcileError(
@@ -153,14 +204,39 @@ class Reconciler:
             raise ReconcileError(f"infra/workers output worker_ips has an unexpected shape: {workers!r}")
         return tuple(workers)
 
-    def _base_outputs(self) -> dict:
+    def _read_base(self) -> dict:
         # A fresh clone or worktree has never initialised infra/base (gpu-down's final sync-peers included).
         self.infra.ensure_init("base")
-        base = self.infra.tf_output("base")
+        return self.infra.tf_output("base")
+
+    @staticmethod
+    def _base_destroyed(base: Mapping) -> bool:
+        """infra/base has none of the cluster's outputs: make down destroyed it (or it was never applied). Ruling
+        R54's "no base stack outputs"; a stack with only some of them is an error, not a gone cluster."""
+        return not base.get("cp_ip") and not base.get("cp_internal_ip")
+
+    def _base_outputs(self, base: Mapping | None = None) -> Mapping:
+        base = self._read_base() if base is None else base
         missing = [key for key in ("cp_ip", "cp_internal_ip") if not base.get(key)]
         if missing:
             raise ReconcileError(f"infra/base outputs lack {', '.join(missing)}: apply the base stack first")
         return base
+
+    def _cluster_gone(self) -> str | None:
+        """Why the cluster is known to be gone (Ruling R54: no kubeconfig, or infra/base has no cluster outputs), or
+        None. An API server that does not answer is not enough (review F3-1), and neither is a base stack that
+        cannot be read: not knowing is not "gone"."""
+        missing = self.infra.kubeconfig_missing()
+        if missing is not None:
+            return missing
+        try:
+            base = self._read_base()
+        except (CommandError, ValueError, OSError) as e:
+            self._warn(f"warning: cannot read infra/base outputs ({e}); treating the cluster as still there")
+            return None
+        if self._base_destroyed(base):
+            return "infra/base has no cluster outputs (cp_ip, cp_internal_ip): the cluster was destroyed"
+        return None
 
     def _live_gpu_ips(self, exclude_ids: Iterable[str] = ()) -> list[str]:
         """The IPs of the owned live GPU instances, minus `exclude_ids`: instances this run terminated, which Lambda
@@ -169,23 +245,24 @@ class Reconciler:
         return sorted(i.ip for i in owned_instances(self.client.list_instances())
                       if i.ip is not None and i.id not in gone)
 
-    def _peer_set(self, exclude_ids: Iterable[str] = ()) -> PeerSet:
-        """Every peer's current IP: cp (Terraform), CPU workers (Terraform), live GPU instances, the operator."""
-        base = self._base_outputs()
+    def _peer_set(self, exclude_ids: Iterable[str] = (), base: Mapping | None = None) -> PeerSet:
+        """Every peer's current IP: cp (Terraform), CPU workers (Terraform), live GPU instances, the operator.
+        `base` is infra/base's outputs when the caller has just read them."""
+        base = self._base_outputs(base)
         worker_ips = self._worker_ips()
         gpu_ips = tuple(self._live_gpu_ips(exclude_ids))
         operator_ip = self.infra.detect_operator_ip()
         return PeerSet(cp_ip=base["cp_ip"], cp_internal_ip=base["cp_internal_ip"], worker_ips=worker_ips,
                        gpu_ips=gpu_ips, operator_ip=operator_ip)
 
-    def sync_peers(self, spec: Spec, *, exclude_ids: Iterable[str] = ()) -> PeerSet:
+    def sync_peers(self, spec: Spec, *, exclude_ids: Iterable[str] = (), base: Mapping | None = None) -> PeerSet:
         """Rebuild every peer allow-list from the current IPs (spec section 3.3); safe to re-run.
 
         Order: cp's k3s_peers set (persisted by the guard helper), Lambda's global rules, then the k3s-gpu-<region>
         ruleset of every spec region and of any other k3s-gpu-* ruleset still on the account. GPU instances in
         `exclude_ids` (terminated by this run) are left out even if Lambda still lists them as live.
         """
-        peers = self._peer_set(exclude_ids)
+        peers = self._peer_set(exclude_ids, base)
         elements = cp_guard_elements(peers)
         self.infra.cp_ssh(GUARD_PEERS_COMMAND, input=nft_replace_script(elements))
         self.client.update_global_rules(global_rules(peers.operator_ip))
@@ -204,10 +281,25 @@ class Reconciler:
         self._emit(f"  Lambda rulesets: {', '.join(ruleset_name(r) for r in regions)}")
         return peers
 
+    def _sync_lambda_rules_cluster_gone(self) -> None:
+        """gpu-down's sync-peers once the cluster is gone (review F3-3, Ruling R54): there is no k3s-cp whose peer set
+        could be updated, so that is skipped; Lambda's global rules and every existing owned k3s-gpu-* ruleset keep
+        only the operator's SSH (no cluster address is left in them). No ruleset is created."""
+        operator = self.infra.detect_operator_ip()
+        rules = global_rules(operator)
+        self.client.update_global_rules(rules)
+        owned = [r for r in self.client.list_rulesets() if r.name == ruleset_name(r.region)]
+        for ruleset in owned:
+            self.client.update_ruleset(ruleset.id, rules)
+        self._emit(f"sync-peers: the cluster is gone (infra/base has no cluster outputs), operator {mask_ip(operator)}")
+        self._emit("  k3s-cp k3s_peers: skipped (there is no k3s-cp)")
+        self._emit("  Lambda global rules: operator ssh only")
+        self._emit(f"  Lambda rulesets: {', '.join(sorted({r.name for r in owned})) or 'none'} (operator ssh only)")
+
     # --- apply / down ---------------------------------------------------------------------------
 
     def _warn(self, line: str) -> None:
-        sys.stderr.write(_clean(line) + "\n")
+        write(sys.stderr, _clean(line) + "\n")  # best effort, like _emit
 
     def wait_active(self, instance_id: str) -> Instance:
         """Poll get_instance every poll_s until the instance is active with an IP (Review Focus #2: never return a
@@ -252,20 +344,34 @@ class Reconciler:
             self._warn(f"apply refused: {e}")
             return 2
         return self._reconcile(spec, overrides=overrides, set_counts=None, auto_approve=auto_approve,
-                               keep_on_failure=keep_on_failure)
+                               keep_on_failure=keep_on_failure, command="apply")
 
-    def down(self, spec: Spec, *, auto_approve: bool) -> int:
+    def down(self, spec: Spec, *, auto_approve: bool, no_drain: bool = False) -> int:
         """Remove the autoscaler's override file, then reconcile every pool to 0 (spec section 10.4: gpu-down always
-        wins over the autoscaler). A second run finds nothing to delete and only re-applies the empty firewall."""
+        wins over the autoscaler). A second run finds nothing to delete and only re-applies the empty firewall.
+        Nothing is recorded (spec section 5.4: no local state); `gpuctl status` treats the pools below their count
+        as a note, not drift (L21-1).
+
+        An owned instance whose drain fails is still terminated, with a warning, when the cluster is known to be gone
+        (Ruling R54: no kubeconfig, or infra/base has no cluster outputs, as after make down); else it would bill on
+        with no way to stop it (review F2-3, G-1). `no_drain` skips the drains on purpose. A cluster that still
+        exists keeps its node when the drain fails, whether its API server refused the drain or does not answer
+        (`make tunnel` not running, review F3-1): that instance is not terminated, the other steps go on, exit 1.
+        With the cluster gone, the final sync-peers skips k3s-cp and leaves only the operator's SSH in the Lambda
+        rules (review F3-3), so gpu-down exits 0 once no owned instance remains."""
         path = Path(self.settings.overrides_path)
         if path.exists():
             path.unlink()
             self._emit(f"Removed the autoscaler overrides {path}")
         return self._reconcile(spec, overrides=None, set_counts={name: 0 for name in spec.pools},
-                               auto_approve=auto_approve, keep_on_failure=False)
+                               auto_approve=auto_approve, keep_on_failure=False, command="down", no_drain=no_drain)
 
     def _reconcile(self, spec: Spec, *, overrides: Mapping[str, int] | None, set_counts: Mapping[str, int] | None,
-                   auto_approve: bool, keep_on_failure: bool) -> int:
+                   auto_approve: bool, keep_on_failure: bool, command: str = "apply", no_drain: bool = False) -> int:
+        self._started = self.clock()
+        self._command = command
+        self._no_drain = no_drain
+        self._gone = self._refusal = None
         # 1. plan and limits: nothing has changed yet
         instances = self.client.list_instances()
         types = self.client.instance_types()
@@ -305,27 +411,82 @@ class Reconciler:
         gone: set[str] = set()
         attempted: set[str] = set()
         failures: list[str] = []
+        undrained: list[str] = []
         try:
             for instance in plan.delete:
                 try:
                     if instance.id in duplicate_ids:
                         # Ruling R17: the node name and host key belong to the instance that is kept, so by id only
+                        with self._step(f"terminate duplicate {instance.name} {instance.id}"):
+                            attempted.add(instance.id)
+                            self.client.terminate([instance.id])
+                            gone.add(instance.id)
+                        self._emit(f"Terminated duplicate {instance.name} {instance.id}")
+                        continue
+                    with self._step(f"delete {instance.name}"):
+                        if not self._drain(instance.name):
+                            undrained.append(instance.name)
                         attempted.add(instance.id)
                         self.client.terminate([instance.id])
                         gone.add(instance.id)
-                        self._emit(f"Terminated duplicate {instance.name} {instance.id}")
-                        continue
-                    self.infra.drain_and_delete_node(instance.name)
-                    attempted.add(instance.id)
-                    self.client.terminate([instance.id])
-                    gone.add(instance.id)
-                    self.infra.forget_host_key(instance.name)
+                        self.infra.forget_host_key(instance.name)
                     self._emit(f"Deleted {instance.name} {instance.id}")
                 except Exception as e:
                     failures.append(f"delete {instance.name} ({instance.id}): {e}")
         except KeyboardInterrupt:
             failures.append("deletes interrupted (KeyboardInterrupt); the remaining deletes were not attempted")
+        for name in undrained:
+            if name in {i.name for i in plan.delete if i.id in gone}:
+                self._warn(f"WARNING: {name} was terminated without draining it; its node object may remain in the "
+                           "cluster (make gpu-status reports it). Once the cluster answers, remove it: "
+                           f"kubectl --kubeconfig ~/{DEFAULT_KUBECONFIG} delete node {name} (join-node.sh also "
+                           "deletes it, NotReady, before the next node of that name joins)")
         return gone, attempted, failures
+
+    def _drain(self, name: str) -> bool:
+        """Drain and delete the node of an instance about to be terminated: True when done, False when gpu-down goes
+        on without it (--no-drain, or the cluster is known to be gone: Ruling R54). Raises when the drain failed in
+        gpu-apply, or in a cluster that still exists (its API server refused the drain, or does not answer, as when
+        `make tunnel` is not running: review F3-1): that instance is then not terminated."""
+        if self._no_drain:
+            self._warn(f"WARNING: --no-drain: terminating {name} without draining it or deleting its node")
+            return False
+        if self._gone is not None:  # found out on an earlier node of this gpu-down: no second wait
+            self._warn(f"WARNING: terminating {name} without draining it: {self._gone}")
+            return False
+        if self._refusal is not None:  # an earlier node's drain found the API server silent: no second wait
+            raise CommandError(["kubectl", "drain", name], 1, f"not drained: {self._refusal}")
+        try:
+            self.infra.drain_and_delete_node(name)
+            return True
+        except CommandError as drain_error:
+            if self._command != "down":
+                raise
+            gone = self._cluster_gone()
+            if gone is not None:
+                self._gone = gone
+                self._warn(f"WARNING: cannot drain {name} ({str(drain_error)[-300:]}) and {gone}. gpu-down "
+                           "terminates this gpuctl-owned instance without draining it, so it stops billing")
+                return False
+            try:
+                reason = self.infra.api_unreachable()
+            except (CommandError, ValueError, OSError) as e:
+                raise CommandError(drain_error.args, drain_error.returncode,
+                                   f"{drain_error.stderr} (and the cluster could not be probed: {e})") from None
+            if reason is None:
+                raise CommandError(drain_error.args, drain_error.returncode,
+                                   f"{drain_error.stderr.strip()}; the API server answers, so gpu-down does not "
+                                   "terminate a node it could not drain: fix the drain and re-run make gpu-down, "
+                                   "or terminate it anyway with scripts/gpuctl down --no-drain") from None
+            # Exactly what a destroyed cluster looks like to kubectl, but nothing says this one was destroyed (the
+            # kubeconfig is there, infra/base was not found empty): terminating undrained would leave the Node object
+            # and k3s's node-password secret for the next instance of this name (review F3-1, Ruling R54).
+            self._refusal = (f"{reason}, but the cluster may still exist (the kubeconfig is there and infra/base "
+                             "was not found destroyed), so gpu-down does not terminate a node it could not drain: "
+                             "start make tunnel and re-run make gpu-down, or pass --no-drain (scripts/gpuctl down "
+                             "--no-drain) to terminate it anyway")
+            raise CommandError(drain_error.args, drain_error.returncode,
+                               f"{drain_error.stderr.strip()}; {self._refusal}") from None
 
     def _delete_failed(self, spec: Spec, gone: set[str], attempted: set[str], failures: list[str]) -> int:
         """A delete failed: launch nothing, but drop the IPs of the instances that were terminated from every
@@ -385,8 +546,15 @@ class Reconciler:
         `gone` holds the ids this run terminated: they are left out even if Lambda still lists them as active.
         """
         gone = set(gone)
-        self.infra.apply_gpu_access(self._live_gpu_ips(gone), max_nodes=spec.max_nodes)
-        self.sync_peers(spec, exclude_ids=gone)
+        ips = self._live_gpu_ips(gone)
+        with self._step(f"terraform apply gpu-access ({len(ips)} GPU IP{'' if len(ips) == 1 else 's'})"):
+            self.infra.apply_gpu_access(ips, max_nodes=spec.max_nodes)
+        with self._step("sync-peers"):
+            base = self._read_base()
+            if self._command == "down" and self._base_destroyed(base):
+                self._sync_lambda_rules_cluster_gone()
+            else:
+                self.sync_peers(spec, exclude_ids=gone, base=base)
 
     def _create_and_join(self, spec: Spec, plan: Plan, types: Mapping[str, InstanceType], *,
                          keep_on_failure: bool, gone: set[str]) -> int:
@@ -399,7 +567,10 @@ class Reconciler:
             if plan.create:
                 rules = region_ruleset_rules(self._peer_set(gone))
                 for name, pool_name in plan.create:
-                    new = self._launch(spec.pools[pool_name], name, types, rules, failures, unknown)
+                    with self._step(f"launch {name}") as step:
+                        new = self._launch(spec.pools[pool_name], name, types, rules, failures, unknown)
+                        if new is None:
+                            step.failed()
                     if new is not None:
                         launched.append(new)
                         unknown.remove(name)
@@ -407,7 +578,8 @@ class Reconciler:
             ready: list[tuple[_Launched, Instance]] = []
             for new in launched:
                 try:
-                    ready.append((new, self.wait_active(new.id)))
+                    with self._step(f"wait for {new.name} to be active with an IP"):
+                        ready.append((new, self.wait_active(new.id)))
                 except (TimeoutError, LambdaAPIError) as e:
                     failures.append(f"{new.name}: {e}")
             # 7. firewalls for every live IP (also corrects them when nothing else changed)
@@ -415,25 +587,31 @@ class Reconciler:
             # 8. join
             for new, instance in ready:
                 try:
-                    self.infra.join_node(new.name, instance.ip, gpu_type_label(new.instance_type))
+                    with self._step(f"join {new.name}"):
+                        self.infra.join_node(new.name, instance.ip, gpu_type_label(new.instance_type),
+                                             progress=self._join_line)
                     joined.add(new.id)
                 except (CommandError, ValueError) as e:
                     failures.append(f"{new.name}: join failed: {e}")
         except (Exception, KeyboardInterrupt) as e:  # anything else (Ctrl-C included): clean up as for a failed node
             failures.append(f"apply failed: {str(e) or type(e).__name__}")
+        now = self.clock()
         if not failures:
-            self._emit("GPU nodes match the spec")
+            self._emit(f"{self._stamp(now)} GPU nodes match the spec ({self._command} took "
+                       f"{duration(now - self._started)})")
             return 0
-        for failure in failures:
-            self._warn(f"error: {failure}")
         failed = [new for new in launched if new.id not in joined]
-        if keep_on_failure:
-            if failed or unknown:
+        try:  # the report never decides whether the billed instances are cleaned up (review C0-2)
+            self._emit(f"{self._stamp(now)} {self._command} failed after {duration(now - self._started)}")
+            for failure in failures:
+                self._warn(f"error: {failure}")
+            if keep_on_failure and (failed or unknown):
                 names = ", ".join([new.name for new in failed] + unknown)
                 self._warn(f"--keep-on-failure: kept {names} for troubleshooting; they bill until "
                            "make gpu-down (or a gpu-apply that no longer wants them)")
-            return 1
-        self._clean_up(spec, failed, unknown, gone)
+        finally:
+            if not keep_on_failure:
+                self._clean_up(spec, failed, unknown, gone)
         return 1
 
     def _find_unknown(self, unknown: list[str], known: set[str]) -> list[tuple[str, str]]:
@@ -446,15 +624,30 @@ class Reconciler:
 
         Best effort: one failing step does not stop the others, and each is reported. The instances whose ids are
         known go first, so nothing that follows (the wait for a lagging listing, a second Ctrl-C) can leak them;
-        then the launches whose outcome is unknown (see _clean_up_unknown).
+        then the launches whose outcome is unknown (see _clean_up_unknown). A second Ctrl-C does not stop the
+        cleanup either (review F2-4): every step still runs, and the KeyboardInterrupt is raised again at the end.
         """
-        self._terminate_victims([(new.id, new.name) for new in failed], gone)
+        interrupted: KeyboardInterrupt | None = None
+        try:
+            self._terminate_victims([(new.id, new.name) for new in failed], gone)
+        except KeyboardInterrupt as e:
+            interrupted = e
         if unknown:
-            self._clean_up_unknown(unknown, {new.id for new in failed}, gone)
+            try:
+                self._clean_up_unknown(unknown, {new.id for new in failed}, gone)
+            except KeyboardInterrupt as e:
+                interrupted = interrupted or e
+                self._warn(f"cleanup: interrupted while cleaning up {', '.join(unknown)}; run make gpu-status and "
+                           "make gpu-down if one of them appears")
         try:
             self._reconcile_firewall(spec, gone)
         except Exception as e:
             self._warn(f"cleanup: firewall reconcile failed: {e}; re-run make gpu-apply or make sync-peers")
+        except KeyboardInterrupt as e:
+            interrupted = interrupted or e
+            self._warn("cleanup: firewall reconcile interrupted; re-run make gpu-apply or make sync-peers")
+        if interrupted is not None:
+            raise interrupted
 
     def _clean_up_unknown(self, unknown: list[str], known: set[str], gone: set[str]) -> None:
         """Terminate the instances of launches whose outcome is unknown, looked up by name. Lambda may list an
@@ -485,18 +678,47 @@ class Reconciler:
                            "make gpu-status in a minute and make gpu-down if it appears")
 
     def _terminate_victims(self, victims: list[tuple[str, str]], gone: set[str]) -> None:
-        """Terminate each (id, name), delete its node and forget its host key; terminated ids go into `gone`."""
+        """Terminate each (id, name), delete its node and forget its host key; terminated ids go into `gone`.
+
+        A Ctrl-C (KeyboardInterrupt) does not stop it, since every victim bills until terminated (review F2-4): an
+        interrupted terminate is sent once more, every other victim is still terminated, and the node deletes (a
+        drain waits up to minutes) are skipped from then on. Then it says what was and was not terminated and
+        raises the KeyboardInterrupt again.
+        """
+        interrupted: KeyboardInterrupt | None = None
         for instance_id, name in victims:
-            for what, step in (("terminate", lambda: self.client.terminate([instance_id])),
-                               ("delete node", lambda: self.infra.drain_and_delete_node(name)),
-                               ("forget host key", lambda: self.infra.forget_host_key(name))):
+            for attempt in (1, 2):
+                try:
+                    self.client.terminate([instance_id])
+                    gone.add(instance_id)
+                    break
+                except KeyboardInterrupt as e:
+                    interrupted = e
+                    self._warn(f"cleanup: Ctrl-C during the terminate of {name} ({instance_id}); "
+                               + ("sending it again: billed instances are terminated before gpuctl stops"
+                                  if attempt == 1 else "moving on"))
+                except Exception as e:
+                    self._warn(f"cleanup: terminate {name} ({instance_id}) failed: {e}")
+                    break
+            steps = [("forget host key", lambda: self.infra.forget_host_key(name))]
+            if interrupted is None:
+                steps.insert(0, ("delete node", lambda: self.infra.drain_and_delete_node(name)))
+            for what, step in steps:
                 try:
                     step()
-                    if what == "terminate":
-                        gone.add(instance_id)
                 except Exception as e:
                     self._warn(f"cleanup: {what} {name} ({instance_id}) failed: {e}")
+                except KeyboardInterrupt as e:
+                    interrupted = e
+                    self._warn(f"cleanup: Ctrl-C during the {what} of {name}; skipping the node deletes")
             self._emit(f"Cleaned up {name} {instance_id}")
+        if interrupted is not None:
+            done = [f"{name} {instance_id}" for instance_id, name in victims if instance_id in gone]
+            left = [f"{name} {instance_id}" for instance_id, name in victims if instance_id not in gone]
+            self._warn(f"cleanup interrupted (Ctrl-C): terminated {', '.join(done) or 'none'}"
+                       + (f"; NOT terminated, still billing: {', '.join(left)}: run make gpu-down" if left else "")
+                       + "; node objects may remain (make gpu-status)")
+            raise interrupted
 
     # --- drift ----------------------------------------------------------------------------------
 

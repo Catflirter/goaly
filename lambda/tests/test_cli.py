@@ -230,8 +230,9 @@ def test_status_lists_owned_instances_and_counts_them(capsys):
 def test_status_with_no_instances_reports_zero(capsys):
     rc = main(["status"], env=ENV, client=FakeLambda(types=TYPES), infra=in_sync())
     out = capsys.readouterr().out
-    assert rc == 3 and "GPU instances (k3s-gpu-*): 0" in out and "other running" not in out
-    assert "pool a6000 has 0, wants 1" in out  # count 1 in the spec: that is drift
+    assert rc == 0 and "GPU instances (k3s-gpu-*): 0" in out and "other running" not in out
+    # count 1 in the spec: a note, not drift (Task 21 Step 7 after gpu-down; Task 21a review S0-1)
+    assert "  note: pool a6000: 0 of 1 running (make gpu-apply starts the rest)\n  No drift\n" in out
 
 
 # --- list-nodes / ip ----------------------------------------------------------------------------
