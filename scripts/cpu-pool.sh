@@ -17,14 +17,23 @@
 # inventory file. N must be an integer from 1 to MAX_WORKERS (exit 2 otherwise).
 #
 # Every apply shows its plan and asks (AUTO_APPROVE=1 skips the question). Removing workers asks
-# once more first, before anything is drained: a node is drained and deleted from the cluster
-# BEFORE the apply destroys its VM. The workers that go are the ones the workers stack has deployed
-# (worker_ips) or the inventory lists, minus the new inventory: so a re-run after a declined or
-# failed apply, or after a hand edit of the file, drains them again. The apply may destroy or
-# replace only those drained workers (tf_apply --destroy-only; --no-destroy when none go): under
+# once more, after the plan and before anything is drained: a node is drained and deleted from the
+# cluster BEFORE the apply destroys its VM. The workers that go are the ones the workers stack has
+# deployed (worker_ips) or the inventory lists, minus the new inventory: so a re-run after a
+# declined or failed apply, or after a hand edit of the file, drains them again. The apply may
+# destroy or replace only those workers (tf_plan --destroy-only; --no-destroy when none go): under
 # AUTO_APPROVE=1 a plan that touches any other worker, k3s-cpu-1 included, is refused (exit 2), and
-# interactively it is listed and asked. Every command is safe to re-run: a second `remove` of the
-# same worker, or a `scale` to the current size, changes nothing.
+# interactively it is listed and asked. That plan is made (with the new inventory as a -var-file)
+# and checked BEFORE the drain: a refused plan has drained nothing and left the inventory as it was.
+# The order is: plan and check, ask, drain and delete, write the inventory, ask, apply that plan.
+# Every command is safe to re-run: a second `remove` of the same worker, or a `scale` to the current
+# size, changes nothing.
+#
+# Scale step 4 joins every worker that has not joined: a new one always; one that was in the pool
+# before when the cluster has no Node of that name, or when its Node is NotReady and its VM is
+# RUNNING (a join that timed out: join-node.sh bootstraps it again). A NotReady worker whose VM is
+# stopped (make cpu-stop: TERMINATED, STOPPED, SUSPENDED) is left alone; one whose VM is in any other
+# state (STOPPING, PROVISIONING, ...) is left alone too, but the scale then exits 1 naming it.
 set -euo pipefail
 
 # shellcheck disable=SC1091  # common.sh is linted on its own
@@ -33,6 +42,48 @@ source "$(dirname -- "${BASH_SOURCE[0]}")/lib/common.sh"
 TFVARS="${WORKERS_TFVARS:-$REPO_ROOT/infra/workers/workers.auto.tfvars.json}"
 # A typo guard (N=30 for N=3 costs real money), not a GCP limit.
 MAX_WORKERS=100
+# The new inventory a scale-down or remove plans with (tf_plan --var-file), and whether the run is
+# between that plan and the drain; the EXIT trap cleans up and says what a failure there left behind.
+NEXT_TFVARS=""
+PLANNING=0
+
+on_exit() {
+  local rc=$?
+  [[ -z "$NEXT_TFVARS" ]] || rm -f -- "$NEXT_TFVARS"
+  [[ -z "${TF_PLAN:-}" ]] || rm -f -- "$TF_PLAN"
+  if (( PLANNING && rc != 0 )); then
+    log "nothing was drained or deleted from the cluster, and $TFVARS is unchanged"
+  fi
+}
+trap on_exit EXIT
+
+# plan_removal NAME... [-- JSON]: tf_plan the workers stack, which may destroy only the NAMEs, before
+# anything is drained. With JSON (the new inventory) the plan uses it as a -var-file, so the
+# inventory file itself is written only after the drain. A refused plan exits 2 here.
+plan_removal() {
+  local -a names=()
+  while (( $# )) && [[ "$1" != -- ]]; do names+=("$1"); shift; done
+  tf_init workers
+  PLANNING=1
+  if (( $# == 2 )); then
+    run_dir || die "cannot create $RUN_DIR"
+    NEXT_TFVARS="$RUN_DIR/workers.next.tfvars.json"
+    printf '%s\n' "$2" > "$NEXT_TFVARS" || die "cannot write $NEXT_TFVARS"
+    tf_plan workers --var-file "$NEXT_TFVARS" --destroy-only "${names[@]}"
+  else
+    tf_plan workers --destroy-only "${names[@]}"
+  fi
+  PLANNING=0
+}
+
+# vm_status NAME: the GCE status of CPU worker NAME's VM (RUNNING, TERMINATED, ...), in VM_STATUS.
+# Call it outside $(...): _worker_zone caches worker_zones for the shell.
+vm_status() {
+  _worker_zone "$1"
+  VM_STATUS="$(gcloud compute instances describe "$1" --project "$GCP_PROJECT" --zone "$_ZONE" \
+    --format='value(status)')" || die "cannot read the status of the VM $1"
+  [[ "$VM_STATUS" =~ ^[A-Z_]+$ ]] || die "unexpected status for the VM $1: '$VM_STATUS'"
+}
 
 usage() {
   log "usage: ${0##*/} render N | scale N | remove NAME | stop | start"
@@ -104,7 +155,7 @@ not_in() {
 
 cmd_scale() {
   local new old_names new_names deployed current name state
-  local -a removed=() join=()
+  local -a removed=() join=() unsettled=()
   new="$(render_pool "$1")" || exit
   load_env
   unset LAMBDA_API_KEY
@@ -129,24 +180,28 @@ cmd_scale() {
       [[ "$name" != k3s-cpu-1 ]] || die "k3s-cpu-1 is never removed (spec §10.2): $TFVARS must keep it" 2
     done
     log "scaling down to $1: ${removed[*]} will be drained, deleted from the cluster and destroyed"
+    # Only the workers that go may be destroyed (never k3s-cpu-1 or another worker, unattended):
+    # checked on the plan of the new inventory before anything is drained, and shown before the
+    # question.
+    plan_removal "${removed[@]}" -- "$new"
     confirm "Drain and delete ${removed[*]}, then apply the workers stack (destroys their VMs)?" \
-      || die "not changed: the pool stays as it is" 2
+      || die "not changed: nothing was drained and $TFVARS is unchanged" 2
     for name in "${removed[@]}"; do
       drain_and_delete_node "$name"
     done
-  fi
-  write_pool "$new"
-  tf_init workers
-  if (( ${#removed[@]} )); then
-    tf_apply workers --destroy-only "${removed[@]}"
+    write_pool "$new"
+    tf_apply_plan workers
   else
     # Only adding workers (or none): nothing may be destroyed, unattended or not without a review.
+    write_pool "$new"
+    tf_init workers
     tf_apply workers --no-destroy
   fi
   # Scale step 4: join each worker that has not joined yet. A new worker is always handed to
-  # join-node.sh (which leaves it alone once Ready); one that was in the pool before only when the
-  # cluster has no Node of that name. A registered worker that is NotReady (stopped with make
-  # cpu-stop, say) is not touched: SSH to a stopped VM would fail the whole scale.
+  # join-node.sh (which leaves it alone once Ready); one that was in the pool before when the cluster
+  # has no Node of that name, or when its Node is NotReady while its VM runs (a join that timed out).
+  # A NotReady worker whose VM is stopped (make cpu-stop) is not touched: SSH to a stopped VM would
+  # fail the whole scale.
   # shellcheck disable=SC2086  # names are k3s-cpu-<n>: no spaces or globs
   while read -r name; do
     [[ -n "$name" ]] || continue
@@ -154,7 +209,18 @@ cmd_scale() {
       state="$(node_state "$name")" || exit
       case "$state" in
         Absent) join+=("$name") ;;
-        NotReady) log "$name is registered but NotReady: not joined again (make cpu-start if it is stopped; scripts/join-node.sh re-joins it)" ;;
+        NotReady)
+          vm_status "$name"
+          case "$VM_STATUS" in
+            RUNNING)
+              log "$name is registered but NotReady and its VM is RUNNING: joining it again"
+              join+=("$name") ;;
+            TERMINATED | STOPPED | SUSPENDED)
+              log "$name is registered but NotReady and its VM is $VM_STATUS: not joined (make cpu-start, then make cpu-scale again)" ;;
+            *)
+              log "$name is registered but NotReady and its VM is $VM_STATUS: not joined now"
+              unsettled+=("$name ($VM_STATUS)") ;;
+          esac ;;
       esac
     else
       join+=("$name")
@@ -162,6 +228,9 @@ cmd_scale() {
   done <<< "$(printf '%s\n' $new_names | sort -t- -k3,3n)"
   join_workers ${join[@]+"${join[@]}"}
   log "CPU pool: $(pool_names | wc -l | tr -d ' ') worker(s)"
+  if (( ${#unsettled[@]} )); then
+    die "NotReady, with a VM neither running nor stopped: ${unsettled[*]}; re-run make cpu-scale once it settles"
+  fi
 }
 
 cmd_remove() {
@@ -174,21 +243,23 @@ cmd_remove() {
   load_env
   unset LAMBDA_API_KEY
   if [[ "$in_pool" == true ]]; then
+    new="$(jq --arg n "$name" '.cpu_workers |= del(.[$n])' "$TFVARS")" || die "cannot update $TFVARS"
+    # Only NAME may be destroyed: never k3s-cpu-1 or another worker, unattended. Checked on the plan
+    # before the drain, and shown before the question.
+    plan_removal "$name" -- "$new"
     confirm "Drain $name, delete it from the cluster, then apply the workers stack (destroys its VM)?" \
       || die "not changed: $name stays" 2
   else
     # Gone from the inventory already (a second run, or an earlier run whose apply was declined):
     # finish whatever is left, which is nothing when that run completed.
     log "$name is not in $TFVARS: making sure it is gone from the cluster and the workers stack"
+    plan_removal "$name"
   fi
   drain_and_delete_node "$name"
   if [[ "$in_pool" == true ]]; then
-    new="$(jq --arg n "$name" '.cpu_workers |= del(.[$n])' "$TFVARS")" || die "cannot update $TFVARS"
     write_pool "$new"
   fi
-  tf_init workers
-  # Only NAME, just drained, may be destroyed: never k3s-cpu-1 or another worker, unattended.
-  tf_apply workers --destroy-only "$name"
+  tf_apply_plan workers
   "$REPO_ROOT/scripts/gpuctl" sync-peers || die "sync-peers failed"
   log "$name removed"
 }

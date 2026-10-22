@@ -130,12 +130,12 @@ _tf_output() {
   terraform -chdir="$dir" output "$2" "$3"
 }
 
-# tf_apply STACK [--no-destroy | --destroy-only NAME...]: plan STACK into a saved plan, then apply
-# exactly that plan once confirm agrees (under AUTO_APPROVE=1 confirm agrees outright, as the brief
-# says). No changes: nothing is asked or applied, so re-runs are quiet. A plan that destroys or
-# replaces anything lists those addresses first.
+# tf_apply STACK [--var-file FILE] [--no-destroy | --destroy-only NAME...]: tf_plan, then
+# tf_apply_plan: plan STACK into a saved plan, then apply exactly that plan once confirm agrees (under
+# AUTO_APPROVE=1 confirm agrees outright, as the brief says). No changes: nothing is asked or applied,
+# so re-runs are quiet. A plan that destroys or replaces anything lists those addresses first.
 #
-# The two options are opt-in guards for plans that spec §3.1 has a human review (base; workers when
+# The two guard options are opt-in for plans that spec §3.1 has a human review (base; workers when
 # scaled by hand). Under AUTO_APPROVE=1 they refuse a plan (exit 2) that destroys or replaces
 # anything they do not allow; interactively the unexpected addresses are listed again and the
 # question is still asked.
@@ -144,17 +144,39 @@ _tf_output() {
 #                          cpu-pool.sh was never drained).
 #   --destroy-only NAME... allows only addresses keyed ["NAME"] (for_each keys: a worker's instance,
 #                          address and per-worker rules). Callers: cpu-pool.sh scale-down and remove,
-#                          with exactly the workers they drained, so k3s-cpu-1 or any other worker is
+#                          with exactly the workers they drain, so k3s-cpu-1 or any other worker is
 #                          never destroyed or replaced unattended.
+#   --var-file FILE        plans with -var-file=FILE (an absolute path): its values override the
+#                          stack's *.auto.tfvars files, and the saved plan keeps them. cpu-pool.sh plans
+#                          the new inventory this way before it drains anything or writes the file.
 # Declining exits 2. STACK must be initialised already (tf_init; `terraform init` for bootstrap).
 tf_apply() {
-  local stack="$1" opt="${2:-}" dir plan rc=0 doomed unexpected addr name ok
-  local -a allowed=()
+  tf_plan "$@"
+  tf_apply_plan "$1"
+}
+
+# tf_plan STACK [options]: the first half of tf_apply (same options): plan, list what the plan
+# destroys or replaces, apply the guard (refusing exits 2 and keeps no plan), and set TF_PLAN to the
+# saved plan, $RUN_DIR/STACK.tfplan, or to "" when there is nothing to change. Call it outside $(...)
+# so TF_PLAN survives. A caller can do work between the check and the apply (cpu-pool.sh drains the
+# workers the plan destroys) and then call tf_apply_plan STACK.
+tf_plan() {
+  local stack="$1" opt dir plan rc=0 doomed unexpected addr name ok
+  local -a allowed=() extra=()
+  TF_PLAN=""
+  shift
+  if [[ "${1:-}" == --var-file ]]; then
+    (( $# >= 2 )) || die "tf_plan: --var-file needs a file"
+    [[ "$2" == /* && -f "$2" ]] || die "tf_plan: --var-file needs an existing absolute path: '$2'"
+    extra=("-var-file=$2")
+    shift 2
+  fi
+  opt="${1:-}"
   case "$opt" in
-    "" | --no-destroy) (( $# <= 2 )) || die "tf_apply: unexpected arguments after $opt" ;;
+    "" | --no-destroy) (( $# <= 1 )) || die "tf_apply: unexpected arguments after $opt" ;;
     --destroy-only)
-      (( $# >= 3 )) || die "tf_apply: --destroy-only needs at least one name"
-      allowed=("${@:3}") ;;
+      (( $# >= 2 )) || die "tf_apply: --destroy-only needs at least one name"
+      allowed=("${@:2}") ;;
     *) die "tf_apply: unknown option $opt" ;;
   esac
   dir="$(tf_dir "$stack")" || exit
@@ -162,7 +184,8 @@ tf_apply() {
   run_dir || die "cannot create $RUN_DIR"
   plan="$RUN_DIR/$stack.tfplan"
   rm -f -- "$plan"
-  terraform -chdir="$dir" plan -input=false -lock-timeout=120s -detailed-exitcode -out="$plan" || rc=$?
+  terraform -chdir="$dir" plan -input=false -lock-timeout=120s -detailed-exitcode ${extra[@]+"${extra[@]}"} \
+    -out="$plan" || rc=$?
   case "$rc" in
     0) rm -f -- "$plan"; log "$stack: no changes"; return 0 ;;
     2) ;;
@@ -188,18 +211,30 @@ tf_apply() {
         log "${unexpected%$'\n'}"
         if [[ "${AUTO_APPROVE:-}" == 1 ]]; then
           rm -f -- "$plan"
-          die "refusing to destroy or replace unexpected resources in $stack under AUTO_APPROVE=1; run it interactively to review" 2
+          die "refusing to destroy or replace unexpected resources in $stack under AUTO_APPROVE=1: nothing was applied; run it interactively to review" 2
         fi
       fi
     fi
   fi
+  TF_PLAN="$plan"
+}
+
+# tf_apply_plan STACK: the second half of tf_apply: ask, then apply exactly the plan tf_plan saved
+# ($TF_PLAN) and remove it. Nothing to do when TF_PLAN is "" (no changes).
+tf_apply_plan() {
+  local stack="$1" dir plan="${TF_PLAN:-}" rc=0
+  [[ -n "$plan" ]] || return 0
+  [[ "$plan" == "$RUN_DIR/$stack.tfplan" && -f "$plan" ]] || die "tf_apply_plan: no saved plan for $stack"
+  dir="$(tf_dir "$stack")" || exit
+  tf_env
   if ! confirm "Apply this plan to the $stack stack?"; then
     rm -f -- "$plan"
+    TF_PLAN=""
     die "not applied: $stack" 2
   fi
-  rc=0
   terraform -chdir="$dir" apply -input=false -lock-timeout=120s "$plan" || rc=$?
   rm -f -- "$plan"
+  TF_PLAN=""
   [[ "$rc" == 0 ]] || die "terraform apply failed for $stack (exit $rc)"
 }
 

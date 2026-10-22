@@ -554,6 +554,31 @@ def index_of(env, predicate):
     return next(i for i, c in enumerate(env.calls()) if predicate(c))
 
 
+def is_tf(sub):
+    return lambda c: c["tool"] == "terraform" and c["argv"][1:2] == [sub]
+
+
+def is_drain(c):
+    return c["tool"] == "kubectl" and c["argv"][2:3] in (["drain"], ["delete"])
+
+
+def planned(env):
+    """The inventory the last plan was given with -var-file (fake_tools copies it), or None."""
+    path = Path(str(env.log) + ".var-file")
+    return json.loads(path.read_text()) if path.exists() else None
+
+
+def leftovers(env):
+    """Saved plans and planned inventories left in .run/ (each run removes its own)."""
+    run = env.repo / ".run"
+    return sorted(p.name for p in run.iterdir() if p.suffix in (".tfplan", ".json")) if run.exists() else []
+
+
+def vm_status(name, zone="us-central1-a"):
+    return ("gcloud", ["compute", "instances", "describe", name, "--project", PROJECT, "--zone", zone,
+                       "--format=value(status)"])
+
+
 def test_scale_up_writes_applies_syncs_then_joins_the_new_worker(env):
     set_workers(env, {"k3s-cpu-1": "34.10.0.11", "k3s-cpu-2": "34.10.0.12"})
     env.scenario["ready"] = ["k3s-cpu-1"]
@@ -594,9 +619,13 @@ def test_scale_down_drains_and_deletes_before_the_apply(env):
         kc(env, "drain", "k3s-cpu-3", "--ignore-daemonsets", "--delete-emptydir-data", "--force", "--timeout=120s"),
         kc(env, "delete", "node", "k3s-cpu-3", RT)]
     last_delete = max(i for i, c in enumerate(env.calls()) if c["argv"][2:4] == ["delete", "node"])
-    assert last_delete < index_of(env, lambda c: c["argv"][1:2] == ["plan"]), "drain before the VM goes"
+    assert last_delete < index_of(env, is_tf("apply")), "drain before the VM goes"
+    # X1-2/C1-1: the plan (with the new inventory) is checked before anything is drained.
+    assert index_of(env, is_tf("show")) < index_of(env, is_drain)
+    assert planned(env) == pool(["k3s-cpu-1"])
     assert tf(env) == ["init", "plan", "show", "apply"]
     assert calls(env)[-2:] == [get_node(env, "k3s-cpu-1"), ("gpuctl", ["sync-peers"])]
+    assert leftovers(env) == []
 
 
 DRAIN_ARGS = ("--ignore-daemonsets", "--delete-emptydir-data", "--force", "--timeout=120s")
@@ -625,17 +654,24 @@ def test_scale_down_rerun_after_a_declined_apply_drains_again(env):
     assert [c for c in calls(env) if c[1][2:3] in (["drain"], ["delete"])] == [
         kc(env, "drain", "k3s-cpu-2", *DRAIN_ARGS), kc(env, "delete", "node", "k3s-cpu-2", RT)]
     last_delete = max(i for i, c in enumerate(env.calls()) if c["argv"][2:4] == ["delete", "node"])
-    assert last_delete < index_of(env, lambda c: c["argv"][1:2] == ["plan"])
+    assert last_delete < index_of(env, is_tf("apply"))
     assert tf(env)[-1] == "apply"
 
 
 def test_scale_down_refuses_a_plan_that_also_destroys_k3s_cpu_1(env):
-    """Under AUTO_APPROVE=1 the apply may destroy only the workers just drained (X0-1)."""
+    """Under AUTO_APPROVE=1 the apply may destroy only the workers just drained (X0-1). The plan is
+    checked before the drain (X1-2/C1-1): a refused plan drains nothing and leaves the inventory alone."""
     set_pool(env, ["k3s-cpu-1", "k3s-cpu-2"])
+    before = env.tfvars.read_text()
     env.scenario["deletes"] = {"workers": [*worker_resources("k3s-cpu-2"),
                                            'google_compute_instance.worker["k3s-cpu-1"]']}
     proc = env.script("cpu-pool.sh", "scale", "1", AUTO_APPROVE="1")
     assert proc.returncode == 2 and "apply" not in tf(env)
+    assert not any(is_drain(c) for c in env.calls()), "nothing drained for a refused plan"
+    assert env.tfvars.read_text() == before
+    assert planned(env) == pool(["k3s-cpu-1"])
+    assert "nothing was drained" in proc.stderr
+    assert leftovers(env) == []
     unexpected = proc.stderr.split("NOT expected", 1)[1]
     assert 'google_compute_instance.worker["k3s-cpu-1"]' in unexpected
     assert 'worker["k3s-cpu-2"]' not in unexpected
@@ -659,18 +695,75 @@ def test_scale_never_removes_k3s_cpu_1(env):
     assert calls(env) == [] and "plan" not in tf(env)
 
 
-def test_scale_does_not_join_a_stopped_worker(env):
+@pytest.mark.parametrize("status", ["TERMINATED", "STOPPED", "SUSPENDED"])
+def test_scale_does_not_join_a_stopped_worker(env, status):
     """Scale step 4 joins only workers that have not joined: k3s-cpu-2, stopped with make cpu-stop, is
-    registered but NotReady and has no SSH; it is left alone and the new k3s-cpu-3 is joined."""
+    registered but NotReady and its VM is not running (no SSH); it is left alone and the new k3s-cpu-3
+    is joined."""
     set_pool(env, ["k3s-cpu-1", "k3s-cpu-2"])
     set_workers(env, {"k3s-cpu-1": "34.10.0.11", "k3s-cpu-2": "34.10.0.12", "k3s-cpu-3": "34.10.0.13"})
     env.scenario["ready"] = ["k3s-cpu-1"]
     env.scenario["registered"] = ["k3s-cpu-2"]
+    env.scenario["vm_status"] = {"k3s-cpu-2": status}
     proc = env.script("cpu-pool.sh", "scale", "3", AUTO_APPROVE="1")
     assert proc.returncode == 0, proc.stderr
-    assert calls(env) == [get_node(env, "k3s-cpu-1"), get_node(env, "k3s-cpu-2"), ("gpuctl", ["sync-peers"]),
+    assert calls(env) == [get_node(env, "k3s-cpu-1"), get_node(env, "k3s-cpu-2"), vm_status("k3s-cpu-2"),
+                          ("gpuctl", ["sync-peers"]),
                           *cpu_join(env, "k3s-cpu-3", "34.10.0.13", sync=False), ("gpuctl", ["sync-peers"])]
-    assert "k3s-cpu-2 is registered but NotReady" in proc.stderr
+    assert f"k3s-cpu-2 is registered but NotReady and its VM is {status}" in proc.stderr
+
+
+def test_scale_rerun_after_a_join_timeout_joins_the_running_worker_again(env):
+    """X1-1: the first scale to 3 times out waiting for k3s-cpu-3 to be Ready (it registered, NotReady).
+    The re-run sees k3s-cpu-3 registered but NotReady with its VM RUNNING: that is a join that never
+    finished, not a stopped worker, so join-node.sh runs again (agent stopped, then a fresh token)."""
+    set_pool(env, ["k3s-cpu-1", "k3s-cpu-2"])
+    set_workers(env, {"k3s-cpu-1": "34.10.0.11", "k3s-cpu-2": "34.10.0.12", "k3s-cpu-3": "34.10.0.13"})
+    env.scenario["ready"] = ["k3s-cpu-1", "k3s-cpu-2"]
+    env.scenario["never_ready"] = ["k3s-cpu-3"]
+    first = env.script("cpu-pool.sh", "scale", "3", AUTO_APPROVE="1", JOIN_READY_TIMEOUT_S="0")
+    assert first.returncode != 0 and "join-node.sh failed for k3s-cpu-3" in first.stderr
+    assert json.loads(env.tfvars.read_text()) == pool(["k3s-cpu-1", "k3s-cpu-2", "k3s-cpu-3"])
+    env.log.unlink()
+    env.scenario["never_ready"] = []
+    env.scenario["registered"] = ["k3s-cpu-3"]
+    env.scenario["plan_rc"] = {"workers": 0}
+    proc = env.script("cpu-pool.sh", "scale", "3", AUTO_APPROVE="1")
+    assert proc.returncode == 0, proc.stderr
+    rejoin = cpu_join(env, "k3s-cpu-3", "34.10.0.13", sync=False)
+    assert calls(env) == [get_node(env, "k3s-cpu-1"), get_node(env, "k3s-cpu-2"), get_node(env, "k3s-cpu-3"),
+                          vm_status("k3s-cpu-3"), ("gpuctl", ["sync-peers"]), *rejoin, ("gpuctl", ["sync-peers"])]
+    stop = calls(env).index(worker("k3s-cpu-3", STOP_AGENT))
+    assert stop < calls(env).index(cp("sudo k3s token create --ttl 15m --description k3s-cpu-3"))
+
+
+@pytest.mark.parametrize("status", ["STOPPING", "PROVISIONING", "STAGING", "REPAIRING"])
+def test_scale_fails_for_a_not_ready_worker_whose_vm_is_neither_running_nor_stopped(env, status):
+    """X1-1: a NotReady worker whose VM is on its way somewhere is not joined (no SSH yet), but the scale
+    does not report success either: the rest is done, then it exits 1 naming the worker."""
+    set_pool(env, ["k3s-cpu-1", "k3s-cpu-2"])
+    set_workers(env, {"k3s-cpu-1": "34.10.0.11", "k3s-cpu-2": "34.10.0.12"})
+    env.scenario["ready"] = ["k3s-cpu-1"]
+    env.scenario["registered"] = ["k3s-cpu-2"]
+    env.scenario["vm_status"] = {"k3s-cpu-2": status}
+    env.scenario["plan_rc"] = {"workers": 0}
+    proc = env.script("cpu-pool.sh", "scale", "2", AUTO_APPROVE="1")
+    assert proc.returncode == 1
+    assert calls(env) == [get_node(env, "k3s-cpu-1"), get_node(env, "k3s-cpu-2"), vm_status("k3s-cpu-2"),
+                          ("gpuctl", ["sync-peers"])]
+    assert f"k3s-cpu-2 ({status})" in proc.stderr
+
+
+def test_scale_refuses_an_unexpected_vm_status(env):
+    set_pool(env, ["k3s-cpu-1", "k3s-cpu-2"])
+    set_workers(env, {"k3s-cpu-1": "34.10.0.11", "k3s-cpu-2": "34.10.0.12"})
+    env.scenario["ready"] = ["k3s-cpu-1"]
+    env.scenario["registered"] = ["k3s-cpu-2"]
+    env.scenario["vm_status"] = {"k3s-cpu-2": "RUNNING; reboot"}
+    env.scenario["plan_rc"] = {"workers": 0}
+    proc = env.script("cpu-pool.sh", "scale", "2", AUTO_APPROVE="1")
+    assert proc.returncode == 1 and "unexpected status" in proc.stderr
+    assert not env.calls("gpuctl")
 
 
 def test_scale_joins_a_pool_worker_the_cluster_does_not_know(env):
@@ -688,10 +781,13 @@ def test_scale_joins_a_pool_worker_the_cluster_does_not_know(env):
 def test_scale_down_declined_changes_nothing(env):
     set_pool(env, ["k3s-cpu-1", "k3s-cpu-2"])
     before = env.tfvars.read_text()
+    env.scenario["deletes"] = {"workers": worker_resources("k3s-cpu-2")}
     proc = env.script("cpu-pool.sh", "scale", "1", stdin="n\n")
     assert proc.returncode == 2
-    # Only the read of what the workers stack has deployed (terraform init/output): nothing else.
-    assert env.tfvars.read_text() == before and calls(env) == [] and tf(env) == ["init"]
+    # The plan is shown before the question (X1-2); declining drains, writes and applies nothing.
+    assert 'google_compute_instance.worker["k3s-cpu-2"]' in proc.stderr.split("[y/N]", 1)[0]
+    assert env.tfvars.read_text() == before and calls(env) == [] and "apply" not in tf(env)
+    assert "nothing was drained" in proc.stderr and leftovers(env) == []
 
 
 def test_scale_down_of_a_node_already_gone_from_the_cluster_succeeds(env):
@@ -709,7 +805,8 @@ def test_scale_down_stops_when_a_drain_fails(env):
     env.scenario["drain_fail"] = ["k3s-cpu-2"]
     proc = env.script("cpu-pool.sh", "scale", "1", AUTO_APPROVE="1")
     assert proc.returncode == 1 and "disruption budget" in proc.stderr
-    assert env.tfvars.read_text() == before and "plan" not in tf(env)
+    assert env.tfvars.read_text() == before and "apply" not in tf(env)
+    assert leftovers(env) == []
 
 
 def test_scale_to_the_current_size_is_quiet(env):
@@ -754,8 +851,10 @@ def test_remove_drains_deletes_then_applies_and_syncs(env):
         kc(env, "delete", "node", "k3s-cpu-2", RT),
         ("gpuctl", ["sync-peers"])]
     assert tf(env) == ["init", "plan", "show", "apply"]
-    assert index_of(env, lambda c: c["argv"][2:4] == ["delete", "node"]) < index_of(
-        env, lambda c: c["argv"][1:2] == ["plan"])
+    assert index_of(env, lambda c: c["argv"][2:4] == ["delete", "node"]) < index_of(env, is_tf("apply"))
+    assert index_of(env, is_tf("show")) < index_of(env, is_drain)
+    assert planned(env) == pool(["k3s-cpu-1", "k3s-cpu-3"])
+    assert leftovers(env) == []
 
 
 def test_remove_applies_every_resource_of_the_removed_worker_unattended(env):
@@ -774,10 +873,14 @@ def test_remove_refuses_a_plan_that_destroys_anything_else_unattended(env, other
     """X0-1: only k3s-cpu-2's own resources may go; k3s-cpu-20 is not k3s-cpu-2 (whole key match)."""
     set_pool(env, ["k3s-cpu-1", "k3s-cpu-2", "k3s-cpu-3"])
     env.scenario["deletes"] = {"workers": [*worker_resources("k3s-cpu-2"), other]}
+    before = env.tfvars.read_text()
     proc = env.script("cpu-pool.sh", "remove", "k3s-cpu-2", AUTO_APPROVE="1")
     assert proc.returncode == 2 and "apply" not in tf(env)
     assert other in proc.stderr.split("NOT expected", 1)[1]
     assert not env.calls("gpuctl")
+    # X1-2: refused before the drain; the inventory and the cluster are untouched.
+    assert not any(is_drain(c) for c in env.calls()) and env.tfvars.read_text() == before
+    assert "nothing was drained" in proc.stderr and leftovers(env) == []
 
 
 def test_tf_apply_destroy_only_needs_a_name(env):
@@ -810,7 +913,8 @@ def test_remove_declined_changes_nothing(env):
     set_pool(env, ["k3s-cpu-1", "k3s-cpu-2"])
     before = env.tfvars.read_text()
     proc = env.script("cpu-pool.sh", "remove", "k3s-cpu-2", stdin="")
-    assert proc.returncode == 2 and env.tfvars.read_text() == before and env.calls() == []
+    assert proc.returncode == 2 and env.tfvars.read_text() == before
+    assert calls(env) == [] and "apply" not in tf(env) and leftovers(env) == []
 
 
 @pytest.mark.parametrize("name", ["k3s-cpu-1", "k3s-cp", "", "k3s-cpu-2x", "k3s-gpu-a6000-1"])

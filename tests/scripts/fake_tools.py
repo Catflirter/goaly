@@ -40,6 +40,10 @@ Workers and GPU nodes (Task 14). A remote command reaches the same handler wheth
   helm_rc        rc                       exit code of `helm upgrade` (default 0)
   sync_rc        rc                       exit code of `scripts/gpuctl sync-peers` (default 0)
   gpu_ip         text                     what `scripts/gpuctl ip NAME` prints
+  vm_status      {name: status}           `gcloud compute instances describe NAME --format=value(status)`
+                                          (default RUNNING)
+
+A plan run with -var-file=FILE copies FILE's text to $FAKE_LOG.var-file, so a test can see what it planned.
 """
 import json
 import os
@@ -100,6 +104,9 @@ def terraform():
     if sub == "plan":
         out = next(a.split("=", 1)[1] for a in rest if a.startswith("-out="))
         Path(out).write_text("fake plan")
+        for a in rest:
+            if a.startswith("-var-file="):
+                Path(os.environ["FAKE_LOG"] + ".var-file").write_text(Path(a.split("=", 1)[1]).read_text())
         return SCENARIO.get("plan_rc", {}).get(stack, 2)
     if sub == "show":
         changes = [{"address": a, "change": {"actions": ["delete", "create"]}}
@@ -116,6 +123,9 @@ def gcloud():
     if ARGS[:2] == ["compute", "scp"]:
         return 0
     if ARGS[:2] == ["compute", "instances"] and ARGS[2] in ("stop", "start"):
+        return 0
+    if ARGS[:3] == ["compute", "instances", "describe"] and opt("--format") == "value(status)":
+        print(SCENARIO.get("vm_status", {}).get(ARGS[3], "RUNNING"))
         return 0
     if ARGS[:2] != ["compute", "ssh"]:
         return 1
