@@ -3,11 +3,14 @@
 Read-only commands: plan, status, rules, list-nodes, ip. None of them changes anything on Lambda.
 sync-peers rewrites the peer allow-lists (k3s-cp's k3s_peers set, Lambda's global rules and k3s-gpu-<region> rulesets).
 apply creates and deletes GPU nodes to match the spec; down deletes all of them.
+apply, down and sync-peers run one at a time: each holds .run/gpuctl.lock (gpuctl.lock), and one started while
+another runs waits for it, so a make gpu-down goes right after a running apply (spec section 10.4).
 tfguard checks a saved workers-stack plan (`terraform show -json` on stdin) for cpu-pool.sh --guarded; it needs no
 Lambda API key and exits 1 on any violation.
 
 Exit codes: 0 success; 1 an operation failed or the target was not found; 2 refused or a usage error
-(no LAMBDA_API_KEY, invalid spec or override file, over budget, over max_nodes, not confirmed); 3 status found drift.
+(no LAMBDA_API_KEY, invalid spec or override file, over budget, over max_nodes, not confirmed); 3 status found drift;
+130 Ctrl-C: one line, then the process dies by SIGINT (see run()), so a calling script stops too.
 """
 
 from __future__ import annotations
@@ -16,13 +19,15 @@ import argparse
 import ipaddress
 import json
 import os
+import signal
 import sys
 from collections.abc import Callable, Iterable, Mapping
 from pathlib import Path
-from typing import TextIO
+from typing import NoReturn, TextIO
 
 from gpuctl.infra import CommandError, Infra, SubprocessShell
 from gpuctl.lambda_api import FirewallRule, Instance, LambdaAPIError, LambdaClient
+from gpuctl.lock import LockError, LockWaitInterrupted, lock_path, write_lock
 from gpuctl.output import write
 from gpuctl.peers import ruleset_name
 from gpuctl.planner import (
@@ -36,11 +41,13 @@ from gpuctl.tfguard import check_names, check_workers_plan
 REPO_ROOT = Path(__file__).resolve().parents[2]
 DEFAULT_SPEC = REPO_ROOT / "lambda" / "gpu-nodes.yaml"
 OVERRIDES_PATH = REPO_ROOT / "lambda" / ".autoscale-state.json"
+LOCK_PATH = lock_path(REPO_ROOT)  # held by apply, down and sync-peers (gpuctl.lock)
 API_KEY_ENV = "LAMBDA_API_KEY"
 SSH_KEY_ENV = "LAMBDA_SSH_KEY_NAME"
 RULESET_PREFIX = ruleset_name("")  # "k3s-gpu-": the rulesets gpuctl owns, one per region
 
 EXIT_OK, EXIT_FAILED, EXIT_REFUSED, EXIT_DRIFT = 0, 1, 2, 3
+EXIT_INTERRUPTED = 130  # Ctrl-C (128 + SIGINT)
 
 
 class _Refused(Exception):
@@ -306,6 +313,21 @@ def _parser() -> argparse.ArgumentParser:
     return parser
 
 
+def _waiting(command: str, out: TextIO, waited: float) -> None:
+    """Said when the command starts to wait for the write lock, and again every lock.WAIT_REPEAT_S (review S4-r3-3)."""
+    then = "gpu-down runs as soon as it ends" if command == "down" else f"{command} runs as soon as it ends"
+    find = f"`fuser -v {LOCK_PATH}` (or `lsof {LOCK_PATH}`) shows the process"
+    if waited == 0:  # the first time
+        _emit(out, f"Waiting for {LOCK_PATH}: another gpuctl apply, down or sync-peers holds it: a make gpu-apply or "
+                   "make gpu-down in another terminal (it may be waiting at its y/N confirmation prompt), the "
+                   "autoscaler's gpu_scale (make autoscale), or the sync-peers of scripts/cpu-pool.sh or "
+                   f"scripts/join-node.sh (make cpu-scale, make up). {find}. {then} "
+                   "(Ctrl-C stops waiting; nothing has changed yet)")
+    else:
+        _emit(out, f"Still waiting for {LOCK_PATH} ({waited:.0f}s): a gpuctl apply/down/sync-peers holds it (one at "
+                   f"its confirmation prompt waits for an answer); {find}. {then} (Ctrl-C stops waiting)")
+
+
 def _load_spec(path: Path) -> Spec:
     try:
         return load_spec(path)
@@ -349,10 +371,14 @@ def main(argv: list[str] | None = None, *, env: Mapping[str, str] = os.environ, 
             if args.command == "apply" and not env.get(SSH_KEY_ENV, "").strip():
                 raise _Refused(f"{SSH_KEY_ENV} is not set: put the name of your Lambda SSH key in .env")
             handler = {"status": _status, "sync-peers": _sync_peers, "apply": _apply, "down": _apply}[args.command]
-            return handler(args, spec, _client(env, client), infra, env, out)
+            client = _client(env, client)
+            if args.command == "status":
+                return handler(args, spec, client, infra, env, out)
+            with write_lock(LOCK_PATH, env=env, waiting=lambda waited: _waiting(args.command, out, waited)):
+                return handler(args, spec, client, infra, env, out)
         handler = {"rules": _rules, "list-nodes": _list_nodes, "ip": _ip}[args.command]
         return handler(args, _client(env, client), out)
-    except _Refused as e:
+    except (_Refused, LockError) as e:
         write(sys.stderr, _clean(f"gpuctl: {e}") + "\n")
         return EXIT_REFUSED
     except _Failed as e:
@@ -361,7 +387,31 @@ def main(argv: list[str] | None = None, *, env: Mapping[str, str] = os.environ, 
     except LambdaAPIError as e:
         write(sys.stderr, _clean(f"gpuctl: Lambda API error: {e}") + "\n")
         return EXIT_FAILED
+    except LockWaitInterrupted:  # Ctrl-C while another write held the lock (review S4-r3-5)
+        write(sys.stderr, f"gpuctl: stopped waiting for {LOCK_PATH}: nothing was changed\n")
+        return EXIT_INTERRUPTED
+    except KeyboardInterrupt:  # the commands clean up what they started first, then raise it again
+        write(sys.stderr, "gpuctl: interrupted (Ctrl-C): check with make gpu-status before running it again\n")
+        return EXIT_INTERRUPTED
+
+
+def run(argv: list[str] | None = None, **kw) -> NoReturn:
+    """The process entry point (python -m gpuctl): exit with main()'s code. After Ctrl-C (main() has printed its
+    one line and returned EXIT_INTERRUPTED) the process dies by SIGINT instead, so the shell's $? is still 130 and a
+    calling script without an INT trap stops too: bash stops on a Ctrl-C only when its child died by SIGINT; a plain
+    exit 130 would run `scripts/gpuctl sync-peers || die ...` in cpu-pool.sh and lib/common.sh and report a failure
+    (review S4-r4-1)."""
+    code = main(argv, **kw)
+    if code == EXIT_INTERRUPTED:
+        for stream in (sys.stdout, sys.stderr):  # death by a signal skips Python's own flush at exit
+            try:
+                stream.flush()
+            except (OSError, ValueError):
+                pass
+        signal.signal(signal.SIGINT, signal.SIG_DFL)
+        os.kill(os.getpid(), signal.SIGINT)
+    sys.exit(code)  # not reached after the SIGINT
 
 
 if __name__ == "__main__":
-    sys.exit(main())
+    run()
