@@ -11,12 +11,14 @@ gpu-apply never terminates an undrained node.
 """
 import io
 
+import pytest
+
 from fakes import DEFAULT_OUTPUTS, FakeInfra, FakeLambda
 from gpuctl.__main__ import main
 from gpuctl.infra import CommandError
 from gpuctl.lambda_api import FirewallRule, Ruleset
 from gpuctl.peers import global_rules
-from test_cli import ENV
+from test_cli import APPLY_ENV, ENV
 from test_reconcile import SPEC, TYPES, inst, make_rec
 
 NO_KUBECONFIG = "no kubeconfig at /h/.kube/hybrid-gpu.yaml"
@@ -221,11 +223,28 @@ def test_down_after_make_down_still_fails_when_an_instance_could_not_be_terminat
     assert fake.global_rules == OPERATOR_SSH and "nft" not in infra.events
 
 
-def test_apply_and_sync_peers_still_need_the_base_stack(capsys):
+def test_sync_peers_still_needs_the_base_stack(capsys):
     """Only gpu-down's final step goes on without a cluster: sync-peers on its own still refuses."""
     fake, infra = gone_account(), FakeInfra(outputs=GONE_OUTPUTS)
     assert main(["sync-peers"], env=ENV, client=fake, infra=infra) != 0
     assert fake.global_rules == list(OLD_RULES)
+    assert "apply the base stack first" in capsys.readouterr().err
+
+
+@pytest.mark.parametrize("instances", [[], [inst()]], ids=["would-launch", "matches-the-spec"])
+def test_apply_still_needs_the_base_stack(instances, tmp_path, monkeypatch, capsys):
+    """Review F4-2: a gpu-apply against a destroyed base stack fails with "apply the base stack first". It launches
+    nothing and rewrites no Lambda rule: the cluster-gone rules (operator SSH only) are for gpu-down alone. With the
+    instance already matching the spec, step 7 is all that runs, and it must not exit 0 on stripped rules."""
+    import gpuctl.__main__ as cli
+    monkeypatch.setattr(cli, "OVERRIDES_PATH", tmp_path / ".autoscale-state.json")
+    fake, infra = gone_account(*instances), FakeInfra(outputs=GONE_OUTPUTS)
+    assert main(["apply", "--auto-approve"], env=APPLY_ENV, client=fake, infra=infra) == 1
+    assert fake.launched == [] and fake.terminated == []
+    assert not [c for c in fake.calls if c[0] in ("launch", "update_global_rules", "update_ruleset",
+                                                  "create_ruleset")]
+    assert fake.global_rules == list(OLD_RULES)
+    assert [(r.id, r.rules) for r in fake.rulesets] == [("rs-old", OLD_RULES)]
     assert "apply the base stack first" in capsys.readouterr().err
 
 
@@ -252,3 +271,14 @@ def test_cli_apply_has_no_no_drain(capsys):
     fake = FakeLambda(types=TYPES)
     assert main(["apply", "--auto-approve", "--no-drain"], env=ENV, client=fake, infra=FakeInfra()) == 2
     assert fake.calls == []
+
+
+def test_cli_down_no_drain_help_states_when_gpu_down_terminates_undrained(capsys):
+    """Review F4-1: the help says what Ruling R54 does. gpu-down terminates undrained on its own only when the cluster
+    is gone (no kubeconfig, or infra/base has no cluster outputs); an API server that does not answer is refused, and
+    --no-drain is the operator's choice to abandon a cluster that exists but cannot be reached."""
+    assert main(["down", "--help"], env=ENV, client=FakeLambda(types=TYPES), infra=FakeInfra()) == 0
+    text = " ".join(capsys.readouterr().out.split())
+    assert "already does this when the API server does not answer" not in text
+    assert "no kubeconfig" in text and "infra/base has no cluster outputs" in text
+    assert "make tunnel" in text and "abandon" in text

@@ -262,8 +262,11 @@ def _parser() -> argparse.ArgumentParser:
     down = sub.add_parser("down", help="remove the autoscaler overrides and delete every GPU node")
     down.add_argument("--auto-approve", action="store_true", help="do not ask for confirmation")
     down.add_argument("--no-drain", action="store_true",
-                      help="terminate the GPU instances without draining or deleting their nodes (a cluster that "
-                           "is gone or broken; gpu-down already does this when the API server does not answer)")
+                      help="terminate the GPU instances without draining or deleting their nodes: for a cluster "
+                           "that still exists but cannot be reached and that you choose to abandon. Without it, "
+                           "gpu-down terminates undrained only when the cluster is gone (no kubeconfig, or "
+                           "infra/base has no cluster outputs); when the API server does not answer it refuses "
+                           "(start make tunnel and re-run)")
     sub.add_parser("status", help="GPU capacity, this cluster's GPU instances and a drift check (exit 3 on drift)")
     sub.add_parser("rules", help="Lambda global firewall rules and the k3s-gpu-<region> rulesets")
     sub.add_parser("list-nodes", help="one line per GPU node: <name> <ip|-> <status> <type> <region>")
