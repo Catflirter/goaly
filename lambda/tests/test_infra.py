@@ -11,8 +11,8 @@ import pytest
 
 from fakes import FakeInfra, FakeShell, fail, ok
 from gpuctl.infra import (
-    CP_SSH_TIMEOUT_S, TF_INIT_MARKER, TF_INIT_TIMEOUT_S, TF_READ_TIMEOUT_S, CommandError, Infra, MissingStackError,
-    SubprocessShell, posix_cksum,
+    CP_SSH_TIMEOUT_S, DRAIN_PROCESS_TIMEOUT_S, NODE_DELETE_PROCESS_TIMEOUT_S, TF_INIT_MARKER, TF_INIT_TIMEOUT_S,
+    TF_READ_TIMEOUT_S, CommandError, Infra, MissingStackError, SubprocessShell, posix_cksum,
 )
 from gpuctl.planner import gpu_type_label
 
@@ -446,9 +446,46 @@ def test_drain_and_delete_commands():
     sh = FakeShell([ok(), ok()])
     Infra(sh, ROOT, {"HOME": "/h"}).drain_and_delete_node("k3s-gpu-a6000-1")
     assert [c.args[3:] for c in sh.calls] == [
-        ["drain", "k3s-gpu-a6000-1", "--ignore-daemonsets", "--delete-emptydir-data", "--force", "--timeout=120s"],
-        ["delete", "node", "k3s-gpu-a6000-1"],
+        ["drain", "k3s-gpu-a6000-1", "--ignore-daemonsets", "--delete-emptydir-data", "--force", "--timeout=120s",
+         "--request-timeout=60s"],
+        ["delete", "node", "k3s-gpu-a6000-1", "--request-timeout=60s"],
     ]
+
+
+def test_drain_and_delete_are_bounded():
+    """Review F3-5: every request has kubectl's own bound and the whole process a timeout, so a stalled tunnel
+    cannot hang gpu-down (the drain: its 120 s eviction wait plus room for its requests)."""
+    sh = FakeShell([ok(), ok()])
+    Infra(sh, ROOT, {"HOME": "/h"}).drain_and_delete_node("k3s-gpu-a6000-1")
+    assert [c.timeout for c in sh.calls] == [DRAIN_PROCESS_TIMEOUT_S, NODE_DELETE_PROCESS_TIMEOUT_S]
+    assert DRAIN_PROCESS_TIMEOUT_S > 120 + 60 and NODE_DELETE_PROCESS_TIMEOUT_S > 60
+
+
+def test_a_stalled_drain_is_cut_off_and_raises(tmp_path, monkeypatch):
+    """A real kubectl that never returns (a half-open tunnel) is killed at the process timeout: the drain fails,
+    so gpu-down decides what to do, instead of hanging; the node is not deleted."""
+    import time
+
+    import gpuctl.infra as infra_module
+    bin_dir = tmp_path / "bin"
+    bin_dir.mkdir()
+    stall = bin_dir / "kubectl"
+    stall.write_text("#!/bin/sh\nexec sleep 30\n")
+    stall.chmod(0o755)
+    monkeypatch.setattr(infra_module, "DRAIN_PROCESS_TIMEOUT_S", 1.0)
+    env = {"HOME": str(tmp_path), "PATH": f"{bin_dir}:{os.environ['PATH']}"}
+    start = time.monotonic()
+    with pytest.raises(CommandError) as error:
+        Infra(SubprocessShell(), ROOT, env).drain_and_delete_node("k3s-gpu-a6000-1")
+    assert time.monotonic() - start < 10
+    assert error.value.returncode == -1 and "timed out" in str(error.value)
+
+
+def test_kubeconfig_missing(tmp_path):
+    """Review F3-1 / Ruling R54: no kubeconfig file is one sign that the cluster is gone."""
+    assert Infra(FakeShell([]), ROOT, {"HOME": "/h"}).kubeconfig_missing() == \
+        "no kubeconfig at /h/.kube/hybrid-gpu.yaml"
+    assert Infra(FakeShell([]), ROOT, kubeconfig(tmp_path)).kubeconfig_missing() is None
 
 
 def test_drain_and_delete_tolerate_notfound():  # Review Focus #3

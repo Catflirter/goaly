@@ -128,7 +128,10 @@ class Reconciler:
         self._started = clock()  # reset by each apply/down: the progress stamps count from there
         self._command = "apply"
         self._no_drain = False  # gpuctl down --no-drain
-        self._unreachable: str | None = None  # why the cluster cannot be reached, once a gpu-down drain found out
+        # Once a gpu-down drain failed (Ruling R54): why the cluster is known to be gone (later nodes are terminated
+        # without a drain), or why an existing cluster cannot be drained now (later nodes are refused at once).
+        self._gone: str | None = None
+        self._refusal: str | None = None
 
     def _emit(self, line: str = "") -> None:
         # Flushed (L21-4: a piped stdout, make gpu-apply | tee, shows each line as it happens) and best effort: a
@@ -201,14 +204,39 @@ class Reconciler:
             raise ReconcileError(f"infra/workers output worker_ips has an unexpected shape: {workers!r}")
         return tuple(workers)
 
-    def _base_outputs(self) -> dict:
+    def _read_base(self) -> dict:
         # A fresh clone or worktree has never initialised infra/base (gpu-down's final sync-peers included).
         self.infra.ensure_init("base")
-        base = self.infra.tf_output("base")
+        return self.infra.tf_output("base")
+
+    @staticmethod
+    def _base_destroyed(base: Mapping) -> bool:
+        """infra/base has none of the cluster's outputs: make down destroyed it (or it was never applied). Ruling
+        R54's "no base stack outputs"; a stack with only some of them is an error, not a gone cluster."""
+        return not base.get("cp_ip") and not base.get("cp_internal_ip")
+
+    def _base_outputs(self, base: Mapping | None = None) -> Mapping:
+        base = self._read_base() if base is None else base
         missing = [key for key in ("cp_ip", "cp_internal_ip") if not base.get(key)]
         if missing:
             raise ReconcileError(f"infra/base outputs lack {', '.join(missing)}: apply the base stack first")
         return base
+
+    def _cluster_gone(self) -> str | None:
+        """Why the cluster is known to be gone (Ruling R54: no kubeconfig, or infra/base has no cluster outputs), or
+        None. An API server that does not answer is not enough (review F3-1), and neither is a base stack that
+        cannot be read: not knowing is not "gone"."""
+        missing = self.infra.kubeconfig_missing()
+        if missing is not None:
+            return missing
+        try:
+            base = self._read_base()
+        except (CommandError, ValueError, OSError) as e:
+            self._warn(f"warning: cannot read infra/base outputs ({e}); treating the cluster as still there")
+            return None
+        if self._base_destroyed(base):
+            return "infra/base has no cluster outputs (cp_ip, cp_internal_ip): the cluster was destroyed"
+        return None
 
     def _live_gpu_ips(self, exclude_ids: Iterable[str] = ()) -> list[str]:
         """The IPs of the owned live GPU instances, minus `exclude_ids`: instances this run terminated, which Lambda
@@ -217,23 +245,24 @@ class Reconciler:
         return sorted(i.ip for i in owned_instances(self.client.list_instances())
                       if i.ip is not None and i.id not in gone)
 
-    def _peer_set(self, exclude_ids: Iterable[str] = ()) -> PeerSet:
-        """Every peer's current IP: cp (Terraform), CPU workers (Terraform), live GPU instances, the operator."""
-        base = self._base_outputs()
+    def _peer_set(self, exclude_ids: Iterable[str] = (), base: Mapping | None = None) -> PeerSet:
+        """Every peer's current IP: cp (Terraform), CPU workers (Terraform), live GPU instances, the operator.
+        `base` is infra/base's outputs when the caller has just read them."""
+        base = self._base_outputs(base)
         worker_ips = self._worker_ips()
         gpu_ips = tuple(self._live_gpu_ips(exclude_ids))
         operator_ip = self.infra.detect_operator_ip()
         return PeerSet(cp_ip=base["cp_ip"], cp_internal_ip=base["cp_internal_ip"], worker_ips=worker_ips,
                        gpu_ips=gpu_ips, operator_ip=operator_ip)
 
-    def sync_peers(self, spec: Spec, *, exclude_ids: Iterable[str] = ()) -> PeerSet:
+    def sync_peers(self, spec: Spec, *, exclude_ids: Iterable[str] = (), base: Mapping | None = None) -> PeerSet:
         """Rebuild every peer allow-list from the current IPs (spec section 3.3); safe to re-run.
 
         Order: cp's k3s_peers set (persisted by the guard helper), Lambda's global rules, then the k3s-gpu-<region>
         ruleset of every spec region and of any other k3s-gpu-* ruleset still on the account. GPU instances in
         `exclude_ids` (terminated by this run) are left out even if Lambda still lists them as live.
         """
-        peers = self._peer_set(exclude_ids)
+        peers = self._peer_set(exclude_ids, base)
         elements = cp_guard_elements(peers)
         self.infra.cp_ssh(GUARD_PEERS_COMMAND, input=nft_replace_script(elements))
         self.client.update_global_rules(global_rules(peers.operator_ip))
@@ -251,6 +280,21 @@ class Reconciler:
         self._emit("  Lambda global rules: operator ssh only")
         self._emit(f"  Lambda rulesets: {', '.join(ruleset_name(r) for r in regions)}")
         return peers
+
+    def _sync_lambda_rules_cluster_gone(self) -> None:
+        """gpu-down's sync-peers once the cluster is gone (review F3-3, Ruling R54): there is no k3s-cp whose peer set
+        could be updated, so that is skipped; Lambda's global rules and every existing owned k3s-gpu-* ruleset keep
+        only the operator's SSH (no cluster address is left in them). No ruleset is created."""
+        operator = self.infra.detect_operator_ip()
+        rules = global_rules(operator)
+        self.client.update_global_rules(rules)
+        owned = [r for r in self.client.list_rulesets() if r.name == ruleset_name(r.region)]
+        for ruleset in owned:
+            self.client.update_ruleset(ruleset.id, rules)
+        self._emit(f"sync-peers: the cluster is gone (infra/base has no cluster outputs), operator {mask_ip(operator)}")
+        self._emit("  k3s-cp k3s_peers: skipped (there is no k3s-cp)")
+        self._emit("  Lambda global rules: operator ssh only")
+        self._emit(f"  Lambda rulesets: {', '.join(sorted({r.name for r in owned})) or 'none'} (operator ssh only)")
 
     # --- apply / down ---------------------------------------------------------------------------
 
@@ -308,10 +352,13 @@ class Reconciler:
         Nothing is recorded (spec section 5.4: no local state); `gpuctl status` treats the pools below their count
         as a note, not drift (L21-1).
 
-        An owned instance whose drain fails is still terminated when the cluster provably cannot be reached (no
-        kubeconfig, the API server does not answer: make down destroyed it, the tunnel is down), with a warning;
-        else it would bill on with no way to stop it (review F2-3, G-1). `no_drain` skips the drains on purpose.
-        A cluster that answers and refused the drain keeps its node: nothing is terminated (spec section 5.4)."""
+        An owned instance whose drain fails is still terminated, with a warning, when the cluster is known to be gone
+        (Ruling R54: no kubeconfig, or infra/base has no cluster outputs, as after make down); else it would bill on
+        with no way to stop it (review F2-3, G-1). `no_drain` skips the drains on purpose. A cluster that still
+        exists keeps its node when the drain fails, whether its API server refused the drain or does not answer
+        (`make tunnel` not running, review F3-1): that instance is not terminated, the other steps go on, exit 1.
+        With the cluster gone, the final sync-peers skips k3s-cp and leaves only the operator's SSH in the Lambda
+        rules (review F3-3), so gpu-down exits 0 once no owned instance remains."""
         path = Path(self.settings.overrides_path)
         if path.exists():
             path.unlink()
@@ -324,7 +371,7 @@ class Reconciler:
         self._started = self.clock()
         self._command = command
         self._no_drain = no_drain
-        self._unreachable = None
+        self._gone = self._refusal = None
         # 1. plan and limits: nothing has changed yet
         instances = self.client.list_instances()
         types = self.client.instance_types()
@@ -392,25 +439,35 @@ class Reconciler:
             if name in {i.name for i in plan.delete if i.id in gone}:
                 self._warn(f"WARNING: {name} was terminated without draining it; its node object may remain in the "
                            "cluster (make gpu-status reports it). Once the cluster answers, remove it: "
-                           f"kubectl --kubeconfig ~/{DEFAULT_KUBECONFIG} delete node {name}")
+                           f"kubectl --kubeconfig ~/{DEFAULT_KUBECONFIG} delete node {name} (join-node.sh also "
+                           "deletes it, NotReady, before the next node of that name joins)")
         return gone, attempted, failures
 
     def _drain(self, name: str) -> bool:
         """Drain and delete the node of an instance about to be terminated: True when done, False when gpu-down goes
-        on without it (--no-drain, or the cluster provably cannot be reached: review F2-3, G-1). Raises when the
-        drain failed in a cluster that answers, or in gpu-apply: that instance is then not terminated."""
+        on without it (--no-drain, or the cluster is known to be gone: Ruling R54). Raises when the drain failed in
+        gpu-apply, or in a cluster that still exists (its API server refused the drain, or does not answer, as when
+        `make tunnel` is not running: review F3-1): that instance is then not terminated."""
         if self._no_drain:
             self._warn(f"WARNING: --no-drain: terminating {name} without draining it or deleting its node")
             return False
-        if self._unreachable is not None:  # found out on an earlier node of this gpu-down: no second wait
-            self._warn(f"WARNING: terminating {name} without draining it: {self._unreachable}")
+        if self._gone is not None:  # found out on an earlier node of this gpu-down: no second wait
+            self._warn(f"WARNING: terminating {name} without draining it: {self._gone}")
             return False
+        if self._refusal is not None:  # an earlier node's drain found the API server silent: no second wait
+            raise CommandError(["kubectl", "drain", name], 1, f"not drained: {self._refusal}")
         try:
             self.infra.drain_and_delete_node(name)
             return True
         except CommandError as drain_error:
             if self._command != "down":
                 raise
+            gone = self._cluster_gone()
+            if gone is not None:
+                self._gone = gone
+                self._warn(f"WARNING: cannot drain {name} ({str(drain_error)[-300:]}) and {gone}. gpu-down "
+                           "terminates this gpuctl-owned instance without draining it, so it stops billing")
+                return False
             try:
                 reason = self.infra.api_unreachable()
             except (CommandError, ValueError, OSError) as e:
@@ -421,10 +478,15 @@ class Reconciler:
                                    f"{drain_error.stderr.strip()}; the API server answers, so gpu-down does not "
                                    "terminate a node it could not drain: fix the drain and re-run make gpu-down, "
                                    "or terminate it anyway with scripts/gpuctl down --no-drain") from None
-            self._unreachable = reason
-            self._warn(f"WARNING: cannot drain {name} ({str(drain_error)[-300:]}) and {reason}. gpu-down "
-                       "terminates this gpuctl-owned instance without draining it, so it stops billing")
-            return False
+            # Exactly what a destroyed cluster looks like to kubectl, but nothing says this one was destroyed (the
+            # kubeconfig is there, infra/base was not found empty): terminating undrained would leave the Node object
+            # and k3s's node-password secret for the next instance of this name (review F3-1, Ruling R54).
+            self._refusal = (f"{reason}, but the cluster may still exist (the kubeconfig is there and infra/base "
+                             "was not found destroyed), so gpu-down does not terminate a node it could not drain: "
+                             "start make tunnel and re-run make gpu-down, or pass --no-drain (scripts/gpuctl down "
+                             "--no-drain) to terminate it anyway")
+            raise CommandError(drain_error.args, drain_error.returncode,
+                               f"{drain_error.stderr.strip()}; {self._refusal}") from None
 
     def _delete_failed(self, spec: Spec, gone: set[str], attempted: set[str], failures: list[str]) -> int:
         """A delete failed: launch nothing, but drop the IPs of the instances that were terminated from every
@@ -488,7 +550,11 @@ class Reconciler:
         with self._step(f"terraform apply gpu-access ({len(ips)} GPU IP{'' if len(ips) == 1 else 's'})"):
             self.infra.apply_gpu_access(ips, max_nodes=spec.max_nodes)
         with self._step("sync-peers"):
-            self.sync_peers(spec, exclude_ids=gone)
+            base = self._read_base()
+            if self._command == "down" and self._base_destroyed(base):
+                self._sync_lambda_rules_cluster_gone()
+            else:
+                self.sync_peers(spec, exclude_ids=gone, base=base)
 
     def _create_and_join(self, spec: Spec, plan: Plan, types: Mapping[str, InstanceType], *,
                          keep_on_failure: bool, gone: set[str]) -> int:

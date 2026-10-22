@@ -279,6 +279,7 @@ class FakeInfra:
         self.forgotten: list[str] = []
         self.unreachable: str | None = None  # what api_unreachable returns (None: the API server answers)
         self.probes = 0
+        self.no_kubeconfig: str | None = None  # what kubeconfig_missing returns (None: the kubeconfig is there)
 
     def ensure_init(self, stack: str) -> None:
         if stack in self.missing:
@@ -307,9 +308,13 @@ class FakeInfra:
         self.events.append("nft" if command == GUARD_PEERS_COMMAND else f"ssh:{command}")
         return ""
 
-    def kubectl(self, *args: str, check: bool = True) -> subprocess.CompletedProcess[str]:
+    def kubectl(self, *args: str, check: bool = True,
+                timeout: float | None = None) -> subprocess.CompletedProcess[str]:
         self.kubectl_calls.append(args)
         return subprocess.CompletedProcess(["kubectl", *args], 0, "", "")
+
+    def kubeconfig_missing(self) -> str | None:
+        return self.no_kubeconfig
 
     def cluster_gpu_nodes(self) -> dict[str, str | None]:
         return dict(self.cluster_nodes)

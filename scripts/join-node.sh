@@ -9,7 +9,9 @@
 #      worker, the gpu-access stack's gpu_ips for a GPU node. Then scripts/gpuctl sync-peers puts it
 #      into k3s-cp's k3s_peers set (and the Lambda rules), unless --skip-sync: the caller already
 #      did (scripts/gpuctl apply, or `make up`/cpu-pool.sh, which sync once for all their nodes).
-#   2. NAME already Ready: done (exit 0), unless --force.
+#   2. NAME already Ready: done (exit 0), unless --force. NAME registered but NotReady: that Node is
+#      deleted first (k3s then drops its node-password secret, which would reject a new machine of
+#      the same name); never a Ready node or another name.
 #   3. Wait (at most 300s) for SSH to the node: a VM or Lambda instance made seconds earlier has no
 #      sshd yet. Then node/ into a fresh private /tmp/k3s-node on it, and node-bootstrap.sh as root.
 #   4. k3s-agent is stopped (a no-op on a first join), so that it starts from the new token: an agent
@@ -97,10 +99,21 @@ if (( ! SKIP_SYNC )); then
   "$REPO_ROOT/scripts/gpuctl" sync-peers || die "sync-peers failed: $NODE was not joined"
 fi
 
-# ---- 2. already Ready? -----------------------------------------------------------------------------
-if node_ready "$NODE" && (( ! FORCE )); then
+# ---- 2. already Ready? A stale NotReady node of this name? -------------------------------------------
+state="$(node_state "$NODE")" || exit
+if [[ "$state" == Ready ]] && (( ! FORCE )); then
   log "$NODE is already Ready: nothing to do (--force bootstraps and joins it again)"
   exit 0
+fi
+# A NotReady Node of exactly this name (left by an instance terminated without a drain, or lost)
+# holds k3s's $NODE.node-password.k3s secret: a new machine under the name would be rejected
+# ("Node password rejected") after billed minutes. Deleting the Node makes k3s remove that secret
+# (review F3-2, Ruling R54). Never a Ready node, never another name. A rejoin of the same machine
+# (a Ready timeout re-run) just registers again with the password it already has.
+if [[ "$state" == NotReady ]]; then
+  log "WARNING: node $NODE is registered but NotReady: deleting it (and so k3s's $NODE.node-password.k3s secret) before the join"
+  _kc_node_gone_ok "$NODE" delete node "$NODE" --request-timeout="$KC_REQUEST_TIMEOUT" \
+    || die "cannot delete the stale NotReady node $NODE: $NODE was not joined (delete it with kubectl delete node $NODE and re-run)"
 fi
 
 # ---- 3. node-bootstrap.sh --------------------------------------------------------------------------

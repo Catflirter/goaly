@@ -56,6 +56,12 @@ STREAM_STOP_TIMEOUT_S = 60.0
 # tunnel cannot hang gpu-down.
 API_PROBE_REQUEST_TIMEOUT_S = 15
 API_PROBE_TIMEOUT_S = 30
+# drain_and_delete_node (review F3-5): kubectl's bound for each request, the drain's own eviction wait, and the
+# process timeouts over them, so a stalled tunnel makes the drain fail instead of hanging gpu-down or a cleanup.
+NODE_REQUEST_TIMEOUT_S = 60
+DRAIN_EVICTION_TIMEOUT_S = 120
+DRAIN_PROCESS_TIMEOUT_S = 240.0
+NODE_DELETE_PROCESS_TIMEOUT_S = 90.0
 # kubectl's words for "no API server answered": the connection was refused, reset or timed out, the name did not
 # resolve, TLS never completed. An HTTP error (Forbidden, Unauthorized, InternalError) is an answer.
 _API_UNREACHABLE_RE = re.compile(
@@ -372,9 +378,16 @@ class Infra:
         home = self.env.get("HOME", "").strip()
         return str((Path(home) if home else Path.home()) / DEFAULT_KUBECONFIG)
 
-    def kubectl(self, *args: str, check: bool = True) -> subprocess.CompletedProcess[str]:
+    def kubectl(self, *args: str, check: bool = True,
+                timeout: float | None = None) -> subprocess.CompletedProcess[str]:
         return self.shell.run(["kubectl", "--kubeconfig", self._kubeconfig(), *args], check=check,
-                              env=self._child_env())
+                              timeout=timeout, env=self._child_env())
+
+    def kubeconfig_missing(self) -> str | None:
+        """"no kubeconfig at PATH" when the kubeconfig file is not there, else None. One of the two signs that the
+        cluster is gone (Ruling R54; the other is a base stack without outputs)."""
+        config = Path(self._kubeconfig())
+        return None if config.is_file() else f"no kubeconfig at {config}"
 
     def cluster_gpu_nodes(self) -> dict[str, str | None]:
         """GPU nodes (k3s-gpu-*) in the cluster, each with its ExternalIP (None if it reports none)."""
@@ -394,8 +407,9 @@ class Infra:
         except (ValueError, TypeError, KeyError, AttributeError) as e:
             raise ValueError(f"kubectl get nodes -o json: unexpected output ({e!r})") from None
 
-    def _kubectl_tolerating_node_gone(self, name: str, *args: str) -> None:
-        result = self.kubectl(*args, check=False)
+    def _kubectl_tolerating_node_gone(self, name: str, *args: str, timeout: float) -> None:
+        # A process timeout raises CommandError (exit -1, "timed out"): a failure like any other.
+        result = self.kubectl(*args, check=False, timeout=timeout)
         # Only "this node is gone" counts as success. A generic NotFound ("the server could not find the requested
         # resource", e.g. a stale tunnel to another server) or another node's name still fails.
         gone = re.compile(rf'\bnodes? "{re.escape(name)}" not found')
@@ -403,12 +417,13 @@ class Infra:
             raise CommandError(result.args, result.returncode, result.stderr)
 
     def api_unreachable(self) -> str | None:
-        """Why the cluster's API server provably cannot be reached, or None when it answers (review F2-3, G-1).
+        """Why the cluster's API server cannot be reached, or None when it answers (review F2-3, G-1).
 
-        gpu-down terminates an owned instance it could not drain only when this says why: there is no kubeconfig
-        (make down removed it with the cluster), or GET /readyz got no answer at all (refused, timed out, no
-        route). Any answer, an HTTP error included, means a cluster is there, so None. A kubectl that cannot run
-        raises CommandError: that proves nothing about the cluster.
+        Either: there is no kubeconfig, or GET /readyz got no answer at all (refused, timed out, no route). Any
+        answer, an HTTP error included, means a cluster is there, so None. A kubectl that cannot run raises
+        CommandError: that proves nothing about the cluster. An unreachable API server alone does not prove the
+        cluster is gone (`make tunnel` not running looks the same, review F3-1): gpu-down uses this only to word
+        its refusal (Ruling R54).
         """
         config = Path(self._kubeconfig())
         if not config.is_file():
@@ -426,10 +441,16 @@ class Infra:
         return None
 
     def drain_and_delete_node(self, name: str) -> None:
-        """Drain then delete the node. A node that is already gone counts as success (Review Focus #3)."""
+        """Drain then delete the node. A node that is already gone counts as success (Review Focus #3).
+
+        Both are bounded (review F3-5): each API request by --request-timeout, the drain's evictions by its own
+        --timeout, and each process by a timeout above those, so a stalled tunnel fails the drain (CommandError)."""
+        request_timeout = f"--request-timeout={NODE_REQUEST_TIMEOUT_S}s"
         self._kubectl_tolerating_node_gone(name, "drain", name, "--ignore-daemonsets", "--delete-emptydir-data",
-                                           "--force", "--timeout=120s")
-        self._kubectl_tolerating_node_gone(name, "delete", "node", name)
+                                           "--force", f"--timeout={DRAIN_EVICTION_TIMEOUT_S}s", request_timeout,
+                                           timeout=DRAIN_PROCESS_TIMEOUT_S)
+        self._kubectl_tolerating_node_gone(name, "delete", "node", name, request_timeout,
+                                           timeout=NODE_DELETE_PROCESS_TIMEOUT_S)
 
     # --- nodes ---
 

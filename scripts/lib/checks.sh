@@ -1132,10 +1132,13 @@ _vr_guarded() {
 }
 
 # _vr_guard_signal SIGNAL CLEANUP: the INT/TERM trap of _vr_guarded. Runs CLEANUP, then kills its own
-# subshell with SIGNAL. A second Ctrl-C (or a TERM) while CLEANUP runs is ignored, by this shell and by
-# the commands CLEANUP starts, or it would stop CLEANUP half way and leave gpu-hold Pods (restartPolicy
-# Always) holding every GPU (review F2-2); CLEANUP stays bounded (every delete has --timeout and
-# --request-timeout). The operator is told on the terminal what happens and, if CLEANUP fails, how to
+# subshell with SIGNAL. A second Ctrl-C while CLEANUP runs is ignored, by this shell and by the commands
+# CLEANUP starts (SIGINT ignored at exec stays ignored, in Go programs such as kubectl too), or it would
+# stop CLEANUP half way and leave gpu-hold Pods (restartPolicy Always) holding every GPU (review F2-2).
+# A TERM is ignored by this shell only: kubectl (Go) does not keep an inherited SIG_IGN for SIGTERM, so
+# a TERM sent to the whole process group kills the delete in flight (review F3-4); CLEANUP's result is
+# then a failure and the leftover hint below says how to finish. CLEANUP stays bounded (every delete has
+# --timeout and --request-timeout). The operator is told on the terminal what happens and, if CLEANUP fails, how to
 # remove what may be left. If the evidence can no longer be written (run_check's filter keeps it open,
 # but a caller's pipe may have died with the Ctrl-C), output goes to /dev/null: a closed pipe must
 # not stop CLEANUP (vr_cmd runs nothing it cannot record) and leave a billed GPU allocated.
