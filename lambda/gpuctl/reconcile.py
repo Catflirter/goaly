@@ -628,7 +628,8 @@ class Reconciler:
         self.infra.drain_and_delete_node(name)
 
     def _delete_failed(self, spec: Spec, gone: set[str], attempted: set[str], failures: list[str]) -> int:
-        """A delete failed: launch nothing, but drop the IPs of the instances that were terminated from every
+        """A delete failed, or the launches were refused (_launches_refused): launch nothing, but drop the IPs of the
+        instances that were terminated from every
         allow-list (step 7), since Lambda may hand those IPs to another tenant. This runs whenever a terminate was
         sent, even one that raised: step 7 reads the live instances, so one Lambda accepted is left out anyway."""
         for failure in failures:
