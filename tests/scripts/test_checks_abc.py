@@ -9,10 +9,13 @@ here reaches GCP, Lambda, a cluster or the network: k3s-cp's ExternalIP is a TES
 """
 import base64
 import json
+import os
 import re
 import shutil
+import signal
 import socket
 import subprocess
+import time
 
 import pytest
 
@@ -78,8 +81,14 @@ def nodes_json(nodes, public=None):
     return json.dumps({"items": items})
 
 
-PCAP_OK = (f"IP 10.10.0.2.51820 > {NODES[CPU1]['ext']}.51820: UDP, length 148\n"
-           f"IP {NODES[CPU1]['ext']}.51820 > 10.10.0.2.51820: UDP, length 92\n"
+def wg_packets(peer, n):
+    """N udp/51820 packets between k3s-cp's NIC and PEER, alternating direction (tcpdump -nn -q -t lines)."""
+    out = (f"IP 10.10.0.2.51820 > {peer}.51820: UDP, length 148\n", f"IP {peer}.51820 > 10.10.0.2.51820: UDP, length 92\n")
+    return "".join(out[i % 2] for i in range(n))
+
+
+# 20 marked requests and their answers cross as at least 40 WireGuard packets; keepalives alone give 1-2.
+PCAP_OK = (wg_packets(NODES[CPU1]["ext"], 50) +
            f"IP {NODES[CPU1]['ext']}.40312 > 10.10.0.2.6443: tcp 0\n"
            f"IP 10.10.0.2.6443 > {NODES[CPU1]['ext']}.40312: tcp 517\n"
            f"IP 10.10.0.2.53210 > {NODES[CPU1]['ext']}.10250: tcp 0\n"
@@ -96,6 +105,7 @@ FIREWALL = [
                  {"IPProtocol": "icmp"}],
      "targetServiceAccounts": ["k3s-cp@p.iam.gserviceaccount.com"]},
 ]
+LISTENING = "tcpdump: listening on ens4, link-type EN10MB (Ethernet), snapshot length 262144 bytes\n"
 GPUCTL_RULES = ("global\n  tcp   22          198.51.100.200/32  operator ssh\n"
                 "ruleset k3s-gpu-us-west-1 rs-1 us-west-1\n  udp   51820       192.0.2.10/32      k3s-cp wireguard\n"
                 "ruleset k3s-gpu-us-east-1 rs-2 us-east-1\n  (no rules)\n")
@@ -128,7 +138,9 @@ def healthy(nodes=(CP, CPU1), mtu=1460):
               on(n, "sudo nft list table inet k3s_guard",
                  stdout="table inet k3s_guard {\n  counter packets 3 bytes 180 drop\n}\n")]
     r += [
-        kc("-n np-denied exec client", rc=28, stderr="curl: (28) Connection timed out after 5001 milliseconds\n"),
+        kc("-n np-denied exec client", "http://echo.nettest.svc.cluster.local:8080/", stdout="200"),
+        kc("-n np-denied exec client", "http://hello.hello.svc.cluster.local", rc=7,
+           stderr="curl: (7) Failed to connect to hello.hello.svc.cluster.local port 80 after 357 ms\n"),
         kc("exec", "-- curl -fsS -m 5 http://10.42.", stdout=WHOAMI),
         kc("exec", "ping -M do", f"-s {mtu - 107} ", rc=1, stderr="ping: sendmsg: Message too long\n"),
         kc("exec", "ping -M do", stdout="2 packets transmitted, 2 received, 0% packet loss\n"),
@@ -158,9 +170,8 @@ def healthy(nodes=(CP, CPU1), mtu=1460):
         kc("apply -f", "np-denied.yaml", stdout="namespace/np-denied created\npod/client created\n"),
         kc("-n np-denied wait pod/client --for=condition=Ready --timeout=120s", stdout="pod/client condition met\n"),
         on(CP, "ip -o route show default", stdout="default via 10.10.0.1 dev ens4 proto dhcp src 10.10.0.2 metric 100\n"),
-        on(CP, "tcpdump -ni ens4 -U -w /tmp/b2.pcap", rc=124,
-           stderr="tcpdump: listening on ens4, link-type EN10MB (Ethernet), snapshot length 262144 bytes\n"),
-        on(CP, "sudo tcpdump -A -nn -r /tmp/b2.pcap", stdout="0\n", rc=1),
+        on(CP, "tcpdump -ni ens4 -U -w /tmp/b2.pcap", rc=124, stderr=LISTENING, sleep=2),   # still capturing
+        on(CP, "sudo tcpdump -A -nn -r /tmp/b2.pcap", stdout="0\n"),
         on(CP, "sudo tcpdump -nn -q -t -r /tmp/b2.pcap", stdout=PCAP_OK),
         on(CP, "sudo rm -f /tmp/b2.pcap"),
         on(CPU1, "sudo find /sys/fs/cgroup -type d", HELLO_CID, stdout=cgroup(HELLO_CID) + "\n"),
@@ -198,6 +209,34 @@ class Cluster(Env):
         assert proc.returncode == 0, proc.stderr
         result = re.search(r"^\| 1 \| T \| title \| (\w+) \|$", (run / "SUMMARY.md").read_text(), re.M).group(1)
         return result, (run / "01-T.txt").read_text()
+
+    def interrupt(self, func, when, sig):
+        """Run FUNC through run_check (as verify.sh does), send SIG to the whole process group (Ctrl-C
+        reaches every process in the terminal's group) once a fake call holding WHEN was made; the
+        exit status of the run."""
+        run = self.repo / "verification" / "s"
+        code = f"set -euo pipefail; source scripts/lib/checks.sh; vr_init {run}; run_check T title {func}"
+        proc = subprocess.Popen(["bash", "-c", code], cwd=self.repo, start_new_session=True,
+                                env=self.environ({"VR_NO_WAIT": "1", "BASH_FUNC_timeout%%": NOT_REACHABLE}),
+                                stdin=subprocess.DEVNULL, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+        deadline = time.monotonic() + 30
+        while when not in (self.log.read_text() if self.log.exists() else ""):
+            assert proc.poll() is None, proc.communicate()
+            assert time.monotonic() < deadline, "the check never got there"
+            time.sleep(0.05)
+        time.sleep(0.3)                                    # the call is running: the check waits on it
+        os.killpg(proc.pid, sig)
+        proc.communicate(timeout=60)
+        # SIGTERM ends the outer shell at once; the check's own shell cleans up after it: wait for the group
+        while time.monotonic() < deadline + 60:
+            try:
+                os.killpg(proc.pid, 0)
+            except ProcessLookupError:
+                break
+            time.sleep(0.05)
+        else:
+            raise AssertionError("processes of the interrupted check are still running")
+        return proc.returncode
 
     def kubectl(self):
         """The kubectl argv of every call, without --kubeconfig FILE."""
@@ -260,6 +299,21 @@ def test_node_external_ip_probe_on_and_echo_on(env):
     assert env.kubectl()[1] == ["-n", "nettest", "get", "pods", "-l", "app=probe",
                                 "--field-selector=spec.nodeName=k3s-cp,status.phase=Running", RT,
                                 "-o", "jsonpath={.items[*].metadata.name}"]
+
+
+def test_vr_pick_keeps_the_callers_line_variable(env):
+    proc = env.run(["bash", "-c", "source scripts/lib/checks.sh; line=mine; _vr_pick b 'a p 1' 'b q 2'; echo \"$line\""])
+    assert proc.stdout.splitlines() == ["q 2", "mine"]
+
+
+def test_kc_within_bounds_kubectl_and_bounded_skips_a_timeout_function(env):
+    # The offline tests replace `timeout` with a shell function (B5); bounded must run the real one.
+    env.first(kc("exec", "stalled", sleep=5))
+    proc = env.run(["bash", "-c", "source scripts/lib/checks.sh; kc_within 5 -n nettest exec p -- true; echo rc=$?; "
+                    "kc_within 1 -n nettest exec stalled -- true; echo rc=$?; bounded 1 sleep 3; echo rc=$?"],
+                   **{"BASH_FUNC_timeout%%": NOT_REACHABLE})
+    assert proc.stdout.splitlines() == ["rc=0", "rc=124", "rc=124"]
+    assert env.kubectl() == [["-n", "nettest", "exec", "p", "--", "true"], ["-n", "nettest", "exec", "stalled", "--", "true"]]
 
 
 @pytest.mark.parametrize("call, bad", [("node_external_ip k3s-cp", "10.0.0.1 192.0.2.10"),
@@ -367,6 +421,9 @@ def test_b1_runs_the_full_matrix_and_prints_an_n_by_n_table(env):
     table = text[text.index("probe \\ echo"):].splitlines()
     assert table[0].split() == ["probe", "\\", "echo", CP, CPU1, "svc-dns"]
     assert table[1].split() == [CP, "ok", "ok", "ok"] and table[2].split() == [CPU1, "ok", "ok", "ok"]
+    # every exec carries an outer bound (kubectl's own request timeout does not bound exec streams)
+    execs = [line for line in cmd_lines(text) if " exec " in line]
+    assert execs and all(line.startswith("$ kc_within 60 -n nettest exec ") for line in execs)
 
 
 def test_b1_ping_sizes_follow_underlay_mtu(env):
@@ -384,6 +441,20 @@ def test_b1_fails_when_the_oversized_ping_gets_through(env):
     assert result == "FAIL"
     rows = {line.split()[0]: line.split()[1:] for line in text[text.index("probe \\ echo"):].splitlines()[1:3]}
     assert rows == {CP: ["ok", "ok", "ok"], CPU1: ["ping-1353-passed", "ok", "ok"]}
+
+
+@pytest.mark.parametrize("answer, ok", [
+    (dict(rc=1, stderr="ping: local error: message too long, mtu=1380\n"), True),
+    (dict(rc=1, stdout="2 packets transmitted, 0 received, +2 errors, 100% packet loss, time 1001ms\n"), True),
+    (dict(rc=1, stderr="error: unable to upgrade connection: container not found (\"netshoot\")\n"), False),
+    (dict(rc=124), False),                                                  # the exec's bound ran out
+])
+def test_b1_oversized_ping_must_fail_as_an_mtu_rejection(env, answer, ok):
+    env.first(kc("exec", NODES[CPU1]["probe"], "ping -M do", "-s 1353 ", f" {NODES[CP]['echo_ip']}", **answer))
+    result, text = env.check("check_b1_matrix")
+    assert result == ("PASS" if ok else "FAIL"), text
+    rows = {line.split()[0]: line.split()[1:] for line in text[text.index("probe \\ echo"):].splitlines()[1:3]}
+    assert rows[CPU1][0] == ("ok" if ok else "ping-1353-error")
 
 
 def test_b1_fails_on_one_broken_cell_and_one_broken_dns_lookup(env):
@@ -409,8 +480,11 @@ def test_b2_captures_on_the_default_interface_while_other_nodes_curl_the_cp_echo
     assert result == "PASS", text
     cp = env.remote(CP)
     assert cp[0] == "ip -o route show default"
-    assert cp[1] == "sudo timeout 25 tcpdump -ni ens4 -U -w /tmp/b2.pcap 'not port 22'"
-    marker = re.fullmatch(r"sudo tcpdump -A -nn -r /tmp/b2\.pcap \| grep -c -F -- '(b2-marker-[0-9a-f]{16})'", cp[2])
+    # umask 077: sudo keeps the stricter umask, so the pcap is never world-readable while it exists
+    assert cp[1] == "umask 077 && sudo timeout 25 tcpdump -ni ens4 -U -w /tmp/b2.pcap 'not port 22'"
+    # pipefail, and grep's 'no match' masked: a non-zero status means tcpdump could not read the file
+    marker = re.fullmatch(r"bash -o pipefail -c 'sudo tcpdump -A -nn -r /tmp/b2\.pcap "
+                          r"\| \{ grep -c -F -- (b2-marker-[0-9a-f]{16}) \|\| true; \}'", cp[2])
     assert marker, cp[2]
     assert cp[3:] == ["sudo tcpdump -nn -q -t -r /tmp/b2.pcap", "sudo rm -f /tmp/b2.pcap"]
     curl = next(a for a in env.kubectl() if "X-Marker" in " ".join(a))
@@ -418,6 +492,8 @@ def test_b2_captures_on_the_default_interface_while_other_nodes_curl_the_cp_echo
     assert f'-H "X-Marker: {marker.group(1)}" http://{NODES[CP]["echo_ip"]}:8080/' in curl[-1]
     assert "seq 20" in curl[-1]
     assert "51820/udp" in text and "6443/tcp" in text and "10250/tcp" in text
+    assert f"50 udp/51820 packets with {NODES[CPU1]['ext']}" in text
+    assert "$ cp_resolve" in cmd_lines(text)                       # the SSH zone lookup is recorded too
 
 
 def test_b2_marker_is_new_each_run(env):
@@ -433,15 +509,53 @@ def test_b2_marker_is_new_each_run(env):
      "no udp/51820"),
     ("other-port", [on(CP, "tcpdump -nn -q", stdout=PCAP_OK + f"IP 10.10.0.2.43000 > {NODES[CPU1]['ext']}.8080: tcp 64\n")],
      "UNEXPECTED tcp 43000 > 8080"),
-    ("curl-failed", [kc("exec", "X-Marker", rc=1, stdout="12/20 requests answered\n")], "requests"),
+    ("curl-failed", [kc("exec", "X-Marker", rc=1, stdout="12/20 requests answered\n")],
+     f"B2: not all 20 requests from {NODES[CPU1]['probe']}"),
     ("capture-failed", [on(CP, "tcpdump -ni ens4", rc=1, stderr="tcpdump: ens4: No such device exists\n")],
-     "capture"),
+     "the capture on k3s-cp did not start"),
+    # the requests finished after tcpdump's 25 s window: the capture may not hold them
+    ("capture-ended", [on(CP, "tcpdump -ni ens4", rc=124, stderr=LISTENING),
+                       kc("exec", "X-Marker", stdout="20/20 requests answered\n", sleep=1)],
+     "the capture on k3s-cp ended before the marked requests finished"),
+    # keepalives only: the marked requests did not cross as WireGuard packets with that peer
+    ("too-few-wireguard", [on(CP, "tcpdump -nn -q", stdout=wg_packets(NODES[CPU1]["ext"], 39))],
+     f"39 udp/51820 packets with {NODES[CPU1]['ext']} (want at least 40"),
+    # the peer's traffic is on the wire under another address: nothing of it would be examined
+    ("peer-not-on-wire", [on(CP, "tcpdump -nn -q", stdout=wg_packets("203.0.113.77", 60))],
+     f"0 udp/51820 packets with {NODES[CPU1]['ext']}"),
 ])
 def test_b2_fails_and_still_removes_the_pcap(env, name, answers, why):
     env.first(*answers)
     result, text = env.check("check_b2_wire")
     assert result == "FAIL", text
     assert why in text
+    assert env.remote(CP)[-1] == "sudo rm -f /tmp/b2.pcap"
+
+
+def test_b2_does_not_call_an_unreadable_capture_marker_free(env):
+    # tcpdump -r fails: grep's count of 0 must not read as "the marker is not in the capture"
+    env.first(on(CP, "sudo tcpdump -A -nn -r", rc=1, stdout="0\n",
+                 stderr="tcpdump: /tmp/b2.pcap: truncated dump file; tried to read 16 header bytes\n"))
+    result, text = env.check("check_b2_wire")
+    assert result == "FAIL"
+    assert "not in the capture" not in text and "B2 ①: cannot search the capture (exit 1)" in text
+
+
+@pytest.mark.parametrize("sig", [signal.SIGINT, signal.SIGTERM])
+def test_b2_removes_the_pcap_when_interrupted_mid_capture(env, sig):
+    env.first(on(CP, "tcpdump -ni ens4", rc=124, stderr=LISTENING, sleep=30))
+    rc = env.interrupt("check_b2_wire", "X-Marker", sig)
+    assert rc == -sig                                              # the run stops: verify.sh does not go on
+    assert env.remote(CP)[-1] == "sudo rm -f /tmp/b2.pcap"
+    assert not any("tcpdump -nn -q" in c for c in env.remote(CP))
+
+
+def test_b2_waits_out_a_late_capture_before_removing_it_when_the_start_was_not_seen(env):
+    env.first(on(CP, "tcpdump -ni ens4", rc=255, stderr="ERROR: (gcloud.compute.ssh) [/usr/bin/ssh] exited\n"))
+    result, text = env.check("check_b2_wire")
+    assert result == "FAIL"
+    wait = "waiting 30 s for a capture that may have started late, then removing its file"
+    assert wait in text and "(VR_NO_WAIT: skipped sleep 30)" in text.split(wait, 1)[1]
     assert env.remote(CP)[-1] == "sudo rm -f /tmp/b2.pcap"
 
 
@@ -464,6 +578,8 @@ def test_b3_reads_wg_show_on_every_node_without_dump(env):
     assert result == "PASS", text
     assert env.remote(CP) == ["sudo wg show flannel-wg"] and env.remote(CPU1) == ["sudo wg show flannel-wg"]
     assert "dump" not in text and "private key: <redacted>" in text
+    # the SSH zone lookups (Terraform outputs) are recorded like every other command
+    assert {"$ cp_resolve", f"$ _worker_zone {CPU1}"} <= set(cmd_lines(text))
 
 
 def test_b3_covers_a_gpu_node_over_plain_ssh(env3):
@@ -493,10 +609,13 @@ def test_b4_measures_cpu1_to_cp_and_records_bits_per_second(env):
     result, text = env.check("check_b4_iperf")
     assert result == "PASS", text
     execs = [a for a in env.kubectl() if "exec" in a]
-    assert ["-n", "nettest", "exec", NODES[CP]["probe"], "--", "timeout", "150", "iperf3", "-s", "-1"] in execs
+    # --forceflush: without a tty iperf3 buffers "Server listening" until it exits
+    assert ["-n", "nettest", "exec", NODES[CP]["probe"], "--", "timeout", "150", "iperf3", "-s", "-1",
+            "--forceflush"] in execs
     assert ["-n", "nettest", "exec", NODES[CPU1]["probe"], "--", "timeout", "120", "iperf3", "-c",
             NODES[CP]["probe_ip"], "-n", "50M", "-J"] in execs
     assert "bits_per_second=410000000" in text
+    assert not any("pkill" in a for a in execs)                     # the one-off server ended by itself
 
 
 def test_b4_also_measures_cpu1_to_each_gpu_node(env3):
@@ -505,9 +624,22 @@ def test_b4_also_measures_cpu1_to_each_gpu_node(env3):
     assert clients == [NODES[CP]["probe_ip"], NODES[GPU1]["probe_ip"]]
 
 
-def test_b4_fails_when_the_client_fails(env):
+PKILL_CP = ["-n", "nettest", "exec", NODES[CP]["probe"], "--", "pkill", "-x", "iperf3"]
+
+
+def test_b4_fails_when_the_client_fails_and_stops_the_server(env):
     env.first(kc("exec", "iperf3 -c", rc=1, stderr="iperf3: error - unable to connect to server\n"))
     assert env.check("check_b4_iperf")[0] == "FAIL"
+    assert env.kubectl()[-1] == PKILL_CP                     # so a re-run can listen on 5201 again
+
+
+def test_b4_fails_when_the_server_never_says_it_listens_and_stops_it(env):
+    env.first(kc("exec", "iperf3 -s -1", stdout=""))
+    result, text = env.check("check_b4_iperf")
+    assert result == "FAIL"
+    assert "the iperf3 server on k3s-cp did not start" in text
+    assert not any("iperf3 -c" in " ".join(a) for a in env.kubectl())
+    assert env.kubectl()[-1] == PKILL_CP
 
 
 # ---- B5 negative tests --------------------------------------------------------------------------
@@ -533,9 +665,10 @@ def test_b5_fails_when_the_api_port_answers_from_here(env):
     assert "reachable from this machine" in text
 
 
-@pytest.mark.parametrize("rc", [0, 1, 126])
+@pytest.mark.parametrize("rc", [0, 1, 126, 124])
 def test_b5_metadata_must_fail_inside_curl(env, rc):
-    # 0: the metadata server answered; 1/126: kubectl or the probe failed, so curl's verdict is unknown.
+    # 0: the metadata server answered; 1/126: kubectl or the probe failed, so curl's verdict is unknown;
+    # 124: the exec's outer bound ran out, which is not curl's own timeout (28).
     env.first(kc("exec", NODES[CPU1]["probe"], "Metadata-Flavor", rc=rc))
     assert env.check("check_b5_negative")[0] == "FAIL"
 
@@ -567,6 +700,22 @@ def test_b6_lists_the_gcp_rules_and_the_lambda_rules(env):
     assert row.split() == ["fw-k3s-cpu-1-to-cp", "k3s-core", "INGRESS", NODES[CPU1]["ext"] + "/32",
                            "tcp:6443,udp:51820,icmp", "k3s-cp@p.iam.gserviceaccount.com"]
     assert "ruleset k3s-gpu-us-west-1" in text
+    assert "$ bounded 120 gcloud compute firewall-rules list --project <GCP_PROJECT> " in text
+
+
+def test_b6_evidence_masks_the_project_id_and_the_operator_ip(env):
+    # verification/final is committed: no real project id or operator address in it (Ruling R39)
+    env.write_env(env.repo.joinpath(".env").read_text() + "OPERATOR_IP=198.51.100.200\n")
+    rules = json.loads(json.dumps(FIREWALL).replace("@p.iam", "@k3s-demo-123456.iam"))
+    rules[0]["sourceRanges"].append("198.51.100.200/32")
+    env.first(rule("gcloud", ["compute firewall-rules list"], stdout=json.dumps(rules)),
+              rule("gpuctl", ["rules"], stdout=GPUCTL_RULES + "  tcp   22          198.51.100.20/32   other\n"))
+    result, text = env.check("check_b6_firewall_inventory")
+    assert result == "PASS", text
+    assert "k3s-demo-123456" not in text and "198.51.100.200" not in text
+    assert "k3s-cp@<GCP_PROJECT>.iam.gserviceaccount.com" in text
+    assert "<operator_ip>/32  operator ssh" in text and "35.235.240.0/20,<operator_ip>/32" in text
+    assert "198.51.100.20/32" in text                                # only that exact address is masked
 
 
 @pytest.mark.parametrize("change", [
@@ -738,6 +887,24 @@ def test_c7_fails_and_still_deletes_both_pods(env, answers):
                                      "--timeout=90s"]
 
 
+def test_c7_still_deletes_both_pods_when_the_ssh_zone_lookup_dies(env):
+    # _worker_zone exits the shell (die) when Terraform's output cannot be read; that must not skip the delete
+    env.first(rule("terraform", ["output", "worker_zones"], rc=1, stderr="Error: Failed to load state\n"))
+    result, text = env.check("check_c7_limits_demo")
+    assert result == "FAIL", text
+    assert "cannot read worker_zones" in text
+    assert limits_calls(env)[-1] == ["-n", "limits-demo", "delete", "pod", "oom", "cpu-burn", "--ignore-not-found",
+                                     "--timeout=90s"]
+
+
+@pytest.mark.parametrize("sig", [signal.SIGINT, signal.SIGTERM])
+def test_c7_deletes_both_pods_when_interrupted(env, sig):
+    env.first(kc("-n limits-demo wait pod/cpu-burn", sleep=30))
+    assert env.interrupt("check_c7_limits_demo", "pod/cpu-burn", sig) == -sig
+    assert limits_calls(env)[-1] == ["-n", "limits-demo", "delete", "pod", "oom", "cpu-burn", "--ignore-not-found",
+                                     "--wait=false", RT]
+
+
 def test_c7_accepts_a_reading_of_exactly_110m(env):
     env.first(kc("top pod cpu-burn", stdout="NAME CPU(cores) MEMORY(bytes)\ncpu-burn 110m 1Mi\n"))
     assert env.check("check_c7_limits_demo")[0] == "PASS"
@@ -747,7 +914,13 @@ def np_calls(env):
     return [a for a in env.kubectl() if "np-denied" in " ".join(a)]
 
 
-def test_c8_checks_c2_then_times_out_from_another_namespace_and_deletes_it(env):
+NP_DELETE = ["delete", "namespace", "np-denied", "--ignore-not-found", "--timeout=120s"]
+NP_CONTROL = ["-n", "np-denied", "exec", "client", "--", "curl", "-sS", "-m", "5", "-o", "/dev/null", "-w",
+              "%{http_code}", "http://echo.nettest.svc.cluster.local:8080/"]
+NP_HELLO = ["-n", "np-denied", "exec", "client", "--", "curl", "-sS", "-m", "5", "http://hello.hello.svc.cluster.local"]
+
+
+def test_c8_checks_c2_then_the_control_then_is_denied_from_another_namespace_and_deletes_it(env):
     result, text = env.check("check_c8_netpol")
     assert result == "PASS", text
     calls = env.kubectl()
@@ -755,19 +928,43 @@ def test_c8_checks_c2_then_times_out_from_another_namespace_and_deletes_it(env):
                            "http://hello.hello.svc.cluster.local"])
     np = np_calls(env)
     assert calls.index(np[0]) > allowed
-    delete = ["delete", "namespace", "np-denied", "--ignore-not-found", "--timeout=120s"]
-    assert np[0] == delete and np[-1] == delete
+    assert np[0] == NP_DELETE and np[-1] == NP_DELETE
     assert np[1][:2] == ["apply", "-f"] and np[1][2].endswith("/k8s/verify/np-denied.yaml")
-    assert ["-n", "np-denied", "wait", "pod/client", "--for=condition=Ready", "--timeout=120s"] in np
-    assert ["-n", "np-denied", "exec", "client", "--", "curl", "-sS", "-m", "5",
-            "http://hello.hello.svc.cluster.local"] in np
+    assert np[2] == ["-n", "np-denied", "wait", "pod/client", "--for=condition=Ready", "--timeout=120s"]
+    # Ruling R45: the same client first reaches echo.nettest (HTTP 200), then hello is refused (exit 7)
+    assert np[3:5] == [NP_CONTROL, NP_HELLO]
+    assert "positive control: the np-denied client gets HTTP 200 from echo.nettest" in text
+    assert "(curl exit 7)" in text
+    assert "$ kc_within 60 -n np-denied exec client -- curl -sS -m 5 http://hello.hello.svc.cluster.local" in text
 
 
-@pytest.mark.parametrize("rc", [0, 7, 1, 6])
-def test_c8_needs_exit_code_28_and_still_deletes_the_namespace(env, rc):
-    env.first(kc("-n np-denied exec client", rc=rc))
-    assert env.check("check_c8_netpol")[0] == "FAIL"
-    assert np_calls(env)[-1] == ["delete", "namespace", "np-denied", "--ignore-not-found", "--timeout=120s"]
+@pytest.mark.parametrize("rc, ok", [(7, True), (28, True), (0, False), (1, False), (6, False), (124, False)])
+def test_c8_needs_exit_code_7_or_28_and_still_deletes_the_namespace(env, rc, ok):
+    # 7: kube-router rejects (measured live), 28: a policy that drops; 0 got through, 6 DNS failed, 1 kubectl
+    # failed, 124 the exec's outer bound ran out: none of those shows the NetworkPolicy at work
+    env.first(kc("-n np-denied exec client", "hello.hello", rc=rc))
+    result, text = env.check("check_c8_netpol")
+    assert result == ("PASS" if ok else "FAIL"), text
+    assert np_calls(env)[-1] == NP_DELETE
+
+
+@pytest.mark.parametrize("control", [dict(rc=7, stdout="000"), dict(rc=6, stdout="000"), dict(stdout="403"),
+                                     dict(rc=1, stdout="")])
+def test_c8_fails_when_the_positive_control_fails_even_if_hello_times_out(env, control):
+    # a client with no working network or DNS must not count as "denied"
+    env.first(kc("-n np-denied exec client", "echo.nettest", **control),
+              kc("-n np-denied exec client", "hello.hello", rc=28))
+    result, text = env.check("check_c8_netpol")
+    assert result == "FAIL", text
+    assert "positive control failed" in text
+    assert np_calls(env)[-1] == NP_DELETE
+
+
+@pytest.mark.parametrize("sig", [signal.SIGINT, signal.SIGTERM])
+def test_c8_deletes_the_namespace_when_interrupted(env, sig):
+    env.first(kc("-n np-denied wait pod/client", sleep=30))
+    assert env.interrupt("check_c8_netpol", "pod/client", sig) == -sig
+    assert np_calls(env)[-1] == ["delete", "namespace", "np-denied", "--ignore-not-found", "--wait=false", RT]
 
 
 def test_c8_fails_without_touching_np_denied_when_c2_fails(env):

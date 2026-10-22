@@ -55,7 +55,9 @@ Verification checks (Task 18) script their answers instead, with rules tried bef
                                           successive calls get successive answers (the last one repeats).
                                           An answer with "serve": TEXT (kubectl port-forward L:R) listens on
                                           127.0.0.1:L, prints kubectl's "Forwarding from" line and answers
-                                          every HTTP GET with TEXT until it is killed.
+                                          every HTTP GET with TEXT until it is killed. "sleep": SECONDS
+                                          waits that long after printing, before exiting (a capture or a
+                                          stalled call that is still running).
 """
 import http.server
 import json
@@ -287,6 +289,7 @@ def scripted():
         sys.stderr.flush()
         if "serve" in answer:
             serve(answer["serve"])
+        time.sleep(answer.get("sleep", 0))
         return answer.get("rc", 0)
     return None
 

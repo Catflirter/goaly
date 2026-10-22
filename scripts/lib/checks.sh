@@ -15,13 +15,17 @@
 # Task 22) are registered in scripts/verify.sh; the demo (Task 25) calls them directly. Each returns 0
 # (PASS), 1 (FAIL) or 77 (SKIP); one that cannot read .env exits 2 (a FAIL), so call it in a subshell.
 # Every command a check runs goes through vr_cmd, vr_cap or vr_bg, so its evidence shows what ran
-# (node_external_ip, probe_on and echo_on appear by name; their kubectl queries are in common.sh).
+# (node_external_ip, probe_on and echo_on appear by name; their kubectl queries are in common.sh;
+# so do cp_resolve and _worker_zone, the SSH zone lookups from Terraform outputs).
 # The offline tests set VR_NO_WAIT=1 (no fixed sleeps) and VR_PF_PORT (C3's local port).
 # Rules for check functions:
 #   - bound every wait (kubectl wait --timeout=…, curl --max-time …): run_check has no timeout of its own;
+#     kubectl exec runs under kc_within SECONDS and other network calls under bounded SECONDS;
 #   - background jobs (kubectl port-forward &, tcpdump &) are killed when the check returns, because
 #     run_check waits for every process holding the check's output; so do not set an EXIT trap in a
-#     check (it replaces that cleanup), and do not leave grandchildren (setsid, nohup) running.
+#     check (it replaces that cleanup), and do not leave grandchildren (setsid, nohup) running;
+#   - a check that leaves something behind until its end (a pcap, Pods, a namespace) removes it on
+#     SIGINT/SIGTERM too, with _vr_on_signal CMD.
 
 # common.sh is linted on its own; pre-commit runs shellcheck without -x, so don't follow it.
 # shellcheck disable=SC1091
@@ -228,9 +232,74 @@ vr_bg() {
 
 # --- check helpers (Task 18) --------------------------------------------------------------------
 
-# The bound of one kubectl request (get, describe, apply, top); waits carry their own --timeout,
-# and exec'd commands bound themselves (curl -m, ping -W, timeout N iperf3).
+# The bound of one kubectl request (get, describe, apply, top); waits carry their own --timeout.
+# kubectl exec streams are not bounded by it: exec runs under kc_within (below), and the exec'd
+# commands bound themselves too (curl -m, ping -W, timeout N iperf3).
 _VR_RT="--request-timeout=$KC_REQUEST_TIMEOUT"
+
+# bounded SECONDS CMD…: run the program CMD for at most SECONDS; exit 124 when it had to be stopped.
+# --foreground keeps CMD in the terminal's process group, so Ctrl-C still reaches it. `command` skips
+# a shell function named timeout (the offline tests replace it for check B5).
+bounded() {
+  command timeout --foreground "$@"
+}
+
+# kc_within SECONDS ARGS…: kc with an outer time bound, for kubectl exec, so a stalled API tunnel
+# fails the call instead of hanging the check. A call stopped by the bound exits 124, which no check
+# takes for a verdict (B5 and C8 want curl's own 7 or 28).
+kc_within() {
+  local seconds="$1"
+  shift
+  bounded "$seconds" kubectl --kubeconfig "$KUBECONFIG_FILE" "$@"
+}
+
+# _vr_within SECONDS CMD…: run CMD (a shell function too, such as cp_ssh) in the background and stop
+# it after SECONDS. Returns CMD's status, or 124.
+_vr_within() {
+  local seconds="$1" pid i
+  shift
+  "$@" &
+  pid=$!
+  for ((i = 0; i < seconds * 5; i++)); do
+    if ! kill -0 "$pid" 2>/dev/null; then
+      wait "$pid"
+      return
+    fi
+    sleep 0.2
+  done
+  _vr_stop "$pid"
+  return 124
+}
+
+# _vr_on_signal CMD…: when the check is interrupted (SIGINT: Ctrl-C during make verify or the demo;
+# SIGTERM), kill its background jobs, run CMD (for at most 120 s; a shell function is fine) and end
+# the check by the same signal, so verify.sh and the demo stop as they would without the trap.
+# _vr_on_signal without CMD removes the trap. The EXIT trap stays the harness's (_vr_reap).
+_vr_on_signal() {
+  if (($# == 0)); then
+    trap - INT TERM
+    return 0
+  fi
+  _VR_ON_SIGNAL=("$@")
+  trap '_vr_signalled INT' INT
+  trap '_vr_signalled TERM' TERM
+}
+
+# _vr_signalled SIGNAL: the trap set by _vr_on_signal. Ctrl-C reaches the evidence filter (redact)
+# too, so writes to the evidence may fail: SIGPIPE is ignored, errexit is off, and CMD's own output
+# is dropped (kubectl or gcloud must not die on a closed pipe before they have done their work).
+_vr_signalled() {
+  set +e
+  trap - INT TERM
+  trap '' PIPE
+  _vr_reap
+  printf 'interrupted (SIG%s); cleaning up:\n' "$1" >&2
+  _vr_quote "${_VR_ON_SIGNAL[@]}" | redact >&2
+  _vr_within 120 "${_VR_ON_SIGNAL[@]}" </dev/null >/dev/null 2>&1
+  trap - PIPE
+  kill -s "$1" "${BASHPID:-$$}"
+  exit 1
+}
 
 # vr_env: load .env once per shell (GCP_PROJECT for IAP SSH and gcloud, UNDERLAY_MTU, the Lambda SSH
 # key path); a missing or non-private .env ends the check (exit 2, a FAIL). The Lambda API key is
@@ -242,9 +311,13 @@ vr_env() {
   _VR_ENV_LOADED=1
 }
 
-# _vr_sleep SECONDS: sleep; VR_NO_WAIT=1 (the offline tests) skips it.
+# _vr_sleep SECONDS: sleep; VR_NO_WAIT=1 (the offline tests) skips it and says so in the evidence.
 _vr_sleep() {
-  [[ "${VR_NO_WAIT:-}" == 1 ]] || sleep "$1"
+  if [[ "${VR_NO_WAIT:-}" == 1 ]]; then
+    echo "(VR_NO_WAIT: skipped sleep $1)" >&2
+  else
+    sleep "$1"
+  fi
 }
 
 # vr_retry TIMEOUT_S INTERVAL_S CMD…: run CMD (in this shell) until it succeeds, every INTERVAL_S
@@ -325,7 +398,7 @@ _vr_load_pods() {
 
 # _vr_pick NODE LINE…: "POD IP" of the first "NODE POD IP" line on NODE; fails if there is none.
 _vr_pick() {
-  local want="$1" node name ip
+  local want="$1" line node name ip
   shift
   for line in "$@"; do
     read -r node name ip <<< "$line"
@@ -349,13 +422,15 @@ _vr_in() {
 
 # _vr_ssh_prepare NODE…: look up the SSH zones once, in the check's own shell: cp_resolve and
 # _worker_zone cache there only, so node_ssh in $(…) would otherwise read Terraform outputs each time.
+# Both exit the shell (die) when an output cannot be read, so a check that must clean up runs the
+# work that calls this in a subshell.
 _vr_ssh_prepare() {
   local n
   for n in "$@"; do
     if [[ "$n" == "$CP_NAME" ]]; then
-      cp_resolve
+      vr_cmd cp_resolve
     elif [[ "$n" =~ $CPU_NODE_RE ]]; then
-      _worker_zone "$n"
+      vr_cmd _worker_zone "$n"
     fi
   done
 }
@@ -454,14 +529,23 @@ check_a4_flannel_annotations() {
 # --- B: connectivity (spec §9 B) ----------------------------------------------------------------
 
 # _vr_b1_cell PROBE ECHO_IP SMALL BIG: one matrix cell (spec §2.3 #3: a Pod-to-Pod ICMP payload of
-# UNDERLAY_MTU-108 fits, UNDERLAY_MTU-107 does not). Sets VR_CELL to ok or the failed parts.
+# UNDERLAY_MTU-108 fits, UNDERLAY_MTU-107 does not). Sets VR_CELL to ok or the failed parts. The
+# oversized ping counts as blocked only when it fails as an MTU rejection (EMSGSIZE "message too
+# long", "frag needed", or every packet lost); a failed exec (kubectl, the bound) is ping-<size>-error.
 _vr_b1_cell() {
+  local outf rc=0
   VR_CELL=""
-  vr_cmd kc -n nettest exec "$1" -- curl -fsS -m 5 "http://$2:8080/" || VR_CELL+="curl,"
-  vr_cmd kc -n nettest exec "$1" -- ping -M 'do' -c 2 -W 2 -s "$3" "$2" || VR_CELL+="ping-$3,"
-  if vr_cmd kc -n nettest exec "$1" -- ping -M 'do' -c 2 -W 2 -s "$4" "$2"; then
+  vr_cmd kc_within 60 -n nettest exec "$1" -- curl -fsS -m 5 "http://$2:8080/" || VR_CELL+="curl,"
+  vr_cmd kc_within 60 -n nettest exec "$1" -- ping -M 'do' -c 2 -W 2 -s "$3" "$2" || VR_CELL+="ping-$3,"
+  outf="$(mktemp)" || return 1
+  vr_cmd kc_within 60 -n nettest exec "$1" -- ping -M 'do' -c 2 -W 2 -s "$4" "$2" >"$outf" 2>&1 || rc=$?
+  cat -- "$outf"
+  if ((rc == 0)); then
     VR_CELL+="ping-$4-passed,"
+  elif ! grep -qiE 'message too long|frag(mentation)? needed| 100% packet loss' "$outf"; then
+    VR_CELL+="ping-$4-error,"
   fi
+  rm -f -- "$outf"
   VR_CELL="${VR_CELL%,}"
   VR_CELL="${VR_CELL:-ok}"
 }
@@ -506,7 +590,7 @@ check_b1_matrix() {
       [[ "$VR_CELL" == ok ]] || fail=1
       row+=$'\t'"$VR_CELL"
     done
-    if vr_cmd kc -n nettest exec "$name" -- curl -fsS -m 5 http://echo.nettest.svc.cluster.local:8080/; then
+    if vr_cmd kc_within 60 -n nettest exec "$name" -- curl -fsS -m 5 http://echo.nettest.svc.cluster.local:8080/; then
       row+=$'\tok'
     else
       row+=$'\tFAIL'
@@ -516,18 +600,24 @@ check_b1_matrix() {
   done
   echo
   echo "B1: N x N matrix, UNDERLAY_MTU=$mtu: each cell is curl to the echo Pod IP, ping -M do -s $small"
-  echo "(must pass) and -s $big (must fail); svc-dns is curl http://echo.nettest.svc.cluster.local:8080/"
+  echo "(must pass) and -s $big (must fail as too big for the MTU); svc-dns is curl"
+  echo "http://echo.nettest.svc.cluster.local:8080/"
   printf '%s\n' "${rows[@]}" | _vr_table
   return "$fail"
 }
 
-# _vr_b2_flows PEER_IP…: read `tcpdump -nn -q -t` lines on stdin and summarise them: the udp/51820
-# packets (any host), and the traffic with the other nodes' public IPs by service port. Only
-# 51820/udp (WireGuard), 6443/tcp (the API, mTLS) and 10250/tcp (kubelet, TLS) may appear there
-# (spec §2.2: the two TLS ports cross the internet by design); ICMP carries no port and is listed.
-# Fails on any other port or protocol, or when no udp/51820 packet was seen.
+# _vr_b2_flows MIN PEER_IP…: read `tcpdump -nn -q -t` lines on stdin and summarise them: the
+# udp/51820 packets (any host, and with each peer), and the traffic with the other nodes' public IPs
+# by service port. Only 51820/udp (WireGuard), 6443/tcp (the API, mTLS) and 10250/tcp (kubelet, TLS)
+# may appear there (spec §2.2: the two TLS ports cross the internet by design); ICMP carries no port
+# and is listed. Fails on any other port or protocol, when no udp/51820 packet was seen, or when a
+# peer has fewer than MIN udp/51820 packets: each peer sends the marked requests, so its WireGuard
+# traffic proves they crossed the wire encrypted while the capture ran (keepalives alone give 1-2
+# packets in 25 s), and that the peer's wire address is the one ③ examines.
 _vr_b2_flows() {
-  awk -v peers="$*" '
+  local min="$1"
+  shift
+  awk -v min="$min" -v peers="$*" '
     BEGIN { n = split(peers, p, " "); for (i = 1; i <= n; i++) peer[p[i]] = 1 }
     function host(a,  f) { split(a, f, "."); return f[1] "." f[2] "." f[3] "." f[4] }
     function port(a,  f) { return split(a, f, ".") == 5 ? f[5] : "" }
@@ -535,7 +625,11 @@ _vr_b2_flows() {
       dst = $4; sub(/:$/, "", dst)
       proto = ($5 == "tcp") ? "tcp" : ($5 ~ /^UDP/) ? "udp" : ($5 == "ICMP") ? "icmp" : "other"
       sh = host($2); dh = host(dst); sp = port($2); dp = port(dst)
-      if (proto == "udp" && (sp == 51820 || dp == 51820)) wg++
+      if (proto == "udp" && (sp == 51820 || dp == 51820)) {
+        wg++
+        if (sh in peer) pwg[sh]++
+        if (dh in peer && dh != sh) pwg[dh]++
+      }
       if (!(sh in peer) && !(dh in peer)) next
       if (proto == "udp" && (sp == 51820 || dp == 51820)) key = "51820/udp"
       else if (proto == "tcp" && (dp == 6443 || dp == 10250)) key = dp "/tcp"
@@ -547,24 +641,32 @@ _vr_b2_flows() {
     END {
       printf "B2 ②: %d udp/51820 packets in the capture\n", wg
       if (wg < 1) print "B2 ②: no udp/51820 packet: no WireGuard traffic was captured"
+      for (i = 1; i <= n; i++) {
+        c = pwg[p[i]] + 0
+        printf "B2 ②: %d udp/51820 packets with %s (want at least %d: the 20 marked requests and their answers)\n", c, p[i], min
+        if (c < min) short = 1
+      }
       printf "B2 ③: packets to or from the other nodes'\'' public IPs (%s):\n", peers
       split("51820/udp 6443/tcp 10250/tcp icmp", k, " ")
       for (i = 1; i <= 4; i++) if (seen[k[i]]) printf "  %-10s %d\n", k[i], seen[k[i]]
       for (b in bad) printf "  UNEXPECTED %s: %d packets\n", b, bad[b]
       if (nbad == 0) print "B2 ③: only 51820/udp, 6443/tcp and 10250/tcp"
-      exit (wg >= 1 && nbad == 0) ? 0 : 1
+      exit (wg >= 1 && !short && nbad == 0) ? 0 : 1
     }'
 }
 
 # B2: capture on k3s-cp's default interface while the probes on the other nodes send 20 requests
 # each, carrying a random marker header, to the echo Pod on k3s-cp. PASS: ① the marker is not in
-# the capture's payloads; ② there is udp/51820; ③ only the expected ports cross to the other nodes'
-# public IPs. The capture file is removed afterwards, pass or fail.
+# the capture's payloads; ② there is udp/51820, and each sending node has at least 40 such packets
+# (its marked requests crossed while the capture ran, which must still be running after them);
+# ③ only the expected ports cross to the other nodes' public IPs. The capture file is created
+# under umask 077 (sudo keeps the stricter umask: never world-readable) and removed afterwards,
+# pass, fail or interrupt.
 check_b2_wire() {
   local marker route iface n ip probe cp_echo capf pid started=0 rc=0 out matches fail=0
   local -a peers=() probes=()
   vr_env
-  cp_resolve
+  vr_cmd cp_resolve
   marker="b2-marker-$(od -An -N8 -tx1 /dev/urandom | tr -d ' \n')"
   [[ "$marker" =~ ^b2-marker-[0-9a-f]{16}$ ]] || { echo "B2: cannot make a random marker"; return 1; }
   echo "B2: marker $marker"
@@ -583,19 +685,27 @@ check_b2_wire() {
   cp_echo="$(vr_cap echo_on "$CP_NAME")" || return 1
 
   capf="$(mktemp)" || return 1
-  vr_bg "$capf" cp_ssh "sudo timeout 25 tcpdump -ni $iface -U -w /tmp/b2.pcap 'not port 22'"
+  _vr_on_signal cp_ssh 'sudo rm -f /tmp/b2.pcap'
+  vr_bg "$capf" cp_ssh "umask 077 && sudo timeout 25 tcpdump -ni $iface -U -w /tmp/b2.pcap 'not port 22'"
   pid="$VR_BG_PID"
   if _vr_wait_text "$capf" "listening on" "$pid" 60; then
     started=1
     for probe in "${probes[@]}"; do
-      vr_cmd kc -n nettest exec "$probe" -- sh -c "n=0; for i in \$(seq 20); do curl -fsS -m 2 -o /dev/null -H \"X-Marker: $marker\" http://$cp_echo:8080/ && n=\$((n + 1)); done; echo \"\$n/20 requests answered\"; [ \"\$n\" -eq 20 ]" \
+      vr_cmd kc_within 90 -n nettest exec "$probe" -- sh -c "n=0; for i in \$(seq 20); do curl -fsS -m 2 -o /dev/null -H \"X-Marker: $marker\" http://$cp_echo:8080/ && n=\$((n + 1)); done; echo \"\$n/20 requests answered\"; [ \"\$n\" -eq 20 ]" \
         || { echo "B2: not all 20 requests from $probe were answered"; fail=1; }
     done
+    if ! kill -0 "$pid" 2>/dev/null; then
+      echo "B2: the capture on $CP_NAME ended before the marked requests finished, so it may not hold them"
+      fail=1
+    fi
     wait "$pid" || rc=$?
   else
     _vr_stop "$pid"
     echo "B2: the capture on $CP_NAME did not start"
     fail=1
+    # Its start may only have been unseen (a slow IAP relay): such a capture writes for up to 25 s.
+    echo "B2: waiting 30 s for a capture that may have started late, then removing its file"
+    _vr_sleep 30
   fi
   _vr_show "$capf" "capture on $CP_NAME"
   if ((started)); then
@@ -604,11 +714,12 @@ check_b2_wire() {
       fail=1
     fi
     rc=0
-    out="$(vr_cap cp_ssh "sudo tcpdump -A -nn -r /tmp/b2.pcap | grep -c -F -- '$marker'" </dev/null)" || rc=$?
+    # pipefail with grep's "no match" (exit 1) masked: a non-zero status is tcpdump failing to read.
+    out="$(vr_cap cp_ssh "bash -o pipefail -c 'sudo tcpdump -A -nn -r /tmp/b2.pcap | { grep -c -F -- $marker || true; }'" </dev/null)" || rc=$?
     matches="${out##*$'\n'}"
-    if ((rc <= 1)) && [[ "$matches" == 0 ]]; then
+    if ((rc == 0)) && [[ "$matches" == 0 ]]; then
       echo "B2 ①: the marker is not in the capture (the cross-node traffic is encrypted)"
-    elif ((rc <= 1)) && [[ "$matches" =~ ^[0-9]+$ ]]; then
+    elif ((rc == 0)) && [[ "$matches" =~ ^[1-9][0-9]*$ ]]; then
       echo "B2 ①: MARKER found in the capture $matches times: Pod traffic crossed the wire in plaintext"
       fail=1
     else
@@ -616,13 +727,14 @@ check_b2_wire() {
       fail=1
     fi
     if out="$(vr_cap --no-echo cp_ssh 'sudo tcpdump -nn -q -t -r /tmp/b2.pcap' </dev/null)"; then
-      _vr_b2_flows "${peers[@]}" <<< "$out" || fail=1
+      _vr_b2_flows 40 "${peers[@]}" <<< "$out" || fail=1
     else
       echo "B2: cannot read the capture"
       fail=1
     fi
   fi
   vr_cmd cp_ssh 'sudo rm -f /tmp/b2.pcap' </dev/null || { echo "B2: cannot remove /tmp/b2.pcap on $CP_NAME"; fail=1; }
+  _vr_on_signal
   return "$fail"
 }
 
@@ -681,22 +793,31 @@ check_b3_wg() {
 }
 
 # _vr_b4_pair CLIENT_PROBE CLIENT_NODE SERVER_NODE: iperf3 from CLIENT_PROBE to the probe on
-# SERVER_NODE (-n 50M: a bounded transfer, spec §9 B4), and record bits_per_second.
+# SERVER_NODE (-n 50M: a bounded transfer, spec §9 B4), and record bits_per_second. The server runs
+# with --forceflush: through kubectl exec without a tty its stdout is a pipe, which iperf3 otherwise
+# buffers, so "Server listening" would only arrive when it exits. When the measurement fails, the
+# server is stopped in its probe too (stopping kubectl leaves it listening on 5201 for up to 150 s).
 _vr_b4_pair() {
   local sprobe sip logf pid json rc=0 sent recv mbit
   sprobe="$(vr_cap probe_on "$3")" || return 1
   sip="$(vr_cap kc -n nettest get pod "$sprobe" "$_VR_RT" -o 'jsonpath={.status.podIP}')" || return 1
   is_ipv4 "$sip" || { echo "B4: $sprobe has no Pod IP: '$sip'"; return 1; }
   logf="$(mktemp)" || return 1
-  vr_bg "$logf" kc -n nettest exec "$sprobe" -- timeout 150 iperf3 -s -1
+  vr_bg "$logf" kc_within 170 -n nettest exec "$sprobe" -- timeout 150 iperf3 -s -1 --forceflush
   pid="$VR_BG_PID"
   if _vr_wait_text "$logf" "Server listening" "$pid" 60; then
-    json="$(vr_cap --no-echo kc -n nettest exec "$1" -- timeout 120 iperf3 -c "$sip" -n 50M -J)" || rc=$?
+    json="$(vr_cap --no-echo kc_within 140 -n nettest exec "$1" -- timeout 120 iperf3 -c "$sip" -n 50M -J)" \
+      || rc=$?
   else
     echo "B4: the iperf3 server on $3 did not start"
     rc=1
   fi
-  if ((rc == 0)); then wait "$pid" || true; else _vr_stop "$pid"; fi
+  if ((rc == 0)); then
+    wait "$pid" || true
+  else
+    _vr_stop "$pid"
+    vr_cmd kc_within 60 -n nettest exec "$sprobe" -- pkill -x iperf3 || true
+  fi
   _vr_show "$logf" "iperf3 server on $3 ($sprobe)"
   if ((rc != 0)); then
     echo "B4: iperf3 $2 -> $3 failed (exit $rc)"
@@ -727,7 +848,8 @@ check_b4_iperf() {
 
 # B5: what must fail does. ① this machine cannot open tcp 6443 or 10250 on k3s-cp's public IP;
 # ② a Pod on a GCP node cannot reach the metadata server (curl itself must fail: exit 28 timeout or
-# 7 refused; any other code means kubectl or the probe failed, so nothing was proven); ③ DNS works
+# 7 refused; any other code means kubectl or the probe failed, or the exec's bound ran out (124), so
+# nothing was proven); ③ DNS works
 # from every probe; ④ the k3s_guard table (with its counters) on every node.
 check_b5_negative() {
   local cp_ip port n p name ip rc fail=0
@@ -752,7 +874,7 @@ check_b5_negative() {
     read -r name ip <<< "$p"
     if [[ "$n" == "$CP_NAME" || "$n" =~ $CPU_NODE_RE ]]; then
       rc=0
-      vr_cmd kc -n nettest exec "$name" -- curl -m 3 -H 'Metadata-Flavor: Google' \
+      vr_cmd kc_within 60 -n nettest exec "$name" -- curl -m 3 -H 'Metadata-Flavor: Google' \
         http://169.254.169.254/computeMetadata/v1/ || rc=$?
       case "$rc" in
         7 | 28) echo "B5 ②: $n: a Pod cannot reach the metadata server (curl exit $rc, expected)" ;;
@@ -760,7 +882,7 @@ check_b5_negative() {
         *) echo "B5 ②: $n: exit $rc: kubectl or curl failed before a verdict (want curl's 28 or 7)"; fail=1 ;;
       esac
     fi
-    vr_cmd kc -n nettest exec "$name" -- nslookup kubernetes.default.svc.cluster.local \
+    vr_cmd kc_within 60 -n nettest exec "$name" -- nslookup kubernetes.default.svc.cluster.local \
       || { echo "B5 ③: $n: the DNS lookup failed"; fail=1; }
   done
   _vr_ssh_prepare "${VR_NODES[@]}"
@@ -781,14 +903,43 @@ _vr_table() {
             sub(/ +$/, "", line); print line } }'
 }
 
+# _vr_mask_ids: stdin -> stdout with the GCP project id and the operator's IP (OPERATOR_IP) from .env
+# replaced by <GCP_PROJECT> and <operator_ip>: B6's evidence holds both, and a run promoted to
+# verification/final is committed (Ruling R39 keeps real project ids and IPs out of what is
+# delivered). Each is checked first, so the only sed metacharacters in them are an IP's dots; the IP
+# must stand alone (198.51.100.2 is not masked inside 198.51.100.20).
+_vr_mask_ids() {
+  local -a exprs=(-e '')
+  if _gcp_project_ok; then
+    exprs+=(-e "s/${GCP_PROJECT}/<GCP_PROJECT>/g")
+  fi
+  if is_ipv4 "${OPERATOR_IP:-}"; then
+    exprs+=(-e "s/(^|[^0-9.])${OPERATOR_IP//./\\.}(\$|[^0-9])/\\1<operator_ip>\\2/g")
+  fi
+  LC_ALL=C sed -E "${exprs[@]}"
+}
+
 # B6: the GCP firewall rules named fw-* as a table, and gpuctl's Lambda rules. Every source must be
 # one address (/32), except Google's IAP range 35.235.240.0/20. An ingress rule without source
 # ranges admits every address on GCP, so it fails too, as does a tag or service-account source.
+# The evidence shows the project id and the operator's IP masked (_vr_mask_ids).
 check_b6_firewall_inventory() {
-  local json table violations rules count fail=0
+  local outf rc=0
   vr_env
-  json="$(vr_cap --no-echo gcloud compute firewall-rules list --project "$GCP_PROJECT" --filter='name~^fw-' \
-    --format=json)" || return 1
+  outf="$(mktemp)" || return 1
+  _vr_b6 >"$outf" 2>&1 || rc=$?
+  if ! _vr_mask_ids <"$outf"; then
+    echo "B6: cannot mask the project id and the operator IP; the evidence is left out"
+    rc=1
+  fi
+  rm -f -- "$outf"
+  return "$rc"
+}
+
+_vr_b6() {
+  local json table violations rules count fail=0
+  json="$(vr_cap --no-echo bounded 120 gcloud compute firewall-rules list --project "$GCP_PROJECT" \
+    --filter='name~^fw-' --format=json)" || return 1
   table="$(jq -r '
     (["NAME", "NETWORK", "DIRECTION", "SOURCES", "ALLOWED", "TARGET_SA"] | @tsv),
     (.[] | [.name, ((.network // "-") | split("/") | last), (.direction // "INGRESS"),
@@ -809,7 +960,7 @@ check_b6_firewall_inventory() {
        | "VIOLATION \($r.name): source \(.) is not a single address (/32)")' <<< "$json")" \
     || { echo "B6: cannot read gcloud's answer"; return 1; }
 
-  rules="$(vr_cap "$REPO_ROOT/scripts/gpuctl" rules </dev/null)" \
+  rules="$(vr_cap bounded 120 "$REPO_ROOT/scripts/gpuctl" rules </dev/null)" \
     || { echo "B6: scripts/gpuctl rules failed"; fail=1; }
   violations+=$'\n'"$(awk '
     /^[^ ]/ { section = $0; next }
@@ -858,7 +1009,7 @@ check_c2_cross_node_curl() {
   fi
   [[ -n "$probe" ]] || { echo "C2: no probe runs on a node other than a hello replica's"; return 1; }
   echo "C2: hello replicas on: ${hello[*]}; asking from $probe on $pnode"
-  body="$(vr_cap kc -n nettest exec "$probe" -- curl -fsS -m 5 http://hello.hello.svc.cluster.local)" || rc=$?
+  body="$(vr_cap kc_within 60 -n nettest exec "$probe" -- curl -fsS -m 5 http://hello.hello.svc.cluster.local)" || rc=$?
   if ((rc == 0)) && [[ "$body" == "hello world" ]]; then
     echo "C2: answered exactly 'hello world'"
     return 0
@@ -1030,45 +1181,69 @@ _vr_c7() {
 
 # C7: k8s/limits-demo: ① oom is OOMKilled with exit code 137 within 90 s; ② 30 s after cpu-burn is
 # Ready, kubectl top reads at most 110m and its cgroup's nr_throttled grows over 10 s. Both Pods are
-# deleted before (left over from an earlier run) and after, pass or fail.
+# deleted before (left over from an earlier run) and after, pass, fail or interrupt. The work runs in
+# a subshell, so a die in it (the SSH zone lookup) cannot skip the delete.
 check_c7_limits_demo() {
   local rc=0
   vr_env
   vr_cmd kc -n limits-demo delete pod oom cpu-burn --ignore-not-found --timeout=90s \
     || echo "C7: could not delete Pods left from an earlier run (going on)"
-  _vr_c7 || rc=1
+  _vr_on_signal kc -n limits-demo delete pod oom cpu-burn --ignore-not-found --wait=false "$_VR_RT"
+  (_vr_c7) || rc=1
   vr_cmd kc -n limits-demo delete pod oom cpu-burn --ignore-not-found --timeout=90s \
     || { echo "C7: cannot delete the demo Pods"; rc=1; }
+  _vr_on_signal
   return "$rc"
 }
 
 _vr_c8() {
-  local rc=0
+  local rc=0 code
   vr_cmd kc apply -f "$REPO_ROOT/k8s/verify/np-denied.yaml" "$_VR_RT" || return 1
   vr_cmd kc -n np-denied wait pod/client --for=condition=Ready --timeout=120s || return 1
-  vr_cmd kc -n np-denied exec client -- curl -sS -m 5 http://hello.hello.svc.cluster.local || rc=$?
-  if ((rc == 28)); then
-    echo "C8: from np-denied the request timed out (curl exit 28): the NetworkPolicy drops it"
-    return 0
+  # Positive control (Ruling R45): echo.nettest has no NetworkPolicy, so the same client must get
+  # HTTP 200 there; a client without a working network or DNS must not count as "denied".
+  code="$(vr_cap kc_within 60 -n np-denied exec client -- curl -sS -m 5 -o /dev/null -w '%{http_code}' \
+    http://echo.nettest.svc.cluster.local:8080/)" || rc=$?
+  if ((rc != 0)) || [[ "$code" != 200 ]]; then
+    echo "C8: positive control failed: the np-denied client got curl exit $rc, HTTP '${code:-}' from echo.nettest;"
+    echo "C8: want 200, else being unable to reach hello proves nothing about the NetworkPolicy"
+    return 1
   fi
-  echo "C8: curl exit $rc from np-denied; want 28 (a timeout: the NetworkPolicy drops the connection)"
+  echo "C8: positive control: the np-denied client gets HTTP 200 from echo.nettest"
+  rc=0
+  vr_cmd kc_within 60 -n np-denied exec client -- curl -sS -m 5 http://hello.hello.svc.cluster.local || rc=$?
+  case "$rc" in
+    7)
+      echo "C8: from np-denied the connection to hello was refused (curl exit 7): the NetworkPolicy rejects it"
+      return 0
+      ;;
+    28)
+      echo "C8: from np-denied the request to hello timed out (curl exit 28): the NetworkPolicy drops it"
+      return 0
+      ;;
+  esac
+  echo "C8: curl exit $rc from np-denied; want 7 (refused) or 28 (timed out), the NetworkPolicy's verdict (R45)"
   return 1
 }
 
-# C8: the allowed path works (C2, from nettest), then a client in the np-denied namespace times out
-# (curl exit 28). The namespace is deleted before (left over from an earlier run) and after.
+# C8: the allowed path works (C2, from nettest); then a client in the np-denied namespace reaches
+# echo.nettest (HTTP 200: the positive control) but not hello: curl exits 7 (kube-router rejects, as
+# measured live) or 28 (a policy that drops), per Ruling R45. The namespace is deleted before (left
+# over from an earlier run) and after, pass, fail or interrupt; the work runs in a subshell, as C7's.
 check_c8_netpol() {
   local rc=0
   echo "C8: first the allowed path from nettest (C2)"
   if ! check_c2_cross_node_curl; then
-    echo "C8: C2 failed, so a timeout from np-denied would prove nothing"
+    echo "C8: C2 failed, so a failure from np-denied would prove nothing"
     return 1
   fi
   vr_cmd kc delete namespace np-denied --ignore-not-found --timeout=120s \
     || { echo "C8: cannot delete np-denied left from an earlier run"; return 1; }
-  _vr_c8 || rc=1
+  _vr_on_signal kc delete namespace np-denied --ignore-not-found --wait=false "$_VR_RT"
+  (_vr_c8) || rc=1
   vr_cmd kc delete namespace np-denied --ignore-not-found --timeout=120s \
     || { echo "C8: cannot delete the np-denied namespace"; rc=1; }
+  _vr_on_signal
   return "$rc"
 }
 
