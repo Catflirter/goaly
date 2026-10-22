@@ -81,7 +81,9 @@ tf_dir() {
 # committed lock file (.terraform.lock.hcl) is unchanged since: a pulled provider bump is installed
 # by the next run instead of failing every plan with "Inconsistent dependency lock file". A marker,
 # .terraform/k3s-tf-init.ok, records both (the lock file's cksum, which only has to notice a
-# change); it is removed before every init and written only after it succeeds.
+# change); it is removed before every init and written only after it succeeds. gpuctl's
+# Infra.ensure_init (lambda/gpuctl/infra.py) writes and checks the very same text, so neither
+# re-initialises a stack the other set up (tests/scripts/test_ops_scripts.py runs both).
 # .terraform/terraform.tfstate cannot tell: terraform writes it before it installs the providers,
 # so a failed or interrupted init would otherwise be skipped on every later run. A stack
 # initialised for another bucket (GCP_PROJECT changed) is re-initialised with -reconfigure, which

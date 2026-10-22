@@ -33,10 +33,14 @@ TF_READ_TIMEOUT_S = 300.0
 # .terraform it created, so the next ensure_init runs init again instead of trusting a half-initialised stack.
 TF_INIT_TIMEOUT_S = 900.0
 # Written into infra/<stack>/.terraform only after an init against the GCS backend succeeded; it holds
-# "gcs <bucket> <stack>". scripts/lib/common.sh tf_init uses the same file and text, so the shell scripts and gpuctl
-# agree on what an initialised stack is. A bare .terraform proves nothing: `terraform init -backend=false` (an
-# offline validate) or a killed init leaves one without a usable backend.
+# "gcs <bucket> <stack> lock <lock sum>", the lock sum being `cksum < .terraform.lock.hcl` ("<crc> <bytes>") or
+# "no-lock-file" (init_marker_text). scripts/lib/common.sh tf_init writes and checks the same file and text, so
+# the shell scripts and gpuctl agree on what an initialised stack is: neither re-initialises (-reconfigure) a stack
+# the other set up, and both init again once a pulled provider bump changes the lock file (Task 10 X1-2, MK-1).
+# A bare .terraform proves nothing: `terraform init -backend=false` (an offline validate) or a killed init leaves
+# one without a usable backend.
 TF_INIT_MARKER = "k3s-tf-init.ok"
+TF_LOCK_FILE = ".terraform.lock.hcl"
 _ZONE_RE = re.compile(r"[a-z0-9]+(?:-[a-z0-9]+)*")
 _NODE_NAME_RE = re.compile(r"[a-z0-9]+(?:-[a-z0-9]+)*")
 # A GPU type label as gpu_type_label() returns it (a6000, a100_80gb_sxm4); also a valid K8s label value (<= 63).
@@ -122,6 +126,45 @@ def check_join_args(name: object, ip: object, gpu_type: object) -> str:
     return gpu_ip(ip)
 
 
+def _cksum_table() -> tuple[int, ...]:
+    table = []
+    for byte in range(256):
+        crc = byte << 24
+        for _ in range(8):
+            crc = (crc << 1) ^ 0x04C11DB7 if crc & 0x80000000 else crc << 1
+        table.append(crc & 0xFFFFFFFF)
+    return tuple(table)
+
+
+_CKSUM_TABLE = _cksum_table()
+
+
+def posix_cksum(data: bytes) -> str:
+    """What `cksum < FILE` prints for FILE's bytes, without the newline: "<crc> <bytes>".
+
+    POSIX cksum: CRC-32 with polynomial 0x04C11DB7, MSB first, initial value 0, over the data followed by its
+    length (least significant byte first, only as many bytes as the length needs), then complemented.
+    GNU, BSD/macOS and uutils cksum agree on it, so gpuctl and scripts/lib/common.sh tf_init compute the same text.
+    """
+    crc = 0
+    table = _CKSUM_TABLE
+    for byte in data:
+        crc = ((crc << 8) & 0xFFFFFFFF) ^ table[(crc >> 24) ^ byte]
+    length = len(data)
+    while length:
+        crc = ((crc << 8) & 0xFFFFFFFF) ^ table[(crc >> 24) ^ (length & 0xFF)]
+        length >>= 8
+    return f"{~crc & 0xFFFFFFFF} {len(data)}"
+
+
+def init_marker_text(bucket: str, stack: str, stack_dir: Path) -> str:
+    """The TF_INIT_MARKER text for `stack` initialised against `bucket` with its current lock file, exactly as
+    scripts/lib/common.sh tf_init builds it: "gcs <bucket> <stack> lock <cksum of the lock file | no-lock-file>"."""
+    lock_file = stack_dir / TF_LOCK_FILE
+    lock_sum = posix_cksum(lock_file.read_bytes()) if lock_file.is_file() else "no-lock-file"
+    return f"gcs {bucket} {stack} lock {lock_sum}"
+
+
 class Infra:
     """Terraform, IAP SSH to k3s-cp, kubectl and join-node for one repo checkout.
 
@@ -168,10 +211,12 @@ class Infra:
     def ensure_init(self, stack: str) -> None:
         """terraform init the stack against its GCS state prefix, unless its last init did exactly that.
 
-        Initialised means .terraform/k3s-tf-init.ok (TF_INIT_MARKER) reads "gcs <GCP_PROJECT>-k3s-tfstate <stack>",
-        the marker scripts/lib/common.sh tf_init writes too. A .terraform without it (an offline
-        `terraform init -backend=false`, an interrupted init, a marker for another project's bucket) is initialised
-        again with -reconfigure, which switches the backend without copying any old state into it.
+        Initialised means .terraform/k3s-tf-init.ok (TF_INIT_MARKER) reads
+        "gcs <GCP_PROJECT>-k3s-tfstate <stack> lock <cksum of .terraform.lock.hcl | no-lock-file>"
+        (init_marker_text), the marker scripts/lib/common.sh tf_init writes and checks too. A .terraform without it
+        (an offline `terraform init -backend=false`, an interrupted init, a marker for another project's bucket, a
+        lock file changed by a pulled provider bump) is initialised again with -reconfigure, which switches the
+        backend without copying any old state into it.
         A stack that is not in this checkout raises MissingStackError (a CommandError). If init fails or is
         interrupted (a timeout included), .terraform is removed, so nothing half-initialised is left behind.
         -lockfile=readonly (Ruling R26(b)): providers are verified against the committed .terraform.lock.hcl, which
@@ -187,7 +232,8 @@ class Infra:
         bucket = f"{project}-k3s-tfstate"
         dot_terraform = stack_dir / ".terraform"
         marker = dot_terraform / TF_INIT_MARKER
-        want = f"gcs {bucket} {stack}"
+        # Read before init, as tf_init does; -lockfile=readonly means init cannot change the lock file anyway.
+        want = init_marker_text(bucket, stack, stack_dir)
         try:
             if marker.read_text().rstrip("\n") == want:
                 return
