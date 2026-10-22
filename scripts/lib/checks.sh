@@ -261,10 +261,22 @@ _vr_quote() {
     if [[ "$arg" =~ ^[A-Za-z0-9_./:=@%+,-]+$ ]]; then
       line+=" $arg"
     else
-      line+=" '${arg//\'/\'\\\'\'}'"
+      line+=" $(_vr_sq "$arg")"
     fi
   done
   printf '%s\n' "$line"
+}
+
+# _vr_sq STRING: STRING in single quotes, each ' in it written as '\''. Not ${s//\'/…} inside double
+# quotes: bash <= 4.2 (macOS's /bin/bash 3.2) does no quote removal on that replacement, which would
+# keep its backslashes and print a command that cannot be pasted.
+_vr_sq() {
+  local s="$1" q="'" out=""
+  while [[ "$s" == *"$q"* ]]; do
+    out+=${s%%"$q"*}$q\\$q$q
+    s=${s#*"$q"}
+  done
+  printf '%s\n' "$q$out$s$q"
 }
 
 # vr_cmd CMD…: record the command (redacted) in the check's output, then run it.
@@ -314,9 +326,17 @@ _VR_RT="--request-timeout=$KC_REQUEST_TIMEOUT"
 
 # bounded SECONDS CMD…: run the program CMD for at most SECONDS; exit 124 when it had to be stopped.
 # --foreground keeps CMD in the terminal's process group, so Ctrl-C still reaches it. `command` skips
-# a shell function named timeout (the offline tests replace it for check B5).
+# a shell function named timeout (the offline tests replace it for check B5). In an interrupt cleanup
+# (_VR_CLEANING=1, set by _vr_signalled) CMD must ignore a further Ctrl-C as the cleanup's other
+# commands do, but timeout sets its own SIGINT handler, so CMD would not inherit the ignore, and
+# passes SIGINT on to CMD or ends it (GNU and uutils differ): there the shell bounds CMD instead
+# (_vr_within), and CMD inherits the ignore. A SIGTERM and the bound still stop CMD.
 bounded() {
-  command timeout --foreground "$@"
+  if [[ "${_VR_CLEANING:-}" == 1 ]]; then
+    _vr_within "$@"
+  else
+    command timeout --foreground "$@"
+  fi
 }
 
 # kc_within SECONDS ARGS…: kc with an outer time bound, for kubectl exec, so a stalled API tunnel
@@ -382,16 +402,18 @@ _vr_tell() {
 # _vr_signalled SIGNAL: the trap set by _vr_on_signal. SIGPIPE is ignored and errexit is off while it
 # cleans up (a closed pipe must not end kubectl or gcloud before they have done their work). The
 # cleanup's progress, its output and its outcome go to the operator and the evidence (_vr_tell).
-# A further Ctrl-C is ignored until then, by this shell and (inherited) by the cleanup's commands, so
-# it can neither cut the cleanup short nor hide its outcome. A further SIGTERM stops the cleanup's
-# commands (they keep its default action: TERM is also how the 120 s bound stops them) but not this
-# shell, which still reports the outcome; the first signal then ends the check.
+# A further Ctrl-C is ignored until then, by this shell and (inherited) by the cleanup's commands, the
+# ones under bounded or kc_within too (_VR_CLEANING: see bounded), so it can neither cut the cleanup
+# short nor hide its outcome. A further SIGTERM stops the cleanup's commands (they keep its default
+# action: TERM is also how the 120 s bound stops them) but not this shell, which still reports the
+# outcome; the first signal then ends the check.
 _vr_signalled() {
   local line rc how
   trap '' INT
   trap ':' TERM
   set +e
   trap '' PIPE
+  _VR_CLEANING=1
   _vr_reap
   line="$(_vr_quote "${_VR_ON_SIGNAL[@]}")"
   line="${line#\$ }"
@@ -407,7 +429,7 @@ _vr_signalled() {
     # .env's values and the harness's functions do not stay behind in the operator's shell.
     line="source scripts/lib/checks.sh && vr_env && $line"
     _vr_tell "cleanup FAILED ($how); may remain: $_VR_ON_SIGNAL_LEFT" \
-      "to remove it, run from the repository root: bash -c '${line//\'/\'\\\'\'}'"
+      "to remove it, run from the repository root: bash -c $(_vr_sq "$line")"
   fi
   trap - INT TERM PIPE
   kill -s "$1" "${BASHPID:-$$}"
@@ -914,9 +936,10 @@ check_b3_wg() {
 
 # Stops the iperf3 servers in a probe (run with sh -c). pkill exits 1 when no process matched: no server
 # is left, the outcome wanted (an interrupt before the server started or after it ended is no failed
-# cleanup); pkill's own errors (2, 3) and a failed kubectl exec still fail.
+# cleanup); pkill's own errors (2: syntax, 3: fatal) still fail with their own code, so they do not
+# read as that harmless 1, and so does a failed kubectl exec.
 # shellcheck disable=SC2016 # expanded by the probe's sh, not here
-_VR_B4_STOP='pkill -x iperf3 || [ $? -eq 1 ]'
+_VR_B4_STOP='pkill -x iperf3; rc=$?; [ $rc -le 1 ] || exit $rc'
 
 # _vr_b4_pair CLIENT_PROBE CLIENT_NODE SERVER_NODE: iperf3 from CLIENT_PROBE to the probe on
 # SERVER_NODE (-n 50M: a bounded transfer, spec §9 B4), and record bits_per_second. The server runs

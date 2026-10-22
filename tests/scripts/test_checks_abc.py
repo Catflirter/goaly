@@ -220,15 +220,17 @@ class Cluster(Env):
         result = re.search(r"^\| 1 \| T \| title \| (\w+) \|$", (run / "SUMMARY.md").read_text(), re.M).group(1)
         return result, (run / "01-T.txt").read_text()
 
-    def interrupt(self, func, when, sig, again=None):
+    def interrupt(self, func, when, sig, again=None, **extra):
         """Run FUNC through run_check (as verify.sh does), send SIG to the whole process group (Ctrl-C
         reaches every process in the terminal's group) once a fake call holding WHEN was made; the
         exit status of the run. self.interrupted is then (the run's stderr, the check's evidence).
-        AGAIN: send SIG a second time once a fake call holding AGAIN (the cleanup's) was made."""
+        AGAIN: send SIG a second time once a further fake call holding AGAIN (the cleanup's) was made.
+        EXTRA: more environment for the run."""
         run = self.repo / "verification" / "s"
         code = f"set -euo pipefail; source scripts/lib/checks.sh; vr_init {run}; run_check T title {func}"
         proc = subprocess.Popen(["bash", "-c", code], cwd=self.repo, start_new_session=True,
-                                env=self.environ({"VR_NO_WAIT": "1", "BASH_FUNC_timeout%%": NOT_REACHABLE}),
+                                env=self.environ({"VR_NO_WAIT": "1", "BASH_FUNC_timeout%%": NOT_REACHABLE,
+                                                  **extra}),
                                 stdin=subprocess.DEVNULL, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
         deadline = time.monotonic() + 30
         while when not in (self.log.read_text() if self.log.exists() else ""):
@@ -236,9 +238,10 @@ class Cluster(Env):
             assert time.monotonic() < deadline, "the check never got there"
             time.sleep(0.05)
         time.sleep(0.3)                                    # the call is running: the check waits on it
+        before = self.log.read_text().count(again) if again is not None else 0
         os.killpg(proc.pid, sig)
         if again is not None:
-            while again not in self.log.read_text():
+            while self.log.read_text().count(again) <= before:
                 assert time.monotonic() < deadline, "the cleanup never got there"
                 time.sleep(0.05)
             time.sleep(0.3)                                # the cleanup's call is running
@@ -289,6 +292,19 @@ def test_vr_cap_records_the_command_and_output_and_returns_only_the_output(env):
                     "echo \"got=$x\"; vr_cap echo shown >/dev/null; vr_cap --no-echo echo hidden >/dev/null"])
     assert proc.stdout.splitlines() == ["got=hi"]
     assert proc.stderr.splitlines() == ["$ echo shown", "shown", "$ echo hidden"]
+
+
+@pytest.mark.parametrize("compat", [None, "42"])
+def test_a_recorded_command_with_single_quotes_runs_as_shown_in_any_bash(env, compat):
+    # F4-3: bash <= 4.2 (BASH_COMPAT=42, like macOS's /bin/bash 3.2) does no quote removal on the replacement
+    # of ${x//\'/...} inside double quotes
+    arg = "it's a 'quoted' word"
+    extra = {"BASH_COMPAT": compat} if compat else {}
+    proc = env.run(["bash", "-c", 'source scripts/lib/checks.sh; vr_cap printf "%s\\n" "$1" 2>&1 >/dev/null',
+                    "sh", arg], **extra)
+    shown = proc.stdout.splitlines()[0]
+    assert shown == "$ printf '%s\\n' 'it'\\''s a '\\''quoted'\\'' word'"
+    assert env.run(["bash", "-c", shown[2:]]).stdout == arg + "\n"
 
 
 def test_vr_cap_returns_the_status_and_redacts_the_command(env):
@@ -644,8 +660,9 @@ def test_b3_fails_on_a_missing_peer_or_handshake(env):
 
 # ---- B4 iperf3 ----------------------------------------------------------------------------------
 
-# Stops the iperf3 server in a probe; pkill's 1 (no process matched: nothing left) counts as done.
-B4_STOP = "pkill -x iperf3 || [ $? -eq 1 ]"
+# Stops the iperf3 server in a probe; pkill's 1 (no process matched: nothing left) counts as done, and its
+# own errors (2, 3) keep their code.
+B4_STOP = "pkill -x iperf3; rc=$?; [ $rc -le 1 ] || exit $rc"
 PKILL_CP = ["-n", "nettest", "exec", NODES[CP]["probe"], "--", "sh", "-c", B4_STOP]
 
 
@@ -682,7 +699,7 @@ def test_b4_goes_on_when_no_server_was_left_over(env):
     assert result == "PASS", text
 
 
-@pytest.mark.parametrize("pkill_rc, rc", [(0, 0), (1, 0), (2, 1), (3, 1)])
+@pytest.mark.parametrize("pkill_rc, rc", [(0, 0), (1, 0), (2, 2), (3, 3)])
 def test_b4_server_stop_counts_no_iperf3_left_as_done_but_not_pkills_own_errors(tmp_path, pkill_rc, rc):
     (tmp_path / "pkill").write_text(f"#!/bin/sh\nexit {pkill_rc}\n")
     (tmp_path / "pkill").chmod(0o755)
@@ -707,7 +724,8 @@ def test_b4_interrupt_cleanup_still_reports_a_failed_pkill(env):
     env.first(kc("exec", B4_STOP, run_with={"pkill": 3}), kc("exec", "iperf3 -c", sleep=30))
     assert env.interrupt("check_b4_iperf", "50M", signal.SIGINT) == -signal.SIGINT
     err, _ = env.interrupted
-    assert "cleanup FAILED (exit 1); may remain: an iperf3 server on port 5201" in err
+    # F4-1: pkill's own code (3: fatal), not 1, which would read as its harmless "no process matched"
+    assert "cleanup FAILED (exit 3); may remain: an iperf3 server on port 5201" in err
 
 
 @pytest.mark.parametrize("sig", [signal.SIGINT, signal.SIGTERM])
@@ -1173,12 +1191,16 @@ def removal_command(err):
     return line.split("to remove it, run from the repository root: ", 1)[1]
 
 
-def test_the_removal_command_runs_the_cleanup_in_a_child_shell(env):
+@pytest.mark.parametrize("compat", [None, "42"])
+def test_the_removal_command_runs_the_cleanup_in_a_child_shell(env, compat):
     # F3-3: pasted into the operator's interactive bash, a die (exit) must end only a child shell, and .env's
-    # variables and the harness's functions must not stay in the operator's shell
+    # variables and the harness's functions must not stay in the operator's shell.
+    # F4-3: B2's cleanup holds single quotes and is quoted twice; bash <= 4.2 (BASH_COMPAT=42, like macOS's
+    # /bin/bash 3.2) must print the same runnable command
     env.first(on(CP, "tcpdump -ni ens4", rc=124, stderr=LISTENING, sleep=30),
               on(CP, "sudo rm -f /tmp/b2.pcap", rc=255, stderr="ERROR: (gcloud.compute.ssh) IAP tunnel failed\n"))
-    assert env.interrupt("check_b2_wire", "X-Marker", signal.SIGINT) == -signal.SIGINT
+    extra = {"BASH_COMPAT": compat} if compat else {}
+    assert env.interrupt("check_b2_wire", "X-Marker", signal.SIGINT, **extra) == -signal.SIGINT
     err, text = env.interrupted
     cmd = removal_command(err)
     assert cmd.startswith("bash -c 'source scripts/lib/checks.sh && vr_env && cp_ssh ")
@@ -1215,6 +1237,24 @@ def test_a_second_ctrl_c_does_not_stop_the_cleanup_or_hide_its_outcome(env):
     for out in (err, text):
         assert "cleanup done" in out and "may remain" not in out
     assert "T: cleanup done" in err
+
+
+def test_a_second_ctrl_c_does_not_stop_a_bounded_cleanup_either(env):
+    # F4-2: B4's cleanup runs under kc_within, whose timeout --foreground would pass a further Ctrl-C on to kubectl
+    env.first(kc("exec", B4_STOP, seq=[{}, {"sleep": 2}]), kc("exec", "iperf3 -c", sleep=30))
+    assert env.interrupt("check_b4_iperf", "50M", signal.SIGINT, again=B4_STOP) == -signal.SIGINT
+    assert env.kubectl()[-1] == PKILL_CP
+    err, text = env.interrupted
+    for out in (err, text):
+        assert "cleanup done" in out and "FAILED" not in out and "may remain" not in out
+
+
+def test_a_sigterm_still_stops_a_bounded_cleanup_and_reports_it(env):
+    env.first(kc("exec", B4_STOP, seq=[{}, {"sleep": 30}]), kc("exec", "iperf3 -c", sleep=30))
+    assert env.interrupt("check_b4_iperf", "50M", signal.SIGTERM, again=B4_STOP) == -signal.SIGTERM
+    err, text = env.interrupted
+    for out in (err, text):
+        assert "cleanup FAILED (exit 143); may remain: an iperf3 server on port 5201" in out
 
 
 def test_a_sigterm_during_the_cleanup_still_reports_its_outcome(env):
