@@ -8,8 +8,12 @@
 #   tunnel.sh stop     stop it (its whole process group: gcloud, ssh, the IAP helper); idempotent
 #   tunnel.sh status   0 if it runs and the API answers /readyz, 1 otherwise
 #
-# start and stop hold a lock (.run/tunnel.lock), so `make tunnel` during `make up`'s tunnel step
-# waits for it instead of launching a second tunnel that would orphan the first.
+# start and stop hold a lock, flock(1) on .run/tunnel.lock (C-2), so `make tunnel` during `make up`'s
+# tunnel step waits for it instead of launching a second tunnel that would orphan the first. The
+# kernel releases the lock when the run exits, however it ends: a killed run leaves no stale lock, and
+# a PID in the file (reused after a reboot, say) means nothing. A live holder is waited for, at most
+# TUNNEL_TIMEOUT_S + 30 s, then the run gives up. The tunnel itself never holds it. Without flock(1)
+# (util-linux), or with a bash older than 4.1, start and stop are refused (exit 2).
 #
 # The forward is spec §8's -L 6443:127.0.0.1:6443. It names no bind address, so ssh listens on the
 # loopback addresses only unless GatewayPorts is on. start passes -o GatewayPorts=no, and ssh takes
@@ -28,67 +32,33 @@ LOCAL_PORT="${K3S_TUNNEL_TEST_PORT:-6443}"
 FORWARD="$LOCAL_PORT:127.0.0.1:6443"
 TIMEOUT="${TUNNEL_TIMEOUT_S:-30}"
 LOCKFILE="$RUN_DIR/tunnel.lock"
-BREAKFILE="$LOCKFILE.break"
 
 usage() {
   log "usage: ${0##*/} start|stop|status"
   exit 2
 }
 
-# lock: take $LOCKFILE (it holds this run's PID), released on exit. Created with bash's noclobber,
-# which opens with O_EXCL inside the shell: atomic everywhere, unlike flock (absent on macOS) or
-# mkdir (uutils coreutils' mkdir, Ubuntu's default from 25.10, is not atomic under contention). A
-# lock whose PID is gone (a killed run) is taken over (break_stale_lock); a live holder is waited
-# for, at most as long as a start can take, then this run gives up.
+# lock: hold flock(1) on $LOCKFILE until this run exits (the descriptor stays open; the background
+# tunnel does not inherit it: close_fds_above_2). A live holder is waited for, at most as long as a
+# start can take, then this run gives up. The holder writes its PID into the file, for the waiting
+# message only. The file is never removed (removing it would let a waiting run lock an unlinked file).
 lock() {
-  local deadline holder said=""
+  local fd holder
   [[ "$TIMEOUT" =~ ^[0-9]+$ ]] || die "bad TUNNEL_TIMEOUT_S '$TIMEOUT'"
-  deadline=$((SECONDS + TIMEOUT + 30))
+  _bash_version_ok \
+    || die "tunnel.sh needs bash >= 4.1 (this is bash ${BASH_VERSION}); run it with a newer bash (macOS: brew install bash): nothing was changed" 2
+  command -v flock > /dev/null 2>&1 \
+    || die "tunnel.sh needs flock(1) (util-linux) on PATH to keep start and stop apart ($FLOCK_INSTALL): nothing was changed" 2
   run_dir || die "cannot create $RUN_DIR"
-  trap unlock EXIT
-  until (set -o noclobber; printf '%s\n' "$$" > "$LOCKFILE") 2> /dev/null; do
-    holder="$(cat -- "$LOCKFILE" 2> /dev/null || true)"
-    if [[ "$holder" =~ ^[1-9][0-9]*$ ]] && ! kill -0 "$holder" 2> /dev/null \
-      && break_stale_lock "$holder"; then
-      continue
-    fi
-    if [[ -z "$said" ]]; then
-      log "waiting for another tunnel.sh (pid ${holder:-unknown}) to finish"
-      said=1
-    fi
-    (( SECONDS < deadline )) \
-      || die "another tunnel.sh still holds $LOCKFILE (pid ${holder:-unknown}); if none is running, remove it and $BREAKFILE"
-    sleep 0.2
-  done
-}
-
-# break_stale_lock DEAD_PID: remove $LOCKFILE if it still holds DEAD_PID; 0 if this run removed it.
-# Serialised by a second noclobber lock, $BREAKFILE. Without it, two waiters that read the same dead
-# holder could both remove "the stale lock": the later rm deletes the lock the other has just
-# taken, and both run start or stop at once (C1-1). Under $BREAKFILE the lock is read again; a dead
-# PID never takes a new lock, so a file that still holds it is the stale one. A run that cannot
-# take $BREAKFILE (another run is breaking the lock) waits and retries like any other waiter.
-break_stale_lock() {
-  local dead="$1" removed=1
-  (set -o noclobber; printf '%s\n' "$$" > "$BREAKFILE") 2> /dev/null || return 1
-  if [[ "$(cat -- "$LOCKFILE" 2> /dev/null || true)" == "$dead" ]]; then
-    log "removing a stale tunnel lock (pid $dead is gone)"
-    rm -f -- "$LOCKFILE"
-    removed=0
+  exec {fd}>> "$LOCKFILE" || die "cannot open $LOCKFILE"
+  if ! flock -n "$fd"; then
+    holder="$(head -n 1 -- "$LOCKFILE" 2> /dev/null || true)"
+    [[ "$holder" =~ ^[1-9][0-9]*$ ]] || holder=unknown
+    log "waiting for another tunnel.sh (pid $holder) to finish"
+    flock -w "$((TIMEOUT + 30))" "$fd" \
+      || die "another tunnel.sh (pid $holder) still holds $LOCKFILE after $((TIMEOUT + 30))s; it is released when that run exits"
   fi
-  rm -f -- "$BREAKFILE"
-  return "$removed"
-}
-
-# unlock (EXIT trap): remove $LOCKFILE and $BREAKFILE, each only while it holds this run's PID, so a
-# run never deletes a lock that another run holds.
-unlock() {
-  local f
-  for f in "$LOCKFILE" "$BREAKFILE"; do
-    if [[ "$(cat -- "$f" 2> /dev/null || true)" == "$$" ]]; then
-      rm -f -- "$f"
-    fi
-  done
+  printf '%s\n' "$$" > "$LOCKFILE" || true
 }
 
 # tunnel_pid: print the PID in $PIDFILE if that process is alive and is this tunnel (its command
@@ -102,6 +72,18 @@ tunnel_pid() {
   kill -0 "$pid" 2> /dev/null || return 1
   [[ " $(ps -ww -p "$pid" -o command= 2> /dev/null) " == *" -L $FORWARD "* ]] || return 1
   printf '%s\n' "$pid"
+}
+
+# close_fds_above_2: close every descriptor of this shell above 2 (the ones /dev/fd lists). Run in the
+# background job right before it execs the tunnel.
+close_fds_above_2() {
+  local f n
+  for f in /dev/fd/*; do
+    n="${f##*/}"
+    if [[ "$n" =~ ^[0-9]+$ ]] && (( n > 2 )); then
+      eval "exec $n>&-"
+    fi
+  done
 }
 
 api_ready() {
@@ -174,11 +156,16 @@ start() {
   run_dir || die "cannot create $RUN_DIR"
   umask 077
   # Job control puts the background job in its own process group, so stop can end gcloud, the ssh
-  # it runs and ssh's IAP ProxyCommand together; nohup keeps it alive when the terminal closes.
+  # it runs and ssh's IAP ProxyCommand together; nohup keeps it alive when the terminal closes. The
+  # job execs gcloud (its PID stays $!) with every descriptor above 2 closed: the tunnel runs for days
+  # and must not keep a lock its starter holds (a stack's lock when make up starts it, stack_lock).
   set -m
-  nohup gcloud compute ssh "$CP_NAME" --project "$GCP_PROJECT" --zone "$CP_ZONE" --tunnel-through-iap --quiet \
-    -- -N -L "$FORWARD" -o ExitOnForwardFailure=yes -o ServerAliveInterval=30 -o GatewayPorts=no \
-    < /dev/null > "$LOGFILE" 2>&1 &
+  {
+    close_fds_above_2
+    exec nohup gcloud compute ssh "$CP_NAME" --project "$GCP_PROJECT" --zone "$CP_ZONE" --tunnel-through-iap \
+      --quiet -- -N -L "$FORWARD" -o ExitOnForwardFailure=yes -o ServerAliveInterval=30 -o GatewayPorts=no \
+      < /dev/null > "$LOGFILE" 2>&1
+  } &
   pid=$!
   set +m
   printf '%s\n' "$pid" > "$PIDFILE"
