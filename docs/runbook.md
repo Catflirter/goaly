@@ -274,7 +274,8 @@ output goes through the same redaction filter as `make verify`.
 ## Measured timings
 
 From live runs on 2026-10-21 and 2026-10-22. "Final run" numbers come from the Task 24 final
-from-scratch run, 2026-10-22 (make output); "rehearsal" is the rebuild rehearsal earlier the same
+from-scratch build, 2026-10-22 (make output; its `make gpu-apply` ran at about 10:25 PDT, before the
+verify runs, when Lambda still launched instances); "rehearsal" is the rebuild rehearsal earlier the same
 day. Each chapter's measured time is in the `timings.txt` of a demo run.
 
 **Bootstrap and bring-up**
