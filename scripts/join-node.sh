@@ -10,7 +10,8 @@
 #      into k3s-cp's k3s_peers set (and the Lambda rules), unless --skip-sync: the caller already
 #      did (scripts/gpuctl apply, or `make up`/cpu-pool.sh, which sync once for all their nodes).
 #   2. NAME already Ready: done (exit 0), unless --force.
-#   3. node/ into a fresh private /tmp/k3s-node on the node, then node-bootstrap.sh as root.
+#   3. Wait (at most 300s) for SSH to the node: a VM or Lambda instance made seconds earlier has no
+#      sshd yet. Then node/ into a fresh private /tmp/k3s-node on it, and node-bootstrap.sh as root.
 #   4. k3s-agent is stopped (a no-op on a first join), so that it starts from the new token: an agent
 #      left running by an earlier join holds that join's token, which is deleted. A join token (TTL
 #      15m) is created on k3s-cp and piped straight into the node's token-file; then k3s-agent
@@ -76,6 +77,7 @@ unset LAMBDA_API_KEY
 MTU="${UNDERLAY_MTU:-1460}"
 [[ "$MTU" =~ ^[1-9][0-9]{2,3}$ ]] || die "UNDERLAY_MTU in .env must be an MTU in bytes (100-9999): '$MTU'" 2
 READY_TIMEOUT="${JOIN_READY_TIMEOUT_S:-300}"
+SSH_TIMEOUT="${JOIN_SSH_TIMEOUT_S:-300}"
 
 # ---- 1. the IP is in the firewall; sync-peers ----------------------------------------------------
 if [[ "$KIND" == cpu ]]; then
@@ -110,13 +112,19 @@ cp_resolve
 [[ "$KIND" == gpu ]] || _worker_zone "$NODE"
 
 log "==> joining $NODE ($IP) to the cluster at $cp_ip"
-# A fresh private staging directory (NODE_STAGING_CMD, as up.sh base does on k3s-cp). Exit 255 is
-# ssh's own failure, not the remote check: it gets its own message.
 if [[ "$KIND" == gpu ]]; then
   SSH_HINT="if this is a new instance under an old name, check its host key and remove $RUN_DIR/known_hosts_$NODE"
+  # A missing SSH key is a configuration error (exit 2), not something the wait below should retry.
+  _gpu_ssh_opts "$NODE"
 else
   SSH_HINT="a worker stopped with make cpu-stop needs make cpu-start first"
 fi
+# A VM the workers apply made, or a Lambda instance that just turned active, can take a minute to
+# accept SSH (exit 255 until then): wait for it, as up.sh base waits for k3s-cp (L3-1).
+wait_for "node_ssh $NODE true < /dev/null" "$SSH_TIMEOUT" \
+  || die "SSH to $NODE not available after ${SSH_TIMEOUT}s ($SSH_HINT)"
+# A fresh private staging directory (NODE_STAGING_CMD, as up.sh base does on k3s-cp). Exit 255 is
+# ssh's own failure, not the remote check: it gets its own message.
 node_ssh "$NODE" "$NODE_STAGING_CMD" < /dev/null || {
   rc=$?
   [[ $rc == 255 ]] && die "SSH to $NODE failed while preparing $STAGING (exit 255); re-run the join ($SSH_HINT)"

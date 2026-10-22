@@ -7,6 +7,7 @@ scripts/gpuctl are tests/scripts/fake_tools.py, which records every call. Nothin
 import json
 import os
 import subprocess
+import time
 from pathlib import Path
 
 import pytest
@@ -92,6 +93,7 @@ def cpu_join(env, name="k3s-cpu-1", ip="34.10.0.11", zone="us-central1-a", mtu="
     return [
         *([("gpuctl", ["sync-peers"])] if sync else []),
         get_node(env, name),
+        worker(name, "true", zone),  # SSH is up (a VM made seconds ago may not have sshd yet: L3-1)
         worker(name, STAGING, zone),
         ("gcloud", ["compute", "scp", "--project", PROJECT, "--zone", zone, "--tunnel-through-iap", "--quiet",
                     "--recurse", "--scp-flag=-oConnectTimeout=20", *node_files(env), f"{name}:/tmp/k3s-node"]),
@@ -108,6 +110,7 @@ def cpu_join(env, name="k3s-cpu-1", ip="34.10.0.11", zone="us-central1-a", mtu="
 def gpu_join(env):
     return [
         get_node(env, GPU),
+        gpu(env, "true"),
         gpu(env, STAGING),
         ("scp", ["-r", *gpu_opts(env), *node_files(env), f"ubuntu@{GPU_IP}:/tmp/k3s-node"]),
         gpu(env, f"sudo bash /tmp/k3s-node/node-bootstrap.sh --server-ip 34.82.10.10 --node-name {GPU}"
@@ -242,6 +245,64 @@ def test_join_gpu_node_ssh_failure_names_the_stale_host_key_file(env):
     assert f"known_hosts_{GPU}" in proc.stderr
 
 
+def test_join_waits_for_ssh_on_a_vm_created_seconds_ago(env):
+    """L3-1: a VM made by the apply just before the join has no sshd yet (exit 255). The join waits for
+    SSH (JOIN_SSH_TIMEOUT_S, default 300s, as up.sh base waits for k3s-cp) and then stages exactly once."""
+    env.scenario["ssh_failures"] = 3
+    proc = join(env, "--node", "k3s-cpu-1", "--external-ip", "34.10.0.11", "--skip-sync")
+    assert proc.returncode == 0, proc.stderr
+    probe = worker("k3s-cpu-1", "true")
+    expected = cpu_join(env, sync=False)
+    assert calls(env) == [*expected[:1], probe, probe, probe, *expected[1:]]
+    assert calls(env).count(worker("k3s-cpu-1", STAGING)) == 1
+    assert "waiting up to 300s for: node_ssh k3s-cpu-1 true" in proc.stderr
+    assert_token_only_piped(env, proc, ["k3s-cpu-1"])
+
+
+def test_join_gpu_node_waits_for_ssh_after_the_instance_turns_active(env):
+    env.scenario["ssh_failures"] = 2
+    proc = gpuctl_join(env)
+    assert proc.returncode == 0, proc.stderr
+    probe = gpu(env, "true")
+    expected = gpu_join(env)
+    assert calls(env) == [*expected[:1], probe, probe, *expected[1:]]
+    assert calls(env).count(gpu(env, STAGING)) == 1
+
+
+def test_join_gives_up_when_ssh_never_comes_up(env):
+    """The SSH wait is bounded: after JOIN_SSH_TIMEOUT_S the join dies naming the node, before any staging,
+    bootstrap or token."""
+    env.scenario["ssh_failures"] = 10**6
+    start = time.time()
+    proc = join(env, "--node", "k3s-cpu-1", "--external-ip", "34.10.0.11", "--skip-sync",
+                JOIN_SSH_TIMEOUT_S="1", WAIT_INTERVAL_S="1")
+    assert time.time() - start < 15
+    assert proc.returncode == 1
+    assert "SSH to k3s-cpu-1 not available after 1s" in proc.stderr
+    assert "make cpu-start" in proc.stderr, "a stopped worker has no SSH"
+    seq = calls(env)
+    assert seq[0] == get_node(env, "k3s-cpu-1")
+    assert len(seq) >= 2 and all(c == worker("k3s-cpu-1", "true") for c in seq[1:]), "only SSH probes, retried"
+    assert piped(env) == []
+
+
+def test_join_gpu_node_gives_up_when_ssh_never_comes_up(env):
+    env.scenario["ssh_failures"] = 10**6
+    proc = gpuctl_join(env, JOIN_SSH_TIMEOUT_S="0")
+    assert proc.returncode == 1
+    assert f"SSH to {GPU} not available after 0s" in proc.stderr and f"known_hosts_{GPU}" in proc.stderr
+    assert calls(env) == [get_node(env, GPU), gpu(env, "true")]
+
+
+def test_join_of_a_ready_node_needs_no_ssh(env):
+    """The SSH wait comes after the Ready check: a Ready node is left alone even while SSH is down."""
+    env.scenario["ready"] = ["k3s-cpu-1"]
+    env.scenario["ssh_failures"] = 10**6
+    proc = join(env, "--node", "k3s-cpu-1", "--external-ip", "34.10.0.11", JOIN_SSH_TIMEOUT_S="0")
+    assert proc.returncode == 0, proc.stderr
+    assert calls(env) == [("gpuctl", ["sync-peers"]), get_node(env, "k3s-cpu-1")]
+
+
 def test_join_stops_when_the_staging_directory_cannot_be_made_private(env):
     env.scenario["ssh_fail"] = [STAGING]
     proc = join(env, "--node", "k3s-cpu-1", "--external-ip", "34.10.0.11", "--skip-sync")
@@ -251,11 +312,11 @@ def test_join_stops_when_the_staging_directory_cannot_be_made_private(env):
 
 
 def test_join_stops_when_the_bootstrap_fails_before_any_token(env):
-    bootstrap = cpu_join(env)[4][1][-1]
+    bootstrap = cpu_join(env)[5][1][-1]
     env.scenario["ssh_fail"] = [bootstrap]
     proc = join(env, "--node", "k3s-cpu-1", "--external-ip", "34.10.0.11")
     assert proc.returncode != 0
-    assert calls(env) == cpu_join(env)[:5] and piped(env) == []
+    assert calls(env) == cpu_join(env)[:6] and piped(env) == []
 
 
 def test_join_deletes_the_token_when_the_node_never_becomes_ready(env):
@@ -298,7 +359,7 @@ def test_join_stops_when_the_agent_cannot_be_stopped(env):
     env.scenario["ssh_fail"] = [STOP_AGENT]
     proc = join(env, "--node", "k3s-cpu-1", "--external-ip", "34.10.0.11", "--skip-sync")
     assert proc.returncode == 1 and "cannot stop k3s-agent" in proc.stderr
-    assert calls(env) == cpu_join(env, sync=False)[:5] and piped(env) == []
+    assert calls(env) == cpu_join(env, sync=False)[:6] and piped(env) == []
 
 
 def test_join_of_a_ready_node_ignores_kubectl_noise_on_stderr(env):
