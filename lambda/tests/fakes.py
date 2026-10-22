@@ -11,7 +11,9 @@ import subprocess
 from collections.abc import Iterable, Mapping, Sequence
 from dataclasses import dataclass
 
-from gpuctl.infra import CommandError, MissingStackError, check_join_args, normalise_gpu_ips, operator_ip
+from gpuctl.infra import (
+    CommandError, MissingStackError, check_join_args, check_max_nodes, normalise_gpu_ips, operator_ip,
+)
 from gpuctl.lambda_api import (
     FirewallRule, Instance, InstanceType, LambdaAPIError, Ruleset, _serialise_rules,
 )
@@ -26,35 +28,65 @@ def _not_found(what: str) -> LambdaAPIError:
     return LambdaAPIError("global/object-does-not-exist", 404, f"{what} not found")
 
 
+DEFAULT_LAUNCH_IPS = tuple(f"129.80.30.{n}" for n in range(30, 40))
+
+
+@dataclass(frozen=True)
+class Launch:
+    """One successful FakeLambda.launch: its arguments and the id it returned."""
+    id: str
+    name: str
+    region: str
+    instance_type: str
+    ssh_key_name: str
+    image_family: str
+    ruleset_id: str
+
+
 class FakeLambda:
     """Lambda account state in memory.
 
     Every call is appended to `calls` as (method name, *positional args); launch, whose arguments are keyword-only,
-    is recorded as ("launch", {kwargs}). `launch_errors[(type, region)]` is raised by launch for that combination;
-    `instance_progress[id]` is the sequence get_instance returns for that id (the last entry repeats), and each
-    result also replaces the instance in `instances`. Rules go through the real client's serialiser, so the fake
-    refuses exactly what LambdaClient would never send.
+    is recorded as ("launch", {kwargs}), and each successful one also in `launched`. Instance ids are i-1, i-2, ...
+    and ruleset ids rs-1, rs-2, ..., counted separately. `launch_errors[(type, region)]` is raised by launch for
+    that combination. `instance_progress[id]` is the sequence get_instance returns for that id (the last entry
+    repeats), and each result also replaces the instance in `instances`; without one, a launched instance is booting
+    (ip null) until the first get_instance, which makes it active with the next of `launch_ips`. Rules go through
+    the real client's serialiser, so the fake refuses exactly what LambdaClient would never send.
     """
+
+    TEST_HELPERS = frozenset({"ruleset_by_name"})  # public, but not LambdaClient methods
 
     def __init__(self, *, types: Mapping[str, InstanceType] | None = None,
                  instances: Iterable[Instance] = (), rulesets: Iterable[Ruleset] = (),
                  global_rules: Iterable[FirewallRule] = (),
                  launch_errors: Mapping[tuple[str, str], Exception] | None = None,
-                 instance_progress: Mapping[str, list[Instance]] | None = None) -> None:
+                 instance_progress: Mapping[str, list[Instance]] | None = None,
+                 launch_ips: Iterable[str] = DEFAULT_LAUNCH_IPS) -> None:
         self.types = dict(types or {})
         self.instances = list(instances)
         self.rulesets = list(rulesets)
         self.global_rules = list(global_rules)
         self.launch_errors = dict(launch_errors or {})
         self.instance_progress = {k: list(v) for k, v in (instance_progress or {}).items()}
+        self.launch_ips = list(launch_ips)
         self.calls: list[tuple] = []
+        self.launched: list[Launch] = []
         self.launched_ids: list[str] = []
         self.terminated: list[str] = []
-        self._next_id = 0
+        self._next_id: dict[str, int] = {}
+        self._pending_ips: dict[str, str] = {}
 
     def _new_id(self, prefix: str) -> str:
-        self._next_id += 1
-        return f"{prefix}-{self._next_id}"
+        self._next_id[prefix] = self._next_id.get(prefix, 0) + 1
+        return f"{prefix}-{self._next_id[prefix]}"
+
+    def ruleset_by_name(self, name: str) -> Ruleset:
+        """The one stored ruleset called `name` (KeyError if there is none, or more than one)."""
+        matches = [r for r in self.rulesets if r.name == name]
+        if len(matches) != 1:
+            raise KeyError(f"{len(matches)} rulesets named {name!r}")
+        return matches[0]
 
     def _replace_instance(self, instance: Instance) -> None:
         self.instances = [instance if i.id == instance.id else i for i in self.instances]
@@ -78,6 +110,10 @@ class FakeLambda:
             return instance
         for instance in self.instances:
             if instance.id == instance_id:
+                if instance.status == "booting" and instance_id in self._pending_ips:
+                    instance = Instance(instance.id, instance.name, "active", self._pending_ips.pop(instance_id),
+                                        instance.region, instance.instance_type)
+                    self._replace_instance(instance)
                 return instance
         raise _not_found(f"instance {instance_id}")
 
@@ -91,6 +127,9 @@ class FakeLambda:
             raise error
         instance_id = self._new_id("i")
         self.instances.append(Instance(instance_id, name, "booting", None, region, instance_type))
+        if self.launch_ips:
+            self._pending_ips[instance_id] = self.launch_ips.pop(0)
+        self.launched.append(Launch(instance_id, name, region, instance_type, ssh_key_name, image_family, ruleset_id))
         self.launched_ids.append(instance_id)
         return instance_id
 
@@ -198,10 +237,10 @@ class FakeInfra:
     `outputs[stack]` is what tf_output returns; a stack missing from it raises CommandError (it cannot be read).
     ensure_init raises MissingStackError for a stack in `missing` (not in the checkout, like Infra) and
     CommandError for a stack in `init_fail`. `events` records the side effects in order:
-    "tf:<gpu ips>" for apply_gpu_access, "nft" for the cp peer-set push, "ssh:<command>" for any other cp_ssh,
-    "join:<name>:<type>". Arguments are validated and normalised exactly like Infra (shared helpers in gpuctl.infra):
-    apply_gpu_access records normalise_gpu_ips(), join_node runs check_join_args(), detect_operator_ip validates
-    env["OPERATOR_IP"] (there is no network fallback).
+    "tf:<gpu ips>" for apply_gpu_access (its max_nodes go to `applied_max_nodes`), "nft" for the cp peer-set push,
+    "ssh:<command>" for any other cp_ssh, "join:<name>:<type>". Arguments are validated and normalised exactly
+    like Infra (shared helpers in gpuctl.infra): apply_gpu_access records normalise_gpu_ips() and check_max_nodes(),
+    join_node runs check_join_args(), detect_operator_ip validates env["OPERATOR_IP"] (there is no network fallback).
     """
 
     def __init__(self, *, outputs: Mapping[str, Mapping] | None = None, env: Mapping[str, str] | None = None,
@@ -220,6 +259,7 @@ class FakeInfra:
         self.ssh_calls: list[tuple[str, str | None]] = []
         self.kubectl_calls: list[tuple[str, ...]] = []
         self.applied_gpu_ips: list[list[str]] = []
+        self.applied_max_nodes: list[int] = []
         self.deleted_nodes: list[str] = []
         self.joined: list[tuple[str, str, str]] = []
         self.forgotten: list[str] = []
@@ -238,8 +278,9 @@ class FakeInfra:
                                "Backend initialization required")
         return dict(self.outputs[stack])
 
-    def apply_gpu_access(self, gpu_ips: Sequence[str]) -> None:
+    def apply_gpu_access(self, gpu_ips: Sequence[str], *, max_nodes: int) -> None:
         ips = normalise_gpu_ips(gpu_ips)  # ValueError on a null or non-public IP, like Infra (Review Focus #2)
+        self.applied_max_nodes.append(check_max_nodes(max_nodes))
         self.applied_gpu_ips.append(ips)
         self.events.append(f"tf:{ips}")
 
