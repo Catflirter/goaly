@@ -191,16 +191,25 @@ vr_init() {
 # again until they are gone, KILL what is left after 5s: one TERM is not enough. This trap makes bash
 # catch TERM, and a job runs that handler until it has exec'd its program, so a TERM that arrives
 # before then can be dropped and the program runs on, holding the check's output open.
+# A job that runs a shell function (vr_bg kc …) is a subshell whose child is the real program (kubectl
+# port-forward), so the children go first, as in _vr_stop: else a TERM to the check's shell alone (kill
+# PID, not the process group) would leave the program running, still listening and holding the output.
 _vr_reap() {
-  local pids i
+  local pids pid i
   for ((i = 0; i < 50; i++)); do
     pids="$(jobs -pr)"
     [[ -n "$pids" ]] || return 0
+    for pid in $pids; do
+      pkill -TERM -P "$pid" 2>/dev/null || true
+    done
     # shellcheck disable=SC2086 # one PID per word
     kill $pids 2>/dev/null || true
     sleep 0.1
   done
   pids="$(jobs -pr)"
+  for pid in $pids; do
+    pkill -KILL -P "$pid" 2>/dev/null || true
+  done
   # shellcheck disable=SC2086 # one PID per word
   [[ -z "$pids" ]] || kill -KILL $pids 2>/dev/null || true
 }
@@ -1462,16 +1471,29 @@ _vr_s0_unforward() {
   _vr_show "$1" "port-forward svc/$2"
 }
 
-# _vr_s0_query PORT QUERY: the JSON of a Prometheus instant query (through the port-forward).
+# _vr_s0_query PORT QUERY: the answer to a Prometheus instant query (through the port-forward). No -f:
+# Prometheus answers a bad query with HTTP 400/422 and a JSON body that says why, which _vr_s0_result
+# reports; an answer that is not JSON (an empty 503) fails there too. --noproxy: the port-forward is on
+# 127.0.0.1, so an http_proxy in the operator's shell must not get the request.
 _vr_s0_query() {
-  vr_cap --no-echo curl -fsS -m 5 --get --data-urlencode "query=$2" "http://127.0.0.1:$1/api/v1/query"
+  vr_cap --no-echo curl -sS -m 5 --noproxy '*' --get --data-urlencode "query=$2" \
+    "http://127.0.0.1:$1/api/v1/query"
 }
 
-# _vr_s0_result JSON JQ: the lines JQ makes of each series of a successful query; fails (with the
-# reason) on an error status or anything that is not a query result.
+# _vr_s0_result ANSWER JQ: the lines JQ makes of each series of a successful query. Fails with the
+# reason: Prometheus' errorType and error, or (on stderr, the evidence) the start of an answer that is
+# not a query result at all.
 _vr_s0_result() {
-  jq -r 'if .status == "success" and (.data.result | type) == "array" then .data.result[] | '"$2"'
-         else error("Prometheus answered status \(.status // "?"): \(.error // "no result")") end' <<< "$1"
+  local rc=0 start
+  jq -nr 'input | if .status == "success" and (.data.result | type) == "array" then .data.result[] | '"$2"'
+          else error("Prometheus answered status \(.status // "?"): \(.errorType // "-"): \(.error // "no result")")
+          end' <<< "$1" || rc=$?
+  if ((rc != 0)); then
+    start="$(head -c 200 <<< "$1" | tr -s '\r\n\t' '   ')"
+    start="${start% }"
+    echo "S0: the answer (at most 200 bytes): ${start:-(empty)}" >&2
+  fi
+  return "$rc"
 }
 
 # _vr_s0_targets PORT: S0 ①, one attempt: every node-exporter and kube-state-metrics target is up (1),
@@ -1527,7 +1549,7 @@ _vr_s0_dcgm() {
 # _vr_s0_grafana PORT: S0 ③, one attempt: Grafana's /api/health (no login needed) says database ok.
 _vr_s0_grafana() {
   local body db
-  body="$(vr_cap curl -fsS -m 5 "http://127.0.0.1:$1/api/health")" || return 1
+  body="$(vr_cap curl -fsS -m 5 --noproxy '*' "http://127.0.0.1:$1/api/health")" || return 1
   db="$(jq -r '.database // empty' <<< "$body" 2>/dev/null)" || db=""
   [[ "$db" == ok ]] && return 0
   echo "S0 ③: Grafana /api/health says database '${db:-?}'; want ok"
@@ -1537,8 +1559,8 @@ _vr_s0_grafana() {
 # _vr_s0 PROM_PORT GRAFANA_PORT DIR: S0's work (check_s0_metrics), the port-forward logs in DIR.
 # Called in an || list, so errexit is off here: every failure is handled and the caller cleans up.
 _vr_s0() {
-  local pport="$1" gport="$2" dir="$3" out g fail=0
-  local -a gpus=()
+  local pport="$1" gport="$2" dir="$3" out g n fail=0
+  local -a gpus=() unlabelled=()
   vr_cmd kc -n monitoring get pods -o wide "$_VR_RT" || true
   vr_cmd kc -n monitoring-host get pods -o wide "$_VR_RT" || true
   _vr_load_nodes || return 1
@@ -1549,6 +1571,16 @@ _vr_s0() {
     [[ "$g" =~ $K8S_NAME_RE ]] || { echo "S0: unexpected GPU node name from the cluster: '$g'"; return 1; }
     gpus+=("$g")
   done <<< "$out"
+  # A joined GPU node (k3s-gpu-<pool>-<n>) without the admin label runs no DCGM exporter (the DaemonSet
+  # selects the label): ② cannot pass for it, and it must not pass as "no GPU node".
+  for n in "${VR_NODES[@]}"; do
+    if [[ "$n" =~ $GPU_NODE_RE ]] && ! _vr_in "$n" ${gpus[@]+"${gpus[@]}"}; then
+      unlabelled+=("$n")
+      echo "S0 ②: FAILED: node $n looks like a GPU node but lacks the label $VR_GPU_LABEL, so the"
+      echo "S0 ②: DCGM exporter does not run there (scripts/join-node.sh sets the label when the node joins)"
+      fail=1
+    fi
+  done
 
   if _vr_s0_forward "$dir/prometheus.log" prometheus "$pport" 9090; then
     if vr_retry "$VR_S0_TARGETS_WAIT_S" 10 _vr_s0_targets "$pport"; then
@@ -1558,7 +1590,7 @@ _vr_s0() {
       fail=1
     fi
     if ((${#gpus[@]} == 0)); then
-      echo "S0 ②: no GPU node (label $VR_GPU_LABEL): the DCGM part is skipped"
+      ((${#unlabelled[@]})) || echo "S0 ②: no GPU node (label $VR_GPU_LABEL): the DCGM part is skipped"
     elif vr_retry "$VR_S0_DCGM_WAIT_S" 10 _vr_s0_dcgm "$pport" "${gpus[@]}"; then
       echo "S0 ②: DCGM_FI_DEV_GPU_UTIL has data from every GPU node (${gpus[*]})"
     else
@@ -1589,10 +1621,11 @@ _vr_s0() {
 # S0 (stretch, STRETCH=1): the monitoring stack (k8s/monitoring/, make monitoring) works. ① Prometheus'
 # `up` is 1 for every node-exporter target (one on every node) and every kube-state-metrics target;
 # ② with a GPU node (label VR_GPU_LABEL), DCGM_FI_DEV_GPU_UTIL has data from each GPU node (without one
-# this part is skipped and said so); ③ Grafana's /api/health says database ok. Prometheus and Grafana
-# are reached through a kubectl port-forward on 127.0.0.1 (never another address), one at a time, each
-# stopped when its part is done; their logs are in a private temporary directory that is removed after,
-# pass, fail or interrupt. SKIP when the stack is not installed (no namespace monitoring).
+# this part is skipped and said so; a node named as a GPU node, k3s-gpu-*, without the label fails it);
+# ③ Grafana's /api/health says database ok. Prometheus and Grafana are reached through a kubectl
+# port-forward on 127.0.0.1 (never another address; curl ignores any proxy), one at a time, each stopped
+# when its part is done; their logs are in a private temporary directory that is removed after, pass,
+# fail or interrupt. SKIP when the stack is not installed (no namespace monitoring).
 # VR_S0_PROM_PORT (default 19090) and VR_S0_GRAFANA_PORT (default 13000) are the local ports; they
 # differ from make prometheus / make grafana's 9090 and 3000, so an open dashboard is not in the way.
 check_s0_metrics() {

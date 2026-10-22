@@ -11,6 +11,7 @@ import re
 import signal
 import socket
 import subprocess
+import time
 
 import pytest
 
@@ -120,6 +121,7 @@ def test_s0_fails_rather_than_skips_when_the_namespace_cannot_be_read(env):
                  stderr="Unable to connect to the server: dial tcp 127.0.0.1:6443: connect: connection refused\n"))
     result, text = env.s0()
     assert result == "FAIL", text
+    assert "cannot tell whether the monitoring stack is installed" in text
     assert forwards(env) == []
 
 
@@ -130,7 +132,7 @@ def test_s0_passes_without_a_gpu_node_and_skips_only_the_dcgm_part(env):
     assert f"$ kc -n monitoring port-forward --address 127.0.0.1 svc/prometheus {env.pport}:9090 &" in lines
     assert f"$ kc -n monitoring port-forward --address 127.0.0.1 svc/grafana {env.gport}:3000 &" in lines
     assert any(UP_QUERY in line and f"http://127.0.0.1:{env.pport}/api/v1/query" in line for line in lines), lines
-    assert f"$ curl -fsS -m 5 http://127.0.0.1:{env.gport}/api/health" in lines
+    assert f"$ curl -fsS -m 5 --noproxy '*' http://127.0.0.1:{env.gport}/api/health" in lines
     assert not any(DCGM_QUERY in line for line in lines)
     assert "no GPU node" in text and "skipped" in text
     assert "node-exporter k3s-cp" in text and "node-exporter k3s-cpu-1" in text  # the targets are evidence
@@ -149,8 +151,35 @@ def test_s0_with_a_gpu_node_needs_dcgm_data_from_it(env3):
     result, text = env3.s0()
     assert result == "PASS", text
     assert any(DCGM_QUERY in line for line in cmd_lines(text))
-    assert f"{GPU1}" in text and "DCGM" in text
+    assert f"{DCGM_QUERY} node {GPU1} gpu 0: 37%" in text
     assert env3.closed()
+
+
+def test_s0_waits_for_dcgm_data_that_comes_late(env3):
+    env3.prom[DCGM_QUERY] = [dcgm(), dcgm(GPU1)]
+    result, text = env3.s0()
+    assert result == "PASS", text
+    assert f"no {DCGM_QUERY} from {GPU1}" in text and "skipped sleep" in text
+    assert f"{DCGM_QUERY} node {GPU1} gpu 0: 37%" in text
+
+
+def test_s0_does_not_take_dcgm_data_from_another_node_for_the_gpu_node(env3):
+    env3.prom[DCGM_QUERY] = dcgm(CPU1)
+    result, text = env3.s0()
+    assert result == "FAIL", text
+    assert f"no {DCGM_QUERY} from {GPU1}" in text
+    assert env3.closed()
+
+
+def test_s0_fails_when_a_gpu_node_lacks_the_admin_label(tmp_path):
+    # joined (named k3s-gpu-*) but without the label the DCGM DaemonSet selects: no DCGM there, never silent
+    env = S0(tmp_path, nodes=(CP, CPU1, GPU1), gpus=())
+    result, text = env.s0()
+    assert result == "FAIL", text
+    assert f"node {GPU1} looks like a GPU node but lacks the label {GPU_LABEL}" in text
+    assert "no GPU node" not in text
+    assert "S0 ③: Grafana /api/health: database ok" in text  # the other parts still ran
+    assert env.closed()
 
 
 def test_s0_fails_when_a_gpu_node_has_no_dcgm_data(env3):
@@ -185,12 +214,32 @@ def test_s0_waits_for_targets_that_come_up(env):
     assert f"no node-exporter target up on node {CPU1}" in text and "skipped sleep" in text
 
 
-@pytest.mark.parametrize("answer", [json.dumps({"status": "error", "errorType": "bad_data", "error": "parse error"}),
-                                    "not json", {"body": "", "status": 503}])
-def test_s0_fails_on_a_prometheus_error(env, answer):
+PROM_ERROR = json.dumps({"status": "error", "errorType": "bad_data", "error": "1:4: parse error: unexpected '{'"})
+
+
+@pytest.mark.parametrize("answer,why", [
+    (PROM_ERROR, "status error: bad_data: 1:4: parse error"),
+    ({"body": PROM_ERROR, "status": 400}, "status error: bad_data: 1:4: parse error"),  # a bad query: HTTP 400
+    ("not json", "the answer (at most 200 bytes): not json"),
+    ({"body": "", "status": 503}, "the answer (at most 200 bytes): (empty)"),
+    ({"body": "<html>Service Unavailable</html>", "status": 503}, "<html>Service Unavailable</html>"),
+])
+def test_s0_fails_on_a_prometheus_error_and_still_checks_grafana(env, answer, why):
     env.prom[UP_QUERY] = answer
-    assert env.s0()[0] == "FAIL"
+    result, text = env.s0()
+    assert result == "FAIL", text
+    assert "S0 ①: not a usable Prometheus answer" in text
+    assert why in text  # Prometheus' own reason (or what came back instead) is in the evidence
+    assert "gave up after" in text
+    assert "S0 ③: Grafana /api/health: database ok" in text  # ③ still ran after ① failed
     assert env.closed()
+
+
+def test_s0_ignores_the_operators_http_proxy(env):
+    # the port-forward is on 127.0.0.1: a proxy from the operator's shell must neither get the requests nor fail S0
+    result, text = env.s0(http_proxy="http://192.0.2.1:9", HTTPS_PROXY="http://192.0.2.1:9",
+                          ALL_PROXY="http://192.0.2.1:9", all_proxy="http://192.0.2.1:9")
+    assert result == "PASS", text
 
 
 @pytest.mark.parametrize("answer", [json.dumps({"database": "failing", "version": "13.2.4"}),
@@ -229,6 +278,61 @@ def test_s0_interrupted_stops_the_forward_and_removes_its_log(env, sig):
     assert "interrupted" in err and "cleanup done" in err
     assert "cleanup done" in text
     assert env.closed()
+
+
+def ppid(pid):
+    return int(open(f"/proc/{pid}/stat").read().rsplit(")", 1)[1].split()[1])
+
+
+def test_s0_sigterm_to_the_check_shell_alone_stops_the_port_forward(env):
+    """A SIGTERM to the check's own shell (not its process group, as `kill PID` sends it) must still stop
+    kubectl port-forward: the vr_bg job is a subshell running kc, and kubectl is that subshell's child."""
+    env.grafana["/api/health"] = {"body": HEALTH_OK, "sleep": 20}
+    run = env.repo / "verification" / "s"
+    # A script file, as verify.sh is: under `bash -c` bash execs the job's last command in place of the
+    # subshell, so kubectl would be the job itself and the orphan this test is about would not arise.
+    script = env.repo / "s0-run.sh"
+    script.write_text(f"set -euo pipefail\nsource scripts/lib/checks.sh\nvr_init {run}\n"
+                      "run_check T title check_s0_metrics\n")
+    proc = subprocess.Popen(["bash", str(script)], cwd=env.repo, start_new_session=True,
+                            env=env.environ({"VR_NO_WAIT": "1", "BASH_FUNC_timeout%%": NOT_REACHABLE}),
+                            stdin=subprocess.DEVNULL, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+    try:
+        deadline = time.monotonic() + 30
+        forward = None
+        while forward is None:
+            assert proc.poll() is None, proc.communicate()
+            assert time.monotonic() < deadline, "the grafana port-forward never started"
+            for d in os.listdir("/proc"):
+                try:
+                    if (d.isdigit() and os.getpgid(int(d)) == proc.pid
+                            and b"svc/grafana" in open(f"/proc/{d}/cmdline", "rb").read()):
+                        forward = int(d)
+                except (OSError, ValueError):
+                    pass
+            time.sleep(0.05)
+        time.sleep(0.5)  # the check is waiting on Grafana
+        shell = forward
+        while ppid(shell) != proc.pid:  # up from kubectl to the check's subshell (a child of bash -c)
+            shell = ppid(shell)
+        os.kill(shell, signal.SIGTERM)
+        _, err = proc.communicate(timeout=60)
+        text = (run / "01-T.txt").read_text()
+        assert "interrupted (SIGTERM)" in text and "cleanup done" in text, err
+        deadline = time.monotonic() + 15
+        while True:
+            try:
+                os.killpg(proc.pid, 0)
+            except ProcessLookupError:
+                break
+            assert time.monotonic() < deadline, "kubectl port-forward outlived the check"
+            time.sleep(0.05)
+        assert env.closed()
+    finally:
+        try:
+            os.killpg(proc.pid, signal.SIGKILL)
+        except ProcessLookupError:
+            pass
 
 
 # ---- verify.sh: group S only under STRETCH=1 -------------------------------------------------------
@@ -348,7 +452,17 @@ def test_make_help_mentions_stretch(target, needle):
     assert needle in line
 
 
-def test_make_verify_passes_stretch_through_the_environment():
-    proc = subprocess.run(["make", "--no-print-directory", "-n", "-f", str(ROOT / "Makefile"), "verify", "STRETCH=1"],
-                          capture_output=True, text=True, cwd="/")
-    assert proc.returncode == 0 and proc.stdout.strip() == f"{ROOT}/scripts/verify.sh"
+@pytest.mark.parametrize("args,want", [(["STRETCH=1"], "1"), ([], "")])
+def test_make_verify_passes_stretch_to_verify_sh(tmp_path, args, want):
+    """make verify STRETCH=1 really reaches verify.sh's environment: a repo copy whose verify.sh records it."""
+    (tmp_path / "scripts").mkdir()
+    (tmp_path / "Makefile").write_text((ROOT / "Makefile").read_text())
+    seen = tmp_path / "stretch"
+    stub = tmp_path / "scripts/verify.sh"
+    stub.write_text(f'#!/usr/bin/env bash\nprintf %s "${{STRETCH-}}" > {seen}\n')
+    stub.chmod(0o755)
+    environ = {k: v for k, v in os.environ.items() if k not in ("STRETCH", "MAKEFLAGS", "MFLAGS")}
+    proc = subprocess.run(["make", "--no-print-directory", "-f", str(tmp_path / "Makefile"), "verify", *args],
+                          capture_output=True, text=True, cwd="/", env=environ)
+    assert proc.returncode == 0, proc.stdout + proc.stderr
+    assert seen.read_text() == want

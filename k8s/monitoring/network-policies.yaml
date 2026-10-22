@@ -6,8 +6,9 @@
 # controller, as for hello (k8s/hello/hello.yaml).
 # The API server's Service proxy (kubectl get --raw .../services/prometheus:9090/proxy/...) is blocked by
 # design: it comes from k3s-cp, not from the Pod's own node, and no rule admits it. Port-forward is the
-# only way in (spec §10.0), so S0b's check_s0_metrics uses `scripts/monitoring.sh forward prometheus`
-# and `forward grafana`. Do not add an allow rule for the cp.
+# only way in (spec §10.0): `make prometheus` / `make grafana` use `scripts/monitoring.sh forward`, and
+# check_s0_metrics (scripts/lib/checks.sh) opens its own `kubectl port-forward --address 127.0.0.1` (vr_bg,
+# local ports VR_S0_PROM_PORT / VR_S0_GRAFANA_PORT). Do not add an allow rule for the cp.
 # scripts/monitoring.sh applies this file together with namespaces.yaml, before any workload.
 apiVersion: networking.k8s.io/v1
 kind: NetworkPolicy
