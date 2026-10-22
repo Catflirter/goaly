@@ -58,11 +58,13 @@ k3s_install_url() {
   printf 'https://raw.githubusercontent.com/k3s-io/k3s/%s/install.sh\n' "${1//+/%2B}"
 }
 
-# default_iface: the interface carrying the default route.
+# default_iface: the interface carrying the default route. Its name must pass the same check as an
+# explicit --iface (Linux allows e.g. "$" and "(" in interface names); anything else dies.
 default_iface() {
   local iface
   iface=$(ip -o route get 1.1.1.1 | awk '{for (i = 1; i < NF; i++) if ($i == "dev") {print $(i + 1); exit}}')
   [[ -n $iface ]] || die "cannot determine the default-route interface"
+  [[ $iface =~ ^[A-Za-z0-9_.:-]+$ ]] || die "unexpected default-route interface name: $iface (pass --iface)"
   printf '%s\n' "$iface"
 }
 
@@ -169,6 +171,71 @@ install_guard() {
   rm -f -- "$pending"
 }
 
+# gpu_audit FILE IFACE LABEL: append a "===== gpu-audit LABEL" section to FILE recording the GPU
+# host's state (spec §6.2 step 1, §12 live checks #2 and #5): each probe as "$ CMD", then its
+# output. A failing probe (tool or file missing) is recorded with its exit status and does not stop
+# the audit. Every probe only reads; in particular the FORWARD policy is recorded, never changed.
+# FILE is appended to, never truncated, so a re-run keeps the first run's evidence (the NIC MTU
+# before set_mtu changed it). IFACE and the paths are shell-quoted (%q) into the probe text, so
+# any value is safe. Each probe gets GPU_AUDIT_TIMEOUT seconds (default 60; nvidia-smi can hang on
+# a GPU in a bad state), then TERM, then KILL GRACE = min(10, limit) seconds later; one cut off this
+# way is recorded as "[exit 124]" (or 137 after KILL) and the audit goes on. A probe stuck in
+# uninterruptible sleep (an nvidia-smi on a GPU that fell off the bus) survives KILL, so timeout
+# would wait for it forever: the audit stops waiting at limit + 2 * GRACE, records
+# "[exit 124 abandoned: ...]" and goes on, leaving that process behind. The probe stays in the
+# caller's process group (timeout --foreground), so Ctrl-C stops the probe and the bootstrap
+# together; only the probe itself is timed out, not processes it started (a pipeline's stages).
+gpu_audit() {
+  local file=$1 iface=$2 label=$3 limit=${GPU_AUDIT_TIMEOUT:-60} cmd rc pid start grace
+  local nvcfg sysfs_mtu iface_q
+  [[ $limit =~ ^[1-9][0-9]*$ ]] || die "gpu_audit: GPU_AUDIT_TIMEOUT must be a number of seconds: $limit"
+  grace=$(( limit < 10 ? limit : 10 ))
+  iface_q=$(printf '%q' "$iface")
+  nvcfg=$(printf '%q' "${K3S_BOOTSTRAP_TEST_ROOT:-}/etc/nvidia-container-runtime/config.toml")
+  sysfs_mtu=$(printf '%q' "${SYSFS_NET:-/sys/class/net}/$iface/mtu")
+  local -a probes=(
+    "date -Is"
+    "nvidia-smi"
+    "nvidia-smi --query-gpu=name,driver_version --format=csv"
+    "lsb_release -a"
+    "uname -r"
+    "command -v nvidia-container-runtime"
+    "grep -i mode $nvcfg"
+    "dpkg -l | grep -E 'nvidia-container|libnvidia-container'"
+    "iptables -V"
+    "iptables -S FORWARD | head -3"
+    "ip -4 addr show $iface_q"
+    "cat $sysfs_mtu"
+    "systemctl is-enabled lambda-jupyter docker"
+  )
+  mkdir -p -- "$(dirname -- "$file")"
+  {
+    printf '===== gpu-audit %s\n' "$label"
+    for cmd in "${probes[@]}"; do
+      printf '$ %s\n' "$cmd"
+      # bash -c runs without pipefail: a pipeline reports its last command (grep: 1 = no match;
+      # head never fails), not a SIGPIPE in iptables; it execs a simple command (nvidia-smi), so
+      # that is timeout's direct child. Started in the background so the audit can stop waiting.
+      timeout --foreground -k "$grace" "$limit" bash -c "$cmd" 2>&1 &
+      pid=$! start=$SECONDS rc=0
+      while kill -0 "$pid" 2> /dev/null; do
+        if (( SECONDS - start > limit + 2 * grace )); then
+          kill -KILL "$pid" 2> /dev/null || true
+          rc=abandoned
+          break
+        fi
+        sleep 0.1
+      done
+      if [[ $rc == abandoned ]]; then
+        printf '[exit 124 abandoned: still running after %d s]\n' "$(( limit + 2 * grace ))"
+        continue
+      fi
+      wait "$pid" || rc=$?
+      if (( rc != 0 )); then printf '[exit %d]\n' "$rc"; fi
+    done
+  } >> "$file"
+}
+
 # k3s_installed_version: e.g. v1.36.5+k3s1, or empty when k3s is not installed.
 k3s_installed_version() {
   if command -v k3s > /dev/null 2>&1; then
@@ -177,7 +244,10 @@ k3s_installed_version() {
 }
 
 # install_k3s EXEC VERSION SKIP_START: run the tag-pinned install.sh unless k3s VERSION is already
-# installed. SKIP_START=true installs without starting the service.
+# installed. SKIP_START=true installs without starting the service. install.sh writes every K3S_*
+# variable in its environment into the service's env file (and K3S_URL/K3S_TOKEN change its mode),
+# so join credentials inherited from the caller are removed: the token only ever reaches
+# token-file (spec §5.1).
 install_k3s() {
   local exec=$1 version=$2 skip_start=$3
   local -a vars=(INSTALL_K3S_VERSION="$version" INSTALL_K3S_EXEC="$exec")
@@ -186,5 +256,6 @@ install_k3s() {
     return 0
   fi
   if [[ $skip_start == true ]]; then vars+=(INSTALL_K3S_SKIP_START=true); fi
-  curl -fsSL "$(k3s_install_url "$version")" | env "${vars[@]}" sh -
+  curl -fsSL "$(k3s_install_url "$version")" \
+    | env -u K3S_TOKEN -u K3S_AGENT_TOKEN -u K3S_TOKEN_FILE -u K3S_URL "${vars[@]}" sh -
 }

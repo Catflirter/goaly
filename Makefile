@@ -58,6 +58,11 @@ lint: ## Run all pre-commit hooks, the repo secret scan, the Terraform tests, th
 	$(MAKE) tf-test
 	$(MAKE) test
 
+# RESILIENCE=1 (make verify RESILIENCE=1) reaches verify.sh through the environment and adds group E.
+.PHONY: verify
+verify: ## Run verification checks A-D (RESILIENCE=1 adds E) into verification/<timestamp>/
+	$(ROOT)/scripts/verify.sh
+
 # AUTO_APPROVE=1 (or yes/true) skips the confirmation prompt of gpu-apply and gpu-down.
 GPU_AUTO_APPROVE := $(if $(filter 1 yes true,$(AUTO_APPROVE)), --auto-approve)
 

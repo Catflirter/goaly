@@ -309,11 +309,14 @@ def guard_stage(tmp, nft_text, files=GUARD_FILES):
 def systemctl_stub(tmp):
     # is-active succeeds once the stub has seen "enable --now" (state file), like the real unit.
     # "reload k3s-guard" fails while the file fail-reload exists; "restart k3s" while fail-restart does.
+    # k3s is active unless k3s-inactive exists; "enable --now k3s" and "restart k3s" start it.
     state = tmp / "guard-active"
     return {"systemctl": f'case "$*" in "enable --now k3s-guard") touch "{state}";; '
                          f'"is-active --quiet k3s-guard") [[ -e "{state}" ]];; '
                          f'"reload k3s-guard") [[ ! -e "{tmp}/fail-reload" ]];; '
-                         f'"restart k3s") [[ ! -e "{tmp}/fail-restart" ]];; esac'}
+                         f'"is-active --quiet k3s") [[ ! -e "{tmp}/k3s-inactive" ]];; '
+                         f'"enable --now k3s") rm -f "{tmp}/k3s-inactive";; '
+                         f'"restart k3s") [[ ! -e "{tmp}/fail-restart" ]] && rm -f "{tmp}/k3s-inactive";; esac'}
 
 
 def test_install_guard_first_run_enables(tmp_path):
@@ -820,7 +823,21 @@ def test_host_rerun_unchanged_does_nothing_disruptive(tmp_path):
     assert r.returncode == 0, r.stderr
     assert host_calls(log) == [
         "k3s --version", *PRE_GUARD, "systemctl mask nftables.service", "systemctl daemon-reload",
-        "systemctl is-active --quiet k3s-guard", "k3s --version", READYZ]
+        "systemctl is-active --quiet k3s-guard", "k3s --version", "systemctl is-active --quiet k3s", READYZ]
+
+
+def test_host_rerun_starts_installed_but_stopped_k3s(tmp_path):
+    # Ruling R24: k3s at the target version, config unchanged, but stopped (e.g. systemctl stop k3s).
+    # Without a start, server-bootstrap's /readyz wait can only time out after 180 s.
+    bindir, log = host_stubs(tmp_path)
+    assert run_host(tmp_path, bindir).returncode == 0
+    (tmp_path / "k3s-inactive").touch()
+    log.write_text("")
+    r = run_host(tmp_path, bindir)
+    assert r.returncode == 0, r.stderr
+    assert host_calls(log)[-4:] == ["k3s --version", "systemctl is-active --quiet k3s",
+                                    "systemctl enable --now k3s", READYZ]
+    assert "restart k3s" not in "\n".join(calls(log))
 
 
 def test_host_config_change_restarts_current_k3s(tmp_path):

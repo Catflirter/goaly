@@ -1,0 +1,10 @@
+# /etc/rancher/k3s/config.yaml on a k3s agent (spec §2.1). Rendered by node/node-bootstrap.sh.
+# node-name is set as well, so the K8s node name always equals the instance name.
+# No flannel settings here: they belong to the server only; on agents they make nodes NotReady
+# (k3s#12942). The join token reaches token-file later, piped in by scripts/join-node.sh.
+server: https://@SERVER_IP@:6443
+token-file: /etc/rancher/k3s/token
+node-name: "@NODE_NAME@"
+node-external-ip: @EXTERNAL_IP@
+protect-kernel-defaults: true
+@GPU_CONFIG@

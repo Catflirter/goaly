@@ -1,0 +1,13 @@
+# Namespace for the NVIDIA device plugin Helm release (spec §4.3, §6.2 step 4). The cluster-wide PSA
+# default is restricted; the device plugin DaemonSet needs hostPath mounts, so only this namespace
+# enforces privileged. warn and audit are set to privileged too: left unset they would fall back to
+# the cluster default (restricted), so every helm upgrade would print PodSecurity warnings and add
+# audit annotations for pods that admission accepts anyway.
+apiVersion: v1
+kind: Namespace
+metadata:
+  name: nvidia-device-plugin
+  labels:
+    pod-security.kubernetes.io/enforce: privileged
+    pod-security.kubernetes.io/warn: privileged
+    pod-security.kubernetes.io/audit: privileged

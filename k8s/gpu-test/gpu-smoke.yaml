@@ -1,0 +1,30 @@
+# Check D4: nvidia-smi as a non-root user prints the node's GPU, then the Pod completes.
+# runtimeClassName nvidia-gpu (k8s/system/nvidia-gpu-runtimeclass.yaml) runs the Pod with the nvidia
+# handler and schedules it onto admin-labelled GPU nodes. The device plugin assigns the GPU, so the
+# Pod never sets NVIDIA_VISIBLE_DEVICES (spec §7).
+apiVersion: v1
+kind: Pod
+metadata:
+  name: gpu-smoke
+  namespace: gpu-test
+spec:
+  runtimeClassName: nvidia-gpu
+  restartPolicy: Never
+  automountServiceAccountToken: false
+  securityContext:
+    runAsNonRoot: true
+    runAsUser: 1000
+    runAsGroup: 1000
+    seccompProfile:
+      type: RuntimeDefault
+  containers:
+    - name: cuda
+      image: docker.io/nvidia/cuda:12.8.1-base-ubuntu24.04@sha256:133c78a0575303be34164d0b90137a042172bdf60696af01a3c424ab402d86e2
+      command: ["nvidia-smi"]
+      resources:
+        limits:
+          nvidia.com/gpu: 1
+      securityContext:
+        allowPrivilegeEscalation: false
+        capabilities:
+          drop: [ALL]
