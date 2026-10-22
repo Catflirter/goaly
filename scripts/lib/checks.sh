@@ -2,7 +2,8 @@
 # Verification harness shared by scripts/verify.sh and the demo (spec section 9). Source it; do not run it.
 #
 #   vr_init DIR                     start a run: DIR (mode 0700)/SUMMARY.md with an empty results table;
-#                                   returns 2 if DIR already holds files
+#                                   returns 2 if DIR already holds files; finds the operator's IP
+#                                   (vr_operator_ip), which redact then masks as <operator_ip>
 #   run_check ID TITLE FUNC [ARG…]  run one check into DIR/<NN>-<ID>.txt; FUNC returns 0 PASS, 77 SKIP, else FAIL
 #   vr_cmd CMD…                     print "$ CMD" (redacted), then run CMD; returns CMD's status
 #   vr_cap [--no-echo] CMD…         vr_cmd for $(…): command and output to stderr, stdout to the caller
@@ -24,8 +25,10 @@
 #   - background jobs (kubectl port-forward &, tcpdump &) are killed when the check returns, because
 #     run_check waits for every process holding the check's output; so do not set an EXIT trap in a
 #     check (it replaces that cleanup), and do not leave grandchildren (setsid, nohup) running;
-#   - a check that leaves something behind until its end (a pcap, Pods, a namespace) removes it on
-#     SIGINT/SIGTERM too, with _vr_on_signal CMD.
+#   - a check that leaves something behind until its end (a pcap, Pods, a namespace, a listening
+#     server) removes it on SIGINT/SIGTERM too, with _vr_on_signal --left WHAT CMD; the operator sees
+#     the cleanup and, if it fails, what may remain and the command that removes it;
+#   - run_check gives a check fd 3 (the operator's stderr) for that; do not use fd 3 otherwise.
 
 # common.sh is linted on its own; pre-commit runs shellcheck without -x, so don't follow it.
 # shellcheck disable=SC1091
@@ -71,10 +74,65 @@ elif sed -l -e '' </dev/null >/dev/null 2>&1; then
   _VR_SED=(sed -l)
 fi
 
+# The operator's public IP, masked as <operator_ip> once vr_operator_ip has found it (empty until then).
+_VR_MASK_EXPRS=()
+
 # LC_ALL=C: match bytes, not characters. All patterns are ASCII, and BSD sed under a UTF-8 locale
 # aborts ("illegal byte sequence") on binary or non-UTF-8 output such as tcpdump -A payloads.
 redact() {
-  LC_ALL=C "${_VR_SED[@]}" -E "${_VR_REDACT_EXPRS[@]}"
+  LC_ALL=C "${_VR_SED[@]}" -E "${_VR_REDACT_EXPRS[@]}" ${_VR_MASK_EXPRS[@]+"${_VR_MASK_EXPRS[@]}"}
+}
+
+# _vr_trim TEXT: TEXT without leading and trailing whitespace (Python's str.strip, as gpuctl uses).
+_vr_trim() {
+  local s="$1"
+  s="${s#"${s%%[![:space:]]*}"}"
+  printf '%s\n' "${s%"${s##*[![:space:]]}"}"
+}
+
+# _vr_operator_ip_lookup: print "IP SOURCE" for the operator's public IP, found as gpuctl finds it
+# (lambda/gpuctl/infra.py detect_operator_ip): OPERATOR_IP from .env, trimmed; when that is empty,
+# the address checkip.amazonaws.com reports (one curl, at most 10 s). Runs in a subshell, so .env's
+# values stay out of the caller. Exits 2 without a readable .env (load_env), 1 when OPERATOR_IP is not
+# an IPv4 address (gpuctl refuses it) or the lookup gives none.
+_vr_operator_ip_lookup() (
+  load_env
+  ip="$(_vr_trim "${OPERATOR_IP:-}")"
+  if [[ -n "$ip" ]]; then
+    is_ipv4 "$ip" || exit 1
+    printf '%s OPERATOR_IP in .env\n' "$ip"
+    exit 0
+  fi
+  ip="$(bounded 10 curl -fsS --max-time 5 https://checkip.amazonaws.com)" || exit 1
+  ip="$(_vr_trim "$ip")"
+  is_ipv4 "$ip" || exit 1
+  printf '%s checkip.amazonaws.com\n' "$ip"
+)
+
+# vr_operator_ip: find the operator's public IP once (vr_init does, so every check of the run shares
+# it) and from then on mask it as <operator_ip> in everything redact filters: all evidence, not only
+# B6. Lambda's "operator ssh" rule holds it, and a run promoted to verification/final is committed
+# (Ruling R39 keeps real IPs out of what is delivered). Sets VR_OPERATOR_IP and VR_OPERATOR_IP_FROM
+# (where it came from); returns 1 when it is unknown, and then nothing can be masked: B6 fails if a
+# Lambda rule shows it. The IP must stand alone to be masked (198.51.100.2 stays in 198.51.100.20 and
+# in 10.198.51.100.2). Each match includes the characters around the IP, so one pass misses an IP
+# right after another ("IP,IP"); after it, no two unmasked ones are adjacent, so a second pass gets them.
+vr_operator_ip() {
+  local out e
+  if [[ -z "${_VR_OPIP_DONE:-}" ]]; then
+    _VR_OPIP_DONE=1
+    VR_OPERATOR_IP=""
+    VR_OPERATOR_IP_FROM=""
+    _VR_OPIP_RC=0
+    _VR_MASK_EXPRS=()
+    out="$(_vr_operator_ip_lookup 2>/dev/null)" || _VR_OPIP_RC=$?
+    if ((_VR_OPIP_RC == 0)); then
+      read -r VR_OPERATOR_IP VR_OPERATOR_IP_FROM <<< "$out"
+      e="s/(^|[^0-9.])${VR_OPERATOR_IP//./\\.}(\$|[^0-9])/\\1<operator_ip>\\2/g"
+      _VR_MASK_EXPRS=(-e "$e" -e "$e")
+    fi
+  fi
+  [[ -n "${VR_OPERATOR_IP:-}" ]]
 }
 
 # --- run bookkeeping ----------------------------------------------------------------------------
@@ -89,7 +147,8 @@ _vr_now() {
 # vr_init DIR: create DIR and its SUMMARY.md. Refuses a DIR that already holds files (returns 2), so
 # the evidence of two runs is never mixed. DIR is 0700 and its files 0600: unreviewed evidence (cluster
 # topology, IPs, anything redact missed) stays readable by the operator only; promoting a run to
-# verification/final/ is a deliberate copy.
+# verification/final/ is a deliberate copy. It also finds the operator's public IP for the whole run
+# (vr_operator_ip) and says in SUMMARY.md whether it is masked; when it is unknown, it warns.
 vr_init() {
   local dir="$1"
   if [[ -d "$dir" && -n "$(ls -A -- "$dir")" ]]; then
@@ -102,11 +161,24 @@ vr_init() {
   VR_SEQ=0
   VR_FAILS=0
   VR_SKIPS=0
+  local opip
+  if vr_operator_ip; then
+    opip="masked as <operator_ip> ($VR_OPERATOR_IP_FROM)"
+  else
+    if ((_VR_OPIP_RC == 2)); then
+      opip="not determined (.env is not readable)" # the checks that need .env say so themselves
+    else
+      opip="not determined (OPERATOR_IP in .env is empty or not an address, and checkip.amazonaws.com gave none)"
+      log "warning: cannot determine the operator's public IP, so the evidence cannot mask it; B6 fails if a"
+      log "Lambda rule shows it. Set OPERATOR_IP in .env to the address gpuctl used, or check the network."
+    fi
+  fi
   (
     umask 077
     {
       printf '# Verification run\n\n'
       printf 'Started: %s (%s)\n\n' "$(_vr_now)" "$VR_TZ"
+      printf 'Operator IP: %s\n\n' "$opip"
       printf '| # | ID | Check | Result |\n'
       printf '|---|---|---|---|\n'
     } >"$VR_DIR/SUMMARY.md"
@@ -145,11 +217,14 @@ run_check() {
   # The check keeps the caller's errexit; run_check itself must survive the check failing.
   [[ $- == *e* ]] && errexit=1
   set +e
+  # fd 3 is run_check's own stderr (the operator's terminal under make verify), for _vr_tell.
   (
     if ((errexit)); then set -e; fi
+    # shellcheck disable=SC2030 # meant for this check's subshell only (_vr_tell)
+    _VR_CHECK_ID="$id" _VR_CHECK_FILE="$file" _VR_TELL_FD=3
     trap _vr_reap EXIT
     "$func" "$@"
-  ) </dev/null 2>&1 | redact >>"$file"
+  ) 3>&2 </dev/null 2>&1 | redact >>"$file"
   local -a status=("${PIPESTATUS[@]}")
   if ((errexit)); then set -e; fi
   rc=${status[0]}
@@ -271,31 +346,61 @@ _vr_within() {
   return 124
 }
 
-# _vr_on_signal CMD…: when the check is interrupted (SIGINT: Ctrl-C during make verify or the demo;
-# SIGTERM), kill its background jobs, run CMD (for at most 120 s; a shell function is fine) and end
-# the check by the same signal, so verify.sh and the demo stop as they would without the trap.
-# _vr_on_signal without CMD removes the trap. The EXIT trap stays the harness's (_vr_reap).
+# _vr_on_signal [--left WHAT] CMD…: when the check is interrupted (SIGINT: Ctrl-C during make verify
+# or the demo; SIGTERM), kill its background jobs, run CMD (for at most 120 s; a shell function is
+# fine) and end the check by the same signal, so verify.sh and the demo stop as they would without
+# the trap. WHAT names what CMD removes; if CMD fails, the operator is told it may remain and how to
+# remove it. _vr_on_signal without CMD removes the trap. The EXIT trap stays the harness's (_vr_reap).
 _vr_on_signal() {
   if (($# == 0)); then
     trap - INT TERM
     return 0
+  fi
+  _VR_ON_SIGNAL_LEFT="what that command removes"
+  if [[ "$1" == --left ]]; then
+    _VR_ON_SIGNAL_LEFT="$2"
+    shift 2
   fi
   _VR_ON_SIGNAL=("$@")
   trap '_vr_signalled INT' INT
   trap '_vr_signalled TERM' TERM
 }
 
-# _vr_signalled SIGNAL: the trap set by _vr_on_signal. Ctrl-C reaches the evidence filter (redact)
-# too, so writes to the evidence may fail: SIGPIPE is ignored, errexit is off, and CMD's own output
-# is dropped (kubectl or gcloud must not die on a closed pipe before they have done their work).
+# _vr_tell [LINE…]: LINEs (else stdin's lines), redacted, to the operator and into the check's
+# evidence file. The operator sees them on run_check's own stderr (fd 3; outside run_check, stderr),
+# prefixed with the check's id. For the interrupt cleanup: Ctrl-C has also ended the evidence filter
+# the check's output normally goes through, so that output would be lost.
+# shellcheck disable=SC2031 # run_check sets the _VR_CHECK_* and _VR_TELL_FD in the check's subshell
+_vr_tell() {
+  local line fd="${_VR_TELL_FD:-2}"
+  if (($#)); then printf '%s\n' "$@"; else cat; fi | redact | while IFS= read -r line || [[ -n "$line" ]]; do
+    if [[ -n "${_VR_CHECK_FILE:-}" ]]; then printf '%s\n' "$line" >>"$_VR_CHECK_FILE"; fi
+    printf '%s: %s\n' "${_VR_CHECK_ID:-check}" "$line" >&"$fd"
+  done 2>/dev/null
+}
+
+# _vr_signalled SIGNAL: the trap set by _vr_on_signal. SIGPIPE is ignored and errexit is off while it
+# cleans up (a closed pipe must not end kubectl or gcloud before they have done their work). The
+# cleanup's progress, its output and its outcome go to the operator and the evidence (_vr_tell).
 _vr_signalled() {
+  local line rc how
   set +e
   trap - INT TERM
   trap '' PIPE
   _vr_reap
-  printf 'interrupted (SIG%s); cleaning up:\n' "$1" >&2
-  _vr_quote "${_VR_ON_SIGNAL[@]}" | redact >&2
-  _vr_within 120 "${_VR_ON_SIGNAL[@]}" </dev/null >/dev/null 2>&1
+  line="$(_vr_quote "${_VR_ON_SIGNAL[@]}")"
+  line="${line#\$ }"
+  _vr_tell "interrupted (SIG$1); cleaning up (at most 120 s): $line"
+  _vr_within 120 "${_VR_ON_SIGNAL[@]}" </dev/null 2>&1 | _vr_tell
+  rc=${PIPESTATUS[0]}
+  if ((rc == 0)); then
+    _vr_tell "cleanup done"
+  else
+    how="exit $rc"
+    ((rc != 124)) || how="stopped after 120 s"
+    _vr_tell "cleanup FAILED ($how); may remain: $_VR_ON_SIGNAL_LEFT" \
+      "to remove it, run from the repository root in bash: source scripts/lib/checks.sh && vr_env && $line"
+  fi
   trap - PIPE
   kill -s "$1" "${BASHPID:-$$}"
   exit 1
@@ -655,6 +760,13 @@ _vr_b2_flows() {
     }'
 }
 
+# B2's cleanup on interrupt, on k3s-cp: stop the capture, wait until it is gone, then remove its file.
+# A Ctrl-C while the check still waits for tcpdump to start could otherwise remove the file before
+# tcpdump creates it. The pattern matches the capture's command line ([^ ]+: the interface) but not
+# this command's own, nor pkill's or pgrep's ("[.]" in their text is not the "." it matches).
+# shellcheck disable=SC2016 # expanded on k3s-cp
+_VR_B2_CLEANUP='p='\''tcpdump -ni [^ ]+ -U -w /tmp/b2[.]pcap'\''; sudo pkill -f "$p"; i=0; while sudo pgrep -f "$p" >/dev/null && [ $i -lt 30 ]; do sleep 1; i=$((i + 1)); done; sudo rm -f /tmp/b2.pcap'
+
 # B2: capture on k3s-cp's default interface while the probes on the other nodes send 20 requests
 # each, carrying a random marker header, to the echo Pod on k3s-cp. PASS: ① the marker is not in
 # the capture's payloads; ② there is udp/51820, and each sending node has at least 40 such packets
@@ -685,7 +797,7 @@ check_b2_wire() {
   cp_echo="$(vr_cap echo_on "$CP_NAME")" || return 1
 
   capf="$(mktemp)" || return 1
-  _vr_on_signal cp_ssh 'sudo rm -f /tmp/b2.pcap'
+  _vr_on_signal --left "/tmp/b2.pcap (the packet capture) on $CP_NAME" cp_ssh "$_VR_B2_CLEANUP"
   vr_bg "$capf" cp_ssh "umask 077 && sudo timeout 25 tcpdump -ni $iface -U -w /tmp/b2.pcap 'not port 22'"
   pid="$VR_BG_PID"
   if _vr_wait_text "$capf" "listening on" "$pid" 60; then
@@ -796,13 +908,18 @@ check_b3_wg() {
 # SERVER_NODE (-n 50M: a bounded transfer, spec §9 B4), and record bits_per_second. The server runs
 # with --forceflush: through kubectl exec without a tty its stdout is a pipe, which iperf3 otherwise
 # buffers, so "Server listening" would only arrive when it exits. When the measurement fails, the
-# server is stopped in its probe too (stopping kubectl leaves it listening on 5201 for up to 150 s).
+# server is stopped in its probe too (stopping kubectl leaves it listening on 5201 for up to 150 s);
+# so it is on interrupt, and a server left by an earlier run is stopped before this one starts.
 _vr_b4_pair() {
   local sprobe sip logf pid json rc=0 sent recv mbit
   sprobe="$(vr_cap probe_on "$3")" || return 1
   sip="$(vr_cap kc -n nettest get pod "$sprobe" "$_VR_RT" -o 'jsonpath={.status.podIP}')" || return 1
   is_ipv4 "$sip" || { echo "B4: $sprobe has no Pod IP: '$sip'"; return 1; }
   logf="$(mktemp)" || return 1
+  # A server left by an interrupted run would hold port 5201: stop it (pkill exits 1 when none is left).
+  vr_cmd kc_within 60 -n nettest exec "$sprobe" -- pkill -x iperf3 || true
+  _vr_on_signal --left "an iperf3 server on port 5201 in $sprobe (it ends by itself within 150 s)" \
+    kc_within 60 -n nettest exec "$sprobe" -- pkill -x iperf3
   vr_bg "$logf" kc_within 170 -n nettest exec "$sprobe" -- timeout 150 iperf3 -s -1 --forceflush
   pid="$VR_BG_PID"
   if _vr_wait_text "$logf" "Server listening" "$pid" 60; then
@@ -818,6 +935,7 @@ _vr_b4_pair() {
     _vr_stop "$pid"
     vr_cmd kc_within 60 -n nettest exec "$sprobe" -- pkill -x iperf3 || true
   fi
+  _vr_on_signal
   _vr_show "$logf" "iperf3 server on $3 ($sprobe)"
   if ((rc != 0)); then
     echo "B4: iperf3 $2 -> $3 failed (exit $rc)"
@@ -903,33 +1021,44 @@ _vr_table() {
             sub(/ +$/, "", line); print line } }'
 }
 
-# _vr_mask_ids: stdin -> stdout with the GCP project id and the operator's IP (OPERATOR_IP) from .env
-# replaced by <GCP_PROJECT> and <operator_ip>: B6's evidence holds both, and a run promoted to
+# A line of `gpuctl rules` for Lambda's rule that admits the operator (lambda/gpuctl/peers.py).
+_VR_OPERATOR_RULE_RE='^(  [a-z]+ +[^ ]+ +)[0-9.]+(/32 +operator ssh)$'
+
+# _vr_mask_ids: stdin -> stdout with the GCP project id from .env replaced by <GCP_PROJECT> and the
+# operator's IP (vr_operator_ip) by <operator_ip>: B6's evidence holds both, and a run promoted to
 # verification/final is committed (Ruling R39 keeps real project ids and IPs out of what is
-# delivered). Each is checked first, so the only sed metacharacters in them are an IP's dots; the IP
-# must stand alone (198.51.100.2 is not masked inside 198.51.100.20).
+# delivered). redact masks the IP in all evidence too; this covers a check called without vr_init.
+# The project id is checked first, so it holds no sed metacharacter. The source of Lambda's
+# "operator ssh" rule is masked even when the operator's IP is unknown.
 _vr_mask_ids() {
   local -a exprs=(-e '')
   if _gcp_project_ok; then
     exprs+=(-e "s/${GCP_PROJECT}/<GCP_PROJECT>/g")
   fi
-  if is_ipv4 "${OPERATOR_IP:-}"; then
-    exprs+=(-e "s/(^|[^0-9.])${OPERATOR_IP//./\\.}(\$|[^0-9])/\\1<operator_ip>\\2/g")
-  fi
-  LC_ALL=C sed -E "${exprs[@]}"
+  exprs+=(-e "s#${_VR_OPERATOR_RULE_RE}#\\1<operator_ip>\\2#")
+  LC_ALL=C sed -E "${exprs[@]}" ${_VR_MASK_EXPRS[@]+"${_VR_MASK_EXPRS[@]}"}
 }
 
 # B6: the GCP firewall rules named fw-* as a table, and gpuctl's Lambda rules. Every source must be
 # one address (/32), except Google's IAP range 35.235.240.0/20. An ingress rule without source
 # ranges admits every address on GCP, so it fails too, as does a tag or service-account source.
-# The evidence shows the project id and the operator's IP masked (_vr_mask_ids).
+# The evidence shows the project id and the operator's IP masked (_vr_mask_ids). When the operator's
+# IP is unknown, the rest of the run's evidence cannot mask it, so B6 fails if Lambda's
+# "operator ssh" rule shows it.
 check_b6_firewall_inventory() {
-  local outf rc=0
+  local outf rc=0 known=1
   vr_env
+  vr_operator_ip || known=0
   outf="$(mktemp)" || return 1
   _vr_b6 >"$outf" 2>&1 || rc=$?
   if ! _vr_mask_ids <"$outf"; then
     echo "B6: cannot mask the project id and the operator IP; the evidence is left out"
+    rc=1
+  fi
+  if ((!known)) && grep -Eq -- "$_VR_OPERATOR_RULE_RE" "$outf"; then
+    echo "B6: cannot determine the operator's public IP (OPERATOR_IP in .env is empty or not an address,"
+    echo "and checkip.amazonaws.com gave none), so this run's evidence cannot mask it; the source of the"
+    echo "'operator ssh' rule is masked above. Set OPERATOR_IP in .env to the address gpuctl used, run again."
     rc=1
   fi
   rm -f -- "$outf"
@@ -1188,7 +1317,8 @@ check_c7_limits_demo() {
   vr_env
   vr_cmd kc -n limits-demo delete pod oom cpu-burn --ignore-not-found --timeout=90s \
     || echo "C7: could not delete Pods left from an earlier run (going on)"
-  _vr_on_signal kc -n limits-demo delete pod oom cpu-burn --ignore-not-found --wait=false "$_VR_RT"
+  _vr_on_signal --left "the Pods oom and cpu-burn in namespace limits-demo" \
+    kc -n limits-demo delete pod oom cpu-burn --ignore-not-found --wait=false "$_VR_RT"
   (_vr_c7) || rc=1
   vr_cmd kc -n limits-demo delete pod oom cpu-burn --ignore-not-found --timeout=90s \
     || { echo "C7: cannot delete the demo Pods"; rc=1; }
@@ -1239,7 +1369,8 @@ check_c8_netpol() {
   fi
   vr_cmd kc delete namespace np-denied --ignore-not-found --timeout=120s \
     || { echo "C8: cannot delete np-denied left from an earlier run"; return 1; }
-  _vr_on_signal kc delete namespace np-denied --ignore-not-found --wait=false "$_VR_RT"
+  _vr_on_signal --left "the namespace np-denied (its client Pod)" \
+    kc delete namespace np-denied --ignore-not-found --wait=false "$_VR_RT"
   (_vr_c8) || rc=1
   vr_cmd kc delete namespace np-denied --ignore-not-found --timeout=120s \
     || { echo "C8: cannot delete the np-denied namespace"; rc=1; }

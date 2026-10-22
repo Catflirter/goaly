@@ -15,11 +15,12 @@ import shutil
 import signal
 import socket
 import subprocess
+import sys
 import time
 
 import pytest
 
-from test_ops_scripts import ROOT, Env, free_port
+from test_ops_scripts import FAKES, ROOT, Env, free_port
 
 CP, CPU1, GPU1 = "k3s-cp", "k3s-cpu-1", "k3s-gpu-a6000-1"
 NODES = {
@@ -106,7 +107,9 @@ FIREWALL = [
      "targetServiceAccounts": ["k3s-cp@p.iam.gserviceaccount.com"]},
 ]
 LISTENING = "tcpdump: listening on ens4, link-type EN10MB (Ethernet), snapshot length 262144 bytes\n"
-GPUCTL_RULES = ("global\n  tcp   22          198.51.100.200/32  operator ssh\n"
+# The operator's public IP: the fake checkip.amazonaws.com answers it (OPERATOR_IP is empty in the test .env).
+OPERATOR = "198.51.100.200"
+GPUCTL_RULES = (f"global\n  tcp   22          {OPERATOR}/32  operator ssh\n"
                 "ruleset k3s-gpu-us-west-1 rs-1 us-west-1\n  udp   51820       192.0.2.10/32      k3s-cp wireguard\n"
                 "ruleset k3s-gpu-us-east-1 rs-2 us-east-1\n  (no rules)\n")
 
@@ -182,6 +185,7 @@ def healthy(nodes=(CP, CPU1), mtu=1460):
                 {"stdout": "usage_usec 19\nnr_periods 150\nnr_throttled 140\n"}]),
         rule("gcloud", ["compute firewall-rules list"], stdout=json.dumps(FIREWALL)),
         rule("gpuctl", ["rules"], stdout=GPUCTL_RULES),
+        rule("curl", ["checkip.amazonaws.com"], stdout=OPERATOR + "\n"),
     ]
     return r
 
@@ -195,6 +199,12 @@ class Cluster(Env):
             shutil.copy2(ROOT / rel, self.repo / rel)
         self.scenario["answers"] = healthy(nodes)
         self.scenario["gpu_ip"] = NODES[GPU1]["ext"]
+        # curl to checkip.amazonaws.com (vr_init's operator IP lookup) is the fake; C3's local curl is real.
+        (self.bin / "curl").write_text(
+            '#!/bin/sh\ncase "$*" in *checkip.amazonaws.com*) exec "%s" "%s" curl "$@" ;; esac\nexec "%s" "$@"\n'
+            % (sys.executable, FAKES, shutil.which("curl")))
+        (self.bin / "curl").chmod(0o755)
+        self.interrupted = ("", "")
 
     def first(self, *rules):
         """Answers that win over the healthy ones (the first matching rule answers)."""
@@ -213,7 +223,7 @@ class Cluster(Env):
     def interrupt(self, func, when, sig):
         """Run FUNC through run_check (as verify.sh does), send SIG to the whole process group (Ctrl-C
         reaches every process in the terminal's group) once a fake call holding WHEN was made; the
-        exit status of the run."""
+        exit status of the run. self.interrupted is then (the run's stderr, the check's evidence)."""
         run = self.repo / "verification" / "s"
         code = f"set -euo pipefail; source scripts/lib/checks.sh; vr_init {run}; run_check T title {func}"
         proc = subprocess.Popen(["bash", "-c", code], cwd=self.repo, start_new_session=True,
@@ -226,7 +236,7 @@ class Cluster(Env):
             time.sleep(0.05)
         time.sleep(0.3)                                    # the call is running: the check waits on it
         os.killpg(proc.pid, sig)
-        proc.communicate(timeout=60)
+        _, err = proc.communicate(timeout=60)
         # SIGTERM ends the outer shell at once; the check's own shell cleans up after it: wait for the group
         while time.monotonic() < deadline + 60:
             try:
@@ -236,6 +246,7 @@ class Cluster(Env):
             time.sleep(0.05)
         else:
             raise AssertionError("processes of the interrupted check are still running")
+        self.interrupted = (err.decode(errors="replace"), (run / "01-T.txt").read_text())
         return proc.returncode
 
     def kubectl(self):
@@ -541,13 +552,34 @@ def test_b2_does_not_call_an_unreadable_capture_marker_free(env):
     assert "not in the capture" not in text and "B2 ①: cannot search the capture (exit 1)" in text
 
 
+def assert_b2_interrupt_cleanup(env):
+    """The last command on k3s-cp stops the capture (pkill), waits until it is gone, then removes the file;
+    its pattern matches the capture's command line but not the cleanup's own."""
+    cmds = env.remote(CP)
+    last = cmds[-1]
+    assert "sudo pkill -f" in last and "pgrep -f" in last and last.endswith("sudo rm -f /tmp/b2.pcap")
+    assert last.index("pkill") < last.index("pgrep") < last.index("rm -f")
+    pattern = re.search(r"p='([^']+)'", last).group(1)
+    capture = next(c for c in cmds if "tcpdump -ni ens4 -U -w /tmp/b2.pcap" in c)
+    assert re.search(pattern, capture) and re.search(pattern, f"bash -c {capture}")
+    assert not re.search(pattern, last)
+    assert not any("tcpdump -nn -q" in c for c in cmds)
+
+
 @pytest.mark.parametrize("sig", [signal.SIGINT, signal.SIGTERM])
 def test_b2_removes_the_pcap_when_interrupted_mid_capture(env, sig):
     env.first(on(CP, "tcpdump -ni ens4", rc=124, stderr=LISTENING, sleep=30))
     rc = env.interrupt("check_b2_wire", "X-Marker", sig)
     assert rc == -sig                                              # the run stops: verify.sh does not go on
-    assert env.remote(CP)[-1] == "sudo rm -f /tmp/b2.pcap"
-    assert not any("tcpdump -nn -q" in c for c in env.remote(CP))
+    assert_b2_interrupt_cleanup(env)
+
+
+def test_b2_interrupted_before_the_capture_said_it_listens_stops_it_before_removing_the_file(env):
+    # Ctrl-C during the start wait: tcpdump may open /tmp/b2.pcap only after a plain rm
+    env.first(on(CP, "tcpdump -ni ens4", sleep=30))
+    assert env.interrupt("check_b2_wire", "tcpdump -ni ens4", signal.SIGINT) == -signal.SIGINT
+    assert_b2_interrupt_cleanup(env)
+    assert not any("X-Marker" in " ".join(a) for a in env.kubectl())
 
 
 def test_b2_waits_out_a_late_capture_before_removing_it_when_the_start_was_not_seen(env):
@@ -615,7 +647,9 @@ def test_b4_measures_cpu1_to_cp_and_records_bits_per_second(env):
     assert ["-n", "nettest", "exec", NODES[CPU1]["probe"], "--", "timeout", "120", "iperf3", "-c",
             NODES[CP]["probe_ip"], "-n", "50M", "-J"] in execs
     assert "bits_per_second=410000000" in text
-    assert not any("pkill" in a for a in execs)                     # the one-off server ended by itself
+    # a server left by an interrupted run is stopped first; the one-off server then ends by itself
+    assert [a for a in execs if "pkill" in a] == [PKILL_CP]
+    assert execs.index(PKILL_CP) < next(i for i, a in enumerate(execs) if "-s" in a and "iperf3" in a)
 
 
 def test_b4_also_measures_cpu1_to_each_gpu_node(env3):
@@ -631,6 +665,22 @@ def test_b4_fails_when_the_client_fails_and_stops_the_server(env):
     env.first(kc("exec", "iperf3 -c", rc=1, stderr="iperf3: error - unable to connect to server\n"))
     assert env.check("check_b4_iperf")[0] == "FAIL"
     assert env.kubectl()[-1] == PKILL_CP                     # so a re-run can listen on 5201 again
+
+
+def test_b4_goes_on_when_no_server_was_left_over(env):
+    env.first(kc("exec", "pkill -x iperf3", rc=1))                # pkill: no process matched
+    result, text = env.check("check_b4_iperf")
+    assert result == "PASS", text
+
+
+@pytest.mark.parametrize("sig", [signal.SIGINT, signal.SIGTERM])
+def test_b4_stops_the_iperf3_server_when_interrupted(env, sig):
+    # else it listens on 5201 for up to 150 s and an immediate re-run fails with "address in use"
+    env.first(kc("exec", "iperf3 -c", sleep=30))
+    assert env.interrupt("check_b4_iperf", "50M", sig) == -sig        # the client is running
+    assert env.kubectl()[-1] == PKILL_CP
+    err, text = env.interrupted
+    assert "may remain" not in err and "cleanup done" in err
 
 
 def test_b4_fails_when_the_server_never_says_it_listens_and_stops_it(env):
@@ -701,6 +751,8 @@ def test_b6_lists_the_gcp_rules_and_the_lambda_rules(env):
                            "tcp:6443,udp:51820,icmp", "k3s-cp@p.iam.gserviceaccount.com"]
     assert "ruleset k3s-gpu-us-west-1" in text
     assert "$ bounded 120 gcloud compute firewall-rules list --project <GCP_PROJECT> " in text
+    # .env has no OPERATOR_IP: the address checkip.amazonaws.com reports (gpuctl's) is masked
+    assert OPERATOR not in text and "<operator_ip>/32  operator ssh" in text
 
 
 def test_b6_evidence_masks_the_project_id_and_the_operator_ip(env):
@@ -716,6 +768,83 @@ def test_b6_evidence_masks_the_project_id_and_the_operator_ip(env):
     assert "k3s-cp@<GCP_PROJECT>.iam.gserviceaccount.com" in text
     assert "<operator_ip>/32  operator ssh" in text and "35.235.240.0/20,<operator_ip>/32" in text
     assert "198.51.100.20/32" in text                                # only that exact address is masked
+
+
+@pytest.mark.parametrize("env_line, curl", [
+    ("", rule("curl", ["checkip.amazonaws.com"], rc=6, stderr="curl: (6) Could not resolve host\n")),
+    ("", rule("curl", ["checkip.amazonaws.com"], stdout="<html>captive portal</html>\n")),
+    ("OPERATOR_IP=not-an-ip\n", None),                             # gpuctl refuses it; nothing to look up
+])
+def test_b6_fails_with_the_operator_rule_masked_when_the_operator_ip_is_unknown(env, env_line, curl):
+    env.write_env(env.repo.joinpath(".env").read_text() + env_line)
+    if curl:
+        env.first(curl)
+    result, text = env.check("check_b6_firewall_inventory")
+    assert result == "FAIL", text
+    assert OPERATOR not in text and "<operator_ip>/32  operator ssh" in text
+    assert "B6: cannot determine the operator's public IP" in text
+    assert "Operator IP: not determined" in (env.repo / "verification/t/SUMMARY.md").read_text()
+    assert len(env.argvs("curl")) == (1 if curl else 0)
+
+
+def test_b6_passes_with_an_unknown_operator_ip_when_no_rule_holds_it(env):
+    no_operator_rule = "global\n  (no rules)\n" + GPUCTL_RULES.split("\n", 2)[2]
+    env.first(rule("curl", ["checkip.amazonaws.com"], rc=28), rule("gpuctl", ["rules"], stdout=no_operator_rule))
+    result, text = env.check("check_b6_firewall_inventory")
+    assert result == "PASS", text
+
+
+# ---- the operator's IP is masked in all evidence (spec §9; Ruling R39) --------------------------
+
+def run_two_checks(env, body):
+    """vr_init, then two checks running BODY; (the run directory, the shell's stdout + stderr)."""
+    run = env.repo / "verification" / "m"
+    code = (f"set -euo pipefail; source scripts/lib/checks.sh; vr_init {run}; f(){{ {body}; }}; "
+            "run_check T one f; run_check U two f; vr_finish")
+    proc = env.run(["bash", "-c", code])
+    return run, proc.stdout + proc.stderr
+
+
+def test_operator_ip_from_checkip_is_looked_up_once_and_masked_in_every_check(env):
+    # .env.example leaves OPERATOR_IP empty: gpuctl then uses what checkip.amazonaws.com reports
+    run, out = run_two_checks(env, f"echo 'ssh from {OPERATOR}:22'; vr_cmd echo {OPERATOR} >&2")
+    assert env.argvs("curl") == [["-fsS", "--max-time", "5", "https://checkip.amazonaws.com"]]
+    for name in ("01-T.txt", "02-U.txt"):
+        text = (run / name).read_text()
+        assert OPERATOR not in text
+        assert "ssh from <operator_ip>:22" in text and "$ echo <operator_ip>" in text
+    summary = (run / "SUMMARY.md").read_text()
+    assert "Operator IP: masked as <operator_ip> (checkip.amazonaws.com)" in summary
+    assert OPERATOR not in summary + out
+
+
+def test_operator_ip_from_env_is_trimmed_and_not_looked_up(env):
+    env.write_env(env.repo.joinpath(".env").read_text() + f'OPERATOR_IP=" {OPERATOR} "\n')
+    run, out = run_two_checks(env, f"echo 'from {OPERATOR}'")
+    assert env.argvs("curl") == []
+    assert "from <operator_ip>" in (run / "02-U.txt").read_text()
+    assert "Operator IP: masked as <operator_ip> (OPERATOR_IP in .env)" in (run / "SUMMARY.md").read_text()
+
+
+def test_unknown_operator_ip_is_reported_in_the_summary_and_to_the_operator(env):
+    env.first(rule("curl", ["checkip.amazonaws.com"], rc=6))
+    run, out = run_two_checks(env, "echo hi")
+    assert "Operator IP: not determined" in (run / "SUMMARY.md").read_text()
+    assert "cannot determine the operator's public IP" in out
+
+
+@pytest.mark.parametrize("line, want", [
+    ("{ip},{ip}", "<operator_ip>,<operator_ip>"),                    # one separator between two occurrences
+    ("{ip} {ip}", "<operator_ip> <operator_ip>"),
+    ("{ip},{ip},{ip},{ip}", ",".join(["<operator_ip>"] * 4)),
+    ("{ip}/32 x{ip}.51820", "<operator_ip>/32 x<operator_ip>.51820"),
+    ("{ip}0 1{ip} 10.{ip} 198.51.100.20 198x51x100x200", "{ip}0 1{ip} 10.{ip} 198.51.100.20 198x51x100x200"),
+])
+def test_operator_ip_mask_catches_adjacent_occurrences_and_only_whole_addresses(env, line, want):
+    env.write_env(env.repo.joinpath(".env").read_text() + f"OPERATOR_IP={OPERATOR}\n")
+    proc = env.run(["bash", "-c", "source scripts/lib/checks.sh; vr_operator_ip; redact"],
+                   stdin=line.format(ip=OPERATOR) + "\n")
+    assert proc.stdout == want.format(ip=OPERATOR) + "\n", proc.stderr
 
 
 @pytest.mark.parametrize("change", [
@@ -965,6 +1094,40 @@ def test_c8_deletes_the_namespace_when_interrupted(env, sig):
     env.first(kc("-n np-denied wait pod/client", sleep=30))
     assert env.interrupt("check_c8_netpol", "pod/client", sig) == -sig
     assert np_calls(env)[-1] == ["delete", "namespace", "np-denied", "--ignore-not-found", "--wait=false", RT]
+
+
+@pytest.mark.parametrize("sig", [signal.SIGINT, signal.SIGTERM])
+def test_interrupt_cleanup_is_shown_to_the_operator_and_recorded(env, sig):
+    # Ctrl-C also ends the evidence filter: the cleanup's progress goes to the operator's terminal as well
+    env.first(kc("-n np-denied wait pod/client", sleep=30))
+    assert env.interrupt("check_c8_netpol", "pod/client", sig) == -sig
+    err, text = env.interrupted
+    for out in (err, text):
+        assert f"interrupted ({sig.name}); cleaning up (at most 120 s): kc delete namespace np-denied" in out
+        assert "cleanup done" in out and "may remain" not in out
+    assert "T: cleanup done" in err
+
+
+def test_failed_interrupt_cleanup_says_what_may_remain_and_how_to_remove_it(env):
+    env.first(on(CP, "tcpdump -ni ens4", rc=124, stderr=LISTENING, sleep=30),
+              on(CP, "sudo rm -f /tmp/b2.pcap", rc=255, stderr="ERROR: (gcloud.compute.ssh) IAP tunnel failed\n"))
+    assert env.interrupt("check_b2_wire", "X-Marker", signal.SIGINT) == -signal.SIGINT
+    err, text = env.interrupted
+    for out in (err, text):
+        assert "IAP tunnel failed" in out                           # the cleanup's own output is shown
+        assert "cleanup FAILED (exit 255)" in out
+        assert "may remain: /tmp/b2.pcap (the packet capture) on k3s-cp" in out
+        assert "source scripts/lib/checks.sh && vr_env && cp_ssh " in out
+    assert "cleanup done" not in err
+
+
+def test_c7_interrupt_names_the_pods_that_may_remain(env):
+    env.first(kc("-n limits-demo wait pod/cpu-burn", sleep=30),
+              kc("-n limits-demo delete pod oom cpu-burn", "--wait=false", rc=1, stderr="Unable to connect\n"))
+    assert env.interrupt("check_c7_limits_demo", "pod/cpu-burn", signal.SIGTERM) == -signal.SIGTERM
+    err, _ = env.interrupted
+    assert "may remain: the Pods oom and cpu-burn in namespace limits-demo" in err
+    assert "source scripts/lib/checks.sh && vr_env && kc -n limits-demo delete pod oom cpu-burn" in err
 
 
 def test_c8_fails_without_touching_np_denied_when_c2_fails(env):
