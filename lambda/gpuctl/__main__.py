@@ -24,13 +24,15 @@ from gpuctl.peers import ruleset_name
 from gpuctl.planner import (
     LIVE_STATUSES, PlanError, check_limits, keeper_order, make_plan, owned_instances, plan_lines, target_counts,
 )
-from gpuctl.reconcile import Reconciler, ReconcileError, Settings, load_overrides
+from gpuctl.reconcile import Reconciler, ReconcileError, Settings, load_overrides, read_down_marker
 from gpuctl.spec import Spec, SpecError, load_spec
 from gpuctl.status import DRIFT_SOURCES, capacity_rows, is_problem, render_capacity
 
 REPO_ROOT = Path(__file__).resolve().parents[2]
 DEFAULT_SPEC = REPO_ROOT / "lambda" / "gpu-nodes.yaml"
 OVERRIDES_PATH = REPO_ROOT / "lambda" / ".autoscale-state.json"
+# gpu-down's record (live finding L21-1): while it exists, status wants 0 instances per pool; apply removes it
+DOWN_MARKER_PATH = REPO_ROOT / "lambda" / ".gpu-down"
 API_KEY_ENV = "LAMBDA_API_KEY"
 SSH_KEY_ENV = "LAMBDA_SSH_KEY_NAME"
 RULESET_PREFIX = ruleset_name("")  # "k3s-gpu-": the rulesets gpuctl owns, one per region
@@ -126,6 +128,9 @@ def _plan(args: argparse.Namespace, spec: Spec, client, out: TextIO) -> int:
 
     for instance in plan.keep:
         _checked_ip(instance)
+    down_since = read_down_marker(DOWN_MARKER_PATH)
+    if down_since is not None:
+        _emit(out, f"Note: make gpu-down set every pool to 0 ({down_since}); gpu-apply ends that and does this:")
     for line in plan_lines(plan, spec):
         _emit(out, line)
     try:
@@ -151,7 +156,12 @@ def _status(args: argparse.Namespace, spec: Spec, client, infra, env: Mapping[st
     if others:
         _emit(out, f"Note: {others} other running instance(s) on this Lambda account are not managed by gpuctl")
 
-    lines = _reconciler(args, client, infra, env, out).drift(spec, instances)
+    reconciler = _reconciler(args, client, infra, env, out)
+    down_since = reconciler.down_since()
+    if down_since is not None:
+        _emit(out, f"GPU pools: down since {down_since} (make gpu-down): every pool wants 0 instances until "
+                   "make gpu-apply")
+    lines = reconciler.drift(spec, instances)
     _emit(out)
     _emit(out, "Drift check (Lambda instances, cluster nodes, gpu-access state, k3s-cp k3s_peers):")
     for line in lines:
@@ -216,7 +226,7 @@ def _confirm(out: TextIO) -> Callable[[str], bool]:
 
 def _reconciler(args: argparse.Namespace, client, infra, env: Mapping[str, str], out: TextIO) -> Reconciler:
     settings = Settings(spec_path=args.spec, overrides_path=OVERRIDES_PATH,
-                        ssh_key_name=env.get(SSH_KEY_ENV, "").strip())
+                        ssh_key_name=env.get(SSH_KEY_ENV, "").strip(), down_marker_path=DOWN_MARKER_PATH)
     if infra is None:
         infra = Infra(SubprocessShell(), REPO_ROOT, env)
     return Reconciler(client, infra, settings, out=out, confirm=_confirm(out))

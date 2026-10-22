@@ -14,3 +14,10 @@ def fake_shells_use_every_scripted_result():
     for sh in shells:
         assert not sh.results, (f"FakeShell left {len(sh.results)} scripted result(s) unused after "
                                 f"{len(sh.calls)} call(s) {[c.args for c in sh.calls]}: {sh.results}")
+
+
+@pytest.fixture(autouse=True)
+def no_down_marker_in_the_checkout(monkeypatch, tmp_path_factory):
+    """gpu-down's record (lambda/.gpu-down, L21-1) of every test that runs main() lives in a temporary directory."""
+    import gpuctl.__main__ as cli
+    monkeypatch.setattr(cli, "DOWN_MARKER_PATH", tmp_path_factory.mktemp("down") / ".gpu-down", raising=False)
