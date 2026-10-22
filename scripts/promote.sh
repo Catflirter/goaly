@@ -2,6 +2,21 @@
 # Promote recorded evidence into verification/final/, the committed deliverable (spec section 9).
 #
 #   scripts/promote.sh verify RUN_DIR   (make promote-verify RUN=verification/<YYYY-MM-DDTHHMM-0700>)
+#   scripts/promote.sh demo DEMO_DIR    (make promote-demo RUN=verification/demo-<YYYY-MM-DDTHHMM-0700>)
+#
+# demo (Task 25): DEMO_DIR must be a scripts/demo.sh run, verification/demo-<YYYY-MM-DDTHHMM±zzzz>/ directly
+# under verification/, holding only regular files named chN.txt (N 1-8; at least one) and timings.txt. A run
+# whose timings.txt records a chapter with a failed step or an interrupted chapter, or that holds a chN.txt with no
+# timings.txt line (the demo was killed part-way through it), is refused (exit 2): its
+# recording is a fallback that would replay the failure; PROMOTE_ALLOW_FAIL=1 promotes it with a warning
+# naming those chapters. It is copied, checked again, scanned and IP-checked exactly as a verify run is
+# (below), and project-checked (see check_project), and the clean copy replaces verification/final/demo/
+# (the recordings make demo-replay plays), the rest of final/ untouched; a missing final/ is created. A
+# verify promotion keeps an existing final/demo/: it is copied into the staged copy, checked by the demo
+# rules, scanned, IP-checked and project-checked with it, and swapped in together with it (a final/demo/
+# that fails any of that fails the promotion, exit 1). So promoting a demo before or after the final verify
+# run gives the same final/ (progress note for Task 25: verify replaces all of final/ otherwise). Only
+# final/demo/ is exempt from the flat-run rule, and only by these demo rules.
 #
 # verify: RUN_DIR must be a finished scripts/verify.sh run, verification/<YYYY-MM-DDTHHMM±zzzz>/ directly
 # under this repo's verification/ (after resolving symlinks and ..), never verification/final itself.
@@ -64,6 +79,14 @@ EVIDENCE_NAME='^(SUMMARY\.md|[0-9]{2,}-[A-Za-z0-9]+\.txt|[a-z0-9-]+\.log)$'
 RESULT_LINE='^\*\*Result:\*\* ([0-9]+) passed, ([0-9]+) failed, ([0-9]+) skipped$'
 # One table row of SUMMARY.md as run_check writes it: | <seq> | <ID> | <title> | PASS/FAIL/SKIP |
 TABLE_ROW='^\| [0-9]+ \| '
+# The directory name scripts/demo.sh gives a run, and the files it writes there (Task 25).
+DEMO_RUN_NAME='^demo-[0-9]{4}-[0-9]{2}-[0-9]{2}T[0-9]{4}[+-][0-9]{4}$'
+DEMO_NAME='^(ch[1-8]\.txt|timings\.txt)$'
+# The subdirectories of verification/final a verify promotion keeps (each checked by check_demo).
+KEPT_IN_FINAL=(demo)
+# A chapter's line of timings.txt as scripts/demo.sh writes it; BASH_REMATCH[2] is its failed steps.
+DEMO_TIMING_LINE='^ch([1-8]) [0-9]+s \(commands [0-9]+s; [0-9]+ step\(s\), ([0-9]+) failed, '
+DEMO_INTERRUPTED_LINE='^ch([1-8]) interrupted after '
 # One dotted-quad IPv4 address, no leading zeros (gpuctl's ipaddress module rejects them too).
 OCTET='(25[0-5]|2[0-4][0-9]|1[0-9][0-9]|[1-9]?[0-9])'
 IPV4="^$OCTET\\.$OCTET\\.$OCTET\\.$OCTET\$"
@@ -72,9 +95,15 @@ usage() {
   cat <<'EOF'
 usage: scripts/promote.sh verify RUN_DIR
        (make promote-verify RUN=verification/<YYYY-MM-DDTHHMM-0700>)
+       scripts/promote.sh demo DEMO_DIR
+       (make promote-demo RUN=verification/demo-<YYYY-MM-DDTHHMM-0700>)
 
-  verify RUN_DIR   copy a finished verify run to verification/final/ (replacing the old one) after
-                   gitleaks finds no secrets in the copy
+  verify RUN_DIR   copy a finished verify run to verification/final/ (replacing the old one, but keeping
+                   final/demo/) after gitleaks finds no secrets in the copy
+  demo DEMO_DIR    copy a demo run (scripts/demo.sh) to verification/final/demo/ (replacing the old one)
+                   after gitleaks finds no secrets in the copy, nor the GCP project id (GCP_PROJECT from
+                   the environment, else .env; any case); PROMOTE_ALLOW_FAIL=1 promotes a run with a
+                   failed or interrupted chapter (warned)
 
   PROMOTE_ALLOW_SKIP=1  promote a run with skipped (never failed) checks, noted in final's SUMMARY.md
   OPERATOR_IP=<ip>      also fail when the copy contains this IPv4 address (Task 24 Step 4)
@@ -86,12 +115,14 @@ EOF
 # Staging directory of the copy being scanned (and of the old final during the swap); removed on exit.
 STAGE=""
 LOCKED=0
+# What swap_in replaces: verification/final (verify) or verification/final/demo (demo).
+SWAP_TARGET="$FINAL_DIR"
 _cleanup() {
   if [[ -n "$STAGE" ]]; then
-    # A swap that stopped half way (final gone, the old one aside): put the previous final back first.
-    if [[ ! -e "$FINAL_DIR" && ! -L "$FINAL_DIR" ]] && [[ -e "$STAGE/old" || -L "$STAGE/old" ]] \
-      && ! mv -- "$STAGE/old" "$FINAL_DIR"; then
-      log "error: the previous final is in $STAGE/old; move it back to $FINAL_DIR by hand"
+    # A swap that stopped half way (target gone, the old one aside): put the previous one back first.
+    if [[ ! -e "$SWAP_TARGET" && ! -L "$SWAP_TARGET" ]] && [[ -e "$STAGE/old" || -L "$STAGE/old" ]] \
+      && ! mv -- "$STAGE/old" "$SWAP_TARGET"; then
+      log "error: the previous ${SWAP_TARGET#"$REPO_ROOT"/} is in $STAGE/old; move it back to $SWAP_TARGET by hand"
     else
       rm -rf -- "$STAGE"
     fi
@@ -101,21 +132,42 @@ _cleanup() {
   fi
 }
 
-# resolve_run ARG: print the physical path of the verify run ARG names, or die (2) saying why not.
+# resolve_run ARG [NAME_RE PATTERN KIND]: print the physical path of the run ARG names, or die (2) saying why
+# not. A verify run by default; a demo run with $DEMO_RUN_NAME demo-<YYYY-MM-DDTHHMM-0700> demo.
 resolve_run() {
-  local arg="$1" run vdir name
+  local arg="$1" name_re="${2:-$VERIFY_RUN_NAME}" pattern="${3:-<YYYY-MM-DDTHHMM-0700>}" kind="${4:-verify}"
+  local run vdir name
   [[ -d "$VERIFICATION_DIR" && ! -L "$VERIFICATION_DIR" ]] \
     || die "$VERIFICATION_DIR is not a directory of this repo (missing or a symlink)" 2
   vdir="$(cd -P -- "$VERIFICATION_DIR" && pwd -P)" || die "cannot enter $VERIFICATION_DIR" 2
-  [[ -d "$arg" ]] || die "$arg is not a directory (expected verification/<YYYY-MM-DDTHHMM-0700>)" 2
+  [[ -d "$arg" ]] || die "$arg is not a directory (expected verification/$pattern)" 2
   run="$(cd -P -- "$arg" && pwd -P)" || die "cannot enter $arg" 2
   [[ "${run%/*}" == "$vdir" ]] \
     || die "$arg is not a run directly under $vdir/ (resolves to $run)" 2
   name="${run##*/}"
-  [[ "$name" != final ]] || die "$arg is verification/final itself; name the verify run to promote" 2
-  [[ "$name" =~ $VERIFY_RUN_NAME ]] \
-    || die "$arg ($name) is not named like a verify run (verification/<YYYY-MM-DDTHHMM-0700>)" 2
+  [[ "$name" != final ]] || die "$arg is verification/final itself; name the $kind run to promote" 2
+  [[ "$name" =~ $name_re ]] \
+    || die "$arg ($name) is not named like a $kind run (verification/$pattern)" 2
   printf '%s\n' "$run"
+}
+
+# check_demo DIR WHAT CODE: die (CODE) unless DIR is a demo run as scripts/demo.sh writes it: only regular
+# files (no subdirectory, symlink or dotfile) named chN.txt (N 1-8) or timings.txt, at least one chapter and
+# the timings. WHAT names DIR in messages.
+check_demo() {
+  local dir="$1" what="$2" code="$3" entry bad="" chapters=0
+  [[ -d "$dir" && ! -L "$dir" ]] || die "$what is not a directory (a symlink or missing)" "$code"
+  for entry in "$dir"/*; do
+    if [[ -L "$entry" || ! -f "$entry" || ! "${entry##*/}" =~ $DEMO_NAME ]]; then
+      bad+=" ${entry##*/}"
+    elif [[ "${entry##*/}" == ch* ]]; then
+      chapters=$((chapters + 1))
+    fi
+  done
+  [[ -z "$bad" ]] \
+    || die "$what holds entries scripts/demo.sh does not write (only regular files named chN.txt, N 1-8, or timings.txt):$bad" "$code"
+  ((chapters > 0)) || die "$what holds no chapter recording (chN.txt); is it a scripts/demo.sh run?" "$code"
+  [[ -f "$dir/timings.txt" ]] || die "$what has no timings.txt; is it a finished scripts/demo.sh run?" "$code"
 }
 
 # bad_entries DIR: print (each after a space) the entries of DIR a verify run never holds: anything
@@ -243,26 +295,109 @@ scan_copy() {
   printf '%s' "$found"
 }
 
-# swap_in COPY: replace verification/final with COPY. Interrupts are ignored (also by mv, which
-# inherits it) so the two renames finish together; a failure moves the previous final back.
+# swap_in COPY [TARGET]: replace TARGET (default verification/final) with COPY. Interrupts are ignored
+# (also by mv, which inherits it) so the two renames finish together; a failure moves the previous one back.
 swap_in() {
-  local copy="$1" rc=0
+  local copy="$1" target="${2:-$FINAL_DIR}" rc=0
+  SWAP_TARGET="$target"
   trap '' INT TERM HUP
-  if [[ -e "$FINAL_DIR" || -L "$FINAL_DIR" ]]; then
-    mv -- "$FINAL_DIR" "$STAGE/old" || rc=1
+  if [[ -e "$target" || -L "$target" ]]; then
+    mv -- "$target" "$STAGE/old" || rc=1
   fi
-  # Without the lock a concurrent promotion could have recreated final; mv would then nest the copy in it.
-  if ((rc == 0)) && [[ ! -e "$FINAL_DIR" && ! -L "$FINAL_DIR" ]]; then
-    mv -- "$copy" "$FINAL_DIR" || rc=1
+  # Without the lock a concurrent promotion could have recreated the target; mv would then nest the copy in it.
+  if ((rc == 0)) && [[ ! -e "$target" && ! -L "$target" ]]; then
+    mv -- "$copy" "$target" || rc=1
   else
     rc=1
   fi
-  if ((rc != 0)) && [[ ! -e "$FINAL_DIR" && ! -L "$FINAL_DIR" ]] && [[ -e "$STAGE/old" || -L "$STAGE/old" ]]; then
-    mv -- "$STAGE/old" "$FINAL_DIR" || log "error: the previous final is in $STAGE/old; restore it by hand"
+  if ((rc != 0)) && [[ ! -e "$target" && ! -L "$target" ]] && [[ -e "$STAGE/old" || -L "$STAGE/old" ]]; then
+    mv -- "$STAGE/old" "$target" || log "error: the previous ${target#"$REPO_ROOT"/} is in $STAGE/old; restore it by hand"
   fi
   trap 'exit 130' INT
   trap 'exit 143' TERM HUP
   return "$rc"
+}
+
+# check_ip DIR IP WHERE: exit 1 when the operator IP (non-empty IP) is in a file of DIR, a flat copy (so the
+# names grep prints are its file names); WHERE says where to redact it. The address is matched whole, between
+# non-digits (73.15.40.4 is not in 73.15.40.40 or 173.15.40.4); ip is a validated dotted quad, so escaping
+# its dots makes it a literal. LC_ALL=C: [^0-9] matches any byte.
+check_ip() {
+  local dir="$1" ip="$2" where="$3" ip_files rc
+  [[ -n "$ip" ]] || return 0
+  ip_files="$(cd -- "$dir" && LC_ALL=C grep -lE -e "(^|[^0-9])${ip//./\\.}([^0-9]|\$)" ./*)" && rc=0 || rc=$?
+  ip_files="${ip_files//.\//}"
+  if ((rc != 1)); then
+    log "error: the operator IP (OPERATOR_IP) appears in (or grep failed on): ${ip_files//$'\n'/ }"
+    log "  redact it in $where and promote again; verification/final was not changed"
+    exit 1
+  fi
+}
+
+# check_project DIR IDS WHERE: exit 1 when a GCP project id of IDS (project_ids' output, one per line; nothing
+# to check when empty) is in a file of DIR, a flat copy; WHERE says where to redact it. Fixed strings (-F), in
+# any case (-i), anywhere in a line: an id also sits inside <id>-k3s-tfstate, service-account emails and FQDNs.
+# LC_ALL=C: bytes that are not UTF-8 cannot hide it, and -i folds ASCII only, which is all a project id holds.
+# The ids reach grep as a pattern file on a pipe (-f), never as arguments; grep prints file names only, never an
+# id. The demo masks it as <GCP_PROJECT> (redact), which this does not match.
+check_project() {
+  local dir="$1" ids="$2" where="$3" files rc
+  [[ -n "$ids" ]] || return 0
+  files="$(cd -- "$dir" && LC_ALL=C grep -liF -f <(printf '%s\n' "$ids") ./*)" && rc=0 || rc=$?
+  files="${files//.\//}"
+  if ((rc != 1)); then
+    log "error: the GCP project id (GCP_PROJECT, environment or .env) appears in (or grep failed on): ${files//$'\n'/ }"
+    log "  redact it in $where and promote again; verification/final was not changed"
+    exit 1
+  fi
+}
+
+# failed_chapters RUN: the chapters RUN/timings.txt records with a failed step or as interrupted, and those with
+# a recording (chN.txt) but no timings.txt line (the demo was killed part-way through them), each after a space
+# ("" when none).
+failed_chapters() {
+  local line out="" seen=" " f n
+  while IFS= read -r line || [[ -n "$line" ]]; do
+    if [[ "$line" =~ $DEMO_TIMING_LINE ]]; then
+      seen+="${BASH_REMATCH[1]} "
+      if ((10#${BASH_REMATCH[2]} > 0)); then out+=" ch${BASH_REMATCH[1]} (${BASH_REMATCH[2]} failed)"; fi
+    elif [[ "$line" =~ $DEMO_INTERRUPTED_LINE ]]; then
+      seen+="${BASH_REMATCH[1]} "
+      out+=" ch${BASH_REMATCH[1]} (interrupted)"
+    fi
+  done <"$1/timings.txt"
+  for f in "$1"/ch[1-8].txt; do
+    [[ -f "$f" ]] || continue
+    n="${f##*/ch}"
+    n="${n%.txt}"
+    [[ "$seen" == *" $n "* ]] || out+=" ch$n (no timings.txt line: stopped part-way)"
+  done
+  printf '%s' "$out"
+}
+
+# carry_kept COPY IP PROJECTS: put a copy of each existing verification/final/<sub> of KEPT_IN_FINAL (final/demo/)
+# into COPY, the staged verify copy that replaces final, so a verify promotion does not delete it. The copy is
+# checked by the demo rules, scanned, IP-checked and project-checked as a demo run is; anything wrong exits 1
+# (final unchanged). A final that is a symlink is not the repo's: nothing is carried from it.
+carry_kept() {
+  local copy="$1" ip="$2" projects="$3" sub src leaks
+  [[ -d "$FINAL_DIR" && ! -L "$FINAL_DIR" ]] || return 0
+  for sub in "${KEPT_IN_FINAL[@]}"; do
+    src="$FINAL_DIR/$sub"
+    [[ -e "$src" || -L "$src" ]] || continue
+    check_demo "$src" "verification/final/$sub" 1
+    cp -R -- "$src" "$copy/$sub" || die "copying verification/final/$sub into the staged copy failed"
+    check_demo "$copy/$sub" "the copy of verification/final/$sub" 1
+    log "keeping verification/final/$sub: scanning its copy for secrets"
+    leaks="$(scan_copy "$copy/$sub")"
+    if [[ -n "$leaks" ]]; then
+      log "error: gitleaks reported leaks (or failed) in verification/final/$sub:$leaks"
+      log "  redact them (or promote the demo again) and promote again; verification/final was not changed"
+      exit 1
+    fi
+    check_ip "$copy/$sub" "$ip" "verification/final/$sub/"
+    check_project "$copy/$sub" "$projects" "verification/final/$sub/"
+  done
 }
 
 promote_verify() {
@@ -336,10 +471,72 @@ promote_verify() {
     fi
   fi
 
+  # A promoted demo (final/demo/) stays: it goes into the copy, checked, scanned, IP- and project-checked.
+  carry_kept "$copy" "$ip" "$projects"
   swap_in "$copy" || die "replacing $FINAL_DIR with the scanned copy failed; verification/final was not changed"
 
   result="$(grep -m 1 '^\*\*Result:\*\* ' -- "$FINAL_DIR/SUMMARY.md")"
   log "promoted ${run#"$REPO_ROOT"/} to verification/final ($result; gitleaks found no leaks)"
+  log "before git add verification/final, check that the operator IP is not in it (Task 24 Step 4):"
+  # shellcheck disable=SC2016 # the command is printed for the operator to run, not expanded here
+  log '  grep -r "$(curl -s https://checkip.amazonaws.com)" verification/final   # must print nothing'
+}
+
+# promote_demo DEMO_DIR: verification/final/demo/ = a scanned copy of the demo run (see the header).
+promote_demo() {
+  (($# == 1)) || { usage >&2; die "usage: demo takes exactly one DEMO_DIR" 2; }
+  local run copy leaks ip projects failed
+  run="$(resolve_run "$1" "$DEMO_RUN_NAME" "demo-<YYYY-MM-DDTHHMM-0700>" demo)" || exit
+  check_demo "$run" "$1" 2
+  # A failed, interrupted or part-recorded chapter's recording would replay the failure (or half a chapter):
+  # the fallback would not work.
+  failed="$(failed_chapters "$run")"
+  if [[ -n "$failed" ]]; then
+    if [[ "${PROMOTE_ALLOW_FAIL:-}" != 1 ]]; then
+      log "error: $1 has chapters that failed, were interrupted or did not finish:$failed"
+      log "  their recordings would replay the failure; promote a run where they passed, or PROMOTE_ALLOW_FAIL=1"
+      exit 2
+    fi
+    log "WARNING: promoting $1 with chapters that failed, were interrupted or did not finish (PROMOTE_ALLOW_FAIL=1):$failed"
+  fi
+  ip="$(operator_ip)" || exit
+  projects="$(project_ids)" || exit
+  if [[ -z "$projects" ]]; then
+    log "WARNING: no GCP project id (GCP_PROJECT in the environment or .env): the project-id check was skipped"
+  fi
+  if [[ -L "$FINAL_DIR" || (-e "$FINAL_DIR" && ! -d "$FINAL_DIR") ]]; then
+    die "$FINAL_DIR is not a directory of this repo (a symlink or a file); nothing was promoted" 2
+  fi
+  command -v gitleaks >/dev/null 2>&1 \
+    || die "gitleaks is not installed; a demo run is promoted only after a secret scan (Task 1 tooling)"
+  [[ -f "$REPO_ROOT/.gitleaks.toml" ]] || die "$REPO_ROOT/.gitleaks.toml not found"
+
+  trap _cleanup EXIT
+  trap 'exit 130' INT
+  trap 'exit 143' TERM HUP
+  take_lock
+  STAGE="$(mktemp -d "$VERIFICATION_DIR/.promote-XXXXXX")" || die "cannot create a staging directory"
+  copy="$STAGE/demo"
+  cp -R -- "$run" "$copy" || die "copying $run to $copy failed"
+  check_demo "$copy" "the copy of $1" 1
+
+  log "scanning each file of the copy of ${run#"$REPO_ROOT"/} for secrets (gitleaks, $REPO_ROOT/.gitleaks.toml)"
+  leaks="$(scan_copy "$copy")"
+  if [[ -n "$leaks" ]]; then
+    log "error: gitleaks reported leaks (or failed) in:$leaks"
+    log "  these are the same files in $run/; redact them and promote again"
+    log "  verification/final was not changed"
+    exit 1
+  fi
+  check_ip "$copy" "$ip" "$run/"
+  check_project "$copy" "$projects" "$run/"
+
+  if [[ ! -d "$FINAL_DIR" ]]; then
+    mkdir -- "$FINAL_DIR" || die "cannot create $FINAL_DIR"
+  fi
+  swap_in "$copy" "$FINAL_DIR/demo" \
+    || die "replacing $FINAL_DIR/demo with the scanned copy failed; verification/final/demo was not changed"
+  log "promoted ${run#"$REPO_ROOT"/} to verification/final/demo (gitleaks found no leaks); make demo-replay CHAPTER=n plays it"
   log "before git add verification/final, check that the operator IP is not in it (Task 24 Step 4):"
   # shellcheck disable=SC2016 # the command is printed for the operator to run, not expanded here
   log '  grep -r "$(curl -s https://checkip.amazonaws.com)" verification/final   # must print nothing'
@@ -350,6 +547,10 @@ main() {
     verify)
       shift
       promote_verify "$@"
+      ;;
+    demo)
+      shift
+      promote_demo "$@"
       ;;
     -h | --help | help)
       usage

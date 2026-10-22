@@ -86,9 +86,10 @@ Verification checks (Task 18) script their answers instead, with rules tried bef
                                           successive calls get successive answers (the last one repeats).
                                           An answer with "serve": TEXT (kubectl port-forward L:R) listens on
                                           127.0.0.1:L, prints kubectl's "Forwarding from" line and answers
-                                          every HTTP GET with TEXT until it is killed. "sleep": SECONDS
-                                          waits that long after printing, before exiting (a capture or a
-                                          stalled call that is still running). "run_with": {TOOL: rc}
+                                          every HTTP GET with TEXT until it is killed. "delay": SECONDS
+                                          waits that long before printing (a call slow to start). "sleep":
+                                          SECONDS waits that long after printing, before exiting (a capture
+                                          or a stalled call that is still running). "run_with": {TOOL: rc}
                                           runs the command after `--` (kubectl exec) for real, here, with
                                           only stubs of the named tools (each exits its rc) in front of
                                           /usr/bin:/bin, and exits with its status: the exec'd script's
@@ -450,6 +451,7 @@ def scripted():
             answer = rule["seq"][min(counter(f"answer-{i}"), len(rule["seq"]) - 1)]
         if READYZ_PROBE:  # a scripted /readyz probe has its answer now: logged before it prints, sleeps or serves
             log()
+        time.sleep(answer.get("delay", 0))
         sys.stdout.write(answer.get("stdout", ""))
         sys.stdout.flush()
         sys.stderr.write(answer.get("stderr", ""))
