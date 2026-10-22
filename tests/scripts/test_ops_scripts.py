@@ -7,6 +7,7 @@ commands and flags the scripts would run. Nothing here reaches GCP, a cluster or
 import contextlib
 import json
 import os
+import select
 import shutil
 import signal
 import socket
@@ -815,6 +816,30 @@ def tunnels(env):
     return [a for a in env.argvs("gcloud") if "-N" in a]
 
 
+def gate_readyz(env):
+    """kubectl's /readyz probes wait while $FAKE_LOG.gate exists, after touching $FAKE_LOG.at_readyz: a tunnel.sh start
+    can be held inside its first probe, its lock taken and its tunnel launched."""
+    gate, at = Path(f"{env.log}.gate"), Path(f"{env.log}.at_readyz")
+    (env.bin / "kubectl").write_text(
+        f'#!/bin/sh\ncase "$*" in *--raw*/readyz*) if [ -e "{gate}" ]; then : > "{at}";'
+        f' while [ -e "{gate}" ]; do sleep 0.05; done; fi;; esac\n'
+        f'exec "{sys.executable}" "{FAKES}" kubectl "$@"\n')
+    gate.write_text("")
+    return gate, at
+
+
+def read_stderr_until(proc, text, seconds=60):
+    """What PROC wrote to stderr up to and including TEXT (which it must write while it runs)."""
+    err, deadline = b"", time.monotonic() + seconds
+    while text.encode() not in err:
+        ready, _, _ = select.select([proc.stderr], [], [], max(0.0, deadline - time.monotonic()))
+        assert ready, f"{text!r} never came; stderr so far: {err.decode()}"
+        chunk = os.read(proc.stderr.fileno(), 4096)
+        assert chunk, f"exited before {text!r}; stderr: {err.decode()}"
+        err += chunk
+    return err.decode()
+
+
 def make_kubeconfig(env):
     env.kubeconfig.parent.mkdir(exist_ok=True)
     env.kubeconfig.write_text(KUBECONFIG)
@@ -833,7 +858,7 @@ def test_tunnel_start_status_stop(env):
         in env.argvs("kubectl")
     assert "waiting up to 30s for the API's /readyz" in proc.stderr, "brief: default wait 30s"
     env.assert_no_lambda_key()  # also the long-lived tunnel's environment
-    assert not env.lockfile.exists(), "the start/stop lock is released"
+    assert lock_free(env.lockfile), "the start/stop lock is released, and the tunnel does not hold it"
 
     assert env.script("tunnel.sh", "status").returncode == 0
 
@@ -992,8 +1017,7 @@ def test_tunnel_running_but_api_down_is_restarted(env):
 
 def test_concurrent_starts_launch_one_tunnel(env):
     """`make tunnel` while `make up` is in its tunnel step: without a lock both launch, the loser's
-    cleanup drops the PID file and the winner's tunnel is orphaned (C0-3). The race is real here:
-    repeat this test to see a non-atomic lock (e.g. uutils' mkdir) fail it."""
+    cleanup drops the PID file and the winner's tunnel is orphaned (C0-3)."""
     make_kubeconfig(env)
     start = [str(env.repo / "scripts/tunnel.sh"), "start"]
     procs = [env.popen(start), env.popen(start)]
@@ -1002,46 +1026,16 @@ def test_concurrent_starts_launch_one_tunnel(env):
     assert len(tunnels(env)) == 1, results
     pid = int(env.pidfile.read_text())
     assert alive(pid) and int(Path(f"{env.log}.tunnel").read_text()) == pid
-    assert not env.lockfile.exists()
+    assert lock_free(env.lockfile), "released by both runs, and never held by the tunnel they started"
 
 
-def test_tunnel_start_waits_for_a_held_lock(env):
+@pytest.mark.parametrize("left_behind", ["", "4242\n", "not a pid\n"])
+def test_concurrent_starts_with_a_lock_file_left_behind_launch_one_tunnel(env, left_behind):
+    """C-2: the lock is flock(1) on .run/tunnel.lock. Whatever an earlier (killed) run left in the file, nothing
+    has to break a stale lock, so four waiting runs still start exactly one tunnel."""
     make_kubeconfig(env)
-    holder = subprocess.Popen(["sleep", "30"])
-    try:
-        env.lockfile.parent.mkdir()
-        env.lockfile.write_text(f"{holder.pid}\n")
-        proc = env.popen([str(env.repo / "scripts/tunnel.sh"), "start"])
-        time.sleep(1.5)
-        assert proc.poll() is None and tunnels(env) == [], "waits while a live holder has the lock"
-        env.lockfile.unlink()
-        _, err = proc.communicate(timeout=60)
-        assert proc.returncode == 0, err
-        assert f"pid {holder.pid}" in err and len(tunnels(env)) == 1
-    finally:
-        holder.kill()
-        holder.wait()
-
-
-def test_tunnel_takes_over_a_stale_lock(env):
-    make_kubeconfig(env)
-    dead = subprocess.Popen(["true"])
-    dead.wait()
     env.lockfile.parent.mkdir()
-    env.lockfile.write_text(f"{dead.pid}\n")
-    proc = env.script("tunnel.sh", "start")
-    assert proc.returncode == 0, proc.stderr
-    assert "stale" in proc.stderr and len(tunnels(env)) == 1 and not env.lockfile.exists()
-
-
-def test_concurrent_starts_take_over_a_stale_lock_once(env):
-    """Several runs waiting on a stale lock: only one may break it. Unserialised, a later waiter's rm
-    deletes the lock an earlier one had just taken, both start a tunnel and one is orphaned (C1-1)."""
-    make_kubeconfig(env)
-    dead = subprocess.Popen(["true"])
-    dead.wait()
-    env.lockfile.parent.mkdir()
-    env.lockfile.write_text(f"{dead.pid}\n")
+    env.lockfile.write_text(left_behind)
     start = [str(env.repo / "scripts/tunnel.sh"), "start"]
     procs = [env.popen(start) for _ in range(4)]
     results = [p.communicate(timeout=60) for p in procs]
@@ -1049,21 +1043,112 @@ def test_concurrent_starts_take_over_a_stale_lock_once(env):
     assert len(tunnels(env)) == 1, results
     pid = int(env.pidfile.read_text())
     assert alive(pid) and int(Path(f"{env.log}.tunnel").read_text()) == pid
-    assert not env.lockfile.exists() and not Path(f"{env.lockfile}.break").exists()
+    assert not any("stale" in err for _, err in results)
+    assert not Path(f"{env.lockfile}.break").exists()
 
 
-def test_tunnel_exit_never_removes_a_lock_held_by_another_run(env):
-    """A run whose lock was taken from it must not delete the new holder's lock on exit (C1-1)."""
-    holder = subprocess.Popen(["sleep", "30"])
+def test_tunnel_start_waits_for_a_live_holder(env):
+    make_kubeconfig(env)
+    with lock_holder(env.lockfile) as holder:
+        env.lockfile.write_text(f"{holder.pid}\n")  # what a holding tunnel.sh writes: its PID, for this message
+        proc = env.popen([str(env.repo / "scripts/tunnel.sh"), "start"])
+        err = read_stderr_until(proc, "waiting for another tunnel.sh")
+        assert proc.poll() is None and tunnels(env) == [], "waits while a live holder has the lock"
+    _, rest = proc.communicate(timeout=60)
+    assert proc.returncode == 0, err + rest
+    assert f"waiting for another tunnel.sh (pid {holder.pid}) to finish" in err and len(tunnels(env)) == 1
+    assert env.lockfile.read_text() == f"{proc.pid}\n", "the new holder wrote its own PID"
+
+
+def test_a_lock_file_naming_a_live_unrelated_pid_never_blocks(env):
+    """C-2: after a reboot the PID in .run/tunnel.lock can belong to another process. Only a held flock(1) counts."""
+    make_kubeconfig(env)
+    other = subprocess.Popen(["sleep", "60"])
     try:
         env.lockfile.parent.mkdir()
-        env.lockfile.write_text(f"{holder.pid}\n")
-        proc = env.script("tunnel.sh", "stop", TUNNEL_TIMEOUT_S="0")
-        assert proc.returncode != 0 and "still holds" in proc.stderr
-        assert env.lockfile.read_text() == f"{holder.pid}\n"
+        env.lockfile.write_text(f"{other.pid}\n")
+        for action in ("stop", "start"):
+            proc = env.script("tunnel.sh", action)
+            assert proc.returncode == 0, proc.stderr
+            assert "waiting for another tunnel.sh" not in proc.stderr
+        assert len(tunnels(env)) == 1
     finally:
-        holder.kill()
-        holder.wait()
+        other.kill()
+        other.wait()
+
+
+def test_a_killed_holder_never_blocks_the_next_run(env):
+    """tunnel.sh SIGKILLed while it holds the lock (inside start, its tunnel launched): the kernel released the lock,
+    and the tunnel it left running never held it, so the next start takes it at once and reuses that tunnel."""
+    make_kubeconfig(env)
+    gate, at = gate_readyz(env)
+    first = env.popen([str(env.repo / "scripts/tunnel.sh"), "start"])
+    wait_for_file(at, first)  # the first run holds the lock and probes its tunnel
+    assert not lock_free(env.lockfile)
+    first.kill()
+    gate.unlink()  # the killed run's probe (it inherited the descriptor and stderr too) ends now
+    first.communicate(timeout=60)
+    deadline = time.monotonic() + 30
+    while not lock_free(env.lockfile):
+        assert time.monotonic() < deadline, "the orphaned tunnel must not hold the lock"
+        time.sleep(0.05)
+    proc = env.script("tunnel.sh", "start")
+    assert proc.returncode == 0, proc.stderr
+    assert "waiting for another tunnel.sh" not in proc.stderr and "already running" in proc.stderr
+    assert len(tunnels(env)) == 1
+
+
+def test_tunnel_stop_during_a_start_waits_then_stops_the_new_tunnel(env):
+    make_kubeconfig(env)
+    gate, at = gate_readyz(env)
+    start = env.popen([str(env.repo / "scripts/tunnel.sh"), "start"])
+    wait_for_file(at, start)  # start holds the lock, its tunnel launched, its first probe held at the gate
+    stop = env.popen([str(env.repo / "scripts/tunnel.sh"), "stop"])
+    err = read_stderr_until(stop, "waiting for another tunnel.sh")
+    assert f"(pid {start.pid})" in err
+    gate.unlink()
+    _, start_err = start.communicate(timeout=60)
+    _, stop_err = stop.communicate(timeout=60)
+    assert start.returncode == 0, start_err
+    assert stop.returncode == 0, err + stop_err
+    tunnel = int(Path(f"{env.log}.tunnel").read_text())
+    assert f"tunnel stopped (pid {tunnel})" in stop_err
+    assert wait_gone(tunnel) and not env.pidfile.exists()
+    assert lock_free(env.lockfile)
+
+
+def test_tunnel_stop_holds_the_lock(env):
+    make_kubeconfig(env)
+    assert env.script("tunnel.sh", "start").returncode == 0
+    record = Path(f"{env.log}.ps_lock")
+    real_ps = shutil.which("ps")
+    (env.bin / "ps").write_text(f'#!/bin/sh\nif flock -n "{env.lockfile}" true; then echo free; else echo held; fi'
+                                f' >> "{record}"\nexec "{real_ps}" "$@"\n')
+    (env.bin / "ps").chmod(0o755)
+    proc = env.script("tunnel.sh", "stop")
+    assert proc.returncode == 0, proc.stderr
+    assert record.read_text().splitlines() == ["held"], "stop looks up and kills the tunnel under the lock"
+
+
+def test_a_run_that_gives_up_waiting_leaves_the_holders_lock_alone(env):
+    with lock_holder(env.lockfile) as holder:
+        env.lockfile.write_text(f"{holder.pid}\n")
+        proc = env.script("tunnel.sh", "stop", TUNNEL_TIMEOUT_S="0")  # waits TUNNEL_TIMEOUT_S + 30 s, then gives up
+        assert proc.returncode != 0 and "still holds" in proc.stderr and f"pid {holder.pid}" in proc.stderr
+        assert not lock_free(env.lockfile) and env.lockfile.read_text() == f"{holder.pid}\n"
+
+
+@pytest.mark.parametrize("action", ["start", "stop"])
+def test_tunnel_refuses_without_flock(env, tmp_path, action):
+    make_kubeconfig(env)
+    proc = env.run([str(env.repo / "scripts/tunnel.sh"), action], PATH=path_without_flock(env, tmp_path))
+    assert proc.returncode == 2 and "flock" in proc.stderr
+    assert tunnels(env) == []
+
+
+def test_tunnel_sh_has_no_stale_lock_breaking_left():
+    text = (ROOT / "scripts/tunnel.sh").read_text()
+    assert "break_stale_lock" not in text and ".break" not in text and "noclobber" not in text
 
 
 def test_tunnel_usage(env):
