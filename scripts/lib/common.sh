@@ -71,6 +71,9 @@ tf_env() {
   _export_tf_vars
 }
 
+# How to install flock(1), for every message that asks for it (stack_lock, cpu-pool.sh --guarded, tunnel.sh).
+FLOCK_INSTALL="Debian/Ubuntu: apt install util-linux; macOS: brew install flock"
+
 # _bash_version_ok [MAJOR MINOR]: the bash version (default: this bash) is at least 4.1, which
 # `exec {fd}>` (a descriptor bash picks and names) needs. macOS ships bash 3.2.
 _bash_version_ok() {
@@ -89,8 +92,10 @@ _bash_version_ok() {
 # already is a no-op (a second open of the file would conflict with this process's own lock); a
 # subshell shares the descriptor, so it may call it too. Children inherit the descriptor: a script
 # that starts a process outliving it must close it there (tunnel.sh does for the API tunnel).
-# Without flock(1) on PATH: one WARNING per process and the run goes on unlocked, or with --required
-# exit 2. Locking needs bash >= 4.1; an older bash is refused (exit 2).
+# stack_lock needs bash >= 4.1 (exec {fd}>): an older bash is refused (exit 2) wherever it is called,
+# with flock(1) on PATH or not, before anything else. Without flock(1) on PATH: one WARNING per
+# process and the run goes on unlocked, or with --required exit 2. The refusal of a held lock says how
+# to find its holder: a killed run's child (terraform, join-node.sh) may still hold the descriptor.
 stack_lock() {
   local required=0 stack file fd
   if [[ "${1:-}" == --required ]]; then
@@ -101,22 +106,22 @@ stack_lock() {
   [[ "$stack" =~ ^[a-z][a-z0-9-]*$ ]] || die "stack_lock: not a stack name: '$stack'"
   [[ " ${_STACK_LOCKS:-} " != *" $stack "* ]] || return 0
   file="$RUN_DIR/$stack.lock"
+  _bash_version_ok \
+    || die "taking the $stack stack's lock needs bash >= 4.1 (this is bash ${BASH_VERSION}); run it with a newer bash (macOS: brew install bash): nothing was changed" 2
   if ! command -v flock > /dev/null 2>&1; then
     (( required == 0 )) \
-      || die "flock(1) (util-linux) is not on PATH, and this run must hold the $stack stack's lock $file: nothing was changed" 2
+      || die "flock(1) (util-linux) is not on PATH ($FLOCK_INSTALL), and this run must hold the $stack stack's lock $file: nothing was changed" 2
     if [[ -z "${_STACK_LOCK_WARNED:-}" ]]; then
-      log "WARNING: flock(1) (util-linux) is not on PATH: this run plans and applies Terraform stacks without their locks; do not run make up, make down or cpu-pool.sh at the same time"
+      log "WARNING: flock(1) (util-linux) is not on PATH ($FLOCK_INSTALL): this run plans and applies Terraform stacks without their locks; do not run make up, make down or cpu-pool.sh at the same time"
       _STACK_LOCK_WARNED=1
     fi
     return 0
   fi
-  _bash_version_ok \
-    || die "taking the $stack stack's lock needs bash >= 4.1 (this is bash ${BASH_VERSION}); run it with a newer bash (macOS: brew install bash)" 2
   run_dir || die "cannot create $RUN_DIR"
   exec {fd}>> "$file" || die "cannot open $file"
   if ! flock -n "$fd"; then
     exec {fd}>&-
-    die "another run holds $file, the lock of the $stack stack (make up, make down, cpu-pool.sh or the autoscaler): this run changed nothing in the $stack stack; the lock is released when that run exits" 2
+    die "another run holds $file, the lock of the $stack stack (make up, make down, cpu-pool.sh or the autoscaler): this run changed nothing in the $stack stack; the lock is released when that run exits. See which process holds it: fuser -v $file (or lsof $file); a killed run's child (terraform, join-node.sh) keeps it until it exits" 2
   fi
   _STACK_LOCKS="${_STACK_LOCKS:-} $stack"
 }

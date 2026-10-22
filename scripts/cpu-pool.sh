@@ -54,7 +54,8 @@
 # tf_plan of the workers stack take too) from before the inventory is read until they exit. A run that
 # finds it held refuses (exit 2) and changes nothing. The kernel releases the lock when the run dies
 # (SIGKILL, a reboot), so there is no stale lock; the file itself stays. Without flock(1) on PATH
-# --guarded is refused (exit 2); an unguarded run says so once (WARNING) and runs unlocked.
+# --guarded is refused (exit 2); an unguarded run says so once (WARNING) and runs unlocked. A bash older
+# than 4.1 is refused (exit 2) either way (stack_lock).
 #
 # Scale step 4 joins every worker that has not joined: a new one always; one that was in the pool
 # before when the cluster has no Node of that name, or when its Node is NotReady and its VM is
@@ -89,6 +90,8 @@ on_exit() {
   if [[ -n "${TF_PLAN:-}" ]]; then
     if (( GUARDED == 0 )) || [[ -z "$READ_SUM" ]] || plan_is "$READ_SUM"; then
       rm -f -- "$TF_PLAN"
+    elif [[ ! -e "$TF_PLAN" ]]; then
+      log "the saved plan $TF_PLAN is gone already (another cpu-pool.sh run?): nothing to remove"
     else
       log "$TF_PLAN is not this run's plan any more (another run wrote it): left where it is"
     fi
@@ -138,7 +141,7 @@ plan_next() {
 take_lock() {
   if (( GUARDED )); then
     command -v flock > /dev/null 2>&1 \
-      || die "--guarded needs flock(1) (util-linux) on PATH to keep runs on the workers stack apart: nothing was changed (without --guarded the run goes on unlocked, with a warning)" 2
+      || die "--guarded needs flock(1) (util-linux) on PATH to keep runs on the workers stack apart ($FLOCK_INSTALL): nothing was changed (without --guarded the run goes on unlocked, with a warning)" 2
     stack_lock --required workers
   else
     stack_lock workers

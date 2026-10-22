@@ -340,6 +340,7 @@ def test_guarded_refuses_without_flock_and_unguarded_runs_unchanged(env, tmp_pat
     proc = env.run([str(env.repo / "scripts/cpu-pool.sh"), "scale", "1", "--guarded"], AUTO_APPROVE="1", PATH=path)
     assert proc.returncode == 2
     assert "--guarded needs flock" in proc.stderr and "nothing was changed" in proc.stderr
+    assert "Debian/Ubuntu: apt install util-linux; macOS: brew install flock" in proc.stderr  # X0-4
     assert env.calls() == [] and env.tfvars.read_text() == before
     workers(env, ips(1, 2))
     env.scenario["ready"] = ["k3s-cpu-1", "k3s-cpu-2"]
@@ -415,6 +416,22 @@ def test_a_failed_run_removes_its_own_plan(env, args):
     assert proc.returncode == 1 and "cannot drain k3s-cpu-2" in proc.stderr
     assert "apply" not in tf(env) and not (env.repo / ".run/workers.tfplan").exists()
     assert leftovers(env) == []
+
+
+@pytest.mark.parametrize("args", [["scale", "1"], ["remove", "k3s-cpu-2"]])
+def test_a_failed_run_says_its_plan_is_gone_when_another_run_removed_it(env, args):
+    """C0-2: the EXIT trap tells a removed plan from a replaced one, as the decline path does (S3-m4)."""
+    set_pool(env, ["k3s-cpu-1", "k3s-cpu-2"])
+    workers(env, ips(1, 2), after=ips(1))
+    env.scenario["changes"] = {"workers": deletes("k3s-cpu-2")}
+    env.scenario["drain_plan"] = "remove"
+    env.scenario["drain_fail"] = ["k3s-cpu-2"]
+    env.scenario["ready"] = ["k3s-cpu-1", "k3s-cpu-2"]
+    proc = guarded(env, *args, AUTO_APPROVE="1")
+    assert proc.returncode == 1 and "cannot drain k3s-cpu-2" in proc.stderr
+    assert "workers.tfplan is gone already" in proc.stderr and "nothing to remove" in proc.stderr
+    assert "another run wrote it" not in proc.stderr
+    assert not (env.repo / ".run/workers.tfplan").exists()
 
 
 def test_a_plan_removed_after_the_guard_is_a_clear_failure(env):

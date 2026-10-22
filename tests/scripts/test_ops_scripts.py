@@ -707,12 +707,39 @@ def test_bash_version_check(env, version, ok):
     assert env.lib("_bash_version_ok").returncode == 0, "the bash running these tests"
 
 
-def test_stack_lock_checks_the_bash_version_before_it_opens_a_descriptor():
-    text = (ROOT / "scripts/lib/common.sh").read_text()
-    body = text[text.index("\nstack_lock() {"):]
-    body = body[:body.index("\n}\n")]
-    assert "_bash_version_ok \\\n    || die" in body
-    assert body.index("_bash_version_ok") < body.index("exec {")
+OLD_BASH = "_bash_version_ok() { return 1; }"  # what bash 3.2 (macOS) answers
+
+
+@pytest.mark.parametrize("flock", [True, False], ids=["flock", "no-flock"])
+@pytest.mark.parametrize("call", ["stack_lock base", "stack_lock --required base", "tf_init base; tf_apply base"])
+def test_stack_lock_refuses_an_old_bash(env, tmp_path, flock, call):
+    """The brief: bash < 4.1 is refused (exit 2) wherever stack_lock is used, with flock(1) on PATH or not (S0-1)."""
+    extra = {} if flock else {"PATH": path_without_flock(env, tmp_path)}
+    proc = env.lib(f"{OLD_BASH}; load_env; {call}", AUTO_APPROVE="1", **extra)
+    assert proc.returncode == 2, proc.stderr
+    assert "bash >= 4.1" in proc.stderr and "brew install bash" in proc.stderr
+    assert "WARNING" not in proc.stderr, "refused, not run unlocked"
+    assert not (env.repo / ".run/base.lock").exists()
+    assert "plan" not in tf_subcommands(env)
+
+
+def test_a_held_stack_lock_says_how_to_find_its_holder(env):
+    """X0-3: children inherit the descriptor, so the holder may be an orphaned terraform or join-node.sh."""
+    lock = env.repo / ".run/base.lock"
+    with lock_holder(lock):
+        proc = env.lib("stack_lock base")
+    assert proc.returncode == 2
+    assert f"fuser -v {lock.resolve()}" in proc.stderr and f"lsof {lock.resolve()}" in proc.stderr
+
+
+FLOCK_HINT = "Debian/Ubuntu: apt install util-linux; macOS: brew install flock"
+
+
+def test_without_flock_the_messages_say_how_to_install_it(env, tmp_path):
+    """X0-4: the refusal (--required) and the warning both name the install command."""
+    path = path_without_flock(env, tmp_path)
+    assert FLOCK_HINT in env.lib("stack_lock --required workers", PATH=path).stderr
+    assert FLOCK_HINT in env.lib("stack_lock workers", PATH=path).stderr
 
 
 def lock_probe_terraform(env):
@@ -1143,7 +1170,22 @@ def test_tunnel_refuses_without_flock(env, tmp_path, action):
     make_kubeconfig(env)
     proc = env.run([str(env.repo / "scripts/tunnel.sh"), action], PATH=path_without_flock(env, tmp_path))
     assert proc.returncode == 2 and "flock" in proc.stderr
+    assert FLOCK_HINT in proc.stderr  # X0-4
     assert tunnels(env) == []
+
+
+@pytest.mark.parametrize("flock", [True, False], ids=["flock", "no-flock"])
+@pytest.mark.parametrize("action", ["start", "stop"])
+def test_tunnel_refuses_an_old_bash(env, tmp_path, action, flock):
+    """S0-2: tunnel.sh sources common.sh; the copy's _bash_version_ok answers as bash 3.2 does."""
+    make_kubeconfig(env)
+    with open(env.repo / "scripts/lib/common.sh", "a") as f:
+        f.write(f"\n{OLD_BASH}\n")
+    extra = {} if flock else {"PATH": path_without_flock(env, tmp_path)}
+    proc = env.run([str(env.repo / "scripts/tunnel.sh"), action], **extra)
+    assert proc.returncode == 2, proc.stderr
+    assert "bash >= 4.1" in proc.stderr and "brew install bash" in proc.stderr
+    assert not env.lockfile.exists() and tunnels(env) == []
 
 
 def test_tunnel_sh_has_no_stale_lock_breaking_left():

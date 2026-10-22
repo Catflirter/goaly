@@ -45,10 +45,10 @@ usage() {
 lock() {
   local fd holder
   [[ "$TIMEOUT" =~ ^[0-9]+$ ]] || die "bad TUNNEL_TIMEOUT_S '$TIMEOUT'"
-  command -v flock > /dev/null 2>&1 \
-    || die "tunnel.sh needs flock(1) (util-linux) on PATH to keep start and stop apart: nothing was changed" 2
   _bash_version_ok \
-    || die "tunnel.sh needs bash >= 4.1 (this is bash ${BASH_VERSION}); run it with a newer bash (macOS: brew install bash)" 2
+    || die "tunnel.sh needs bash >= 4.1 (this is bash ${BASH_VERSION}); run it with a newer bash (macOS: brew install bash): nothing was changed" 2
+  command -v flock > /dev/null 2>&1 \
+    || die "tunnel.sh needs flock(1) (util-linux) on PATH to keep start and stop apart ($FLOCK_INSTALL): nothing was changed" 2
   run_dir || die "cannot create $RUN_DIR"
   exec {fd}>> "$LOCKFILE" || die "cannot open $LOCKFILE"
   if ! flock -n "$fd"; then
