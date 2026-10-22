@@ -30,8 +30,35 @@ register_check() {
   VR_REG_FUNC+=("$func")
 }
 
-# Tasks 18 (A–C), 21 (D) and 22 (E) register their checks below this line.
+# Tasks 18 (A–C), 21 (D) and 22 (E) register their checks below this line (the functions are in
+# scripts/lib/checks.sh; the PASS criteria are the plan's, Task 18's table and spec §9).
 # --- registered checks ---
+register_check A A1 'Nodes Ready (at least 2)' check_a1_nodes
+register_check A A2 'kubectl describe every node' check_a2_describe_nodes
+register_check A A3 'metrics-server and CoreDNS Ready on k3s-cp' check_a3_system_pods
+register_check A A4 'flannel annotations: public-ip is the ExternalIP' check_a4_flannel_annotations
+register_check B B1 'N x N connectivity matrix (curl, MTU ping, Service DNS)' check_b1_matrix
+register_check B B2 'On the wire at k3s-cp: encrypted, WireGuard, expected ports only' check_b2_wire
+register_check B B3 'WireGuard peers and recent handshakes' check_b3_wg
+register_check B B4 'iperf3 across nodes' check_b4_iperf
+register_check B B5 'Negative tests: API ports, metadata server, DNS, guard counters' check_b5_negative
+register_check B B6 'Firewall inventory: every source a /32 (or IAP)' check_b6_firewall_inventory
+register_check C C1 'hello rollout' check_c1_rollout
+register_check C C2 'hello world from another node' check_c2_cross_node_curl
+register_check C C3 'hello world through kubectl port-forward' check_c3_port_forward
+register_check C C4 'QoS class Guaranteed' check_c4_qos
+register_check C C5 'cgroup memory.max and cpu.max' check_c5_cgroup
+register_check C C6 'kubectl top pod' check_c6_top
+register_check C C7 'limits-demo: OOMKilled and CPU throttling' check_c7_limits_demo
+register_check C C8 'NetworkPolicy: allowed from nettest, denied elsewhere' check_c8_netpol
+# D1-D6: placeholders (SKIP) until Task 21 replaces check_d_pending with check_d1_gpu_stack … check_d6_overflow.
+register_check D D1 'GPU stack: audit, containerd, RuntimeClass' check_d_pending
+register_check D D2 'GPU capacity and allocatable' check_d_pending
+register_check D D3 'Device plugin registered' check_d_pending
+register_check D D4 'gpu-smoke: nvidia-smi' check_d_pending
+register_check D D5 'vectoradd: Test PASSED' check_d_pending
+register_check D D6 'gpu-overflow stays Pending' check_d_pending
+# --- end of registered checks ---
 
 main() {
   local groups=("$@") group i ran
