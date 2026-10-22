@@ -56,6 +56,15 @@ The plan guardrail (stretch S3, cpu-pool.sh --guarded):
   tfguard_rc     rc                       `scripts/gpuctl tfguard` exits rc. Without it the fake runs the real
                                           `gpuctl tfguard` (lambda/gpuctl) on the plan it was piped. Its stdin
                                           is logged as "stdin" either way
+  guard_show_rc  {stack: rc}              the second and later `terraform show` of that stack (the first is
+                                          tf_plan's own check; the next is the guard's) print as usual, then
+                                          exit rc
+  guard_show_replaces true                 ... and that later show overwrites the saved plan with other bytes
+                                          while it is read (another run's plan lands mid-guard)
+  drain_plan     "keep" | "replace" | "remove"  `kubectl drain` stands in for another cpu-pool.sh run during the
+                                          drain: it leaves the saved plan (the last plan -out file) alone,
+                                          overwrites it with other bytes, or deletes it, and copies what
+                                          .run/workers.lock holds then ("" when absent) to $FAKE_LOG.lock_at_drain
 
 Teardown (Task 22a, scripts/down.sh):
 
@@ -142,14 +151,19 @@ def terraform():
     if sub == "plan":
         out = next(a.split("=", 1)[1] for a in rest if a.startswith("-out="))
         Path(out).write_text("fake plan")
+        Path(os.environ["FAKE_LOG"] + ".plan_out").write_text(out)
         for a in rest:
             if a.startswith("-var-file="):
                 Path(os.environ["FAKE_LOG"] + ".var-file").write_text(Path(a.split("=", 1)[1]).read_text())
         return SCENARIO.get("plan_rc", {}).get(stack, 2)
     if sub == "show":
+        shown = counter("show." + stack)
         if stack in SCENARIO.get("changes", {}):
-            print(json.dumps({"format_version": "1.2", "resource_changes": SCENARIO["changes"][stack]}))
-            return 0
+            print(json.dumps({"format_version": "1.2", "planned_values": {},
+                              "resource_changes": SCENARIO["changes"][stack]}))
+            if shown and SCENARIO.get("guard_show_replaces"):
+                Path(rest[-1]).write_text("another run's plan")
+            return SCENARIO.get("guard_show_rc", {}).get(stack, 0) if shown else 0
         changes = [{"address": a, "change": {"actions": ["delete", "create"]}}
                    for a in SCENARIO.get("deletes", {}).get(stack, [])]
         changes.append({"address": "google_storage_bucket.x", "change": {"actions": ["create"]}})
@@ -279,10 +293,23 @@ def kubectl():
     if node is not None:
         if node in SCENARIO.get("gone", []):
             return not_found(node)
+        if args[0] == "drain" and "drain_plan" in SCENARIO:
+            other_run()
         if args[0] == "drain" and node in SCENARIO.get("drain_fail", []):
             print("error: cannot evict pod as it would violate the pod's disruption budget", file=sys.stderr)
             return 1
     return 0
+
+
+def other_run():
+    """drain_plan: another cpu-pool.sh run touches the saved plan while this one drains."""
+    plan = Path(Path(os.environ["FAKE_LOG"] + ".plan_out").read_text())
+    lock = plan.parent / "workers.lock"
+    Path(os.environ["FAKE_LOG"] + ".lock_at_drain").write_text(lock.read_text() if lock.exists() else "")
+    if SCENARIO["drain_plan"] == "replace":
+        plan.write_text("another run's plan")
+    elif SCENARIO["drain_plan"] == "remove":
+        plan.unlink()
 
 
 def helm():

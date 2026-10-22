@@ -7,6 +7,7 @@ and applies it only when the guard passes. The fake gpuctl runs the real tfguard
 Same harness as test_workers_ops.py: nothing reaches a cloud or a cluster.
 """
 import json
+from pathlib import Path
 
 import pytest
 
@@ -208,6 +209,124 @@ def test_guarded_scale_fails_closed_when_the_guard_cannot_run(env):
     proc = guarded(env, "scale", "1", AUTO_APPROVE="1")
     assert proc.returncode == 1 and "apply" not in tf(env)
     assert not any(is_drain(c) for c in env.calls())
+
+
+def test_guarded_scale_fails_closed_when_the_guards_show_fails(env):
+    """The other half of the guard pipe (C0-2): `terraform show -json` prints a plan that passes, then exits 1.
+    pipefail makes that a refusal too: exit 1, nothing drained, written or applied."""
+    set_pool(env, ["k3s-cpu-1", "k3s-cpu-2"])
+    workers(env, ips(1, 2), after=ips(1))
+    env.scenario["changes"] = {"workers": deletes("k3s-cpu-2")}
+    env.scenario["guard_show_rc"] = {"workers": 1}
+    env.scenario["ready"] = ["k3s-cpu-1", "k3s-cpu-2"]
+    before = env.tfvars.read_text()
+    proc = guarded(env, "scale", "1", AUTO_APPROVE="1")
+    assert proc.returncode == 1, proc.stderr
+    assert [c["argv"] for c in guard_calls(env)] == [["tfguard", "--remove", "k3s-cpu-2"]], "tfguard itself passed"
+    assert tf(env) == ["init", "plan", "show", "show"] and "failed the guard" in proc.stderr
+    assert not any(is_drain(c) for c in env.calls())
+    assert env.tfvars.read_text() == before
+    assert leftovers(env) == []
+
+
+# ---- one guarded run at a time, and only the plan that passed the guard is applied (X0-1) --------------
+
+LOCK = ".run/workers.lock"
+
+
+@pytest.mark.parametrize("args", [["scale", "2"], ["scale", "1"], ["remove", "k3s-cpu-2"]])
+def test_a_guarded_run_refuses_while_another_holds_the_lock(env, args):
+    set_pool(env, ["k3s-cpu-1", "k3s-cpu-2"])
+    (env.repo / ".run").mkdir()
+    (env.repo / LOCK).write_text("4242\n")
+    before = env.tfvars.read_text()
+    proc = guarded(env, *args, AUTO_APPROVE="1")
+    assert proc.returncode == 2
+    assert "workers.lock" in proc.stderr and "pid 4242" in proc.stderr
+    assert env.calls() == [], "nothing planned, drained or applied"
+    assert (env.repo / LOCK).read_text() == "4242\n", "the other run's lock is left alone"
+    assert env.tfvars.read_text() == before
+
+
+def test_a_guarded_run_holds_the_lock_from_plan_to_apply_then_releases_it(env):
+    set_pool(env, ["k3s-cpu-1", "k3s-cpu-2"])
+    workers(env, ips(1, 2), after=ips(1))
+    env.scenario["changes"] = {"workers": deletes("k3s-cpu-2")}
+    env.scenario["drain_plan"] = "keep"
+    env.scenario["ready"] = ["k3s-cpu-1", "k3s-cpu-2"]
+    proc = guarded(env, "scale", "1", AUTO_APPROVE="1")
+    assert proc.returncode == 0, proc.stderr
+    pid = Path(str(env.log) + ".lock_at_drain").read_text().strip()
+    assert pid.isdigit(), "the lock is held during the drain, and names the run"
+    assert tf(env)[-1] == "apply"
+    assert not (env.repo / LOCK).exists()
+
+
+def test_a_failed_guarded_run_releases_the_lock(env):
+    workers(env, ips(1), after=ips(1, 2))
+    env.scenario["changes"] = {"workers": [*creates("k3s-cpu-2"), CP_UPDATE]}
+    proc = guarded(env, "scale", "2", AUTO_APPROVE="1")
+    assert proc.returncode == 1
+    assert not (env.repo / LOCK).exists()
+
+
+def test_without_guarded_the_lock_is_not_used(env):
+    """Core behaviour is unchanged without --guarded (task scope): an unguarded run neither takes nor honours it.
+    A guarded run is protected from an unguarded one by the plan check below."""
+    (env.repo / ".run").mkdir()
+    (env.repo / LOCK).write_text("4242\n")
+    workers(env, ips(1, 2))
+    env.scenario["ready"] = ["k3s-cpu-1"]
+    proc = env.script("cpu-pool.sh", "scale", "2", AUTO_APPROVE="1")
+    assert proc.returncode == 0, proc.stderr
+    assert (env.repo / LOCK).read_text() == "4242\n"
+
+
+@pytest.mark.parametrize("args, changes", [(["scale", "1"], deletes("k3s-cpu-2")),
+                                           (["remove", "k3s-cpu-2"], deletes("k3s-cpu-2"))])
+def test_a_plan_replaced_after_the_guard_is_never_applied(env, args, changes):
+    """Another run (an unguarded make cpu-scale, say) overwrites .run/workers.tfplan while this one drains: the
+    bytes about to be applied are not the bytes the guard passed, so nothing is applied (exit 1), and the other run's
+    plan is left where it was."""
+    set_pool(env, ["k3s-cpu-1", "k3s-cpu-2"])
+    workers(env, ips(1, 2), after=ips(1))
+    env.scenario["changes"] = {"workers": changes}
+    env.scenario["drain_plan"] = "replace"
+    env.scenario["ready"] = ["k3s-cpu-1", "k3s-cpu-2"]
+    proc = guarded(env, *args, AUTO_APPROVE="1")
+    assert proc.returncode == 1
+    assert "changed after the guard" in proc.stderr and "nothing was applied" in proc.stderr
+    assert "apply" not in tf(env)
+    assert (env.repo / ".run/workers.tfplan").read_text() == "another run's plan"
+    assert ("gpuctl", ["sync-peers"]) not in calls(env)
+    assert not (env.repo / LOCK).exists()
+
+
+def test_a_plan_replaced_while_the_guard_reads_it_is_never_applied(env):
+    """The guard passed the JSON of one plan, but the file now holds another: refused before the drain."""
+    set_pool(env, ["k3s-cpu-1", "k3s-cpu-2"])
+    workers(env, ips(1, 2), after=ips(1))
+    env.scenario["changes"] = {"workers": deletes("k3s-cpu-2")}
+    env.scenario["guard_show_replaces"] = True
+    env.scenario["ready"] = ["k3s-cpu-1", "k3s-cpu-2"]
+    before = env.tfvars.read_text()
+    proc = guarded(env, "scale", "1", AUTO_APPROVE="1")
+    assert proc.returncode == 1
+    assert "changed while the guard read it" in proc.stderr and "nothing was drained" in proc.stderr
+    assert "apply" not in tf(env) and not any(is_drain(c) for c in env.calls())
+    assert env.tfvars.read_text() == before
+    assert (env.repo / ".run/workers.tfplan").read_text() == "another run's plan"
+
+
+def test_a_plan_removed_after_the_guard_is_a_clear_failure(env):
+    set_pool(env, ["k3s-cpu-1", "k3s-cpu-2"])
+    workers(env, ips(1, 2), after=ips(1))
+    env.scenario["changes"] = {"workers": deletes("k3s-cpu-2")}
+    env.scenario["drain_plan"] = "remove"
+    env.scenario["ready"] = ["k3s-cpu-1", "k3s-cpu-2"]
+    proc = guarded(env, "scale", "1", AUTO_APPROVE="1")
+    assert proc.returncode == 1
+    assert "changed after the guard" in proc.stderr and "apply" not in tf(env)
 
 
 # ---- remove ----------------------------------------------------------------------------------------
