@@ -14,3 +14,10 @@ def fake_shells_use_every_scripted_result():
     for sh in shells:
         assert not sh.results, (f"FakeShell left {len(sh.results)} scripted result(s) unused after "
                                 f"{len(sh.calls)} call(s) {[c.args for c in sh.calls]}: {sh.results}")
+
+
+@pytest.fixture(autouse=True)
+def gpuctl_lock_path(tmp_path_factory, monkeypatch):
+    """gpuctl's write lock (.run/gpuctl.lock) for this test, never the checkout's."""
+    import gpuctl.__main__ as cli
+    monkeypatch.setattr(cli, "LOCK_PATH", tmp_path_factory.mktemp("run") / "gpuctl.lock")

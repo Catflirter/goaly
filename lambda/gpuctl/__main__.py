@@ -3,6 +3,8 @@
 Read-only commands: plan, status, rules, list-nodes, ip. None of them changes anything on Lambda.
 sync-peers rewrites the peer allow-lists (k3s-cp's k3s_peers set, Lambda's global rules and k3s-gpu-<region> rulesets).
 apply creates and deletes GPU nodes to match the spec; down deletes all of them.
+apply, down and sync-peers run one at a time: each holds .run/gpuctl.lock (gpuctl.lock), and one started while
+another runs waits for it, so a make gpu-down goes right after a running apply (spec section 10.4).
 tfguard checks a saved workers-stack plan (`terraform show -json` on stdin) for cpu-pool.sh --guarded; it needs no
 Lambda API key and exits 1 on any violation.
 
@@ -23,6 +25,7 @@ from typing import TextIO
 
 from gpuctl.infra import CommandError, Infra, SubprocessShell
 from gpuctl.lambda_api import FirewallRule, Instance, LambdaAPIError, LambdaClient
+from gpuctl.lock import LockError, lock_path, write_lock
 from gpuctl.output import write
 from gpuctl.peers import ruleset_name
 from gpuctl.planner import (
@@ -36,6 +39,7 @@ from gpuctl.tfguard import check_names, check_workers_plan
 REPO_ROOT = Path(__file__).resolve().parents[2]
 DEFAULT_SPEC = REPO_ROOT / "lambda" / "gpu-nodes.yaml"
 OVERRIDES_PATH = REPO_ROOT / "lambda" / ".autoscale-state.json"
+LOCK_PATH = lock_path(REPO_ROOT)  # held by apply, down and sync-peers (gpuctl.lock)
 API_KEY_ENV = "LAMBDA_API_KEY"
 SSH_KEY_ENV = "LAMBDA_SSH_KEY_NAME"
 RULESET_PREFIX = ruleset_name("")  # "k3s-gpu-": the rulesets gpuctl owns, one per region
@@ -306,6 +310,12 @@ def _parser() -> argparse.ArgumentParser:
     return parser
 
 
+def _waiting(command: str, out: TextIO) -> None:
+    then = "gpu-down runs as soon as it ends" if command == "down" else f"{command} runs as soon as it ends"
+    _emit(out, f"Waiting for the gpuctl apply/down/sync-peers that holds {LOCK_PATH} (the autoscaler's gpu_scale, "
+               f"or a make gpu-apply in another terminal): {then} (Ctrl-C stops waiting; nothing has changed yet)")
+
+
 def _load_spec(path: Path) -> Spec:
     try:
         return load_spec(path)
@@ -349,10 +359,14 @@ def main(argv: list[str] | None = None, *, env: Mapping[str, str] = os.environ, 
             if args.command == "apply" and not env.get(SSH_KEY_ENV, "").strip():
                 raise _Refused(f"{SSH_KEY_ENV} is not set: put the name of your Lambda SSH key in .env")
             handler = {"status": _status, "sync-peers": _sync_peers, "apply": _apply, "down": _apply}[args.command]
-            return handler(args, spec, _client(env, client), infra, env, out)
+            client = _client(env, client)
+            if args.command == "status":
+                return handler(args, spec, client, infra, env, out)
+            with write_lock(LOCK_PATH, env=env, waiting=lambda: _waiting(args.command, out)):
+                return handler(args, spec, client, infra, env, out)
         handler = {"rules": _rules, "list-nodes": _list_nodes, "ip": _ip}[args.command]
         return handler(args, _client(env, client), out)
-    except _Refused as e:
+    except (_Refused, LockError) as e:
         write(sys.stderr, _clean(f"gpuctl: {e}") + "\n")
         return EXIT_REFUSED
     except _Failed as e:
