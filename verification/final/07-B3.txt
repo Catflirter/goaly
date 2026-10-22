@@ -1,0 +1,46 @@
+# B3 — WireGuard peers and recent handshakes
+# started: 2026-10-22T12:51:55-07:00
+$ kc get nodes --request-timeout=60s -o 'jsonpath={range .items[*]}{.metadata.name}{"\n"}{end}'
+k3s-cp
+k3s-cpu-1
+$ cp_resolve
+$ _worker_zone k3s-cpu-1
+$ node_ssh k3s-cp 'sudo wg show flannel-wg'
+WARNING: 
+
+To increase the performance of the tunnel, consider installing NumPy. For instructions,
+please see https://cloud.google.com/iap/docs/using-tcp-forwarding#increasing_the_tcp_upload_bandwidth
+
+interface: flannel-wg
+  public key: 6IClWSJ0isyRBCUTuppozJmJnj+BY83JISQCt7Z7PTU=
+  private key: <redacted>
+  listening port: 51820
+
+peer: gq9TOcwRhmqKecw/teRkRFKJ0Et8QUqJHvqdMUCN/kE=
+  endpoint: 34.28.157.143:51820
+  allowed ips: 10.42.1.0/24
+  latest handshake: 2 minutes, 2 seconds ago
+  transfer: 33.63 KiB received, 38.27 KiB sent
+  persistent keepalive: every 25 seconds
+B3: k3s-cp: 1 peers (want 1)
+  peer 34.28.157.143:51820: latest handshake 122 s ago
+$ node_ssh k3s-cpu-1 'sudo wg show flannel-wg'
+WARNING: 
+
+To increase the performance of the tunnel, consider installing NumPy. For instructions,
+please see https://cloud.google.com/iap/docs/using-tcp-forwarding#increasing_the_tcp_upload_bandwidth
+
+interface: flannel-wg
+  public key: gq9TOcwRhmqKecw/teRkRFKJ0Et8QUqJHvqdMUCN/kE=
+  private key: <redacted>
+  listening port: 51820
+
+peer: 6IClWSJ0isyRBCUTuppozJmJnj+BY83JISQCt7Z7PTU=
+  endpoint: 136.87.143.58:51820
+  allowed ips: 10.42.0.0/24
+  latest handshake: 2 minutes, 6 seconds ago
+  transfer: 38.12 KiB received, 33.63 KiB sent
+  persistent keepalive: every 25 seconds
+B3: k3s-cpu-1: 1 peers (want 1)
+  peer 136.87.143.58:51820: latest handshake 126 s ago
+# finished: 2026-10-22T12:52:05-07:00 — PASS (exit 0)

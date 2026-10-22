@@ -1,0 +1,187 @@
+# A2 — kubectl describe every node
+# started: 2026-10-22T12:50:47-07:00
+$ kc get nodes --request-timeout=60s -o 'jsonpath={range .items[*]}{.metadata.name}{"\n"}{end}'
+k3s-cp
+k3s-cpu-1
+$ kc describe node k3s-cp --request-timeout=60s
+Name:               k3s-cp
+Roles:              control-plane
+Labels:             beta.kubernetes.io/arch=amd64
+                    beta.kubernetes.io/instance-type=k3s
+                    beta.kubernetes.io/os=linux
+                    kubernetes.io/arch=amd64
+                    kubernetes.io/hostname=k3s-cp
+                    kubernetes.io/os=linux
+                    node-role.kubernetes.io/control-plane=true
+                    node.kubernetes.io/instance-type=k3s
+Annotations:        alpha.kubernetes.io/provided-node-ip: 10.10.0.2
+                    flannel.alpha.coreos.com/backend-data: {"PublicKey":"6IClWSJ0isyRBCUTuppozJmJnj+BY83JISQCt7Z7PTU=","Port":51820}
+                    flannel.alpha.coreos.com/backend-type: wireguard
+                    flannel.alpha.coreos.com/kube-subnet-manager: true
+                    flannel.alpha.coreos.com/public-ip: 136.87.143.58
+                    flannel.alpha.coreos.com/public-ip-overwrite: 136.87.143.58
+                    k3s.io/encryption-config-hash: start-45fdf04b32e710de3ac010072e2e157331fc64d8318a9f646ad8001681123b09
+                    k3s.io/external-ip: 136.87.143.58
+                    k3s.io/hostname: k3s-cp.us-west1-b.c.<GCP_PROJECT>.internal
+                    k3s.io/internal-ip: 10.10.0.2
+                    k3s.io/node-args:
+                      ["server","--node-name","k3s-cp","--node-external-ip","136.87.143.58","--flannel-backend","wireguard-native","--flannel-external-ip","true...
+                    k3s.io/node-config-hash: TW7677NIH73CGLINN63CMYZLIVCYWF6R2SEIDM42BEFQICMGFZRA====
+                    k3s.io/node-env: {}
+                    node.alpha.kubernetes.io/ttl: 0
+                    volumes.kubernetes.io/controller-managed-attach-detach: true
+CreationTimestamp:  Thu, 22 Oct 2026 17:20:40 +0000
+Taints:             CriticalAddonsOnly=true:NoExecute
+Unschedulable:      false
+Lease:
+  HolderIdentity:  k3s-cp
+  AcquireTime:     <unset>
+  RenewTime:       Thu, 22 Oct 2026 19:50:46 +0000
+Conditions:
+  Type             Status  LastHeartbeatTime                 LastTransitionTime                Reason                       Message
+  ----             ------  -----------------                 ------------------                ------                       -------
+  MemoryPressure   False   Thu, 22 Oct 2026 19:49:57 +0000   Thu, 22 Oct 2026 17:20:40 +0000   KubeletHasSufficientMemory   kubelet has sufficient memory available
+  DiskPressure     False   Thu, 22 Oct 2026 19:49:57 +0000   Thu, 22 Oct 2026 17:20:40 +0000   KubeletHasNoDiskPressure     kubelet has no disk pressure
+  PIDPressure      False   Thu, 22 Oct 2026 19:49:57 +0000   Thu, 22 Oct 2026 17:20:40 +0000   KubeletHasSufficientPID      kubelet has sufficient PID available
+  Ready            True    Thu, 22 Oct 2026 19:49:57 +0000   Thu, 22 Oct 2026 17:20:40 +0000   KubeletReady                 kubelet is posting ready status
+Addresses:
+  InternalIP:  10.10.0.2
+  ExternalIP:  136.87.143.58
+  Hostname:    k3s-cp.us-west1-b.c.<GCP_PROJECT>.internal
+Capacity:
+  cpu:                2
+  ephemeral-storage:  19221248Ki
+  hugepages-1Gi:      0
+  hugepages-2Mi:      0
+  memory:             4002088Ki
+  pods:               110
+Allocatable:
+  cpu:                2
+  ephemeral-storage:  18698430040
+  hugepages-1Gi:      0
+  hugepages-2Mi:      0
+  memory:             4002088Ki
+  pods:               110
+System Info:
+  Machine ID:                 4de316b761ec4b9db18de1d99a5f0e70
+  System UUID:                a6af9cb0-f1f1-6629-9a22-3d3bed3605f1
+  Boot ID:                    406fde2f-105e-427f-bc9c-8c2600c1866e
+  Kernel Version:             7.0.0-1014-gcp
+  OS Image:                   Ubuntu 24.04.5 LTS
+  Operating System:           linux
+  Architecture:               amd64
+  Container Runtime Version:  containerd://2.3.4-k3s1.36
+  Kubelet Version:            v1.36.5+k3s1
+PodCIDR:                      10.42.0.0/24
+PodCIDRs:                     10.42.0.0/24
+ProviderID:                   k3s://k3s-cp
+Non-terminated Pods:          (5 in total)
+  Namespace                   Name                                       CPU Requests  CPU Limits  Memory Requests  Memory Limits  Age
+  ---------                   ----                                       ------------  ----------  ---------------  -------------  ---
+  kube-system                 coredns-7cfb7bc9c7-q9n5d                   100m (5%)     0 (0%)      70Mi (1%)        170Mi (4%)     150m
+  kube-system                 local-path-provisioner-77b9867795-dp89r    0 (0%)        0 (0%)      0 (0%)           0 (0%)         150m
+  kube-system                 metrics-server-5bff977ff5-fgfrr            100m (5%)     0 (0%)      70Mi (1%)        0 (0%)         146m
+  nettest                     echo-qb27z                                 50m (2%)      50m (2%)    32Mi (0%)        32Mi (0%)      146m
+  nettest                     probe-kkl5q                                500m (25%)    500m (25%)  128Mi (3%)       128Mi (3%)     146m
+Allocated resources:
+  (Total limits may be over 100 percent, i.e., overcommitted.)
+  Resource           Requests    Limits
+  --------           --------    ------
+  cpu                750m (37%)  550m (27%)
+  memory             300Mi (7%)  330Mi (8%)
+  ephemeral-storage  0 (0%)      0 (0%)
+  hugepages-1Gi      0 (0%)      0 (0%)
+  hugepages-2Mi      0 (0%)      0 (0%)
+Events:              <none>
+$ kc describe node k3s-cpu-1 --request-timeout=60s
+Name:               k3s-cpu-1
+Roles:              <none>
+Labels:             beta.kubernetes.io/arch=amd64
+                    beta.kubernetes.io/instance-type=k3s
+                    beta.kubernetes.io/os=linux
+                    kubernetes.io/arch=amd64
+                    kubernetes.io/hostname=k3s-cpu-1
+                    kubernetes.io/os=linux
+                    node.kubernetes.io/instance-type=k3s
+Annotations:        alpha.kubernetes.io/provided-node-ip: 10.20.0.2
+                    flannel.alpha.coreos.com/backend-data: {"PublicKey":"gq9TOcwRhmqKecw/teRkRFKJ0Et8QUqJHvqdMUCN/kE=","Port":51820}
+                    flannel.alpha.coreos.com/backend-type: wireguard
+                    flannel.alpha.coreos.com/kube-subnet-manager: true
+                    flannel.alpha.coreos.com/public-ip: 34.28.157.143
+                    flannel.alpha.coreos.com/public-ip-overwrite: 34.28.157.143
+                    k3s.io/external-ip: 34.28.157.143
+                    k3s.io/hostname: k3s-cpu-1
+                    k3s.io/internal-ip: 10.20.0.2
+                    k3s.io/node-args:
+                      ["agent","--server","https://136.87.143.58:6443","--token-file","/etc/rancher/k3s/token","--node-name","k3s-cpu-1","--node-external-ip","3...
+                    k3s.io/node-config-hash: D362OYY23K2P27LJPTCSCSB2LL2CC4OXQNXU7RK5ZJNXWV3QPMOQ====
+                    k3s.io/node-env: {}
+                    node.alpha.kubernetes.io/ttl: 0
+                    volumes.kubernetes.io/controller-managed-attach-detach: true
+CreationTimestamp:  Thu, 22 Oct 2026 17:23:26 +0000
+Taints:             <none>
+Unschedulable:      false
+Lease:
+  HolderIdentity:  k3s-cpu-1
+  AcquireTime:     <unset>
+  RenewTime:       Thu, 22 Oct 2026 19:50:38 +0000
+Conditions:
+  Type             Status  LastHeartbeatTime                 LastTransitionTime                Reason                       Message
+  ----             ------  -----------------                 ------------------                ------                       -------
+  MemoryPressure   False   Thu, 22 Oct 2026 19:46:58 +0000   Thu, 22 Oct 2026 19:26:34 +0000   KubeletHasSufficientMemory   kubelet has sufficient memory available
+  DiskPressure     False   Thu, 22 Oct 2026 19:46:58 +0000   Thu, 22 Oct 2026 19:26:34 +0000   KubeletHasNoDiskPressure     kubelet has no disk pressure
+  PIDPressure      False   Thu, 22 Oct 2026 19:46:58 +0000   Thu, 22 Oct 2026 19:26:34 +0000   KubeletHasSufficientPID      kubelet has sufficient PID available
+  Ready            True    Thu, 22 Oct 2026 19:46:58 +0000   Thu, 22 Oct 2026 19:26:34 +0000   KubeletReady                 kubelet is posting ready status
+Addresses:
+  InternalIP:  10.20.0.2
+  ExternalIP:  34.28.157.143
+  Hostname:    k3s-cpu-1
+Capacity:
+  cpu:                2
+  ephemeral-storage:  19221248Ki
+  hugepages-1Gi:      0
+  hugepages-2Mi:      0
+  memory:             8124712Ki
+  pods:               110
+Allocatable:
+  cpu:                2
+  ephemeral-storage:  18698430040
+  hugepages-1Gi:      0
+  hugepages-2Mi:      0
+  memory:             8124712Ki
+  pods:               110
+System Info:
+  Machine ID:                 62cb9dc39c3548088ffa772110e23506
+  System UUID:                ea66b856-9309-6deb-042b-e8cc59d12497
+  Boot ID:                    45abbb1c-e691-4017-b319-28f530d97d4b
+  Kernel Version:             7.0.0-1014-gcp
+  OS Image:                   Ubuntu 24.04.5 LTS
+  Operating System:           linux
+  Architecture:               amd64
+  Container Runtime Version:  containerd://2.3.4-k3s1.36
+  Kubelet Version:            v1.36.5+k3s1
+PodCIDR:                      10.42.1.0/24
+PodCIDRs:                     10.42.1.0/24
+ProviderID:                   k3s://k3s-cpu-1
+Non-terminated Pods:          (4 in total)
+  Namespace                   Name                      CPU Requests  CPU Limits  Memory Requests  Memory Limits  Age
+  ---------                   ----                      ------------  ----------  ---------------  -------------  ---
+  hello                       hello-849b58876f-7mzbr    100m (5%)     100m (5%)   64Mi (0%)        64Mi (0%)      146m
+  hello                       hello-849b58876f-wjgt5    100m (5%)     100m (5%)   64Mi (0%)        64Mi (0%)      146m
+  nettest                     echo-zlljg                50m (2%)      50m (2%)    32Mi (0%)        32Mi (0%)      146m
+  nettest                     probe-v54jv               500m (25%)    500m (25%)  128Mi (1%)       128Mi (1%)     146m
+Allocated resources:
+  (Total limits may be over 100 percent, i.e., overcommitted.)
+  Resource           Requests    Limits
+  --------           --------    ------
+  cpu                750m (37%)  750m (37%)
+  memory             288Mi (3%)  288Mi (3%)
+  ephemeral-storage  0 (0%)      0 (0%)
+  hugepages-1Gi      0 (0%)      0 (0%)
+  hugepages-2Mi      0 (0%)      0 (0%)
+Events:
+  Type    Reason                   Age                 From              Message
+  ----    ------                   ----                ----              -------
+  Normal  NodeNotReady             25m (x3 over 118m)  node-controller   Node k3s-cpu-1 status is now: NodeNotReady
+  Normal  CertificateExpirationOK  24m                 k3s-cert-monitor  Node and Certificate Authority certificates managed by k3s are OK
+# finished: 2026-10-22T12:50:48-07:00 — PASS (exit 0)

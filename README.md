@@ -273,20 +273,47 @@ check functions in [scripts/lib/checks.sh](scripts/lib/checks.sh)):
 | D, GPU | GPU audit, containerd's `nvidia` section, the RuntimeClass; `nvidia.com/gpu` in Capacity and Allocatable; device plugin registered; `nvidia-smi` in a pod; `vectoradd` `Test PASSED`; a pod asking one GPU too many stays Pending. SKIP, not FAIL, without a GPU node |
 | E, resilience | E1 reboots `k3s-cpu-1` (NotReady, Ready, B1 again); E2 replaces the GPU node with `gpuctl down` and `gpuctl apply`, then D1-D6 and B1; E3 forges a stale `gpu-access` rule that `gpuctl status` must report and `gpuctl apply` must remove |
 
+Group C's QoS and cgroup values come from the hello Deployment's requests and limits, set equal
+([k8s/hello/hello.yaml](k8s/hello/hello.yaml)):
+
+```yaml
+          resources:
+            requests:
+              cpu: 100m
+              memory: 64Mi
+            limits:
+              cpu: 100m
+              memory: 64Mi
+```
+
 Each run writes `verification/<YYYY-MM-DDTHHMM-0700>/`: one numbered file per check, starting with the
 commands it ran, and a `SUMMARY.md` with PASS, FAIL or SKIP. Output passes a redaction filter
 (`redact` in [scripts/lib/checks.sh](scripts/lib/checks.sh): tokens, kubeconfig keys, private keys, the Lambda key; the operator's IP becomes `<operator_ip>` and
 the GCP project id `<GCP_PROJECT>`, in any case), every check is time-bounded, an interrupt runs each
 check's cleanup, and gitleaks scans the run.
 
-| Run | Result | Time |
-|---|---|---|
-| A-C, no GPU node (2026-10-21) | 18 PASS, D SKIP | 258-263 s |
-| A-D, one A10 (2026-10-21) | 24/24 PASS | 412 s |
-| `RESILIENCE=1` on a cluster rebuilt from scratch (2026-10-22) | 27/27 PASS, 0 skipped, gitleaks clean | 21m54s |
+The final run is committed as [verification/final/SUMMARY.md](verification/final/SUMMARY.md):
+2026-10-22, on a freshly rebuilt cluster (`make down` 6m10s, then `make up` 6m19s from scratch),
+`make verify` gave 18 PASS (A1-A4, B1-B6, C1-C8), 0 failed, 6 skipped. Group D was skipped because no
+GPU node could be launched: Lambda's write API (instance launch and firewall updates) returned
+timeouts and HTTP 504 for about 30 minutes around 12:30-13:00 PDT, while reads worked. The run was
+promoted with `PROMOTE_ALLOW_SKIP=1`, and `SUMMARY.md` notes the skips (see the
+[Lambda write API](#limitations-and-next-steps) limitation).
 
-The final run, from scratch (`make down`, `make up`, `make gpu-apply`, `make verify RESILIENCE=1`,
-2026-10-22), is committed as `verification/final/SUMMARY.md`. It was promoted with
+GPU and resilience results from earlier runs on 2026-10-22 (evidence not committed; the same code
+except PRs #106, #105 and #107 where noted):
+
+| Run | Code | Result | Time |
+|---|---|---|---|
+| Rebuild rehearsal, 09:14 PDT | main `d314f13`, before project-id masking (#105) | `make verify RESILIENCE=1`: 27/27 PASS, D1-D6 and E1-E3 included | 21m54s |
+| Task 24 run 1, 10:43 | main `f9b24a7` (#105 and #107 merged, #106 not) | D1-D6 PASS, E1 PASS; C7 FAIL (containerd reported reason `Error`, exit 137; the kernel log confirmed a memcg OOM kill); interrupted during E2 | |
+| Task 24 run 2, 11:06 | main `f9b24a7` | 26/27 PASS, C7, D1-D6, E1, E2 and E3 included; B3 FAIL (stale WireGuard peer on `k3s-cp`) | |
+| Task 24 run 3, 12:17 | main `f9b24a7` | 25 PASS, B3, D1-D6 and E1 included; E2 FAIL (Lambda API read timeout during `gpuctl down`; cleanup confirmed no instance left), E3 SKIP | |
+
+Earlier, Task 21 (2026-10-21): A-D 24/24 PASS on one A10 in 412 s, and A-C without a GPU node 18 PASS
+with D skipped in 258-263 s.
+
+Promotion runs
 `OPERATOR_IP=$(curl -s https://checkip.amazonaws.com) make promote-verify RUN=verification/<ts>`
 ([scripts/promote.sh](scripts/promote.sh)), which copies the run to a staging directory, scans every
 file with gitleaks, refuses the copy if it contains the GCP project id (the environment's or
@@ -384,8 +411,14 @@ of this cluster.
   Pod's reason as `Error` (exit 137) although the kernel's memory-cgroup OOM killer had enforced the
   64Mi limit (planned fix: C7 also accepts exit 137 plus a kernel memcg OOM record); after a GPU node
   is deleted, `k3s-cp` keeps its stale WireGuard peer, so B3 counts one peer too many on the next run
-  (planned fix: `gpuctl down` removes the peer); the budget guard admits one new GPU node per plan;
+  (planned fix: `gpuctl down` removes the peer), and stale peers also appeared intermittently after
+  `k3s-cpu-1` re-keyed on reboot; the budget guard admits one new GPU node per plan;
   the IAP tunnel can die while idle, so run `make tunnel` before `make down`.
+- **Lambda write API timeouts/504.** `gpuctl`'s Lambda API timeout is a fixed 30 s (`TIMEOUT_S` in
+  [lambda/gpuctl/lambda_api.py](lambda/gpuctl/lambda_api.py)). On 2026-10-22 instance launches and
+  firewall updates timed out even at 120 s, with HTTP 504, for about 30 minutes, while reads took
+  about 0.4 s; every failure left no instance (`make gpu-status`: 0 instances, no drift). Planned
+  fix: a configurable timeout ([runbook](docs/runbook.md#troubleshooting)).
 - **Not merged before the deadline:** a monitoring check and an autoscaler, implemented and reviewed
   in separate PRs (#101, #102), on top of the port-forward-only monitoring stack (`make monitoring`)
   that is already on main.

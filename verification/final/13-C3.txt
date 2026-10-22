@@ -1,0 +1,12 @@
+# C3 — hello world through kubectl port-forward
+# started: 2026-10-22T12:52:38-07:00
+$ kc -n hello port-forward svc/hello 18080:80 &
+$ curl --noproxy '*' -fsS -m 5 localhost:18080
+hello world
+C3: port-forward stopped
+--- port-forward ---
+Forwarding from 127.0.0.1:18080 -> 8080
+Forwarding from [::1]:18080 -> 8080
+Handling connection for 18080
+C3: localhost:18080 answered exactly 'hello world'
+# finished: 2026-10-22T12:52:40-07:00 — PASS (exit 0)

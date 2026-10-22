@@ -1,0 +1,63 @@
+# B2 — On the wire at k3s-cp: encrypted, WireGuard, expected ports only
+# started: 2026-10-22T12:51:12-07:00
+$ cp_resolve
+B2: marker b2-marker-09dcbf0dde1d0202
+$ cp_ssh 'ip -o route show default'
+WARNING: 
+
+To increase the performance of the tunnel, consider installing NumPy. For instructions,
+please see https://cloud.google.com/iap/docs/using-tcp-forwarding#increasing_the_tcp_upload_bandwidth
+
+default via 10.10.0.1 dev ens4 proto dhcp src 10.10.0.2 metric 100 
+$ kc get nodes --request-timeout=60s -o 'jsonpath={range .items[*]}{.metadata.name}{"\n"}{end}'
+k3s-cp
+k3s-cpu-1
+$ node_external_ip k3s-cpu-1
+34.28.157.143
+$ probe_on k3s-cpu-1
+probe-v54jv
+$ echo_on k3s-cp
+10.42.0.5
+$ cp_ssh 'umask 077 && sudo timeout 25 tcpdump -ni ens4 -U -w /tmp/b2.pcap '\''not port 22'\''' &
+$ kc_within 90 -n nettest exec probe-v54jv -- sh -c 'n=0; for i in $(seq 20); do curl -fsS -m 2 -o /dev/null -H "X-Marker: b2-marker-09dcbf0dde1d0202" http://10.42.0.5:8080/ && n=$((n + 1)); done; echo "$n/20 requests answered"; [ "$n" -eq 20 ]'
+20/20 requests answered
+--- capture on k3s-cp ---
+WARNING: 
+
+To increase the performance of the tunnel, consider installing NumPy. For instructions,
+please see https://cloud.google.com/iap/docs/using-tcp-forwarding#increasing_the_tcp_upload_bandwidth
+
+tcpdump: listening on ens4, link-type EN10MB (Ethernet), snapshot length 262144 bytes
+382 packets captured
+386 packets received by filter
+0 packets dropped by kernel
+$ cp_ssh 'bash -o pipefail -c '\''sudo tcpdump -A -nn -r /tmp/b2.pcap | { grep -c -F -- b2-marker-09dcbf0dde1d0202 || true; }'\'''
+WARNING: 
+
+To increase the performance of the tunnel, consider installing NumPy. For instructions,
+please see https://cloud.google.com/iap/docs/using-tcp-forwarding#increasing_the_tcp_upload_bandwidth
+
+reading from file /tmp/b2.pcap, link-type EN10MB (Ethernet), snapshot length 262144
+0
+B2 ①: the marker is not in the capture (the cross-node traffic is encrypted)
+$ cp_ssh 'sudo tcpdump -nn -q -t -r /tmp/b2.pcap'
+WARNING: 
+
+To increase the performance of the tunnel, consider installing NumPy. For instructions,
+please see https://cloud.google.com/iap/docs/using-tcp-forwarding#increasing_the_tcp_upload_bandwidth
+
+reading from file /tmp/b2.pcap, link-type EN10MB (Ethernet), snapshot length 262144
+B2 ②: 201 udp/51820 packets in the capture
+B2 ②: 201 udp/51820 packets with 34.28.157.143 (want at least 40: the 20 marked requests and their answers)
+B2 ③: packets to or from the other nodes' public IPs (34.28.157.143):
+  51820/udp  201
+  6443/tcp   73
+  10250/tcp  8
+B2 ③: only 51820/udp, 6443/tcp and 10250/tcp
+$ cp_ssh 'sudo rm -f /tmp/b2.pcap'
+WARNING: 
+
+To increase the performance of the tunnel, consider installing NumPy. For instructions,
+please see https://cloud.google.com/iap/docs/using-tcp-forwarding#increasing_the_tcp_upload_bandwidth
+
+# finished: 2026-10-22T12:51:55-07:00 — PASS (exit 0)

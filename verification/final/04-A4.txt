@@ -1,0 +1,18 @@
+# A4 — flannel annotations: public-ip is the ExternalIP
+# started: 2026-10-22T12:50:49-07:00
+$ kc get nodes --request-timeout=60s -o json
+node k3s-cp ExternalIP=136.87.143.58
+  flannel.alpha.coreos.com/backend-data={"PublicKey":"6IClWSJ0isyRBCUTuppozJmJnj+BY83JISQCt7Z7PTU=","Port":51820}
+  flannel.alpha.coreos.com/backend-type=wireguard
+  flannel.alpha.coreos.com/kube-subnet-manager=true
+  flannel.alpha.coreos.com/public-ip=136.87.143.58
+  flannel.alpha.coreos.com/public-ip-overwrite=136.87.143.58
+  OK: public IP 136.87.143.58 = ExternalIP
+node k3s-cpu-1 ExternalIP=34.28.157.143
+  flannel.alpha.coreos.com/backend-data={"PublicKey":"gq9TOcwRhmqKecw/teRkRFKJ0Et8QUqJHvqdMUCN/kE=","Port":51820}
+  flannel.alpha.coreos.com/backend-type=wireguard
+  flannel.alpha.coreos.com/kube-subnet-manager=true
+  flannel.alpha.coreos.com/public-ip=34.28.157.143
+  flannel.alpha.coreos.com/public-ip-overwrite=34.28.157.143
+  OK: public IP 34.28.157.143 = ExternalIP
+# finished: 2026-10-22T12:50:49-07:00 — PASS (exit 0)

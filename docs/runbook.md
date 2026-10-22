@@ -158,7 +158,8 @@ project id as `<GCP_PROJECT>` (`redact` in [scripts/lib/checks.sh](../scripts/li
 check is a backstop. The operator-IP check runs only when `OPERATOR_IP` is set in the caller's
 environment (promote.sh does not look the IP up itself), hence the command above. The `grep` after
 it is a required step before the promoted copy is committed. The final from-scratch run is committed
-as `verification/final/SUMMARY.md`.
+as [verification/final/SUMMARY.md](../verification/final/SUMMARY.md): 18 PASS (A-C), 6 skipped (D, no
+GPU node during Lambda write API timeouts), promoted with `PROMOTE_ALLOW_SKIP=1`.
 
 ## Break-glass
 
@@ -244,7 +245,7 @@ estimated length.
 | When | Action |
 |---|---|
 | Day before | `make up`; `make verify`; check `SUMMARY.md` is all PASS (D included only with a GPU node); GCP stays up overnight (see [Cost](../README.md#cost)) |
-| T-60 min | `make preflight`, every line OK: tool versions (flock included); an active `gcloud auth list` account; ADC works (as `gcloud auth application-default print-access-token > /dev/null`: the token is never shown); `scripts/gpuctl status` exits 0 (capacity listed, no drift); `gpuctl sync-peers` (the operator IP of this network); the tunnel, started if down; every node Ready; the operator IP and project id known, so the demo can mask them |
+| T-60 min | `make preflight`, every line OK: tool versions (flock included); an active `gcloud auth list` account; ADC works (as `gcloud auth application-default print-access-token > /dev/null`: the token is never shown); `scripts/gpuctl status` exits 0 (capacity listed, no drift); `make sync-peers` (the operator IP of this network); the tunnel, started if down; every node Ready; the operator IP and project id known, so the demo can mask them |
 | T-30 min | `make gpu-apply` (5-10 min measured). If no candidate type has capacity in any region, the GPU chapter uses its recorded output |
 | T-5 min | `make demo-reset` (deletes the limits-demo Pods, the `np-denied` namespace and the GPU test Pods; scales the CPU pool back to 1); `make preflight` again |
 | During | `make demo` (pauses after every step; `DEMO_NO_PAUSE=1` does not); `make demo CHAPTERS=1,2,4,5` for a shorter slot; a failed step names its fallback, `make demo-replay CHAPTER=n`, and the demo goes on |
@@ -260,7 +261,8 @@ output goes through the same redaction filter as `make verify`.
 |---|---|---|
 | `make down` warns that it skipped the drains | the IAP tunnel had died while idle (2026-10-22) | run `make tunnel` before `make down`, so the drains run; the destroys remove the VMs either way |
 | C7 reports the oom Pod's reason as `Error` (exit 137), not `OOMKilled` | containerd reported the wrong reason (1 of 6 runs); the node's kernel log showed `Memory cgroup out of memory: Killed process (tail) anon-rss:64792kB` (`CONSTRAINT_MEMCG`), so the 64Mi limit was enforced | re-run `scripts/verify.sh C`; planned fix: C7 also accepts exit 137 plus a kernel memcg OOM record |
-| B3 reports 3 WireGuard peers instead of 2 | after a GPU node is deleted (`make gpu-down`, or E2's replacement), flannel's wireguard-native backend on `k3s-cp` keeps the deleted node's peer (it carries no traffic) | on `k3s-cp`: `sudo wg show flannel-wg latest-handshakes`, then `sudo wg set flannel-wg peer <stale-public-key> remove` for each key that matches no Node's `flannel.alpha.coreos.com/backend-data` PublicKey (or restart k3s); planned fix: `gpuctl down` removes the peer |
+| B3 reports 3 WireGuard peers instead of 2 | flannel's wireguard-native backend on `k3s-cp` keeps a stale peer (it carries no traffic): seen after a GPU node was deleted (`make gpu-down`, or E2's replacement) and, intermittently, after `k3s-cpu-1` re-keyed on reboot | on `k3s-cp`: `sudo wg show flannel-wg latest-handshakes`, then `sudo wg set flannel-wg peer <stale-public-key> remove` for each key that matches no Node's `flannel.alpha.coreos.com/backend-data` PublicKey (or restart k3s); planned fix: `gpuctl down` removes the peer |
+| `make gpu-apply` or `gpuctl down` fails with a timeout or HTTP 504 from Lambda (Lambda write API timeouts/504) | Lambda's write API: on 2026-10-22, instance launches and firewall updates timed out even at 120 s, with HTTP 504, for about 30 minutes, while reads took about 0.4 s. `gpuctl`'s Lambda API timeout is a fixed 30 s (`TIMEOUT_S` in `lambda/gpuctl/lambda_api.py`) | `make gpu-status` to confirm what exists (every failure that day left no instance: 0 instances, no drift); retry later, and use the recorded GPU output meanwhile; planned fix: a configurable timeout |
 | `gpuctl plan --set-count a6000=2` prints `plan refused: budget_usd_per_hour ...` | by design: every new GPU node is priced at the pool's most expensive candidate ($1.99/h, the A100), so the 3.0 budget fits one new node per plan | raise `budget_usd_per_hour` or drop the A100 fallback ([GPU nodes](#gpu-nodes)) |
 | `gpu-apply`'s join step takes about 4 minutes | `apt-get update` over the Lambda image's package sources, then the installs (1m03s and 4m06s in two runs) | wait; the join is bounded (SSH 300 s, Ready 300 s) |
 | `gpu-apply` launches an A10 instead of an A6000 | no `gpu_1x_a6000` capacity in any listed region | expected fallback; `make gpu-status` shows capacity. E2 waits a bounded time for a freed unit before it gives up |
@@ -271,9 +273,9 @@ output goes through the same redaction filter as `make verify`.
 
 ## Measured timings
 
-From live runs on 2026-10-21 and 2026-10-22. "Final run" is the last from-scratch run (Task 24,
-2026-10-22); "rehearsal" is the rebuild rehearsal earlier the same day. Each chapter's measured time
-is in the `timings.txt` of a demo run.
+From live runs on 2026-10-21 and 2026-10-22. "Final run" numbers come from the Task 24 final
+from-scratch run, 2026-10-22 (make output); "rehearsal" is the rebuild rehearsal earlier the same
+day. Each chapter's measured time is in the `timings.txt` of a demo run.
 
 **Bootstrap and bring-up**
 
@@ -314,7 +316,8 @@ deleted, then the 6 workers and 10 base resources destroyed).
 |---|---|---|
 | A-C, no GPU node | 18 PASS, D SKIP | 258-263 s |
 | A-D, one GPU node | 24/24 PASS | 412 s |
-| `RESILIENCE=1` on a freshly rebuilt cluster | 27/27 PASS, 0 skipped, gitleaks clean | 21m54s |
+| `RESILIENCE=1` on a freshly rebuilt cluster (rehearsal) | 27/27 PASS, 0 skipped, gitleaks clean | 21m54s |
+| A-C, final run (no GPU node: Lambda write API timeouts) | 18 PASS, 0 failed, 6 skipped (D) | 4m20s |
 
 **Network:** iperf3 across nodes over WireGuard about 205 Mbit/s; pod-to-pod ICMP payload 1352 bytes
 passes with DF set, 1353 does not.

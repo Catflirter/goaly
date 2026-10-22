@@ -1,0 +1,159 @@
+# B1 — N x N connectivity matrix (curl, MTU ping, Service DNS)
+# started: 2026-10-22T12:50:49-07:00
+$ kc get nodes --request-timeout=60s -o 'jsonpath={range .items[*]}{.metadata.name}{"\n"}{end}'
+k3s-cp
+k3s-cpu-1
+$ kc -n nettest get pods -l app=probe --field-selector=status.phase=Running --request-timeout=60s -o 'jsonpath={range .items[*]}{.spec.nodeName}{" "}{.metadata.name}{" "}{.status.podIP}{"\n"}{end}'
+k3s-cp probe-kkl5q 10.42.0.6
+k3s-cpu-1 probe-v54jv 10.42.1.26
+$ kc -n nettest get pods -l app=echo --field-selector=status.phase=Running --request-timeout=60s -o 'jsonpath={range .items[*]}{.spec.nodeName}{" "}{.metadata.name}{" "}{.status.podIP}{"\n"}{end}'
+k3s-cp echo-qb27z 10.42.0.5
+k3s-cpu-1 echo-zlljg 10.42.1.23
+$ kc_within 60 -n nettest exec probe-kkl5q -- curl -fsS -m 5 http://10.42.0.5:8080/
+Hostname: echo-qb27z
+IP: 127.0.0.1
+IP: ::1
+IP: 10.42.0.5
+IP: fe80::c005:bbff:fe53:e62c
+RemoteAddr: 10.42.0.6:36846
+GET / HTTP/1.1
+Host: 10.42.0.5:8080
+User-Agent: curl/8.21.0
+Accept: */*
+
+$ kc_within 60 -n nettest exec probe-kkl5q -- ping -M do -c 2 -W 2 -s 1352 10.42.0.5
+PING 10.42.0.5 (10.42.0.5) 1352(1380) bytes of data.
+1360 bytes from 10.42.0.5: icmp_seq=1 ttl=64 time=0.140 ms
+1360 bytes from 10.42.0.5: icmp_seq=2 ttl=64 time=0.121 ms
+
+--- 10.42.0.5 ping statistics ---
+2 packets transmitted, 2 received, 0% packet loss, time 1004ms
+rtt min/avg/max/mdev = 0.121/0.130/0.140/0.009 ms
+$ kc_within 60 -n nettest exec probe-kkl5q -- ping -M do -c 2 -W 2 -s 1353 10.42.0.5
+ping: sendmsg: Message too large
+PING 10.42.0.5 (10.42.0.5) 1353(1381) bytes of data.
+ping: sendmsg: Message too large
+
+--- 10.42.0.5 ping statistics ---
+2 packets transmitted, 0 received, +2 errors, 100% packet loss, time 1042ms
+
+command terminated with exit code 1
+$ kc_within 60 -n nettest exec probe-kkl5q -- curl -fsS -m 5 http://10.42.1.23:8080/
+Hostname: echo-zlljg
+IP: 127.0.0.1
+IP: ::1
+IP: 10.42.1.23
+IP: fe80::4c76:b6ff:fe2c:e0ce
+RemoteAddr: 10.42.0.6:37096
+GET / HTTP/1.1
+Host: 10.42.1.23:8080
+User-Agent: curl/8.21.0
+Accept: */*
+
+$ kc_within 60 -n nettest exec probe-kkl5q -- ping -M do -c 2 -W 2 -s 1352 10.42.1.23
+PING 10.42.1.23 (10.42.1.23) 1352(1380) bytes of data.
+1360 bytes from 10.42.1.23: icmp_seq=1 ttl=62 time=37.2 ms
+1360 bytes from 10.42.1.23: icmp_seq=2 ttl=62 time=37.6 ms
+
+--- 10.42.1.23 ping statistics ---
+2 packets transmitted, 2 received, 0% packet loss, time 1001ms
+rtt min/avg/max/mdev = 37.168/37.359/37.551/0.191 ms
+$ kc_within 60 -n nettest exec probe-kkl5q -- ping -M do -c 2 -W 2 -s 1353 10.42.1.23
+ping: sendmsg: Message too large
+PING 10.42.1.23 (10.42.1.23) 1353(1381) bytes of data.
+ping: sendmsg: Message too large
+
+--- 10.42.1.23 ping statistics ---
+2 packets transmitted, 0 received, +2 errors, 100% packet loss, time 1023ms
+
+command terminated with exit code 1
+$ kc_within 60 -n nettest exec probe-kkl5q -- curl -fsS -m 5 http://echo.nettest.svc.cluster.local:8080/
+Hostname: echo-zlljg
+IP: 127.0.0.1
+IP: ::1
+IP: 10.42.1.23
+IP: fe80::4c76:b6ff:fe2c:e0ce
+RemoteAddr: 10.42.0.6:57602
+GET / HTTP/1.1
+Host: echo.nettest.svc.cluster.local:8080
+User-Agent: curl/8.21.0
+Accept: */*
+
+$ kc_within 60 -n nettest exec probe-v54jv -- curl -fsS -m 5 http://10.42.0.5:8080/
+Hostname: echo-qb27z
+IP: 127.0.0.1
+IP: ::1
+IP: 10.42.0.5
+IP: fe80::c005:bbff:fe53:e62c
+RemoteAddr: 10.42.1.26:45580
+GET / HTTP/1.1
+Host: 10.42.0.5:8080
+User-Agent: curl/8.21.0
+Accept: */*
+
+$ kc_within 60 -n nettest exec probe-v54jv -- ping -M do -c 2 -W 2 -s 1352 10.42.0.5
+PING 10.42.0.5 (10.42.0.5) 1352(1380) bytes of data.
+1360 bytes from 10.42.0.5: icmp_seq=1 ttl=62 time=37.0 ms
+1360 bytes from 10.42.0.5: icmp_seq=2 ttl=62 time=36.7 ms
+
+--- 10.42.0.5 ping statistics ---
+2 packets transmitted, 2 received, 0% packet loss, time 1001ms
+rtt min/avg/max/mdev = 36.697/36.861/37.026/0.164 ms
+$ kc_within 60 -n nettest exec probe-v54jv -- ping -M do -c 2 -W 2 -s 1353 10.42.0.5
+PING 10.42.0.5 (10.42.0.5) 1353(1381) bytes of data.
+ping: sendmsg: Message too large
+ping: sendmsg: Message too large
+
+--- 10.42.0.5 ping statistics ---
+2 packets transmitted, 0 received, +2 errors, 100% packet loss, time 1018ms
+
+command terminated with exit code 1
+$ kc_within 60 -n nettest exec probe-v54jv -- curl -fsS -m 5 http://10.42.1.23:8080/
+Hostname: echo-zlljg
+IP: 127.0.0.1
+IP: ::1
+IP: 10.42.1.23
+IP: fe80::4c76:b6ff:fe2c:e0ce
+RemoteAddr: 10.42.1.26:34648
+GET / HTTP/1.1
+Host: 10.42.1.23:8080
+User-Agent: curl/8.21.0
+Accept: */*
+
+$ kc_within 60 -n nettest exec probe-v54jv -- ping -M do -c 2 -W 2 -s 1352 10.42.1.23
+PING 10.42.1.23 (10.42.1.23) 1352(1380) bytes of data.
+1360 bytes from 10.42.1.23: icmp_seq=1 ttl=64 time=0.082 ms
+1360 bytes from 10.42.1.23: icmp_seq=2 ttl=64 time=0.081 ms
+
+--- 10.42.1.23 ping statistics ---
+2 packets transmitted, 2 received, 0% packet loss, time 1049ms
+rtt min/avg/max/mdev = 0.081/0.081/0.082/0.000 ms
+$ kc_within 60 -n nettest exec probe-v54jv -- ping -M do -c 2 -W 2 -s 1353 10.42.1.23
+PING 10.42.1.23 (10.42.1.23) 1353(1381) bytes of data.
+ping: sendmsg: Message too large
+ping: sendmsg: Message too large
+
+--- 10.42.1.23 ping statistics ---
+2 packets transmitted, 0 received, +2 errors, 100% packet loss, time 1003ms
+
+command terminated with exit code 1
+$ kc_within 60 -n nettest exec probe-v54jv -- curl -fsS -m 5 http://echo.nettest.svc.cluster.local:8080/
+Hostname: echo-zlljg
+IP: 127.0.0.1
+IP: ::1
+IP: 10.42.1.23
+IP: fe80::4c76:b6ff:fe2c:e0ce
+RemoteAddr: 10.42.1.26:45546
+GET / HTTP/1.1
+Host: echo.nettest.svc.cluster.local:8080
+User-Agent: curl/8.21.0
+Accept: */*
+
+
+B1: N x N matrix, UNDERLAY_MTU=1460: each cell is curl to the echo Pod IP, ping -M do -s 1352
+(must pass) and -s 1353 (must fail as too big for the MTU); svc-dns is curl
+http://echo.nettest.svc.cluster.local:8080/
+probe \ echo  k3s-cp  k3s-cpu-1  svc-dns
+k3s-cp        ok      ok         ok
+k3s-cpu-1     ok      ok         ok
+# finished: 2026-10-22T12:51:12-07:00 — PASS (exit 0)
