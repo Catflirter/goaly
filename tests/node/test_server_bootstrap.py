@@ -783,14 +783,14 @@ def host_stubs(tmp):
     })
 
 
-def run_host(tmp, bindir):
+def run_host(tmp, bindir, **extra):
     sysroot = tmp / "sys"
     networkd(tmp, "10-netplan-ens4.network", "[Match]\nName=ens4\n")
     env = {**os.environ, "SYSFS_NET": str(fake_sysfs(tmp, "ens4", 1460)),
-           "K3S_BOOTSTRAP_TEST_ROOT": str(sysroot), "PATH": f"{bindir}:{os.environ['PATH']}"}
+           "K3S_BOOTSTRAP_TEST_ROOT": str(sysroot), "PATH": f"{bindir}:{os.environ['PATH']}", **extra}
     return subprocess.run(["bash", str(ROOT / "node/server-bootstrap.sh"), "--cp-ip", "34.82.10.10",
                            "--cp-internal-ip", "10.10.0.2", "--iface", "ens4"],
-                          capture_output=True, text=True, env=env)
+                          capture_output=True, text=True, env=env, timeout=60)
 
 
 def snapshot_sysctl(bindir, tmp):
@@ -928,3 +928,40 @@ def test_host_rerun_applies_the_new_sysctl_file_without_restarting_k3s(tmp_path)
     assert r.returncode == 0, r.stderr
     assert "net.ipv4.ip_forward=1" in (tmp_path / "sysctl-saw.conf").read_text().splitlines()
     assert not any(c.startswith("systemctl restart") for c in calls(log)), calls(log)
+
+
+def readyz_stubs(tmp, fail_first):
+    """host_stubs whose first FAIL_FIRST /readyz probes fail, plus a sleep stub that only logs its call."""
+    bindir, log = host_stubs(tmp)
+    k3s, count = bindir / "k3s", tmp / "readyz-probes"
+    k3s.write_text(k3s.read_text() + f'if [[ "$*" == *"get --raw /readyz"* ]]; then '
+                   f'n=$(cat "{count}" 2>/dev/null || echo 0); echo $((n + 1)) > "{count}"; (( n >= {fail_first} )); fi\n')
+    make_stubs(tmp, {"sleep": ""}, names=[])
+    return bindir, log
+
+
+def test_host_readyz_wait_retries_until_the_apiserver_is_ready(tmp_path):
+    # Minors M-2: the apiserver is not ready at the first two probes; the loop sleeps 5 s (stubbed) and asks again.
+    bindir, log = readyz_stubs(tmp_path, fail_first=2)
+    r = run_host(tmp_path, bindir)
+    assert r.returncode == 0, r.stderr
+    assert [c for c in calls(log) if c in (READYZ, "sleep 5")] == [READYZ, "sleep 5", READYZ, "sleep 5", READYZ]
+    assert host_calls(log)[-5:] == [READYZ, "sleep 5", READYZ, "sleep 5", READYZ]
+    assert r.stderr.rstrip().endswith("k3s server v1.36.5+k3s1 ready")
+
+
+def test_host_readyz_wait_gives_up_at_the_deadline(tmp_path):
+    # READYZ_TIMEOUT (seconds, test mode only) brings the 180 s deadline within reach of a test.
+    bindir, log = readyz_stubs(tmp_path, fail_first=10**6)
+    r = run_host(tmp_path, bindir, READYZ_TIMEOUT="0")
+    assert r.returncode == 1
+    assert r.stderr.rstrip().endswith("ERROR: apiserver not ready after 0s; see journalctl -u k3s")
+    assert host_calls(log)[-1] == READYZ and "sleep 5" not in calls(log)
+
+
+@pytest.mark.parametrize("value", ["-1", "1.5", "soon"])
+def test_host_readyz_timeout_must_be_a_number_of_seconds(tmp_path, value):
+    bindir, log = readyz_stubs(tmp_path, fail_first=0)
+    r = run_host(tmp_path, bindir, READYZ_TIMEOUT=value)
+    assert r.returncode == 1 and f"READYZ_TIMEOUT must be a number of seconds: {value}" in r.stderr
+    assert READYZ not in calls(log)

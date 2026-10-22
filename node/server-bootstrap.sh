@@ -86,8 +86,13 @@ fi
 # HOST is "" (i.e. /) on a node; the offline tests point K3S_BOOTSTRAP_TEST_ROOT at a scratch tree
 # and put stub binaries first on PATH (common.sh).
 HOST=${K3S_BOOTSTRAP_TEST_ROOT:-}
+# How long to wait for the apiserver's /readyz (seconds). Test mode may shorten it with
+# READYZ_TIMEOUT, so the offline tests reach the deadline; on a node it is always 180.
+READYZ_WAIT=180
 if [[ -n $HOST ]]; then
   log "WARNING: K3S_BOOTSTRAP_TEST_ROOT=$HOST: test mode, host paths are prefixed with it"
+  READYZ_WAIT=${READYZ_TIMEOUT:-180}
+  [[ $READYZ_WAIT =~ ^[0-9]+$ ]] || die "READYZ_TIMEOUT must be a number of seconds: $READYZ_WAIT"
 else
   (( EUID == 0 )) || die "run as root, or use --render-only DIR"
 fi
@@ -133,11 +138,11 @@ fi
 # Either restarted above or (re)started by install.sh with the new files.
 rm -f -- "$RESTART_PENDING"
 
-log "waiting up to 180s for the apiserver to report /readyz"
-deadline=$((SECONDS + 180))
-# --request-timeout bounds each probe, so a hung connection cannot stretch the 180s.
+log "waiting up to ${READYZ_WAIT}s for the apiserver to report /readyz"
+deadline=$((SECONDS + READYZ_WAIT))
+# --request-timeout bounds each probe, so a hung connection cannot stretch the wait.
 until k3s kubectl --request-timeout=5s get --raw /readyz > /dev/null 2>&1; do
-  (( SECONDS < deadline )) || die "apiserver not ready after 180s; see journalctl -u k3s"
+  (( SECONDS < deadline )) || die "apiserver not ready after ${READYZ_WAIT}s; see journalctl -u k3s"
   # Not a foreground sleep, so a Ctrl-C as it ends still stops the bootstrap (see gpu_audit in common.sh).
   sleep 5 &
   wait "$!"
