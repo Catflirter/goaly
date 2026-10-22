@@ -88,3 +88,96 @@ def test_mermaid_blocks_name_a_diagram_type():
         for block in re.findall(r"```mermaid\n(.*?)```", p.read_text(), re.S):
             first = block.strip().splitlines()[0]
             assert re.match(r"(flowchart|graph) (LR|RL|TB|TD|BT)$", first), (p.name, first)
+
+
+# --- link fragments (#anchor) ----------------------------------------------------------------------
+
+def _slug(heading: str) -> str:
+    """GitHub's heading anchor: lowercase, punctuation dropped (hyphens and underscores kept), spaces to '-'."""
+    return re.sub(r"[^\w\- ]", "", heading.strip().lower()).replace(" ", "-")
+
+
+def anchors(text: str) -> set[str]:
+    """Every anchor the '#' headings of a Markdown text get on GitHub (fenced code skipped; repeats -1, -2)."""
+    found: set[str] = set()
+    seen: dict[str, int] = {}
+    fenced = False
+    for line in text.splitlines():
+        if line.lstrip().startswith("```"):
+            fenced = not fenced
+            continue
+        m = None if fenced else re.match(r"#{1,6} +(.*?) *#* *$", line)
+        if m:
+            slug = _slug(m.group(1))
+            n = seen.get(slug, 0)
+            seen[slug] = n + 1
+            found.add(slug if n == 0 else f"{slug}-{n}")
+    return found
+
+
+LINK = re.compile(r"\]\((?!https?://)([^)\s]+)\)")
+
+
+def broken_fragments(path: Path, text: str) -> list[str]:
+    """Links in `text` (the content of `path`) whose #fragment names no heading of the target file."""
+    broken = []
+    for target in LINK.findall(text):
+        file, _, fragment = target.partition("#")
+        if not fragment:
+            continue
+        dest = (path.parent / file).resolve() if file else path
+        if dest.suffix == ".md" and (not dest.exists() or fragment not in anchors(dest.read_text())):
+            broken.append(target)
+    return broken
+
+
+def test_link_fragments_resolve():
+    for p in DOCS:
+        assert broken_fragments(p, p.read_text()) == [], p.name
+
+
+def test_fragment_check_reports_a_missing_anchor():
+    # The check above must be able to fail: a renamed heading leaves its old anchor dangling.
+    readme = ROOT / "README.md"
+    assert broken_fragments(readme, "[c](docs/runbook.md#no-such-heading) [d](#cost) [e](#nope)") == [
+        "docs/runbook.md#no-such-heading", "#nope"]
+    assert anchors("# A `b`, c!\n```bash\n# not a heading\n```\n## A b c\n") == {"a-b-c", "a-b-c-1"}
+
+
+# --- the docs describe the merged code on main ------------------------------------------------------
+
+def test_docs_drop_claims_the_merged_code_contradicts():
+    stale = {
+        "lambda/.gpu-down": "gpuctl keeps no local state; there is no gpu-down marker",
+        "follow-up change": "project-id masking (#105) and the promote-time check (#107) are merged",
+        "bash 3.2": "stack_lock and tunnel.sh need bash >= 4.1",
+        "only for `cpu-pool.sh --guarded`": "make tunnel needs flock(1), and every stack run takes a lock",
+        "one node can be added at a time": "with the A100 fallback the 3.00 budget admits one GPU node in total",
+        "one new node at a time": "with the A100 fallback the 3.00 budget admits one GPU node in total",
+        '"$SSH_PRIVATE_KEY_PATH"': ".env is not loaded into the operator's shell",
+    }
+    for p in DOCS:
+        t = p.read_text()
+        for phrase, why in stale.items():
+            assert phrase not in t, (p.name, phrase, why)
+
+
+def test_no_doc_prints_an_access_token():
+    # A demo-day step must never put a live bearer token on a shared screen.
+    for p in DOCS:
+        for line in p.read_text().splitlines():
+            if "print-access-token" in line:
+                assert re.search(r"print-access-token\s*>\s*/dev/null", line), (p.name, line)
+
+
+def test_docs_name_the_merged_evidence_and_lock_rules():
+    readme = (ROOT / "README.md").read_text()
+    tm = (ROOT / "docs/threat-model.md").read_text()
+    rb = (ROOT / "docs/runbook.md").read_text()
+    for name, t in (("README.md", readme), ("threat-model.md", tm)):
+        assert "<GCP_PROJECT>" in t and "OPERATOR_IP" in t, name
+    assert "brew install bash" in rb and "brew install flock" in rb
+    # With the A100 fallback the committed budget refuses a second GPU node: the docs must say so where
+    # they show a changed count (runbook --set-count example, README demo chapter 6).
+    assert "plan refused" in rb and "plan refused" in readme
+    assert "monitoring-host" in readme and "monitoring-host" in tm

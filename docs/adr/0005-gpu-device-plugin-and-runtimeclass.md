@@ -61,8 +61,10 @@ flowchart TB
   node, so only `join-node.sh`, with the admin kubeconfig, applies that label after the node is Ready.
 - **Layer 5 (ours).** Helm chart `nvidia-device-plugin` `0.20.1`, image pinned by digest, running
   under `nvidia-gpu`, tolerations written out (`CriticalAddonsOnly`, the GPU taint) instead of
-  relying on chart defaults, in namespace `nvidia-device-plugin`, the only namespace with PSA
-  `privileged` (it needs hostPath) ([k8s/system/nvdp-values.yaml](../../k8s/system/nvdp-values.yaml)).
+  relying on chart defaults, in namespace `nvidia-device-plugin`, the only namespace the core build
+  labels PSA `privileged` (it needs hostPath; `kube-system` is exempt in `node/k3s/psa.yaml`, and the
+  optional monitoring stack adds `monitoring-host`)
+  ([k8s/system/nvdp-values.yaml](../../k8s/system/nvdp-values.yaml)).
 - **Node registration.** GPU agents register with the labels `nvidia.com/gpu.present=true` (the
   chart's node affinity) and `gpu-type=<model>`, and the taint `nvidia.com/gpu=present:NoSchedule`.
   On the host, `node-bootstrap.sh` first records an audit (`nvidia-smi`, OS, kernel, runtime path and

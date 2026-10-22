@@ -121,7 +121,9 @@ container image in `k8s/` is pinned by `@sha256:` digest.
      so a pod cannot read GCE metadata or a service-account token.
 3. **k3s and Kubernetes.** mTLS on 6443; CA-pinned `K10…` join tokens valid 15 minutes, piped from
    the control plane straight to the node and deleted once it is Ready; Secrets encrypted at rest; Pod
-   Security Admission `restricted` by default (only the device plugin namespace is `privileged`);
+   Security Admission `restricted` by default (`kube-system` is exempt, and in the core build
+   `nvidia-device-plugin` is the only namespace labelled `privileged`; the optional monitoring stack
+   adds `monitoring-host`, privileged for the hostPath reads of node-exporter and the DCGM exporter);
    audit log at `Metadata` level; NodeRestriction; default-deny NetworkPolicy in `hello`;
    `protect-kernel-defaults` with the kubelet sysctls written first.
 
@@ -231,7 +233,8 @@ Prerequisites (details in the [runbook](docs/runbook.md#prerequisites)):
   `roles/iap.tunnelResourceAccessor`, `roles/iam.serviceAccountUser` on the two service accounts, and
   rights to create the resources;
 - a Lambda Cloud account, an API key, and an SSH public key uploaded to Lambda;
-- terraform >= 1.9, gcloud, kubectl, helm, python3 >= 3.11, jq, gitleaks, kubeconform;
+- terraform >= 1.9, gcloud, kubectl, helm, python3 >= 3.11, jq, gitleaks, kubeconform, bash >= 4.1
+  and flock (on macOS: `brew install bash flock`);
 - `gcloud auth login` and `gcloud auth application-default login`.
 
 ```bash
@@ -239,7 +242,7 @@ cp .env.example .env && chmod 600 .env  # GCP_PROJECT, LAMBDA_API_KEY, LAMBDA_SS
                                         # SSH_PRIVATE_KEY_PATH; OPERATOR_IP optional
 make venv        # .venv with the Python tooling
 make lint        # pre-commit hooks, gitleaks over history, terraform validate/test, pytest
-make init        # once: state bucket and GCP APIs (billing starts with make up)
+make init        # once: state bucket and GCP APIs (a few cents of storage; VM billing starts with make up)
 make up          # base, k3s-cp, kubeconfig, tunnel, CPU workers, system components, workloads
 make gpu-plan    # what gpu-apply would launch, and the hourly cost at live prices
 make gpu-apply   # launch, firewall, join and label the GPU node(s); asks first
@@ -249,10 +252,13 @@ make down        # GPU nodes, workers, base; the state bucket is kept
 ```
 
 `make help` lists every target. Every step can be re-run: a second `make up` on a running cluster
-took 92 s and changed nothing (no Terraform change, no k3s restart, guard rules untouched). Every
-Terraform apply shows its plan and asks; `AUTO_APPROVE=1` skips the question but never lets an
-unattended run destroy or replace `k3s-cp` or an undrained worker. Scaling, break-glass access and
-the teardown details are in the [runbook](docs/runbook.md).
+took 92 s and changed nothing (no Terraform change, no k3s restart, guard rules untouched). Applies
+by `make up` and the CPU pool targets show their plan and ask; under `AUTO_APPROVE=1` they refuse
+any destroy or replace of `k3s-cp` or an undrained worker. Two exceptions: `gpuctl` applies the
+`gpu-access` stack without a prompt, inside the `gpu-apply` or `gpu-down` that asked first
+([ADR-0003](docs/adr/0003-terraform-three-stacks.md)), and `make down` destroys everything after one
+question, which `AUTO_APPROVE=1` also skips. Never export `AUTO_APPROVE` in a shell. Scaling,
+break-glass access and the teardown details are in the [runbook](docs/runbook.md).
 
 ## Verification
 
@@ -269,8 +275,9 @@ check functions in [scripts/lib/checks.sh](scripts/lib/checks.sh)):
 
 Each run writes `verification/<YYYY-MM-DDTHHMM-0700>/`: one numbered file per check, starting with the
 commands it ran, and a `SUMMARY.md` with PASS, FAIL or SKIP. Output passes a redaction filter
-(tokens, kubeconfig keys, private keys, the Lambda key; the operator's IP becomes `<operator_ip>`),
-every check is time-bounded, an interrupt runs each check's cleanup, and gitleaks scans the run.
+(tokens, kubeconfig keys, private keys, the Lambda key; the operator's IP becomes `<operator_ip>` and
+the GCP project id `<GCP_PROJECT>`, in any case), every check is time-bounded, an interrupt runs each
+check's cleanup, and gitleaks scans the run.
 
 | Run | Result | Time |
 |---|---|---|
@@ -280,8 +287,13 @@ every check is time-bounded, an interrupt runs each check's cleanup, and gitleak
 
 The committed evidence will be `verification/final/SUMMARY.md`. Task 24 produces it from a final
 from-scratch run (`make down`, `make up`, `make gpu-apply`, `make verify RESILIENCE=1`) and promotes
-it with `make promote-verify RUN=verification/<ts>`, which copies the run to a staging directory,
-scans every file with gitleaks and for the operator's IP, and only then replaces `verification/final/`.
+it with `OPERATOR_IP=$(curl -s https://checkip.amazonaws.com) make promote-verify
+RUN=verification/<ts>`, which copies the run to a staging directory, scans every file with gitleaks
+and for the GCP project id (the environment's and `.env`'s), and only then replaces
+`verification/final/`. It also fails on the operator's IP, but only when `OPERATOR_IP` is set in the
+caller's environment, as above; it never looks the IP up itself. A
+`grep -r "$(curl -s https://checkip.amazonaws.com)" verification/final` that prints nothing is the
+required last step before the copy is committed ([runbook](docs/runbook.md#verification)).
 To re-run on a live cluster: `make tunnel` if it is not running, then `make verify`, and compare the
 new `SUMMARY.md` with the committed one.
 
@@ -298,12 +310,16 @@ prints each step's title and command, runs it through the same redaction filter,
 | 3 | Cross-node connectivity matrix | B1 |
 | 4 | Hello world: cross-node curl, port-forward, QoS and cgroup values, OOMKilled, throttling, NetworkPolicy | C2-C5, C7, C8 |
 | 5 | GPU: advertised GPU, `nvidia-smi` pod, `vectoradd`, oversubscription Pending | D2, D4-D6 |
-| 6 | Spec-driven scaling: `cpu-scale` to 2 and back to 1 (guarded), `gpu-plan` with a changed count | - |
+| 6 | Spec-driven scaling: `cpu-scale` to 2 and back to 1 (guarded), `gpu-plan` with a changed count (with the committed budget, a second GPU node is refused: the plan is printed, then `plan refused`; see [Cost](#cost)) | - |
 | 8 | Teardown: the `make down` plan, or the real teardown | - |
 
-`make demo CHAPTERS=1,2,4,5` fits a shorter slot; `make demo-replay CHAPTER=n` prints a chapter's
-recorded output if a live step fails; `make demo-reset` removes what a run creates; `make preflight`
-checks tools, logins, the operator IP and GPU stock beforehand. Task 25 adds the per-chapter timings
+Chapter 7 (autoscaling) belongs to the optional stretch and is not part of the core demo.
+
+Task 25 also adds the other demo targets: `make demo CHAPTERS=1,2,4,5` for a shorter slot,
+`make demo-replay CHAPTER=n` to print a chapter's recorded output if a live step fails,
+`make demo-reset` to remove what a run creates, and `make preflight` to check tools, logins, the
+operator IP and GPU stock beforehand. Until then the [demo-day checklist](docs/runbook.md#demo-day-checklist)
+lists the commands each one automates. Task 25 adds the per-chapter timings
 after the rehearsals; the measured building blocks are `make cpu-scale N=2` 156 s, back to 1 in
 179-182 s, and `make gpu-apply` 5m43s-9m41s, which is why the GPU node is launched about 30 minutes
 ahead ([demo-day checklist](docs/runbook.md#demo-day-checklist)).
@@ -331,7 +347,8 @@ divided by 30.
 
 The largest cost risk is a forgotten GPU node: Lambda has no stopped state. The guards are
 `budget_usd_per_hour` (3.0, checked at live prices, new nodes priced at their pool's most expensive
-candidate) and `max_nodes` (3) in [lambda/gpu-nodes.yaml](lambda/gpu-nodes.yaml); automatic
+candidate, so with the A100 fallback listed it admits one GPU node in total) and `max_nodes` (3) in
+[lambda/gpu-nodes.yaml](lambda/gpu-nodes.yaml); automatic
 termination of a node that fails to join; `make gpu-down` after every GPU session with `make
 gpu-status` to confirm; and `make down`'s last step, which fails while Lambda still lists a GPU node
 of this cluster.
@@ -348,7 +365,9 @@ of this cluster.
 - **GPU isolation relies on scheduling.** A pod under the NVIDIA runtime whose image sets
   `NVIDIA_VISIBLE_DEVICES=all` sees all GPUs; the fix is CDI plus an admission policy.
 - **IP forwarding on Lambda hosts** routes between all interfaces with no provider-side
-  anti-spoofing; a guard forward rule would close it.
+  anti-spoofing: a host on the same L2 segment could reach any pod or ClusterIP Service through a GPU
+  host, past both allow-list layers, with NetworkPolicy as the only remaining control. A guard
+  forward rule would close it; default-deny NetworkPolicies narrow it meanwhile.
 - **One shared admin credential**, not tied to a person.
 - **Third-party GPU hosts:** Lambda has root on them, and each new host key is trusted on first use.
 - **Bundled containerd 2.3.4** is likely affected by two medium-severity DoS advisories; upgrade with

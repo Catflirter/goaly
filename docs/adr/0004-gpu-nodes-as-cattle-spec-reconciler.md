@@ -90,9 +90,11 @@ undrained terminate and says "start make tunnel and re-run, or pass --no-drain".
 
 - **Budget at live prices.** The plan sums `price_cents_per_hour` from Lambda's API: kept instances
   at their own type's price, new nodes at the pool's most expensive candidate type (today the A100,
-  $1.99/h), and refuses a plan above `budget_usd_per_hour`. With today's prices and the A100 listed as
-  a fallback, the 3.00 budget admits one new node at a time (an A10 at $1.29 plus a new node priced at
-  $1.99 is $3.28).
+  $1.99/h), and refuses a plan above `budget_usd_per_hour` (`gpuctl plan` prints the plan, then
+  `plan refused: budget_usd_per_hour ...`). With today's prices and the A100 listed as a fallback, the
+  3.00 budget admits only one GPU node in total: a second node next to a running A10 is refused
+  ($1.29 + $1.99 = $3.28), and so are two new nodes ($3.98). Running two needs a budget of at least
+  3.98, or the A100 dropped from the fallbacks (then 2 × $1.29 = $2.58).
 - **Count.** `max_nodes` caps the total; the `gpu-access` stack refuses more IPs than its own copy of
   the cap, and `gpuctl` passes the spec's value on every apply.
 - **Architecture.** arm64 types (GH200) are refused when the spec is loaded.
@@ -110,10 +112,16 @@ undrained terminate and says "start make tunnel and re-run, or pass --no-drain".
 ### Drift check
 
 `gpuctl status` compares five sources: the target counts, Lambda's instances, the cluster's GPU
-nodes, the IPs in the `gpu-access` state and the members of `k3s_peers`. An allow-list entry for an IP
-with no live instance is reported as a security problem. After `make gpu-down`, a git-ignored marker
-`lambda/.gpu-down` records the time; while it exists the status expects zero instances, so a pool
-below its spec count is a note, not drift, and any running instance is drift.
+nodes, the IPs in the `gpu-access` state and the members of `k3s_peers`. Any problem exits 3. An
+allow-list entry (`gpu-access` rule or `k3s_peers` member) for an IP with no live instance is
+reported first, as a security problem; a live instance missing from the cluster or an allow-list,
+and a stale Node, are drift. `gpuctl` keeps no local state, so it cannot tell a pool that
+`gpu-down` emptied from one never applied: a pool with fewer live instances than its target (the spec
+count, or the autoscaler's override) is only a note, never drift, and a pool with more is drift.
+
+So after `make gpu-down` the exit code alone does not prove the session is over: one instance left
+in a pool whose target is 1 is neither drift nor a problem. The operator confirms by reading the
+instance list in `make gpu-status`, which must read `GPU instances (k3s-gpu-*): 0`.
 
 ### Consequences
 

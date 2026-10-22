@@ -1,9 +1,11 @@
 # Runbook
 
 Day-to-day operation of the hybrid cluster: bring-up, scaling, GPU sessions, verification,
-break-glass access, teardown and the demo day. Every `make` target here is safe to re-run; each one
-that changes cloud resources shows a plan and asks first unless `AUTO_APPROVE=1` is set. Architecture
-and rationale: [README](../README.md). Times are Pacific (PDT).
+break-glass access, teardown and the demo day. Every `make` target here is safe to re-run. Every
+Terraform apply of the base and workers stacks, `gpu-apply` and `gpu-down` show what they will do and
+ask first; `make down` asks once for the project id. `AUTO_APPROVE=1` skips each of those questions,
+so never export it in a shell. `cpu-stop`, `cpu-start` and `sync-peers` act at once without asking.
+Architecture and rationale: [README](../README.md). Times are Pacific (PDT).
 
 ## Prerequisites
 
@@ -15,7 +17,7 @@ and rationale: [README](../README.md). Times are Pacific (PDT).
   `make init`, which enables six APIs).
 - A Lambda Cloud account, an API key, and an SSH public key uploaded to Lambda.
 
-**Tools on the operator machine** (Linux or macOS; the scripts keep to bash 3.2)
+**Tools on the operator machine** (Linux or macOS)
 
 | Tool | Version | Used by |
 |---|---|---|
@@ -25,8 +27,10 @@ and rationale: [README](../README.md). Times are Pacific (PDT).
 | python3 | >= 3.11 | `gpuctl` (in `.venv`, from `make venv`) |
 | jq, ssh, coreutils `timeout` | any | scripts |
 | gitleaks | >= 8.19 | `make lint`, `make verify`, `make promote-verify` |
-| kubeconform, shellcheck (via pre-commit) | any | `make lint` |
-| flock (util-linux) | any | only for `cpu-pool.sh --guarded` |
+| bash | >= 4.1 (macOS ships 3.2: `brew install bash`) | `make up`, `make down`, `make tunnel`, `make cpu-scale`, `make cpu-remove`: each takes a lock with `exec {fd}>` and refuses an older bash (exit 2) |
+| flock (util-linux; macOS: `brew install flock`) | any | required by `make up`, `make down`, `make tunnel` and `make tunnel-stop` (each runs `tunnel.sh` start or stop, which refuses without it, exit 2) and by `cpu-pool.sh --guarded`; without it, `cpu-scale` and `cpu-remove` run without the workers lock, with a warning |
+| shellcheck | installed by pre-commit (`shellcheck-py`) | `make lint` |
+| kubeconform | any, on `PATH` (a `language: system` hook, like `terraform fmt`) | `make lint` |
 
 **One-time setup**
 
@@ -85,8 +89,13 @@ The CPU pool is the inventory `infra/workers/workers.auto.tfvars.json`
 `k3s-cpu-1` is never removed. It is an `e2-standard-2`, set in the inventory; workers that
 `cpu-scale` adds default to `e2-small` (`CPU_TYPE` overrides). For unattended use,
 `scripts/cpu-pool.sh scale N --guarded` also requires the saved plan to pass `gpuctl tfguard` (only
-the four per-worker resources of the added or removed workers may change) and holds a lock so two
-guarded runs never overlap.
+the four per-worker resources of the added or removed workers may change).
+
+Every run that plans or applies a stack holds that stack's lock, `.run/<stack>.lock` (flock), until
+it exits: `make up` (each stack from the stage that plans it), every `cpu-scale` and `cpu-remove`
+(`workers.lock`) and `make down` (all three stacks). A second run on the same stack refuses at once
+(exit 2) and says how to find the holder (`fuser -v` or `lsof` on the lock file). The kernel drops
+the lock when the holder exits, however it ends, so there is no stale lock to clean up.
 
 ## GPU nodes
 
@@ -99,18 +108,25 @@ make gpu-plan     # creates/deletes and the hourly cost at live prices
 make gpu-apply    # asks, launches, opens the firewalls, joins, labels
 make verify       # D1-D6 now run instead of SKIP
 make gpu-down     # asks, drains, deletes the Node, terminates, closes the firewalls
-make gpu-status   # want: no instance of this cluster, no drift
+make gpu-status   # want: "GPU instances (k3s-gpu-*): 0" and no drift
 ```
+
+Read the instance count, not only the exit code: a pool below its target is a note, never drift, so
+a leftover instance in a pool whose target is 1 still exits 0.
 
 - **Every GPU session ends with `make gpu-down` and a `make gpu-status` that shows no instance.**
   Lambda bills until an instance is terminated; shutting it down from inside does not stop billing.
 - To change the count, edit `count` in the spec; `scripts/gpuctl plan --set-count a6000=2` previews a
-  count without editing the file.
+  count without editing the file. With the spec as committed, that preview prints the plan followed
+  by `plan refused: budget_usd_per_hour ...` (see the budget below).
 - Capacity: `gpu-status` shows which (type, region) pairs have stock. On both measured days only
   `gpu_1x_a10` had any; `gpu-apply` falls back to it automatically.
-- The budget check prices new nodes at the pool's most expensive candidate (the A100 at $1.99/h): with
-  `budget_usd_per_hour: 3.0`, one node can be added at a time. Raise the budget or drop the A100
-  fallback to launch two at once.
+- The budget check prices kept nodes at their own type and every new node at the pool's most
+  expensive candidate (the A100 at $1.99/h). With `gpu_1x_a100` listed as a fallback, the 3.00
+  budget admits only one GPU node in total: a second node next to a running A10 is refused
+  ($1.29 + $1.99 = $3.28), and so are two new nodes ($3.98). To run two, raise
+  `budget_usd_per_hour` to at least 3.98, or drop the A100 fallback (then 2 × $1.29 = $2.58 for two
+  A10s).
 - `scripts/gpuctl apply --keep-on-failure` keeps a node whose join failed, for debugging. It bills
   until `make gpu-down`.
 - `make sync-peers` after the operator's network changes: it replaces the operator's old IP with the
@@ -122,7 +138,9 @@ make gpu-status   # want: no instance of this cluster, no drift
 make verify                       # A-D into verification/<YYYY-MM-DDTHHMM-0700>/
 make verify RESILIENCE=1          # adds E1-E3: reboots k3s-cpu-1, replaces the GPU node, forges drift
 scripts/verify.sh B               # one group
-make promote-verify RUN=verification/<YYYY-MM-DDTHHMM-0700>   # scan and copy to verification/final/
+OPERATOR_IP=$(curl -s https://checkip.amazonaws.com) \
+  make promote-verify RUN=verification/<YYYY-MM-DDTHHMM-0700>  # scan, then replace verification/final/
+grep -r "$(curl -s https://checkip.amazonaws.com)" verification/final   # must print nothing
 ```
 
 A run exits 0 when no check failed (SKIP is not a failure) and gitleaks found nothing in it. D-group
@@ -130,7 +148,11 @@ checks SKIP without a GPU node. E2 replaces the GPU node only when its pool show
 itself holds a unit of a candidate type; otherwise it SKIPs, which means "not verified": replace the
 node by hand (`make gpu-down`, `make gpu-apply`) and re-run `scripts/verify.sh E`.
 `make promote-verify` refuses a run with a failed check, and a run with a skipped check unless
-`PROMOTE_ALLOW_SKIP=1`.
+`PROMOTE_ALLOW_SKIP=1`. It copies the run to a staging directory and fails if gitleaks finds
+anything, or if the copy contains the GCP project id (from the environment and from `.env`, in any
+case) or `OPERATOR_IP`. The operator-IP check runs only when `OPERATOR_IP` is set in the caller's
+environment (promote.sh does not look the IP up itself), hence the command above. The `grep` after
+it is a required step before the promoted copy is committed.
 
 ## Break-glass
 
@@ -148,13 +170,19 @@ gcloud compute ssh k3s-cp --zone us-west1-b --tunnel-through-iap -- sudo k3s kub
 ```bash
 make sync-peers                           # if the operator's network changed
 ip=$(scripts/gpuctl ip k3s-gpu-a6000-1)
-ssh -i "$SSH_PRIVATE_KEY_PATH" -o UserKnownHostsFile=.run/known_hosts_k3s-gpu-a6000-1 ubuntu@"$ip"
+ssh -i ~/.ssh/<your-lambda-key> -o UserKnownHostsFile=.run/known_hosts_k3s-gpu-a6000-1 ubuntu@"$ip"
 ```
 
+The key is the private key that `SSH_PRIVATE_KEY_PATH` names in `.env`; write its path out. Do not
+`source .env` into your shell: it would export the Lambda API key there.
+
 **A GPU node must go and the cluster is unreachable.** `scripts/gpuctl down --no-drain` terminates it
-without the drain. When the cluster is known to be gone (no base outputs, no kubeconfig), `make
-gpu-down` does that by itself. Last resort: terminate it in the Lambda console, then run
-`make gpu-apply` or `make gpu-down` so the firewalls and `k3s_peers` follow.
+without the drain. Risk: the node's Pods are killed without eviction, and its Node object stays in
+the cluster; delete it with `kubectl delete node <name>` once the API is back. When the cluster is
+known to be gone (no base outputs, no kubeconfig), `make gpu-down` skips the drain by itself. Last
+resort: terminate it in the Lambda console, then run `make gpu-down` so the firewalls and
+`k3s_peers` follow (`make gpu-apply` only if you want a replacement: it launches and bills a new
+node).
 
 **The host firewall on `k3s-cp` blocks something it should not** (for example a node whose IP is
 missing from `k3s_peers`). First try `make sync-peers`. In an emergency, on `k3s-cp`:
@@ -175,8 +203,11 @@ lock ID; `terraform -chdir=infra/<stack> force-unlock <id>` after confirming not
 
 ```bash
 make gpu-down && make gpu-status          # optional: make down does this too
-make down                                 # asks for the GCP project id; AUTO_APPROVE=1 skips the question
+make down                                 # asks for the GCP project id, then destroys everything
 ```
+
+`AUTO_APPROVE=1` in the caller's environment skips that one question, and nothing after it asks: the
+whole teardown, `k3s-cp` included, then runs unattended. `.env` cannot set it.
 
 `make down` ([scripts/down.sh](../scripts/down.sh)), in order: `gpuctl down`; drain and delete every
 CPU worker's Node (skipped with a warning when the cluster is unreachable); `terraform destroy` of
@@ -191,10 +222,12 @@ To confirm nothing is left (with `gcloud config set project <GCP_PROJECT>`):
 gcloud compute instances list --filter='name~^k3s-'
 gcloud compute addresses list --filter='name~k3s'
 gcloud compute firewall-rules list --filter='name~^fw-'
+gcloud compute networks list --filter='name~^k3s-'
+gcloud iam service-accounts list --filter='email~^k3s-'
 scripts/gpuctl list-nodes
 ```
 
-All four print nothing.
+All six print nothing.
 
 ## Demo-day checklist
 
@@ -205,14 +238,14 @@ below; until then each step lists the commands it automates.
 | When | Action |
 |---|---|
 | Day before | `make up`; `make verify`; check `SUMMARY.md` is all PASS (D included only with a GPU node); GCP stays up overnight (see [Cost](../README.md#cost)) |
-| T-60 min | `make preflight`: tool versions; `gcloud auth list` and `gcloud auth application-default print-access-token`; `scripts/gpuctl status` (also checks Lambda capacity); `make sync-peers` (refreshes the operator IP for this network); `scripts/tunnel.sh status` or `make tunnel`; every node Ready |
+| T-60 min | `make preflight`: tool versions; `gcloud auth list`, and `gcloud auth application-default print-access-token > /dev/null && echo 'ADC ok'` (it must succeed; the token is discarded, never shown); `scripts/gpuctl status` (also checks Lambda capacity); `make sync-peers` (refreshes the operator IP for this network); `scripts/tunnel.sh status` or `make tunnel`; every node Ready |
 | T-30 min | `make gpu-apply` (5-10 min measured). If no candidate type has capacity in any region, the GPU chapter uses its recorded output |
 | T-5 min | `make demo-reset` (removes demo pods, the `np-denied` namespace, GPU test pods; scales the CPU pool back to 1); `make preflight` again |
 | During | `make demo` (pauses after every step); `make demo CHAPTERS=1,2,4,5` for a shorter slot; `make demo-replay CHAPTER=n` if a live step fails |
 | After | `make gpu-down`, then `make gpu-status` shows no instance; decide whether GCP stays up or `make down` |
 
-Screen safety: never `cat .env` or the kubeconfig on screen; demo output goes through the same
-redaction filter as `make verify`.
+Screen safety: never `cat .env` or the kubeconfig on screen, and never print an access token; demo
+output goes through the same redaction filter as `make verify`.
 
 ## Troubleshooting
 
