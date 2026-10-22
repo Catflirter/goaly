@@ -124,6 +124,11 @@ install_k3s server "$K3S_VERSION" false
 if [[ -e $RESTART_PENDING ]] && (( k3s_already_current )); then
   log "k3s config changed: restarting k3s"
   systemctl restart k3s
+elif (( k3s_already_current )) && ! systemctl is-active --quiet k3s; then
+  # Ruling R24: installed at the target version, config unchanged, but stopped. install.sh is
+  # skipped, so nothing else would start it and the /readyz wait below could only time out.
+  log "k3s $K3S_VERSION installed but not running: starting k3s"
+  systemctl enable --now k3s
 fi
 # Either restarted above or (re)started by install.sh with the new files.
 rm -f -- "$RESTART_PENDING"
