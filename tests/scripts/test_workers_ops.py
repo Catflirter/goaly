@@ -277,14 +277,19 @@ def test_join_gpu_node_waits_for_ssh_after_the_instance_turns_active(env):
 
 def test_join_gives_up_when_ssh_never_comes_up(env):
     """The SSH wait is bounded: after JOIN_SSH_TIMEOUT_S the join dies naming the node, before any staging,
-    bootstrap or token."""
+    bootstrap or token.
+
+    The budget is 2s, not 1s (S4-1/C4-1/X4-1): wait_for's deadline is SECONDS + TIMEOUT_S and bash's
+    SECONDS steps on whole wall-clock seconds, so a 1s deadline can pass a few ms after the wait
+    starts and end it after a single probe. A 2s deadline is at least 1s of wall time away, so unless
+    the first probe takes over 1s, the wait sleeps WAIT_INTERVAL_S and probes again."""
     env.scenario["ssh_failures"] = 10**6
     start = time.time()
     proc = join(env, "--node", "k3s-cpu-1", "--external-ip", "34.10.0.11", "--skip-sync",
-                JOIN_SSH_TIMEOUT_S="1", WAIT_INTERVAL_S="1")
+                JOIN_SSH_TIMEOUT_S="2", WAIT_INTERVAL_S="1")
     assert time.time() - start < 15
     assert proc.returncode == 1
-    assert "SSH to k3s-cpu-1 not available after 1s" in proc.stderr
+    assert "SSH to k3s-cpu-1 not available after 2s" in proc.stderr
     assert "make cpu-start" in proc.stderr, "a stopped worker has no SSH"
     seq = calls(env)
     probe = worker("k3s-cpu-1", "true")

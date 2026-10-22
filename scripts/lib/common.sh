@@ -286,12 +286,13 @@ confirm() {
 
 # wait_for CMD TIMEOUT_S [STOP_RC]: eval CMD (a string, so shell functions such as kc and cp_ssh
 # work) every WAIT_INTERVAL_S seconds (default 5) until it succeeds. Returns 1 after TIMEOUT_S
-# seconds, with the last attempt's output on stderr. With STOP_RC, an attempt that exits STOP_RC
-# (a failure that no retry can clear) ends the wait at once: wait_for returns STOP_RC, with that
-# attempt's output on stderr. Each attempt runs in a subshell: a CMD that dies (cp_ssh -> tf_out ->
-# die) is a failed attempt whose message is shown, not a silent exit of the whole script; variables
-# CMD sets do not outlive the attempt. CMD must bound its own runtime (kubectl --timeout,
-# ConnectTimeout), or one hung attempt outlasts TIMEOUT_S.
+# seconds, with the last attempt's output on stderr (TIMEOUT_S counts bash SECONDS, which step on
+# whole wall-clock seconds: a TIMEOUT_S of 1 can expire after a few ms; N gives at least N-1 s).
+# With STOP_RC, an attempt that exits STOP_RC (a failure that no retry can clear) ends the wait
+# at once: wait_for returns STOP_RC, with that attempt's output on stderr. Each attempt runs in a
+# subshell: a CMD that dies (cp_ssh -> tf_out -> die) is a failed attempt whose message is shown,
+# not a silent exit of the whole script; variables CMD sets do not outlive the attempt. CMD must
+# bound its own runtime (kubectl --timeout, ConnectTimeout), or one hung attempt outlasts TIMEOUT_S.
 wait_for() {
   local cmd="$1" timeout="$2" stop="${3:-}" interval="${WAIT_INTERVAL_S:-5}" deadline last rc
   [[ "$timeout" =~ ^[0-9]+$ ]] || die "wait_for: bad timeout '$timeout'"
