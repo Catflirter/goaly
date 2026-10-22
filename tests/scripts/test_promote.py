@@ -134,10 +134,14 @@ def test_promote_accepts_a_run_that_scripts_verify_sh_wrote(repo):
     for rel in ("scripts/verify.sh", "scripts/lib/checks.sh"):
         shutil.copy2(ROOT / rel, repo / rel)
     verify_sh = repo / "scripts/verify.sh"
-    marker = "# --- registered checks ---\n"
-    assert marker in verify_sh.read_text()
-    verify_sh.write_text(verify_sh.read_text().replace(
-        marker, marker + "check_ok() { echo ok; }\nregister_check A A1 'always passes' check_ok\n", 1))
+    # Replace the whole registration block: the real checks need a live cluster.
+    start, end = "# --- registered checks ---\n", "# --- end of registered checks ---\n"
+    text = verify_sh.read_text()
+    assert start in text and end in text
+    head, rest = text.split(start, 1)
+    _, tail = rest.split(end, 1)
+    verify_sh.write_text(head + start + "check_ok() { echo ok; }\nregister_check A A1 'always passes' check_ok\n"
+                         + end + tail)
     v = subprocess.run(["bash", str(repo / "scripts/verify.sh")], capture_output=True, text=True, cwd=repo,
                        env={k: val for k, val in os.environ.items() if k != "RESILIENCE"})
     assert v.returncode == 0, v.stderr
