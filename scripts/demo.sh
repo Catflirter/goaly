@@ -148,10 +148,10 @@ demo_replay() {
   [[ -f "$file" ]] || die "no recording for chapter $n ($file; make promote-demo RUN=verification/demo-<ts> records one)" 1
   # Recordings were redacted when they were made; once more, as everything the demo puts on the screen, with
   # the operator's IP and the project id as they are now (a recording made while the IP was unknown, or
-  # before it changed, may still hold it). An unknown IP is not masked here: replay is the fallback, so it
-  # plays anyway.
+  # before it changed, may still hold it). Replay is the fallback for a bad network, so it looks nothing up
+  # (--local): the IP is masked only when .env sets OPERATOR_IP, and an unknown IP does not stop it playing.
   cd -- "$REPO_ROOT"
-  screen_masks
+  screen_masks --local
   redact <"$file"
 }
 
@@ -339,12 +339,22 @@ _demo_node_ready() {
   [[ "$status" == True ]]
 }
 
+# _demo_watch_lines MARK: copy stdin to stdout line by line and create the file MARK at the first line. Builtins
+# only (no child process of its own), so stopping the watch subshell's children stops it.
+_demo_watch_lines() {
+  local line
+  while IFS= read -r line; do
+    printf '%s\n' "$line"
+    [[ -e "$1" ]] || : >"$1"
+  done
+}
+
 # demo_scale_up N: AUTO_APPROVE=1 scripts/cpu-pool.sh scale N --guarded in the background (_demo_detach) while
 # kubectl get nodes -w shows the new worker(s) join; waits for the scale to end, for at most
 # DEMO_SCALE_TIMEOUT_S seconds. Its log goes to the recording (redacted), not the screen. Passes when the scale
 # exited 0 and every new worker is Ready.
 demo_scale_up() {
-  local n="$1" rcfile logfile timeout="${DEMO_SCALE_TIMEOUT_S:-900}" deadline watch rc fail=0 node names
+  local n="$1" rcfile logfile timeout="${DEMO_SCALE_TIMEOUT_S:-900}" deadline watch started rc fail=0 node names
   local -a new=()
   [[ "$timeout" =~ ^[0-9]+$ ]] || { echo "DEMO_SCALE_TIMEOUT_S is not a number of seconds: '$timeout'"; return 1; }
   names="$(_demo_new_workers "$n")" || { echo "cannot read the CPU pool inventory (scripts/cpu-pool.sh render $n)"; return 1; }
@@ -358,13 +368,24 @@ demo_scale_up() {
   echo "\$ AUTO_APPROVE=1 scripts/cpu-pool.sh scale $n --guarded &   # in the background; its log goes to ch$DEMO_CH.txt"
   _demo_detach "$rcfile" "$logfile" env AUTO_APPROVE=1 scripts/cpu-pool.sh scale "$n" --guarded
   _vr_quote kc get nodes -w | redact
-  kc get nodes -w </dev/null &
+  # The watch's lines pass through _demo_watch_lines, which marks the first one (kubectl has started). kubectl
+  # and that reader are both children of $watch, so _vr_stop stops both.
+  started="$RUN_DIR/demo-watch.started"
+  rm -f -- "$started"
+  (kc get nodes -w </dev/null > >(_demo_watch_lines "$started")) &
   watch=$!
+  # A scale that ends at once must not stop the watch before it has shown anything: wait (at most 5 s, or
+  # until the watch has ended) for its first line.
+  deadline=$((SECONDS + 5))
+  while [[ ! -e "$started" ]] && kill -0 "$watch" 2>/dev/null && ((SECONDS < deadline)); do
+    sleep 0.1
+  done
   deadline=$((SECONDS + timeout))
   while [[ ! -s "$rcfile" ]] && ((SECONDS < deadline)); do
     sleep "$DEMO_POLL_S"
   done
   _vr_stop "$watch"
+  rm -f -- "$started"
   if [[ ! -s "$rcfile" ]]; then
     # The log so far goes to the recording; the file itself stays, and the scale goes on writing to it.
     {

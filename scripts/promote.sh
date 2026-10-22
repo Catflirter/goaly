@@ -6,7 +6,8 @@
 #
 # demo (Task 25): DEMO_DIR must be a scripts/demo.sh run, verification/demo-<YYYY-MM-DDTHHMM±zzzz>/ directly
 # under verification/, holding only regular files named chN.txt (N 1-8; at least one) and timings.txt. A run
-# whose timings.txt records a chapter with a failed step, or an interrupted chapter, is refused (exit 2): its
+# whose timings.txt records a chapter with a failed step or an interrupted chapter, or that holds a chN.txt with no
+# timings.txt line (the demo was killed part-way through it), is refused (exit 2): its
 # recording is a fallback that would replay the failure; PROMOTE_ALLOW_FAIL=1 promotes it with a warning
 # naming those chapters. It is copied, checked again, scanned and IP-checked exactly as a verify run is
 # (below), and project-checked (see check_project), and the clean copy replaces verification/final/demo/
@@ -333,66 +334,57 @@ check_ip() {
   fi
 }
 
-# project_for_check: print the GCP project id a demo copy (and a kept final/demo/) must not contain:
-# GCP_PROJECT from the environment, else from $REPO_ROOT/.env (load_env; callers run it in $(...), so .env's
-# other values never reach promote.sh's commands); nothing when neither sets one. load_env's refusals (a .env
-# that is not 600) exit 2, and so does an id that is not a GCP project id (not printed): an id the check
-# cannot match must not pass. (The same rule as open PR minors-1's project_id for the verify copy; whichever
-# merges second keeps one of the two.)
-project_for_check() {
-  local id="${GCP_PROJECT:-}"
-  if [[ -z "$id" && -f "$REPO_ROOT/.env" ]]; then
-    load_env
-    id="${GCP_PROJECT:-}"
-  fi
-  if [[ -n "$id" ]] && ! GCP_PROJECT="$id" _gcp_project_ok; then
-    die "GCP_PROJECT is not a GCP project id (the value is not printed); fix it in the environment or in $REPO_ROOT/.env, or leave it unset" 2
-  fi
-  printf '%s' "$id"
-}
-
-# check_project DIR ID WHERE: exit 1 when the GCP project id (non-empty ID) is in a file of DIR, a flat copy;
-# WHERE says where to redact it. A fixed string (-F), in any case (-i), anywhere in a line: the id also sits
-# inside <id>-k3s-tfstate, service-account emails and FQDNs. LC_ALL=C: bytes that are not UTF-8 cannot hide it,
-# and -i folds ASCII only, which is all a project id holds. grep prints file names only, never the id; the
-# demo masks it as <GCP_PROJECT> (scripts/lib/screen.sh), which this does not match.
+# check_project DIR IDS WHERE: exit 1 when a GCP project id of IDS (project_ids' output, one per line; nothing
+# to check when empty) is in a file of DIR, a flat copy; WHERE says where to redact it. Fixed strings (-F), in
+# any case (-i), anywhere in a line: an id also sits inside <id>-k3s-tfstate, service-account emails and FQDNs.
+# LC_ALL=C: bytes that are not UTF-8 cannot hide it, and -i folds ASCII only, which is all a project id holds.
+# The ids reach grep as a pattern file on a pipe (-f), never as arguments; grep prints file names only, never an
+# id. The demo masks it as <GCP_PROJECT> (redact), which this does not match.
 check_project() {
-  local dir="$1" id="$2" where="$3" files rc
-  [[ -n "$id" ]] || return 0
-  files="$(cd -- "$dir" && LC_ALL=C grep -liF -e "$id" ./*)" && rc=0 || rc=$?
+  local dir="$1" ids="$2" where="$3" files rc
+  [[ -n "$ids" ]] || return 0
+  files="$(cd -- "$dir" && LC_ALL=C grep -liF -f <(printf '%s\n' "$ids") ./*)" && rc=0 || rc=$?
   files="${files//.\//}"
   if ((rc != 1)); then
-    log "error: the GCP project id (GCP_PROJECT) appears in (or grep failed on): ${files//$'\n'/ }"
+    log "error: the GCP project id (GCP_PROJECT, environment or .env) appears in (or grep failed on): ${files//$'\n'/ }"
     log "  redact it in $where and promote again; verification/final was not changed"
     exit 1
   fi
 }
 
-# failed_chapters TIMINGS: the chapters timings.txt records with a failed step or as interrupted, each after a
-# space ("" when none).
+# failed_chapters RUN: the chapters RUN/timings.txt records with a failed step or as interrupted, and those with
+# a recording (chN.txt) but no timings.txt line (the demo was killed part-way through them), each after a space
+# ("" when none).
 failed_chapters() {
-  local line out=""
+  local line out="" seen=" " f n
   while IFS= read -r line || [[ -n "$line" ]]; do
-    if [[ "$line" =~ $DEMO_TIMING_LINE ]] && ((10#${BASH_REMATCH[2]} > 0)); then
-      out+=" ch${BASH_REMATCH[1]} (${BASH_REMATCH[2]} failed)"
+    if [[ "$line" =~ $DEMO_TIMING_LINE ]]; then
+      seen+="${BASH_REMATCH[1]} "
+      if ((10#${BASH_REMATCH[2]} > 0)); then out+=" ch${BASH_REMATCH[1]} (${BASH_REMATCH[2]} failed)"; fi
     elif [[ "$line" =~ $DEMO_INTERRUPTED_LINE ]]; then
+      seen+="${BASH_REMATCH[1]} "
       out+=" ch${BASH_REMATCH[1]} (interrupted)"
     fi
-  done <"$1"
+  done <"$1/timings.txt"
+  for f in "$1"/ch[1-8].txt; do
+    [[ -f "$f" ]] || continue
+    n="${f##*/ch}"
+    n="${n%.txt}"
+    [[ "$seen" == *" $n "* ]] || out+=" ch$n (no timings.txt line: stopped part-way)"
+  done
   printf '%s' "$out"
 }
 
-# carry_kept COPY IP: put a copy of each existing verification/final/<sub> of KEPT_IN_FINAL (final/demo/)
+# carry_kept COPY IP PROJECTS: put a copy of each existing verification/final/<sub> of KEPT_IN_FINAL (final/demo/)
 # into COPY, the staged verify copy that replaces final, so a verify promotion does not delete it. The copy is
 # checked by the demo rules, scanned, IP-checked and project-checked as a demo run is; anything wrong exits 1
 # (final unchanged). A final that is a symlink is not the repo's: nothing is carried from it.
 carry_kept() {
-  local copy="$1" ip="$2" sub src leaks project
+  local copy="$1" ip="$2" projects="$3" sub src leaks
   [[ -d "$FINAL_DIR" && ! -L "$FINAL_DIR" ]] || return 0
   for sub in "${KEPT_IN_FINAL[@]}"; do
     src="$FINAL_DIR/$sub"
     [[ -e "$src" || -L "$src" ]] || continue
-    project="$(project_for_check)" || exit
     check_demo "$src" "verification/final/$sub" 1
     cp -R -- "$src" "$copy/$sub" || die "copying verification/final/$sub into the staged copy failed"
     check_demo "$copy/$sub" "the copy of verification/final/$sub" 1
@@ -404,7 +396,7 @@ carry_kept() {
       exit 1
     fi
     check_ip "$copy/$sub" "$ip" "verification/final/$sub/"
-    check_project "$copy/$sub" "$project" "verification/final/$sub/"
+    check_project "$copy/$sub" "$projects" "verification/final/$sub/"
   done
 }
 
@@ -480,7 +472,7 @@ promote_verify() {
   fi
 
   # A promoted demo (final/demo/) stays: it goes into the copy, checked, scanned, IP- and project-checked.
-  carry_kept "$copy" "$ip"
+  carry_kept "$copy" "$ip" "$projects"
   swap_in "$copy" || die "replacing $FINAL_DIR with the scanned copy failed; verification/final was not changed"
 
   result="$(grep -m 1 '^\*\*Result:\*\* ' -- "$FINAL_DIR/SUMMARY.md")"
@@ -493,22 +485,23 @@ promote_verify() {
 # promote_demo DEMO_DIR: verification/final/demo/ = a scanned copy of the demo run (see the header).
 promote_demo() {
   (($# == 1)) || { usage >&2; die "usage: demo takes exactly one DEMO_DIR" 2; }
-  local run copy leaks ip project failed
+  local run copy leaks ip projects failed
   run="$(resolve_run "$1" "$DEMO_RUN_NAME" "demo-<YYYY-MM-DDTHHMM-0700>" demo)" || exit
   check_demo "$run" "$1" 2
-  # A failed or interrupted chapter's recording would replay the failure: the fallback would not work.
-  failed="$(failed_chapters "$run/timings.txt")"
+  # A failed, interrupted or part-recorded chapter's recording would replay the failure (or half a chapter):
+  # the fallback would not work.
+  failed="$(failed_chapters "$run")"
   if [[ -n "$failed" ]]; then
     if [[ "${PROMOTE_ALLOW_FAIL:-}" != 1 ]]; then
-      log "error: $1 has chapters that failed or were interrupted:$failed"
+      log "error: $1 has chapters that failed, were interrupted or did not finish:$failed"
       log "  their recordings would replay the failure; promote a run where they passed, or PROMOTE_ALLOW_FAIL=1"
       exit 2
     fi
-    log "WARNING: promoting $1 with chapters that failed or were interrupted (PROMOTE_ALLOW_FAIL=1):$failed"
+    log "WARNING: promoting $1 with chapters that failed, were interrupted or did not finish (PROMOTE_ALLOW_FAIL=1):$failed"
   fi
   ip="$(operator_ip)" || exit
-  project="$(project_for_check)" || exit
-  if [[ -z "$project" ]]; then
+  projects="$(project_ids)" || exit
+  if [[ -z "$projects" ]]; then
     log "WARNING: no GCP project id (GCP_PROJECT in the environment or .env): the project-id check was skipped"
   fi
   if [[ -L "$FINAL_DIR" || (-e "$FINAL_DIR" && ! -d "$FINAL_DIR") ]]; then
@@ -536,7 +529,7 @@ promote_demo() {
     exit 1
   fi
   check_ip "$copy" "$ip" "$run/"
-  check_project "$copy" "$project" "$run/"
+  check_project "$copy" "$projects" "$run/"
 
   if [[ ! -d "$FINAL_DIR" ]]; then
     mkdir -- "$FINAL_DIR" || die "cannot create $FINAL_DIR"

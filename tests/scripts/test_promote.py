@@ -1028,7 +1028,9 @@ def test_a_stale_lock_is_reported_not_broken(repo):
 
 DEMO_FILES = {"ch1.txt": "--- [ch1.1] A1\n$ check_a1_nodes\nA1: 2 of 2 nodes Ready\n",
               "ch3.txt": "--- [ch3.1] B1\nmatrix ok\n",
-              "timings.txt": "ch1 120s (commands 40s; 3 step(s), 0 failed, 0 skipped) Architecture\n"}
+              # A line per chapter: a recording without one (a chapter stopped part-way) is refused (F25-3).
+              "timings.txt": "".join(f"ch{n} 120s (commands 40s; 3 step(s), 0 failed, 0 skipped) Chapter {n}\n"
+                                     for n in range(1, 9))}
 
 
 def make_demo(repo, name=DEMO_TS, files=None):
@@ -1316,6 +1318,18 @@ def test_promote_demo_reads_the_project_id_from_env_file(repo):
     assert "ch8.txt" in r.stderr
 
 
+def test_promote_demo_checks_env_file_id_also_when_the_environment_sets_another(repo):
+    """SYNC-25: promote demo uses main's project_ids (R67): both ids are checked."""
+    before = previous_final(repo)
+    (repo / ".env").write_text(f"GCP_PROJECT={DEMO_PROJECT}\n")
+    (repo / ".env").chmod(0o600)
+    make_demo(repo, files={**DEMO_FILES, "ch8.txt": f"make down destroys, in GCP project {DEMO_PROJECT}:\n"})
+    r = promote_demo(repo, env=no_project_env(GCP_PROJECT="other-project-1"))
+    assert r.returncode == 1, r.stderr
+    assert snapshot(repo / "verification/final") == before
+    assert "ch8.txt" in r.stderr and DEMO_PROJECT not in r.stdout + r.stderr
+
+
 def test_promote_demo_without_a_project_id_warns_and_promotes(repo):
     run = make_demo(repo)
     r = promote_demo(repo, env=no_project_env())
@@ -1379,8 +1393,31 @@ def test_promote_demo_promotes_a_failed_chapter_with_promote_allow_fail(repo):
 
 def test_promote_demo_takes_a_run_whose_chapters_all_passed(repo):
     timings = ("ch1 120s (commands 40s; 3 step(s), 0 failed, 1 skipped) Architecture\n"
-               "total 120s; chapters 1-6: 2m00s (target 25 min)\n")
+               "ch3 60s (commands 30s; 1 step(s), 0 failed, 0 skipped) Cross-node connectivity matrix (B1)\n"
+               "total 180s; chapters 1-6: 3m00s (target 25 min)\n")
     run = make_demo(repo, files={**DEMO_FILES, "timings.txt": timings})
     r = promote_demo(repo, env=no_project_env())
     assert r.returncode == 0, r.stderr
     assert snapshot(repo / "verification/final/demo") == snapshot(run)
+
+
+# F25-3: the demo killed part-way through a chapter leaves its chN.txt but no timings.txt line for it.
+STOPPED_TIMINGS = "ch1 120s (commands 40s; 3 step(s), 0 failed, 0 skipped) Architecture\n"
+
+
+def test_promote_demo_refuses_a_chapter_recording_without_a_timings_line(repo):
+    before = previous_final(repo)
+    make_demo(repo, files={**DEMO_FILES, "timings.txt": STOPPED_TIMINGS})
+    r = promote_demo(repo, env=no_project_env())
+    assert r.returncode == 2, r.stderr
+    assert snapshot(repo / "verification/final") == before
+    assert "ch3 (no timings.txt line" in r.stderr and "ch1" not in r.stderr and "PROMOTE_ALLOW_FAIL=1" in r.stderr
+    assert verification_entries(repo) == [".gitkeep", DEMO_TS, "final"]
+
+
+def test_promote_demo_promotes_a_chapter_without_a_timings_line_with_promote_allow_fail(repo):
+    run = make_demo(repo, files={**DEMO_FILES, "timings.txt": STOPPED_TIMINGS})
+    r = promote_demo(repo, env=no_project_env(PROMOTE_ALLOW_FAIL="1"))
+    assert r.returncode == 0, r.stderr
+    assert snapshot(repo / "verification/final/demo") == snapshot(run)
+    assert "WARNING" in r.stderr and "ch3 (no timings.txt line" in r.stderr

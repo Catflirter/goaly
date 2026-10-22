@@ -401,6 +401,23 @@ def test_replay_masks_the_operator_ip_and_the_project_id(denv, tmp_path):
     assert r.stdout == "rule <operator_ip>/32 in <GCP_PROJECT>\n"
 
 
+def test_replay_makes_no_network_call_without_operator_ip_in_env(denv, tmp_path):
+    """F25-2: replay is the fallback for a bad network: no checkip.amazonaws.com lookup, even when .env has no
+    OPERATOR_IP (the recordings were redacted when they were made); .env's project id is still masked."""
+    denv.write_demo_env(operator_ip="")
+    called = tmp_path / "curl-called"
+    (denv.bin / "curl").write_text(f'#!/bin/sh\n: > "{called}"\nsleep 10\nexit 7\n')
+    final = tmp_path / "final"
+    (final / "demo").mkdir(parents=True)
+    (final / "demo/ch2.txt").write_text(f"rule <operator_ip>/32 in {PROJECT}\n")
+    started = time.monotonic()
+    r = denv.script("demo.sh", "replay", "2", VERIFICATION_FINAL=str(final))
+    assert r.returncode == 0, r.stderr
+    assert r.stdout == "rule <operator_ip>/32 in <GCP_PROJECT>\n"
+    assert not called.exists(), "replay called curl"
+    assert time.monotonic() - started < 5
+
+
 def test_a_failed_step_names_the_replay_and_the_demo_goes_on(denv):
     r = run_demo(denv, "3,1", code=stubs(check_b1_matrix=1))
     assert r.returncode == 1, r.stderr
@@ -629,8 +646,16 @@ def test_chapter_6_plans_scales_up_in_the_background_back_down_and_previews_gpus
     gpuctl_ok(denv)
     terraform_plans(denv)
     denv.scenario["ready"] = ["k3s-cpu-2"]
+    # Like the real watch, it prints the nodes at once and keeps running until it is stopped.
+    denv.scenario["answers"].insert(0, {"tool": "kubectl", "has": ["get nodes -w"], "sleep": 60,
+                                        "stdout": "NAME        STATUS     ROLES\nk3s-cpu-2   NotReady   <none>\n"})
+    started = time.monotonic()
     r = run_demo(denv, "6")
     assert r.returncode == 0, (r.stdout, r.stderr)
+    assert time.monotonic() - started < 30, "the watch was stopped, not left to end by itself"
+    # F25-1: the scale stub ends at once, yet the watch has started (its first lines are on the screen) before it is
+    # stopped: the step waits for its first line.
+    assert "k3s-cpu-2   NotReady   <none>" in r.stdout
     # The plan of the inventory scaled to 2, before anything is scaled.
     plans = [a for a in tf_calls(denv) if a[1] == "plan"]
     assert len(plans) == 1
