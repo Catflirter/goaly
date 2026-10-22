@@ -14,6 +14,8 @@ to $FAKE_LOG. $FAKE_SCENARIO (a JSON file) steers the answers:
   ssh_fail       [command]                a remote command C (any target) exits ssh_fail_rc for each listed C
   ssh_fail_rc    rc                       ... exit code of those calls (default 1: the remote command
                                           failed; 255 is ssh's own error, e.g. IAP dropped the connection)
+  ssh_stderr     text                     ... and each failing call above (ssh_failures, ssh_fail) prints this
+                                          on stderr, as ssh does (e.g. REMOTE HOST IDENTIFICATION HAS CHANGED)
   kubeconfig     text                     answer to `sudo cat /etc/rancher/k3s/k3s.yaml`
   readyz         "ok" | anything else     kubectl get --raw /readyz (anything else: exit 1). Like the
                                           real API behind the tunnel, it answers ok only while a fake
@@ -151,10 +153,14 @@ def scp():
 
 def remote(target, command):
     """A command run on k3s-cp, a CPU worker or a GPU node."""
+    failed = command in SCENARIO.get("ssh_fail", []) or (
+        command == "true" and counter("ssh-true") < SCENARIO.get("ssh_failures", 0))
+    if failed and "ssh_stderr" in SCENARIO:
+        print(SCENARIO["ssh_stderr"], file=sys.stderr)
     if command in SCENARIO.get("ssh_fail", []):
         return SCENARIO.get("ssh_fail_rc", 1)
     if command == "true":
-        return 255 if counter("ssh-true") < SCENARIO.get("ssh_failures", 0) else 0
+        return 255 if failed else 0
     if command == "sudo cat /etc/rancher/k3s/k3s.yaml":
         sys.stdout.write(SCENARIO.get("kubeconfig", ""))
     if command.startswith("sudo k3s token create "):
