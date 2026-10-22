@@ -1085,3 +1085,65 @@ def test_a_lock_file_that_cannot_be_opened_is_a_failed_gpu_scale(harness):
     assert h.of("gpuctl-apply") == [] and h.overrides() is None
     (line,) = [x for x in h.log() if x["action"] == "gpu_scale"]
     assert line["result"].startswith("failed") and "gpuctl.lock" in line["result"]
+
+
+
+# --- review round 3 ----------------------------------------------------------------------------------
+
+def test_a_retried_scale_down_that_finishes_before_the_recheck_is_not_a_gpu_down(harness):  # review S4-r3-2
+    """The first apply's terminate goes through while the retry runs gpuctl plan: the re-check under the lock sees
+    k3s-gpu-a6000-2 gone. That is this autoscaler's own scale-down finishing, not a make gpu-down."""
+    h = scaled_down_cluster(harness, [1, 0])
+    plans = []
+
+    def plan_hook(h):
+        plans.append(1)
+        if len(plans) == 2:  # the retry's plan (tick 3)
+            terminated_2(h)
+
+    def gpu_pod_arrives(h, tick):
+        if tick == 3:
+            h.pods = klist(GPU1_BUSY, GPU_PENDING)
+
+    h.hooks["gpuctl-plan"] = plan_hook
+    h.on_wait = gpu_pod_arrives
+    assert h.main("--loop", ticks=5, interval=70) == 0
+    first, retry, up = [x for x in h.log() if x["action"] == "gpu_scale"]
+    assert first["target"] == 1 and first["result"].startswith("failed")
+    assert retry["target"] == 1 and retry["result"].startswith("not started")
+    assert "scale-down finished" in retry["result"] and "make gpu-down" not in retry["result"]
+    assert up["target"] == 2 and up["result"] == "ok"  # GPU scaling is still on
+    assert len(h.of("gpuctl-apply")) == 2 and h.overrides() == {"pools": {"a6000": 2}}
+    assert not any("GPU scaling is off" in x["reason"] for x in h.log())
+
+
+def test_instances_gone_below_the_target_during_a_retry_still_turn_gpu_scaling_off(harness):  # review S4-r3-2
+    """Not the scale-down finishing: every instance went (terminated outside the autoscaler) and the pool is now
+    below its target."""
+    h = scaled_down_cluster(harness, [1, 0])
+    plans = []
+
+    def plan_hook(h):
+        plans.append(1)
+        if len(plans) == 2:
+            h.instances = []
+
+    h.hooks["gpuctl-plan"] = plan_hook
+    h.main("--loop", ticks=4, interval=70)
+    first, retry = [x for x in h.log() if x["action"] == "gpu_scale"]
+    assert retry["result"].startswith("not started") and "make gpu-down" in retry["result"]
+    assert len(h.of("gpuctl-apply")) == 1
+    assert any("GPU scaling is off" in x["reason"] for x in h.log() if x["action"] == "notice")
+
+
+def test_an_unwritable_log_never_stops_the_loop(harness, capsys):  # review S4-r3-6
+    h = harness(**GPU_CLUSTER, overrides={"a6000": 1}, rc={"gpuctl-apply": 1})
+    h.hooks["gpuctl-apply"] = lambda h: shutil.rmtree(h.log_dir)  # the log directory goes during the apply
+    assert h.main("--loop", ticks=2, interval=20) == 0
+    assert h.overrides() == {"pools": {"a6000": 1}}  # the failed scale-up was still put back
+    assert h.state()["last_action_at"] == NOW + 5  # and its cooldown saved
+    assert len(h.of("kubectl")) == 4  # the second tick ran
+    out = h.out.getvalue()
+    assert "gpu_scale pool=a6000 target=2 -> failed" in out and "no action" in out
+    err = capsys.readouterr().err
+    assert err.count("cannot write the log") == 1 and str(h.log_dir / "autoscaler.log") in err

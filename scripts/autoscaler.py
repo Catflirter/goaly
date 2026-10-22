@@ -48,11 +48,16 @@ failure.
 make gpu-down always wins (spec section 10.4), and the autoscaler should be stopped (Ctrl-C) before it, which the
 startup line says. gpuctl apply, down and sync-peers hold .run/gpuctl.lock, and one started while another runs waits
 for it (gpuctl.lock); the autoscaler takes that lock without waiting (held: the gpu_scale is not started and is
-decided again next tick) before its re-check, and keeps it through its write and gpuctl apply. So a gpu-down that
-starts during a gpu_scale runs right after its apply and removes what it launched; one that ended between this
-tick's read and the lock shows in the re-check: the live instances it terminated are gone (then nothing is written
-and GPU scaling is off until a restart), or the override file changed. gpuctl keeps no record of a gpu-down (spec
-section 5.4; the lock file is empty), so the autoscaler also protects itself across ticks:
+decided again next tick) before its re-check, and keeps it through its write and gpuctl apply. What that
+guarantees: a gpu-down that holds the lock when a gpu_scale wants it wins (nothing is started), and one that starts
+during a gpu_scale runs right after its apply and removes what it launched. A gpu-down that ended between this
+tick's read and the lock is seen only through what it changed: the override file (changed or deleted), or live
+instances it terminated (gone, and not this process's own failed scale-down finishing: its pool still has its
+target live); then nothing is written and GPU scaling is off until a restart. gpuctl keeps no record of a gpu-down
+(spec section 5.4; the lock file is empty), so one that changed nothing observable (no override file and no live
+GPU instance) is invisible: the gpu_scale goes ahead exactly as the next tick would, and launches the node a Pending
+Pod asks for. That is why spec section 10.4 says to stop the autoscaler before make gpu-down. Across ticks the
+autoscaler also protects itself:
   - once it has written the override file, finding that file deleted or changed by someone else (make gpu-down, or a
     hand edit) turns GPU scaling off until it is restarted; a write re-reads the file first and stops if it changed
     since the tick read it;
@@ -361,6 +366,7 @@ class Autoscaler:
         self.notes: list[str] = []  # what the current action did to the override file
         self.memory_state: State | None = None  # --dry-run: the state is kept here, never saved
         self.log_path: Path | None = None
+        self.log_errors: set[int | None] = set()  # errnos of log writes that failed (each said once)
         if args.log:
             self.log_path = Path(args.log) / "autoscaler.log"
         elif not args.dry_run:
@@ -378,9 +384,16 @@ class Autoscaler:
         line = {"ts": self._ts(started), "action": action, **{k: v for k, v in extra.items() if v is not None},
                 "reason": reason, "result": result,
                 "duration_s": round(max(self.deps.clock() - started, 0.0), 1)}
-        if self.log_path is not None:
+        if self.log_path is None:
+            return
+        try:
             with open(self.log_path, "a", encoding="utf-8") as f:
                 f.write(json.dumps(line) + "\n")
+        except OSError as e:  # a full disk, a removed directory: never the end of the loop (review S4-r3-6)
+            if e.errno not in self.log_errors:  # once per kind of error
+                self.log_errors.add(e.errno)
+                print(f"autoscaler: cannot write the log {self.log_path}: {e.strerror or e}; the autoscaler goes on "
+                      "and this terminal still shows every tick (said once per kind of error)", file=sys.stderr)
 
     def say(self, text: str) -> None:
         self.out.write(text + "\n")
@@ -739,7 +752,8 @@ class Autoscaler:
             return Result(1, str(e), "")
         if fd is None:  # make gpu-down or make gpu-apply runs in another terminal: decided again next tick
             return NotStarted(f"another gpuctl apply/down/sync-peers holds {lock} (make gpu-down or make gpu-apply "
-                              "running?); decided again next tick")
+                              "in another terminal, possibly at its confirmation prompt, or a cpu-pool.sh sync-peers; "
+                              f"fuser -v {lock} shows it); decided again next tick")
         try:
             return self._gpu_scale_locked(snap, action, fd)
         finally:
@@ -756,21 +770,27 @@ class Autoscaler:
                                  "off until make autoscale is restarted")
             return NotStarted(f"{path} changed since this tick read it (make gpu-down?); GPU scaling is off until "
                               "make autoscale is restarted")
-        # A make gpu-down that ended after this tick read the instances leaves no record (spec section 5.4) and,
-        # without an override file, nothing of the autoscaler's changed; its terminates show here. Any later one
-        # waits for this lock, so it runs after this apply and wins (spec section 10.4).
+        # A make gpu-down that ended after this tick read the instances leaves no record (spec section 5.4); without
+        # an override file only its terminates can show, here. With no live instance either it is invisible (see the
+        # module docstring). Any later one waits for this lock, so it runs after this apply and wins (section 10.4).
         _, _, names, error = self._instances(set())
         if error is not None or snap.live_names is None:
             return NotStarted("cannot re-check the GPU instances before writing the target: "
                               + (error or "list-nodes failed when this tick read them"))
         if names != snap.live_names:
             gone, new = sorted(snap.live_names - names), sorted(names - snap.live_names)
-            change = "; ".join(filter(None, [gone and f"gone: {', '.join(gone)}", new and f"new: {', '.join(new)}"]))
-            if gone:
-                self.gpu_disabled = (f"GPU instances went away while a tick ran ({', '.join(gone)}; make gpu-down?): "
-                                     "GPU scaling is off until make autoscale is restarted")
-            return NotStarted(f"the GPU instances changed since this tick read them ({change}; make gpu-down?)"
-                              + ("; GPU scaling is off until make autoscale is restarted" if gone else
+            finished = self._own_scale_down_finished(snap, gone, names)
+            unexplained = [name for name in gone if name not in finished]
+            change = "; ".join(filter(None, [
+                unexplained and f"gone: {', '.join(unexplained)} (make gpu-down?)",
+                finished and (f"gone: {', '.join(finished)}: this autoscaler's failed scale-down finished "
+                              "meanwhile"),
+                new and f"new: {', '.join(new)}"]))
+            if unexplained:
+                self.gpu_disabled = (f"GPU instances went away while a tick ran ({', '.join(unexplained)}; make "
+                                     "gpu-down?): GPU scaling is off until make autoscale is restarted")
+            return NotStarted(f"the GPU instances changed since this tick read them ({change})"
+                              + ("; GPU scaling is off until make autoscale is restarted" if unexplained else
                                  "; decided again next tick"))
         merged = dict(sorted({**snap.overrides, action.pool: action.target}.items()))
         text = json.dumps({"pools": merged}) + "\n"
@@ -791,6 +811,20 @@ class Autoscaler:
                 # a further Ctrl-C only repeats the message: it must not leave the raised target behind (r2-3)
                 self.stopper.in_action = False
                 self._restore_override(written=text, before=before)
+
+    def _own_scale_down_finished(self, snap: Snapshot, gone: list[str], names: frozenset[str]) -> list[str]:
+        """The gone instances that this process's own failed scale-down explains (review S4-r3-2): their pool's
+        scale-down failed earlier (its terminate may still go through) and the pool still has at least its target
+        live. A make gpu-down leaves fewer (and deletes the override file)."""
+        live_now = collections.Counter(parsed[0] for name in names if (parsed := parse_node_name(name)) is not None)
+        finished = []
+        for name in gone:
+            parsed = parse_node_name(name)
+            target = snap.gpu_counts.get(parsed[0]) if parsed is not None else None
+            if parsed is not None and parsed[0] in self.unfinished_down and target is not None \
+                    and live_now[parsed[0]] >= target:
+                finished.append(name)
+        return finished
 
     def _restore_override(self, *, written: str, before: str | None) -> None:
         """Put the override file back as it was before a scale-up that did not complete, unless someone else
