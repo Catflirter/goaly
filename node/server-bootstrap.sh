@@ -138,6 +138,8 @@ deadline=$((SECONDS + 180))
 # --request-timeout bounds each probe, so a hung connection cannot stretch the 180s.
 until k3s kubectl --request-timeout=5s get --raw /readyz > /dev/null 2>&1; do
   (( SECONDS < deadline )) || die "apiserver not ready after 180s; see journalctl -u k3s"
-  sleep 5
+  # Not a foreground sleep, so a Ctrl-C as it ends still stops the bootstrap (see gpu_audit in common.sh).
+  sleep 5 &
+  wait "$!"
 done
 log "k3s server $K3S_VERSION ready"

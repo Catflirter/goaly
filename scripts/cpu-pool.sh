@@ -32,8 +32,9 @@
 # Scale step 4 joins every worker that has not joined: a new one always; one that was in the pool
 # before when the cluster has no Node of that name, or when its Node is NotReady and its VM is
 # RUNNING (a join that timed out: join-node.sh bootstraps it again). A NotReady worker whose VM is
-# stopped (make cpu-stop: TERMINATED, STOPPED, SUSPENDED) is left alone; one whose VM is in any other
-# state (STOPPING, PROVISIONING, ...) is left alone too, but the scale then exits 1 naming it.
+# stopped (make cpu-stop: TERMINATED, STOPPED; or SUSPENDED, which needs gcloud compute instances
+# resume, not cpu-start) is left alone; one whose VM is in any other state (STOPPING, PROVISIONING,
+# ...) is left alone too, but the scale then exits 1 naming it.
 set -euo pipefail
 
 # shellcheck disable=SC1091  # common.sh is linted on its own
@@ -74,15 +75,6 @@ plan_removal() {
     tf_plan workers --destroy-only "${names[@]}"
   fi
   PLANNING=0
-}
-
-# vm_status NAME: the GCE status of CPU worker NAME's VM (RUNNING, TERMINATED, ...), in VM_STATUS.
-# Call it outside $(...): _worker_zone caches worker_zones for the shell.
-vm_status() {
-  _worker_zone "$1"
-  VM_STATUS="$(gcloud compute instances describe "$1" --project "$GCP_PROJECT" --zone "$_ZONE" \
-    --format='value(status)')" || die "cannot read the status of the VM $1"
-  [[ "$VM_STATUS" =~ ^[A-Z_]+$ ]] || die "unexpected status for the VM $1: '$VM_STATUS'"
 }
 
 usage() {
@@ -215,8 +207,11 @@ cmd_scale() {
             RUNNING)
               log "$name is registered but NotReady and its VM is RUNNING: joining it again"
               join+=("$name") ;;
-            TERMINATED | STOPPED | SUSPENDED)
-              log "$name is registered but NotReady and its VM is $VM_STATUS: not joined (make cpu-start, then make cpu-scale again)" ;;
+            TERMINATED | STOPPED)
+              log "$name is registered but NotReady and its VM is $VM_STATUS: not joined (make cpu-start starts it; a re-run of make cpu-scale joins it if it stays NotReady once RUNNING)" ;;
+            SUSPENDED)
+              # make cpu-start (instances start) does not wake a suspended VM.
+              log "$name is registered but NotReady and its VM is SUSPENDED: not joined (gcloud compute instances resume $name --project $GCP_PROJECT --zone $_ZONE wakes it; a re-run of make cpu-scale joins it if it stays NotReady once RUNNING)" ;;
             *)
               log "$name is registered but NotReady and its VM is $VM_STATUS: not joined now"
               unsettled+=("$name ($VM_STATUS)") ;;
@@ -229,7 +224,7 @@ cmd_scale() {
   join_workers ${join[@]+"${join[@]}"}
   log "CPU pool: $(pool_names | wc -l | tr -d ' ') worker(s)"
   if (( ${#unsettled[@]} )); then
-    die "NotReady, with a VM neither running nor stopped: ${unsettled[*]}; re-run make cpu-scale once it settles"
+    die "NotReady, with a VM neither running nor stopped: ${unsettled[*]}; once it settles, a re-run of make cpu-scale joins it if it is RUNNING and still NotReady"
   fi
 }
 

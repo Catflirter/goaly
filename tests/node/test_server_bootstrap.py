@@ -105,8 +105,13 @@ def test_audit_policy_metadata_only(tmp_path):
 
 def test_sysctl_values(tmp_path):
     assert run_server(tmp_path).returncode == 0
-    lines = {l.strip() for l in rendered(tmp_path, "etc/sysctl.d/90-kubelet.conf").splitlines() if l.strip()}
-    assert lines == {"vm.panic_on_oom=0", "vm.overcommit_memory=1", "kernel.panic=10", "kernel.panic_on_oops=1"}
+    lines = {l.strip() for l in rendered(tmp_path, "etc/sysctl.d/90-kubelet.conf").splitlines()
+             if l.strip() and not l.lstrip().startswith("#")}
+    assert lines == {"vm.panic_on_oom=0", "vm.overcommit_memory=1", "kernel.panic=10", "kernel.panic_on_oops=1",
+                     "net.ipv4.ip_forward=1", "net.ipv4.conf.all.forwarding=1",
+                     "net.ipv4.conf.all.accept_redirects=0", "net.ipv4.conf.default.accept_redirects=0",
+                     "net.ipv4.conf.all.send_redirects=0", "net.ipv4.conf.default.send_redirects=0",
+                     "net.ipv4.conf.all.accept_source_route=0", "net.ipv4.conf.default.accept_source_route=0"}
 
 
 def test_server_guard_rules(tmp_path):
@@ -788,6 +793,13 @@ def run_host(tmp, bindir):
                           capture_output=True, text=True, env=env)
 
 
+def snapshot_sysctl(bindir, tmp):
+    """Make the sysctl stub copy the 90-kubelet.conf that `sysctl --system` would apply."""
+    stub = bindir / "sysctl"
+    stub.write_text(stub.read_text() + f'cp "{tmp}/sys/etc/sysctl.d/90-kubelet.conf" "{tmp}/sysctl-saw.conf" '
+                    f'2>/dev/null || echo MISSING > "{tmp}/sysctl-saw.conf"\n')
+
+
 def host_calls(log):
     # The staging dir is a mktemp path; normalise it.
     return [re.sub(r"-f \S+/etc/k3s-guard/", "-f STAGE/etc/k3s-guard/", c) for c in calls(log)]
@@ -901,3 +913,18 @@ def test_host_mode_requires_root_without_test_root(tmp_path):
                         "--cp-internal-ip", "10.10.0.2", "--iface", "ens4"], capture_output=True, text=True, env=env)
     assert r.returncode == 1 and "run as root" in r.stderr
     assert calls(log) == []
+
+
+def test_host_rerun_applies_the_new_sysctl_file_without_restarting_k3s(tmp_path):
+    # Upgrade path of the IP-forwarding fix: k3s already runs with an older 90-kubelet.conf. The re-run
+    # must install the new file BEFORE `sysctl --system` applies the directory, and a sysctl-only change
+    # must not restart k3s.
+    bindir, log = host_stubs(tmp_path)
+    assert run_host(tmp_path, bindir).returncode == 0
+    (tmp_path / "sys/etc/sysctl.d/90-kubelet.conf").write_text("vm.panic_on_oom=0\nvm.overcommit_memory=1\nkernel.panic=10\nkernel.panic_on_oops=1\n")
+    snapshot_sysctl(bindir, tmp_path)
+    log.write_text("")
+    r = run_host(tmp_path, bindir)
+    assert r.returncode == 0, r.stderr
+    assert "net.ipv4.ip_forward=1" in (tmp_path / "sysctl-saw.conf").read_text().splitlines()
+    assert not any(c.startswith("systemctl restart") for c in calls(log)), calls(log)

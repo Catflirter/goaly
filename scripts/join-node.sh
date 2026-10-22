@@ -11,7 +11,11 @@
 #      did (scripts/gpuctl apply, or `make up`/cpu-pool.sh, which sync once for all their nodes).
 #   2. NAME already Ready: done (exit 0), unless --force.
 #   3. Wait (at most 300s) for SSH to the node: a VM or Lambda instance made seconds earlier has no
-#      sshd yet. Then node/ into a fresh private /tmp/k3s-node on it, and node-bootstrap.sh as root.
+#      sshd yet. What no wait can cure fails at once instead: a CPU worker whose VM is stopped (make
+#      cpu-stop; the cure is make cpu-start) or suspended (gcloud compute instances resume), read
+#      from its VM status first; and a host key that ssh rejects (a Lambda IP reused by a new
+#      instance: .run/known_hosts_NAME). Then node/ into a fresh private /tmp/k3s-node on it, and
+#      node-bootstrap.sh as root.
 #   4. k3s-agent is stopped (a no-op on a first join), so that it starts from the new token: an agent
 #      left running by an earlier join holds that join's token, which is deleted. A join token (TTL
 #      15m) is created on k3s-cp and piped straight into the node's token-file; then k3s-agent
@@ -114,15 +118,50 @@ cp_resolve
 log "==> joining $NODE ($IP) to the cluster at $cp_ip"
 if [[ "$KIND" == gpu ]]; then
   SSH_HINT="if this is a new instance under an old name, check its host key and remove $RUN_DIR/known_hosts_$NODE"
+  # Lambda hands a terminated instance's IP to a new one: the old key in this file then rejects it.
+  HOST_KEY_HINT="if $NODE is a new instance on a reused IP, check its host key and remove $RUN_DIR/known_hosts_$NODE"
   # A missing SSH key is a configuration error (exit 2), not something the wait below should retry.
   _gpu_ssh_opts "$NODE"
 else
   SSH_HINT="a worker stopped with make cpu-stop needs make cpu-start first"
+  # gcloud compute ssh keeps every VM's host key in this file, under the alias compute.<instance id>.
+  HOST_KEY_HINT="check the host key of $NODE and remove its compute.<instance id> entry from $HOME/.ssh/google_compute_known_hosts"
+  # A stopped or suspended VM never answers SSH: say so now, not after the SSH wait (M4-2). A VM on
+  # its way up (PROVISIONING, STAGING), RUNNING, or in any other state gets the wait.
+  vm_status "$NODE"
+  case "$VM_STATUS" in
+    TERMINATED | STOPPED | STOPPING)
+      die "the VM of $NODE is $VM_STATUS: make cpu-start first, then re-run the join" ;;
+    SUSPENDED | SUSPENDING)
+      die "the VM of $NODE is $VM_STATUS: resume it first (gcloud compute instances resume $NODE --project $GCP_PROJECT --zone $_ZONE; a start does not wake it), then re-run the join" ;;
+  esac
 fi
+
+# ssh_probe NAME: SSH to NAME works (0). A host key that ssh rejects exits SSH_HOST_KEY_RC, which
+# ends the wait below at once: no retry clears it. Any other failure (no sshd yet: exit 255, an
+# IAP hiccup) is retried.
+SSH_HOST_KEY_RC=86
+ssh_probe() {
+  local err rc=0
+  err="$(node_ssh "$1" true 2>&1 < /dev/null)" || rc=$?
+  [[ -z "$err" ]] || printf '%s\n' "$err" >&2
+  if (( rc != 0 )) && [[ "$err" == *"REMOTE HOST IDENTIFICATION HAS CHANGED"* || "$err" == *"Host key verification failed"* ]]; then
+    return "$SSH_HOST_KEY_RC"
+  fi
+  (( rc != SSH_HOST_KEY_RC )) || rc=1
+  return "$rc"
+}
+
 # A VM the workers apply made, or a Lambda instance that just turned active, can take a minute to
 # accept SSH (exit 255 until then): wait for it, as up.sh base waits for k3s-cp (L3-1).
-wait_for "node_ssh $NODE true < /dev/null" "$SSH_TIMEOUT" \
-  || die "SSH to $NODE not available after ${SSH_TIMEOUT}s ($SSH_HINT)"
+rc=0
+wait_for "ssh_probe $NODE" "$SSH_TIMEOUT" "$SSH_HOST_KEY_RC" || rc=$?
+case "$rc" in
+  0) ;;
+  "$SSH_HOST_KEY_RC")
+    die "ssh rejected the host key of $NODE ($IP): it is not the key on record ($HOST_KEY_HINT, then re-run the join)" ;;
+  *) die "SSH to $NODE not available after ${SSH_TIMEOUT}s ($SSH_HINT)" ;;
+esac
 # A fresh private staging directory (NODE_STAGING_CMD, as up.sh base does on k3s-cp). Exit 255 is
 # ssh's own failure, not the remote check: it gets its own message.
 node_ssh "$NODE" "$NODE_STAGING_CMD" < /dev/null || {
