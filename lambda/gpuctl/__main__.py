@@ -3,6 +3,8 @@
 Read-only commands: plan, status, rules, list-nodes, ip. None of them changes anything on Lambda.
 sync-peers rewrites the peer allow-lists (k3s-cp's k3s_peers set, Lambda's global rules and k3s-gpu-<region> rulesets).
 apply creates and deletes GPU nodes to match the spec; down deletes all of them.
+tfguard checks a saved workers-stack plan (`terraform show -json` on stdin) for cpu-pool.sh --guarded; it needs no
+Lambda API key and exits 1 on any violation.
 
 Exit codes: 0 success; 1 an operation failed or the target was not found; 2 refused or a usage error
 (no LAMBDA_API_KEY, invalid spec or override file, over budget, over max_nodes, not confirmed); 3 status found drift.
@@ -12,6 +14,7 @@ from __future__ import annotations
 
 import argparse
 import ipaddress
+import json
 import os
 import sys
 from collections.abc import Callable, Iterable, Mapping
@@ -27,6 +30,7 @@ from gpuctl.planner import (
 from gpuctl.reconcile import Reconciler, ReconcileError, Settings, load_overrides
 from gpuctl.spec import Spec, SpecError, load_spec
 from gpuctl.status import DRIFT_SOURCES, capacity_rows, is_problem, render_capacity
+from gpuctl.tfguard import check_names, check_workers_plan
 
 REPO_ROOT = Path(__file__).resolve().parents[2]
 DEFAULT_SPEC = REPO_ROOT / "lambda" / "gpu-nodes.yaml"
@@ -241,6 +245,26 @@ def _apply(args: argparse.Namespace, spec: Spec, client, infra, env: Mapping[str
         raise _Failed(f"{args.command}: {e}") from None
 
 
+def _tfguard(args: argparse.Namespace, out: TextIO) -> int:
+    """Stretch S3: the saved workers plan on stdin may only create --add and delete --remove workers (gpuctl.tfguard)."""
+    add, remove = set(args.add), set(args.remove)
+    try:
+        check_names(add, remove)
+    except ValueError as e:
+        raise _Refused(f"tfguard: {e}") from None
+    try:
+        plan = json.loads(sys.stdin.read())
+    except (ValueError, UnicodeDecodeError) as e:  # fail closed: a plan the guard cannot read is never applied
+        violations = [f"stdin is not the JSON of terraform show -json: {e}"]
+    else:
+        violations = check_workers_plan(plan, add=add, remove=remove)
+    for line in violations:
+        _emit(out, f"violation: {line}")
+    if violations:
+        raise _Failed(f"tfguard: {len(violations)} violation(s): the plan must not be applied")
+    return EXIT_OK
+
+
 # --- entry point --------------------------------------------------------------------------------
 
 def _parser() -> argparse.ArgumentParser:
@@ -263,6 +287,11 @@ def _parser() -> argparse.ArgumentParser:
     ip = sub.add_parser("ip", help="print the public IP of GPU node NAME")
     ip.add_argument("name", metavar="NAME")
     sub.add_parser("sync-peers", help="rewrite the peer allow-lists: cp k3s_peers set, Lambda global rules and rulesets")
+    tfguard = sub.add_parser("tfguard", help="check a workers plan (terraform show -json on stdin): exit 1 on a violation")
+    tfguard.add_argument("--add", nargs="*", action="extend", default=[], metavar="NAME",
+                         help="CPU workers the plan may create (k3s-cpu-<n>)")
+    tfguard.add_argument("--remove", nargs="*", action="extend", default=[], metavar="NAME",
+                         help="CPU workers the plan may delete (never k3s-cpu-1)")
     return parser
 
 
@@ -300,6 +329,8 @@ def main(argv: list[str] | None = None, *, env: Mapping[str, str] = os.environ, 
             args = _parser().parse_args(argv)
         except SystemExit as e:  # --help
             return e.code if isinstance(e.code, int) else EXIT_OK
+        if args.command == "tfguard":  # no spec, no Lambda client: it only reads stdin
+            return _tfguard(args, out)
         if args.command == "plan":
             return _plan(args, _load_spec(args.spec), _client(env, client), out)
         if args.command in ("status", "sync-peers", "apply", "down"):
